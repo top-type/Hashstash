@@ -67,10 +67,11 @@ pub enum Parameter {
     Interval,
     Lead,
     Rest,
-    Duration,
+    DecisionBlocks,
     MinerFeePercent,
     PassMarginBps,
     MinimumFeeRate,
+    MaxPriceChangeBps,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,16 +267,12 @@ pub enum Operation {
     Deposit {
         #[serde(with = "amount")]
         amount: Amount,
-        #[serde(with = "amount")]
-        min_shares: Amount,
         decision: Option<Hash>,
         outcome: Option<Outcome>,
     },
     Redeem {
         #[serde(with = "amount")]
         shares: Amount,
-        #[serde(with = "amount")]
-        min_received: Amount,
         decision: Option<Hash>,
         outcome: Option<Outcome>,
     },

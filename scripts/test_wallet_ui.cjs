@@ -146,13 +146,13 @@ class Element {
 
 function snapshot(chain = 'a'.repeat(64)) {
 
-  const settings = { block_bytes: 1048576, interval: 15, lead: 60, rest: 480, duration: 240, miner_fee_percent:50, pass_margin_bps:0, minimum_fee_rate:1 };
+  const settings = { block_bytes: 1048576, interval: 15, lead: 60, rest: 480, decision_blocks: 16, miner_fee_percent:50, pass_margin_bps:0, minimum_fee_rate:1, max_price_change_bps:1000 };
 
   const config = { network: 'hashstash-ui-test', auction_timeout: 480, quote_scale: '1000000', share_scale: '1000000000000000000' };
 
 
 
-  const world = { reserve: '1000', curve_mass: '5000', shares: '1000000000000000000', revenue: '0', grant_escrow: '0', price_integral: '0' };
+  const world = { reserve: '1000', curve_mass: '5000', shares: '1000000000000000000', revenue: '0', grant_escrow: '0' };
 
   return {
 
@@ -210,6 +210,7 @@ async function harness(options = {}) {
   });
 
   get('wallet-expiry').value = '100';
+  get('trade-expiry').value = '2';
 
   const navLinks = [...html.matchAll(/<a\b([^>]*data-route="[^"]+"[^>]*)>/g)].map(match => {
     const link = new Element(); link.dataset.route = attr(match[1], 'data-route'); return link;
@@ -413,7 +414,7 @@ async function harness(options = {}) {
 
     return {
 
-      kind, amount:String(amount), shares:String(quotedShares), share_before:String(owned), share_after:String(shareAfter),
+      kind, amount:String(amount), shares:String(quotedShares), input_requested:String(isRedeem?quotedShares:amount), input_filled:String(isRedeem?quotedShares:amount), input_unfilled:'0', output:String(isRedeem?output:quotedShares), indicative:true, partial_fill_possible:true, execution:'block_batch', share_before:String(owned), share_after:String(shareAfter),
 
       output_hash:String(output), stash_before_hash:String(before), stash_after_hash:String(after),
 
@@ -680,7 +681,7 @@ async function run() {
  }
  const h=await harness(), s=h.currentSnapshot;
  eq(h.get('connection-label').textContent,'Connected');
- eq(h.get('proposal-parameter').options.map(o=>o.value),['BlockBytes','Interval','Lead','Rest','Duration','MinerFeePercent','PassMarginBps','MinimumFeeRate']);
+ eq(h.get('proposal-parameter').options.map(o=>o.value),['BlockBytes','Interval','Lead','Rest','DecisionBlocks','MinerFeePercent','PassMarginBps','MinimumFeeRate','MaxPriceChangeBps']);
  ok(!/legacy-fee|guide-clockfree-mining|UncleFinder|DifficultyFloor/.test(html));
  eq(h.get('network-phase-label').textContent,'Auction');
  eq(h.get('sidebar-height-value').textContent,'20');
@@ -695,19 +696,19 @@ async function run() {
   BlockBytes:['1024','1537','33554433','18446744073709551615'],
   Interval:['1','61','9007199254740993','18446744073709551615'],
   Lead:['0','17','18446744073709551615'], Rest:['0','19','18446744073709551615'],
-  Duration:['1','73','18446744073709551615'], MinerFeePercent:['0','37','100'],
-  PassMarginBps:['0.01','150.01','184467440737095516.15'], MinimumFeeRate:['0','3','18446744073709551615']
+  DecisionBlocks:['1','73','18446744073709551615'], MinerFeePercent:['0','37','100'],
+  PassMarginBps:['0.01','150.01','184467440737095516.15'], MaxPriceChangeBps:['0','100','150.01','184467440737095516.15'], MinimumFeeRate:['0','3','18446744073709551615']
  };
- const settingNames={BlockBytes:'block_bytes',Interval:'interval',Lead:'lead',Rest:'rest',Duration:'duration',MinerFeePercent:'miner_fee_percent',PassMarginBps:'pass_margin_bps',MinimumFeeRate:'minimum_fee_rate'};
+ const settingNames={BlockBytes:'block_bytes',Interval:'interval',Lead:'lead',Rest:'rest',DecisionBlocks:'decision_blocks',MaxPriceChangeBps:'max_price_change_bps',MinerFeePercent:'miner_fee_percent',PassMarginBps:'pass_margin_bps',MinimumFeeRate:'minimum_fee_rate'};
  for(const [parameter,inputs] of Object.entries(values)) for(const value of inputs) {
   const form=h.get('propose-form'),before=h.wallet.length;form.elements.type.value='parameter';form.elements.parameter.value=parameter;form.elements.parameter_value.value=value;form.elements.support.value=amounts.exactInput('1');
   await h.get('proposal-parameter').fire('change');await form.fire('input');await h.timersDue();await h.waitForFee('propose');await form.requestSubmit();
   eq(h.wallet.length,before+1,`${parameter}=${value}: ${form.feedback.textContent}`);
-  const [whole,fraction='']=value.split('.'),next=parameter==='PassMarginBps'?BigInt(whole)*100n+BigInt(fraction.padEnd(2,'0')):BigInt(value);
+  const [whole,fraction='']=value.split('.'),next=['PassMarginBps','MaxPriceChangeBps'].includes(parameter)?BigInt(whole)*100n+BigInt(fraction.padEnd(2,'0')):BigInt(value);
   eq(h.wallet.at(-1)?.operation.Propose.proposal.Parameter,{parameter,old:s.status.settings[settingNames[parameter]],new:next>BigInt(Number.MAX_SAFE_INTEGER)?String(next):Number(next)});
  }
  ok(!/proposal-direction|proposal-miner-fee|halve|double|1–60/.test(html),'all settings use one direct value field');
- for(const [parameter,value] of [['BlockBytes','1023'],['BlockBytes','0'],['Interval','0'],['Duration','0'],['MinerFeePercent','101'],['Lead','-1'],['Rest','1.5'],['MinimumFeeRate','18446744073709551616'],['PassMarginBps','184467440737095516.16'],['PassMarginBps','0.001'],['Interval','15']]) {
+ for(const [parameter,value] of [['BlockBytes','1023'],['BlockBytes','0'],['Interval','0'],['DecisionBlocks','0'],['MinerFeePercent','101'],['Lead','-1'],['Rest','1.5'],['MinimumFeeRate','18446744073709551616'],['PassMarginBps','184467440737095516.16'],['PassMarginBps','0.001'],['MaxPriceChangeBps','0.001'],['MaxPriceChangeBps','184467440737095516.16'],['Interval','15']]) {
   const count=h.wallet.length,form=h.get('propose-form');form.elements.parameter.value=parameter;form.elements.parameter_value.value=value;
   await form.fire('input');await h.timersDue();await form.requestSubmit();eq(h.wallet.length,count,`${parameter}=${value} cannot sign`);
  }

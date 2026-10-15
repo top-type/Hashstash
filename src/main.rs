@@ -139,8 +139,9 @@ enum Command {
         data_hex: Option<String>,
         #[arg(long)]
         nonce: Option<u64>,
-        #[arg(long, default_value_t = 100)]
-        expiry_blocks: u64,
+        /// Inclusion deadline: defaults to 2 blocks for trades, 100 otherwise.
+        #[arg(long)]
+        expiry_blocks: Option<u64>,
     },
     /// Prepare an unsigned transaction for the offline signer. No private key is used.
     Prepare {
@@ -165,8 +166,9 @@ enum Command {
         /// Optional uninterpreted bytes, encoded as hexadecimal.
         #[arg(long)]
         data_hex: Option<String>,
-        #[arg(long, default_value_t = 100)]
-        expiry_blocks: u64,
+        /// Inclusion deadline: defaults to 2 blocks for trades, 100 otherwise.
+        #[arg(long)]
+        expiry_blocks: Option<u64>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -697,7 +699,7 @@ async fn send_operation(
     extra_fee: Option<String>,
     data_hex: Option<String>,
     nonce: Option<u64>,
-    expiry_blocks: u64,
+    expiry_blocks: Option<u64>,
 ) -> Result<Value> {
     let (secret, sender) = key_file(key)?;
     let status = node::call_rpc(url, "status", json!({})).await?;
@@ -705,6 +707,10 @@ async fn send_operation(
     add_requested_data(&mut fee_request, data_hex)?;
     let chain_id = node::parse_hash(status["chain_id"].as_str().context("missing chain id")?)?;
     let operation = operation_addresses(operation, &chain_id)?;
+    let operation: Operation = serde_json::from_value(operation)?;
+    let expiry_blocks =
+        expiry_blocks.unwrap_or_else(|| hashstash::wallet::default_expiry_blocks(&operation));
+    ensure!(expiry_blocks > 0, "expiry blocks must be positive");
     let account = node::call_rpc(url, "account", json!({"key":hex::encode(sender)})).await?;
     let height = status["height"].as_u64().context("invalid status height")?;
     let nonce = if let Some(n) = nonce {
@@ -740,7 +746,6 @@ async fn send_operation(
         .checked_add(expiry_blocks)
         .context("height overflow")?;
     let body: TransactionBody = {
-        let operation: Operation = serde_json::from_value(operation)?;
         let mut request = fee_request;
         request["sender"] = json!(hex::encode(sender));
         request["operation"] = serde_json::to_value(&operation)?;
@@ -947,6 +952,10 @@ async fn main() -> Result<()> {
             let chain_id =
                 node::parse_hash(status["chain_id"].as_str().context("missing chain id")?)?;
             let operation = operation_addresses(operation, &chain_id)?;
+            let parsed_operation: Operation = serde_json::from_value(operation.clone())?;
+            let expiry_blocks = expiry_blocks
+                .unwrap_or_else(|| hashstash::wallet::default_expiry_blocks(&parsed_operation));
+            ensure!(expiry_blocks > 0, "expiry blocks must be positive");
             let mut request = transaction_fee_request(fee, extra_fee)?;
             add_requested_data(&mut request, data_hex)?;
             request["sender"] = json!(sender);
@@ -1159,8 +1168,17 @@ async fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &send_operation(&url, &key, operation, fee, extra_fee, data_hex, None, 100)
-                        .await?
+                    &send_operation(
+                        &url,
+                        &key,
+                        operation,
+                        fee,
+                        extra_fee,
+                        data_hex,
+                        None,
+                        Some(100)
+                    )
+                    .await?
                 )?
             );
         }

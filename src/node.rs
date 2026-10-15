@@ -854,7 +854,10 @@ impl Node {
         request: WalletRequest,
     ) -> Result<TransactionBody> {
         check_operation_bounds(&i.chain.config, &request.operation)?;
-        ensure!(request.expiry_blocks > 0, "expiry_blocks must be positive");
+        ensure!(
+            request.expiry_blocks.is_none_or(|blocks| blocks > 0),
+            "expiry_blocks must be positive"
+        );
         let selected = Self::selected(&i.chain, self.miner, &i.mempool)?;
         if selected != i.mempool {
             i.mempool = selected;
@@ -1261,9 +1264,15 @@ impl Node {
             }
             "governance" => {
                 let s = i.chain.tip_state();
-                let world = |w: &crate::state::World| json!({"reserve":w.reserve.to_str_radix(10),"shares":w.shares.to_str_radix(10),"curve_mass":w.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(w).to_str_radix(10),"account_shares":w.account_shares.to_str_radix(10),"revenue":w.revenue.to_str_radix(10),"grant_escrow":w.grant_escrow.to_str_radix(10),"price_integral":w.price_integral.to_str_radix(10)});
+                let world = |w: &crate::state::World| json!({"reserve":w.reserve.to_str_radix(10),"shares":w.shares.to_str_radix(10),"curve_mass":w.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(w).to_str_radix(10),"account_shares":w.account_shares.to_str_radix(10),"revenue":w.revenue.to_str_radix(10),"grant_escrow":w.grant_escrow.to_str_radix(10)});
+                let progress = if let crate::state::Phase::Governance(d) = &s.phase {
+                    let observed = s.height.saturating_sub(d.started_height).min(d.blocks);
+                    json!({"leading_blocks":d.leading_blocks,"observed_blocks":observed,"blocks":d.blocks,"blocks_remaining":d.blocks.saturating_sub(observed)})
+                } else {
+                    Value::Null
+                };
                 Ok(
-                    json!({"phase":s.phase,"height":s.height,"state_root":hex::encode(s.root()),"clock":s.clock,"time_unit":"seconds","clock_basis":"target_interval","settings":s.settings,"frozen":s.frozen,"pass_margin_bps":s.frozen.pass_margin_bps.unwrap_or(0).to_string(),"world":world(&s.world),"pass":s.alternative.as_ref().map(world),"auction_escrow":s.auction_escrow.to_str_radix(10)}),
+                    json!({"phase":s.phase,"height":s.height,"state_root":hex::encode(s.root()),"clock":s.clock,"time_unit":"blocks","clock_basis":"target_interval","settings":s.settings,"frozen":s.frozen,"pass_margin_bps":s.frozen.pass_margin_bps.unwrap_or(0).to_string(),"world":world(&s.world),"pass":s.alternative.as_ref().map(world),"auction_escrow":s.auction_escrow.to_str_radix(10),"progress":progress}),
                 )
             }
             "proposals" => {
@@ -1414,38 +1423,12 @@ impl Node {
                 }
                 ensure!(all || !amount.is_zero(), "amount must be positive");
                 let before = stash_withdrawal(w, &a.shares)?;
-                let (amount, shares, output, after) = if kind == "deposit" {
-                    let cash = &a.ordinary;
-                    ensure!(&amount <= cash, "insufficient deposit balance");
-                    let new_reserve = &w.reserve + &amount;
-                    c.check_amount(&new_reserve)?;
-                    let new_supply = if w.shares.is_zero() {
-                        &amount * &c.share_scale
-                    } else {
-                        math::dynamic_deposit_total(&w.reserve, &w.shares, &amount, &w.curve_mass)?
-                    };
-                    c.check_shares(&new_supply)?;
-                    ensure!(new_supply > w.shares, "deposit rounds to zero shares");
-                    let minted = &new_supply - &w.shares;
-                    let new_holding = &a.shares + &minted;
-                    c.check_shares(&new_holding)?;
-                    let new_mass = if w.reserve.is_zero() {
-                        new_reserve.clone()
-                    } else {
-                        math::deposit_mass(&w.reserve, &w.curve_mass, &new_reserve)?
-                    };
-                    let after = &new_reserve
-                        - math::dynamic_remaining_reserve(
-                            &new_reserve,
-                            &new_supply,
-                            &new_holding,
-                            &new_mass,
-                        )?;
-                    ensure!(after >= before, "deposit reduces withdrawal value");
-                    let output = &after - &before;
-                    (amount, minted, output, after)
+                let is_buy = kind == "deposit";
+                let (amount, input) = if is_buy {
+                    ensure!(amount <= a.ordinary, "insufficient deposit balance");
+                    (amount.clone(), amount)
                 } else {
-                    ensure!(!before.is_zero(), "Stash has no withdrawable HASH");
+                    ensure!(!a.shares.is_zero(), "Stash has no shares");
                     let target = if all {
                         if kind == "redeem" {
                             a.shares.clone()
@@ -1455,61 +1438,56 @@ impl Node {
                     } else {
                         amount
                     };
-                    if kind == "redeem" {
+                    let burn = if kind == "redeem" {
                         ensure!(target <= a.shares, "amount exceeds Stash share balance");
+                        target.clone()
                     } else {
                         ensure!(target <= before, "amount exceeds Stash withdrawal balance");
-                    }
-                    let burn = if kind == "redeem" {
-                        target.clone()
-                    } else if all {
-                        a.shares.clone()
-                    } else {
-                        math::dynamic_withdrawal_shares(
-                            &w.reserve,
-                            &w.shares,
-                            &target,
-                            &w.curve_mass,
-                        )?
+                        if all {
+                            a.shares.clone()
+                        } else {
+                            math::dynamic_withdrawal_shares(
+                                &w.reserve,
+                                &w.shares,
+                                &target,
+                                &w.curve_mass,
+                            )?
+                        }
                     };
                     ensure!(burn <= a.shares, "insufficient shares");
-                    let new_reserve = math::dynamic_remaining_reserve(
-                        &w.reserve,
-                        &w.shares,
-                        &burn,
-                        &w.curve_mass,
-                    )?;
-                    let output = &w.reserve - &new_reserve;
-                    ensure!(!output.is_zero(), "redemption output too small");
-                    let new_supply = &w.shares - &burn;
-                    let new_holding = &a.shares - &burn;
-                    let new_mass = math::remaining_mass(&w.reserve, &w.curve_mass, &new_reserve)?;
-                    let after = if new_holding.is_zero() {
-                        Amount::zero()
-                    } else {
-                        &new_reserve
-                            - math::dynamic_remaining_reserve(
-                                &new_reserve,
-                                &new_supply,
-                                &new_holding,
-                                &new_mass,
-                            )?
-                    };
-                    (target, burn, output, after)
+                    (target, burn)
                 };
-                let share_after = if kind == "deposit" {
-                    &a.shares + &shares
+                let (filled, output, after_world) =
+                    preview_trade(c, w, is_buy, &input, s.settings.max_price_change_bps)?;
+                let share_after = if is_buy {
+                    &a.shares + &output
                 } else {
-                    &a.shares - &shares
+                    &a.shares - &filled
+                };
+                let after = stash_withdrawal(&after_world, &share_after)?;
+                let shares = if is_buy {
+                    output.clone()
+                } else {
+                    input.clone()
+                };
+                let output_hash = if is_buy {
+                    ensure!(after >= before, "deposit reduces withdrawal value");
+                    &after - &before
+                } else {
+                    output.clone()
                 };
                 Ok(json!({
                     "kind":kind, "amount":amount.to_str_radix(10), "all":all,
-                    "shares":shares.to_str_radix(10), "output_hash":output.to_str_radix(10),
+                    "shares":shares.to_str_radix(10), "shares_filled":if is_buy {output.to_str_radix(10)} else {filled.to_str_radix(10)},
+                    "input_requested":input.to_str_radix(10), "input_filled":filled.to_str_radix(10),
+                    "input_unfilled":(&input-&filled).to_str_radix(10), "output":output.to_str_radix(10),
+                    "output_hash":output_hash.to_str_radix(10),
                     "share_before":a.shares.to_str_radix(10), "share_after":share_after.to_str_radix(10),
                     "stash_before_hash":before.to_str_radix(10), "stash_after_hash":after.to_str_radix(10),
                     "outcome":outcome, "decision":s.decision_id().map(hex::encode),
                     "height":s.height, "tip":hex::encode(i.chain.tip_hash()), "state_root":hex::encode(s.root()),
-                    "transaction_fee_included":false
+                    "transaction_fee_included":false, "indicative":true, "partial_fill_possible":true,
+                    "execution":"block_batch", "max_price_change_bps":s.settings.max_price_change_bps
                 }))
             }
             "quote" => {
@@ -1527,41 +1505,35 @@ impl Node {
                     amount.bits() <= c.money_bits.max(c.share_bits),
                     "amount out of range"
                 );
-                let result = match required_str(&params, "kind")? {
+                let is_buy = match required_str(&params, "kind")? {
+                    "deposit" => {
+                        c.check_amount(&amount)?;
+                        true
+                    }
                     "redeem" => {
+                        c.check_shares(&amount)?;
                         ensure!(
                             amount <= w.account_shares,
                             "shares exceed redeemable supply"
                         );
-                        if w.shares.is_zero() {
-                            Amount::zero()
-                        } else {
-                            &w.reserve
-                                - math::dynamic_remaining_reserve(
-                                    &w.reserve,
-                                    &w.shares,
-                                    &amount,
-                                    &w.curve_mass,
-                                )?
-                        }
-                    }
-                    "deposit" => {
-                        if w.shares.is_zero() {
-                            &amount * &c.share_scale
-                        } else {
-                            math::dynamic_deposit_total(
-                                &w.reserve,
-                                &w.shares,
-                                &amount,
-                                &w.curve_mass,
-                            )? - &w.shares
-                        }
+                        false
                     }
                     _ => bail!("kind must be deposit or redeem"),
                 };
-                Ok(
-                    json!({"output":result.to_str_radix(10), "tip":hex::encode(i.chain.tip_hash()), "amount":amount.to_str_radix(10), "kind":params.get("kind"), "outcome":params.get("outcome"), "decision":s.decision_id().map(hex::encode), "transaction_fee_included":false, "height":s.height, "state_root":hex::encode(s.root()), "reserve":w.reserve.to_str_radix(10), "shares":w.shares.to_str_radix(10)}),
-                )
+                ensure!(!amount.is_zero(), "amount must be positive");
+                let (filled, output, _) =
+                    preview_trade(c, w, is_buy, &amount, s.settings.max_price_change_bps)?;
+                Ok(json!({
+                    "output":output.to_str_radix(10), "tip":hex::encode(i.chain.tip_hash()),
+                    "amount":amount.to_str_radix(10), "input_requested":amount.to_str_radix(10),
+                    "input_filled":filled.to_str_radix(10), "input_unfilled":(&amount-&filled).to_str_radix(10),
+                    "kind":params.get("kind"), "outcome":params.get("outcome"),
+                    "decision":s.decision_id().map(hex::encode), "transaction_fee_included":false,
+                    "height":s.height, "state_root":hex::encode(s.root()),
+                    "reserve":w.reserve.to_str_radix(10), "shares":w.shares.to_str_radix(10),
+                    "indicative":true, "partial_fill_possible":true, "execution":"block_batch",
+                    "max_price_change_bps":s.settings.max_price_change_bps
+                }))
             }
             "snapshot" => {
                 let keys = params
@@ -1850,6 +1822,38 @@ impl Node {
     }
 }
 /// Value of this holding if fully redeemed now, before transaction fees.
+/// A one-order estimate. Actual fills depend on the full set of included orders.
+fn preview_trade(
+    c: &Config,
+    w: &crate::state::World,
+    is_buy: bool,
+    input: &Amount,
+    cap: u64,
+) -> Result<(Amount, Amount, crate::state::World)> {
+    let orders = [crate::batch::Order {
+        id: [0; 32],
+        amount: input.clone(),
+    }];
+    let result = if is_buy {
+        crate::batch::clear(c, w, &orders, &[], cap)?
+    } else {
+        crate::batch::clear(c, w, &[], &orders, cap)?
+    };
+    let fill = if is_buy {
+        result.buys.first()
+    } else {
+        result.sells.first()
+    }
+    .context("missing trade estimate")?;
+    let filled = fill.input.clone();
+    let output = fill.output.clone();
+    let mut after = w.clone();
+    after.reserve = result.reserve;
+    after.shares = result.shares;
+    after.curve_mass = result.curve_mass;
+    Ok((filled, output, after))
+}
+
 fn stash_withdrawal(w: &crate::state::World, shares: &Amount) -> Result<Amount> {
     Ok(if shares.is_zero() || w.shares.is_zero() {
         Amount::zero()
@@ -1900,19 +1904,13 @@ fn check_operation_bounds(config: &Config, operation: &Operation) -> Result<()> 
             ensure!(!amount.is_zero(), "zero transfer");
             config.check_amount(amount)?;
         }
-        Operation::Deposit {
-            amount, min_shares, ..
-        } => {
+        Operation::Deposit { amount, .. } => {
             config.check_amount(amount)?;
-            config.check_shares(min_shares)?;
+            ensure!(!amount.is_zero(), "zero deposit");
         }
-        Operation::Redeem {
-            shares,
-            min_received,
-            ..
-        } => {
+        Operation::Redeem { shares, .. } => {
             config.check_shares(shares)?;
-            config.check_amount(min_received)?;
+            ensure!(!shares.is_zero(), "zero redemption");
         }
 
         Operation::Support { amount, .. } => config.check_amount(amount)?,
@@ -2813,8 +2811,7 @@ struct WalletRequest {
     fee: Option<String>,
     extra_fee: Option<String>,
     data_hex: Option<String>,
-    #[serde(default = "wallet_expiry")]
-    expiry_blocks: u64,
+    expiry_blocks: Option<u64>,
     expiry_height: Option<u64>,
     nonce: Option<u64>,
 }
@@ -2825,8 +2822,7 @@ struct HotWalletRequest {
     fee: Option<String>,
     extra_fee: Option<String>,
     data_hex: Option<String>,
-    #[serde(default = "wallet_expiry")]
-    expiry_blocks: u64,
+    expiry_blocks: Option<u64>,
     expiry_height: Option<u64>,
     nonce: Option<u64>,
     expected_sender: String,
@@ -2840,8 +2836,7 @@ struct PrepareRequest {
     fee: Option<String>,
     extra_fee: Option<String>,
     data_hex: Option<String>,
-    #[serde(default = "wallet_expiry")]
-    expiry_blocks: u64,
+    expiry_blocks: Option<u64>,
     expiry_height: Option<u64>,
     nonce: Option<u64>,
 }
@@ -2849,9 +2844,6 @@ struct PrepareRequest {
 #[serde(deny_unknown_fields)]
 struct BroadcastRequest {
     raw: String,
-}
-fn wallet_expiry() -> u64 {
-    100
 }
 
 /// Construct one exact-fee body. Quotes never reserve a nonce or funds.
@@ -2863,12 +2855,19 @@ fn wallet_body(
     request: WalletRequest,
 ) -> Result<TransactionBody> {
     ensure!(nonce < u64::MAX, "nonce exhausted");
-    ensure!(request.expiry_blocks > 0, "expiry_blocks must be positive");
+    ensure!(
+        request.expiry_blocks.is_none_or(|blocks| blocks > 0),
+        "expiry_blocks must be positive"
+    );
     let expiry_height = match request.expiry_height {
         Some(height) => height,
         None => s
             .height
-            .checked_add(request.expiry_blocks)
+            .checked_add(
+                request
+                    .expiry_blocks
+                    .unwrap_or_else(|| wallet::default_expiry_blocks(&request.operation)),
+            )
             .context("expiry height overflow")?,
     };
     ensure!(
@@ -2946,21 +2945,30 @@ fn fee_quote_json(c: &Config, s: &State, tip: Hash, body: &TransactionBody) -> R
             signature: [0; 64],
         },
     )?;
-    Ok(json!({
-        "fee":quote.fee.to_str_radix(10), "minimum_fee":quote.minimum_fee.to_str_radix(10),
-        "account_creation_fee":quote.account_creation_fee.to_str_radix(10),
-        "grant_recipient_fee":quote.grant_recipient_fee.to_str_radix(10),
-        "extra_fee":quote.extra_fee.to_str_radix(10),
-        "miner_fee":quote.miner_fee.to_str_radix(10), "revenue_fee":quote.revenue_fee.to_str_radix(10),
-        "miner_fee_percent":quote.miner_fee_percent,
-        "weight":quote.weight.to_string(), "minimum_fee_rate":s.settings.minimum_fee_rate.to_string(),
-        "chain_id":hex::encode(s.chain_id), "height":s.height, "tip":hex::encode(tip), "state_root":hex::encode(s.root()),
-        "sender":address::encode(&body.sender,&s.chain_id)?, "sender_public_key":hex::encode(body.sender),
-        "payment_available_hash":s.common_spendable(&body.sender).unwrap_or_default().to_str_radix(10),
-        "nonce":body.nonce, "expiry_height":body.expiry_height, "pending":false,
-        "operation":body.operation,
-        "data_hex":hex::encode(&body.data), "data_bytes":body.data.len()
-    }))
+    let mut value = json!({
+       "fee":quote.fee.to_str_radix(10), "minimum_fee":quote.minimum_fee.to_str_radix(10),
+       "account_creation_fee":quote.account_creation_fee.to_str_radix(10),
+       "grant_recipient_fee":quote.grant_recipient_fee.to_str_radix(10),
+       "extra_fee":quote.extra_fee.to_str_radix(10),
+       "miner_fee":quote.miner_fee.to_str_radix(10), "revenue_fee":quote.revenue_fee.to_str_radix(10),
+       "miner_fee_percent":quote.miner_fee_percent,
+       "weight":quote.weight.to_string(), "minimum_fee_rate":s.settings.minimum_fee_rate.to_string(),
+       "chain_id":hex::encode(s.chain_id), "height":s.height, "tip":hex::encode(tip), "state_root":hex::encode(s.root()),
+       "sender":address::encode(&body.sender,&s.chain_id)?, "sender_public_key":hex::encode(body.sender),
+       "payment_available_hash":s.common_spendable(&body.sender).unwrap_or_default().to_str_radix(10),
+       "nonce":body.nonce, "expiry_height":body.expiry_height, "pending":false,
+       "operation":body.operation,
+       "data_hex":hex::encode(&body.data), "data_bytes":body.data.len()
+    });
+    if matches!(
+        body.operation,
+        Operation::Deposit { .. } | Operation::Redeem { .. }
+    ) {
+        value["execution"] = json!("block_batch");
+        value["partial_fill_possible"] = json!(true);
+        value["unfilled_input_returned"] = json!(true);
+    }
+    Ok(value)
 }
 
 fn transaction_data(max_bytes: usize, input: Option<&str>) -> Result<Vec<u8>> {
@@ -4890,16 +4898,15 @@ mod tests {
                 new: 2_097_152,
             },
             started: 0,
-            duration: 64,
-
-            start_integral: 0u32.into(),
+            started_height: 0,
+            blocks: 64,
+            leading_blocks: 0,
         });
         s.alternative = Some(s.world.clone());
         view.chain.state = Arc::new(stash_test_apply(
             &view,
             Operation::Deposit {
                 amount: 40u32.into(),
-                min_shares: 0u32.into(),
                 decision: Some([3; 32]),
                 outcome: Some(Outcome::Pass),
             },
@@ -4950,9 +4957,9 @@ mod tests {
                 new: 2_097_152,
             },
             started: 0,
-            duration: 64,
-
-            start_integral: 0u32.into(),
+            started_height: 0,
+            blocks: 64,
+            leading_blocks: 0,
         });
         state.alternative = Some(state.world.clone());
         view.chain.config = Arc::new(config);
@@ -4960,7 +4967,6 @@ mod tests {
         let mut state = view.chain.tip_state().clone();
         let operation = Operation::Deposit {
             amount: 40u32.into(),
-            min_shares: Amount::zero(),
             decision: Some([3; 32]),
             outcome: Some(Outcome::Pass),
         };
@@ -5070,17 +5076,17 @@ mod tests {
                 let operation = if kind == "deposit" {
                     Operation::Deposit {
                         amount: amount.into(),
-                        min_shares: shares,
                         decision: None,
                         outcome: None,
                     }
                 } else {
-                    assert!(output >= Amount::from(amount));
+                    if quote["input_unfilled"] == "0" {
+                        assert!(output >= Amount::from(amount));
+                    }
                     let w = &view.chain.tip_state().world;
                     assert!(stash_withdrawal(w, &(&shares - 1u32)).unwrap() < Amount::from(amount));
                     Operation::Redeem {
                         shares,
-                        min_received: output.clone(),
                         decision: None,
                         outcome: None,
                     }
@@ -5093,7 +5099,8 @@ mod tests {
                 assert_eq!(quote["share_after"], a.shares.to_str_radix(10));
                 if kind == "deposit" {
                     assert_eq!(after - 409u32, output);
-                    assert_eq!(a.ordinary, Amount::from(999 - amount));
+                    let filled = parse_amount(quote["input_filled"].as_str().unwrap()).unwrap();
+                    assert_eq!(a.ordinary, Amount::from(999u32) - filled);
                 } else {
                     assert_eq!(a.ordinary, 999u32 + output);
                 }
@@ -5106,21 +5113,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(all["amount"], "409");
-        assert_eq!(all["output_hash"], "409");
-        assert_eq!(all["stash_after_hash"], "0");
+        assert!(parse_amount(all["output_hash"].as_str().unwrap()).unwrap() < 409u32.into());
+        assert_ne!(all["input_unfilled"], "0");
+        assert_eq!(all["indicative"], true);
+        assert_eq!(all["partial_fill_possible"], true);
         assert_eq!(all["shares"], account["account"]["shares"]);
         assert_eq!(all["share_before"], account["account"]["shares"]);
-        assert_eq!(all["share_after"], "0");
+        assert_ne!(all["share_after"], "0");
         let next = stash_test_apply(
             &view,
             Operation::Redeem {
                 shares: parse_amount(all["shares"].as_str().unwrap()).unwrap(),
-                min_received: 409u32.into(),
                 decision: None,
                 outcome: None,
             },
         );
-        assert!(next.account(&key, None).unwrap().shares.is_zero());
+        assert_eq!(
+            next.account(&key, None).unwrap().shares.to_str_radix(10),
+            all["share_after"]
+        );
         assert_eq!(
             root,
             view.chain.tip_state().root(),
@@ -5175,13 +5186,14 @@ mod tests {
             assert_eq!(quote["amount"], atoms.to_str_radix(10));
             assert_eq!(quote["shares"], atoms.to_str_radix(10));
             assert_eq!(quote["share_before"], before.to_str_radix(10));
-            assert_eq!(quote["share_after"], (&before - &atoms).to_str_radix(10));
+            let filled = parse_amount(quote["input_filled"].as_str().unwrap()).unwrap();
+            assert!(filled <= atoms);
+            assert_eq!(quote["share_after"], (&before - &filled).to_str_radix(10));
             let payout = parse_amount(quote["output_hash"].as_str().unwrap()).unwrap();
             let next = stash_test_apply(
                 &view,
                 Operation::Redeem {
                     shares: atoms,
-                    min_received: payout.clone(),
                     decision: None,
                     outcome: None,
                 },
@@ -5204,13 +5216,12 @@ mod tests {
             let quote = Node::read_rpc(&view, "stash_quote", request).unwrap();
             assert_eq!(quote["amount"], before.to_str_radix(10));
             assert_eq!(quote["shares"], before.to_str_radix(10));
-            assert_eq!(quote["share_after"], "0");
-            assert_eq!(quote["output_hash"], "409");
-            assert_eq!(quote["stash_after_hash"], "0");
+            assert_ne!(quote["share_after"], "0");
+            assert_ne!(quote["input_unfilled"], "0");
+            assert!(parse_amount(quote["output_hash"].as_str().unwrap()).unwrap() < 409u32.into());
         }
         for amount in [
             "0".to_string(),
-            "1".to_string(),
             "01".to_string(),
             (&before + 1u32).to_str_radix(10),
             (Amount::from(1u32) << 256usize).to_str_radix(10),
@@ -5244,16 +5255,15 @@ mod tests {
                 new: 2_097_152,
             },
             started: 0,
-            duration: 64,
-
-            start_integral: 0u32.into(),
+            started_height: 0,
+            blocks: 64,
+            leading_blocks: 0,
         });
         s.alternative = Some(s.world.clone());
         view.chain.state = Arc::new(stash_test_apply(
             &view,
             Operation::Deposit {
                 amount: 40u32.into(),
-                min_shares: 0u32.into(),
                 decision: Some([3; 32]),
                 outcome: Some(Outcome::Pass),
             },
@@ -5289,14 +5299,12 @@ mod tests {
                 let operation = if kind == "deposit" {
                     Operation::Deposit {
                         amount: 10u32.into(),
-                        min_shares: shares,
                         decision: Some([3; 32]),
                         outcome: Some(outcome),
                     }
                 } else {
                     Operation::Redeem {
                         shares,
-                        min_received: parse_amount(quote["output_hash"].as_str().unwrap()).unwrap(),
                         decision: Some([3; 32]),
                         outcome: Some(outcome),
                     }
@@ -5329,7 +5337,9 @@ mod tests {
                     .unwrap()
                     .ordinary;
                 let after_cash = if kind == "deposit" {
-                    before_cash - 11u32
+                    before_cash
+                        - parse_amount(quote["input_filled"].as_str().unwrap()).unwrap()
+                        - 1u32
                 } else {
                     before_cash + parse_amount(quote["output_hash"].as_str().unwrap()).unwrap()
                         - 1u32
@@ -5358,9 +5368,12 @@ mod tests {
             .world
             .put(key, a.clone(), &view.chain.config)
             .unwrap();
-        assert!(Node::read_rpc(&view, "stash_quote", request.clone()).is_err());
-        // Full redemption can empty a curve, including its final share.
+        let dust = Node::read_rpc(&view, "stash_quote", request.clone()).unwrap();
+        assert_eq!(dust["input_filled"], "0");
+        assert_eq!(dust["output_hash"], "0");
+        // A 100% downward movement allowance permits emptying a curve.
         let s = Arc::make_mut(&mut view.chain.state);
+        s.settings.max_price_change_bps = 10_000;
         s.world.accounts = crate::tree::Map::new();
         s.world.account_cash = 0u32.into();
         s.world.account_shares = 0u32.into();
@@ -5373,7 +5386,6 @@ mod tests {
             &view,
             Operation::Redeem {
                 shares: a.shares,
-                min_received: 1000u32.into(),
                 decision: None,
                 outcome: None,
             },
@@ -5393,7 +5405,6 @@ mod tests {
             &view,
             Operation::Deposit {
                 amount: 10u32.into(),
-                min_shares: parse_amount(quote["shares"].as_str().unwrap()).unwrap(),
                 decision: None,
                 outcome: None,
             },
@@ -5441,9 +5452,10 @@ mod tests {
             .unwrap();
         assert_eq!(quote["shares"], config.share_scale.to_str_radix(10));
         let request = json!({"sender":hex::encode(miner),"operation":Operation::Deposit {
-            amount: 1u32.into(), min_shares: config.share_scale, decision: None, outcome: None,
-        },"extra_fee":"0","expiry_blocks":100});
-        assert!(node.rpc("preparetransaction", request).is_ok());
+            amount: 1u32.into(), decision: None, outcome: None,
+        },"extra_fee":"0"});
+        let prepared = node.rpc("preparetransaction", request).unwrap();
+        assert_eq!(prepared["fee_quote"]["expiry_height"], 3);
     }
     #[tokio::test]
     async fn bounded_line_rejects_before_unbounded_allocation() {

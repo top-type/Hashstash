@@ -21,8 +21,6 @@ pub struct World {
     #[serde(with = "amount")]
     pub grant_escrow: Amount,
     #[serde(with = "amount")]
-    pub price_integral: Amount,
-    #[serde(with = "amount")]
     pub curve_mass: Amount,
     #[serde(with = "amount")]
     pub account_cash: Amount,
@@ -72,7 +70,6 @@ impl World {
                 &self.shares,
                 &self.revenue,
                 &self.grant_escrow,
-                &self.price_integral,
                 &self.curve_mass,
                 &self.account_cash,
                 &self.account_shares,
@@ -112,10 +109,6 @@ impl World {
             c.check_amount(x)?;
         }
         c.check_shares(&self.shares)?;
-        ensure!(
-            self.price_integral.bits() <= c.max_integer_bits,
-            "price integral overflow"
-        );
         Ok(())
     }
     pub fn audit_accounts(&self, c: &Config, last_epoch: u64) -> Result<()> {
@@ -156,9 +149,9 @@ pub struct Decision {
     pub proposal_id: Hash,
     pub proposal: Proposal,
     pub started: u64,
-    pub duration: u64,
-    #[serde(with = "amount")]
-    pub start_integral: Amount,
+    pub started_height: u64,
+    pub blocks: u64,
+    pub leading_blocks: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Rest {
@@ -374,9 +367,15 @@ impl State {
                     .ok_or_else(|| anyhow::anyhow!("auction deadline overflow"))?;
             }
             Phase::Governance(d) => {
+                ensure!(
+                    d.started_height.checked_add(d.blocks).is_some(),
+                    "decision height overflow"
+                );
                 let resolution = crate::consensus::rounded_deadline(
                     d.started,
-                    d.duration,
+                    d.blocks
+                        .checked_mul(self.frozen.interval)
+                        .ok_or_else(|| anyhow::anyhow!("decision schedule overflow"))?,
                     self.frozen.interval,
                 )?;
                 let activation = crate::consensus::rounded_deadline(
@@ -609,12 +608,19 @@ impl State {
                     "decision epoch mismatch"
                 );
                 ensure!(
-                    d.started <= self.clock && self.clock - d.started < d.duration,
+                    d.started_height <= self.height
+                        && self.height - d.started_height < d.blocks
+                        && d.leading_blocks <= self.height - d.started_height
+                        && d.started.checked_add(
+                            (self.height - d.started_height)
+                                .checked_mul(self.frozen.interval)
+                                .ok_or_else(|| anyhow::anyhow!("decision schedule overflow"))?
+                        ) == Some(self.clock),
                     "decision clock mismatch"
                 );
                 ensure!(
-                    d.duration == self.frozen.duration,
-                    "decision duration mismatch"
+                    d.blocks == self.frozen.decision_blocks,
+                    "decision block count mismatch"
                 );
                 let p = self
                     .proposals
@@ -629,11 +635,6 @@ impl State {
                     "decision round winner mismatch"
                 );
                 let pass = self.alternative.as_ref().unwrap();
-                ensure!(
-                    d.start_integral <= self.world.price_integral
-                        && d.start_integral <= pass.price_integral,
-                    "decision integral baseline mismatch"
-                );
                 match &d.proposal {
                     Proposal::Grant { payments } => {
                         ensure!(

@@ -128,8 +128,8 @@ async function run() {
     equal(b.api.verifySigned(signed.raw,{...intent,txid:signed.transaction_id}).operation.Propose.proposal.Parameter.new,String(percent));
     const bad=JSON.parse(JSON.stringify(intent));bad.operation.Propose.proposal.Parameter.new='101';throws(()=>b.api.verifyUnsigned(envelope,bad),/0 to 100/);
   }
-  const parameterCases={BlockBytes:[[1024n,1537n],[33554432n,33554433n],[1024n,(1n<<64n)-1n]],Interval:[[15n,61n],[61n,(1n<<64n)-1n]],Lead:[[0n,17n],[17n,0n],[0n,(1n<<64n)-1n]],Rest:[[0n,19n],[19n,0n],[0n,(1n<<64n)-1n]],Duration:[[60n,1n],[1n,(1n<<64n)-1n]],PassMarginBps:[[0n,15001n],[15001n,0n],[0n,(1n<<64n)-1n]],MinimumFeeRate:[[0n,1n],[1n,0n],[3n,1n],[2n,3n],[(1n<<64n)-1n,0n],[0n,(1n<<64n)-1n]]};
-  const parameterNames=['BlockBytes','Interval','Lead','Rest','Duration','MinerFeePercent','PassMarginBps','MinimumFeeRate'];
+  const parameterCases={BlockBytes:[[1024n,1537n],[33554432n,33554433n],[1024n,(1n<<64n)-1n]],Interval:[[15n,61n],[61n,(1n<<64n)-1n]],Lead:[[0n,17n],[17n,0n],[0n,(1n<<64n)-1n]],Rest:[[0n,19n],[19n,0n],[0n,(1n<<64n)-1n]],DecisionBlocks:[[60n,1n],[1n,(1n<<64n)-1n]],MaxPriceChangeBps:[[1000n,0n],[0n,10000n],[10000n,(1n<<64n)-1n]],PassMarginBps:[[0n,15001n],[15001n,0n],[0n,(1n<<64n)-1n]],MinimumFeeRate:[[0n,1n],[1n,0n],[3n,1n],[2n,3n],[(1n<<64n)-1n,0n],[0n,(1n<<64n)-1n]]};
+  const parameterNames=['BlockBytes','Interval','Lead','Rest','DecisionBlocks','MinerFeePercent','PassMarginBps','MinimumFeeRate','MaxPriceChangeBps'];
   for(const [parameter,pairs] of Object.entries(parameterCases)) for(const [oldValue,newValue] of pairs) {
     const intent={...expected,data_hex:'',operation:{Propose:{round:'0',description:'44'.repeat(32),proposal:{Parameter:{parameter,old:String(oldValue),new:String(newValue)}},support:'1'}}};
     const inner=Buffer.concat([compact(3),compact(0),Buffer.from('44'.repeat(32),'hex'),compact(1),compact(parameterNames.indexOf(parameter)),compact(oldValue),compact(newValue),amt(1)]);
@@ -139,7 +139,7 @@ async function run() {
     for(const invalid of ['18446744073709551616','-1','1.5',9007199254740992]) {
       const bad={...intent,operation:{Propose:{...intent.operation.Propose,proposal:{Parameter:{parameter,old:String(oldValue),new:invalid}}}}};throws(()=>b.api.verifyUnsigned(envelope,bad),/integer|too large/i);
     }
-    if(['BlockBytes','Interval','Duration'].includes(parameter)) {
+    if(['BlockBytes','Interval','DecisionBlocks'].includes(parameter)) {
       const bad={...intent,operation:{Propose:{...intent.operation.Propose,proposal:{Parameter:{parameter,old:String(oldValue),new:'0'}}}}};throws(()=>b.api.verifyUnsigned(envelope,bad),/positive/i);
     }
     if(parameter==='BlockBytes') {
@@ -151,9 +151,9 @@ async function run() {
   const optional=value=>value==null?Buffer.from([0]):Buffer.concat([Buffer.from([1]),value]);
   const sides=(d,o)=>Buffer.concat([optional(d==null?null:hash(d)),optional(o==null?null:compact(o==='Pass'?0:1))]);
   const operationVectors=[
-    [{Deposit:{amount:'256',min_shares:'0',decision:null,outcome:null}},Buffer.concat([compact(1),amt(256),amt(0),sides(null,null)])],
-    [{Deposit:{amount:'251',min_shares:'65536',decision,outcome:'Pass'}},Buffer.concat([compact(1),amt(251),amt(65536),sides(decision,'Pass')])],
-    [{Redeem:{shares:'65536',min_received:'0',decision,outcome:'Fail'}},Buffer.concat([compact(2),amt(65536),amt(0),sides(decision,'Fail')])],
+    [{Deposit:{amount:'256',decision:null,outcome:null}},Buffer.concat([compact(1),amt(256),sides(null,null)])],
+    [{Deposit:{amount:'251',decision,outcome:'Pass'}},Buffer.concat([compact(1),amt(251),sides(decision,'Pass')])],
+    [{Redeem:{shares:'65536',decision,outcome:'Fail'}},Buffer.concat([compact(2),amt(65536),sides(decision,'Fail')])],
     [{Propose:{round:'251',description:proposal,proposal:{Grant:{payments:[{recipient:expected.operation.TransferExact.recipient,amount:'65536'}]}},support:'1'}},Buffer.concat([compact(3),compact(251),hash(proposal),compact(0),compact(1),hash(expected.operation.TransferExact.recipient),amt(65536),amt(1)])],
     [{Support:{round:'65536',proposal,amount:'1'}},Buffer.concat([compact(4),compact(65536),hash(proposal),amt(1)])],
     [{Refund:{round:'18446744073709551615',proposal}},Buffer.concat([compact(5),compact((1n<<64n)-1n),hash(proposal)])]
@@ -169,6 +169,11 @@ async function run() {
     const signed=store.signUnsigned(envelope,intent);equal(signed.raw.length/2,envelope.body.length/2+64);
     const verified=b.api.verifySigned(signed.raw,{...intent,txid:signed.transaction_id});
     equal(JSON.stringify(verified.operation),JSON.stringify(operation));equal(verified.data_hex,intent.data_hex);
+  }
+  for (const [operation,inner] of operationVectors.slice(0,3)) {
+    const kind=Object.keys(operation)[0],field=kind==='Deposit'?'min_shares':'min_received';
+    const intent={...expected,data_hex:'',operation:{[kind]:{...operation[kind],[field]:'0'}}};
+    throws(()=>b.api.verifyUnsigned(oracleEnvelope(inner),intent),/unsupported fields/);
   }
   {
     const [operation,inner]=operationVectors[0],data=Buffer.alloc(256*1024,0xa5),envelope=oracleEnvelope(inner,data),intent={...expected,operation,data_hex:data.toString('hex')};
@@ -196,9 +201,9 @@ async function run() {
     const valid=oracleEnvelope(inner(payments.slice(0,2)));throws(()=>b.api.verifyUnsigned(valid,intent([{...payments[0],amount:'9'},payments[1]])),/does not match/);
     const legacy={...intent(payments.slice(0,1)),operation:{Propose:{round:'0',description:proposal,proposal:{Grant:{recipient:payments[0].recipient,amount:'1'}},support:'1'}}};throws(()=>b.api.verifyUnsigned(valid,legacy),/unsupported fields/);
   }
-  throws(()=>b.api.decodeUnsigned(oracleEnvelope(Buffer.concat([compact(1),amt(1),amt(0),Buffer.from([2,0])]))),/Invalid optional/);
-  throws(()=>b.api.decodeUnsigned(oracleEnvelope(Buffer.concat([compact(1),amt(1),amt(0),optional(hash(decision)),Buffer.from([0])]))),/appear together/);
-  throws(()=>b.api.decodeUnsigned(oracleEnvelope(Buffer.concat([compact(1),amt(1),amt(0),optional(hash(decision)),optional(compact(2))]))),/Invalid outcome/);
+  throws(()=>b.api.decodeUnsigned(oracleEnvelope(Buffer.concat([compact(1),amt(1),Buffer.from([2,0])]))),/Invalid optional/);
+  throws(()=>b.api.decodeUnsigned(oracleEnvelope(Buffer.concat([compact(1),amt(1),optional(hash(decision)),Buffer.from([0])]))),/appear together/);
+  throws(()=>b.api.decodeUnsigned(oracleEnvelope(Buffer.concat([compact(1),amt(1),optional(hash(decision)),optional(compact(2))]))),/Invalid outcome/);
   throws(()=>b.api.decodeUnsigned(oracleEnvelope(Buffer.concat([compact(1),compact(65),Buffer.alloc(65,1)]))),/too large/);
   throws(()=>b.api.decodeUnsigned(oracleEnvelope(Buffer.concat([compact(1n<<32n)]))),/too large/);
   const signed=store.signUnsigned(f.envelope,expected),raw=Buffer.from(signed.raw,'hex'),body=Buffer.from(f.envelope.body,'hex');

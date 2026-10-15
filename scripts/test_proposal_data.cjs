@@ -26,7 +26,7 @@ async function run(){
  s.proposals=[{...s.proposals[0],id:'bc'.repeat(32)}];h.handlers.explorer_governance=()=>response({result:{chain_id:s.status.chain_id,proposals:[{id:'bc'.repeat(32),description:sha(text),description_text:'Altered rationale'}]}});await h.refresh();await settle();
  ok(!h.get('proposal-list').textContent.includes('Altered rationale'));ok(!h.get('proposal-list').textContent.includes('No verified explanation published.'));
  const action={Grant:{payments:[{recipient:'12'.repeat(32),amount:'1000000000000000000'},{recipient:'34'.repeat(32),amount:'2000000000000000000'}]}};
- const decision={id:'de'.repeat(32),proposal_id:id,round:0,started:240,duration:240,start_integral:'0',proposal:action};
+ const decision={id:'de'.repeat(32),proposal_id:id,round:0,started:240,blocks:16,started_height:16,leading_blocks:0,proposal:action};
  s.governance.phase={Governance:decision};s.governance.pass={...s.governance.world,grant_escrow:'3000000000000000000'};
  s.proposals=[{id,proposal:{round:0,support:'10',description:sha(text),action,refund_height:null}}];await h.refresh();await settle();
  const payouts=h.get('gov-grant-payments').children;

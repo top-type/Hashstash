@@ -150,7 +150,7 @@ fn old_derived_schema_is_rebuilt_without_retired_tables_or_consensus_changes() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(schema, "24-address-only");
+    assert_eq!(schema, "batch-fills-leading-blocks");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

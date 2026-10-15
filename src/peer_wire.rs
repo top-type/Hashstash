@@ -281,7 +281,6 @@ impl<'a> Cursor<'a> {
             }
             1 | 2 => {
                 self.amount()?;
-                self.amount()?;
                 self.option(|r| {
                     r.take(32)?;
                     Ok(())
@@ -314,7 +313,7 @@ impl<'a> Cursor<'a> {
                         }
                     }
                     1 => {
-                        ensure!(self.integer()? <= 7, "invalid parameter tag");
+                        ensure!(self.integer()? <= 8, "invalid parameter tag");
                         self.integer()?;
                         self.integer()?;
                     }
@@ -556,19 +555,16 @@ mod tests {
             },
             Operation::Deposit {
                 amount: 1u32.into(),
-                min_shares: 0u32.into(),
                 decision: None,
                 outcome: None,
             },
             Operation::Redeem {
                 shares: Amount::from(10u32).pow(36),
-                min_received: 0u32.into(),
                 decision: Some([5; 32]),
                 outcome: Some(Outcome::Pass),
             },
             Operation::Deposit {
                 amount: 251u32.into(),
-                min_shares: 256u32.into(),
                 decision: Some([5; 32]),
                 outcome: Some(Outcome::Fail),
             },
@@ -850,6 +846,53 @@ mod tests {
         assert!(frame(&payload, payload.len() - 1).is_err());
     }
     #[test]
+    fn preflight_accepts_block_count_and_price_movement_parameters_but_rejects_unknown_tags() {
+        let (limits, sync) = fixture();
+        for parameter in [
+            Parameter::DecisionBlocks,
+            Parameter::MinimumFeeRate,
+            Parameter::MaxPriceChangeBps,
+        ] {
+            let tx = transaction(
+                Operation::Propose {
+                    round: 1,
+                    description: [4; 32],
+                    support: 3u32.into(),
+                    proposal: Proposal::Parameter {
+                        parameter,
+                        old: 1,
+                        new: 2,
+                    },
+                },
+                0,
+            );
+            let mut current = sync.clone();
+            current.transactions = vec![tx.clone()];
+            current.blocks[0].transactions = vec![tx.clone()];
+            let wire = encode(&Message::Sync(current.clone()), limits).unwrap();
+            assert_eq!(decode(&wire, limits).unwrap(), Message::Sync(current));
+            let raw = codec::encode(&tx);
+            let mut cursor = Cursor::new(&raw);
+            cursor.take(64).unwrap();
+            cursor.integer().unwrap();
+            cursor.amount().unwrap();
+            cursor.integer().unwrap();
+            assert_eq!(cursor.integer().unwrap(), 3);
+            cursor.integer().unwrap();
+            cursor.take(32).unwrap();
+            assert_eq!(cursor.integer().unwrap(), 1);
+            let mut unknown = raw.clone();
+            unknown[cursor.at] = 9;
+            assert!(
+                Cursor::new(&unknown)
+                    .transaction(limits.transaction_bytes)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid parameter tag")
+            );
+        }
+    }
+    #[test]
     fn nested_preflight_matches_integer_option_and_amount_boundaries() {
         let (limits, mut sync) = fixture();
         sync.transactions[0].body.nonce = u64::MAX;
@@ -875,7 +918,6 @@ mod tests {
         cursor.amount().unwrap();
         cursor.integer().unwrap();
         assert_eq!(cursor.integer().unwrap(), 1);
-        cursor.amount().unwrap();
         cursor.amount().unwrap();
         let mut bad = raw.clone();
         bad[cursor.at] = 2;

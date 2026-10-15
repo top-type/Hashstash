@@ -105,7 +105,8 @@ fn newly_ready_priority_candidate_precedes_unrelated_entries_at_capacity() {
         0,
         Operation::TransferExact {
             recipient: crypto::public_key(&other_secret).unwrap(),
-            amount: 400u32.into(),
+            // Cover principal and fees for every opening-balance commitment.
+            amount: 600u32.into(),
         },
         0,
     );
@@ -288,7 +289,7 @@ fn governed_capacity_shrink_evicts_large_pending_transactions_and_refreshes_temp
         0,
         Operation::Deposit {
             amount: 18_000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -330,7 +331,7 @@ fn governed_capacity_shrink_evicts_large_pending_transactions_and_refreshes_temp
                 chain.tip_state().account(&key(), None).unwrap().nonce,
                 Operation::Deposit {
                     amount: 10_000u32.into(),
-                    min_shares: 1u32.into(),
+
                     decision: Some(decision.id),
                     outcome: Some(Outcome::Pass),
                 },
@@ -509,7 +510,7 @@ fn prepared_selection_matches_execution_through_governance_and_activation() {
         0,
         Operation::Deposit {
             amount: 18_000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -554,16 +555,14 @@ fn prepared_selection_matches_execution_through_governance_and_activation() {
                     nonce + 1,
                     Operation::Deposit {
                         amount: 10_000u32.into(),
-                        min_shares: 1u32.into(),
+
                         decision: Some(decision.id),
                         outcome: Some(Outcome::Pass),
                     },
                     0,
                 ));
             }
-            if chain.tip_state().clock + chain.tip_state().settings.interval
-                >= decision.started + decision.duration
-            {
+            if chain.tip_state().height + 1 >= decision.started_height + decision.blocks {
                 // Selection must resolve first and reject the stale outcome context.
                 candidates.push(signed(
                     &chain,
@@ -571,7 +570,7 @@ fn prepared_selection_matches_execution_through_governance_and_activation() {
                     nonce,
                     Operation::Deposit {
                         amount: 1u32.into(),
-                        min_shares: 0u32.into(),
+
                         decision: Some(decision.id),
                         outcome: Some(Outcome::Pass),
                     },

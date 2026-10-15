@@ -16,7 +16,7 @@ fn config() -> Config {
     let mut c = Config::testnet();
     c.initial.rest = 60;
     c.initial.lead = 30;
-    c.initial.duration = 180;
+    c.initial.decision_blocks = 12;
     c.initial.block_bytes = 4096;
     c.validate().unwrap();
     c
@@ -50,7 +50,7 @@ fn funded_amount(c: &Config, amount: u32) -> State {
         &s,
         Operation::Deposit {
             amount: amount.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -153,7 +153,7 @@ fn before_resolution(c: &Config, mut s: State, pass: bool) -> State {
             &s,
             Operation::Deposit {
                 amount: 100_000u32.into(),
-                min_shares: 1u32.into(),
+
                 decision: s.decision_id(),
                 outcome: Some(Outcome::Pass),
             },
@@ -167,7 +167,7 @@ fn before_resolution(c: &Config, mut s: State, pass: bool) -> State {
         let Phase::Governance(d) = &s.phase else {
             panic!("grant resolved too soon");
         };
-        if s.clock + s.settings.interval >= d.started + d.duration {
+        if s.height + 1 >= d.started_height + d.blocks {
             return s;
         }
         s = step(c, &s, key(181), 0, &[]);

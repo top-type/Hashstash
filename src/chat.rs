@@ -69,7 +69,6 @@ mod tests {
             },
             Operation::Deposit {
                 amount: 1u32.into(),
-                min_shares: 0u32.into(),
                 decision: None,
                 outcome: None,
             },

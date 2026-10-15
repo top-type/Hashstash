@@ -158,37 +158,37 @@ fn every_operation_roundtrips_and_reviews_every_signed_field_exactly() {
             Some(Outcome::Pass) => "PASS",
             Some(Outcome::Fail) => "FAIL",
         };
-        for (operation, action, value_label, minimum_field) in [
+        for (operation, action, value_label) in [
             (
                 Operation::Deposit {
                     amount: amount.clone(),
-                    min_shares: minimum.clone(),
+
                     decision,
                     outcome,
                 },
                 "Deposit",
                 "Amount · HASH",
-                Some("Minimum shares"),
             ),
             (
                 Operation::Redeem {
                     shares: amount.clone(),
-                    min_received: minimum.clone(),
+
                     decision,
                     outcome,
                 },
                 "Redeem",
                 "Shares",
-                Some("Minimum received · HASH"),
             ),
         ] {
             let mut entries = vec![
                 (value_label, amount.to_string()),
                 ("Outcome", outcome_name.into()),
             ];
-            if let Some(label) = minimum_field {
-                entries.push((label, minimum.to_string()));
-            }
+            entries.push(("Execution", "Batch trade; full or partial fill".into()));
+            entries.push((
+                "Unfilled input",
+                "Returned automatically; transaction fee remains payable".into(),
+            ));
             if let Some(decision) = decision {
                 entries.push(("Decision ID", hex::encode(decision)));
             }
@@ -227,18 +227,28 @@ fn every_operation_roundtrips_and_reviews_every_signed_field_exactly() {
         Parameter::BlockBytes,
         Parameter::Lead,
         Parameter::Rest,
-        Parameter::Duration,
+        Parameter::DecisionBlocks,
     ] {
-        let seconds = parameter != Parameter::BlockBytes;
+        let seconds = matches!(parameter, Parameter::Lead | Parameter::Rest);
+        let blocks = parameter == Parameter::DecisionBlocks;
         let mut fields = vec![
             ("Auction round", u64::MAX.to_string()),
             ("Description hash", hex::encode([43; 32])),
             ("Support · HASH", amount.to_string()),
             ("Proposal", "Parameter".into()),
-            ("Parameter", format!("{parameter:?}")),
+            (
+                "Parameter",
+                if blocks {
+                    "Decision length".into()
+                } else {
+                    format!("{parameter:?}")
+                },
+            ),
             (
                 "Expected value",
-                if seconds {
+                if blocks {
+                    format!("{} blocks", u64::MAX)
+                } else if seconds {
                     format!("{} seconds", u64::MAX)
                 } else {
                     u64::MAX.to_string()
@@ -246,7 +256,9 @@ fn every_operation_roundtrips_and_reviews_every_signed_field_exactly() {
             ),
             (
                 "Proposed value",
-                if seconds {
+                if blocks {
+                    format!("{} blocks", u64::MAX - 1)
+                } else if seconds {
                     format!("{} seconds", u64::MAX - 1)
                 } else {
                     (u64::MAX - 1).to_string()
@@ -391,7 +403,7 @@ fn fee_share_exports_reject_invalid_or_unchanged_percentages() {
 fn ordinary() -> TransactionBody {
     body(Operation::Deposit {
         amount: 17u32.into(),
-        min_shares: 9u32.into(),
+
         decision: None,
         outcome: None,
     })
@@ -425,13 +437,6 @@ fn signed_exports_reject_modified_fields_and_signatures() {
     changed.push(tx);
     let mut tx = original.clone();
     let mut operation = tx.body.operation.clone();
-    if let Operation::Deposit { min_shares, .. } = &mut operation {
-        *min_shares += 1u32
-    };
-    tx.body.operation = operation;
-    changed.push(tx);
-    let mut tx = original.clone();
-    let mut operation = tx.body.operation.clone();
     if let Operation::Deposit {
         decision, outcome, ..
     } = &mut operation
@@ -452,7 +457,7 @@ fn signed_exports_reject_modified_fields_and_signatures() {
     }
     let conditional = body(Operation::Redeem {
         shares: 17u32.into(),
-        min_received: 2u32.into(),
+
         decision: Some([7; 32]),
         outcome: Some(Outcome::Pass),
     });
@@ -571,26 +576,25 @@ fn invalid_sender_recipient_limits_and_conditional_contexts_are_rejected() {
     }));
     cases.push(body(Operation::Redeem {
         shares: large.clone(),
-        min_received: 0u32.into(),
+
         decision: None,
         outcome: None,
     }));
     cases.push(body(Operation::Deposit {
-        amount: 1u32.into(),
-        min_shares: large,
+        amount: large.clone(),
         decision: None,
         outcome: None,
     }));
     for (decision, outcome) in [(None, Some(Outcome::Pass)), (Some([7; 32]), None)] {
         cases.push(body(Operation::Deposit {
             amount: 1u32.into(),
-            min_shares: 0u32.into(),
+
             decision,
             outcome,
         }));
         cases.push(body(Operation::Redeem {
             shares: 1u32.into(),
-            min_received: 0u32.into(),
+
             decision,
             outcome,
         }));

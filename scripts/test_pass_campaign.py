@@ -38,7 +38,7 @@ class CampaignPlanTests(unittest.TestCase):
         desc = hashlib.sha256(p.proposal_description('sgp', 0, p.PASS_PROFILE).encode()).digest()
         self.snapshot['proposals'] = [{'id': 'ab' * 32, 'proposal': dict(round=0, description=list(desc), action=grant)}]
         self.snapshot['governance']['phase'] = {'Governance': dict(round=0, proposal_id=[171]*32, proposal=grant,
-                                                                   started=1500, duration=900)}
+                                                                   started=1500, started_height=100, blocks=60, leading_blocks=0)}
         self.snapshot['governance']['pass'] = dict(self.snapshot['governance']['world'], reserve='4500000', grant_escrow='4500100')
 
     def test_single_coordinator_proposes_half_reserve_empty_data(self):
@@ -144,13 +144,44 @@ class CampaignPlanTests(unittest.TestCase):
         self.assertEqual(b['kind'], 'deposit_pass')
         self.assertNotEqual(b['sender_index'], a['sender_index'])
 
+    def test_partial_quote_does_not_undervalue_existing_portfolio(self):
+        self.live()
+        expected = self.choose()
+        original = self.rpc
+        def partial(method, params):
+            result = original(method, params)
+            if method == 'stash_quote' and params.get('all'):
+                requested = int(result['input_requested'])
+                result.update(input_filled=str(requested // 10), input_unfilled=str(requested-requested // 10),
+                              output_hash=str(int(result['output_hash']) // 10), output=str(int(result['output']) // 10))
+            return result
+        self.rpc = partial
+        actual = self.choose()
+        self.assertEqual(actual['operation'], expected['operation'])
+        self.assertEqual(actual['expiry_blocks'], 2)
+
+    def test_partial_fill_rechecks_actual_holdings_before_next_order(self):
+        self.live()
+        first = self.choose()
+        self.assertEqual(first['kind'], 'deposit_pass')
+        self.confirm_full_cash(first)
+        actor = self.accounts[first['sender_index']]['pass_account']
+        # Model an unfilled order: only the fee was paid and holdings stay short
+        # of the target. A confirmed transaction alone cannot complete this leg.
+        actor['ordinary'] = '1000000'
+        actor['shares'] = '1000000000'
+        self.accounts[1]['pending'] = self.accounts[2]['pending'] = True
+        following = self.choose()
+        self.assertEqual(following['kind'], 'deposit_pass')
+        self.assertEqual(following['sender_index'], first['sender_index'])
+
     def test_unknown_unfunded_unrelated_or_near_end_decisions_wait(self):
         for change in ('unknown', 'unfunded', 'unrelated', 'late', 'settling'):
             self.live()
             if change == 'unknown': self.snapshot['campaign']['checked'] = False
             elif change == 'unfunded': self.snapshot['governance']['pass']['grant_escrow'] = '1'
             elif change == 'unrelated': self.snapshot['proposals'][0]['proposal']['description'][0] ^= 1
-            elif change == 'late': self.snapshot['status']['clock'] = 2399
+            elif change == 'late': self.snapshot['status']['height'] = 159
             else: self.snapshot['campaign']['settlement_pending'] = True
             with self.subTest(change=change): self.assertIsNone(self.choose())
 
@@ -214,10 +245,10 @@ class CampaignCustodyTests(unittest.TestCase):
         self.node.proposals = [dict(id='ab'*32, proposal=dict(round=0, description=list(desc),
             action={'Grant': {'payments': [dict(recipient=list(bytes.fromhex(recipient)), amount='1000')]}}))]
         self.decisions = [dict(id=DECISION, proposal='ab'*32, round=0, ended_height=self.node.height,
-                              outcome='pass', funded=True, pass_integral='101', fail_integral='100', pass_margin_bps=0)]
+                              outcome='pass', funded=True, blocks=60, observed_blocks=60, blocks_remaining=0, leading_blocks=31, pass_margin_bps=0)]
         self.snapshot['status']['height'] = self.node.height
 
-    def test_completion_needs_depth_funding_strict_score_and_canonical_anchor(self):
+    def test_completion_needs_depth_funding_strict_majority_and_canonical_anchor(self):
         self.settlement()
         value = self.activity.observe_campaign(self.snapshot)
         self.assertFalse(value['completed']); self.assertTrue(value['settlement_pending'])
@@ -225,9 +256,9 @@ class CampaignCustodyTests(unittest.TestCase):
         self.decisions[0]['outcome'] = 'fail'
         self.assertFalse(self.activity.observe_campaign(self.snapshot)['completed'])
         self.decisions[0]['outcome'] = 'pass'
-        self.decisions[0]['pass_integral'] = '100'
+        self.decisions[0]['leading_blocks'] = 30
         with self.assertRaises(ca.Fault): self.activity.observe_campaign(self.snapshot)
-        self.decisions[0]['pass_integral'] = '101'
+        self.decisions[0]['leading_blocks'] = 31
         self.decisions[0]['funded'] = False
         with self.assertRaises(ca.Fault): self.activity.observe_campaign(self.snapshot)
         self.decisions[0]['funded'] = True
@@ -238,6 +269,17 @@ class CampaignCustodyTests(unittest.TestCase):
         self.assertTrue(self.activity.observe_campaign(self.snapshot)['completed'])
         self.node.anchor = 'ff'*32
         with self.assertRaisesRegex(ca.Fault, 'reorganized'): self.activity.observe_campaign(self.snapshot)
+
+    def test_completion_rejects_incomplete_or_malformed_block_counts(self):
+        for changed in (dict(blocks=0), dict(blocks=True), dict(observed_blocks=59),
+                        dict(blocks_remaining=1), dict(leading_blocks=61), dict(leading_blocks=-1),
+                        dict(leading_blocks=True), dict(leading_blocks='31')):
+            self.settlement()
+            self.snapshot['status']['height'] += 2
+            self.decisions[0].update(changed)
+            with self.subTest(changed=changed), self.assertRaises(ca.Fault):
+                self.activity.observe_campaign(self.snapshot)
+            self.assertIsNone(self.activity.ledger.get('pass_campaign_completion'))
 
     def test_unrelated_pass_is_not_campaign_completion(self):
         self.settlement()

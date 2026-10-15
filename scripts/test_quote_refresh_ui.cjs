@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const { setup } = require('./test_outcome_wallet.cjs');
 const { deferred, response, settle } = require('./test_wallet_ui.cjs');
 const amounts = require('../ui/amounts.js');
+const shares = require('../ui/shares.js');
 
 let checks = 0;
 const equal = (actual, expected, message) => { assert.equal(actual, expected, message); checks++; };
@@ -154,6 +155,40 @@ async function malformedQuotesStillShowErrors() {
   equal(h.get('trade-submit').disabled, true);
 }
 
+async function amountOnlyPartialFillsRemainEstimates() {
+  for (const kind of ['deposit', 'redeem']) for (const filled of ['0', '4', '10']) {
+    const h = await setup(), form = h.get('trade-form');
+    await h.tradeTab(kind);
+    h.handlers.stash_quote = p => {
+      const base = h.stashQuote(p), input = BigInt(filled), output = kind === 'deposit' ? input * 100n : input;
+      return response({result: {...base, input_filled: filled, input_unfilled: String(10n-input), output: String(output),
+        shares: kind === 'deposit' ? String(output) : '10', output_hash: String(input),
+        share_after: String(BigInt(base.share_before) + (kind === 'deposit' ? output : -input))}});
+    };
+    form.elements.outcome.value='Pass';await h.get('trade-outcome').fire('change');
+    form.elements.amount.value = kind === 'deposit' ? amounts.exactInput('10') : shares.exactInput('10');
+    await h.get('trade-amount').fire('input');await h.timersDue();await h.timersDue();
+    equal(visible(h,'quote-label'),'Estimated receive');
+    ok(visible(h,'quote-height').includes('partial fills possible'));
+    equal(h.get('trade-submit').disabled,false,`${kind} ${filled} estimate can authorize the requested order`);
+    await form.requestSubmit();
+    equal(h.wallet.at(-1).expiry_blocks,2,'trade orders default to two-block expiry');
+    const operation=h.wallet.at(-1).operation[kind === 'deposit' ? 'Deposit' : 'Redeem'];
+    equal(operation[kind === 'deposit' ? 'amount' : 'shares'],'10','the requested amount is signed, not the preview fill');
+    equal(Object.keys(operation).sort().join(','),kind === 'deposit' ? 'amount,decision,outcome' : 'decision,outcome,shares');
+  }
+  {
+    const h=await setup();await h.trade('10');h.get('trade-expiry').value='5';await h.get('trade-expiry').fire('input');await h.timersDue();await h.timersDue();await h.get('trade-form').requestSubmit();
+    equal(h.wallet.at(-1).expiry_blocks,5,'explicit trade expiry is retained');
+    await h.send('10');await h.get('send-form').requestSubmit();equal(h.wallet.at(-1).expiry_blocks,100,'other transactions keep their independent expiry');
+  }
+  for (const mutation of [{input_requested:'11'},{input_filled:'11',input_unfilled:'0'}, {input_filled:'4',input_unfilled:'5'}, {output:'999'}, {share_after:'0'}, {kind:'redeem'}, {indicative:false}, {partial_fill_possible:false}, {execution:'immediate'}]) {
+    const h=await setup();h.handlers.stash_quote=p=>response({result:h.stashQuote(p,mutation)});await h.trade('10');
+    equal(visible(h,'trade-quote'),'Quote unavailable',`${Object.keys(mutation)[0]} cannot change a signed intent`);
+    equal(h.get('trade-submit').disabled,true);equal(h.wallet.length,0);
+  }
+}
+
 async function realFailuresReplacePreservedSuccess() {
   for (const kind of ['send', 'trade']) {
     const h = await setup();
@@ -202,7 +237,7 @@ async function staleAsyncRepliesCannotOverwriteNewerResults() {
 }
 
 async function run() {
-  for (const test of [paymentDisplaySurvivesOverlappingRefreshes, tradeDisplaySurvivesOverlappingRefreshes, errorsRemainStableWhileRetrying, feeErrorsRemainStableWhileRetrying, chainMovementIsPendingRatherThanInvalidInput, malformedQuotesStillShowErrors, realFailuresReplacePreservedSuccess, pendingFeeRetriesWithoutAnotherBlock, staleAsyncRepliesCannotOverwriteNewerResults]) await test();
+  for (const test of [paymentDisplaySurvivesOverlappingRefreshes, tradeDisplaySurvivesOverlappingRefreshes, errorsRemainStableWhileRetrying, feeErrorsRemainStableWhileRetrying, chainMovementIsPendingRatherThanInvalidInput, malformedQuotesStillShowErrors, amountOnlyPartialFillsRemainEstimates, realFailuresReplacePreservedSuccess, pendingFeeRetriesWithoutAnotherBlock, staleAsyncRepliesCannotOverwriteNewerResults]) await test();
   console.log(`Quote refresh UI: ${checks} behavior checks passed`);
 }
 run().catch(error => { console.error(error); process.exitCode = 1; });

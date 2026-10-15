@@ -112,11 +112,13 @@ def encode_operation(operation):
             raise ValueError('unexpected transfer fields')
         code, payload = 0, key_bytes(p['recipient']) + amount(p['amount'])
     elif kind in ('Deposit', 'Redeem'):
-        a, minimum = ('amount', 'min_shares') if kind == 'Deposit' else ('shares', 'min_received')
+        a = 'amount' if kind == 'Deposit' else 'shares'
+        if set(p) != {a, 'decision', 'outcome'}:
+            raise ValueError('unexpected trade fields')
         if (p.get('decision') is None) != (p.get('outcome') is None):
             raise ValueError('conditional decision/outcome mismatch')
         code = 1 if kind == 'Deposit' else 2
-        payload = amount(p[a]) + amount(p[minimum])
+        payload = amount(p[a])
         payload += option(p.get('decision'), key_bytes)
         payload += option(p.get('outcome'), lambda x: u64(['Pass', 'Fail'].index(x)))
     elif kind == 'Propose':
@@ -457,7 +459,14 @@ class Activity:
             if decision.get('outcome') != 'pass':
                 continue
             if (decision.get('funded') is not True
-                    or int(decision['pass_integral']) * 10000 <= int(decision['fail_integral']) * (10000 + int(decision['pass_margin_bps']))):
+                    or type(decision.get('blocks')) is not int or decision['blocks'] <= 0
+                    or type(decision.get('leading_blocks')) is not int
+                    or not 0 <= decision['leading_blocks'] <= decision['blocks']
+                    or type(decision.get('observed_blocks')) is not int
+                    or decision.get('observed_blocks') != decision['blocks']
+                    or type(decision.get('blocks_remaining')) is not int
+                    or decision.get('blocks_remaining') != 0
+                    or decision['leading_blocks'] * 2 <= decision['blocks']):
                 raise Fault('campaign settlement proof is inconsistent')
             block = self.rpc('explorer_block', {'height': ended, 'limit': 1})
             if block.get('chain_id') != self.c['chain_id'] or not block.get('block', {}).get('hash'):
@@ -744,7 +753,7 @@ class Activity:
         if native and not full_cash_governance(snapshot or {}):
             kind, fields = next(iter(action['operation'].items()))
             debit = int(fields['amount']) if kind in ('TransferExact', 'Deposit', 'Support') else int(fields['support']) if kind == 'Propose' else 0
-            credit = int(fields['min_received']) if kind == 'Redeem' else 0
+            credit = 0  # A batch order may receive no fill; its fee needs existing cash.
             ordinary = int((account.get('account') or {}).get('ordinary', 0))
             if ordinary + credit - debit < fee + (reserve if debit else 0):
                 reason = 'waiting_for_native_balance_and_fee'

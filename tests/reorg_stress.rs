@@ -131,7 +131,7 @@ fn funded_current_protocol() -> (TempDir, Chain) {
                 &player(i),
                 Operation::Deposit {
                     amount: 400u32.into(),
-                    min_shares: 1u32.into(),
+
                     decision: None,
                     outcome: None,
                 },
@@ -249,7 +249,7 @@ fn buy(chain: &mut Chain, outcome: Outcome, salt: u64) {
         &MINER,
         Operation::Deposit {
             amount: 800u32.into(),
-            min_shares: 1u32.into(),
+
             decision: Some(decision),
             outcome: Some(outcome),
         },
@@ -447,7 +447,20 @@ fn auction_lead_changes_refunds_and_timeouts_are_branch_local() {
 
 #[test]
 fn reorg_filters_hundreds_of_conflicting_detached_transactions_before_pool_cap() {
-    let (_base_dir, base) = funded();
+    let (_base_dir, mut base) = funded();
+    // Every self-payment commits principal and fee from opening cash; its
+    // same-block receipt cannot fund the next transaction in the nonce chain.
+    let top_up = sign(
+        &base,
+        &MINER,
+        Operation::TransferExact {
+            recipient: key(&player(0)),
+            amount: 400u32.into(),
+        },
+        1,
+        0,
+    );
+    append(&mut base, vec![top_up], 0);
     let fork_height = base.tip_height();
     let (_old_dir, mut old) = fork(&base);
     let (_new_dir, mut new) = fork(&base);
@@ -532,7 +545,7 @@ fn reorg_drops_expired_conditional_transactions_and_recovers_valid_common_transf
         &player(0),
         Operation::Deposit {
             amount: 10u32.into(),
-            min_shares: 0u32.into(),
+
             decision: Some(decision),
             outcome: Some(Outcome::Pass),
         },

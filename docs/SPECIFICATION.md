@@ -50,31 +50,33 @@ p = M / S = R / (r * S)
 
 At `r = 1`, the curve is flat: ordinary buying and selling preserve the price in ideal arithmetic. Below 1, buying raises the price and selling lowers it. A smaller ratio makes the response steeper. Neither M nor a marked stash value is an additional reserve balance.
 
-### Ordinary trades
+### Amount-only block clearing
 
-A deposit of `d` hashes creates:
+A buy order commits a hash amount; a sell order commits a Stash amount. Neither specifies a limit price or minimum output. All included orders in the same world clear together from that block’s opening reserve. PASS and FAIL clear independently. Signed nonces and ordinary transaction dependencies still apply, but the order of valid Stash transactions cannot choose their clearing price or allocation.
 
-```text
-new_S = S * (1 + d/R)^r
-stash_received = new_S - S
-new_R = R + d
-```
-
-Redeeming `b` stash returns:
+In ideal arithmetic let D be total buy cash, B total Stash offered for sale, and x the net new Stash. The curve’s net cash change and common execution price satisfy:
 
 ```text
-new_S = S - b
-new_R = R * (1 - b/S)^(1/r)
-hashes_received = R - new_R
+C(x) = R * ((1 + x/S)^(1/r) - 1)
+P(x) = C(x)/x, with P(0) = M/S
+D = P(x) * (B + x)
 ```
 
-Ordinary trades preserve the current ratio in ideal arithmetic by scaling M with reserve: `new_M = M * new_R / R`. The executable rule rounds mass down on deposits and up on withdrawals, so reversing a trade cannot benefit from a more favorable curve shape created by that rounding. A signed deposit or redemption sets its minimum acceptable output. Zero-output and out-of-range trades are rejected. Fees are additional ordinary balance debits; they do not come out of the displayed trade output.
+Each buyer receives its filled cash divided by P; each seller receives its filled Stash multiplied by P. Afterward `R' = R + P*x`, `S' = S + x`, and mass scales with reserve. This execution price is the average along the net curve movement; it differs from the closing marginal price `M'/S'`.
+
+`MaxPriceChangeBps` bounds the actual closing marginal price relative to the opening one. Its default is 1,000 basis points (10%). If the full batch would move too far upward, buy inputs are reduced proportionally. If it would move too far downward, sell inputs are reduced proportionally. The opposite side remains eligible for its full input, subject to integer rounding and zero-output refunds. Unused input stays with its owner; it does not become an order for a future block. Accepted orders still pay their signed fees, even if their filled input is zero.
+
+The bound applies separately to each block and compounds across blocks. Zero allows no price movement. Values at or above 10,000 allow a zero lower bound, including full redemption; the upper bound continues to use the configured value. An empty curve opens at the fixed genesis exchange rate. Revenue replenishment and grant reservation change backing without changing the marginal price.
 
 ### Integer execution
 
-Amounts and curve inputs are bounded integers, at most 512 bits. Flat curves use exact rational arithmetic. Small rational ratios whose reduced denominator is at most eight use integer powers and root comparisons. General ratios use deterministic directed bounds with 2,048 fractional bits: a bounded atanh series for logarithms, a bounded exponential series after division by 1,024, and ten squarings. Deposits use a lower bound on minted supply; withdrawals round retained reserve upward using a lower bound on the reciprocal exponential. These operations do not depend on floating-point or machine math libraries.
+The implementation uses integer ratios and directed logarithm bounds, never floating point. Small rational curves use exact power comparisons. A common price bracket determines conservative outputs: buys round Stash down and sells round hash payouts down. No transaction ID, array position or miner-selected rounding winner receives the leftover atoms. Flat curves use exact reduced-price lots and refund unusable principal. Zero-output orders have their principal refunded together before the remaining batch is recalculated.
 
-Rounding favors retained reserve. Deposits never create more stash than the ideal formula; withdrawals never pay more hashes than the ideal formula. A full supply redemption empties reserve, stash and mass. Restarting an empty curve uses the fixed genesis share scale and a flat curve; waiting revenue remains separate until it can replenish a nonflat curve.
+When a bound is reached, deterministic integer search reduces the affected side’s aggregate budget and apportions it by input amount. Rounding can make the result conservative: this rule does not promise the greatest possible filled volume at dust boundaries. The same search reduces fills if their combined reserve, mass or supply would exceed the configured numeric range. Final exact cross-products enforce both price bounds against the actual rounded mass and supply. Reserve, Stash and mass must become empty together. Mass rounds down when reserve grows and up when it shrinks. All actual fills and refunds conserve cash and Stash.
+
+Inputs and fees must be covered by the account’s opening balances, including all its other commitments in that block. A transfer, refund, mining reward or trade output received within the block cannot fund another operation in that same block. This removes funding-order dependencies from clearing. Account credits are aggregated; execution updates affected account-tree paths rather than rewriting all accounts whenever an order changes.
+
+Miners still choose which transactions to include and can censor or delay orders. Batching removes within-block price priority for the included set; the price bound and leading-block rule do not eliminate manipulation across blocks. Wallets use a short default trade expiry to limit how long an amount-only order remains eligible.
 
 ## 4 Revenue and grants
 
@@ -126,13 +128,14 @@ Governance may change one of:
 | Minimum fee rate | Any unsigned 64-bit number of raw hash atoms per 1,024 weight, including zero |
 | Target block interval | Positive whole scheduled seconds |
 | Auction lead and rest duration | Whole scheduled seconds, including zero |
-| Decision duration | Positive whole scheduled seconds |
+| Decision length | Positive whole block count |
+| Maximum Stash price change per block | Any u64 basis-point value, including zero; default 1,000 (10%) |
 | Miner fee percentage | Whole percent from 0 to 100 |
 | Required PASS margin | From 0 through 2^64 − 1 basis points; one basis point is 0.01% |
 
 A proposal signs the exact old and new values, and the new value must differ. Every setting fits unsigned 64-bit representation; block capacity must also fit the host's allocation representation. The 1,024 minimum lets an otherwise empty block create its mining account. Genesis choices for timestamp-window size and ASERT half-life also retain only their required positive/representation rules; the preset values are not mandatory bounds.
 
-Scheduled time and deadlines must remain representable. The effective auction timeout is the greater of the configured timeout and `lead + interval`; all additions and rounding to future block boundaries are checked. The node checks proposed settings at submission and their projected activation, then checks again when applying them. A positive decision duration may be shorter than a block interval, allowing resolution in the first subsequent block before any conditional trade can be included.
+Scheduled time and deadlines must remain representable. The effective auction timeout is the greater of the configured timeout and `lead + interval`; all additions and rounding to future block boundaries are checked. The node checks proposed settings at submission and their projected activation, then checks again when applying them. A one-block decision resolves on the first subsequent block, before an outcome trade can affect an observation. Decision block counts and projected scheduled-time arithmetic must fit their integer representations.
 
 The reserve ratio is state derived from R and M, not a governed fixed parameter. Issuance, proof of work, authentication, timestamp-validation policy, ASERT half-life and opening share scale remain fixed by the protocol or genesis configuration. Approved settings activate after rest, with the activating block still using its parent's settings.
 
@@ -146,22 +149,17 @@ At settlement, account balances continue directly from the chosen root. The losi
 
 ## 7 Price comparison and resolution
 
-The decision compares the marginal stash price over its full scheduled duration. Each completed parent world contributes `q = floor(Q * M / S)` multiplied by the target seconds covered by the next block. Empty curves quote zero. Q is the fixed positive quote scale. The two ratios may differ, so validators compare the full normalized price M/S, not reserve per share.
-
-Let A be the cumulative quote integral, A_start its value at activation, D the frozen decision duration, t_start its start clock and C the closing block clock. Scores clip the last interval to the exact deadline:
+A decision freezes a positive block count N and PASS margin m when it opens. Each subsequent block observes the completed parent’s quotes `q = floor(Q*M/S)`, with zero for an empty curve. Q is the fixed quote precision. It adds one PASS leading block exactly when:
 
 ```text
-overshoot = C - (t_start + D)
-score = A - A_start - closing_parent_quote * overshoot
-average = score / D
-PASS iff score_PASS * 10000 > score_FAIL * (10000 + margin_bps)
+q_PASS * 10000 > q_FAIL * (10000 + m)
 ```
 
-Equality selects FAIL. A change to the PASS margin is judged under the old frozen margin. A trade first affects the price observation in a following block. The full duration counts; there is no special final-price window.
+The size of the lead and the block timestamp add no extra weight. Equality contributes no PASS lead. After exactly N observations, PASS wins only if `leading_blocks > N/2` and the proposal is still fully funded. This is a strict majority of all observed blocks, including ties. A change to the PASS margin is judged under the old frozen margin.
 
-If both outcomes stay flat at the same price, trades cannot separate their scores. A grant fully covered by waiting revenue leaves the curves unchanged, so that case resolves FAIL when no other state difference changes the scores. A grant that uses reserve can change PASS price sensitivity without changing its starting price. The mechanism does not guarantee that the price signal measures a grant's benefit or is immune to manipulation.
+A trade affects the closing quote of its inclusion block and is first counted by the following block. Resolution happens before the final block’s user transactions, so a last-moment trade cannot alter an observation that has already settled. The opening quotes are equal when the decision merely reserves a grant, so its first observation is a tie unless another prior state difference exists. There is no price integral or magnitude-weighted average.
 
-Resolution occurs before the closing block's user transactions. It keeps the selected world's account root, reserve, supply, mass, waiting revenue and price integral. A passing grant pays its existing escrow in full to the listed recipients, without payment deductions. Its bounded account updates were charged when the proposal was included, so they do not consume the closing block's transaction capacity. A passing setting change is recorded for activation after rest. Reorganizations can reverse a resolution along with every dependent state transition.
+Resolution keeps the selected world’s accounts, reserve, supply, mass and revenue. A passing grant pays its escrow in full to the listed recipients once. Its account-update work was charged when the proposal was included. A passing setting change activates after rest. Reorganizations reverse a resolution together with dependent state changes. The rule measures market prices; it does not guarantee a proposal’s benefit.
 
 ## 8 Fees and block construction
 
@@ -184,7 +182,7 @@ Node policy selects executable transactions by miner fee per weight, respecting 
 
 ## 9 Scheduled time, timestamps and difficulty
 
-Each block advances the economic clock by its parent's target interval. Auction lead, decision and rest periods use these scheduled seconds. Changing target interval preserves their nominal duration; actual elapsed time still varies with mining. Transaction expiry, confirmation depths and timestamp samples remain counts of blocks.
+Each block advances the economic clock by its parent's target interval. Auction lead and rest periods use these scheduled seconds; decisions use their frozen block counts. Changing target interval preserves auction/rest nominal durations; actual elapsed time still varies with mining. Transaction expiry, confirmation depths and timestamp samples remain counts of blocks.
 
 Mining uses a fixed 80-byte Bitcoin-style SHA256d header. The timestamp must exceed median past time and remain within the future allowance relative to the validating node's clock. Too-far-future blocks remain retryable. Presets use an 11-header median, 120-second future allowance, 900-second ASERT half-life and 15-second initial target interval.
 
@@ -202,9 +200,9 @@ Each branch anchors ASERT at its first mined block, excluding the wait between c
 
 Accounts and protocol indexes use persistent authenticated treaps. Keys determine deterministic priorities; map roots are independent of insertion order. Updates copy changed paths and share untouched immutable subtrees. Starting a decision shares a root; settlement selects one. These operations avoid scanning or rewriting every account at phase boundaries.
 
-Block execution validates its parent, encoding, target and resource limits; advances scheduled time and parent-price integrals; settles a due decision; applies ordered user transactions and fees; pays the mining subsidy and collected miner fees; replenishes reserves from revenue; processes auctions and complete grant escrow; applies due rest activation; and verifies the resulting committed state. Activation and revenue processing are deterministic and operate independently on active outcomes. The exact ordering is defined by the maintained consensus implementation and corresponding integration tests.
+Block execution validates its parent, encoding, target and resource limits; advances scheduled time and counts the parent’s leading-block observation; settles a due decision; reserves transaction inputs and fees; clears the included amount-only orders in each world together; pays the mining subsidy and collected miner fees; replenishes reserves from revenue; processes auctions and complete grant escrow; applies due rest activation; and verifies the resulting committed state. Activation and revenue processing are deterministic and operate independently on active outcomes. The exact ordering is defined by the maintained consensus implementation and corresponding integration tests.
 
-The world commitment includes the account root, reserve, stash supply, curve mass, waiting revenue, grant escrow, price integral, account aggregates. The top-level commitment includes worlds, chain identity, height, clock, issuance, settings, phase, proposal/support/refund indexes. Every accepted block must reproduce its declared state root.
+The world commitment includes the account root, reserve, stash supply, curve mass, waiting revenue, grant escrow, account aggregates. The top-level commitment includes worlds, chain identity, height, clock, issuance, settings, phase, proposal/support/refund indexes. Every accepted block must reproduce its declared state root.
 
 ## 11 Conservation and bounds
 
@@ -217,9 +215,9 @@ account hashes + reserve + waiting revenue + grant escrow
 total stash = sum of account stash
 ```
 
-Curve mass, marginal marked values, price integrals and withdrawal quotes are not additional money pools. Count alternative worlds separately, never together: only the selected outcome survives settlement. Reserve, stash and mass are empty together; a nonempty world has M >= R > 0.
+Curve mass, marginal marked values, withdrawal quotes are not additional money pools. Count alternative worlds separately, never together: only the selected outcome survives settlement. Reserve, stash and mass are empty together; a nonempty world has M >= R > 0.
 
-Balances, shares, curve state, intermediate arithmetic, price integrals, clocks, deadlines and collection sizes have explicit bounds. Nonces and heights never wrap. Genesis validation ensures the maximum expected-work issuance and opening stash allocation fit configured amounts. Voluntary operations exceeding bounds are rejected. Compact encoding does not remove execution or storage limits.
+Balances, shares, curve state, intermediate arithmetic, clocks, deadlines and collection sizes have explicit bounds. Nonces and heights never wrap. Genesis validation ensures the maximum expected-work issuance and opening stash allocation fit configured amounts. Voluntary operations exceeding bounds are rejected. Compact encoding does not remove execution or storage limits.
 
 ## 12 Records, storage and networking
 

@@ -41,25 +41,25 @@ fn browser_signatures_verify_in_rust_for_every_current_operation() {
         },
         Operation::Deposit {
             amount: maximum.clone(),
-            min_shares: large.clone(),
+
             decision: None,
             outcome: None,
         },
         Operation::Deposit {
             amount: large.clone(),
-            min_shares: 0u32.into(),
+
             decision: Some([51; 32]),
             outcome: Some(Outcome::Pass),
         },
         Operation::Redeem {
             shares: maximum.clone(),
-            min_received: large.clone(),
+
             decision: Some([52; 32]),
             outcome: Some(Outcome::Fail),
         },
         Operation::Redeem {
             shares: large.clone(),
-            min_received: 0u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -118,9 +118,11 @@ fn browser_signatures_verify_in_rust_for_every_current_operation() {
         Parameter::Interval,
         Parameter::Lead,
         Parameter::Rest,
-        Parameter::Duration,
+        Parameter::DecisionBlocks,
         Parameter::MinerFeePercent,
         Parameter::PassMarginBps,
+        Parameter::MinimumFeeRate,
+        Parameter::MaxPriceChangeBps,
     ] {
         let (old, new) = match parameter {
             Parameter::MinerFeePercent => (50, 51),
@@ -164,7 +166,7 @@ fn browser_signatures_verify_in_rust_for_every_current_operation() {
     );
     let signed: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(signed.len(), bodies.len());
-    assert_eq!(signed.len(), 23);
+    assert_eq!(signed.len(), 25);
     for (index, (signed, expected)) in signed.iter().zip(&bodies).enumerate() {
         let tx = wallet::decode_signed(signed["raw"].as_str().unwrap()).unwrap();
         assert_eq!(&tx.body, expected, "case {index}");

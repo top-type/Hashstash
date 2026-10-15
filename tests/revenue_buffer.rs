@@ -16,7 +16,7 @@ fn owner() -> PublicKey {
 fn config() -> Config {
     let mut c = Config::testnet();
     c.initial.lead = 2 * c.initial.interval;
-    c.initial.duration = 12 * c.initial.interval;
+    c.initial.decision_blocks = 12;
     c.initial.rest = 4 * c.initial.interval;
     c.validate().unwrap();
     c
@@ -57,7 +57,7 @@ fn funded_curve(c: &Config) -> State {
         &s,
         Operation::Deposit {
             amount: 800_000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -111,7 +111,7 @@ fn explicit_deposits_keep_accumulated_fees_outside_private_reserve_and_shares() 
         &s,
         Operation::Deposit {
             amount: 1000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -131,13 +131,16 @@ fn explicit_deposits_keep_accumulated_fees_outside_private_reserve_and_shares() 
 
 #[test]
 fn empty_reserve_keeps_revenue_and_reopens_flat_only_with_a_real_deposit() {
-    let c = config();
+    let mut c = config();
+    // Emptying makes the quote zero, so this fixture explicitly permits a
+    // complete downward move while testing revenue retention and reopening.
+    c.initial.max_price_change_bps = 10_000;
     let mut s = funded_curve(&c);
     let tx = sign(
         &s,
         Operation::Redeem {
             shares: s.world.shares.clone(),
-            min_received: 1u64.into(),
+
             decision: None,
             outcome: None,
         },
@@ -156,7 +159,7 @@ fn empty_reserve_keeps_revenue_and_reopens_flat_only_with_a_real_deposit() {
         &s,
         Operation::Deposit {
             amount: 100u64.into(),
-            min_shares: 1u64.into(),
+
             decision: None,
             outcome: None,
         },

@@ -268,7 +268,7 @@ input[name=fee],#send-form input[name=amount],#send-form input[name=minimum] { c
 #trade-form[data-trade=deposit] #trade-amount:focus { border-color:var(--text); outline-color:var(--text); }
 #trade-max { color:var(--text); }
 #pass-cash,#fail-cash,#pass-funding,.proposal-support strong { color:var(--text); }
-#pass-stash,#fail-stash,#pass-price,#fail-price,#pass-twap,#fail-twap,#pass-reserve,#fail-reserve { color:var(--text); }
+#pass-stash,#fail-stash,#pass-price,#fail-price,#pass-leading-blocks,#fail-leading-blocks,#pass-reserve,#fail-reserve { color:var(--text); }
 #support-form input[name=amount],#propose-form input[name=support],#propose-form input[name=grant] { color:var(--text); }
 .inline-balance { font-size:12px; color:var(--muted); text-align:right; }
 .inline-balance strong { color:var(--text); font:13px var(--mono); }
@@ -374,10 +374,10 @@ dt { color:var(--muted); font-size:12px; }
 dd { margin:0; text-align:right; font:12px/1.5 var(--mono); overflow-wrap:anywhere; }
 .outcome-card dl>div { display:block; padding:7px 0; }
 .outcome-card dd { text-align:left; font-size:13px; margin-top:3px; }
-.outcome-card .outcome-average { padding:0; margin:0; }
-.outcome-card .outcome-average dd { font:500 clamp(23px,2.4vw,30px)/1.25 var(--sans); font-variant-numeric:tabular-nums; letter-spacing:-.7px; margin-top:6px; }
-#pass-twap { color:var(--pass); }
-#fail-twap { color:var(--fail); }
+.outcome-card .outcome-count { padding:0; margin:0; }
+.outcome-card .outcome-count dd { font:500 clamp(23px,2.4vw,30px)/1.25 var(--sans); font-variant-numeric:tabular-nums; letter-spacing:-.7px; margin-top:6px; }
+#pass-leading-blocks { color:var(--pass); }
+#fail-leading-blocks { color:var(--fail); }
 .outcome-card .outcome-spot { display:flex; align-items:baseline; flex-wrap:wrap; justify-content:space-between; gap:6px 12px; padding:0; margin-top:10px; }
 .outcome-spot dd { margin:0; font:13px/1.5 var(--sans); font-variant-numeric:tabular-nums; }
 .governance-result { padding:18px 22px; margin:4px 0 20px; border:1px solid var(--line); border-radius:12px; background:var(--surface); }
@@ -546,7 +546,7 @@ dd { margin:0; text-align:right; font:12px/1.5 var(--mono); overflow-wrap:anywhe
   .outcome-card { padding:16px 18px; }
   .outcome-card dt { font-size:11px; }
   .outcome-card dd { font-size:12px; }
-  .outcome-card .outcome-average dd { font-size:26px; }
+  .outcome-card .outcome-count dd { font-size:26px; }
   .outcome-card-heading { gap:8px; flex-wrap:wrap; margin-bottom:12px; }
   .outcome-card-heading h3 { margin:0; }
   .governance-curve { padding:10px 0 0; }
@@ -603,8 +603,8 @@ dd { margin:0; text-align:right; font:12px/1.5 var(--mono); overflow-wrap:anywhe
   .governance-mining-status { max-width:155px; text-align:right; margin:0; }
   .governance-page-heading .small-link { font-size:11px; }
   .outcome-card { padding:16px; }
-  .outcome-card .outcome-average dd { font-size:27px; }
-  .outcome-card .outcome-average { padding-bottom:0; }
+  .outcome-card .outcome-count dd { font-size:27px; }
+  .outcome-card .outcome-count { padding-bottom:0; }
   .outcome-card .outcome-spot { display:flex; }
   .outcome-spot dd { margin-top:0; }
   .outcome-card h3 { font-size:11px; }

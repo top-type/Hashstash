@@ -18,7 +18,7 @@ fn config() -> Config {
     c.initial_bits = 0x201fffff;
     c.limit_bits = 0x207fffff;
     c.initial.lead = 2 * 15;
-    c.initial.duration = 12 * 15;
+    c.initial.decision_blocks = 12;
     c.initial.rest = 4 * 15;
     c.validate().unwrap();
     c
@@ -271,7 +271,7 @@ fn interval_governance_changes_future_schedule_without_accelerating_economics() 
         chain.tip_state(),
         Operation::Deposit {
             amount,
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -310,7 +310,7 @@ fn interval_governance_changes_future_schedule_without_accelerating_economics() 
         state,
         Operation::Deposit {
             amount: 1000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: state.decision_id(),
             outcome: Some(Outcome::Pass),
         },
@@ -358,7 +358,7 @@ fn interval_governance_changes_future_schedule_without_accelerating_economics() 
         s,
         Operation::Deposit {
             amount: 1000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: s.decision_id(),
             outcome: Some(Outcome::Pass),
         },
@@ -375,7 +375,10 @@ fn interval_governance_changes_future_schedule_without_accelerating_economics() 
     assert_eq!(before, chain.tip_height() * 15);
     assert_eq!(chain.tip_state().clock, before);
     assert_eq!(chain.tip_state().settings.lead, c.initial.lead);
-    assert_eq!(chain.tip_state().settings.duration, c.initial.duration);
+    assert_eq!(
+        chain.tip_state().settings.decision_blocks,
+        c.initial.decision_blocks
+    );
     assert_eq!(chain.tip_state().settings.rest, c.initial.rest);
     append(&mut chain, 10, vec![]);
     assert_eq!(chain.expected_elapsed_seconds(), before + 10);
@@ -423,7 +426,7 @@ fn immediate_revenue_replenishment_is_independent_of_block_interval() {
         &s,
         Operation::Deposit {
             amount: 10_000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -436,7 +439,6 @@ fn immediate_revenue_replenishment_is_independent_of_block_interval() {
     let reserve = s.world.reserve.clone();
     let revenue = s.world.revenue.clone();
     let mass = s.world.curve_mass.clone();
-    let integral = s.world.price_integral.clone();
     let quote = s.world.quote(&c);
     let clock = s.clock;
     for interval in [15, 60] {
@@ -449,7 +451,7 @@ fn immediate_revenue_replenishment_is_independent_of_block_interval() {
         assert_eq!(after.world.reserve, &reserve + 500u32);
         assert_eq!(after.world.curve_mass, mass);
         assert_eq!(after.world.revenue, &revenue - 500u32);
-        assert_eq!(after.world.price_integral, &integral + &quote * interval);
+        assert_eq!(after.world.quote(&c), quote);
         after.audit(&c).unwrap();
     }
 }
@@ -481,7 +483,7 @@ fn decision_duration_is_independent_of_removed_funding_steps() {
     let c = config();
     let mut settings = c.initial.clone();
     settings.interval = 60;
-    settings.duration = 4096 * 60 + 1;
+    settings.decision_blocks = 4096 * 60 + 1;
     c.validate_governance_settings(&settings).unwrap();
     c.parameter_change(&settings, Parameter::Interval, 60, 30)
         .unwrap();
@@ -504,9 +506,9 @@ fn immediate_grant_uses_waiting_cash_then_backing_and_keeps_price() {
 }
 
 #[test]
-fn non_multiple_grant_duration_reserves_upfront_and_clips_final_price_observation() {
+fn grant_decision_counts_blocks_and_reserves_upfront() {
     let mut c = config();
-    c.initial.duration = 37;
+    c.initial.decision_blocks = 3;
     let mut s = State::genesis(&c);
     for _ in 0..30 {
         s = consensus::execute(&c, &s, &s.root(), &miner(), &1_000_000u32.into(), &[]).unwrap();
@@ -516,7 +518,7 @@ fn non_multiple_grant_duration_reserves_upfront_and_clips_final_price_observatio
         &s,
         Operation::Deposit {
             amount: 10_000_000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -563,7 +565,7 @@ fn non_multiple_grant_duration_reserves_upfront_and_clips_final_price_observatio
     let Phase::Governance(decision) = s.phase.clone() else {
         panic!("grant decision expected")
     };
-    assert_eq!(decision.duration, 37);
+    assert_eq!(decision.blocks, 3);
     assert_eq!(s.alternative.as_ref().unwrap().grant_escrow, grant);
     assert!(consensus::grant_capacity(&s.world) >= grant);
     s.audit(&c).unwrap();
@@ -571,7 +573,7 @@ fn non_multiple_grant_duration_reserves_upfront_and_clips_final_price_observatio
         &s,
         Operation::Deposit {
             amount: 2_000_000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: s.decision_id(),
             outcome: Some(Outcome::Pass),
         },
@@ -598,11 +600,12 @@ fn non_multiple_grant_duration_reserves_upfront_and_clips_final_price_observatio
         .unwrap()
         .ordinary;
     let pass_quote = pass.quote(&c);
-    let fail_quote = s.world.quote(&c);
-    // The last observation gets only seven seconds of voting weight, not 15.
-    let pass_score = &pass.price_integral + &pass_quote * 7u32 - &decision.start_integral;
-    let fail_score = &s.world.price_integral + fail_quote * 7u32 - &decision.start_integral;
-    assert!(consensus::pass_beats_fail(&pass_score, &fail_score, 0));
+    assert!(consensus::pass_beats_fail(
+        &pass_quote,
+        &s.world.quote(&c),
+        0
+    ));
+    assert!(matches!(&s.phase, Phase::Governance(d) if d.leading_blocks == 1));
     s = consensus::execute(&c, &s, &s.root(), &miner(), &1_000_000u32.into(), &[]).unwrap();
     assert_eq!(s.clock - decision.started, 45);
     assert!(matches!(s.phase, Phase::Rest(_)));
@@ -617,7 +620,7 @@ fn non_multiple_grant_duration_reserves_upfront_and_clips_final_price_observatio
 #[test]
 fn shortest_decision_allows_an_outcome_trade_and_successful_governance() {
     let mut c = config();
-    c.initial.duration = c.initial.interval + 1;
+    c.initial.decision_blocks = 3;
     c.validate().unwrap();
     let mut s = State::genesis(&c);
     for _ in 0..30 {
@@ -627,7 +630,7 @@ fn shortest_decision_allows_an_outcome_trade_and_successful_governance() {
         &s,
         Operation::Deposit {
             amount: 10_000_000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -682,13 +685,13 @@ fn shortest_decision_allows_an_outcome_trade_and_successful_governance() {
     let Phase::Governance(decision) = s.phase.clone() else {
         panic!("parameter decision expected")
     };
-    assert_eq!(decision.duration, 16);
+    assert_eq!(decision.blocks, 3);
     s.audit(&c).unwrap();
     let deposit = sign(
         &s,
         Operation::Deposit {
             amount: 2_000_000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: s.decision_id(),
             outcome: Some(Outcome::Pass),
         },
@@ -708,6 +711,8 @@ fn shortest_decision_allows_an_outcome_trade_and_successful_governance() {
     s.audit(&c).unwrap();
     s = consensus::execute(&c, &s, &s.root(), &miner(), &1_000_000u32.into(), &[]).unwrap();
     assert_eq!(s.clock - decision.started, 30);
+    assert!(matches!(&s.phase, Phase::Governance(d) if d.leading_blocks == 1));
+    s = consensus::execute(&c, &s, &s.root(), &miner(), &1_000_000u32.into(), &[]).unwrap();
     let Phase::Rest(rest) = &s.phase else {
         panic!("resolved parameter decision expected")
     };

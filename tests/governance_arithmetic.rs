@@ -18,7 +18,7 @@ fn config() -> Config {
     c.initial.minimum_fee_rate = 0;
     c.initial.lead = 0;
     c.initial.rest = 0;
-    c.initial.duration = 45;
+    c.initial.decision_blocks = 3;
     c.validate().unwrap();
     c
 }
@@ -63,7 +63,7 @@ fn funded(c: &Config) -> State {
         &s,
         Operation::Deposit {
             amount: 400_000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -88,7 +88,7 @@ fn zero_rest_and_lead_open_and_resolve_without_stuck_transient_phases() {
     let mut s = curved::state(&c, funded(&c), &SECRET);
     assert!(matches!(s.phase, Phase::Auction(_)));
     for (parameter, value) in [
-        (Parameter::Duration, 155),
+        (Parameter::DecisionBlocks, 155),
         (Parameter::Interval, 77),
         (Parameter::MinimumFeeRate, 3),
     ] {
@@ -109,13 +109,13 @@ fn zero_rest_and_lead_open_and_resolve_without_stuck_transient_phases() {
             &s,
             Operation::Deposit {
                 amount: 10_000u32.into(),
-                min_shares: 1u32.into(),
+
                 decision: s.decision_id(),
                 outcome: Some(Outcome::Pass),
             },
         );
         s = step(&c, &s, 0, &[buy]);
-        for _ in 0..10 {
+        for _ in 0..=s.frozen.decision_blocks {
             if matches!(s.phase, Phase::Auction(_)) {
                 break;
             }
@@ -130,10 +130,10 @@ fn zero_rest_and_lead_open_and_resolve_without_stuck_transient_phases() {
 }
 
 #[test]
-fn sub_block_decisions_fail_ties_and_restore_grant_escrow() {
+fn block_count_decisions_fail_ties_and_restore_grant_escrow() {
     for duration in [1, 14, 15] {
         let mut c = config();
-        c.initial.duration = duration;
+        c.initial.decision_blocks = duration;
         let s = funded(&c);
         let tx = propose(
             &s,
@@ -150,15 +150,15 @@ fn sub_block_decisions_fail_ties_and_restore_grant_escrow() {
             opened.alternative.as_ref().unwrap().grant_escrow,
             100u32.into()
         );
-        let closed = step(&c, &opened, 0, &[]);
+        let mut closed = opened.clone();
+        for _ in 0..duration {
+            closed = step(&c, &closed, 0, &[]);
+        }
         assert!(matches!(closed.phase, Phase::Auction(_)));
         assert_eq!(closed.world.reserve, opened.world.reserve);
         assert!(closed.alternative.is_none());
         assert_eq!(closed.world.grant_escrow, 0u32.into());
-        assert_eq!(
-            &closed.world.price_integral - &opened.world.price_integral,
-            opened.world.quote(&c) * c.initial.interval
-        );
+        assert_eq!(closed.height - opened.height, duration);
     }
 }
 
@@ -183,8 +183,14 @@ fn long_intervals_resolve_escrow_without_losing_funds() {
     let huge_interval = 1u64 << 48;
     opened.settings.interval = huge_interval;
     opened.frozen.interval = huge_interval;
-    let closed = step(&c, &opened, 0, &[]);
-    assert_eq!(closed.clock, opened.clock + huge_interval);
+    let mut closed = opened.clone();
+    for _ in 0..c.initial.decision_blocks {
+        closed = step(&c, &closed, 0, &[]);
+    }
+    assert_eq!(
+        closed.clock,
+        opened.clock + huge_interval * c.initial.decision_blocks
+    );
     assert!(closed.decision_id().is_none());
     assert!(closed.alternative.is_none());
     assert_eq!(closed.world.reserve, opened.world.reserve);
@@ -204,12 +210,12 @@ fn proposals_that_no_longer_fit_at_activation_are_refunded_without_halting_block
         a.lead_since = s.clock;
     }
     s.audit(&c).unwrap();
-    let new = u64::MAX - (s.clock + s.settings.interval);
+    let new = (u64::MAX - (s.clock + s.settings.interval)) / s.settings.interval;
     let tx = propose(
         &s,
         Proposal::Parameter {
-            parameter: Parameter::Duration,
-            old: s.settings.duration,
+            parameter: Parameter::DecisionBlocks,
+            old: s.settings.decision_blocks,
             new,
         },
     );
@@ -225,7 +231,7 @@ fn proposals_that_no_longer_fit_at_activation_are_refunded_without_halting_block
             .refund_height
             .is_some()
     );
-    assert_eq!(next.settings.duration, c.initial.duration);
+    assert_eq!(next.settings.decision_blocks, c.initial.decision_blocks);
     let advanced = step(&c, &next, 0, &[]);
     assert_eq!(advanced.clock, next.clock + c.initial.interval);
 }
@@ -300,7 +306,7 @@ fn replenished_reserve_funds_repeated_grants_without_historical_spending_limits(
         &s,
         Operation::Deposit {
             amount: &unit * 400u32,
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -325,7 +331,7 @@ fn replenished_reserve_funds_repeated_grants_without_historical_spending_limits(
             &s,
             Operation::Deposit {
                 amount: unit.clone(),
-                min_shares: 1u32.into(),
+
                 decision: s.decision_id(),
                 outcome: Some(Outcome::Pass),
             },
@@ -367,8 +373,8 @@ fn active_decision_audit_checks_the_pending_value_at_its_activation_clock() {
     let tx = propose(
         &s,
         Proposal::Parameter {
-            parameter: Parameter::Duration,
-            old: s.settings.duration,
+            parameter: Parameter::DecisionBlocks,
+            old: s.settings.decision_blocks,
             new: 71,
         },
     );
@@ -377,8 +383,8 @@ fn active_decision_audit_checks_the_pending_value_at_its_activation_clock() {
         panic!("missing decision")
     };
     d.proposal = Proposal::Parameter {
-        parameter: Parameter::Duration,
-        old: s.settings.duration,
+        parameter: Parameter::DecisionBlocks,
+        old: s.settings.decision_blocks,
         new: u64::MAX - d.started,
     };
     // The proposed duration fits at decision opening but not at activation.

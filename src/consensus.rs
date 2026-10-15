@@ -1,9 +1,165 @@
-use crate::{codec, config::Config, crypto, fees, math, state::*, types::*};
+use crate::{batch, codec, config::Config, crypto, fees, state::*, types::*};
 use anyhow::{Context, Result, bail, ensure};
 use num_traits::Zero;
 use std::collections::BTreeMap;
 
 type AccountWrites = BTreeMap<PublicKey, Account>;
+
+#[derive(Clone, Debug)]
+struct PendingTrade {
+    id: Hash,
+    sender: PublicKey,
+    outcome: Option<Outcome>,
+    amount: Amount,
+    is_buy: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TradeFill {
+    pub transaction_id: Hash,
+    pub outcome: Option<Outcome>,
+    pub input_requested: Amount,
+    pub input_filled: Amount,
+    pub output: Amount,
+    pub input_unfilled: Amount,
+    pub is_buy: bool,
+}
+
+type Spending = BTreeMap<(PublicKey, bool), (Amount, Amount)>;
+type Reservations = Vec<((PublicKey, bool), (Amount, Amount))>;
+
+/// Only opening funds can be committed. This prevents a miner from changing
+/// the batch by moving a transfer, refund, or redemption ahead of another order.
+fn reserve_inputs(opening: &State, spent: &Spending, t: &Transaction) -> Result<Reservations> {
+    let mut reservations = Vec::new();
+    for pass in [false, true] {
+        if pass && opening.alternative.is_none() {
+            continue;
+        }
+        let outcome = pass.then_some(Outcome::Pass);
+        let a = opening
+            .account(&t.body.sender, outcome)
+            .context("sender must exist at block opening")?;
+        let key = (t.body.sender, pass);
+        let (mut cash, mut shares) = spent.get(&key).cloned().unwrap_or_default();
+        cash += &t.body.fee;
+        match &t.body.operation {
+            Operation::TransferExact { amount, .. } | Operation::Support { amount, .. } => {
+                cash += amount
+            }
+            Operation::Propose { support, .. } => cash += support,
+            Operation::Deposit {
+                amount, outcome, ..
+            } if (*outcome == Some(Outcome::Pass)) == pass => cash += amount,
+            Operation::Redeem {
+                shares: n, outcome, ..
+            } if (*outcome == Some(Outcome::Pass)) == pass => shares += n,
+            _ => {}
+        }
+        ensure!(
+            cash <= a.ordinary,
+            "insufficient opening HASH for inputs and fees"
+        );
+        ensure!(shares <= a.shares, "insufficient opening Stash for orders");
+        reservations.push((key, (cash, shares)));
+    }
+    Ok(reservations)
+}
+
+/// Each world clears once. Account credits are accumulated and each affected
+/// leaf is updated once, without recalculating all accounts for each order.
+fn settle_trades(
+    c: &Config,
+    opening: &State,
+    s: &mut State,
+    trades: &[PendingTrade],
+) -> Result<Vec<TradeFill>> {
+    let mut fills = Vec::new();
+    for pass in [false, true] {
+        let initial = if pass {
+            let Some(w) = opening.alternative.as_ref() else {
+                continue;
+            };
+            w
+        } else {
+            &opening.world
+        };
+        let orders: Vec<_> = trades
+            .iter()
+            .filter(|t| (t.outcome == Some(Outcome::Pass)) == pass)
+            .collect();
+        if orders.is_empty() {
+            continue;
+        }
+        let buys: Vec<_> = orders
+            .iter()
+            .filter(|t| t.is_buy)
+            .map(|t| batch::Order {
+                id: t.id,
+                amount: t.amount.clone(),
+            })
+            .collect();
+        let sells: Vec<_> = orders
+            .iter()
+            .filter(|t| !t.is_buy)
+            .map(|t| batch::Order {
+                id: t.id,
+                amount: t.amount.clone(),
+            })
+            .collect();
+        let clearing = batch::clear(
+            c,
+            initial,
+            &buys,
+            &sells,
+            opening.settings.max_price_change_bps,
+        )?;
+        let allocations: BTreeMap<_, _> = clearing
+            .buys
+            .iter()
+            .chain(&clearing.sells)
+            .map(|f| (f.id, f))
+            .collect();
+        let epoch = s.epoch();
+        let w = if pass {
+            s.alternative.as_mut().unwrap()
+        } else {
+            &mut s.world
+        };
+        let mut accounts = AccountWrites::new();
+        for t in orders {
+            let f = allocations.get(&t.id).context("missing batch allocation")?;
+            ensure!(f.input <= t.amount, "batch overfilled input");
+            let unfilled = &t.amount - &f.input;
+            let a = accounts
+                .entry(t.sender)
+                .or_insert_with(|| w.account(&t.sender, epoch).unwrap());
+            if t.is_buy {
+                a.ordinary += &unfilled;
+                a.shares += &f.output;
+            } else {
+                a.shares += &unfilled;
+                a.ordinary += &f.output;
+            }
+            fills.push(TradeFill {
+                transaction_id: t.id,
+                outcome: t.outcome,
+                input_requested: t.amount.clone(),
+                input_filled: f.input.clone(),
+                output: f.output.clone(),
+                input_unfilled: unfilled,
+                is_buy: t.is_buy,
+            });
+        }
+        w.reserve = clearing.reserve;
+        w.shares = clearing.shares;
+        w.curve_mass = clearing.curve_mass;
+        for (key, a) in accounts {
+            w.put(key, a, c)?;
+        }
+    }
+    Ok(fills)
+}
 
 /// A transaction observes its own writes but updates each authenticated account
 /// leaf once. World totals are finalized before returning to block execution.
@@ -169,7 +325,14 @@ pub fn apply_transaction(c: &Config, s: &mut State, t: &Transaction) -> Result<(
     let prepared = fees::PreparedTransaction::with_limit(t, c.transaction_bytes(&s.settings))?;
     crypto::verify(t)?;
     let quote = Some(prepared.quote(c, s)?);
-    apply_prepared_transaction(c, s, &prepared, quote.as_ref())
+    let opening = s.clone();
+    let mut next = s.clone();
+    let mut trades = Vec::new();
+    reserve_inputs(&opening, &BTreeMap::new(), t)?;
+    apply_prepared_transaction(c, &mut next, &prepared, quote.as_ref(), &mut trades)?;
+    settle_trades(c, &opening, &mut next, &trades)?;
+    *s = next;
+    Ok(())
 }
 
 fn apply_prepared_transaction(
@@ -177,9 +340,12 @@ fn apply_prepared_transaction(
     s: &mut State,
     prepared: &fees::PreparedTransaction<'_>,
     quote: Option<&fees::FeeQuote>,
+    trades: &mut Vec<PendingTrade>,
 ) -> Result<()> {
     let mut next = s.clone();
-    transaction_inner(c, &mut next, prepared, quote)?;
+    let mut added = Vec::new();
+    transaction_inner(c, &mut next, prepared, quote, &mut added)?;
+    trades.extend(added);
     *s = next;
     Ok(())
 }
@@ -188,6 +354,7 @@ fn transaction_inner(
     s: &mut State,
     prepared: &fees::PreparedTransaction<'_>,
     quote: Option<&fees::FeeQuote>,
+    trades: &mut Vec<PendingTrade>,
 ) -> Result<()> {
     let t = prepared.transaction();
     let b = &t.body;
@@ -231,51 +398,33 @@ fn transaction_inner(
         }
         Operation::Deposit {
             amount,
-            min_shares,
             decision,
             outcome,
         } => {
             c.check_amount(amount)?;
-            c.check_shares(min_shares)?;
             ensure!(!amount.is_zero(), "zero deposit");
             let o = context(s, *decision, *outcome)?;
             let epoch = s.epoch();
             let w = world_mut(s, o);
             let pending = accounts.world(o);
             let mut a = pending_account(w, pending, &b.sender, epoch).unwrap();
-            let cash = &mut a.ordinary;
-            ensure!(*cash >= *amount, "insufficient deposit balance");
-            let new_r = &w.reserve + amount;
-            c.check_amount(&new_r)?;
-            let (n, mass) = if w.shares.is_zero() {
-                let scale = &c.share_scale;
-                (amount * scale, new_r.clone())
-            } else {
-                (
-                    math::dynamic_deposit_total(&w.reserve, &w.shares, amount, &w.curve_mass)?,
-                    math::deposit_mass(&w.reserve, &w.curve_mass, &new_r)?,
-                )
-            };
-            c.check_amount(&mass)?;
-            c.check_shares(&n)?;
-            ensure!(n > w.shares, "deposit rounds to zero shares");
-            let minted = &n - &w.shares;
-            ensure!(minted >= *min_shares, "minimum minted shares not met");
-            *cash -= amount;
-            a.shares += &minted;
-            w.reserve = new_r;
-            w.curve_mass = mass;
-            w.shares = n;
+            ensure!(a.ordinary >= *amount, "insufficient deposit balance");
+            a.ordinary -= amount;
             stage_account(pending, b.sender, a, c)?;
+            trades.push(PendingTrade {
+                id: codec::transaction_id(t),
+                sender: b.sender,
+                outcome: o,
+                amount: amount.clone(),
+                is_buy: true,
+            });
         }
         Operation::Redeem {
             shares,
-            min_received,
             decision,
             outcome,
         } => {
             c.check_shares(shares)?;
-            c.check_amount(min_received)?;
             ensure!(!shares.is_zero(), "zero redemption");
             let o = context(s, *decision, *outcome)?;
             let epoch = s.epoch();
@@ -283,18 +432,15 @@ fn transaction_inner(
             let pending = accounts.world(o);
             let mut a = pending_account(w, pending, &b.sender, epoch).unwrap();
             ensure!(a.shares >= *shares, "insufficient shares");
-            let m = math::dynamic_remaining_reserve(&w.reserve, &w.shares, shares, &w.curve_mass)?;
-            let payout = &w.reserve - &m;
-            ensure!(
-                !payout.is_zero() && payout >= *min_received,
-                "redemption output too small"
-            );
-            w.curve_mass = math::remaining_mass(&w.reserve, &w.curve_mass, &m)?;
-            w.reserve = m;
-            w.shares -= shares;
             a.shares -= shares;
-            a.ordinary += payout;
             stage_account(pending, b.sender, a, c)?;
+            trades.push(PendingTrade {
+                id: codec::transaction_id(t),
+                sender: b.sender,
+                outcome: o,
+                amount: shares.clone(),
+                is_buy: false,
+            });
         }
         Operation::Propose {
             round,
@@ -367,9 +513,7 @@ fn transaction_inner(
             accounts.credit(s, &b.sender, &record.amount, c)?;
         }
     }
-    // A redeem can pay from its resulting ordinary proceeds.
-    // During governance the fee must be affordable in both worlds:
-    // proceeds in one outcome cannot pay the other's fee.
+    // Fees are prepaid in both worlds; unsettled trade proceeds cannot pay them.
     accounts.each(s, |w, pending, epoch| {
         let mut a = pending_account(w, pending, &b.sender, epoch).unwrap();
         ensure!(a.ordinary >= *charged_fee, "insufficient ordinary HASH");
@@ -477,7 +621,14 @@ fn eligible(c: &Config, s: &State, p: &Proposal) -> Result<()> {
             old,
             new,
         } => {
-            let resolution = rounded_deadline(s.clock, s.frozen.duration, s.frozen.interval)?;
+            let resolution = rounded_deadline(
+                s.clock,
+                s.frozen
+                    .decision_blocks
+                    .checked_mul(s.frozen.interval)
+                    .context("decision schedule overflow")?,
+                s.frozen.interval,
+            )?;
             let activation = rounded_deadline(resolution, s.frozen.rest, s.frozen.interval)?;
             c.parameter_change_at(&s.frozen, *parameter, *old, *new, activation)?;
         }
@@ -538,9 +689,19 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
         && s.clock - a.lead_since >= s.frozen.lead
     {
         let p = s.proposals.get(&id).unwrap().clone();
-        let schedule_valid = rounded_deadline(s.clock, s.frozen.duration, s.frozen.interval)
-            .and_then(|resolution| rounded_deadline(resolution, s.frozen.rest, s.frozen.interval));
-        if schedule_valid.is_ok() && eligible(c, s, &p.action).is_ok() {
+        let schedule_valid = rounded_deadline(
+            s.clock,
+            s.frozen
+                .decision_blocks
+                .checked_mul(s.frozen.interval)
+                .context("decision schedule overflow")?,
+            s.frozen.interval,
+        )
+        .and_then(|resolution| rounded_deadline(resolution, s.frozen.rest, s.frozen.interval));
+        if schedule_valid.is_ok()
+            && s.height.checked_add(s.frozen.decision_blocks).is_some()
+            && eligible(c, s, &p.action).is_ok()
+        {
             s.auction_escrow -= &p.support;
             s.world.revenue += &p.support;
             replenish_reserve(c, &mut s.world)?;
@@ -568,8 +729,9 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
                 proposal_id: id,
                 proposal: p.action,
                 started: s.clock,
-                duration: s.frozen.duration,
-                start_integral: s.world.price_integral.clone(),
+                started_height: s.height,
+                blocks: s.frozen.decision_blocks,
+                leading_blocks: 0,
             };
             let mut pass = s.world.clone();
             if let Proposal::Grant { payments } = &d.proposal {
@@ -593,8 +755,8 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
     }
     Ok(())
 }
-/// Equal full-window durations cancel; compare the integrals with exact integers.
-/// Equality at the threshold remains FAIL, including when both integrals are zero.
+/// Exact strict quote comparison for one block observation.
+/// Equality at the threshold does not award a leading block.
 pub fn pass_beats_fail(pass: &Amount, fail: &Amount, margin_bps: u64) -> bool {
     pass * Amount::from(10_000u32) > fail * (Amount::from(10_000u32) + Amount::from(margin_bps))
 }
@@ -616,72 +778,6 @@ mod margin_tests {
         assert!(!pass_beats_fail(&threshold, &fail, u64::MAX));
         assert!(pass_beats_fail(&(threshold + 1u32), &fail, u64::MAX));
     }
-
-    fn resolution(margin: u64, pass: u32, fail: u32) -> (Config, State) {
-        let mut c = Config::testnet();
-        c.initial.pass_margin_bps = Some(margin);
-        let mut state = State::genesis(&c);
-        state.clock = 100;
-        state.world.price_integral = fail.into();
-        let mut alternative = state.world.clone();
-        alternative.price_integral = pass.into();
-        state.alternative = Some(alternative);
-        state.phase = Phase::Governance(Decision {
-            id: [1; 32],
-            epoch: 1,
-            round: 1,
-            proposal_id: [2; 32],
-            proposal: Proposal::Parameter {
-                parameter: Parameter::PassMarginBps,
-                old: margin,
-                new: 20_000,
-            },
-            started: 0,
-            duration: 100,
-            start_integral: Amount::zero(),
-        });
-        (c, state)
-    }
-
-    #[test]
-    fn resolution_uses_existing_margin_and_defers_the_proposed_margin() {
-        for (margin, pass, expected) in [(0, 101, true), (500, 105, false), (500, 106, true)] {
-            let (c, mut state) = resolution(margin, pass, 100);
-            assert_eq!(resolve(&c, &mut state).unwrap(), expected);
-            let Phase::Rest(rest) = state.phase else {
-                panic!("rest expected")
-            };
-            assert_eq!(
-                rest.pending,
-                expected.then_some((Parameter::PassMarginBps, 20_000))
-            );
-            assert_eq!(state.settings.pass_margin_bps, Some(margin));
-        }
-    }
-
-    #[test]
-    fn resolution_clips_the_final_price_observation_to_its_deadline() {
-        let (mut c, mut state) = resolution(0, 1500, 1450);
-        c.quote_scale = 1u32.into();
-        state.clock = 108;
-        // These quotes apply for only the final seven seconds. Counting the
-        // complete 15-second interval would incorrectly change FAIL to PASS.
-        state.world.reserve = 90u32.into();
-        state.world.curve_mass = 90u32.into();
-        state.world.shares = 1u32.into();
-        let pass = state.alternative.as_mut().unwrap();
-        pass.reserve = 100u32.into();
-        pass.curve_mass = 100u32.into();
-        pass.shares = 1u32.into();
-        assert_eq!(state.world.quote(&c), 90u32.into());
-        assert_eq!(pass.quote(&c), 100u32.into());
-        assert!(pass_beats_fail(
-            &pass.price_integral,
-            &state.world.price_integral,
-            0
-        ));
-        assert!(!resolve(&c, &mut state).unwrap());
-    }
 }
 
 fn resolve(c: &Config, s: &mut State) -> Result<bool> {
@@ -689,21 +785,15 @@ fn resolve(c: &Config, s: &mut State) -> Result<bool> {
         bail!("resolution outside governance");
     };
     let pass = s.alternative.as_ref().unwrap();
-    let end = d
-        .started
-        .checked_add(d.duration)
-        .context("decision deadline overflow")?;
-    let excess = s.clock.checked_sub(end).context("decision has not ended")?;
-    let pass_score =
-        &pass.price_integral - pass.quote(c) * Amount::from(excess) - &d.start_integral;
-    let fail_score =
-        &s.world.price_integral - s.world.quote(c) * Amount::from(excess) - &d.start_integral;
+    ensure!(
+        s.height.checked_sub(d.started_height) == Some(d.blocks),
+        "decision has not ended"
+    );
     let funded = match &d.proposal {
         Proposal::Grant { payments } => pass.grant_escrow == c.validate_grant(payments)?,
         Proposal::Parameter { .. } => true,
     };
-    let margin = s.frozen.pass_margin_bps.unwrap_or(0);
-    let won = funded && pass_beats_fail(&pass_score, &fail_score, margin);
+    let won = funded && d.leading_blocks > d.blocks / 2;
     let alternative = s.alternative.take().unwrap();
     if won {
         s.world = alternative;
@@ -739,6 +829,18 @@ pub fn execute(
     subsidy: &Amount,
     transactions: &[Transaction],
 ) -> Result<State> {
+    Ok(execute_with_fills(c, parent, parent_hash, miner, subsidy, transactions)?.0)
+}
+
+/// Replay once and return the actual batch fills for explorers and wallets.
+pub fn execute_with_fills(
+    c: &Config,
+    parent: &State,
+    parent_hash: &Hash,
+    miner: &PublicKey,
+    subsidy: &Amount,
+    transactions: &[Transaction],
+) -> Result<(State, Vec<TradeFill>)> {
     ensure!(crypto::valid_key(miner), "invalid miner key");
     ensure!(
         transactions.len() <= c.max_signatures,
@@ -751,13 +853,16 @@ pub fn execute(
         crypto::verify(t)?;
         execution.apply_prepared_transaction(c, &prepared)?;
     }
-    finish_block(c, parent, parent_hash, miner, subsidy, execution)
+    finish_block_with_fills(c, parent, parent_hash, miner, subsidy, execution)
 }
 
 /// Completed time/phase transitions before the first user transaction.
 /// A single prepared state can admit independent atomic transaction attempts.
 pub(crate) struct BlockExecution {
     pub state: State,
+    opening: State,
+    spent: Spending,
+    trades: Vec<PendingTrade>,
     miner_fees: Amount,
     used_weight: u64,
     weight_limit: u64,
@@ -794,7 +899,9 @@ impl BlockExecution {
             .and_then(|n| n.checked_add(reserved_accounts * fees::ACCOUNT_WEIGHT))
             .ok_or_else(|| anyhow::anyhow!("block weight overflow"))?;
         ensure!(used <= self.weight_limit, "block exceeds weighted capacity");
-        apply_prepared_transaction(c, &mut self.state, prepared, Some(&quote))?;
+        let spent = reserve_inputs(&self.opening, &self.spent, prepared.transaction())?;
+        apply_prepared_transaction(c, &mut self.state, prepared, Some(&quote), &mut self.trades)?;
+        self.spent.extend(spent);
         self.used_weight += quote.weight;
         self.miner_fees += quote.miner_fee;
         Ok(())
@@ -820,17 +927,21 @@ pub(crate) fn prepare_block(
         .clock
         .checked_add(tau)
         .ok_or_else(|| anyhow::anyhow!("clock overflow"))?;
-    s.world.price_integral += parent.world.quote(c) * Amount::from(tau);
-    if let Some(w) = &mut s.alternative {
-        w.price_integral += parent.alternative.as_ref().unwrap().quote(c) * Amount::from(tau);
-    }
-    if let Phase::Governance(d) = &parent.phase
-        && s.clock
-            >= d.started
-                .checked_add(d.duration)
-                .context("decision deadline overflow")?
-    {
-        resolve(c, &mut s)?;
+    if let Phase::Governance(d) = &mut s.phase {
+        let pass = parent.alternative.as_ref().context("missing PASS world")?;
+        if pass_beats_fail(
+            &pass.quote(c),
+            &parent.world.quote(c),
+            parent.frozen.pass_margin_bps.unwrap_or(0),
+        ) {
+            d.leading_blocks = d
+                .leading_blocks
+                .checked_add(1)
+                .context("leading block overflow")?;
+        }
+        if s.height.checked_sub(d.started_height) == Some(d.blocks) {
+            resolve(c, &mut s)?;
+        }
     }
     // Grant settlement writes were paid for when proposed. The miner's account
     // still consumes ordinary capacity if settlement happened to create it.
@@ -852,7 +963,10 @@ pub(crate) fn prepare_block(
         "protocol account creation exceeds weighted capacity"
     );
     Ok(BlockExecution {
+        opening: s.clone(),
         state: s,
+        spent: BTreeMap::new(),
+        trades: Vec::new(),
         miner_fees,
         used_weight,
         weight_limit,
@@ -869,9 +983,23 @@ pub(crate) fn finish_block(
     subsidy: &Amount,
     execution: BlockExecution,
 ) -> Result<State> {
+    Ok(finish_block_with_fills(c, parent, parent_hash, miner, subsidy, execution)?.0)
+}
+
+fn finish_block_with_fills(
+    c: &Config,
+    parent: &State,
+    parent_hash: &Hash,
+    miner: &PublicKey,
+    subsidy: &Amount,
+    execution: BlockExecution,
+) -> Result<(State, Vec<TradeFill>)> {
     ensure!(crypto::valid_key(miner), "invalid miner key");
     let BlockExecution {
         state: mut s,
+        opening,
+        spent: _,
+        trades,
         miner_fees,
         mut used_weight,
         weight_limit,
@@ -882,6 +1010,7 @@ pub(crate) fn finish_block(
         *miner == prepared_miner,
         "block payout changed during execution"
     );
+    let fills = settle_trades(c, &opening, &mut s, &trades)?;
     c.check_amount(subsidy)?;
     let accounts_before = s.world.accounts.len();
     credit(&mut s, miner, subsidy, c)?;
@@ -937,7 +1066,7 @@ pub(crate) fn finish_block(
         s.ranking = crate::tree::Map::new();
     }
     s.validate(c)?;
-    Ok(s)
+    Ok((s, fills))
 }
 
 #[cfg(test)]
@@ -1145,7 +1274,7 @@ mod reserve_model_tests {
             &s,
             Operation::Deposit {
                 amount: 800_000u32.into(),
-                min_shares: 1u32.into(),
+
                 decision: None,
                 outcome: None,
             },
@@ -1223,7 +1352,8 @@ mod reserve_model_tests {
     }
     #[test]
     fn genesis_stash_redeems_completely_and_reopens_without_balance_conversion() {
-        let c = config();
+        let mut c = config();
+        c.initial.max_price_change_bps = 10_000;
         let genesis = State::genesis(&c);
         genesis.audit(&c).unwrap();
         assert!(matches!(&genesis.phase, Phase::Rest(r) if r.until == c.initial.rest));
@@ -1233,7 +1363,7 @@ mod reserve_model_tests {
             &s,
             Operation::Deposit {
                 amount: 300u32.into(),
-                min_shares: 1u32.into(),
+
                 decision: None,
                 outcome: None,
             },
@@ -1247,7 +1377,7 @@ mod reserve_model_tests {
             &s,
             Operation::Redeem {
                 shares: s.world.shares.clone(),
-                min_received: 300u32.into(),
+
                 decision: None,
                 outcome: None,
             },
@@ -1270,7 +1400,7 @@ mod reserve_model_tests {
             &s,
             Operation::Deposit {
                 amount: 30u32.into(),
-                min_shares: 1u32.into(),
+
                 decision: None,
                 outcome: None,
             },
@@ -1291,7 +1421,7 @@ mod reserve_model_tests {
             &s,
             Operation::Deposit {
                 amount: 300u32.into(),
-                min_shares: 1u32.into(),
+
                 decision: None,
                 outcome: None,
             },
@@ -1404,7 +1534,7 @@ mod reserve_model_tests {
             &pass,
             Operation::Deposit {
                 amount: 100_000u32.into(),
-                min_shares: 0u32.into(),
+
                 decision: pass.decision_id(),
                 outcome: Some(Outcome::Pass),
             },
@@ -1420,8 +1550,10 @@ mod reserve_model_tests {
 
     fn short_grant_rounds() -> Config {
         let mut c = config();
+        // This fixture isolates repeated reserve funding from trade throttling.
+        c.initial.max_price_change_bps = u64::MAX;
         c.initial.lead = c.initial.interval;
-        c.initial.duration = 3 * c.initial.interval;
+        c.initial.decision_blocks = 3;
         c.validate().unwrap();
         c
     }
@@ -1472,7 +1604,7 @@ mod reserve_model_tests {
             &s,
             Operation::Deposit {
                 amount: 100_000u32.into(),
-                min_shares: 0u32.into(),
+
                 decision: s.decision_id(),
                 outcome: Some(Outcome::Pass),
             },
@@ -1583,9 +1715,9 @@ mod reserve_model_tests {
                 &c,
                 &empty,
                 &Proposal::Parameter {
-                    parameter: Parameter::Duration,
-                    old: c.initial.duration,
-                    new: c.initial.duration + 1,
+                    parameter: Parameter::DecisionBlocks,
+                    old: c.initial.decision_blocks,
+                    new: c.initial.decision_blocks + 1,
                 }
             )
             .is_ok()

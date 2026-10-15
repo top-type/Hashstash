@@ -9,7 +9,7 @@
   function operationOf(tx) { const op = tx.operation; return op && typeof op === 'object' && Object.keys(op).length === 1 ? Object.values(op)[0] || {} : op || {}; }
   function outcomeLabel(value) {
     const outcome = value.outcome || operationOf(value).outcome, effect = effects[value.settlement?.effect];
-    return [outcome ? String(outcome).toUpperCase() : '', effect || ''].filter(Boolean).join(' · ');
+    return [outcome ? String(outcome).toUpperCase() : '', effect || '', {full:'Filled',partial:'Partial fill',unfilled:'Unfilled'}[value.fill_status] || ''].filter(Boolean).join(' · ');
   }
   function href(kind, value) { return `#explorer?${kind}=${encodeURIComponent(String(value))}`; }
   function create({ rpc, amountText, document = root.document, location = root.location }) {
@@ -34,8 +34,8 @@
     function amount(parent, value, asset = 'hash', denominator) {
       const result = add(parent, 'span', 'explorer-amount');
       try {
-        const display = asset === 'stash' ? `${root.HashstashShares.formatAmount(value)} stash` : root.HashstashAmounts.formatHash(value, denominator);
-        amountText(result, display); result.title = asset === 'stash' ? `${root.HashstashShares.exactInput(value)} stash` : root.HashstashAmounts.formatExactHash(value, denominator);
+        const display = (asset === 'stash' || asset === 'shares') ? `${root.HashstashShares.formatAmount(value)} stash` : root.HashstashAmounts.formatHash(value, denominator);
+        amountText(result, display); result.title = (asset === 'stash' || asset === 'shares') ? `${root.HashstashShares.exactInput(value)} stash` : root.HashstashAmounts.formatExactHash(value, denominator);
       } catch { result.textContent = '—'; }
       return result;
     }
@@ -184,7 +184,11 @@
         ['Confirmations', tx.status === 'confirmed' ? grouped(tx.confirmations) : undefined],
         ['From', tx.sender ? cell => link(cell, 'account', tx.sender, tx.sender, 'explorer-link explorer-full') : undefined],
         ['To', tx.recipient ? cell => link(cell, 'account', tx.recipient, tx.recipient, 'explorer-link explorer-full') : undefined],
-        ['Amount', value ? cell => amount(cell, value.value, value.asset) : undefined],
+        [tx.input_filled !== undefined ? 'Filled input' : ['deposit','redeem','Deposit','Redeem'].includes(tx.kind) ? 'Requested input' : 'Amount', value ? cell => amount(cell, value.value, value.asset) : undefined],
+        ['Fill', {full:'Filled',partial:'Partial fill',unfilled:'Unfilled'}[tx.fill_status]],
+        ['Requested input', tx.input_filled !== undefined ? cell => amount(cell, tx.input_requested, tx.asset || 'hash') : undefined],
+        ['Unfilled input returned', tx.input_unfilled !== undefined ? cell => amount(cell, tx.input_unfilled, tx.asset || 'hash') : undefined],
+        ['Received', tx.output !== undefined ? cell => amount(cell, tx.output, tx.output_asset || 'hash') : undefined],
         [tx.status === 'orphaned' ? 'Recorded fee' : tx.status === 'pending' ? 'Signed fee' : 'Fee paid', tx.fee !== null && tx.fee !== undefined ? cell => amount(cell, tx.fee) : undefined],
         [tx.fee_estimated ? 'Current minimum fee' : 'Minimum fee', tx.minimum_fee !== null && tx.minimum_fee !== undefined ? cell => amount(cell, tx.minimum_fee) : undefined],
         ['Above minimum', tx.extra_fee !== null && tx.extra_fee !== undefined ? cell => amount(cell, tx.extra_fee) : undefined],
@@ -280,7 +284,7 @@
           const grant = proposal.action?.Grant, parameter = proposal.action?.Parameter;
           if (grant) { record(section, [['Grant total', cell => amount(cell, grant.payments.reduce((sum,payment)=>sum+BigInt(payment.amount),0n).toString())]]);for(const payment of grant.payments)record(section,[['Recipient',cell=>link(cell,'account',payment.recipient)],['Amount',cell=>amount(cell,payment.amount)]]); }
           if (parameter) {
-            const unit = ['Interval', 'Lead', 'Rest', 'Duration'].includes(parameter.parameter) ? ' seconds' : '';
+            const unit = parameter.parameter === 'DecisionBlocks' ? ' blocks' : ['Interval', 'Lead', 'Rest'].includes(parameter.parameter) ? ' seconds' : '';
             record(section, [['Change', `${grouped(parameter.old)}${unit} → ${grouped(parameter.new)}${unit}`]]);
           }
           const explanation = root.HashstashProposalData?.verifiedText(proposal.description_text, proposal.description);
@@ -307,8 +311,10 @@
             ['Outcome', decision.outcome ? String(decision.outcome).toUpperCase() : 'In progress'],
             ['Started', cell => link(cell, 'block', decision.started_height, `Block ${grouped(decision.started_height)}`)],
             ['Resolved', decision.ended_height !== null && decision.ended_height !== undefined ? cell => link(cell, 'block', decision.ended_height, `Block ${grouped(decision.ended_height)}`) : undefined],
-            ['PASS average', decision.pass_average ? cell => price(cell, decision.pass_average) : undefined],
-            ['FAIL average', decision.fail_average ? cell => price(cell, decision.fail_average) : undefined],
+            ['PASS leading blocks', decision.leading_blocks === undefined ? undefined : grouped(decision.leading_blocks)],
+            ['Observed blocks', decision.observed_blocks === undefined ? undefined : grouped(decision.observed_blocks)],
+            ['Decision length', decision.blocks === undefined ? undefined : `${grouped(decision.blocks)} blocks`],
+            ['Remaining blocks', decision.blocks_remaining === undefined ? undefined : grouped(decision.blocks_remaining)],
             ['PASS margin', decision.pass_margin_bps !== undefined ? `${BigInt(decision.pass_margin_bps) / 100n}.${(BigInt(decision.pass_margin_bps) % 100n).toString().padStart(2, '0')}%` : undefined],
           ]);
         }

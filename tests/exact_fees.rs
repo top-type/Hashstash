@@ -184,10 +184,14 @@ fn invalid_transfer_operations_are_rejected_atomically_and_direct_data_is_bound(
     let valid = crypto::sign(&changed.body, &ALICE).unwrap();
     let next = step(&c, &s, &MINER, 0, &[valid]);
     assert_eq!(balance(&next, &BOB), 1u32.into());
-    assert_eq!(c.governance_parameters().len(), 8);
+    assert_eq!(c.governance_parameters().len(), 9);
     assert!(
         c.governance_parameters()
             .contains(&Parameter::MinimumFeeRate)
+    );
+    assert!(
+        c.governance_parameters()
+            .contains(&Parameter::MaxPriceChangeBps)
     );
 }
 
@@ -235,7 +239,7 @@ fn funded_curve(c: &Config) -> State {
         &ALICE,
         Operation::Deposit {
             amount: 999_900u32.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -254,7 +258,7 @@ fn funded_curve(c: &Config) -> State {
 }
 
 #[test]
-fn redemption_can_pay_from_proceeds_when_sender_has_no_liquid_hash() {
+fn redemption_requires_preexisting_fee_cash() {
     let c = config();
     let s = funded_curve(&c);
     assert!(balance(&s, &ALICE).is_zero());
@@ -264,7 +268,7 @@ fn redemption_can_pay_from_proceeds_when_sender_has_no_liquid_hash() {
         &ALICE,
         Operation::Redeem {
             shares,
-            min_received: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -272,8 +276,20 @@ fn redemption_can_pay_from_proceeds_when_sender_has_no_liquid_hash() {
         3,
         0,
     );
-    let quote = fees::quote(&c, &s, &tx).unwrap();
-    let next = step(&c, &s, &MINER, 0, &[tx]);
+    assert!(
+        consensus::execute(
+            &c,
+            &s,
+            &s.root(),
+            &key(&MINER),
+            &0u32.into(),
+            std::slice::from_ref(&tx)
+        )
+        .is_err()
+    );
+    let funded = step(&c, &s, &ALICE, 1_000, &[]);
+    let quote = fees::quote(&c, &funded, &tx).unwrap();
+    let next = step(&c, &funded, &MINER, 0, &[tx]);
     assert!(!balance(&next, &ALICE).is_zero());
     assert_eq!(balance(&next, &MINER), quote.miner_fee);
 }
@@ -326,7 +342,7 @@ fn conditional_trades_pay_one_common_fee_and_both_outcomes_preserve_account_stat
         &ALICE,
         Operation::Deposit {
             amount: 500u32.into(),
-            min_shares: Amount::zero(),
+
             decision: Some(id),
             outcome: Some(Outcome::Pass),
         },
@@ -366,7 +382,7 @@ fn successful_grant_creates_recipient_even_when_minimum_rate_exceeds_grant_amoun
         &ALICE,
         Operation::Deposit {
             amount: 100_000u32.into(),
-            min_shares: Amount::zero(),
+
             decision: Some(id),
             outcome: Some(Outcome::Pass),
         },
@@ -504,10 +520,16 @@ fn ordinary_heavy_transaction_queue_does_not_change_minimum_fee_rate() {
     c.limit_bits = c.initial_bits;
     let dir = tempfile::tempdir().unwrap();
     let mut chain = Chain::open(&dir.path().join("large-queue.sqlite"), c.clone()).unwrap();
-    for _ in 0..8 {
+    // Self-payments still reserve their gross amount and fee from opening cash;
+    // their incoming principal cannot be reused by another transaction here.
+    for _ in 0..12 {
         append(&mut chain, vec![]);
     }
     let s = chain.tip_state();
+    let opening_cash = balance(s, &ALICE);
+    let opening_issued = s.issued.clone();
+    let opening_revenue = s.world.revenue.clone();
+    assert!(opening_cash >= Amount::from(6000u32));
     let transactions: Vec<_> = (0..3000u64)
         .map(|nonce| transfer(s, key(&ALICE), 1, 1, 0, nonce))
         .collect();
@@ -527,6 +549,12 @@ fn ordinary_heavy_transaction_queue_does_not_change_minimum_fee_rate() {
     assert!(weight > c.initial.block_bytes / 2 && weight < c.initial.block_bytes);
     append(&mut chain, selection.transactions);
     assert_eq!(chain.tip_state().settings.minimum_fee_rate, 1);
+    let subsidy = &chain.tip_state().issued - opening_issued;
+    assert_eq!(
+        balance(chain.tip_state(), &ALICE),
+        opening_cash - 3000u32 + subsidy
+    );
+    assert_eq!(chain.tip_state().world.revenue, opening_revenue + 3000u32);
     eprintln!(
         "3000 ordinary transactions selected, mined, validated, and audited in {:?}",
         started.elapsed()
@@ -568,7 +596,7 @@ fn governed_capacity_change_applies_next_block_without_repricing_activation_tran
         &ALICE,
         Operation::Deposit {
             amount: 100_000u32.into(),
-            min_shares: Amount::zero(),
+
             decision: Some(id),
             outcome: Some(Outcome::Pass),
         },
@@ -668,7 +696,7 @@ fn governed_minimum_rate_changes_only_after_rest_and_leaves_signed_fee_exact() {
         &ALICE,
         Operation::Deposit {
             amount: 100_000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: s.decision_id(),
             outcome: Some(Outcome::Pass),
         },
@@ -718,7 +746,7 @@ fn prepaid_grant_settlement_leaves_capacity_but_new_miner_still_counts() {
         &ALICE,
         Operation::Deposit {
             amount: 100_000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: s.decision_id(),
             outcome: Some(Outcome::Pass),
         },
@@ -731,7 +759,7 @@ fn prepaid_grant_settlement_leaves_capacity_but_new_miner_still_counts() {
         let Phase::Governance(d) = &s.phase else {
             panic!("early resolution")
         };
-        if s.clock + s.settings.interval >= d.started + d.duration {
+        if s.height + 1 >= d.started_height + d.blocks {
             break;
         }
         s = step(&c, &s, &ALICE, 0, &[]);

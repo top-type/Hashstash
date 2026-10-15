@@ -16,7 +16,7 @@ async function setup(pass='1000',fail='400',options={}){
  Object.assign(s.status.settings,{pass_margin_bps:0,miner_fee_percent:50});
  s.status.fee_policy={minimum_fee_rate:'1',fee_scale:1024,account_weight:1024};
  s.governance.pass={...s.governance.world};
- s.governance.phase={Governance:{id:'d'.repeat(64),round:0,started:240,duration:240,start_integral:'0',proposal:{Parameter:{parameter:'Lead',old:60,new:120}}}};
+ s.governance.phase={Governance:{id:'d'.repeat(64),round:0,started:240,blocks:16,started_height:16,leading_blocks:0,proposal:{Parameter:{parameter:'Lead',old:60,new:120}}}};
  s.pass={...s.account,account:{...s.account.account,ordinary:pass}};
  s.fail={...s.account,account:{...s.account.account,ordinary:fail}};s.account=s.fail;
  h.handlers.fee_quote=p=>response({result:h.fee(p)});
@@ -77,7 +77,8 @@ async function run(){
   f.elements.outcome.value='Fail';await h.get('trade-outcome').fire('change');await h.get('trade-max').click();await h.timersDue();await h.timersDue();eq(amounts.parseAmount(f.elements.amount.value),'399','FAIL max uses own smaller balance');
  }
  {
-  const h=await setup('0','2'),f=h.get('trade-form');await h.tradeTab('redeem');await h.get('trade-max').click();await h.timersDue();await h.timersDue();eq(h.get('trade-submit').disabled,false,'withdrawal proceeds can fund selected-side fee');await f.requestSubmit();eq(h.wallet.at(-1).operation.Redeem.outcome,'Pass');
+  const h=await setup('0','2'),f=h.get('trade-form');await h.tradeTab('redeem');await h.get('trade-max').click();await h.timersDue();await h.timersDue();eq(h.get('trade-submit').disabled,true,'withdrawal proceeds cannot fund fees before the batch clears');await f.fire('submit');eq(h.wallet.length,0);
+  h.currentSnapshot.pass.account.ordinary='2';h.currentSnapshot.status.tip='d'.repeat(64);await h.refresh();await h.timersDue();await h.timersDue();eq(h.get('trade-submit').disabled,false,'existing cash in both outcomes covers the fee');await f.requestSubmit();eq(h.wallet.at(-1).operation.Redeem.outcome,'Pass');
   h.currentSnapshot.fail.account.ordinary='0';h.currentSnapshot.status.tip='e'.repeat(64);await h.refresh();await h.timersDue();await h.timersDue();eq(h.get('trade-submit').disabled,true,'withdrawal cannot fund fee in opposite outcome');
  }
  {

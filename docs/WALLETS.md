@@ -2,7 +2,7 @@
 
 ## Wallet setup in the app
 
-The network phase and its remaining duration are visible beside or below the Hashstash name on every page. It shows Rest, Auction or Governance. Click it to open the relevant details. **Explorer → Network → Phase timing** lists the current cycle’s durations. Governance timing uses scheduled seconds: each new block advances the clock by the target block interval in force for that block. A shorter target therefore needs more blocks to complete the same duration. These are nominal durations, not wall-clock deadlines; a stopped chain does not advance them.
+The network phase is visible beside the Hashstash name on every page. Click Rest, Auction or Governance to open its details. **Explorer → Network → Phase timing** shows the current schedule. Decisions last a fixed number of blocks, and each block counts once. Auction lead and rest use scheduled seconds, advanced by each block’s target interval. Wall-clock estimates depend on mining; a stopped chain does not advance.
 
 A new browser profile, site, or network starts with no saved wallets or selected account. You can browse the network without creating a wallet. Open **Wallet** in the main navigation. The three actions are:
 
@@ -52,19 +52,21 @@ If the proposal reaches a decision, PASS escrows the combined amount. If PASS wi
 
 ## Governance settings
 
-Choose a setting and enter its exact new value. **Target block interval** and **Governance duration** use positive whole seconds. **Auction lead** and **Rest** use whole seconds and allow zero. **Block capacity** uses weight and must be at least 1,024 to cover a new mining account. **Minimum fee rate** uses whole raw hash atoms per 1,024 weight and allows zero. **Miner fee share** is a whole percentage from 0 through 100; revenue receives the remainder. **PASS margin** uses percentages in exact 0.01% steps, including zero and values above 100%.
+Choose a setting and enter its exact new value. **Target block interval** uses positive whole seconds. **Decision length** uses a positive whole number of blocks. **Auction lead** and **Rest** use whole seconds and allow zero. **Block capacity** uses weight and must be at least 1,024 to cover a new mining account. **Minimum fee rate** uses whole raw hash atoms per 1,024 weight and allows zero. **Miner fee share** is a whole percentage from 0 through 100. **PASS margin** and **Price change per block** accept percentages in exact 0.01% steps, including zero and values above 100%. The initial price-change limit is 10% per block.
 
-Values must fit unsigned 64-bit integers, block capacity must fit the implementation's allocation representation, and future clocks and deadlines must remain representable. A decision shorter than a block interval can resolve before any conditional trade is included. The node checks these conditions against the current state; see the [parameter rules](CONSENSUS.md#transactions-and-parameters).
+Values must fit unsigned 64-bit integers; block capacity must also fit the implementation’s allocation representation. Clocks, heights and future phase boundaries must remain representable. A one-block decision resolves before any trade included in its closing block can influence the result. See the [parameter rules](CONSENSUS.md#transactions-and-parameters).
 
-The active decision and rest period keep their frozen settings; approved changes affect the following cycle. Phase durations are scheduled seconds, so changing the block interval changes the number of blocks they span. Minimum fee rate starts at one in the presets; block usage does not adjust it.
+The active decision and rest period keep their frozen settings; approved changes affect the following cycle. Changing the target interval changes approximate wall time, not the number of blocks in an active decision. Minimum fee rate starts at one in the presets; block usage does not adjust it.
 
 The browser preserves every digit of the entered integer or margin percentage when quoting, exporting and signing. Offline review shows the exact old and proposed values. Signing verifies the canonical bytes; the node checks the proposal against the current settings, phase and schedule before accepting it.
 
 ## Deposits and withdrawals
 
-Deposits exchange hashes for stash; withdrawals burn stash and return hashes. During Rest and Auction, trades use the shared reserve. During Governance, each trade selects the PASS or FAIL reserve. A deposit into an empty reserve opens a flat curve at the configured share scale.
+Deposits exchange hashes for stash; withdrawals burn stash and return hashes. Enter only the input amount. During Rest and Auction, orders use the shared reserve. During Governance, each order selects PASS or FAIL. A deposit into an empty reserve opens a flat curve at the configured share scale.
 
-Outside governance, a Stash withdrawal can pay its fee from the returned hashes. Preparing or signing a transaction does not freeze its balances, quote or inclusion conditions.
+Orders included in the same block clear together at one execution price per world. The batch respects the governed price-change limit, initially 10% from the previous closing price. Excess input on a constrained side fills proportionally. An order can fill fully, partly, or not at all; unused input stays in your balance. Included orders do not remain open for another block. The preview is an estimate, and other orders in the same batch can change it.
+
+Fees require hashes already available before the block begins, in both outcomes during a decision. Withdrawal proceeds and incoming transfers in that block cannot fund an order or its fee. Signing fixes the input, fee and expiry; it does not guarantee an output. Explorer shows the actual fill and returned input.
 
 ## Cold signing
 
@@ -89,13 +91,13 @@ Choose **Export watch-only account** to save the watch-only descriptor. Copy onl
 ## Prepare, sign, broadcast
 
 1. In the watch-only interface, use Payments, Stash, or Governance forms. **Prepare transaction** opens an unsigned export. Copy it or download its file.
-2. Bring the export to the cold computer. Import or paste it, then choose **Review**. The tool decodes the transaction itself and displays every signed field. Hash amounts, fees, and minimums use exact hash decimals with every signed raw hash atom preserved; Stash quantities use exact stash decimals with every share atom preserved. Raw share atoms remain in the collapsed technical details.
+2. Bring the export to the cold computer. Import or paste it, then choose **Review**. The tool decodes the transaction itself and displays every signed field. Hash amounts and fees use exact hash decimals with every signed raw hash atom preserved; Stash quantities use exact stash decimals with every share atom preserved. Raw share atoms remain in the collapsed technical details.
 3. Choose **Sign transaction**, then copy or export the signed result.
 4. On the online computer, open **Payments → Advanced → Broadcast signed transaction**, paste or import the signed result, and choose **Broadcast**.
 
 The signer checks the transaction format and matching sender. It cannot check live balances, governance state, or whether a nonce or expiry is still usable; the online node validates those when broadcasting and including the transaction. Editing or replacing the unsigned input clears its previous review. Signing consumes that review.
 
-Both hot and watch-only wallets offer this broadcast control. Transaction expiry is configurable under **Payments → Advanced → Transaction expiry** in blocks and defaults to 100.
+Both hot and watch-only wallets offer this broadcast control. Stash orders default to a two-block expiry, editable under **Order expiry** in the trade form. Other transactions default to 100 blocks under **Payments → Advanced → Transaction expiry**. Expiry governs how long an order can wait for inclusion; the price limit applies separately to each block, so it can compound while an order waits.
 
 ## Advanced startup options
 
@@ -122,7 +124,7 @@ Move `unsigned.json` to the cold tool, review and sign it, then bring its signed
 
 Preparation fills the chain identity, next available nonce, exact total fee, operation, data and expiry. Add `--data-hex 00ff80` to `prepare`, `send`, or `transfer` to attach exact bytes; omit it for empty data. Use `--extra-fee` to add an amount to the quoted minimum, or `--fee` to choose the exact total instead; these options are mutually exclusive. The entire signed fee follows the governed split. The optional extra is not independently encoded in the signed record. Preparation includes transactions already pending at that node when choosing the nonce. Preparing does not reserve a nonce or send a transaction. Two unbroadcast preparations may therefore use the same nonce; only one can be executed. Prepare again if the account changes or the signed transaction expires.
 
-`preparetransaction` accepts `{sender, operation, fee?, extra_fee?, expiry_blocks?, nonce?, expiry_height?, data_hex?}` with a direct operation. Specify either the exact `fee` or quote-builder `extra_fee`, never both. Omitted extra is zero, so an omitted fee quotes the required minimum. `expiry_blocks` defaults to 100. Browser forms provide explicit nonce and expiry height so they can verify those fields independently. The response contains the unsigned export plus `fee_quote`; save only `format` and `body` for the strict offline export, as the CLI and browser do. The quote reports `fee`, `minimum_fee`, `account_creation_fee`, `extra_fee`, `weight`, `minimum_fee_rate`, `miner_fee`, `revenue_fee` and `miner_fee_percent`, plus operation identity and exact lowercase `data_hex`/`data_bytes`. `extra_fee` describes the difference between the exact fee and the quoted minimum. `broadcasttransaction` accepts `{raw}` and returns `transaction_id`. Normal consensus validation applies before acceptance.
+`preparetransaction` accepts `{sender, operation, fee?, extra_fee?, expiry_blocks?, nonce?, expiry_height?, data_hex?}` with a direct operation. Specify either the exact `fee` or quote-builder `extra_fee`, never both. Omitted extra is zero, so an omitted fee quotes the required minimum. `expiry_blocks` defaults to 2 for Deposit/Redeem and 100 for other operations. Browser forms provide explicit nonce and expiry height so they can verify those fields independently. The response contains the unsigned export plus `fee_quote`; save only `format` and `body` for the strict offline export, as the CLI and browser do. The quote reports `fee`, `minimum_fee`, `account_creation_fee`, `extra_fee`, `weight`, `minimum_fee_rate`, `miner_fee`, `revenue_fee` and `miner_fee_percent`, plus operation identity and exact lowercase `data_hex`/`data_bytes`. `extra_fee` describes the difference between the exact fee and the quoted minimum. `broadcasttransaction` accepts `{raw}` and returns `transaction_id`. Normal consensus validation applies before acceptance.
 
 The browser manager does not call server-wallet endpoints. It serializes local storage updates with Web Locks and checks a wallet revision before importing, selecting, exporting, signing or decrypting mail. Only public account details, quote/preparation requests, encrypted mail and signed transaction bytes go to the node. Normal wallet pages do not submit mining work or configure a mining recipient.
 
@@ -148,7 +150,7 @@ Signed exports are canonical `Transaction` bytes in hexadecimal, with surroundin
 
 Mail encrypts subject and message locally for the sender and recipient using their existing account keys. See [encrypted mail](MAIL.md) for the format, visibility and recovery limits. Chat remains public. Never paste a private key into a recipient field.
 
-Every account takes part in both governance outcomes automatically. Each outcome has its own cash and stash. Deposit or withdraw directly in PASS or FAIL. Only the winning outcome survives. Ordinary payments debit both cash balances, so the payment ceiling is their minimum, before fees. Every fee also needs funding in both outcomes: a selected-outcome withdrawal can use its proceeds for that side, while the other side must already cover the fee. Use max reserves the exact quoted fee on the selected side and checks the other side. Outcome totals are alternatives, never a sum. Governance keeps personal holdings separate from public prices and reserves.
+Every account takes part in both governance outcomes automatically. Each outcome has its own cash and stash. Deposit or withdraw directly in PASS or FAIL. Only the winning outcome survives. Ordinary payments debit both cash balances, so the payment ceiling is their minimum, before fees. Every fee needs hashes already available in both outcomes before the block begins. Withdrawal proceeds cannot pay that fee. Use max reserves the exact quoted fee and checks both cash balances. Outcome totals are alternatives, never a sum. Governance keeps personal holdings separate from public prices and reserves.
 
 Outcome trading binds the transaction to the active decision and selected PASS or FAIL state.
 

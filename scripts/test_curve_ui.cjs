@@ -14,7 +14,7 @@ let checks = 0;
 const eq = (actual, expected, message) => { assert.deepEqual(actual, expected, message); checks++; };
 const ok = (value, message) => { assert.ok(value, message); checks++; };
 const near = (actual, expected, message) => { ok(Math.abs(actual - expected) < 1e-10, message); };
-const world = (reserve, mass, supply = shareUnit) => ({reserve: String(reserve), curve_mass: String(mass), shares: String(supply), revenue: '0', grant_escrow: '0', price_integral: '0'});
+const world = (reserve, mass, supply = shareUnit) => ({reserve: String(reserve), curve_mass: String(mass), shares: String(supply), revenue: '0', grant_escrow: '0'});
 const nodes = (svg, className) => svg.children.filter(child => child.class === className);
 const coords = element => [...element.d.matchAll(/[ML](-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/g)].map(match => [Number(match[1]), Number(match[2])]);
 
@@ -84,7 +84,7 @@ async function run() {
   s.governance.world.reserve = String(hashUnit/2n); await h.refresh();
   eq(svg.dataset.exponent,'5');eq(h.get('curve-price').textContent,'3','reserve-only change preserves current marginal price');
 
-  s.governance.phase = {Governance: {id:'ef'.repeat(32),proposal_id:'ab'.repeat(32),round:0,started:0,duration:240,start_integral:'0',proposal:{Grant:{payments:[{recipient:'12'.repeat(32),amount:'10'}]}}}};
+  s.governance.phase = {Governance: {id:'ef'.repeat(32),proposal_id:'ab'.repeat(32),round:0,started:0,blocks:16,started_height:16,leading_blocks:0,proposal:{Grant:{payments:[{recipient:'12'.repeat(32),amount:'10'}]}}}};
   s.governance.pass = world(hashUnit,5n*hashUnit);
   await h.refresh();await h.navigate('#stash');
   eq(h.get('stash-trading').parentElement.id,'governance-trade-mount');

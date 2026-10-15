@@ -2,7 +2,7 @@
 
 Hashstash is a proof-of-work blockchain with two kinds of holdings: **hashes**, which you can spend, and **stash**, which you obtain by depositing hashes into a shared reserve. Its governance system uses trading in two possible outcomes—PASS and FAIL—to decide grants and changes to network settings.
 
-This repository contains the node, browser wallet, explorer, messaging tools and an optional faucet service. The current version is **0.38.0**. It is experimental software; its security and economic design have not received a complete independent audit.
+This repository contains the node, browser wallet, explorer, messaging tools and an optional faucet service. The current version is **0.39.0**. It is experimental software; its security and economic design have not received a complete independent audit.
 
 ## How it works
 
@@ -14,7 +14,7 @@ Hashes pay for transfers, Stash deposits, proposal bids and transaction fees. A 
 
 ### Stash draws its value from a reserve
 
-Depositing hashes adds them to the shared reserve and creates stash for the depositor. Withdrawing burns stash and returns hashes from that reserve. The conversion follows a mathematical curve, and the wallet quotes the amount you will receive before you sign. Stash stays in its owner's account; payments use hashes.
+Depositing hashes adds them to the shared reserve and creates stash for the depositor. Withdrawing burns stash and returns hashes from that reserve. Each block clears its buy and sell orders together against a mathematical curve. You specify only the amount to buy with or sell; the wallet shows an estimate before you sign. The price can move at most 10% per block by default, a setting governance can change. Orders that would exceed the bound receive proportional partial fills, with unused inputs returned. Stash stays in its owner's account; payments use hashes.
 
 The curve starts at a fixed exchange rate. When governance draws a grant from the reserve, the curve becomes more sensitive to trading: deposits raise its price and withdrawals lower it. Grant funding leaves the current quoted price and everyone's stash quantities unchanged, but reduces the hashes available to back withdrawals. A displayed stash value is therefore an estimate at the current price; the amount received from a withdrawal depends on its size and fees.
 
@@ -35,9 +35,9 @@ During the decision, the chain maintains two versions of its balances and reserv
 
 Each account starts with its full holdings in both versions. You can trade stash separately in each outcome. Ordinary payments and fees apply to both, so you must have enough hashes in each. These are alternative futures: when the decision ends, one becomes the continuing state and the other is discarded.
 
-The network compares the average stash price across the full decision period. PASS must exceed FAIL by the configured margin; a tie means FAIL. A passing grant pays its recipients at settlement. A passing setting change takes effect after the following rest period. The price comparison is the decision rule, not proof that a proposal is beneficial.
+The network counts the blocks in which PASS’s closing Stash price exceeds FAIL’s by the configured margin. PASS must lead in more than half of the decision’s blocks; a tied block counts for neither side, and a tied decision fails. A passing grant pays its recipients at settlement. A passing setting change takes effect after the following rest period. The price comparison is the decision rule, not proof that a proposal is beneficial.
 
-Governance timing uses a clock advanced by each block's target interval. Actual waiting time depends on mining. The [protocol specification](docs/SPECIFICATION.md) lists the settings, permitted ranges, funding rules and exact settlement calculation.
+Decision length is a number of blocks. Auction and rest timing use a clock advanced by each block's target interval. Actual waiting time depends on mining. The [protocol specification](docs/SPECIFICATION.md) lists the settings, permitted ranges, funding rules and exact settlement calculation.
 
 ## Using Hashstash
 

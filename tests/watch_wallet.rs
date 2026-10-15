@@ -232,7 +232,7 @@ fn every_operation_uses_the_offline_route_including_governance() {
         &secret,
         Operation::Deposit {
             amount: 150u32.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -252,7 +252,7 @@ fn every_operation_uses_the_offline_route_including_governance() {
         &secret,
         Operation::Redeem {
             shares,
-            min_received: 0u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -306,7 +306,7 @@ fn every_operation_uses_the_offline_route_including_governance() {
         &secret,
         Operation::Deposit {
             amount: 2u32.into(),
-            min_shares: 1u32.into(),
+
             decision: Some(decision),
             outcome: Some(Outcome::Pass),
         },
@@ -329,7 +329,7 @@ fn every_operation_uses_the_offline_route_including_governance() {
         &secret,
         Operation::Redeem {
             shares,
-            min_received: 0u32.into(),
+
             decision: Some(decision),
             outcome: Some(Outcome::Pass),
         },

@@ -21,7 +21,7 @@ fn config(percent: u64) -> Config {
     let mut c = Config::testnet();
     c.initial.miner_fee_percent = Some(percent);
     c.initial.lead = 2 * c.initial.interval;
-    c.initial.duration = 12 * c.initial.interval;
+    c.initial.decision_blocks = 12;
     c.initial.rest = 4 * c.initial.interval;
     c.validate().unwrap();
     c
@@ -88,7 +88,7 @@ fn funded_curve(c: &Config) -> State {
         &OWNER,
         Operation::Deposit {
             amount: 800_000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -220,7 +220,7 @@ fn the_same_fee_allocation_is_conserved_in_both_automatic_outcomes() {
         );
         let op = Operation::Deposit {
             amount: 100_000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: s.decision_id(),
             outcome: Some(Outcome::Pass),
         };
@@ -269,7 +269,7 @@ fn a_winning_percentage_stays_frozen_through_rest_and_activates_after_its_last_b
         &OWNER,
         Operation::Deposit {
             amount: 200_000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: s.decision_id(),
             outcome: Some(Outcome::Pass),
         },
@@ -504,7 +504,7 @@ fn governed_fee_activation_reorg_and_database_reopen_are_exact() {
         &OWNER,
         Operation::Deposit {
             amount: 1900u32.into(),
-            min_shares: 1u32.into(),
+
             decision: s.decision_id(),
             outcome: Some(Outcome::Pass),
         },

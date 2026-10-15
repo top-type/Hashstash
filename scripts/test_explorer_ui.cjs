@@ -38,7 +38,7 @@ function harness() {
     explorer_transaction: { ...ctx, transaction: tx },
     explorer_transactions: { ...ctx, transactions: [tx], pending: [], next_cursor: '12:0' },
     explorer_account: { ...ctx, address, public_key: publicKey, account: { ordinary: '1000', shares: '2000000000000000000', nonce: 1 }, stash_value_hash: { numerator: '3000', denominator: '1' }, stash_withdrawal_hash: '2000', history: [{ height: 12, block_hash: blockHash, kind: 'mining_reward', amount: '1000000000000', asset: 'hash' }], pending: [], next_cursor: null },
-    explorer_governance: { ...ctx, phase: 'rest', proposals: [{ id: proposal, round: 0, description: 'f'.repeat(64), action: { Grant: { payments: [{recipient:Array(32).fill(18),amount:'1000'}] } }, support: '100', created_height: 5 }], decisions: [{ id: 'f'.repeat(64), proposal, started: 105, started_height: 7, ended_height: 10, outcome: 'pass', pass_average: { numerator: '2', denominator: '1' }, fail_average: { numerator: '1', denominator: '1' }, pass_margin_bps: 0 }], contributions: [{ txid, height: 5, sender: address, amount: '100' }], next_cursor: null, next_before_height: null },
+    explorer_governance: { ...ctx, phase: 'rest', proposals: [{ id: proposal, round: 0, description: 'f'.repeat(64), action: { Grant: { payments: [{recipient:Array(32).fill(18),amount:'1000'}] } }, support: '100', created_height: 5 }], decisions: [{ id: 'f'.repeat(64), proposal, started: 105, started_height: 7, ended_height: 10, outcome: 'pass', blocks:3, observed_blocks:3, leading_blocks:2, blocks_remaining:0, pass_margin_bps: 0 }], contributions: [{ txid, height: 5, sender: address, amount: '100' }], next_cursor: null, next_before_height: null },
   };
   const api = create({ document, location, amountText: (n, value) => { n.textContent = value; }, rpc: async (method, params) => { calls.push({ method, params }); const value = replies[method]; if (typeof value === 'function') return value(params); if (value instanceof Error) throw value; return value; } });
   return { get, location, calls, replies, api, tabs, content: get('explorer-content'), navigate: async hash => { location.hash = hash; api.route(); await settle(); } };
@@ -96,6 +96,21 @@ async function run() {
   assert.match(h.content.textContent, /Recorded fee0\.000000000000000009 hash/); checks++;
   assert.equal(h.content.textContent.includes('Fee paid'), false); checks++;
 
+  for (const kind of ['deposit','redeem']) for (const fill of ['full','partial','unfilled']) {
+    const input=fill==='full'?'1000':fill==='partial'?'400':'0',output=String(BigInt(input)*2n),asset=kind==='deposit'?'hash':'stash';
+    h.replies.explorer_transaction={...ctx,transaction:{...tx,kind,amount:input,asset,input_requested:'1000',input_filled:input,input_unfilled:String(1000n-BigInt(input)),output,output_asset:kind==='deposit'?'shares':'hash',fill_status:fill,operation:{[kind==='deposit'?'Deposit':'Redeem']:{[kind==='deposit'?'amount':'shares']:'1000'}}}};
+    await h.navigate('#explorer?tx='+txid);
+    assert.match(h.content.textContent,/Filled input/);checks++;
+    assert.match(h.content.textContent,/Requested input/);checks++;
+    assert.match(h.content.textContent,/Unfilled input returned/);checks++;
+    assert.match(h.content.textContent,kind==='deposit'?/Received[^A-Za-z]*stash/:/Received[^A-Za-z]*hash/,'received output uses its actual asset denomination');checks++;
+    assert.ok(h.content.textContent.includes({full:'FillFilled',partial:'FillPartial fill',unfilled:'FillUnfilled'}[fill]));checks++;
+  }
+  h.replies.explorer_transaction={...ctx,transaction:{...tx,kind:'deposit',status:'pending',operation:{Deposit:{amount:'1000'}}}};
+  await h.navigate('#explorer?tx='+txid);
+  assert.match(h.content.textContent,/Requested input/);checks++;
+  assert.doesNotMatch(h.content.textContent,/Filled input|Unfilled input returned/);checks++;
+
   h.replies.explorer_transactions.pending = [{ ...tx, status: 'pending', height: null }];
   await h.navigate('#explorer?view=transactions');
   assert.match(h.content.textContent, /Pending transactions/); checks++;
@@ -120,7 +135,7 @@ async function run() {
   await h.navigate('#explorer?governance=' + proposal);
   assert.match(h.content.textContent, /Description commitment/); checks++;
   assert.match(h.content.textContent, /OutcomePASS/); checks++;
-  assert.match(h.content.textContent, /PASS average2 hash\/stash/); checks++;
+  assert.match(h.content.textContent, /PASS leading blocks2/); checks++;
   assert.ok(links(h).some(n => n.href === '#explorer?account=' + address)); checks++;
   assert.equal(links(h).some(n => n.href.includes('18%2C18')), false, 'proposal recipients are encoded addresses'); checks++;
 
@@ -210,9 +225,9 @@ async function run() {
   h.replies.explorer_governance.decisions[0].started_height=null;
   await h.navigate('#explorer?governance='+proposal);
   assert.equal(links(h).some(n=>n.href.startsWith('#explorer?block=')),false,'unknown start height has no fabricated link');checks++;
-  h.replies.explorer_governance.proposals=[{id:proposal,round:0,action:{Parameter:{parameter:'Duration',old:600,new:1200}},support:'1'}];
+  h.replies.explorer_governance.proposals=[{id:proposal,round:0,action:{Parameter:{parameter:'DecisionBlocks',old:600,new:1200}},support:'1'}];
   await h.navigate('#explorer?governance='+proposal);
-  assert.ok(h.content.textContent.includes('600 seconds → 1,200 seconds'),'duration proposals label their consensus unit');checks++;
+  assert.ok(h.content.textContent.includes('600 blocks → 1,200 blocks'),'decision length proposals label their consensus unit');checks++;
   console.log(`Explorer UI: ${checks} behavior assertions passed.`);
 }
 run().catch(error => { console.error(error); process.exitCode = 1; });

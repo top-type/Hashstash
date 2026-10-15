@@ -19,7 +19,7 @@ fn recipient() -> PublicKey {
 fn config(duration: u64) -> Config {
     let mut c = Config::testnet();
     c.initial.lead = 2 * c.initial.interval;
-    c.initial.duration = duration * c.initial.interval;
+    c.initial.decision_blocks = duration;
     c.initial.rest = 4 * c.initial.interval;
     c.validate().unwrap();
     c
@@ -50,7 +50,7 @@ fn funded_curve(c: &Config) -> State {
         &s,
         Operation::Deposit {
             amount: 1_000_000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -119,14 +119,13 @@ fn whole_grant_is_reserved_at_opening_and_tied_prices_fail() {
             &s.world.reserve + &s.world.revenue
         );
         let reserve = pass.reserve.clone();
-        let mut expected_integral = Amount::zero();
         for elapsed in 0..duration {
             assert_eq!(s.clock - d.started, elapsed * c.initial.interval);
             let pass = s.alternative.as_ref().unwrap();
             assert_eq!(pass.grant_escrow, amount.into());
             assert_eq!(pass.reserve, reserve);
             assert_eq!(pass.quote(&c), s.world.quote(&c));
-            expected_integral += s.world.quote(&c) * c.initial.interval;
+            assert!(matches!(&s.phase, Phase::Governance(d) if d.leading_blocks == 0));
             if elapsed + 1 < duration {
                 s = step(&c, &s, 1, &[]);
             }
@@ -135,7 +134,7 @@ fn whole_grant_is_reserved_at_opening_and_tied_prices_fail() {
             &s,
             Operation::Deposit {
                 amount: 1u64.into(),
-                min_shares: 1u64.into(),
+
                 decision: Some(d.id),
                 outcome: Some(Outcome::Pass),
             },
@@ -146,10 +145,7 @@ fn whole_grant_is_reserved_at_opening_and_tied_prices_fail() {
         let closed = step(&c, &s, 1, &[]);
         assert!(matches!(closed.phase, Phase::Rest(_)));
         assert!(closed.alternative.is_none());
-        assert_eq!(
-            &closed.world.price_integral - &d.start_integral,
-            expected_integral
-        );
+        assert_eq!(closed.height - d.started_height, duration);
         assert!(closed.account(&recipient(), None).is_none());
         assert!(closed.world.grant_escrow.is_zero());
     }
@@ -180,7 +176,7 @@ fn pass_trade_can_win_and_release_escrow_exactly_once() {
         &s,
         Operation::Deposit {
             amount: 100_000u64.into(),
-            min_shares: 1u64.into(),
+
             decision: s.decision_id(),
             outcome: Some(Outcome::Pass),
         },

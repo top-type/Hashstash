@@ -26,23 +26,26 @@ fn checked_in_presets_are_exact_current_configs() {
 fn preset_chain_ids_match_independent_encoding() {
     // Independently packed: length-prefixed network name, variable-width
     // little-endian integers in Config field order, magnitude byte vectors for
-    // amounts, and presence bytes before the two optional percentages.
+    // amounts, then Settings in declaration order: block_bytes, fee rate,
+    // interval, lead, rest, decision_blocks, max_price_change_bps, and the
+    // presence-prefixed miner percentage and PASS margin. These vectors were
+    // packed with a separate Python integer/byte encoder, not Rust serialization.
     // Expected IDs use SHA256(SHA256(tag) || SHA256(tag) || encoded_config).
     for (c, encoded, expected) in [
         (
             Config::devnet(),
-            "106861736873746173682d6465766e6574fc800e8069fcffff7f20fcffff7f20fb84030b78fb0010fcfffffffffb0002fb0002fb00200d00000040eaed7446d09c2c9f0c08000064a7b3b6e00dfb8007fb0040010f3cfbc003fbe00101320100",
-            "511c2a230ca56b8e88761191e4b3dce0bd615fc356cb64d12766f6315857b6ac",
+            "106861736873746173682d6465766e6574fc800e8069fcffff7f20fcffff7f20fb84030b78fb0010fcfffffffffb0002fb0002fb00200d00000040eaed7446d09c2c9f0c08000064a7b3b6e00dfb8007fb0040010f3cfbc00320fbe80301320100",
+            "346c56f05e5c6be263d1bc62f0962c98bf91d344d919276ebafb26ffbb94a7b3",
         ),
         (
             Config::testnet(),
-            "116861736873746173682d746573746e6574fc800e8069fcffff7f20fcffff7f20fb84030b78fb0010fcfffffffffb0002fb0002fb00200d00000040eaed7446d09c2c9f0c08000064a7b3b6e00dfbe001fb0040010f3cfbe001f001320100",
-            "bb57388852720849e037ee5181cb8dff588b253c4fe8e66e2b9a87f83ebe99c4",
+            "116861736873746173682d746573746e6574fc800e8069fcffff7f20fcffff7f20fb84030b78fb0010fcfffffffffb0002fb0002fb00200d00000040eaed7446d09c2c9f0c08000064a7b3b6e00dfbe001fb0040010f3cfbe00110fbe80301320100",
+            "9a6078be48527f3b77bd119c7ee5bd1e67d37dcbf5358f2af248f968c7ce0498",
         ),
         (
             Config::slow_testnet(),
-            "166861736873746173682d736c6f772d746573746e6574fc800e8069fcffff7f20fcffff7f20fb84030b78fb0010fcfffffffffb0002fb0002fb00200d00000040eaed7446d09c2c9f0c08000064a7b3b6e00dfb100efb0040010ffb2c01fb302afb100e01320100",
-            "888fcdfda274eacc884acb4f7507c351afd4980d73df0bc5b331a57fbf48b174",
+            "166861736873746173682d736c6f772d746573746e6574fc800e8069fcffff7f20fcffff7f20fb84030b78fb0010fcfffffffffb0002fb0002fb00200d00000040eaed7446d09c2c9f0c08000064a7b3b6e00dfb100efb0040010ffb2c01fb302af0fbe80301320100",
+            "c92cfeea6d5eb179c053e347ef913f438efb2eadbd5211a9fe3e8b88dd1e12aa",
         ),
     ] {
         c.validate().unwrap();
@@ -108,11 +111,18 @@ fn governance_timing_uses_arithmetic_domains() {
                 .is_err()
         );
     }
-    for duration in [1, config.initial.interval, u64::MAX] {
+    for duration in [
+        1,
+        config.initial.interval,
+        u64::MAX / config.initial.interval,
+    ] {
         let mut changed = config.clone();
-        changed.initial.duration = duration;
+        changed.initial.decision_blocks = duration;
         changed.validate().unwrap();
     }
+    let mut overflowing = config.clone();
+    overflowing.initial.decision_blocks = u64::MAX / config.initial.interval + 1;
+    assert!(overflowing.validate().is_err());
 }
 
 #[test]
@@ -207,7 +217,7 @@ fn database_reopen_requires_the_exact_genesis_configuration() {
     changed.genesis_time += 1;
     assert!(hashstash::chain::Chain::open(&path, changed).is_err());
     let mut changed = config.clone();
-    changed.initial.duration += 1;
+    changed.initial.decision_blocks += 1;
     assert!(hashstash::chain::Chain::open(&path, changed).is_err());
 
     let chain = hashstash::chain::Chain::open(&path, config).unwrap();

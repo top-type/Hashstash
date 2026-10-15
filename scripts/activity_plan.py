@@ -162,8 +162,8 @@ def common_cash(snapshot, actor):
 def cash_guard(snapshot, actor, operation, max_fee, reserve=0):
     """Conservative automatic-outcome pre-sign check; no quotes, invented proceeds or writes.
 
-    Selected redemption can fund its own world's fee using min_received, but
-    cannot fund the other world. Shared transfers pay in both worlds. A maximum
+    Trade orders can be partially filled or unfilled, so estimated proceeds cannot
+    fund their fees. Shared transfers pay in both worlds. A maximum
     fee budget is retained so changing minimum requirements cannot strand cash.
     """
     kind, fields = next(iter(operation.items()))
@@ -183,8 +183,6 @@ def cash_guard(snapshot, actor, operation, max_fee, reserve=0):
         if kind == "Deposit":
             after[side] -= int(fields["amount"])
             debit = True
-        else:
-            after[side] += int(fields["min_received"])
     elif kind == "TransferExact":
         cost = int(fields["amount"])
         after = [amount - cost for amount in after]
@@ -344,12 +342,13 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
     def completed_or_reserved(kind, index=None, **context):
         return confirmed(kind, index, **context) or reserved(kind, index, **context)
 
-    def emit(index, operation, kind, amount, debit=0, ordinary_credit=0, **metadata):
+    def emit(index, operation, kind, amount, debit=0, **metadata):
         if not usable(index):
             return None
         data = metadata.pop("data_hex", None)
+        expiry_blocks = 2 if next(iter(operation)) in {"Deposit", "Redeem"} else 20
         request = {"sender": accounts[index]["public_key"], "operation": operation,
-                   "extra_fee": "0", "expiry_blocks": 20}
+                   "extra_fee": "0", "expiry_blocks": expiry_blocks}
         if data:
             request["data_hex"] = data
         quote = _read(rpc, "fee_quote", request)
@@ -364,7 +363,7 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
         fee = _number(quote["fee"], max_fee + 1)
         fee_budget = max(max_fee, fee) if native else max_fee
         cash_reserve = fee_budget * 2 if native else reserve
-        cash_after = _number(balances[index]["ordinary"]) + ordinary_credit - debit
+        cash_after = _number(balances[index]["ordinary"]) - debit
         if (not native and fee > max_fee) or (full_cash and cash_guard(snapshot, accounts[index], operation, fee_budget, cash_reserve)):
             return None
         if not full_cash and (cash_after < fee or (debit and cash_after < cash_reserve + (fee if native else 0))):
@@ -375,7 +374,7 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
                  "nonce": _number(balances[index]["nonce"])}
         result = {"sender_index": index, "kind": kind, "operation": operation,
                   "amount_raw": str(amount), "max_fee_raw": str(fee_budget),
-                  "quoted_fee_raw": str(fee), "expiry_blocks": 20,
+                  "quoted_fee_raw": str(fee), "expiry_blocks": expiry_blocks,
                   "guard": guard, **metadata}
         if substantive:
             result.update(profile=profile_name, persona=personas[index]["name"], region=region)
@@ -407,8 +406,7 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
             return None
         if quote.get("decision") != (decision if outcome else None):
             return None
-        minimum = max(1, _number(quote["shares"]) * 99 // 100)
-        return emit(index, {"Deposit": {"amount": str(amount), "min_shares": str(minimum),
+        return emit(index, {"Deposit": {"amount": str(amount),
                     "decision": _bytes(decision) if outcome else None, "outcome": outcome}},
                     "deposit_" + outcome.lower() if outcome else "deposit", amount,
                     debit=0 if outcome else amount, decision=decision if outcome else None)
@@ -435,20 +433,19 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
             # Leave headroom while still checking the actual quote against the cap.
             request.update(kind="withdraw", amount=str(TRADE * 99 // 100))
             quote = _read(rpc, "stash_quote", request)
-        if (not isinstance(quote, dict) or _number(quote.get("shares")) < 1
+        if (not isinstance(quote, dict) or _number(quote.get("input_requested")) < 1
                 or _number(quote.get("output_hash")) < 1
                 or quote.get("decision") != (decision if outcome else None)):
             return None
         output = _number(quote["output_hash"])
-        if (not substantive and output > TRADE) or _number(quote["shares"]) > shares:
+        if (not substantive and output > TRADE) or _number(quote["input_requested"]) > shares:
             return None
         if substantive and not recovery and output < minimum_trade:
             return None
-        minimum = max(1, output * 99 // 100)
-        return emit(index, {"Redeem": {"shares": str(quote["shares"]), "min_received": str(minimum),
+        return emit(index, {"Redeem": {"shares": str(quote["input_requested"]),
                     "decision": _bytes(decision) if outcome else None, "outcome": outcome}},
                     "redeem_" + outcome.lower() if outcome else ("recover_cash" if recovery else "redeem"),
-                    output, ordinary_credit=minimum if outcome is None else 0,
+                    output,
                     decision=decision if outcome else None)
 
     def withdrawal_value(index, outcome=None):
@@ -462,13 +459,13 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
                 if outcome:
                     request["outcome"] = outcome.lower()
                 quote = _read(rpc, "stash_quote", request)
-                quotes[cache_key] = (_number(quote.get("output_hash"))
+                quotes[cache_key] = (_number(quote.get("stash_before_hash"))
                                      if isinstance(quote, dict) and quote.get("decision") == (decision if outcome else None)
                                      else None)
         return quotes[cache_key]
 
     def native_rebalance(index, outcome=None, target_bps=None, recovery=False):
-        """Move the whole cash-valued portfolio gap, retaining only actual fees.
+        """Request the cash-valued portfolio gap, then recheck actual filled balances.
 
         Each conditional world owns its cash and shares independently. An
         unfavored-world target of zero exits that exposure; the favored world
@@ -531,7 +528,7 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
                 if action:
                     return action
 
-    # Ordinary redemption can recover spending liquidity and pay its fee from proceeds.
+    # Redemption can recover spending liquidity when existing cash covers its fee.
     if phase in {"auction", "rest"}:
         for index in order:
             if usable(index) and _number(balances[index]["ordinary"]) < reserve * 2:
@@ -563,7 +560,7 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
 
     if campaign:
         # One explicit campaign, not nine purportedly independent opinions.
-        # No chat or circulation competes with the time-integrated decision.
+        # No chat or circulation competes with the active decision.
         progress = snapshot.get("campaign", {})
         if not progress.get("checked") or progress.get("settlement_pending"):
             return None
@@ -591,16 +588,16 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
             grant = validated_grant(active["proposal"]["Grant"])[1]
             if _number((snapshot.get("governance", {}).get("pass") or {}).get("grant_escrow")) != grant:
                 return None
-            timing = (active.get("started"), active.get("duration"), status.get("clock"), status.get("settings", {}).get("interval"))
-            if (not all(type(n) is int and n >= 0 for n in timing) or timing[3] <= 0
+            timing = (active.get("started_height"), active.get("blocks"), status.get("height"))
+            if (not all(type(n) is int and n >= 0 for n in timing) or timing[1] <= 0
                     or not timing[0] <= timing[2] < timing[0] + timing[1]
-                    or timing[0] + timing[1] - timing[2] < 2 * timing[3]):
+                    or timing[0] + timing[1] - timing[2] < 2):
                 return None
             # Buy PASS first across all three local actors, so its higher price
-            # contributes early to the integral. Retain 10% portfolio liquidity.
+            # leads in subsequent observed blocks. Retain 10% portfolio liquidity.
             # A world owns its own cash: selling FAIL never finances PASS.
             for index in order:
-                if not usable(index) or completed_or_reserved("deposit_pass", index, decision=decision, campaign_leg="buy_pass"):
+                if not usable(index) or reserved("deposit_pass", index, decision=decision, campaign_leg="buy_pass"):
                     continue
                 value = withdrawal_value(index, "Pass")
                 if value is None:
@@ -613,7 +610,7 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
                         action.update(campaign_leg="buy_pass", preferred_outcome="Pass", strategy_reason="coordinated_pass_campaign")
                         return action
             for index in order:
-                if not usable(index) or completed_or_reserved("redeem_fail", index, decision=decision, campaign_leg="exit_fail"):
+                if not usable(index) or reserved("redeem_fail", index, decision=decision, campaign_leg="exit_fail"):
                     continue
                 action = native_rebalance(index, "Fail", target_bps=0)
                 if action:
@@ -691,7 +688,7 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
         if isinstance(quote, dict) and quote.get("refundable") is True and _number(quote.get("amount")):
             amount = _number(quote["amount"])
             action = emit(index, {"Refund": {"round": round_id, "proposal": _bytes(proposal)}},
-                          "refund", amount, ordinary_credit=amount, round=round_id, proposal=proposal)
+                          "refund", amount, round=round_id, proposal=proposal)
             if action:
                 return action
 
@@ -855,15 +852,12 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
     if phase == "governance" and substantive:
         metrics = metrics_for()
         active = snapshot.get("governance", {}).get("phase", {}).get("Governance", {})
-        # Scheduled seconds and height are different units. Missing timing must
-        # never be guessed from height when starting another outcome cycle.
-        timing = (active.get("started"), active.get("duration"), status.get("clock"),
-                  status.get("settings", {}).get("interval"))
+        # Decision runway is measured directly in canonical block heights.
+        timing = (active.get("started_height"), active.get("blocks"), status.get("height"))
         valid_timing = (all(type(value) is int and value >= 0 for value in timing)
-                        and timing[1] > 0 and timing[3] > 0
-                        and timing[0] <= timing[2] < timing[0] + timing[1])
+                        and timing[1] > 0 and timing[0] <= timing[2] < timing[0] + timing[1])
         remaining = timing[0] + timing[1] - timing[2] if valid_timing else None
-        minimum_cycle_seconds = 6 * timing[3] if valid_timing else None
+        minimum_cycle_blocks = 6
         for index in order:
             if not usable(index):
                 continue
@@ -880,11 +874,11 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
             if "build_preferred" in done or "rebalance_preferred" in done:
                 last_height = max((_number(h.get("height", h.get("guard", {}).get("height")))
                                    for h in cycle_history), default=height)
-                if height - last_height < 6 or remaining is None or remaining < minimum_cycle_seconds:
+                if height - last_height < 6 or remaining is None or remaining < minimum_cycle_blocks:
                     continue
                 cycle += 1
                 cycle_history, done = [], set()
-            elif not cycle_history and (remaining is None or remaining < minimum_cycle_seconds):
+            elif not cycle_history and (remaining is None or remaining < minimum_cycle_blocks):
                 continue
             preferred = (cycle_history[0].get("preferred_outcome") if cycle_history
                          else evaluation["preferred_outcome"])

@@ -54,7 +54,9 @@ fn signed_outcome_trades_pass_half_reserve_grant_and_keep_a_bent_curve() {
     c.limit_bits = c.initial_bits;
     c.initial.rest = 30;
     c.initial.lead = 90;
-    c.initial.duration = 900;
+    // Two separately mined trade legs still leave a majority of observations
+    // after the PASS buy; price magnitude cannot make up for tied blocks.
+    c.initial.decision_blocks = 6;
     c.auction_timeout = 120;
     c.validate().unwrap();
     let mut chain = Chain::open(&path, c.clone()).unwrap();
@@ -66,7 +68,7 @@ fn signed_outcome_trades_pass_half_reserve_grant_and_keep_a_bent_curve() {
         chain.tip_state(),
         Operation::Deposit {
             amount: 8000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -136,7 +138,7 @@ fn signed_outcome_trades_pass_half_reserve_grant_and_keep_a_bent_curve() {
         s,
         Operation::Redeem {
             shares: s.account(&owner(), Some(Outcome::Fail)).unwrap().shares * 3u32 / 4u32,
-            min_received: 1u32.into(),
+
             decision: s.decision_id(),
             outcome: Some(Outcome::Fail),
         },
@@ -148,7 +150,7 @@ fn signed_outcome_trades_pass_half_reserve_grant_and_keep_a_bent_curve() {
         s,
         Operation::Deposit {
             amount: s.account(&owner(), Some(Outcome::Pass)).unwrap().ordinary * 3u32 / 4u32,
-            min_shares: 1u32.into(),
+
             decision: s.decision_id(),
             outcome: Some(Outcome::Pass),
         },

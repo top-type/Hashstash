@@ -8,11 +8,10 @@ async function run() {
   const proposal = 'ab'.repeat(32), other = 'cd'.repeat(32), key = '12'.repeat(32);
   s.config.quote_scale = '1000000000000000000000000000000000000';
   Object.assign(s.status.settings, { pass_margin_bps: 0, });
-  const decision = { id: 'ef'.repeat(32), proposal_id: proposal, round: 0, started: 240, duration: 240,
-    start_integral: '0', proposal: { Grant: { payments: [{recipient:key,amount:'10'}] } } };
+  const decision = { id: 'ef'.repeat(32), proposal_id: proposal, round: 0, started: 240, blocks:16, started_height:16, leading_blocks:3, proposal: { Grant: { payments: [{recipient:key,amount:'10'}] } } };
   s.governance.phase = { Governance: decision };
-  Object.assign(s.governance.world, { reserve: '1000000000000000000', shares: '1000000000000000000000000000000000000', curve_mass: '5000000000000000000', price_integral: '800000000000000000' });
-  s.governance.pass = { ...s.governance.world, reserve: '2000000000000000000', curve_mass: '10000000000000000000', grant_escrow: '10', price_integral: '800000000000000001' };
+  Object.assign(s.governance.world, { reserve: '1000000000000000000', shares: '1000000000000000000000000000000000000', curve_mass: '5000000000000000000' });
+  s.governance.pass = { ...s.governance.world, reserve: '2000000000000000000', curve_mass: '10000000000000000000', grant_escrow: '10' };
   const record = id => ({ id, proposal: { round: 0, action: decision.proposal, description: '00'.repeat(32), support: '10', refund_height: null } });
   s.proposals = [record(proposal), record(other)];
   await h.refresh(); await h.navigate('#governance');
@@ -28,13 +27,13 @@ async function run() {
   assert.equal(h.get('governance-common').hidden, true); checks++;
   assert.equal(h.get('governance-trading').hidden, true, 'visitors are not shown a disabled trade form'); checks++;
   assert.equal(h.get('governance-actions').hidden, true); checks++;
-  assert.equal(h.get('pass-twap').textContent, h.get('fail-twap').textContent, 'rounded price display can hide the decisive difference'); checks++;
-  assert.equal(h.get('gov-result-status').textContent, 'PASS leads', 'one integral unit above equality passes exactly'); checks++;
+  assert.equal(h.get('pass-leading-blocks').textContent, '3', 'counted leading blocks are exact'); checks++;
+  assert.equal(h.get('gov-result-status').textContent, 'PASS leads', 'three of four observed blocks puts PASS ahead'); checks++;
   s.governance.pass.grant_escrow = '9'; await h.refresh();
-  assert.equal(h.get('gov-result-status').textContent, 'FAIL leads', 'an underfunded grant cannot pass even with a higher average'); checks++;
+  assert.equal(h.get('gov-result-status').textContent, 'FAIL leads', 'an underfunded grant cannot pass even with a majority'); checks++;
   assert.match(h.get('gov-result-detail').textContent, /funding is incomplete/i); checks++;
   s.governance.pass.grant_escrow = '10'; await h.refresh();
-  assert.match(h.get('gov-result-detail').textContent, /<0\.01% above FAIL/); checks++;
+  assert.match(h.get('gov-result-detail').textContent, /3 of 4 blocks counted for PASS/); checks++;
   assert.equal(h.get('gov-proposal-link').href, `#explorer?governance=${proposal}`); checks++;
   assert.match(h.get('gov-grant-payments').children[0].children[0].href, /^#explorer\?account=hsh/); checks++;
   assert.equal(h.get('gov-title').textContent, 'Recipients', 'grant category is replaced by the payout itself'); checks++;
@@ -64,22 +63,21 @@ async function run() {
   assert.equal(h.get('pass-price').textContent, '10', 'account prices never overwrite the same snapshot market'); checks++;
   assert.equal(h.get('proposal-list').children.find(r => r.textContent.includes(other.slice(0,7))).children[1].children[1].disabled, false, 'watch-wallet selection enables read-only refund check'); checks++;
 
-  s.governance.pass.price_integral = '799999999999999999'; await h.refresh();
-  assert.equal(h.get('gov-result-status').textContent, 'FAIL leads', 'higher current PASS spot price does not override the decision average'); checks++;
-  s.governance.pass.price_integral = s.governance.world.price_integral; await h.refresh();
-  assert.match(h.get('gov-result-detail').textContent, /exactly equal/); checks++;
-  assert.equal(h.get('gov-result-status').textContent, 'FAIL leads', 'equal decision averages fail'); checks++;
+  decision.leading_blocks = 1; await h.refresh();
+  assert.equal(h.get('gov-result-status').textContent, 'FAIL leads', 'current spot price does not replace accumulated block counts'); checks++;
+  decision.leading_blocks = 2; await h.refresh();
+  assert.equal(h.get('gov-result-status').textContent, 'FAIL leads', 'equal observed block counts favor FAIL'); checks++;
   s.governance.frozen.pass_margin_bps = 500;
-  s.governance.pass.price_integral = '1050000000000000000'; s.governance.world.price_integral = '1000000000000000000'; await h.refresh();
-  assert.equal(h.get('gov-result-status').textContent, 'FAIL leads', 'equality at a 5% required margin fails'); checks++;
-  s.governance.pass.price_integral = '1050000000000000001'; await h.refresh();
+  assert.match(h.get('gov-subtitle').textContent, /Equal prices/); checks++;
+  decision.leading_blocks = 3; await h.refresh();
+  assert.match(h.get('gov-subtitle').textContent, /more than 5% above FAIL/); checks++;
   assert.equal(h.get('gov-result-status').textContent, 'PASS leads'); checks++;
   assert.match(h.get('gov-grant-progress').title, /Set aside on PASS/); checks++;
   assert.equal(h.get('pass-ratio').textContent, '20%'); checks++;
   assert.equal(h.get('fail-ratio').textContent, '20%'); checks++;
-  decision.started = s.governance.clock; await h.refresh();
+  decision.started_height = s.status.height; decision.leading_blocks = 0; await h.refresh();
   assert.equal(h.get('gov-result-status').textContent, 'Pending'); checks++;
-  assert.equal(h.get('pass-twap').textContent, '—'); checks++;
+  assert.equal(h.get('pass-leading-blocks').textContent, '0'); checks++;
 
   // A grant changes PASS backing and shape, not its starting spot price.
   s.governance.world.curve_mass = s.governance.world.reserve = '5000000000000000000';
@@ -101,7 +99,7 @@ async function run() {
   Object.assign(s.governance.pass, { reserve:'0',shares:'0',curve_mass:'0' });
   await h.refresh();
   assert.equal(h.get('pass-price').textContent, '0', 'empty outcome has no price contribution to governance'); checks++;
-  assert.match(h.get('pass-price').title, /No outstanding stash.*zero to the decision average/); checks++;
+  assert.match(h.get('pass-price').title, /No outstanding stash.*price is zero/); checks++;
   assert.equal(h.get('overview-price-pass').textContent, '1', 'opening conversion rate remains available for the next deposit'); checks++;
 
   s.governance.phase = { Rest: { until: 780, pending: null } }; s.governance.pass = s.pass = s.fail = null;

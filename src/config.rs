@@ -16,7 +16,9 @@ pub struct Settings {
     /// Nominal seconds; each block advances schedules by its parent's interval.
     pub lead: u64,
     pub rest: u64,
-    pub duration: u64,
+    pub decision_blocks: u64,
+    /// Maximum marginal Stash price movement in basis points per block.
+    pub max_price_change_bps: u64,
     pub miner_fee_percent: Option<u64>,
     pub pass_margin_bps: Option<u64>,
 }
@@ -25,10 +27,11 @@ impl Settings {
         match p {
             Parameter::BlockBytes => self.block_bytes,
             Parameter::MinimumFeeRate => self.minimum_fee_rate,
+            Parameter::MaxPriceChangeBps => self.max_price_change_bps,
             Parameter::Interval => self.interval,
             Parameter::Lead => self.lead,
             Parameter::Rest => self.rest,
-            Parameter::Duration => self.duration,
+            Parameter::DecisionBlocks => self.decision_blocks,
             Parameter::MinerFeePercent => self.miner_fee_percent.unwrap_or(0),
             Parameter::PassMarginBps => self.pass_margin_bps.unwrap_or(0),
         }
@@ -37,24 +40,26 @@ impl Settings {
         match p {
             Parameter::BlockBytes => self.block_bytes = value,
             Parameter::MinimumFeeRate => self.minimum_fee_rate = value,
+            Parameter::MaxPriceChangeBps => self.max_price_change_bps = value,
             Parameter::Interval => self.interval = value,
             Parameter::Lead => self.lead = value,
             Parameter::Rest => self.rest = value,
-            Parameter::Duration => self.duration = value,
+            Parameter::DecisionBlocks => self.decision_blocks = value,
             Parameter::MinerFeePercent => self.miner_fee_percent = Some(value),
             Parameter::PassMarginBps => self.pass_margin_bps = Some(value),
         }
     }
 }
-pub const PARAMETERS: [Parameter; 8] = [
+pub const PARAMETERS: [Parameter; 9] = [
     Parameter::BlockBytes,
     Parameter::Interval,
     Parameter::Lead,
     Parameter::Rest,
-    Parameter::Duration,
+    Parameter::DecisionBlocks,
     Parameter::MinerFeePercent,
     Parameter::PassMarginBps,
     Parameter::MinimumFeeRate,
+    Parameter::MaxPriceChangeBps,
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,7 +109,8 @@ impl Config {
                 interval: 15,
                 lead: 4 * 15,
                 rest: 64 * 15,
-                duration: 32 * 15,
+                decision_blocks: 32,
+                max_price_change_bps: 1000,
                 miner_fee_percent: Some(50),
                 pass_margin_bps: Some(0),
             },
@@ -115,7 +121,7 @@ impl Config {
         config.network = "hashstash-testnet".into();
         config.auction_timeout = 32 * 15;
         config.initial.rest = 32 * 15;
-        config.initial.duration = 16 * 15;
+        config.initial.decision_blocks = 16;
         config
     }
     pub fn slow_testnet() -> Self {
@@ -124,7 +130,7 @@ impl Config {
         config.auction_timeout = 240 * 15;
         config.initial.lead = 20 * 15;
         config.initial.rest = 720 * 15;
-        config.initial.duration = 240 * 15;
+        config.initial.decision_blocks = 240;
         config
     }
     pub fn progress_increment(&self, settings: &Settings) -> u64 {
@@ -168,7 +174,10 @@ impl Config {
             self.valid_block_bytes(settings.block_bytes),
             "block capacity cannot cover mandatory account creation or fit this implementation"
         );
-        ensure!(settings.duration > 0, "decision duration must be positive");
+        ensure!(
+            settings.decision_blocks > 0,
+            "decision block count must be positive"
+        );
         self.auction_timeout_for(settings)?;
         Ok(())
     }
@@ -178,7 +187,10 @@ impl Config {
         self.validate_governance_settings(settings)?;
         for duration in [
             settings.interval,
-            settings.duration,
+            settings
+                .decision_blocks
+                .checked_mul(settings.interval)
+                .context("decision schedule overflow")?,
             settings.rest,
             self.auction_timeout_for(settings)?,
         ] {
@@ -242,7 +254,6 @@ impl Config {
         );
         ensure!(!self.quote_scale.is_zero(), "invalid quote precision");
         self.validate_governance_settings_at(&self.initial, 0)?;
-        let max_clock = u64::MAX;
         let max_issued = Amount::from(self.max_height) * (Amount::one() << 255usize);
         ensure!(
             max_issued.bits() <= self.money_bits,
@@ -261,11 +272,10 @@ impl Config {
         ensure!(
             (((Amount::one() << self.money_bits as usize) - 1u32)
                 * &self.quote_scale
-                * Amount::from(max_clock)
                 * (Amount::from(u64::MAX) + Amount::from(10_000u32)))
             .bits()
                 <= self.max_integer_bits,
-            "price integral range too small"
+            "price comparison range too small"
         );
         Ok(())
     }

@@ -1,6 +1,7 @@
 //! Wallet formats are independent of consensus and preserve every signed byte.
 use crate::{codec, crypto, types::*};
 use anyhow::{Result, ensure};
+use num_traits::Zero;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -127,22 +128,20 @@ fn validate_body(body: &TransactionBody) -> Result<()> {
         }
         Operation::Deposit {
             amount: a,
-            min_shares,
             decision,
             outcome,
         } => {
             amount(a)?;
-            amount(min_shares)?;
+            ensure!(!a.is_zero(), "zero deposit");
             side(decision, outcome)?;
         }
         Operation::Redeem {
             shares,
-            min_received,
             decision,
             outcome,
         } => {
             amount(shares)?;
-            amount(min_received)?;
+            ensure!(!shares.is_zero(), "zero redemption");
             side(decision, outcome)?;
         }
         Operation::Support { amount: a, .. } => amount(a)?,
@@ -176,6 +175,26 @@ fn validate_body(body: &TransactionBody) -> Result<()> {
             } = proposal
             {
                 ensure!(old != new, "minimum fee rate must change");
+            }
+            if let Proposal::Parameter {
+                parameter: Parameter::DecisionBlocks,
+                old,
+                new,
+            } = proposal
+            {
+                ensure!(
+                    *old > 0 && *new > 0,
+                    "decision block count must be positive"
+                );
+                ensure!(old != new, "decision block count must change");
+            }
+            if let Proposal::Parameter {
+                parameter: Parameter::MaxPriceChangeBps,
+                old,
+                new,
+            } = proposal
+            {
+                ensure!(old != new, "maximum price change must change");
             }
             if let Proposal::Parameter {
                 parameter: Parameter::PassMarginBps,
@@ -231,13 +250,16 @@ pub fn review(body: &TransactionBody) -> Vec<ReviewField> {
         }
         Operation::Deposit {
             amount,
-            min_shares,
             decision,
             outcome,
         } => {
             add("Action", "Deposit".into());
             add("Amount · HASH", amount.to_str_radix(10));
-            add("Minimum shares", min_shares.to_str_radix(10));
+            add("Execution", "Batch trade; full or partial fill".into());
+            add(
+                "Unfilled input",
+                "Returned automatically; transaction fee remains payable".into(),
+            );
             add("Outcome", outcome.map_or("Ordinary", outcome_name).into());
             if let Some(id) = decision {
                 add("Decision ID", hex::encode(id));
@@ -245,13 +267,16 @@ pub fn review(body: &TransactionBody) -> Vec<ReviewField> {
         }
         Operation::Redeem {
             shares,
-            min_received,
             decision,
             outcome,
         } => {
             add("Action", "Redeem".into());
             add("Shares", shares.to_str_radix(10));
-            add("Minimum received · HASH", min_received.to_str_radix(10));
+            add("Execution", "Batch trade; full or partial fill".into());
+            add(
+                "Unfilled input",
+                "Returned automatically; transaction fee remains payable".into(),
+            );
             add("Outcome", outcome.map_or("Ordinary", outcome_name).into());
             if let Some(id) = decision {
                 add("Decision ID", hex::encode(id));
@@ -323,12 +348,17 @@ pub fn review(body: &TransactionBody) -> Vec<ReviewField> {
                             "Proposed margin",
                             format!("{}.{:02}%", new / 100, new % 100),
                         );
+                    } else if *parameter == Parameter::MaxPriceChangeBps {
+                        add("Parameter", "Maximum price change per block".into());
+                        add("Expected value", format!("{}.{:02}%", old / 100, old % 100));
+                        add("Proposed value", format!("{}.{:02}%", new / 100, new % 100));
+                    } else if *parameter == Parameter::DecisionBlocks {
+                        add("Parameter", "Decision length".into());
+                        add("Expected value", format!("{old} blocks"));
+                        add("Proposed value", format!("{new} blocks"));
                     } else if matches!(
                         parameter,
-                        Parameter::Interval
-                            | Parameter::Lead
-                            | Parameter::Rest
-                            | Parameter::Duration
+                        Parameter::Interval | Parameter::Lead | Parameter::Rest
                     ) {
                         add("Parameter", format!("{parameter:?}"));
                         add("Expected value", format!("{old} seconds"));
@@ -368,6 +398,18 @@ pub fn review(body: &TransactionBody) -> Vec<ReviewField> {
     }
     fields
 }
+/// Market trade estimates are short-lived; other operations retain a longer default.
+pub fn default_expiry_blocks(operation: &Operation) -> u64 {
+    if matches!(
+        operation,
+        Operation::Deposit { .. } | Operation::Redeem { .. }
+    ) {
+        2
+    } else {
+        100
+    }
+}
+
 fn outcome_name(outcome: Outcome) -> &'static str {
     match outcome {
         Outcome::Pass => "PASS",
@@ -392,12 +434,7 @@ mod governance_review_tests {
 
     #[test]
     fn cold_review_labels_governed_timing_in_seconds() {
-        for parameter in [
-            Parameter::Interval,
-            Parameter::Lead,
-            Parameter::Rest,
-            Parameter::Duration,
-        ] {
+        for parameter in [Parameter::Interval, Parameter::Lead, Parameter::Rest] {
             let fields = review(&body(parameter, 30, 60));
             assert!(
                 fields
@@ -408,6 +445,57 @@ mod governance_review_tests {
                 fields
                     .iter()
                     .any(|f| f.label == "Proposed value" && f.value == "60 seconds")
+            );
+        }
+    }
+
+    #[test]
+    fn cold_review_uses_blocks_and_discloses_partial_trade_execution() {
+        let fields = review(&body(Parameter::DecisionBlocks, 60, 120));
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.label == "Proposed value" && field.value == "120 blocks")
+        );
+        let fields = review(&body(Parameter::MaxPriceChangeBps, 1000, 2500));
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.label == "Proposed value" && field.value == "25.00%")
+        );
+        assert!(validate_body(&body(Parameter::DecisionBlocks, 60, 0)).is_err());
+        assert!(validate_body(&body(Parameter::MaxPriceChangeBps, 1000, 0)).is_ok());
+        for operation in [
+            Operation::Deposit {
+                amount: 100u32.into(),
+                decision: None,
+                outcome: None,
+            },
+            Operation::Redeem {
+                shares: 100u32.into(),
+                decision: None,
+                outcome: None,
+            },
+        ] {
+            let mut transaction = body(Parameter::DecisionBlocks, 60, 120);
+            transaction.operation = operation;
+            let fields = review(&transaction);
+            assert!(
+                fields
+                    .iter()
+                    .any(|field| field.label == "Execution" && field.value.contains("partial"))
+            );
+            assert!(fields.iter().any(|field| field.label == "Unfilled input"
+                && field.value.contains("fee remains payable")));
+            assert!(
+                fields
+                    .iter()
+                    .any(|field| field.label == "Expiry block" && field.value == "100")
+            );
+            assert_eq!(default_expiry_blocks(&transaction.operation), 2);
+            assert_eq!(
+                decode_unsigned(&unsigned(&transaction)).unwrap(),
+                transaction
             );
         }
     }

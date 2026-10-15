@@ -211,13 +211,13 @@
           unitText(value, display, 'hash', 'hash-unit');
           value.title = display;
         } else if (/shares/i.test(field.label)) {
-          const label = field.label === 'Shares' ? 'Amount · stash' : field.label === 'Minimum shares' ? 'Minimum received · stash' : field.label.replace(/shares/gi, 'stash');
+          const label = field.label === 'Shares' ? 'Amount · stash' : field.label.replace(/shares/gi, 'stash');
           unitText(name, label, 'stash', 'stash-unit');
           value.className = 'stash-amount';
           value.textContent = HashstashShares.exactInput(field.value);
           value.title = `${field.value} stash atoms`;
           const atomName = document.createElement('dt'), atomValue = document.createElement('dd');
-          unitText(atomName, field.label === 'Minimum shares' ? 'Minimum stash atoms' : 'stash atoms', 'stash', 'stash-unit');
+          unitText(atomName, 'stash atoms', 'stash', 'stash-unit');
           atomValue.textContent = field.value;
           atomValue.className = 'stash-amount';
           technical.append(atomName, atomValue);

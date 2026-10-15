@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use num_traits::{One, ToPrimitive, Zero};
+use std::cmp::Ordering;
 use std::sync::OnceLock;
 
 // All public curve inputs are at most 512 bits. The additional precision keeps
@@ -155,7 +156,7 @@ fn check_dynamic_curve(reserve: &Amount, supply: &Amount, mass: &Amount) -> Resu
 
 // An exact fast path covers common rational curves and their perfect-power
 // boundaries. Eight bounds intermediate integer powers below 8192 bits.
-fn small_ratio(reserve: &Amount, mass: &Amount) -> Option<(u32, u32)> {
+pub(crate) fn small_ratio(reserve: &Amount, mass: &Amount) -> Option<(u32, u32)> {
     let mut a = reserve.clone();
     let mut b = mass.clone();
     while !b.is_zero() {
@@ -166,6 +167,51 @@ fn small_ratio(reserve: &Amount, mass: &Amount) -> Option<(u32, u32)> {
     let numerator = (reserve / &a).to_u32()?;
     let denominator = (mass / a).to_u32()?;
     (denominator <= 8).then_some((numerator, denominator))
+}
+
+/// Compare `reserve * ln(a/b)` with `mass * ln(c/d)` without floating point.
+/// The rational ratios must be at least one. `None` means the proven directed
+/// intervals overlap; callers must retain both sides of their root bracket.
+pub(crate) fn compare_curve_logs(
+    reserve: &Amount,
+    mass: &Amount,
+    a: &Amount,
+    b: &Amount,
+    c: &Amount,
+    d: &Amount,
+) -> Option<Ordering> {
+    assert!(!b.is_zero() && !d.is_zero() && a >= b && c >= d);
+    if let Some((u, v)) = small_ratio(reserve, mass) {
+        return Some((a.pow(u) * d.pow(v)).cmp(&(b.pow(u) * c.pow(v))));
+    }
+    curve_log_evaluation(reserve, mass, a, b, c, d).0
+}
+
+/// The midpoint proposes a safeguarded root-search step. Only the separately
+/// returned directed comparison can establish a root bracket or an output.
+pub(crate) fn curve_log_evaluation(
+    reserve: &Amount,
+    mass: &Amount,
+    a: &Amount,
+    b: &Amount,
+    c: &Amount,
+    d: &Amount,
+) -> (Option<Ordering>, num_bigint::BigInt, Amount) {
+    use num_bigint::BigInt;
+    let left = log_ratio(a, b);
+    let right = log_ratio(c, d);
+    let lower = BigInt::from(left.low * reserve) - BigInt::from(right.high * mass);
+    let upper = BigInt::from(left.high * reserve) - BigInt::from(right.low * mass);
+    let comparison = if upper < BigInt::zero() {
+        Some(Ordering::Less)
+    } else if lower > BigInt::zero() {
+        Some(Ordering::Greater)
+    } else if a == b && c == d {
+        Some(Ordering::Equal)
+    } else {
+        None
+    };
+    (comparison, (lower + upper) / 2u32, curve_scale())
 }
 
 /// Conservative new total stash supply for a deposit. The instantaneous curve

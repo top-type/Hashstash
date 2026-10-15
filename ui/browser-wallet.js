@@ -9,7 +9,7 @@
   if (!noble || !addresses) throw new Error('Wallet cryptography is unavailable.');
   const MAX_U64 = (1n << 64n) - 1n, MAX_AMOUNT = (1n << 512n) - 1n;
   const operations = ['TransferExact','Deposit','Redeem','Propose','Support','Refund'];
-  const parameters = ['BlockBytes','Interval','Lead','Rest','Duration','MinerFeePercent','PassMarginBps','MinimumFeeRate'];
+  const parameters = ['BlockBytes','Interval','Lead','Rest','DecisionBlocks','MinerFeePercent','PassMarginBps','MinimumFeeRate','MaxPriceChangeBps'];
   const utf8 = new TextEncoder();
   const fail = message => { throw new Error(message); };
   const hex = bytes => {
@@ -146,14 +146,14 @@
     w.uint(operations.indexOf(name));
     const layout = {
       TransferExact:['recipient','amount'],
-      Deposit:['amount','min_shares','decision','outcome'], Redeem:['shares','min_received','decision','outcome'],
+      Deposit:['amount','decision','outcome'], Redeem:['shares','decision','outcome'],
       Propose:['round','description','proposal','support'], Support:['round','proposal','amount'], Refund:['round','proposal']
     };
     fields(v, layout[name], 'Operation');
     switch (name) {
       case 'TransferExact': w.hash(v.recipient, true); w.amount(v.amount); break;
-      case 'Deposit': w.amount(v.amount); w.amount(v.min_shares); sides(w,v); break;
-      case 'Redeem': w.amount(v.shares); w.amount(v.min_received); sides(w,v); break;
+      case 'Deposit': w.amount(v.amount); sides(w,v); break;
+      case 'Redeem': w.amount(v.shares); sides(w,v); break;
       case 'Propose': w.uint(v.round); w.hash(v.description); writeProposal(w,v.proposal); w.amount(v.support); break;
       case 'Support': case 'Refund': w.uint(v.round); w.hash(v.proposal); if (name === 'Support') w.amount(v.amount); break;
       default: fail('Unknown operation.');
@@ -165,8 +165,8 @@
     let v;
     switch(name) {
       case 'TransferExact': v={recipient:r.hash(true),amount:r.amount()}; break;
-      case 'Deposit': v={amount:r.amount(),min_shares:r.amount(),...readSides(r)}; break;
-      case 'Redeem': v={shares:r.amount(),min_received:r.amount(),...readSides(r)}; break;
+      case 'Deposit': v={amount:r.amount(),...readSides(r)}; break;
+      case 'Redeem': v={shares:r.amount(),...readSides(r)}; break;
       case 'Propose': v={round:String(r.uint()),description:r.hash(),proposal:readProposal(r),support:r.amount()}; break;
       case 'Support': v={round:String(r.uint()),proposal:r.hash(),amount:r.amount()}; break;
       case 'Refund': v={round:String(r.uint()),proposal:r.hash()}; break;
@@ -190,7 +190,7 @@
     if (expected.current_height !== undefined && expiry <= u64(expected.current_height)) fail('Transaction has expired.');
     const parameter = expected.operation?.Propose?.proposal?.Parameter;
     if (parameter?.parameter === 'MinerFeePercent' && (u64(parameter.old) > 100n || u64(parameter.new) > 100n)) fail('Miner fee share must be from 0 to 100 percent.');
-    if (parameter && ['Interval','Duration','BlockBytes'].includes(parameter.parameter) && (!u64(parameter.old) || !u64(parameter.new))) fail('This setting must be positive.');
+    if (parameter && ['Interval','DecisionBlocks','BlockBytes'].includes(parameter.parameter) && (!u64(parameter.old) || !u64(parameter.new))) fail('This setting must be positive.');
     if (parameter?.parameter === 'BlockBytes' && (u64(parameter.old) < 1024n || u64(parameter.new) < 1024n)) fail('Block capacity must cover the miner account’s 1,024 weight.');
     const op = encodeOperation(expected.operation), data = fromHex(expected.data_hex ?? '', undefined, 'Transaction data');
     const fee = amount(expected.fee);

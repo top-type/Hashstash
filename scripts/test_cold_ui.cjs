@@ -155,8 +155,6 @@ async function run() {
     h.review.fields = [
       {label:'Action',value:'Redeem'},
       {label:'Shares',value:'95000000000000000000'},
-      {label:'Minimum shares',value:'1'},
-      {label:'Minimum received · HASH',value:'1000000000000000000'},
       {label:'Fee · HASH',value:'1234567890000000000'},
       {label:'Outcome',value:'PASS'},
     ];
@@ -168,25 +166,12 @@ async function run() {
     assert.equal(fields[3].textContent,'0.000000000000000095','raw signed shares display exactly in stash');checks++;
     assert.equal(fields[3].title,'95000000000000000000 stash atoms');checks++;
     assert.equal(fields[3].className,'stash-amount');checks++;
-    assert.equal(fields[4].textContent,'Minimum received · stash');checks++;
-    assert.equal(fields[5].textContent,'0.000000000000000000000000000000000001','primary Stash limit preserves a single protocol atom');checks++;
-    assert.equal(fields[6].textContent,'Minimum received','offline signer does not promise an unverifiable current return');checks++;
-    assert.equal(fields[7].textContent,'1 hash','monetary values use fixed hash units');checks++;
-    assert.equal(fields[7].title,'1 hash','the exact value uses the same monetary unit');checks++;
-    assert.equal(fields[7].className,'hash-amount');checks++;
-    assert.equal(fields[7].children[0].className,'hash-unit');checks++;
-    assert.equal(fields[7].children[0].textContent,'hash','only the monetary unit receives the accent');checks++;
-    assert.equal(fields[2].children[0].className,'stash-unit');checks++;
-    assert.equal(fields[2].children[0].textContent,'stash');checks++;
-    assert.equal(fields[3].children.length,0,'the exact stash quantity stays plain text');checks++;
-    assert.match(fields[9].textContent,/ hash$/,'exact signed fee uses the same monetary unit');checks++;
-    assert.equal(amounts.parseAmount(fields[9].textContent),'1234567890000000000','fee display never rounds away signed digits');checks++;
-    assert.equal(fields[11].textContent,'PASS');checks++;
-    assert.equal(fields.some(field=>/shares/i.test(field.textContent)),false,'review names ownership as STASH');checks++;
+    assert.match(fields[5].textContent,/ hash$/,'exact signed fee uses the same monetary unit');checks++;
+    assert.equal(amounts.parseAmount(fields[5].textContent),'1234567890000000000','fee display never rounds away signed digits');checks++;
+    assert.equal(fields[7].textContent,'PASS');checks++;
+    assert.equal(fields.some(field=>/minimum received|minimum shares/i.test(field.textContent)),false,'amount-only orders authorize no minimum output');checks++;
     assert.equal(technical[1].textContent,'95000000000000000000','technical details retain signed raw STASH atom count');checks++;
-    assert.equal(technical[3].textContent,'1','technical details preserve a single protocol atom');checks++;
     assert.equal(technical[0].textContent,'stash atoms');checks++;
-    assert.equal(technical[2].textContent,'Minimum stash atoms');checks++;
     assert.equal(technical[1].className,'stash-amount');checks++;
     assert.equal(h.get('review-details').hidden,false);checks++;
     assert.equal(h.get('review-details').open,false,'technical share details start collapsed');checks++;
@@ -214,13 +199,12 @@ async function run() {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
     h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
-    h.review.fields=[{label:'Action',value:'Deposit'},{label:'Amount · HASH',value:'1234000'},{label:'Minimum shares',value:'95000000000000000000'},{label:'Data bytes',value:'2'},{label:'Data hex',value:'00ff'}];
+    h.review.fields=[{label:'Action',value:'Deposit'},{label:'Amount · HASH',value:'1234000'},{label:'Data bytes',value:'2'},{label:'Data hex',value:'00ff'}];
     await h.get('review-form').fire('submit');
     const fields=h.get('review-fields').children[0].children;
     assert.equal(fields[1].textContent,'Deposit');checks++;
     assert.equal(fields[3].textContent,'0.000000000001234 hash','deposit amount retains every signed hash');checks++;
-    assert.equal(fields[4].textContent,'Minimum received · stash','deposit review visibly includes its Stash minimum');checks++;
-    assert.equal(fields[5].textContent,'0.000000000000000095');checks++;
+    assert.ok(!fields.some(field=>/Minimum/.test(field.textContent)),'deposit review has no minimum-output field');checks++;
     h.get('review-details').open=true;
     h.get('review-data').open=true; h.get('review-bytes').open=true;
     if(edit==='input') await h.get('unsigned').fire('input');
@@ -230,7 +214,7 @@ async function run() {
     if(edit==='lock') await h.get('lock').fire('click');
     if(edit==='rejected') {h.review.error='Transaction expired';await h.get('review-form').fire('submit');}
     if(edit==='bad-json') {h.get('unsigned').value='{';await h.get('review-form').fire('submit');}
-    if(edit==='bad-hash') {h.review.fields=[{label:'Minimum received · HASH',value:'not an integer'}];await h.get('review-form').fire('submit');}
+    if(edit==='bad-hash') {h.review.fields=[{label:'Amount · HASH',value:'not an integer'}];await h.get('review-form').fire('submit');}
     assert.equal(h.get('review-panel').hidden,true,`${edit} clears review`);checks++;
     assert.equal(h.get('review-details').hidden,true,`${edit} hides technical review`);checks++;
     assert.equal(h.get('review-details').open,false,`${edit} collapses details`);checks++;
@@ -433,13 +417,13 @@ async function run() {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
     h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
-    h.review.fields=['Amount', 'Recipient receives', 'Fee', 'Total debit', 'Minimum received', 'Support', 'Grant'].map(label => ({label:label+' · HASH',value:raw}));
+    h.review.fields=['Amount', 'Recipient receives', 'Fee', 'Total debit', 'Payment', 'Support', 'Grant'].map(label => ({label:label+' · HASH',value:raw}));
     await h.get('review-form').fire('submit');
     assert.equal(h.get('review-panel').hidden,false);checks++;
     const fields=h.get('review-fields').children[0].children;
     for (let index=1;index<fields.length;index+=2) {
       assert.match(fields[index].textContent,/^\d+(?:\.\d{1,18})? hash$/,'every approval amount is a plain exact hash decimal');checks++;
-      assert.equal(amounts.parseAmount(fields[index].textContent),raw,'approval cannot round amounts, fees, or minimums');checks++;
+      assert.equal(amounts.parseAmount(fields[index].textContent),raw,'approval cannot round amounts or fees');checks++;
       assert.equal(fields[index].title,fields[index].textContent);checks++;
     }
     assert.equal(h.get('review-body-hex').textContent,'abcdef','changing display units leaves signing bytes intact');checks++;
@@ -451,7 +435,7 @@ async function run() {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
     h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
-    h.review.fields=[{label:'Minimum received · HASH',value:raw}];
+    h.review.fields=[{label:'Amount · HASH',value:raw}];
     await h.get('review-form').fire('submit');
     assert.equal(h.get('review-panel').hidden,true,'review API still requires nonnegative integer hash atoms');checks++;
     await h.get('sign').fire('click');

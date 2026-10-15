@@ -127,7 +127,7 @@ class Audit:
 
     def buy_side(self, outcome, amount='20'):
         decision = self.decision()
-        self.send({'Deposit': {'amount': amount, 'min_shares': '1', 'decision': decision, 'outcome': outcome}}, mine=False)
+        self.send({'Deposit': {'amount': amount, 'decision': decision, 'outcome': outcome}}, mine=False)
         self.mine()
 
     def agree(self):

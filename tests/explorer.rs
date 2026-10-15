@@ -243,7 +243,7 @@ fn governance_evidence_contributions_same_height_proposals_and_reorg() {
         &c,
         Operation::Deposit {
             amount: 1000u32.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -319,8 +319,13 @@ fn governance_evidence_contributions_same_height_proposals_and_reorg() {
         live["decisions"][0]["started"],
         started_height * c.initial.interval
     );
-    assert_eq!(live["decisions"][0]["time_unit"], "seconds");
-    assert_eq!(live["decisions"][0]["clock_basis"], "target_interval");
+    assert_eq!(live["decisions"][0]["time_unit"], "blocks");
+    assert_eq!(live["decisions"][0]["observed_blocks"], 0);
+    assert_eq!(live["decisions"][0]["leading_blocks"], 0);
+    assert_eq!(
+        live["decisions"][0]["blocks_remaining"],
+        c.initial.decision_blocks
+    );
     assert!(live["next_before_height"].is_u64());
     let older = a
         .explorer_rpc(
@@ -334,7 +339,7 @@ fn governance_evidence_contributions_same_height_proposals_and_reorg() {
         &c,
         Operation::Deposit {
             amount: 256u32.into(),
-            min_shares: 1u32.into(),
+
             decision: Some(decision),
             outcome: Some(Outcome::Pass),
         },
@@ -360,7 +365,14 @@ fn governance_evidence_contributions_same_height_proposals_and_reorg() {
     assert_eq!(detail["decisions"][0]["outcome"], "pass");
     assert_eq!(detail["decisions"][0]["started_height"], started_height);
     assert_eq!(detail["contributions"].as_array().unwrap().len(), 1);
-    assert!(detail["decisions"][0]["pass_average"]["numerator"].is_string());
+    let decision_record = &detail["decisions"][0];
+    assert_eq!(
+        decision_record["observed_blocks"],
+        c.initial.decision_blocks
+    );
+    assert_eq!(decision_record["blocks_remaining"], 0);
+    assert!(decision_record["leading_blocks"].as_u64().unwrap() > c.initial.decision_blocks / 2);
+    assert!(decision_record.get("pass_average").is_none());
     assert_eq!(lookup(&a, trade_id)["settlement"]["effect"], "survived");
     let grant_address = address::encode(&key(96), &c.chain_id()).unwrap();
     let granted = a

@@ -103,7 +103,7 @@ def main():
 
         assert initialized_at <= configuration['genesis_time'] <= int(time.time())
         assert configuration['initial']['interval'] == 15
-        assert set(configuration['initial']) == {'block_bytes', 'minimum_fee_rate', 'interval', 'lead', 'rest', 'duration', 'miner_fee_percent', 'pass_margin_bps'}
+        assert set(configuration['initial']) == {'block_bytes', 'minimum_fee_rate', 'interval', 'lead', 'rest', 'decision_blocks', 'miner_fee_percent', 'pass_margin_bps', 'max_price_change_bps'}
         # Keep the deliberately oversized --data-hex argument within Windows'
         # command-line bound; consensus still rejects it at this fixture's capacity.
         configuration['initial']['block_bytes'] = 8192

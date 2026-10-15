@@ -21,7 +21,7 @@ fn key(secret: &[u8; 32]) -> PublicKey {
 fn config() -> Config {
     let mut c = Config::testnet();
     c.initial.lead = 2 * c.initial.interval;
-    c.initial.duration = 12 * c.initial.interval;
+    c.initial.decision_blocks = 12;
     c.initial.rest = 4 * c.initial.interval;
     c.validate().unwrap();
     c
@@ -73,7 +73,7 @@ fn transfer(recipient: PublicKey, amount: impl Into<Amount>) -> Operation {
 fn buy(s: &State, outcome: Outcome, amount: impl Into<Amount>) -> Operation {
     Operation::Deposit {
         amount: amount.into(),
-        min_shares: 1u32.into(),
+
         decision: s.decision_id(),
         outcome: Some(outcome),
     }
@@ -81,7 +81,7 @@ fn buy(s: &State, outcome: Outcome, amount: impl Into<Amount>) -> Operation {
 fn sell(s: &State, outcome: Outcome, shares: Amount) -> Operation {
     Operation::Redeem {
         shares,
-        min_received: 1u32.into(),
+
         decision: s.decision_id(),
         outcome: Some(outcome),
     }
@@ -96,7 +96,7 @@ fn funded_curve(c: &Config) -> State {
             secret,
             Operation::Deposit {
                 amount: amount.into(),
-                min_shares: 1u32.into(),
+
                 decision: None,
                 outcome: None,
             },
@@ -121,9 +121,9 @@ fn activate(c: &Config, mut s: State) -> State {
             round: s.auction_round().unwrap(),
             description: [14; 32],
             proposal: Proposal::Parameter {
-                parameter: Parameter::Duration,
-                old: s.settings.duration,
-                new: s.settings.duration * 2,
+                parameter: Parameter::DecisionBlocks,
+                old: s.settings.decision_blocks,
+                new: s.settings.decision_blocks * 2,
             },
             support: 10u32.into(),
         },
@@ -193,7 +193,7 @@ fn decision_opening_makes_full_balances_available_for_outcome_trades() {
     );
     let malformed = Operation::Deposit {
         amount: 1u32.into(),
-        min_shares: 0u32.into(),
+
         decision: None,
         outcome: None,
     };
@@ -298,15 +298,15 @@ fn selected_world_settles_directly_and_next_decision_clones_it_again() {
         // are deliberately inert at the flat limit, so use an already curved state.
         prior.world.curve_mass = &prior.world.reserve * 2u32;
         let mut s = activate(&c, prior);
-        // Buying only the chosen side raises its integrated price.
+        // Buying only the chosen side raises its closing price.
         let op = buy(&s, winner, 200_000u32);
         apply(&c, &mut s, &OWNER, op);
         let old_id = s.decision_id().unwrap();
         let end = match &s.phase {
-            Phase::Governance(d) => d.started + d.duration,
+            Phase::Governance(d) => d.started_height + d.blocks,
             _ => unreachable!(),
         };
-        while s.clock + s.settings.interval < end {
+        while s.height + 1 < end {
             s = step(&c, &s, 1, &[]);
         }
         let selected = account(&s, &OWNER, winner);
@@ -405,7 +405,7 @@ fn automatic_outcomes_grant_payment_reorg_and_reopen_are_exact() {
         &OWNER,
         Operation::Deposit {
             amount: 1500u32.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },

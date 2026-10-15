@@ -14,7 +14,11 @@ use anyhow::{Context, Result, bail, ensure};
 use num_traits::{ToPrimitive, Zero};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
-use std::{collections::VecDeque, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    path::Path,
+    sync::Arc,
+};
 
 // A pagination target, never a record or consensus validity limit. A single
 // larger record is returned alone so cursors cannot hide valid history.
@@ -30,7 +34,7 @@ pub const METHODS: &[&str] = &[
     "explorer_chat",
     "explorer_mail",
 ];
-const SCHEMA: &str = "24-address-only";
+const SCHEMA: &str = "batch-fills-leading-blocks";
 pub const MAX_PAGE: u64 = 50;
 
 pub struct Explorer {
@@ -1195,32 +1199,61 @@ fn index_block(
     let mut extra_fees = Amount::zero();
     let mut revenue_fees = Amount::zero();
     let mut mandatory = Amount::zero();
-    let mut execution = parent
-        .map(|p| consensus::prepare_block(c, p, &b.miner))
+    let mut fee_state = parent
+        .map(|p| consensus::prepare_block(c, p, &b.miner).map(|execution| execution.state))
         .transpose()?;
+    let (post, fills) = if let Some(parent) = parent {
+        consensus::execute_with_fills(
+            c,
+            parent,
+            &b.header.previous,
+            &b.miner,
+            &subsidy,
+            &b.transactions,
+        )?
+    } else {
+        (State::genesis(c), Vec::new())
+    };
+    ensure!(
+        post.root() == b.state_root,
+        "explorer replay commitment mismatch"
+    );
+    let fills: BTreeMap<_, _> = fills
+        .into_iter()
+        .map(|fill| (fill.transaction_id, fill))
+        .collect();
     for (position, t) in b.transactions.iter().enumerate() {
-        let execution = execution.as_mut().context("genesis has transactions")?;
-        let quote = fees::quote(c, &execution.state, t)?;
+        let opening = fee_state.as_mut().context("genesis has transactions")?;
+        let quote = fees::quote(c, opening, t)?;
         miner_fees += &quote.miner_fee;
         revenue_fees += &quote.revenue_fee;
         extra_fees += &quote.extra_fee;
         mandatory += &quote.minimum_fee;
         let paid = quote.fee;
         transaction_fees += &paid;
-        let value = tx_value(
-            c,
-            &execution.state,
-            t,
-            Some(b.height),
-            Some(hash),
-            Some(paid),
-        )?;
-        let id = hex::encode(codec::transaction_id(t));
+        let mut value = tx_value(c, opening, t, Some(b.height), Some(hash), Some(paid))?;
+        let transaction_id = codec::transaction_id(t);
+        let fill = if matches!(
+            t.body.operation,
+            Operation::Deposit { .. } | Operation::Redeem { .. }
+        ) {
+            Some(
+                fills
+                    .get(&transaction_id)
+                    .context("missing confirmed trade fill")?,
+            )
+        } else {
+            None
+        };
+        if let Some(fill) = fill {
+            attach_fill(&mut value, fill);
+        }
+        let id = hex::encode(transaction_id);
         let operation = t.body.operation.clone();
         db.execute("INSERT OR REPLACE INTO explorer_transactions(txid,block_hash,height,position,record,data) VALUES(?1,?2,?3,?4,?5,?6)",params![id,hash_text,b.height,position as u64,serde_json::to_string(&value)?,hex::encode(&t.body.data)])?;
         if let Some(message) = chat_value(
             c,
-            &execution.state,
+            opening,
             t,
             Some(b.height),
             Some(hash),
@@ -1230,7 +1263,7 @@ fn index_block(
         }
         if let Some(message) = mail_value(
             c,
-            &execution.state,
+            opening,
             t,
             Some(b.height),
             Some(hash),
@@ -1241,6 +1274,9 @@ fn index_block(
         }
         let mut event = json!({"height":b.height,"block_hash":hash_text,"txid":id,"kind":kind(&operation),"role":"sender","fee":value["fee"],"amount":value.get("amount"),"asset":value.get("asset"),"recipient":value.get("recipient")});
         conditional_fields(&operation, &mut event);
+        if let Some(fill) = fill {
+            attach_fill(&mut event, fill);
+        }
         event_row(
             db,
             &t.body.sender,
@@ -1263,7 +1299,17 @@ fn index_block(
                 &event,
             )?;
         }
-        execution.apply_verified_transaction(c, t)?;
+        // Fee allocation charges the first transfer that creates a recipient.
+        // Track only existence here; execution and actual trade fills came from
+        // the complete batch replay above.
+        if let Operation::TransferExact { recipient, .. } = &operation
+            && opening.account(recipient, None).is_none()
+        {
+            opening.world.put(*recipient, Account::default(), c)?;
+            if let Some(pass) = &mut opening.alternative {
+                pass.put(*recipient, Account::default(), c)?;
+            }
+        }
         match &operation {
             Operation::Propose {
                 round,
@@ -1303,15 +1349,6 @@ fn index_block(
             _ => {}
         }
     }
-    let post = if let (Some(parent), Some(execution)) = (parent, execution) {
-        consensus::finish_block(c, parent, &b.header.previous, &b.miner, &subsidy, execution)?
-    } else {
-        State::genesis(c)
-    };
-    ensure!(
-        post.root() == b.state_root,
-        "explorer replay commitment mismatch"
-    );
     summary["phase"] = json!(post.phase_name());
     summary["rewards"] = json!({"subsidy":subsidy.to_str_radix(10),"transaction_fees":transaction_fees.to_str_radix(10),"extra_fees":extra_fees.to_str_radix(10),"minimum_fees":mandatory.to_str_radix(10),"miner_fees":miner_fees.to_str_radix(10),"revenue_fees":revenue_fees.to_str_radix(10),"miner_total":(&subsidy+&miner_fees).to_str_radix(10),"complete":true});
     if b.height > 0 {
@@ -1389,43 +1426,207 @@ fn decision_record(c: &Config, s: &State, ended_height: Option<u64>) -> Result<V
         .alternative
         .as_ref()
         .context("missing conditional state")?;
-    let end = d.started.saturating_add(d.duration);
-    let clock = if ended_height.is_some() {
-        s.clock
-            .saturating_add(c.progress_increment(&s.settings))
-            .min(end)
-    } else {
-        s.clock.min(end)
-    };
-    let extra = clock.saturating_sub(s.clock);
-    let elapsed = clock.saturating_sub(d.started);
-    let pass_integral =
-        &pass.price_integral + pass.quote(c) * Amount::from(extra) - &d.start_integral;
-    let fail_integral =
-        &s.world.price_integral + s.world.quote(c) * Amount::from(extra) - &d.start_integral;
     let margin = s.frozen.pass_margin_bps.unwrap_or(0);
+    let mut observed = s.height.saturating_sub(d.started_height).min(d.blocks);
+    let mut leading = d.leading_blocks;
+    // Resolution runs at the next block boundary using the parent's closing
+    // quotes. Include that final observation in the historical result.
+    if ended_height.is_some_and(|height| height > s.height) && observed < d.blocks {
+        observed += 1;
+        if consensus::pass_beats_fail(&pass.quote(c), &s.world.quote(c), margin) {
+            leading += 1;
+        }
+    }
     let funded = match &d.proposal {
         Proposal::Grant { payments } => pass.grant_escrow == c.validate_grant(payments)?,
         _ => true,
     };
-    let won = funded && consensus::pass_beats_fail(&pass_integral, &fail_integral, margin);
-    let avg = |value: &Amount| {
-        let den = &c.quote_scale * Amount::from(elapsed);
-        if den.is_zero() {
-            Value::Null
-        } else {
-            json!({"numerator":(value*Amount::from(1_000_000_000_000_000_000u64)).to_str_radix(10),"denominator":den.to_str_radix(10)})
-        }
-    };
-    Ok(
-        json!({"id":hex::encode(d.id),"proposal":hex::encode(d.proposal_id),"round":d.round,"started":d.started,"started_height":s.height.checked_sub(s.clock.saturating_sub(d.started) / s.frozen.interval),"time_unit":"seconds","clock_basis":"target_interval","ended_height":ended_height,"outcome":ended_height.map(|_|if won{"pass"}else{"fail"}),"duration":d.duration,"elapsed":elapsed,"pass_integral":pass_integral.to_str_radix(10),"fail_integral":fail_integral.to_str_radix(10),"quote_scale":c.quote_scale.to_str_radix(10),"pass_margin_bps":margin,"funded":funded,"pass_average":avg(&pass_integral),"fail_average":avg(&fail_integral)}),
-    )
+    let won = funded && observed == d.blocks && leading > d.blocks / 2;
+    Ok(json!({
+        "id":hex::encode(d.id), "proposal":hex::encode(d.proposal_id), "round":d.round,
+        "started":d.started, "started_height":d.started_height, "ended_height":ended_height,
+        "time_unit":"blocks", "blocks":d.blocks, "observed_blocks":observed,
+        "leading_blocks":leading, "blocks_remaining":d.blocks.saturating_sub(observed),
+        "outcome":ended_height.map(|_|if won {"pass"} else {"fail"}),
+        "pass_margin_bps":margin, "funded":funded
+    }))
+}
+
+fn attach_fill(value: &mut Value, fill: &consensus::TradeFill) {
+    value["amount"] = json!(fill.input_filled.to_str_radix(10));
+    value["input_requested"] = json!(fill.input_requested.to_str_radix(10));
+    value["input_filled"] = json!(fill.input_filled.to_str_radix(10));
+    value["input_unfilled"] = json!(fill.input_unfilled.to_str_radix(10));
+    value["output"] = json!(fill.output.to_str_radix(10));
+    value["output_asset"] = json!(if fill.is_buy { "shares" } else { "hash" });
+    value["fill_status"] = json!(if fill.input_filled.is_zero() {
+        "unfilled"
+    } else if fill.input_unfilled.is_zero() {
+        "full"
+    } else {
+        "partial"
+    });
 }
 
 #[cfg(test)]
 mod indexing_tests {
     use super::*;
     use crate::crypto;
+
+    #[test]
+    fn index_records_actual_partial_fills_and_retains_signed_request() {
+        let c = Config::testnet();
+        let secret = [91; 32];
+        let owner = crypto::public_key(&secret).unwrap();
+        let other = crypto::public_key(&[92; 32]).unwrap();
+        let mut parent = State::genesis(&c);
+        for (key, shares) in [(owner, 100u32), (other, 900)] {
+            parent
+                .world
+                .put(
+                    key,
+                    Account {
+                        ordinary: 1000u32.into(),
+                        shares: &c.share_scale * shares,
+                        ..Account::default()
+                    },
+                    &c,
+                )
+                .unwrap();
+        }
+        parent.world.reserve = 1000u32.into();
+        parent.world.curve_mass = 5000u32.into();
+        parent.world.shares = &c.share_scale * 1000u32;
+        parent.issued = 3000u32.into();
+        parent.height = 1;
+        let tx = crypto::sign(
+            &TransactionBody {
+                chain_id: c.chain_id(),
+                sender: owner,
+                nonce: 0,
+                fee: 1u32.into(),
+                expiry_height: 3,
+                operation: Operation::Redeem {
+                    shares: &c.share_scale * 100u32,
+                    decision: None,
+                    outcome: None,
+                },
+                data: Vec::new(),
+            },
+            &secret,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("partial-fill.sqlite");
+        let chain = Chain::open(&path, c.clone()).unwrap();
+        let mut block = chain.tip_block().clone();
+        block.height = parent.height + 1;
+        block.header.previous = [41; 32];
+        block.miner = owner;
+        block.transactions = vec![tx.clone()];
+        let subsidy = math::work(&math::target_from_bits(block.header.bits).unwrap());
+        let (post, fills) = consensus::execute_with_fills(
+            &c,
+            &parent,
+            &block.header.previous,
+            &owner,
+            &subsidy,
+            &block.transactions,
+        )
+        .unwrap();
+        let fill = &fills[0];
+        assert!(!fill.input_filled.is_zero());
+        assert!(!fill.input_unfilled.is_zero());
+        block.state_root = post.root();
+        block.header.merkle_root = codec::merkle_root(&block).unwrap();
+        let mut index = Explorer::open(&path, &chain).unwrap();
+        let db = index.db.as_mut().unwrap();
+        let transaction = db.transaction().unwrap();
+        assert_eq!(
+            index_block(&transaction, &c, &block, Some(&parent))
+                .unwrap()
+                .root(),
+            post.root()
+        );
+        transaction.commit().unwrap();
+        let row: String = db
+            .query_row(
+                "SELECT record FROM explorer_transactions WHERE txid=?1",
+                [hex::encode(codec::transaction_id(&tx))],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let record: Value = serde_json::from_str(&row).unwrap();
+        assert_eq!(record["fill_status"], "partial");
+        assert_eq!(record["amount"], fill.input_filled.to_str_radix(10));
+        assert_eq!(
+            record["input_requested"],
+            fill.input_requested.to_str_radix(10)
+        );
+        assert_eq!(
+            record["operation"]["Redeem"]["shares"],
+            fill.input_requested.to_str_radix(10)
+        );
+        assert_eq!(
+            record["input_unfilled"],
+            fill.input_unfilled.to_str_radix(10)
+        );
+        assert_eq!(record["output"], fill.output.to_str_radix(10));
+        let row: String = db
+            .query_row(
+                "SELECT record FROM explorer_events WHERE position=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event: Value = serde_json::from_str(&row).unwrap();
+        assert_eq!(event["input_filled"], record["input_filled"]);
+        assert_eq!(event["output"], record["output"]);
+    }
+
+    #[test]
+    fn decision_history_counts_final_parent_quote_once_and_requires_majority() {
+        let c = Config::testnet();
+        let mut state = State::genesis(&c);
+        state.height = 7;
+        state.world.reserve = 100u32.into();
+        state.world.curve_mass = 100u32.into();
+        state.world.shares = 100u32.into();
+        let mut pass = state.world.clone();
+        pass.curve_mass = 110u32.into();
+        state.alternative = Some(pass);
+        state.phase = Phase::Governance(crate::state::Decision {
+            id: [1; 32],
+            epoch: 1,
+            round: 1,
+            proposal_id: [2; 32],
+            proposal: Proposal::Parameter {
+                parameter: Parameter::Lead,
+                old: 1,
+                new: 2,
+            },
+            started: 5,
+            started_height: 5,
+            blocks: 3,
+            leading_blocks: 1,
+        });
+        let live = decision_record(&c, &state, None).unwrap();
+        assert_eq!(live["observed_blocks"], 2);
+        assert_eq!(live["leading_blocks"], 1);
+        assert_eq!(live["blocks_remaining"], 1);
+        assert!(live["outcome"].is_null());
+        let ended = decision_record(&c, &state, Some(8)).unwrap();
+        assert_eq!(ended["leading_blocks"], 2);
+        assert_eq!(ended["observed_blocks"], 3);
+        assert_eq!(ended["outcome"], "pass");
+        state.height = 8;
+        if let Phase::Governance(decision) = &mut state.phase {
+            decision.blocks = 4;
+        }
+        let tied = decision_record(&c, &state, Some(9)).unwrap();
+        assert_eq!(tied["leading_blocks"], 2);
+        assert_eq!(tied["outcome"], "fail");
+    }
 
     #[test]
     fn account_history_continues_after_large_block_event_positions() {
@@ -1795,7 +1996,6 @@ mod chat_tests {
             (
                 Operation::Deposit {
                     amount: 1u32.into(),
-                    min_shares: 0u32.into(),
                     decision: None,
                     outcome: None,
                 },
@@ -1806,7 +2006,6 @@ mod chat_tests {
             (
                 Operation::Redeem {
                     shares: 2u32.into(),
-                    min_received: 0u32.into(),
                     decision: None,
                     outcome: None,
                 },

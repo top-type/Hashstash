@@ -34,10 +34,11 @@
         Interval: [ "interval", "Target block interval", "seconds" ],
         Lead: [ "lead", "Auction lead period", "seconds" ],
         Rest: [ "rest", "Rest period", "seconds" ],
-        Duration: [ "duration", "Governance duration", "seconds" ],
+        DecisionBlocks: [ "decision_blocks", "Decision length", "blocks" ],
         MinerFeePercent: [ "miner_fee_percent", "Miner fee share", "%" ],
         PassMarginBps: [ "pass_margin_bps", "PASS margin", "bps" ],
-        MinimumFeeRate: [ "minimum_fee_rate", "Minimum fee rate", "hash / 1,024 weight" ]
+        MinimumFeeRate: [ "minimum_fee_rate", "Minimum fee rate", "hash / 1,024 weight" ],
+        MaxPriceChangeBps: [ "max_price_change_bps", "Price change per block", "bps" ]
     };
     const parameterAvailable = parameter => Object.hasOwn(settings, parameter);
     const titles = {
@@ -391,9 +392,12 @@
             end = wins ? "decision" : "auction timeout";
             summaryEnd = wins ? "to decision" : "to timeout";
         } else if (name === "Governance") {
-            seconds = remaining(BigInt(phase.started) + BigInt(phase.duration));
-            total = BigInt(phase.duration);
-            end = "resolution";
+            const totalBlocks = BigInt(phase.blocks), elapsed = BigInt(state.status.height) - BigInt(phase.started_height);
+            const completedBlocks = elapsed < 0n ? 0n : elapsed > totalBlocks ? totalBlocks : elapsed;
+            const count = totalBlocks - completedBlocks;
+            return {seconds: count * interval, blocks: count, total: totalBlocks * interval, totalBlocks, completedBlocks,
+                estimate: `~${duration(count * interval)}`, end: "resolution", summary: `${blockCount(count)} remaining`,
+                detail: `${blockCount(count)} at the ${interval}s target.`};
         } else {
             if (name !== "Rest") return null;
             seconds = remaining(BigInt(phase.until));
@@ -488,7 +492,6 @@
             let available = BigInt(data.account.ordinary), debit = fee;
             kind === "TransferExact" && (debit += BigInt(value.amount));
             kind === "Deposit" && value.outcome === name && (debit += BigInt(value.amount));
-            kind === "Redeem" && value.outcome === name && (available += BigInt(value.min_received));
             if (available < debit) throw new Error(`${name.toUpperCase()} balance cannot cover this transaction and its fee. Payments and fees need hashes in both outcomes.`);
         }
     }
@@ -755,6 +758,9 @@
         }
     }
     $("faucet-claim").addEventListener("click", claimFaucet);
+    function transactionExpiry(form) {
+        return safeInteger($(form.id === "trade-form" ? "trade-expiry" : "wallet-expiry").value, "Transaction expiry");
+    }
     async function submit(form, operation) {
         if (!state.ready) throw new Error("Wait for the node connection to refresh.");
         if (!state.session) throw new Error("Wallet session is unavailable.");
@@ -772,7 +778,7 @@
             };
         }
         checkOutcomeFunds(operation, feeFields.fee);
-        const expiry = safeInteger($("wallet-expiry").value, "Transaction expiry");
+        const expiry = transactionExpiry(form);
         if (!expiry) throw new Error("Transaction expiry must be greater than zero.");
         const identity = submissionIdentity(form), hot = state.session.wallet_enabled, dataFields = transactionData(form);
         const nonce = nextNonce();
@@ -848,7 +854,7 @@
         form.id === "send-form" && (values.quoteIdentity = sendIdentity());
         values.nonce = nextNonce().toString();
         form.id === "propose-form" && values.type === "parameter" && (values.currentSetting = [ state.status?.settings?.[settings[values.parameter]?.[0]] ]);
-        return JSON.stringify([ walletIdentity(), state.session?.wallet_enabled, $("wallet-expiry").value, state.status?.chain_id, phaseName(), activeDecision()?.id, state.gov?.phase?.Auction?.round, form.id === "trade-form" ? state.trade : null, values ]);
+        return JSON.stringify([ walletIdentity(), state.session?.wallet_enabled, $(form.id === "trade-form" ? "trade-expiry" : "wallet-expiry").value, state.status?.chain_id, phaseName(), activeDecision()?.id, state.gov?.phase?.Auction?.round, form.id === "trade-form" ? state.trade : null, values ]);
     }
     function bindForm(id, operationBuilder) {
         const form = $(id);
@@ -966,7 +972,7 @@
                 operation: operation,
                 ...transactionData(form),
                 extra_fee: extra,
-                expiry_blocks: safeInteger($("wallet-expiry").value, "Transaction expiry")
+                expiry_blocks: transactionExpiry(form)
             });
             if (!current()) return;
             checkFeeQuote(result, extra, form, operation);
@@ -1380,7 +1386,7 @@
         svg.replaceChildren();
         svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
         svgElement(svg, "title", {id: titleId}, "PASS and FAIL conversion curves");
-        svgElement(svg, "desc", {id: descriptionId}, "Both curves use the same total stash supply and hash-per-stash axes. Dots mark current supply and price. These are current conversion curves, not price history or probabilities. The decision uses the full-period average price. Preview excludes fees and integer rounding.");
+        svgElement(svg, "desc", {id: descriptionId}, "Both curves use the same total stash supply and hash-per-stash axes. Dots mark current supply and price. These are current conversion curves, not price history or probabilities. The decision counts the blocks led by each outcome. Preview excludes fees and integer rounding.");
         const funded = worlds.filter(([, world]) => world && BigInt(world.shares) > 0n && curveModel(world));
         if (!funded.length) {
             svgElement(svg, "text", {x: 18, y: 58, class: "curve-axis-label"}, "The first deposit starts a curve.");
@@ -1527,43 +1533,32 @@
         } else if (active) {
             text("gov-round", `Round ${decision.round}`);
             text("gov-title", grant ? "Recipients" : proposalTitle(decision.proposal));
-            const elapsed = BigInt(clock) - BigInt(decision.started);
+            const total = BigInt(decision.blocks), elapsed = BigInt(state.status.height) - BigInt(decision.started_height);
+            const observed = elapsed < 0n ? 0n : elapsed > total ? total : elapsed;
+            const leading = BigInt(decision.leading_blocks), other = observed - leading;
+            if (leading < 0n || other < 0n) throw new Error("Invalid decision block counts.");
             const margin = BigInt(gov.frozen.pass_margin_bps || 0);
-            const criterion = margin ? `PASS average must exceed FAIL by more than ${fraction(margin, 100, 2)}%.` : "PASS average must be higher than FAIL.";
+            const criterion = `PASS must lead in more than half of ${blockCount(total)}.${margin ? ` A block counts only when its price is more than ${fraction(margin, 100, 2)}% above FAIL.` : " Equal prices count for FAIL."}`;
             text("gov-subtitle", criterion);
             text("overview-governance-title", "Decision active");
             text("overview-governance-text", proposalTitle(decision.proposal));
-            const period = elapsed < 0n ? 0n : elapsed > BigInt(decision.duration) ? BigInt(decision.duration) : elapsed;
-            const scores = {};
-            for (const [id, world] of [ [ "pass", gov.pass ], [ "fail", gov.world ] ]) {
-                const score = BigInt(world.price_integral) - BigInt(decision.start_integral);
-                scores[id] = score;
-                const numerator = score;
-                const denominator = BigInt(state.config.quote_scale) * BigInt(period || 1);
-                period ? sharePrice(`${id}-twap`, {
-                    numerator: numerator,
-                    denominator: denominator
-                }) : text(`${id}-twap`, "—");
+            for (const [id, world, count] of [["pass", gov.pass, leading], ["fail", gov.world, other]]) {
+                text(`${id}-leading-blocks`, commas(count));
                 const hasStash = BigInt(world.shares) > 0n;
-                sharePrice(`${id}-price`, hasStash ? worldPrice(world) : { numerator: "0", denominator: "1" });
-                if (!hasStash) $(`${id}-price`).title = "No outstanding stash. This outcome contributes zero to the decision average until a deposit starts its reserve.";
+                sharePrice(`${id}-price`, hasStash ? worldPrice(world) : {numerator: "0", denominator: "1"});
+                if (!hasStash) $(`${id}-price`).title = "No outstanding stash. Its price is zero until a deposit starts the reserve.";
             }
-            const pricePass = scores.pass * 10000n > scores.fail * (10000n + margin);
             const funded = !grant || BigInt(gov.pass.grant_escrow) === BigInt(grantTotal(grant.payments));
-            const passLeads = pricePass && funded;
-            const difference = scores.pass - scores.fail;
-            const gap = difference === 0n ? "The averages are exactly equal." : scores.fail > 0n ? `PASS average is ${fraction((difference < 0n ? -difference : difference) * 100n, scores.fail, 6)}% ${difference > 0n ? "above" : "below"} FAIL.` : "PASS has a positive average; FAIL is zero.";
-            const roundedGap = scores.fail > 0n ? ((difference < 0n ? -difference : difference) * 10000n + scores.fail / 2n) / scores.fail : 0n;
-            const briefGap = difference === 0n ? gap : scores.fail > 0n ? `PASS average is ${roundedGap ? "~" + fraction(roundedGap, 100n, 2) : "<0.01"}% ${difference > 0n ? "above" : "below"} FAIL.` : gap;
-            text("gov-result-status", period ? passLeads ? "PASS leads" : "FAIL leads" : "Pending");
-            text("gov-result-detail", period ? `${briefGap}${funded ? "" : " Funding is incomplete."}` : "The next block starts the comparison.");
-            $("gov-result").dataset.outcome = period ? passLeads ? "pass" : "fail" : "";
-            $("gov-result").title = `${protocolDuration(period)} measured. ${gap} ${criterion} The result is not final until resolution.`;
+            const passLeads = leading * 2n > observed && funded;
+            text("gov-result-status", observed ? passLeads ? "PASS leads" : "FAIL leads" : "Pending");
+            text("gov-result-detail", `${commas(leading)} of ${blockCount(observed)} counted for PASS. ${blockCount(total - observed)} remain.${funded ? "" : " Funding is incomplete."}`);
+            $("gov-result").dataset.outcome = observed ? passLeads ? "pass" : "fail" : "";
+            $("gov-result").title = `${blockCount(observed)} observed. ${criterion} The result is not final until resolution.`;
             for (const side of ["pass", "fail"]) {
-                const leading = !!period && (side === "pass" ? passLeads : !passLeads);
+                const isLeading = !!observed && (side === "pass" ? passLeads : !passLeads);
                 $(`${side}-outcome-leader`).hidden = true;
-                $(`${side}-outcome-card`).title = leading ? `${side.toUpperCase()} leads. Decision pending.` : "";
-                $(`${side}-outcome-card`).classList.toggle("is-leading", leading);
+                $(`${side}-outcome-card`).title = isLeading ? `${side.toUpperCase()} leads. Decision pending.` : "";
+                $(`${side}-outcome-card`).classList.toggle("is-leading", isLeading);
             }
             number("pass-reserve", gov.pass.reserve);
             number("fail-reserve", gov.world.reserve);
@@ -1715,7 +1710,7 @@
         const select = $("proposal-parameter");
         parameterAvailable(select.value) || (select.value = "BlockBytes");
         const parameter = select.value, setting = settings[parameter], old = state.status.settings[setting[0]], input = $("proposal-value");
-        const margin = parameter === "PassMarginBps", positive = ["Interval", "Duration", "BlockBytes"].includes(parameter);
+        const margin = ["PassMarginBps", "MaxPriceChangeBps"].includes(parameter), positive = ["Interval", "DecisionBlocks", "BlockBytes"].includes(parameter);
         input.required = $("proposal-type").value === "parameter";
         text("proposal-value-label", parameter === "MinimumFeeRate" ? "Minimum fee rate · raw hashes / 1,024 weight" : `${setting[1]} · ${margin ? "%" : setting[2]}`);
         input.inputMode = margin ? "decimal" : "numeric";
@@ -1737,8 +1732,8 @@
         if (!parameterAvailable(parameter)) throw new Error("This network does not support this parameter.");
         const raw = String(value ?? "").trim();
         let next;
-        if (parameter === "PassMarginBps") {
-            if (raw.length > 24 || !/^\d+(?:\.\d{1,2})?$/.test(raw)) throw new Error("PASS margin needs at most two decimal places.");
+        if (["PassMarginBps", "MaxPriceChangeBps"].includes(parameter)) {
+            if (raw.length > 24 || !/^\d+(?:\.\d{1,2})?$/.test(raw)) throw new Error("This percentage needs at most two decimal places.");
             const [whole, decimals = ""] = raw.split(".");
             next = BigInt(whole) * 100n + BigInt(decimals.padEnd(2, "0"));
         } else {
@@ -1746,7 +1741,7 @@
             next = BigInt(raw);
         }
         if (next > 18446744073709551615n) throw new Error("Setting exceeds the supported integer range.");
-        if (["Interval", "Duration", "BlockBytes"].includes(parameter) && next === 0n) throw new Error(`${settings[parameter][1]} must be positive.`);
+        if (["Interval", "DecisionBlocks", "BlockBytes"].includes(parameter) && next === 0n) throw new Error(`${settings[parameter][1]} must be positive.`);
         if (parameter === "BlockBytes" && next < 1024n) throw new Error("Block capacity must cover the miner account’s 1,024 weight.");
         if (parameter === "MinerFeePercent" && next > 100n) throw new Error("Miner fee share must be between 0 and 100%.");
         return next;
@@ -1767,7 +1762,7 @@
             number(`${id}-revenue`, world?.revenue || "0");
         }
         text("guide-fees", `Transaction weight determines the minimum fee. Governance sets its rate and the miner's share. The entire fee, including any extra, currently goes ${s.settings.miner_fee_percent}% to the miner and ${100 - Number(s.settings.miner_fee_percent)}% to revenue.`);
-        text("guide-proposals", "A proposal requests a grant or sets a new value for one network setting. Time periods use whole seconds, the miner's fee share uses whole percentages from 0 to 100, and the PASS margin uses 0.01% steps. Block capacity uses weight; the minimum fee rate uses raw hashes per 1,024 weight.");
+        text("guide-proposals", "A proposal requests a grant or sets a new value for one network setting. Decision length uses blocks. Auction lead, rest and target interval use whole seconds. The miner’s fee share uses whole percentages from 0 to 100; PASS margin and the price-change limit use 0.01% steps. Block capacity uses weight; the minimum fee rate uses raw hashes per 1,024 weight.");
         text("guide-revenue-flow", "Revenue fills the gap between reserve and curve mass. This raises the reserve ratio toward 100%, making the curve flatter while keeping its current price and stash supply unchanged. Once the gap is filled, further revenue waits outside the reserve.");
         text("guide-grant-flow", "At the start of a grant decision, PASS sets aside the proposed payments from waiting revenue, then reserve. Drawing from reserve lowers its ratio and makes the curve steeper, while the current price and stash supply stay unchanged. If PASS wins, the recipients receive those payments. If FAIL wins, its reserve and balances continue.");
         text("network-height", commas(s.height));
@@ -1783,8 +1778,8 @@
         document.querySelectorAll(".outcome-cash-label").forEach(node => {
             node.textContent = "Hashes";
         });
-        text("guide-average", "The average uses each completed block's stash price, weighted by the scheduled seconds it covers, across the full decision. PASS wins when its average exceeds the FAIL average by the required margin. For example, a 5% margin requires PASS to exceed 1.05 times FAIL. Equality means FAIL. The margin is fixed when the decision begins.");
-        text("guide-clock", "Each block advances the governance clock by the target block interval. With a 15-second target, a 900-second decision spans 60 block intervals. Mining can make the actual wait longer or shorter. Auctions, decisions and rest periods use this clock; transaction expiry and confirmations use block counts.");
+        text("guide-decision", "Each block compares the previous block’s closing stash prices. PASS gets one leading block when its price beats FAIL by more than the required margin. PASS wins only with more than half of all decision blocks; a tie means FAIL. The margin and decision length are fixed when the decision begins.");
+        text("guide-clock", "A decision lasts its configured number of blocks. Each block counts once toward PASS or FAIL. Auction lead and rest use a scheduled clock that advances by the target interval; mining determines the actual wait. Transaction expiry and confirmations also use block counts.");
         text("guide-difficulty", "ASERT, the difficulty-adjustment algorithm, uses block timestamps to aim for the governed average block interval. Only blocks on the accepted chain create new hashes; losing blocks receive no reward.");
         for (const field of [ "reserve", "revenue", "grant_capacity" ]) {
             const node = $(`network-${field}`);
@@ -1813,7 +1808,7 @@
         parameterPreview();
         const frozen = state.gov.frozen;
         text("timing-auction", `${protocolDuration(frozen.lead)} lead · ${protocolDuration(auctionTimeout())} limit`);
-        text("timing-governance", protocolDuration(activeDecision()?.duration ?? frozen.duration));
+        text("timing-governance", blockCount(activeDecision()?.blocks ?? frozen.decision_blocks));
         text("timing-rest", protocolDuration(frozen.rest));
     }
     function miningView() {
@@ -2125,17 +2120,22 @@
             });
             if (version !== state.quoteVersion || identity !== tradeIdentity() || !state.ready) return;
             if (hex(result.decision) !== hex(activeDecision()?.id)) throw new QuoteRefreshPending("Updating quote for the current decision.");
-            for (const field of [ "shares", "output_hash", "share_before", "share_after", "stash_before_hash", "stash_after_hash" ]) if (typeof result[field] !== "string" || !/^\d{1,160}$/.test(result[field])) throw new Error("Invalid Stash quote.");
+            for (const field of [ "input_requested", "input_filled", "input_unfilled", "output", "shares", "output_hash", "share_before", "share_after", "stash_before_hash", "stash_after_hash" ]) if (typeof result[field] !== "string" || !/^\d{1,160}$/.test(result[field])) throw new Error("Invalid Stash quote.");
             checkQuoteSnapshot(result);
-            if (BigInt(result.shares) === 0n || kind === "redeem" && (BigInt(result.output_hash) === 0n || !state.tradeAll && result.shares !== amount)) throw new Error("Quote does not cover the requested amount.");
-            state.tradeAll && kind === "redeem" && ($("trade-amount").value = HashstashShares.exactInput(result.shares));
+            const requested = BigInt(result.input_requested), filled = BigInt(result.input_filled), unfilled = BigInt(result.input_unfilled);
+            const owned = BigInt(snapshotAccount(outcome === "Pass" ? state.pass : outcome === "Fail" ? state.fail : state.account)?.shares || "0");
+            if (result.kind !== kind || result.indicative !== true || result.partial_fill_possible !== true || result.execution !== "block_batch") throw new Error("Invalid Stash quote.");
+            if (requested !== (state.tradeAll && kind === "redeem" ? owned : BigInt(amount)) || filled + unfilled !== requested) throw new Error("Quote does not match the requested amount.");
+            const output = BigInt(result.output), before = BigInt(result.share_before), after = BigInt(result.share_after);
+            if (before !== owned || (kind === "deposit" ? BigInt(result.shares) !== output || after !== before + output : filled > before || after !== before - filled || BigInt(result.shares) !== requested || BigInt(result.output_hash) !== output)) throw new Error("Invalid Stash quote.");
+            state.tradeAll && kind === "redeem" && ($("trade-amount").value = HashstashShares.exactInput(result.input_requested));
             amountText("trade-quote", kind === "deposit" ? `${HashstashShares.formatAmount(result.shares)} stash` : formatExactHash(result.output_hash));
             $("trade-quote").title = kind === "deposit" ? `${HashstashShares.exactInput(result.shares)} stash` : formatExactHash(result.output_hash);
             amountText("quote-remaining", `${kind === "deposit" ? "Stash balance" : "Stash remaining"}: ${HashstashShares.formatAmount(result.share_after)} stash`);
             $("quote-remaining").title = `${HashstashShares.exactInput(result.share_after)} stash`;
             $("quote-remaining").hidden = false;
-            text("quote-height", "Fees excluded");
-            $("quote-height").title = `Quoted at block ${commas(result.height)}`;
+            text("quote-height", "Estimate · partial fills possible · fees excluded");
+            $("quote-height").title = `Estimated at block ${commas(result.height)}. Orders in the same block share an execution price. Unfilled input stays in your balance.`;
             state.quoteOutput = {
                 ...result,
                 identity: tradeIdentity()
@@ -2273,7 +2273,7 @@
         quoteTimer = setTimeout(quote, 350);
     }
     function tradeIdentity() {
-        return JSON.stringify([ walletIdentity(), state.status?.chain_id, activeDecision()?.id, state.trade, state.tradeAll, $("trade-amount").value, $("trade-outcome").value, $("trade-form").elements.extra_fee.value, $("trade-form").elements.data_format.value, $("trade-form").elements.data_text.value, $("trade-form").elements.data_hex.value, attachmentIdentity($("trade-form")) ]);
+        return JSON.stringify([ walletIdentity(), state.status?.chain_id, activeDecision()?.id, state.trade, state.tradeAll, $("trade-amount").value, $("trade-outcome").value, $("trade-form").elements.extra_fee.value, $("trade-expiry").value, $("trade-form").elements.data_format.value, $("trade-form").elements.data_text.value, $("trade-form").elements.data_hex.value, attachmentIdentity($("trade-form")) ]);
     }
     function tradeTab(kind) {
         $("trade-form").dataset.trade = kind;
@@ -2290,7 +2290,7 @@
         text("trade-unit", kind === "deposit" ? "hash" : "stash");
         $("trade-amount").inputMode = "decimal";
         $("trade-amount").title = kind === "deposit" ? "Amount in hashes; up to 18 decimal places." : "Amount in stash; up to 36 decimal places.";
-        text("quote-label", "You receive");
+        text("quote-label", "Estimated receive");
         text("trade-submit", kind === "deposit" ? "Deposit" : "Withdraw");
         text("trade-quote", "—");
         text("quote-height", "");
@@ -2693,13 +2693,13 @@
         return state.trade === "deposit" ? {
             Deposit: {
                 amount: amount,
-                min_shares: quote.shares,
+
                 ...ctx
             }
         } : {
             Redeem: {
-                shares: quote.shares,
-                min_received: quote.output_hash,
+                shares: quote.input_requested,
+
                 ...ctx
             }
         };
@@ -2823,7 +2823,7 @@
         if (state.trade === "deposit" && (!outcome || true)) {
             const identity = tradeIdentity(), snapshot = state.status.state_root, balance = value;
             try {
-                const extra = integer($("trade-form").elements.extra_fee.value, "Optional extra", true);
+                const extra = integer($("trade-form").elements.extra_fee.value, $("trade-expiry").value, "Optional extra", true);
                 for (let attempt = 0; attempt < 8; attempt++) {
                     if (value <= 0n) break;
                     const quote = await rpc("stash_quote", {
@@ -2837,7 +2837,7 @@
                     const operation = {
                         Deposit: {
                             amount: value.toString(),
-                            min_shares: quote.shares,
+
                             ...context(outcome)
                         }
                     };
@@ -2846,7 +2846,7 @@
                         operation: operation,
                         ...transactionData($("trade-form")),
                         extra_fee: extra,
-                        expiry_blocks: safeInteger($("wallet-expiry").value, "Transaction expiry")
+                        expiry_blocks: transactionExpiry($("trade-form"))
                     });
                     if (identity !== tradeIdentity() || snapshot !== state.status?.state_root || !state.ready) return;
                     checkFeeQuote(fee, extra, $("trade-form"));
@@ -2874,6 +2874,7 @@
     });
     $("proposal-parameter").addEventListener("change", parameterPreview);
     $("proposal-value").addEventListener("input", parameterPreview);
+    $("trade-expiry").addEventListener("input", quoteSoon);
     $("wallet-expiry").addEventListener("input", () => {
         feeForms.forEach(name => feeSoon($(`${name}-form`)));
         sendSoon();

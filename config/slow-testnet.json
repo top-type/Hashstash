@@ -18,10 +18,11 @@
     "interval": 15,
     "lead": 300,
     "rest": 10800,
-    "duration": 3600,
     "miner_fee_percent": 50,
     "pass_margin_bps": 0,
-    "minimum_fee_rate": 1
+    "minimum_fee_rate": 1,
+    "decision_blocks": 240,
+    "max_price_change_bps": 1000
   },
   "share_scale": "1000000000000000000"
 }

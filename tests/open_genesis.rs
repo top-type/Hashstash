@@ -38,7 +38,7 @@ fn signed(s: &State, secret: &[u8; 32], operation: Operation) -> Transaction {
 fn deposit(amount: u32) -> Operation {
     Operation::Deposit {
         amount: amount.into(),
-        min_shares: 1u32.into(),
+
         decision: None,
         outcome: None,
     }
@@ -77,7 +77,7 @@ fn genesis_opens_payments_and_flat_stash_before_first_auction() {
         &BOB,
         Operation::Redeem {
             shares: before.shares.clone() / 2u32,
-            min_received: 1u32.into(),
+
             decision: None,
             outcome: None,
         },

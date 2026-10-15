@@ -53,7 +53,7 @@ class PlannerTest(unittest.TestCase):
                 shares, output = amount * 1000, amount
             else:
                 shares, output = amount, amount // 1000
-            return {"shares": str(shares), "output_hash": str(output),
+            return {"shares": str(shares), "input_requested": str(amount if params["kind"] == "deposit" else shares), "input_filled": str(amount if params["kind"] == "deposit" else shares), "input_unfilled": "0", "output": str(shares if params["kind"] == "deposit" else output), "output_hash": str(output), "stash_before_hash": str(amount // 1000 if params["kind"] == "redeem" else output),
                     "decision": self.snapshot["status"]["decision"] if params.get("outcome") else None}
         if method == "grant_quote":
             return {"feasible": self.grant_feasible, "funded_baseline": params["amount"]}
@@ -87,7 +87,7 @@ class PlannerTest(unittest.TestCase):
         self.phase("governance")
         self.snapshot["governance"]["pass"] = dict(self.snapshot["governance"]["world"], grant_escrow=str(3 * 10**15))
         self.snapshot["governance"]["phase"] = {"Governance": {
-            "started": 1350, "duration": 3600, "proposal": {"Grant": {'payments': [{
+            "started": 1350, "started_height": 90, "blocks": 240, "leading_blocks": 0, "proposal": {"Grant": {'payments': [{
                 "recipient": list(bytes.fromhex(REGISTRY["sgp"][0])), "amount": str(3 * 10**15)}]}}}}
 
     def confirm_simulated(self, action):
@@ -178,22 +178,20 @@ class PlannerTest(unittest.TestCase):
             actor["account"].update(ordinary="1", shares="0")
         self.assertIsNone(self.choose())
 
-    def test_cash_recovery_pays_fee_from_redemption(self):
+    def test_unfilled_redemption_cannot_finance_its_fee(self):
         self.phase("auction")
         for actor in self.accounts:
             actor["account"]["ordinary"] = "0"
-        action = self.choose()
-        self.assertEqual(action["kind"], "recover_cash")
-        self.assertIsNone(action["operation"]["Redeem"]["decision"])
-        self.assertGreater(int(action["operation"]["Redeem"]["min_received"]), int(self.fee))
+        self.assertIsNone(self.choose())
 
-    def test_rest_deposit_and_redemption_are_quoted_and_slippage_bounded(self):
+    def test_rest_orders_sign_only_the_requested_amount(self):
         self.phase("rest")
-        for cursor, kind, field in ((1, "deposit", "min_shares"), (2, "redeem", "min_received")):
+        for cursor, kind, field in ((1,"deposit","amount"),(2,"redeem","shares")):
             self.policy["cursor"] = cursor
             action = self.choose()
             self.assertEqual(action["kind"], kind)
             operation = action["operation"]["Deposit" if kind == "deposit" else "Redeem"]
+            self.assertEqual(set(operation), {field,"decision","outcome"})
             self.assertGreater(int(operation[field]), 0)
             self.assertIsNone(operation["decision"])
             self.assertIsNone(operation["outcome"])
@@ -513,23 +511,17 @@ class PlannerTest(unittest.TestCase):
         action = planner.plan(self.snapshot, self.accounts, REGISTRY, self.policy, self.now, no_valuation)
         self.assertEqual(action["kind"], "transfer")
         self.snapshot["governance"]["phase"]["Governance"].update(
-            started=self.snapshot["status"]["clock"] - 99, duration=100)
+            started_height=self.snapshot["status"]["height"] - 99, blocks=100)
         self.assertEqual(self.choose()["kind"], "transfer")
 
-    def test_substantive_new_cycle_needs_six_target_intervals_remaining(self):
-        # The same 120 scheduled seconds permit six observations at 15 seconds,
-        # but only four at 30 seconds. Heights cannot substitute for this clock.
-        for interval, remaining, can_trade in (
-                (15, 120, True), (30, 120, False),
-                (15, 90, True), (15, 89, False),
-                (30, 180, True), (30, 179, False)):
+    def test_new_cycle_needs_six_blocks_independent_of_target_interval(self):
+        for interval, remaining, can_trade in ((1,6,True),(15,6,True),(100,6,True),(15,5,False),(100,5,False)):
             with self.subTest(interval=interval, remaining=remaining):
                 self.setUp()
                 self.full_cash_governance(substantive=True)
                 self.accounts[1]["pending"] = self.accounts[2]["pending"] = True
                 self.snapshot["status"].update(clock=50000, settings={"interval": interval})
-                self.snapshot["governance"]["phase"]["Governance"].update(
-                    started=50000 - (3600 - remaining), duration=3600)
+                self.snapshot["governance"]["phase"]["Governance"].update(started_height=0, blocks=100+remaining)
                 action = self.choose()
                 if can_trade:
                     self.assertEqual(action["strategy_leg"], "trim_unfavored")
@@ -537,12 +529,10 @@ class PlannerTest(unittest.TestCase):
                     self.assertEqual(action["kind"], "transfer")
                     self.assertNotIn("strategy_leg", action)
 
-    def test_substantive_missing_clock_does_not_guess_from_height(self):
+    def test_missing_decision_height_does_not_guess_from_clock(self):
         self.full_cash_governance(substantive=True)
         self.accounts[1]["pending"] = self.accounts[2]["pending"] = True
-        del self.snapshot["status"]["clock"]
-        # Height is present and would appear to leave ample time if mistakenly
-        # compared with the scheduled-seconds start and duration.
+        del self.snapshot["governance"]["phase"]["Governance"]["started_height"]
         action = self.choose()
         self.assertEqual(action["kind"], "transfer")
         self.assertNotIn("strategy_leg", action)
@@ -669,16 +659,15 @@ class PlannerTest(unittest.TestCase):
         self.assertEqual(action["kind"], "refuel")
         self.assertEqual(action["sender_index"], 1)
 
-    def test_current_redemption_only_credits_selected_world_and_uses_minimum_proceeds(self):
+    def test_redemption_requires_existing_fee_cash_in_both_worlds(self):
         self.full_cash_governance()
         actor = self.accounts[0]
         actor["account"]["ordinary"] = "1000000"
         actor["pass_account"]["ordinary"] = "0"
-        op = {"Redeem": {"outcome": "Pass", "shares": "1000000000", "min_received": "1000000"}}
-        self.assertIsNone(planner.cash_guard(self.snapshot, actor, op, 1000000))
-        op["Redeem"]["min_received"] = "999999"
+        op = {"Redeem": {"outcome": "Pass", "shares": "1000000000"}}
         self.assertEqual(planner.cash_guard(self.snapshot, actor, op, 1000000), "waiting_for_cash_in_both_outcomes")
-        op["Redeem"]["min_received"] = "99999999999999"
+        actor["pass_account"]["ordinary"] = "1000000"
+        self.assertIsNone(planner.cash_guard(self.snapshot, actor, op, 1000000))
         actor["account"]["ordinary"] = "999999"
         self.assertEqual(planner.cash_guard(self.snapshot, actor, op, 1000000), "waiting_for_cash_in_both_outcomes")
 

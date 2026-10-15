@@ -125,6 +125,68 @@ class ReserveAudit(Audit):
         for name in ('reserve', 'shares', 'curve_mass', 'revenue', 'grant_capacity'):
             assert state[name] == governance['world'][name]
 
+    def indexed(self, method, params, predicate, port=None):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                result = rpc(port or self.port, method, params)
+                if predicate(result):
+                    return result
+            except RuntimeError as error:
+                if 'updating' not in str(error).lower():
+                    raise
+            time.sleep(0.05)
+        raise AssertionError('Derived history did not reach the requested canonical record')
+
+    def decision_record(self, identity, port=None):
+        result = self.indexed('explorer_governance', {'limit':50},
+            lambda result: any(d['id'] == identity and d.get('outcome') for d in result['decisions']), port)
+        record = next(d for d in result['decisions'] if d['id'] == identity)
+        assert record['observed_blocks'] == record['blocks'] and record['blocks_remaining'] == 0
+        assert record['ended_height'] - record['started_height'] == record['blocks']
+        assert (record['outcome'] == 'pass') == (record['funded'] and record['leading_blocks'] * 2 > record['blocks'])
+        return record
+
+    def mine_counted(self):
+        before, status = rpc(self.port, 'governance'), self.status()
+        decision = before['phase']['Governance']
+        quote = lambda world: int(self.config['quote_scale']) * int(world['curve_mass']) // int(world['shares']) if int(world['shares']) else 0
+        leads = quote(before['pass']) * 10000 > quote(before['world']) * (10000 + before['frozen']['pass_margin_bps'])
+        expected = decision['leading_blocks'] + int(leads)
+        self.mine()
+        after = rpc(self.port, 'governance')
+        if self.status()['phase'] == 'governance':
+            assert after['phase']['Governance']['leading_blocks'] == expected
+            assert after['progress']['observed_blocks'] == status['height'] + 1 - decision['started_height']
+        else:
+            record = self.decision_record(status['decision'])
+            assert record['leading_blocks'] == expected
+        return after
+
+    def buy_side(self, outcome, amount='20'):
+        before, account = self.status(), self.account(outcome=outcome)
+        world = rpc(self.port, 'governance')['pass' if outcome == 'Pass' else 'world']
+        operation = {'Deposit': {'amount':amount,'decision':self.decision(),'outcome':outcome}}
+        terms = self.payment_terms(operation)
+        sent = self.send(operation, mine=False)
+        self.mine_counted()
+        after = self.status()
+        record = self.indexed('explorer_transaction', {'txid':sent['transaction_id']},
+            lambda result: result['transaction'].get('status') == 'confirmed')['transaction']
+        assert int(record['input_requested']) == int(amount)
+        filled, unfilled, output = (int(record[field]) for field in ('input_filled','input_unfilled','output'))
+        assert filled + unfilled == int(amount) and filled > 0 and output > 0
+        assert record['amount'] == record['input_filled'] and record['output_asset'] == 'shares'
+        holding = self.account(outcome=outcome)
+        assert int(holding['shares']) - int(account['shares']) == output
+        assert int(holding['ordinary']) == int(account['ordinary']) - filled - terms['required'] + terms['miner'] + int(after['issued']) - int(before['issued'])
+        current = rpc(self.port, 'governance')['pass' if outcome == 'Pass' else 'world']
+        lhs = int(current['curve_mass']) * int(world['shares']) * 10000
+        reference = int(world['curve_mass']) * int(current['shares'])
+        bound = before['settings']['max_price_change_bps']
+        assert reference * max(0,10000-bound) <= lhs <= reference * (10000+bound)
+        return record
+
     def open_curve(self):
         initial = self.status()
         assert initial['phase'] == 'rest' and int(initial['reserve']) == 0
@@ -132,7 +194,7 @@ class ReserveAudit(Audit):
         self.mine(6)
         self.send(self.transfer_operation(self.nodes[1]['public_key'], 2))
         assert self.account_at(self.port, self.nodes[1]['public_key'])['ordinary'] == '2'
-        self.send({'Deposit': {'amount': '4', 'min_shares': '1', 'decision': None, 'outcome': None}})
+        self.send({'Deposit': {'amount': '4', 'decision': None, 'outcome': None}})
         after = self.status()
         assert int(after['clock']) < self.config['initial']['rest']
         assert after['phase'] == 'rest'
@@ -150,8 +212,11 @@ class ReserveAudit(Audit):
         assert int(self.status()['reserve']) == 4
         self.check('The first auction never converts idle hashes or alters account Stash holdings')
         quote = rpc(self.port, 'stash_quote', {'key': self.key, 'kind': 'redeem', 'all': True})
-        assert int(quote['shares']) == shares and int(quote['output_hash']) == 4
-        self.check('All voluntarily deposited Stash quotes the whole reserve, with fees quoted separately')
+        assert int(quote['input_requested']) == shares
+        assert int(quote['input_filled']) + int(quote['input_unfilled']) == shares
+        assert int(quote['stash_before_hash']) == 4 and 0 <= int(quote['output_hash']) <= 4
+        assert quote['indicative'] is True and quote['execution'] == 'block_batch'
+        self.check('The whole holding is valued separately from its bounded single-block fill, with fees quoted separately')
 
     def ensure_cash(self, amount):
         for _ in range(4096):
@@ -196,7 +261,7 @@ class ReserveAudit(Audit):
 
     def flat_decision(self):
         self.ensure_cash(150)
-        self.send({'Deposit': {'amount': '100', 'min_shares': '1', 'decision': None, 'outcome': None}})
+        self.send({'Deposit': {'amount': '100', 'decision': None, 'outcome': None}})
         self.wait_open_auction()
         recipient = self.nodes[1]['public_key']
         assert int(self.status()['revenue']) >= 1
@@ -211,7 +276,8 @@ class ReserveAudit(Audit):
         governance = rpc(self.port, 'governance')
         failed, passed = governance['world'], governance['pass']
         assert int(failed['curve_mass']) * int(passed['shares']) == int(passed['curve_mass']) * int(failed['shares'])
-        self.wait_phase('rest')
+        while self.status()['phase'] == 'governance':
+            self.mine_counted()
         assert int(self.account(recipient)['ordinary']) == prior
         self.assert_supply()
         self.check('A cash-buffered grant is reserved immediately; buying a flat PASS curve leaves a tie, so the existing decision rule resolves FAIL')
@@ -223,7 +289,7 @@ class ReserveAudit(Audit):
         deposit = max(0, target_reserve - int(state['reserve']))
         self.ensure_cash(deposit + target_reserve + 100)
         if deposit:
-            self.send({'Deposit': {'amount': str(deposit), 'min_shares': '1', 'decision': None, 'outcome': None}})
+            self.send({'Deposit': {'amount': str(deposit), 'decision': None, 'outcome': None}})
         self.wait_open_auction()
         state = self.status()
         grant = int(state['revenue']) + int(state['reserve']) // 2
@@ -251,7 +317,9 @@ class ReserveAudit(Audit):
         common_height = initial['height']
         with Fork(self, common_height, 'reject') as reject:
             assert reject.status()['state_root'] == initial['state_root']
-            self.buy_side('Pass', str(int(governance['world']['reserve'])))
+            fill = self.buy_side('Pass', str(int(governance['world']['reserve'])))
+            assert fill['fill_status'] == 'partial' and int(fill['input_unfilled']) > 0
+            self.check('A capped PASS order fills partially, refunds unused cash and records actual input/output under the exact 10% closing-price bound')
             holdings = {side: [a['shares'] for a in self.world_accounts(self.port, side)] for side in ('Pass', 'Fail')}
             for _ in range(256):
                 if self.status()['phase'] != 'governance':
@@ -261,7 +329,7 @@ class ReserveAudit(Audit):
                 for side in ('Pass', 'Fail'):
                     assert [a['shares'] for a in self.world_accounts(self.port, side)] == holdings[side]
                 self.assert_supply()
-                self.mine()
+                self.mine_counted()
             else:
                 raise AssertionError('Traded decision did not resolve')
             assert self.status()['phase'] == 'rest'
@@ -280,6 +348,8 @@ class ReserveAudit(Audit):
                 raise AssertionError('Untraded decision did not resolve')
             for key, prior in before_payout.items():
                 assert int(self.account_at(reject.port, key)['ordinary']) == prior
+            rejected_decision = self.decision_record(initial['decision'], reject.port)
+            assert rejected_decision['leading_blocks'] == 0 and rejected_decision['outcome'] == 'fail'
             self.assert_supply(reject.port)
             reject.overtake(passed['height'])
             rejected = reject.status()

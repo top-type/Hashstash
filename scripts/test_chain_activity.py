@@ -590,6 +590,14 @@ class WireTests(unittest.TestCase):
         self.assertEqual(signed, raw + b'\x07' * 64)
         self.assertEqual(len(signed) - len(raw), 64)
 
+    def test_amount_only_trade_encoding_rejects_removed_output_fields(self):
+        for kind, field, removed, tag in [('Deposit','amount','min_shares',1), ('Redeem','shares','min_received',2)]:
+            op = {kind: {field:'256', 'decision':None, 'outcome':None}}
+            self.assertEqual(ca.encode_operation(op), ca.u64(tag) + ca.amount(256) + b'\x00\x00')
+            op[kind][removed] = '0'
+            with self.assertRaisesRegex(ValueError, 'unexpected trade fields'):
+                ca.encode_operation(op)
+
     def test_every_intent_field_is_compared(self):
         body, raw = ca.make_body(CHAIN, KEYS[0], 9, 1000, 120, operation())
         envelope = {'format': 'hashstash-unsigned-v1', 'body': raw.hex()}
@@ -640,8 +648,8 @@ class WireTests(unittest.TestCase):
                 second = cli.run(['public-key', '--key', root / 'second.key'])
                 op = operation()
                 ops = [op,
-                    {'Deposit': dict(amount='1000', min_shares='9', decision=None, outcome=None)},
-                    {'Redeem': dict(shares='1000000', min_received='1', decision=[1] * 32, outcome='Pass')},
+                    {'Deposit': dict(amount='1000', decision=None, outcome=None)},
+                    {'Redeem': dict(shares='1000000', decision=[1] * 32, outcome='Pass')},
                     {'Propose': dict(round=2, description=[1] * 32, proposal={'Grant': {'payments': [dict(recipient=list(bytes.fromhex(public)), amount='10')]}}, support='1')},
                     {'Propose': dict(round=2, description=[2] * 32, proposal={'Grant': {'payments': [
                         dict(recipient=list(bytes.fromhex(key)), amount=str(i + 10))

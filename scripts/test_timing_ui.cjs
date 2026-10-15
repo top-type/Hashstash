@@ -8,21 +8,21 @@ async function run() {
   const match = (actual, expected, message) => { assert.match(actual, expected, message); checks++; };
   const h = await setup(), s = h.currentSnapshot;
   const decision = s.governance.phase.Governance;
-  decision.started = 180; decision.duration = 600;
-  Object.assign(s.status.settings, { lead: 60, rest: 480, duration: 600 });
-  for (const [interval, blocks, countdown] of [[1,480,'8m 0s'], [7,69,'8m 3s'], [15,32,'8m 0s'], [30,16,'8m 0s'], [60,8,'8m 0s']]) {
+  decision.started = 180; decision.started_height = 12; decision.blocks = 40; decision.leading_blocks = 5;
+  Object.assign(s.status.settings, {lead:60,rest:480,decision_blocks:40});
+  for (const [interval,countdown] of [[1,'32s'],[7,'3m 44s'],[15,'8m 0s'],[30,'16m 0s'],[60,'32m 0s']]) {
     s.status.settings.interval = interval;
-    s.governance.frozen = { ...s.status.settings };
+    s.governance.frozen = {...s.status.settings};
     await h.refresh(); await h.navigate('#governance');
-    equal(h.get('gov-countdown').textContent, `${blocks} blocks`, 'countdown shows the actual block boundary without promising wall time');
-    equal(h.get('gov-progress').value, 20, 'progress uses scheduled seconds');
-    equal(h.get('network-phase-progress').value, Math.floor((Math.ceil(600 / interval) - blocks) * 10000 / Math.ceil(600 / interval)) / 100, 'compact phase progress advances in whole block steps');
-    equal(h.get('timing-governance').textContent, '10m 0s');
+    equal(h.get('gov-countdown').textContent, '32 blocks', 'target interval cannot change the remaining decision blocks');
+    equal(h.get('gov-progress').value, 20, 'eight of forty blocks observed');
+    equal(h.get('network-phase-progress').value, 20);
+    equal(h.get('timing-governance').textContent, '40 blocks');
     equal(h.get('timing-rest').textContent, '8m 0s');
     equal(h.get('network-clock').textContent, '5m 0s');
-    match(h.get('network-phase').title, new RegExp(`^${blocks} blocks at the ${interval}s target`));
-    match(h.get('gov-countdown').title, new RegExp(`^~${countdown}`), 'target-time estimate remains secondary and explicitly approximate');
-    match(h.get('gov-result').title, /2m 0s measured/, 'average exposure is timed in nominal seconds');
+    match(h.get('network-phase').title, new RegExp(`^32 blocks at the ${interval}s target`));
+    match(h.get('gov-countdown').title, new RegExp(`^~${countdown}`));
+    match(h.get('gov-result').title, /8 blocks observed/);
   }
   s.status.settings.interval = 15; s.governance.frozen = { ...s.status.settings };
   s.governance.phase = { Rest: { until: 780, pending: ['Interval',30] } }; s.governance.pass = s.pass = s.fail = null;
@@ -43,9 +43,9 @@ async function run() {
   equal(h.get('timing-auction').textContent, '1m 1s lead · 1m 31s limit');
   equal(h.get('gov-countdown').textContent, '4 blocks', 'ceil division handles policy durations not divisible by the interval');
   const form = h.get('propose-form');
-  form.elements.type.value = 'parameter'; form.elements.parameter.value = 'Duration'; form.elements.parameter_value.value = '1200';
+  form.elements.type.value = 'parameter'; form.elements.parameter.value = 'DecisionBlocks'; form.elements.parameter_value.value = '1200';
   await h.get('proposal-parameter').fire('change');
-  equal(h.get('parameter-preview').textContent, '10m 0s → 20m 0s');
+  equal(h.get('parameter-preview').textContent, '40 blocks → 1,200 blocks');
   form.elements.parameter.value = 'Interval'; form.elements.parameter_value.value = '15';
   await h.get('proposal-parameter').fire('change');
   match(h.get('parameter-preview').title, /after rest if approved/);

@@ -144,7 +144,6 @@ fn main() -> Result<()> {
         &config,
         Operation::Deposit {
             amount: 80u32.into(),
-            min_shares: 1u32.into(),
             decision: Some(decision),
             outcome: Some(Outcome::Pass),
         },

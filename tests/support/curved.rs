@@ -48,7 +48,7 @@ fn establish(
             secret,
             Operation::Deposit {
                 amount,
-                min_shares: 1u32.into(),
+
                 decision: None,
                 outcome: None,
             },
@@ -112,7 +112,7 @@ fn establish(
         secret,
         Operation::Deposit {
             amount,
-            min_shares: 1u32.into(),
+
             decision: s.decision_id(),
             outcome: Some(Outcome::Pass),
         },

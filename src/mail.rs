@@ -60,7 +60,6 @@ pub fn from_transaction(c: &Config, tx: &Transaction) -> Option<Envelope> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use num_traits::Zero;
     #[test]
     fn independent_browser_crypto_fixture_has_exact_node_encoding() {
         let fixture: serde_json::Value =
@@ -161,13 +160,11 @@ pub(crate) mod tests {
             },
             Operation::Deposit {
                 amount: 1u32.into(),
-                min_shares: Amount::zero(),
                 decision: None,
                 outcome: None,
             },
             Operation::Redeem {
                 shares: 1u32.into(),
-                min_received: Amount::zero(),
                 decision: Some([7; 32]),
                 outcome: Some(Outcome::Pass),
             },

@@ -105,7 +105,7 @@ fn canonical_mail_carries_payments_stash_actions_and_proposals_without_recipient
         },
         Operation::Deposit {
             amount: 80u32.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },
@@ -127,7 +127,7 @@ fn canonical_mail_carries_payments_stash_actions_and_proposals_without_recipient
     .unwrap();
     actions.push(Operation::Redeem {
         shares: shares / 10u32,
-        min_received: 1u32.into(),
+
         decision: None,
         outcome: None,
     });

@@ -39,7 +39,7 @@ fn governance_snapshot_keeps_current_proposal_after_more_than_one_page_of_histor
         0,
         Operation::Deposit {
             amount: 20u32.into(),
-            min_shares: 1u32.into(),
+
             decision: None,
             outcome: None,
         },

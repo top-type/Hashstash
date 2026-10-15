@@ -522,13 +522,13 @@ async fn all_operations_sign_the_exact_reviewed_bytes_with_exact_large_fields() 
         },
         Operation::Deposit {
             amount: 23u32.into(),
-            min_shares: 19u32.into(),
+
             decision: None,
             outcome: None,
         },
         Operation::Redeem {
             shares: 23u32.into(),
-            min_received: 19u32.into(),
+
             decision: Some([5; 32]),
             outcome: Some(Outcome::Pass),
         },
@@ -557,7 +557,8 @@ async fn all_operations_sign_the_exact_reviewed_bytes_with_exact_large_fields() 
         Parameter::BlockBytes,
         Parameter::Lead,
         Parameter::Rest,
-        Parameter::Duration,
+        Parameter::DecisionBlocks,
+        Parameter::MaxPriceChangeBps,
     ] {
         operations.push(Operation::Propose {
             round: 3,

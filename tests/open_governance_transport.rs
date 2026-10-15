@@ -55,7 +55,7 @@ async fn large_governed_block_relays_compactly_and_survives_reopen() {
 
     config.initial.rest = 30;
     config.initial.lead = 15;
-    config.initial.duration = 60;
+    config.initial.decision_blocks = 4;
     config.validate().unwrap();
 
     // Build and fund directly, avoiding repeated mempool-prefix validation.
@@ -106,7 +106,7 @@ async fn large_governed_block_relays_compactly_and_survives_reopen() {
                 .unwrap()
                 .ordinary
                 / 2u32,
-            min_shares: 1u32.into(),
+
             decision: chain.tip_state().decision_id(),
             outcome: Some(Outcome::Pass),
         },

@@ -49,7 +49,7 @@ fn offline_review_discloses_exact_fee_for_every_operation() {
         (
             Operation::Deposit {
                 amount: 101u32.into(),
-                min_shares: 1u32.into(),
+
                 decision: None,
                 outcome: None,
             },
@@ -58,7 +58,7 @@ fn offline_review_discloses_exact_fee_for_every_operation() {
         (
             Operation::Redeem {
                 shares: 101u32.into(),
-                min_received: 1u32.into(),
+
                 decision: Some([3; 32]),
                 outcome: Some(Outcome::Pass),
             },
@@ -67,7 +67,7 @@ fn offline_review_discloses_exact_fee_for_every_operation() {
         (
             Operation::Deposit {
                 amount: 101u32.into(),
-                min_shares: 1u32.into(),
+
                 decision: Some([3; 32]),
                 outcome: Some(Outcome::Fail),
             },
@@ -178,13 +178,13 @@ fn offline_exports_reject_invalid_values_and_removed_operation_tags() {
         },
         Operation::Deposit {
             amount: Amount::from(1u32) << 512usize,
-            min_shares: 0u32.into(),
+
             decision: None,
             outcome: None,
         },
         Operation::Deposit {
             amount: 1u32.into(),
-            min_shares: 0u32.into(),
+
             decision: Some([3; 32]),
             outcome: None,
         },

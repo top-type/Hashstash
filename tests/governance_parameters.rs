@@ -66,8 +66,8 @@ fn parameters_accept_direct_values_and_zero_where_defined() {
         (Parameter::Lead, 0),
         (Parameter::Rest, 7),
         (Parameter::Rest, 0),
-        (Parameter::Duration, 17),
-        (Parameter::Duration, 1),
+        (Parameter::DecisionBlocks, 17),
+        (Parameter::DecisionBlocks, 1),
         (Parameter::Interval, 61),
         (Parameter::Interval, 1 << 40),
         (Parameter::MinimumFeeRate, 0),
@@ -79,7 +79,7 @@ fn parameters_accept_direct_values_and_zero_where_defined() {
         changed.initial.set(parameter, next);
         changed.validate().unwrap();
     }
-    for parameter in [Parameter::Interval, Parameter::Duration] {
+    for parameter in [Parameter::Interval, Parameter::DecisionBlocks] {
         assert!(
             c.parameter_change(&c.initial, parameter, c.initial.get(parameter), 0)
                 .is_err()
@@ -99,11 +99,11 @@ fn parameters_accept_direct_values_and_zero_where_defined() {
 fn deadlines_are_checked_at_the_actual_activation_clock() {
     let c = Config::testnet();
     let clock = 1_000;
-    let duration = u64::MAX - clock;
+    let duration = (u64::MAX - clock) / c.initial.interval;
     c.parameter_change_at(
         &c.initial,
-        Parameter::Duration,
-        c.initial.duration,
+        Parameter::DecisionBlocks,
+        c.initial.decision_blocks,
         duration,
         clock,
     )
@@ -111,8 +111,8 @@ fn deadlines_are_checked_at_the_actual_activation_clock() {
     assert!(
         c.parameter_change_at(
             &c.initial,
-            Parameter::Duration,
-            c.initial.duration,
+            Parameter::DecisionBlocks,
+            c.initial.decision_blocks,
             duration + 1,
             clock
         )
@@ -121,36 +121,36 @@ fn deadlines_are_checked_at_the_actual_activation_clock() {
     // The same value can be arithmetically valid earlier, then become stale.
     c.parameter_change(
         &c.initial,
-        Parameter::Duration,
-        c.initial.duration,
+        Parameter::DecisionBlocks,
+        c.initial.decision_blocks,
         duration + 1,
     )
     .unwrap();
     assert!(
         c.parameter_change_at(
             &c.initial,
-            Parameter::Duration,
-            c.initial.duration,
+            Parameter::DecisionBlocks,
+            c.initial.decision_blocks,
             duration,
-            clock + 1
+            clock + c.initial.interval
         )
         .is_err()
     );
 }
 
 #[test]
-fn decision_duration_can_be_shorter_than_one_block() {
+fn decision_block_count_can_be_one() {
     let c = Config::testnet();
     for duration in [1, c.initial.interval - 1, c.initial.interval] {
         let mut changed = c.clone();
-        changed.initial.duration = duration;
+        changed.initial.decision_blocks = duration;
         changed.validate().unwrap();
     }
     c.parameter_change(
         &c.initial,
         Parameter::Interval,
         c.initial.interval,
-        c.initial.duration + 1,
+        c.initial.decision_blocks + 1,
     )
     .unwrap();
 }
@@ -193,7 +193,7 @@ fn state_validation_and_audit_accept_governed_settings_outside_all_old_grids() {
     state.settings.block_bytes = 8 * 1024 * 1024;
     state.settings.lead = 1 << 20;
     state.settings.rest = 1 << 21;
-    state.settings.duration = 4096;
+    state.settings.decision_blocks = 4096;
     state.settings.pass_margin_bps = Some(u64::MAX);
     state.frozen = state.settings.clone();
 

@@ -4,6 +4,7 @@ compile_error!(
 );
 
 pub mod address;
+pub mod batch;
 pub mod chain;
 pub mod chat;
 pub mod codec;

@@ -4,9 +4,6 @@ This directory preserves available license and notice files from the exact regis
 
 | Dependency | Version | Declared license | Notice files |
 | --- | --- | --- | --- |
-| aead | 0.5.2 | MIT OR Apache-2.0 | 2 |
-| aes | 0.8.4 | MIT OR Apache-2.0 | 2 |
-| aes-gcm | 0.10.3 | Apache-2.0 OR MIT | 2 |
 | ahash | 0.8.12 | MIT OR Apache-2.0 | 2 |
 | anstream | 1.0.0 | MIT OR Apache-2.0 | 2 |
 | anstyle | 1.0.14 | MIT OR Apache-2.0 | 2 |
@@ -31,12 +28,10 @@ This directory preserves available license and notice files from the exact regis
 | block-buffer | 0.10.4 | MIT OR Apache-2.0 | 2 |
 | bumpalo | 3.20.3 | MIT OR Apache-2.0 | 2 |
 | bytes | 1.12.1 | MIT | 1 |
-| caseless | 0.2.2 | MIT | 1 |
 | cc | 1.6.0 | MIT OR Apache-2.0 | 2 |
 | cfg-if | 1.0.5 | MIT OR Apache-2.0 | 2 |
 | cfg_aliases | 0.2.2 | MIT | 2 |
 | chacha20 | 0.10.2 | MIT OR Apache-2.0 | 2 |
-| cipher | 0.4.4 | MIT OR Apache-2.0 | 2 |
 | clap | 4.6.7 | MIT OR Apache-2.0 | 2 |
 | clap_builder | 4.6.7 | MIT OR Apache-2.0 | 2 |
 | clap_derive | 4.6.7 | MIT OR Apache-2.0 | 2 |
@@ -45,7 +40,6 @@ This directory preserves available license and notice files from the exact regis
 | cpufeatures | 0.2.17 | MIT OR Apache-2.0 | 2 |
 | cpufeatures | 0.3.1 | MIT OR Apache-2.0 | 2 |
 | crypto-common | 0.1.7 | MIT OR Apache-2.0 | 2 |
-| ctr | 0.9.2 | MIT OR Apache-2.0 | 2 |
 | digest | 0.10.7 | MIT OR Apache-2.0 | 2 |
 | displaydoc | 0.2.7 | MIT OR Apache-2.0 | 2 |
 | errno | 0.3.14 | MIT OR Apache-2.0 | 2 |
@@ -62,15 +56,12 @@ This directory preserves available license and notice files from the exact regis
 | getrandom | 0.2.17 | MIT OR Apache-2.0 | 2 |
 | getrandom | 0.3.4 | MIT OR Apache-2.0 | 2 |
 | getrandom | 0.4.3 | MIT OR Apache-2.0 | 2 |
-| ghash | 0.5.1 | Apache-2.0 OR MIT | 2 |
 | hashbrown | 0.14.5 | MIT OR Apache-2.0 | 2 |
 | hashlink | 0.9.1 | MIT OR Apache-2.0 | 2 |
 | heck | 0.5.0 | MIT OR Apache-2.0 | 2 |
 | hex | 0.4.3 | MIT OR Apache-2.0 | 2 |
 | hex-conservative | 0.2.3 | CC0-1.0 | 1 |
 | hex-conservative | 1.3.0 | CC0-1.0 | 1 |
-| hkdf | 0.12.4 | MIT OR Apache-2.0 | 2 |
-| hmac | 0.12.1 | MIT OR Apache-2.0 | 2 |
 | http | 1.5.0 | MIT OR Apache-2.0 | 2 |
 | http-body | 1.1.0 | MIT | 1 |
 | http-body-util | 0.1.5 | MIT | 1 |
@@ -88,7 +79,6 @@ This directory preserves available license and notice files from the exact regis
 | icu_provider | 2.3.1 | Unicode-3.0 | 1 |
 | idna | 1.1.0 | MIT OR Apache-2.0 | 2 |
 | idna_adapter | 1.2.2 | Apache-2.0 OR MIT | 2 |
-| inout | 0.1.4 | MIT OR Apache-2.0 | 2 |
 | ipnet | 2.12.2 | MIT OR Apache-2.0 | 2 |
 | is_terminal_polyfill | 1.70.2 | MIT OR Apache-2.0 | 2 |
 | itoa | 1.0.18 | MIT OR Apache-2.0 | 2 |
@@ -109,13 +99,11 @@ This directory preserves available license and notice files from the exact regis
 | num-traits | 0.2.19 | MIT OR Apache-2.0 | 2 |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 | 2 |
 | once_cell_polyfill | 1.70.2 | MIT OR Apache-2.0 | 2 |
-| opaque-debug | 0.3.1 | MIT OR Apache-2.0 | 2 |
 | parking_lot | 0.12.5 | MIT OR Apache-2.0 | 2 |
 | parking_lot_core | 0.9.12 | MIT OR Apache-2.0 | 2 |
 | percent-encoding | 2.3.2 | MIT OR Apache-2.0 | 2 |
 | pin-project-lite | 0.2.17 | Apache-2.0 OR MIT | 2 |
 | pkg-config | 0.3.34 | MIT OR Apache-2.0 | 2 |
-| polyval | 0.6.2 | Apache-2.0 OR MIT | 2 |
 | potential_utf | 0.1.6 | Unicode-3.0 | 1 |
 | ppv-lite86 | 0.2.21 | MIT OR Apache-2.0 | 2 |
 | proc-macro2 | 1.0.107 | MIT OR Apache-2.0 | 2 |
@@ -129,7 +117,6 @@ This directory preserves available license and notice files from the exact regis
 | rand | 0.9.5 | MIT OR Apache-2.0 | 2 |
 | rand_chacha | 0.9.0 | MIT OR Apache-2.0 | 2 |
 | rand_core | 0.10.1 | MIT OR Apache-2.0 | 2 |
-| rand_core | 0.6.4 | MIT OR Apache-2.0 | 3 |
 | rand_core | 0.9.5 | MIT OR Apache-2.0 | 2 |
 | rand_pcg | 0.10.2 | MIT OR Apache-2.0 | 2 |
 | redox_syscall | 0.5.18 | MIT | 1 |
@@ -138,7 +125,7 @@ This directory preserves available license and notice files from the exact regis
 | rusqlite | 0.32.1 | MIT | 1 |
 | rustc-hash | 2.1.3 | Apache-2.0 OR MIT | 2 |
 | rustix | 1.1.5 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 4 |
-| rustls | 0.23.45 | Apache-2.0 OR ISC OR MIT | 3 |
+| rustls | 0.23.46 | Apache-2.0 OR ISC OR MIT | 3 |
 | rustls-pki-types | 1.15.1 | MIT OR Apache-2.0 | 2 |
 | rustls-webpki | 0.103.15 | ISC | 1 |
 | rustversion | 1.0.23 | MIT OR Apache-2.0 | 2 |
@@ -181,12 +168,7 @@ This directory preserves available license and notice files from the exact regis
 | tracing-core | 0.1.36 | MIT | 2 |
 | try-lock | 0.2.5 | MIT | 1 |
 | typenum | 1.20.1 | MIT OR Apache-2.0 | 3 |
-| unicode-general-category | 1.1.0 | Apache-2.0 | 1 |
 | unicode-ident | 1.0.26 | (MIT OR Apache-2.0) AND Unicode-3.0 | 3 |
-| unicode-normalization | 0.1.24 | MIT/Apache-2.0 | 3 |
-| unicode-script | 0.5.8 | MIT OR Apache-2.0 | 2 |
-| unicode-security | 0.1.2 | MIT/Apache-2.0 | 3 |
-| universal-hash | 0.5.1 | MIT OR Apache-2.0 | 2 |
 | untrusted | 0.9.0 | ISC | 1 |
 | url | 2.5.8 | MIT OR Apache-2.0 | 2 |
 | utf8_iter | 1.0.4 | Apache-2.0 OR MIT | 2 |

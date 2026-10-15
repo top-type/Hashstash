@@ -1,6 +1,6 @@
 # Node operation
 
-Hashstash 0.37.0 accepts protocol 27 configurations and compact binary records. The node requires a 64-bit target. Genesis identifies the chain. A database must use its exact genesis configuration; changing that configuration creates a different identity, affecting addresses, application caches and chain-scoped faucet/mixer ledgers.
+Hashstash 0.37.1 accepts protocol 27 configurations and compact binary records. The node requires a 64-bit target. Genesis identifies the chain. A database must use its exact genesis configuration; changing that configuration creates a different identity, affecting addresses, application caches and chain-scoped faucet ledgers.
 
 Source builds place executables in `target/release`; packaged releases place them in `bin`. The PowerShell launchers prefer the source build when present. Examples using `bin` assume the packaged layout.
 

@@ -1,4 +1,4 @@
-# Hashstash consensus format · protocol 27 · implementation 0.37.0
+# Hashstash consensus format · protocol 27 · implementation 0.37.1
 
 This implementation accepts protocol 27 configurations and records. The complete genesis configuration fixes the chain identity and must match the database. [The specification](SPECIFICATION.md) describes economic transitions.
 

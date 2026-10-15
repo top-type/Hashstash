@@ -736,8 +736,6 @@ dd { margin:0; text-align:right; font:12px/1.5 var(--mono); overflow-wrap:anywhe
 .governance-common > strong { color:var(--text); font-family:var(--mono); overflow-wrap:anywhere; text-align:right; }
 .governance-common > p { grid-column:1/-1; margin:0; font-size:11px; }
 
-.custodian-trust { display: flex; align-items: flex-start; gap: 9px; margin-top: 12px; }
-.custodian-trust input { width:auto; min-height:auto; flex:0 0 auto; margin:3px 0 0; }
 /* Grant recipients remain readable on narrow screens. */
 .grant-payment { display:grid; grid-template-columns:minmax(0,2fr) minmax(0,1fr) auto; gap:12px; align-items:end; margin-bottom:16px; }
 .grant-payment label { min-width:0; }

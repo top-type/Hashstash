@@ -531,7 +531,6 @@ async function harness(options = {}) {
     async fetch(url, options = {}) {
 
       if (url === '/api/session') return response({...h.currentSession,chain_id:h.currentSnapshot.status.chain_id,public_web:h.publicWeb,browser_wallet:true});
-      if (url === '/mixer-config.json') { (h.mixerCalls ||= []).push({url,options}); return h.mixerTransport ? h.mixerTransport(url,options) : response({},404); }
       if (url === '/faucet-config.json' || url.startsWith('https://')) {
         h.faucetCalls.push({url,options});
         return h.faucetTransport ? h.faucetTransport(url,options) : response({},404);
@@ -589,7 +588,7 @@ async function harness(options = {}) {
   }
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../ui/proposal-data.js'),'utf8'),context,{filename:'proposal-data.js'});
   if (options.chat) vm.runInContext(fs.readFileSync(path.join(__dirname,'../ui/chat.js'),'utf8'),context,{filename:'chat.js'});
-  if (options.mail || options.rationale || options.mixer) {
+  if (options.mail || options.rationale) {
     context.isSecureContext=true;
     for(const name of ['vendor/noble.js','mail-crypto.js','proposal-data.js']) vm.runInContext(fs.readFileSync(path.join(__dirname,'../ui',name),'utf8'),context,{filename:name});
     h.noble=context.HashstashNoble;h.mailCrypto=context.HashstashMailCrypto;h.proposalData=context.HashstashProposalData;
@@ -602,7 +601,6 @@ async function harness(options = {}) {
     }
   }
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../ui/transaction-mail.js'),'utf8'),context,{filename:'transaction-mail.js'});
-  if(options.mixer) vm.runInContext(fs.readFileSync(path.join(__dirname,'../ui/mixer.js'),'utf8'),context,{filename:'mixer.js'});
   vm.runInContext(source, context, { filename: 'app.js' });
 
   await settle();
@@ -681,7 +679,6 @@ async function run() {
  await h.navigate('#guide');eq(h.get('guide-overview-panel').hidden,false);eq(h.get('guide-technical-panel').hidden,true);
  await h.get('guide-technical-tab').click();eq(h.get('guide-overview-panel').hidden,true);eq(h.get('guide-technical-panel').hidden,false);eq(h.get('guide-technical-tab')['aria-selected'],'true');eq(h.get('guide-overview-tab').tabIndex,-1);
  await h.get('guide-technical-tab').fire('keydown',{key:'Home'});eq(h.get('guide-overview-panel').hidden,false);eq(h.get('guide-technical-panel').hidden,true);eq(h.get('guide-overview-tab').tabIndex,0);
- await h.navigate('#mixer');eq(h.get('view-mixer').hidden,false);eq(h.get('view-send').hidden,true);ok(h.navLinks.some(link=>link.dataset.route==='mixer'));
  await h.navigate('#governance');
  const values = {
   BlockBytes:['1024','1537','33554433','18446744073709551615'],

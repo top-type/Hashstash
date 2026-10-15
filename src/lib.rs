@@ -16,7 +16,6 @@ pub mod faucet;
 pub mod fees;
 pub mod mail;
 pub mod math;
-pub mod mixer;
 pub mod network_guard;
 pub mod node;
 pub mod peer_auth;

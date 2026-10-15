@@ -1,6 +1,6 @@
 # Linux nodes
 
-One persistent Hashstash 0.37.0 node per Linux host, managed by systemd. Each node exposes P2P, optionally exposes solo Stratum V1, keeps RPC on loopback, and pays its own configured public key. There is no wallet private key on the server and no software miner in this service. A dedicated peer transport key, when enabled, is separate from all spending keys.
+One persistent Hashstash 0.37.1 node per Linux host, managed by systemd. Each node exposes P2P, optionally exposes solo Stratum V1, keeps RPC on loopback, and pays its own configured public key. There is no wallet private key on the server and no software miner in this service. A dedicated peer transport key, when enabled, is separate from all spending keys.
 
 These files target Debian/Ubuntu with Bash, GNU coreutils, `awk`, `flock`, `useradd`, and systemd. The listener setup uses public IPv4; advertised Stratum endpoints may use DNS. No cloud provider is required by the scripts.
 
@@ -16,7 +16,7 @@ rustc --version --verbose
 cargo --version
 ```
 
-Keep the exact source snapshot, `Cargo.lock`, compiler versions, and binary SHA256 with the deployment record. Use that recorded SHA256 during installation; a hash obtained only from an untrusted download does not establish its origin. Copy the same built binary to hosts with a compatible architecture and Linux runtime. The installer pins version 0.37.0 and the complete binary hash under `/opt/hashstash/`; it will not silently upgrade an existing installation.
+Keep the exact source snapshot, `Cargo.lock`, compiler versions, and binary SHA256 with the deployment record. Use that recorded SHA256 during installation; a hash obtained only from an untrusted download does not establish its origin. Copy the same built binary to hosts with a compatible architecture and Linux runtime. The installer pins version 0.37.1 and the complete binary hash under `/opt/hashstash/`; it will not silently upgrade an existing installation.
 
 ## Prepare shared and per-node files
 
@@ -88,7 +88,7 @@ sudo systemctl status hashstash
 sudo journalctl -u hashstash -n 50 --no-pager
 sudo -u hashstash /usr/local/libexec/hashstash/run-node.sh snapshot
 sudo -u hashstash /usr/local/libexec/hashstash/run-node.sh peers
-sudo -u hashstash /opt/hashstash/0.37.0-RECORDED_BINARY_SHA256/hashstash rpc --url http://127.0.0.1:18480/rpc peerstatus
+sudo -u hashstash /opt/hashstash/0.37.1-RECORDED_BINARY_SHA256/hashstash rpc --url http://127.0.0.1:18480/rpc peerstatus
 ```
 
 These reads do not mine or submit transactions. `snapshot` includes chain height, tip, state root, issuance, phase, and Stratum worker/share counters; `peers` lists endpoints. `peerstatus` adds transport mode, successful exchange times, failures and stalled indicators. Its chain-stalled indicator also becomes true normally when there are no miners. Compare chain IDs first and tip/state roots at the same height across regions. A reachable RPC or connected worker alone does not establish that mining has produced valid blocks. Observe accepted shares, accepted blocks, payout balances, and peer convergence during the first mining run. Use a modest polling interval, such as 10 seconds.

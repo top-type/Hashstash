@@ -4,7 +4,7 @@ Hashstash is experimental software. The maintained tests exercise protocol 27 ac
 
 Accounting and consensus tests cover conservation in each outcome, deposits into an empty flat reserve, price preservation for protocol reserve movements, directed integer curve bounds, grant eligibility and escrow, PASS/FAIL price comparison, settlement, reorganization and overflow limits. Multi-recipient cases include bounded decoding, canonical recipient ordering, aggregate funding limits, prepaid execution weight, atomic credits and miner-account overlap. The [validation guide](VALIDATION.md) explains how to repeat the maintained checks and record their results.
 
-The protocol has six direct operations, exact signed fees, whole-fee miner/revenue allocation, compact binary records and bounded binary peer transport. Browser and cold signing bind the current transaction domain. Application data, recipient-hidden Mail and the optional custodial mixer are separate from the reserve mechanics.
+The protocol has six direct operations, exact signed fees, whole-fee miner/revenue allocation, compact binary records and bounded binary peer transport. Browser and cold signing bind the current transaction domain. Application data and recipient-hidden Mail are separate from the reserve mechanics.
 
 The flat baseline deliberately permits equal-price outcomes that resolve FAIL. Different curve shapes can affect the cost of influencing a decision. Correct accounting does not prove economic stability, representative participation, manipulation resistance or project value.
 
@@ -12,6 +12,6 @@ Authenticated peers prove possession of transport keys and protect message integ
 
 Difficulty adjustment anchors each branch at its first mined block, so waiting before mining starts does not lower the initial difficulty. Pauses after mining begins do affect ASERT's elapsed time. Timestamp checks constrain the inputs but do not eliminate manipulation. Agreement on a configuration or protocol number alone is insufficient if implementations execute different consensus rules.
 
-Browser wallets trust the serving origin; stored keys are unencrypted. Public transaction actions and senders remain visible. Mail verifies the publishing transaction signature locally before decrypting contents; inclusion and confirmation counts still depend on the connected node. It does not hide the ledger, and static-key compromise can expose historical mail. A mixer custodian learns its deposit-to-payout mapping and can steal deposited funds.
+Browser wallets trust the serving origin; stored keys are unencrypted. Public transaction actions and senders remain visible. Mail verifies the publishing transaction signature locally before decrypting contents; inclusion and confirmation counts still depend on the connected node. It does not hide the ledger, and static-key compromise can expose historical mail.
 
 Tests and source review are not independent security certification. Dependency advisories need separate, repeatable review against the locked versions. Long-running adversarial networks, deployment security and real mining delivery require evidence beyond local tests.

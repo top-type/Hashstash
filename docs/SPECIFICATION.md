@@ -235,8 +235,8 @@ Peers exchange bounded compact binary frames carrying canonical records. Block l
 
 ## 13 Applications and security scope
 
-Signed transaction data is raw bytes. Chat interprets readable UTF-8 and Mail defines recipient-hidden encrypted envelopes. They are applications over the chain's data, not new account fields or consensus operation types. The optional mixer is a separately operated trusted custodian; its operator knows the deposit-to-payout mapping and controls deposited funds.
+Signed transaction data is raw bytes. Chat interprets readable UTF-8 and Mail defines recipient-hidden encrypted envelopes. They are applications over the chain's data, not new account fields or consensus operation types.
 
 Browser wallets sign locally and trust their serving origin. Keys stored in browser storage are unencrypted. Peer authentication and consensus validation do not establish application privacy, independent participation, economic stability or a guarantee against manipulation. HASH represents expected-work issuance rather than stable external purchasing power. Governance compares an internal stash/hash price, not an independently measured public benefit.
 
-Implementation 0.37.0 accepts protocol 27 configurations and records. A database must use its exact genesis configuration. The existing `v26` hash-domain strings and record layout remain unchanged. Protocol 27 is included in the genesis configuration and therefore changes chain identity; signed transactions bind that identity.
+Implementation 0.37.1 accepts protocol 27 configurations and records. A database must use its exact genesis configuration. The existing `v26` hash-domain strings and record layout remain unchanged. Protocol 27 is included in the genesis configuration and therefore changes chain identity; signed transactions bind that identity.

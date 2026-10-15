@@ -3279,10 +3279,6 @@ async fn http_session(
                 "application/javascript; charset=utf-8",
                 include_bytes!("../ui/transaction-mail.js").as_slice(),
             )),
-            "/mixer.js" => Some((
-                "application/javascript; charset=utf-8",
-                include_bytes!("../ui/mixer.js").as_slice(),
-            )),
             "/mail.js" => Some((
                 "application/javascript; charset=utf-8",
                 include_bytes!("../ui/mail.js").as_slice(),

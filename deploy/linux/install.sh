@@ -9,7 +9,7 @@ Usage: sudo bash install.sh --binary /path/hashstash --sha256 HEX \
   [--stratum-password-file /path/mining-password] \
   [--peer-key-file /path/dedicated-peer-identity.json] [--check]
 
-Installs Hashstash 0.37.0 without starting or enabling it. Existing files must
+Installs Hashstash 0.37.1 without starting or enabling it. Existing files must
 match exactly; configuration and databases are never replaced. --check performs
 read-only input validation and needs no root privileges.
 EOF
@@ -62,7 +62,7 @@ actual=$(sha256sum -- "$binary"); actual=${actual%% *}
 [[ $(od -An -tx1 -N4 -- "$binary" | tr -d ' \n') == 7f454c46 ]] || fail 'binary must be a Linux ELF executable'
 actual=$(sha256sum -- "$genesis"); actual=${actual%% *}
 [[ "$actual" == "$genesis_sha256" ]] || fail 'shared genesis SHA256 does not match'
-[[ $("$binary" --version) == 'hashstash 0.37.0' ]] || fail 'expected Hashstash 0.37.0 Linux binary'
+[[ $("$binary" --version) == 'hashstash 0.37.1' ]] || fail 'expected Hashstash 0.37.1 Linux binary'
 bash "$script_dir/run-node.sh" check "$node_env" "$binary" "$genesis" "$password_file" "$peer_key_file"
 printf 'Shared genesis SHA256: %s\n' "$(sha256sum -- "$genesis" | awk '{print $1}')"
 "$binary" network --config "$genesis"
@@ -72,7 +72,7 @@ for command in getent useradd flock systemctl; do command -v "$command" >/dev/nu
 # Serialize repeat installs. No service state is changed by this script.
 exec 9>/run/lock/hashstash-install.lock
 flock -n 9 || fail 'another Hashstash installer is running'
-binary_dest="/opt/hashstash/0.37.0-$sha256/hashstash"
+binary_dest="/opt/hashstash/0.37.1-$sha256/hashstash"
 pointer=$(mktemp)
 trap 'rm -f -- "$pointer"' EXIT
 printf '%s\n' "$binary_dest" > "$pointer"

@@ -1,6 +1,6 @@
 [package]
 name = "hashstash"
-version = "0.37.0"
+version = "0.37.1"
 edition = "2024"
 default-run = "hashstash"
 description = "Hashstash account-based SHA256d blockchain node"
@@ -20,8 +20,6 @@ sha2 = "0.10"
 secp256k1 = { version = "0.31", features = ["rand", "serde"] }
 getrandom = "0.3"
 zeroize = "1"
-aes-gcm = "=0.10.3"
-hkdf = "=0.12.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"

@@ -311,32 +311,6 @@
       subscribe(callback) { if(typeof callback!=='function') fail('Invalid wallet subscriber.'); callbacks.add(callback); return ()=>callbacks.delete(callback); },
       destroy() { root.removeEventListener?.('storage',onStorage); callbacks.clear(); invalidateMetadata(); },
       async create(expected) { let secret; do { secret=random(32); } while(!noble.validSecret(secret)); try { return await add(hex(noble.schnorr.getPublicKey(secret)),hex(secret),expected); } finally { secret.fill(0); } },
-      async createReceiving(count,expected) {
-        if(!Number.isInteger(count)||count<1||count>8)fail('Choose one to eight receiving wallets.');
-        if(!expected||expected.wallet_revision===undefined)fail('Wallet context changed. Try again.');
-        const created=[];
-        await change(data=>{
-          if(expected.chain_id!==undefined&&expected.chain_id!==chainId||expected.wallet_id!==undefined&&expected.wallet_id!==data.selected)fail('Wallet context changed. Try again.');
-          if(data.wallets.length+count>1000)fail('Too many saved wallets.');
-          const seen=new Set(data.wallets.map(w=>w.public_key));
-          for(let i=0;i<count;i++){
-            let made=false;
-            for(let attempt=0;attempt<128&&!made;attempt++){
-              const secret=new Uint8Array(32);
-              try{
-                requireSecure();root.crypto.getRandomValues(secret);
-                if(!noble.validSecret(secret))continue;
-                const public_key=hex(noble.schnorr.getPublicKey(secret));if(seen.has(public_key))continue;
-                data.wallets.push({id:public_key,public_key,private_key:hex(secret),backed_up:false});seen.add(public_key);created.push(public_key);made=true;
-              }finally{secret.fill(0);}
-            }
-            if(!made)fail('Could not generate fresh receiving wallets. Try again.');
-          }
-          // Preserve the depositing wallet selection; save the complete set in
-          // the single guarded change so a failure never creates half a list.
-        },expected);
-        return created;
-      },
       importPrivate(privateHex,expected) { const key=publicKey(privateHex); return add(key,privateHex.toLowerCase(),expected); },
       importPassphrase(passphrase,expected) { const secret=derivePrivate(passphrase); return add(publicKey(secret),secret,expected); },
       watch(value,expected) { const key=typeof value==='string' && value.length===78 ? addresses.decode(value,hrp) : hex(publicBytes(value)); publicBytes(key); return add(key,null,expected); },

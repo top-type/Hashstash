@@ -328,35 +328,6 @@ async function run() {
   mb.context.HashstashMailCrypto=actualMailCrypto;const watchedMail=ms.snapshot();
   await rejects(()=>ms.decryptMail(mailBytes,mailIdentity,{chain_id:f.expected.chain_id,wallet_id:watchedMail.wallet_id,wallet_revision:watchedMail.wallet_revision}),/private key locally/);
   equal(mb.logs.length,0);
-  // Mixer receiving-wallet generation is one guarded local write; it must
-  // never change the depositing account selection or return private material.
-  {
-    const rb=browser(),rs=rb.api.createStore(f.expected.chain_id),initial=await rs.importPrivate(f.secret),expected={chain_id:f.expected.chain_id,wallet_id:initial.wallet_id,wallet_revision:initial.wallet_revision};
-    const secrets=[];rb.context.crypto={getRandomValues(target){const out=webcrypto.getRandomValues(target);if(target.length===32)secrets.push(target);return out;}};
-    let writes=0;const actualSet=rb.profile.storage.setItem;rb.profile.storage.setItem=(...args)=>{writes++;return actualSet(...args);};
-    const keys=await rs.createReceiving(8,expected),after=rs.snapshot();equal(keys.length,8);equal(new Set(keys).size,8);equal(writes,1);equal(after.wallet_id,initial.wallet_id);equal(after.public_key,initial.public_key);equal(after.wallets.length,9);ok(keys.every(k=>/^[0-9a-f]{64}$/.test(k)&&k!==initial.public_key));ok(keys.every(k=>after.wallets.find(w=>w.id===k).backed_up===false));ok(keys.every(k=>after.wallets.find(w=>w.id===k).can_sign));ok(secrets.every(b=>b.every(x=>x===0)));equal(await rs.exportPrivate(initial.wallet_id,{wallet_revision:after.wallet_revision}),f.secret);equal(browser(rb.profile).api.createStore(f.expected.chain_id).snapshot().wallets.length,9);equal(rb.logs.length,0);
-    for(const count of [0,9,-1,1.5,'2',NaN])await rejects(()=>rs.createReceiving(count,expected),/one to eight/);
-    const unchanged=[...rb.profile.values.entries()];await rejects(()=>rs.createReceiving(2,expected),/changed/);assert.deepEqual([...rb.profile.values.entries()],unchanged);checks++;
-    await rejects(()=>rs.createReceiving(1),/changed/);await rejects(()=>rs.createReceiving(1,{wallet_revision:after.wallet_revision,wallet_id:keys[0],chain_id:f.expected.chain_id}),/changed/);await rejects(()=>rs.createReceiving(1,{wallet_revision:after.wallet_revision,wallet_id:after.wallet_id,chain_id:'99'.repeat(32)}),/changed/);
-    rb.profile.storage.setItem=()=>{throw Error('quota');};await rejects(()=>rs.createReceiving(3,{wallet_revision:after.wallet_revision}),/saved/);assert.deepEqual([...rb.profile.values.entries()],unchanged);checks++;ok(secrets.every(b=>b.every(x=>x===0)));
-  }
-  {
-    const rb=browser(),rs=rb.api.createStore(f.expected.chain_id),initial=await rs.importPrivate(f.secret),saved=[...rb.profile.values.entries()],buffers=[];let draws=0;
-    rb.context.crypto={getRandomValues(target){if(target.length===32)buffers.push(target);webcrypto.getRandomValues(target);if(target.length===32&&++draws===2)throw Error('random failed');return target;}};
-    await rejects(()=>rs.createReceiving(3,{wallet_revision:initial.wallet_revision}),/random failed/);assert.deepEqual([...rb.profile.values.entries()],saved);checks++;ok(buffers.every(b=>b.every(x=>x===0)));
-    draws=0;buffers.length=0;rb.context.crypto={getRandomValues(target){if(target.length!==32)return webcrypto.getRandomValues(target);draws++;buffers.push(target);target.set(Buffer.from(f.secret,'hex'));return target;}};
-    await rejects(()=>rs.createReceiving(1,{wallet_revision:initial.wallet_revision}),/fresh receiving/);equal(draws,128);ok(buffers.every(b=>b.every(x=>x===0)));assert.deepEqual([...rb.profile.values.entries()],saved);checks++;
-  }
-  {
-    const shared=profile(),first=browser(shared).api.createStore(f.expected.chain_id),second=browser(shared).api.createStore(f.expected.chain_id),initial=await first.importPrivate(f.secret),expected={wallet_revision:initial.wallet_revision};
-    const outcomes=await Promise.allSettled([first.createReceiving(2,expected),second.createReceiving(2,expected)]);equal(outcomes.filter(x=>x.status==='fulfilled').length,1);equal(outcomes.filter(x=>x.status==='rejected').length,1);equal(first.snapshot().wallets.length,3);equal(first.snapshot().wallet_id,initial.wallet_id);
-  }
-  {
-    const rb=browser(),rs=rb.api.createStore(f.expected.chain_id),initial=await rs.importPrivate(f.secret),name=[...rb.profile.values.keys()][0],data=JSON.parse(rb.profile.values.get(name));
-    for(let n=1;n<=998;n++){const key=rb.api.publicKey(BigInt(n).toString(16).padStart(64,'0'));data.wallets.push({id:key,public_key:key,private_key:null,backed_up:false});}
-    rb.profile.values.set(name,JSON.stringify(data));const saved=rb.profile.values.get(name);let randomCalls=0;rb.context.crypto={getRandomValues(target){if(target.length===32)randomCalls++;return webcrypto.getRandomValues(target);}};
-    await rejects(()=>rs.createReceiving(2,{wallet_revision:initial.wallet_revision}),/Too many/);equal(randomCalls,0);equal(rb.profile.values.get(name),saved);
-  }
   process.stdout.write(JSON.stringify({ok:true,checks})+'\n');
 }
 (process.argv.includes('--rust-vectors')?runRustVectors():run()).catch(error=>{console.error(error.stack);process.exitCode=1;});

@@ -155,37 +155,15 @@ async function run() {
     assert.equal(broadcasts(c).length,1,'redirected ordinary transfer is never signed');checks++;
     assert.match(f.querySelector().textContent,/does not match/);checks++;
   }
-  // The Mixer has its own route; preparing a deposit carries encrypted
-  // instructions into Send for explicit signing, without broadcasting itself.
+  // Periodic refresh reads only the selected wallet, keeping other saved
+  // addresses local until they are explicitly selected.
   {
-    const c=await setup({mixer:true});c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();
-    const pub=n=>Buffer.from(c.noble.schnorr.getPublicKey(Uint8Array.from(Buffer.from(BigInt(n).toString(16).padStart(64,'0'),'hex')))).toString('hex');
-    const custodian=pub(6),destinations=[addr(pub(8)),addr(pub(9))],terms={version:1,chain_id:c.currentSnapshot.status.chain_id,public_key:custodian,denomination_atoms:'100',service_fee_bps:100,payout_fee_cap_atoms:'2',minimum_deposits:2,confirmations:2,timeout_seconds:3600,max_addresses:8};
-    const termsId=sha(Buffer.from(JSON.stringify(Object.fromEntries(Object.keys(terms).sort().map(k=>[k,terms[k]]))))).toString('hex');
-    c.mixerTransport=()=>response({terms,terms_id:termsId,address:addr(custodian)});
-    assert.equal((c.mixerCalls||[]).length,0,'other app pages do not fetch mixer metadata');checks++;
-    await c.navigate('#mixer');for(let i=0;i<100&&!c.get('mixer-terms').textContent;i++)await new Promise(r=>setTimeout(r,5));
-    assert.equal(c.get('view-mixer').hidden,false);checks++;assert.equal(c.get('view-send').hidden,true);checks++;assert.ok(c.get('mixer-terms').textContent);checks++;
-    const f=c.get('mixer-form');f.elements.amount.value='0.00000000000000022';f.elements.addresses.value=destinations.join('\n');f.elements.trust.checked=true;await f.requestSubmit();
-    assert.equal(c.location.hash,'#send',c.get('mixer-feedback').textContent);checks++;assert.equal(c.get('view-send').hidden,false);checks++;
-    const send=c.get('send-form');assert.equal(send.elements.recipient.value,addr(custodian));checks++;assert.equal(send.elements.data_format.value,'private');checks++;assert.equal(send.elements.mail_subject.value,'hashstash.mix/1');checks++;assert.deepEqual(JSON.parse(send.elements.mail_body.value),{terms:termsId,addresses:destinations});checks++;
-    assert.equal(broadcasts(c).length,0,'review never broadcasts a deposit');checks++;
-    await c.timersDue();for(let i=0;i<100&&c.get('send-submit').disabled;i++)await new Promise(r=>setTimeout(r,5));assert.equal(c.get('send-submit').disabled,false,c.get('send-cost').textContent);checks++;
-    for(const destination of destinations){assert.equal(JSON.stringify(c.calls).includes(destination),false,'payout addresses are not disclosed in RPC before encryption');checks++;}
-    await send.requestSubmit();assert.equal(broadcasts(c).length,1,send.querySelector().textContent);checks++;
-    const raw=Buffer.from(broadcasts(c)[0].body.params.raw,'hex'),tx=c.browserApi.decodeUnsigned({format:'hashstash-unsigned-v1',body:raw.subarray(0,-64).toString('hex')});
-    assert.equal(tx.operation.TransferExact.recipient,custodian);checks++;assert.equal(tx.operation.TransferExact.amount,'220');checks++;assert.ok(tx.data_hex.length>0);checks++;
-    for(const destination of destinations){assert.equal(Buffer.from(tx.data_hex,'hex').includes(Buffer.from(destination)),false,'destination is inside authenticated ciphertext');checks++;}
-  }
-  // Fresh mixing destinations are local-only until explicitly selected. A
-  // periodic snapshot must not disclose the whole browser wallet collection.
-  {
-    const c=await setup();c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();const before=c.browserStore.snapshot(),start=c.calls.length;
-    const receiving=await c.browserStore.createReceiving(3,{chain_id:c.currentSnapshot.status.chain_id,wallet_id:before.wallet_id,wallet_revision:before.wallet_revision});await c.refresh();await settle();
-    assert.equal(c.browserStore.snapshot().wallet_id,before.wallet_id,'generating destinations keeps depositing wallet selected');checks++;
-    const requests=JSON.stringify(c.calls.slice(start));for(const key of receiving){assert.equal(requests.includes(key),false,'unselected receiving key never enters RPC');checks++;assert.equal(requests.includes(addr(key)),false,'unselected receiving address never enters RPC');checks++;}
+    const c=await setup();c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();const before=c.browserStore.snapshot();
+    const others=[];for(const n of [8,9,10]){const created=await c.browserStore.importPrivate(BigInt(n).toString(16).padStart(64,'0'));others.push(created.public_key);}
+    await c.refresh();await c.chooseWallet(before.wallet_id);await settle();assert.equal(c.browserStore.snapshot().wallet_id,before.wallet_id);checks++;const start=c.calls.length;await c.refresh();await settle();
+    const requests=JSON.stringify(c.calls.slice(start));for(const key of others){assert.equal(requests.includes(key),false,'unselected key never enters RPC');checks++;assert.equal(requests.includes(addr(key)),false,'unselected address never enters RPC');checks++;}
     const snapshots=c.calls.slice(start).filter(call=>call.body.method==='snapshot');assert.ok(snapshots.length>0);checks++;for(const request of snapshots){assert.deepEqual(request.body.params.keys,[before.public_key],'snapshot queries selected wallet only');checks++;}
-    const next=c.calls.length;await c.chooseWallet(receiving[0]);await c.refresh();const selectedRequests=JSON.stringify(c.calls.slice(next));assert.ok(selectedRequests.includes(receiving[0]),'explicit selection permits reading that account');checks++;for(const key of receiving.slice(1)){assert.equal(selectedRequests.includes(key),false,'selecting one destination does not reveal its siblings');checks++;}
+    const next=c.calls.length;await c.chooseWallet(others[0]);await c.refresh();const selectedRequests=JSON.stringify(c.calls.slice(next));assert.ok(selectedRequests.includes(others[0]),'explicit selection permits reading that account');checks++;for(const key of others.slice(1)){assert.equal(selectedRequests.includes(key),false,'selecting one wallet does not reveal the others');checks++;}
   }
   console.log(`Browser wallet UI: ${checks} integration assertions passed.`);
 }

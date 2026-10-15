@@ -2,7 +2,7 @@
 
 Hashstash is a proof-of-work blockchain with two kinds of holdings: **hashes**, which you can spend, and **stash**, which you obtain by depositing hashes into a shared reserve. Its governance system uses trading in two possible outcomes—PASS and FAIL—to decide grants and changes to network settings.
 
-This repository contains the node, browser wallet, explorer, messaging tools and optional faucet and mixer services. The current version is **0.37.0**, implementing protocol **27**. It is experimental software; its security and economic design have not received a complete independent audit.
+This repository contains the node, browser wallet, explorer, messaging tools and an optional faucet service. The current version is **0.37.1**, implementing protocol **27**. It is experimental software; its security and economic design have not received a complete independent audit.
 
 ## How it works
 
@@ -45,7 +45,7 @@ The browser **Wallet** creates or imports keys, displays balances and signs tran
 
 **Stash** quotes deposits and withdrawals. **Governance** shows proposals and outcome markets. The **Explorer** provides blocks, transactions, accounts and network details without requiring a wallet.
 
-**Chat** displays public text attached to transactions. **Mail** encrypts messages inside transaction data; the underlying transactions remain public, and compromise of a wallet key can expose past mail. The optional faucet distributes an operator's funds. The optional mixer holds deposits in the custody of its operator, who controls those funds and can see their deposit-to-payout mapping.
+**Chat** displays public text attached to transactions. **Mail** encrypts messages inside transaction data; the underlying transactions remain public, and compromise of a wallet key can expose past mail. The optional faucet distributes an operator's funds.
 
 ## Build and run
 
@@ -94,5 +94,5 @@ The committed browser bundle supports normal builds and frontend tests. See [bro
 - [Protocol specification](docs/SPECIFICATION.md), [consensus encoding](docs/CONSENSUS.md), [reserve mathematics](docs/RESERVE.md)
 - [Node operation](docs/RUNNING.md), [mining](docs/MINING.md), [network controls](docs/NETWORK-HARDENING.md)
 - [Wallets](docs/WALLETS.md), [addresses](docs/ADDRESSES.md), [explorer](docs/EXPLORER.md)
-- [Chat](docs/CHAT.md), [Mail](docs/MAIL.md), [faucet](docs/FAUCET.md), [mixer](docs/MIXER.md)
+- [Chat](docs/CHAT.md), [Mail](docs/MAIL.md), [faucet](docs/FAUCET.md)
 - [Validation](docs/VALIDATION.md), [security review](docs/AUDIT.md)

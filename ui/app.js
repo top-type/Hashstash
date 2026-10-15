@@ -48,7 +48,6 @@
         governance: "Governance",
         chat: "Chat",
         mail: "Mail",
-        mixer: "Mixer",
         network: "Network",
         explorer: "Explorer",
         guide: "Guide"
@@ -146,22 +145,6 @@
         }
     }
     function attachmentIdentity(form) { return JSON.stringify([form.elements.mail_recipient?.value,form.elements.mail_subject?.value,form.elements.mail_body?.value,nextNonce().toString()]); }
-    const mixer = typeof HashstashMixer === "object" ? HashstashMixer.create({
-        getContext: () => ({ready:state.ready,chain_id:state.status?.chain_id,key:key(),wallet:walletIdentity()}),
-        encodeAddress:address,decodeAddress:addressKey,parseAmount:integer,formatAmount:formatExactHash,
-        createAddresses: async count => {
-            if (!browserWallet || !state.session || state.managing || state.submitting) throw new Error("Wait for the wallet to be ready.");
-            state.managing = true; modeButtons();
-            try { return (await browserWallet.createReceiving(count,{wallet_revision:state.session.wallet_revision,wallet_id:state.session.wallet_id,chain_id:state.status.chain_id})).map(publicKey=>address(publicKey)); }
-            finally { state.managing=false; modeButtons(); await refresh(); }
-        },
-        prepareDeposit: value => {
-            const form=$("send-form");form.elements.recipient.value=value.recipient;form.elements.amount.value=value.amount;
-            form.elements.data_format.value="private";form.elements.mail_recipient.value=value.recipient;form.elements.mail_subject.value=value.subject;form.elements.mail_body.value=value.body;
-            transactionDataView(form);$("send-data").open=true;location.hash="#send";route();sendSoon();form.scrollIntoView?.({behavior:"smooth",block:"start"});
-            feedback(form,"Mixer deposit: review the custodian address, amount, encrypted instructions and fee before sending.");
-        }
-    }) : null;
     const amountRenders = new WeakMap, listRenders = new WeakMap;
     function text(id, value) {
         const node = $(id), content = String(value);
@@ -1048,7 +1031,6 @@
         document.querySelectorAll(".view").forEach(view => {
             view.hidden = view.id !== `view-${selected}`;
         });
-        mixer?.open(selected === "mixer");
         document.querySelectorAll("[data-route]").forEach(link => {
             const current = link.dataset.route === (selected === "network" ? "explorer" : selected);
             link.classList.toggle("active", current);
@@ -1863,7 +1845,6 @@
         transactionMail?.clear();
         state.ready = false;
         state.contextEpoch++;
-        mixer?.update();
         explorer?.update({
             ready: false,
             chain_id: state.session?.chain_id
@@ -2055,7 +2036,6 @@
                 height: status.height,
                 message_bytes: transactionByteLimit().toString()
             });
-            mixer?.update();
             $("mail-nav").hidden = false;
             mail?.update({
             node_id: state.contextEpoch,

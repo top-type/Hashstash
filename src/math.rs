@@ -406,6 +406,13 @@ pub fn work(target: &Amount) -> Amount {
     (Amount::one() << 256usize) / (target + 1u32)
 }
 
+/// Convert this block's exact expected work into whole monetary atoms.
+/// Any fractional atom is discarded; it is never carried into another block.
+pub fn issuance(block_work: &Amount, work_per_atom: &Amount) -> Result<Amount> {
+    ensure!(!work_per_atom.is_zero(), "zero work denomination");
+    Ok(block_work / work_per_atom)
+}
+
 pub fn check_pow(header: &Header, target: &Amount) -> Result<()> {
     ensure!(
         target_from_bits(header.bits)? == *target,

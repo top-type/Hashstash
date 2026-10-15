@@ -21,8 +21,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--directory', type=Path, default=REPO / 'work/wallet-audit')
     parser.add_argument('--base-port', type=int, default=28080)
-    parser.add_argument('--node', type=Path, default=REPO / 'target/release/hashstash.exe')
-    parser.add_argument('--cold', type=Path, default=REPO / 'target/release/hashstash-cold.exe')
+    parser.add_argument('--node', type=Path, default=REPO / 'target/fixtures/release/hashstash.exe')
+    parser.add_argument('--cold', type=Path, default=REPO / 'target/fixtures/release/hashstash-cold.exe')
     parser.add_argument('--report-prefix', default='full-audit-wallet')
     options = parser.parse_args()
     options.directory.mkdir(parents=True, exist_ok=True)
@@ -67,7 +67,7 @@ def main():
     try:
         for name in ('test_wallet_cli', 'test_wallet_manager', 'test_addresses'):
             report = directory / (options.report_prefix + '-' + name.removeprefix('test_') + '.json')
-            with patch.object(sys, 'argv', [name, '--node', str(node), '--cold', str(cold), '--report', str(report)]), \
+            with patch.object(sys, 'argv', [name, '--node', str(node), '--cold', str(cold), '--directory', str(directory), '--report', str(report)]), \
                     patch.object(tempfile, 'mkdtemp', mkdtemp), patch.object(subprocess, 'Popen', popen):
                 importlib.import_module(name).main()
             results.append(json.loads(report.read_text(encoding='utf-8')))

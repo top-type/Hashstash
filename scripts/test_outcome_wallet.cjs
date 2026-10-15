@@ -31,13 +31,13 @@ async function run(){
  for(const action of ['commit','merge']){ok(!html.includes(`id="${action}-form"`));ok(!source.includes(`bindForm('${action}-form'`));}
  {
   const h=await setup('1','1');
-  h.currentSnapshot.pass.account.shares='1';h.currentSnapshot.fail.account.shares='999999999999999999999999999999';await h.refresh();
-  eq(selectorValues(h).map(n=>n.textContent),['<0.000001','<0.000001','<0.000001'],'tiny nonzero selector balances show an honest bound, not truncated zeros');
-  eq(selectorValues(h).map(n=>n['aria-label']),[amounts.formatHash('1'),stash('1'),stash('999999999999999999999999999999')],'tiny values keep complete accessible amounts');
-  ok(selectorValues(h)[1].title.includes('0.000000000000000000000000000000000001 stash'),'one-atom tooltip stays exact');
-  h.currentSnapshot.pass.account.ordinary=h.currentSnapshot.fail.account.ordinary='1000000000000';
-  h.currentSnapshot.pass.account.shares=h.currentSnapshot.fail.account.shares='1000000000000000000000000000000';await h.refresh();
-  eq(selectorValues(h).map(n=>n.textContent),['0.000001','0.000001','0.000001'],'threshold equality displays its amount without a less-than sign');
+  h.currentSnapshot.pass.account.shares='1';h.currentSnapshot.fail.account.shares='999';await h.refresh();
+  eq(selectorValues(h).map(n=>n.textContent),['0.001','0.001','0.999'],'one-atom balances display exactly without underflow');
+  eq(selectorValues(h).map(n=>n['aria-label']),[amounts.formatHash('1'),stash('1'),stash('999')],'tiny values keep complete accessible amounts');
+  ok(selectorValues(h)[1].title.includes('0.001 stash'),'one-atom tooltip stays exact');
+  h.currentSnapshot.pass.account.ordinary=h.currentSnapshot.fail.account.ordinary='1000';
+  h.currentSnapshot.pass.account.shares=h.currentSnapshot.fail.account.shares='1000';await h.refresh();
+  eq(selectorValues(h).map(n=>n.textContent),['1','1','1'],'threshold equality displays its amount without a less-than sign');
   h.currentSnapshot.pass.account.ordinary=h.currentSnapshot.fail.account.ordinary='0';
   h.currentSnapshot.pass.account.shares=h.currentSnapshot.fail.account.shares='0';await h.refresh();
   eq(selectorValues(h).map(n=>n.textContent),['0','0','0'],'true zeros remain zero');
@@ -47,7 +47,7 @@ async function run(){
   eq(h.get('pass-cash').textContent,amounts.formatHash('1000'));eq(h.get('fail-cash').textContent,amounts.formatHash('400'));
   eq(cash(balanceRows(h.get('account-balances'))[0]),amounts.formatHash('400'));eq(cash(balanceRows(h.get('account-balances'))[1]),amounts.formatHash('1000'));eq(cash(balanceRows(h.get('account-balances'))[2]),amounts.formatHash('400'));
   const grid=h.get('account-balances'),rows=balanceRows(grid),heading=grid.children[0];
-  eq(selectorValues(h).map(n=>n['aria-label']),[amounts.formatHash('400'),stash('100000000000000000'),stash('100000000000000000')],'top selector shows shared cash and distinct conditional Stash holdings');
+  eq(selectorValues(h).map(n=>n['aria-label']),[amounts.formatHash('400'),stash('100'),stash('100')],'top selector shows shared cash and distinct conditional Stash holdings');
   eq(walk(h.get('account-summary')).filter(n=>n.className==='account-summary-outcome').map(n=>n.textContent),['PASS','FAIL']);
   ok(h.get('account-summary').textContent.includes('Available before fees'),'conditional common cash has an accessible scope label');
   h.currentSnapshot.pass.account.shares='300000000000000000';h.currentSnapshot.fail.account.shares='700000000000000000';await h.refresh();
@@ -58,7 +58,7 @@ async function run(){
   eq(h.get('overview-total-pass')['aria-label'],amounts.formatHash('1500'),'compact Home balances retain accessible units');
   eq(h.get('overview-total').hidden,true);eq(h.get('overview-total-pass').textContent,amounts.formatHash('1500').replace(/ hash$/,''),'PASS total includes its own cash once');eq(h.get('overview-total-fail').textContent,amounts.formatHash('900').replace(/ hash$/,''),'FAIL total includes its own cash once');ok(h.get('governance-outcome-help').textContent.includes('balances continue from the winning side'));
   h.currentSnapshot.pass.account.ordinary='100';await h.refresh();eq(h.get('send-available').textContent,amounts.formatHash('100'),'smaller PASS replaces default FAIL as payment ceiling');
-  h.currentSnapshot.pass.account.ordinary='9007199254740993';h.currentSnapshot.fail.account.ordinary='9007199254740994';await h.refresh();ok(h.get('send-available').title.startsWith('0.009007199254740993 hash'),'ceiling remains exact beyond JS safe integers');
+  h.currentSnapshot.pass.account.ordinary='9007199254740993';h.currentSnapshot.fail.account.ordinary='9007199254740994';await h.refresh();ok(h.get('send-available').title.startsWith('9007199254740.993 hash'),'ceiling remains exact beyond JS safe integers');
  }
  {
   const h=await setup('1000','400'),f=await h.send('399');eq(h.get('send-submit').disabled,false,'amount plus exact fee exactly fits both');await f.requestSubmit();eq(h.wallet.at(-1).operation.TransferExact.amount,'399');
@@ -106,7 +106,7 @@ async function run(){
   eq(h.get('send-available').textContent,'0 hash','an address absent from one outcome has no shared spendable balance');
   eq(cash(balanceRows(h.get('account-balances'))[0]),'0 hash');eq(h.get('pass-cash').textContent,'0 hash');eq(h.get('fail-cash').textContent,amounts.formatHash('400'));
   delete h.currentSnapshot.pass;await h.refresh();eq(h.get('send-available').textContent,'—','an omitted outcome response is unknown, not an absent on-chain address');
-  eq(selectorValues(h).map(n=>n['aria-label']),['— hash','— stash',stash('100000000000000000')],'missing outcome prevents fabricated shared cash or Stash');
+  eq(selectorValues(h).map(n=>n['aria-label']),['— hash','— stash',stash('100')],'missing outcome prevents fabricated shared cash or Stash');
  }
  {
   const h=await setup();h.currentSnapshot.governance.phase={Rest:{until:64}};h.currentSnapshot.governance.pass=null;h.currentSnapshot.account=h.currentSnapshot.pass=h.currentSnapshot.fail=null;await h.refresh();
@@ -131,16 +131,16 @@ async function run(){
 
  {
   const h=await setup();await h.trade('50');h.currentSnapshot.governance.phase={Rest:{until:64}};h.currentSnapshot.governance.pass=null;h.currentSnapshot.pass=null;h.currentSnapshot.fail=null;h.currentSnapshot.account.account.ordinary='123';await h.refresh();eq(h.get('trade-outcome').value,'');eq(h.get('send-available').textContent,amounts.formatHash('123'));eq(h.get('overview-total').hidden,false);eq(h.get('overview-total-outcomes').hidden,true);eq(balanceRows(h.get('account-balances')).length,1,'resolution restores a single surviving balance');
-  eq(selectorValues(h).map(n=>n['aria-label']),[amounts.formatHash('123'),stash('100000000000000000')],'resolution returns the top selector to the surviving ordinary balances');
+  eq(selectorValues(h).map(n=>n['aria-label']),[amounts.formatHash('123'),stash('100')],'resolution returns the top selector to the surviving ordinary balances');
  }
  for(const channel of ['send','mail']){
-  const h=await setup('1000000000010',channel==='mail'?'1':'1000000000000',channel==='mail'?{mail:true}:{}),s=h.currentSnapshot,f=h.get(`${channel}-form`);
+  const h=await setup('1010',channel==='mail'?'1':'1000',channel==='mail'?{mail:true}:{}),s=h.currentSnapshot,f=h.get(`${channel}-form`);
   if(channel==='send'){f.elements.data_text.value='Public test fixture message';f.elements.recipient.value=addr(recipient);}else{f.elements.message.value='Private test fixture message';}
-  if(channel==='send')f.elements.amount.value='0.000001';
+  if(channel==='send')f.elements.amount.value='1';
   if(channel==='mail'){f.elements.subject.value='Published fixture';f.elements.recipient.value=addr('79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798');}
   const preview=async()=>{await f.fire('input');await h.timersDue();for(let i=0;i<100&&h.get(`${channel}-fee-quote`).textContent==='—'&&!h.get(`${channel}-fee-error`).textContent;i++)await new Promise(r=>setTimeout(r,5));};
   await preview();eq(h.get(`${channel}-submit`).disabled,true,`${channel} cannot bypass min-both payment limit`);ok(h.get(channel==='send'?'send-cost':`${channel}-fee-error`).textContent.includes('FAIL balance'),`${channel} explains insufficient other-outcome exact fee`);await f.fire('submit');eq(h.wallet.length,0);
-  s.fail.account.ordinary=channel==='mail'?'2':'1000000000001';s.status.tip='f'.repeat(64);await h.refresh();await preview();eq(h.get(`${channel}-submit`).disabled,false,`${channel} payment plus exact fee fits both`);await f.requestSubmit();eq(h.wallet.at(-1).operation.TransferExact.amount,channel==='mail'?'1':'1000000000000');ok(h.wallet.at(-1).data_hex.length>0);
+  s.fail.account.ordinary=channel==='mail'?'2':'1001';s.status.tip='f'.repeat(64);await h.refresh();await preview();eq(h.get(`${channel}-submit`).disabled,false,`${channel} payment plus exact fee fits both`);await f.requestSubmit();eq(h.wallet.at(-1).operation.TransferExact.amount,channel==='mail'?'1':'1000');ok(h.wallet.at(-1).data_hex.length>0);
  }
  console.log(`Automatic outcome wallet: ${checks} checks passed`);
 }

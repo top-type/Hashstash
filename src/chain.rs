@@ -858,7 +858,10 @@ impl Chain {
             "selection candidate limit exceeded"
         );
         ensure!(crypto::valid_key(&miner), "invalid miner key");
-        let mut execution = consensus::prepare_block(&self.config, &self.tip_state, &miner)?;
+        let target = self.target(&self.tip_entry)?;
+        let block_work = math::work(&target);
+        let mut execution =
+            consensus::prepare_block(&self.config, &self.tip_state, &miner, &block_work)?;
         let mut result = SelectionResult {
             transactions: Vec::new(),
             signatures_checked: 0,
@@ -1000,13 +1003,12 @@ impl Chain {
                 break;
             }
         }
-        let target = self.target(&self.tip_entry)?;
         let state = consensus::finish_block(
             &self.config,
             &self.tip_state,
             &self.tip,
             &miner,
-            &math::work(&target),
+            &block_work,
             execution,
         )?;
         Ok((result, state))
@@ -1237,6 +1239,10 @@ mod cache_tests {
         chain.tip_state().audit(&chain.config).unwrap();
     }
     #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
     fn anchor_index_failure_does_not_poison_invalid_block_cache() {
         let directory = tempfile::tempdir().unwrap();
         let mut chain =

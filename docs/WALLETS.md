@@ -12,7 +12,7 @@ A new browser profile, site, or network starts with no saved wallets or selected
 
 The menu at the top identifies each wallet by its address and shows its hash and stash balances. Hot and watch-only labels distinguish the signing mode. Governance begins with full holdings in each possible outcome. If PASS and If FAIL show those separate positions; only the winner survives. For payments shows the smaller cash balance before fees, already included in both outcome rows. These values are never added together. Selecting an entry switches accounts immediately. Importing a private key for an existing watch entry upgrades it to a hot wallet; adding a watched address never removes a saved key. Adding a wallet does not create an on-chain account. Its first funded payment or mining reward does that. Mining configuration belongs to node operators; normal wallet pages do not initiate mining or change its payout account.
 
-Hash amounts in the browser wallet and cold signer use **hash**: one displayed hash is 10¹⁸ raw hash atoms. Amount fields accept a decimal hash amount, optionally followed by `hash`, with up to 18 decimal places. One raw atom is `0.000000000000000001 hash`. Stash quantities use **stash**: one displayed stash is 10³⁶ protocol share atoms. Stash fields accept a decimal, optionally followed by `stash`, with up to 36 decimal places. Prices show hash per stash. Both display denominations preserve the underlying balances and signed amounts. Mining work uses EH and hash rate uses EH/s, including small decimal values.
+Hash amounts in the browser wallet and cold signer use **hash**: one displayed hash is 1,000 raw hash atoms. Amount fields accept a decimal hash amount, optionally followed by `hash`, with up to three decimal places. One raw atom is `0.001 hash`. Stash quantities use **stash**: one displayed stash is 1,000 share atoms. Stash fields accept a decimal, optionally followed by `stash`, with up to three decimal places. Prices show hash per stash. Both display denominations preserve the underlying balances and signed amounts. Mining work uses EH and hash rate uses EH/s, including small decimal values.
 
 Use **Stash** to buy or sell during Rest and Auction. During an active decision, that page links to **Governance**, where the same controls trade the selected PASS or FAIL outcome. The curve graph stays on Stash with its own PASS/FAIL selector, independent of the trade form. It plots marginal price against stash supply, shows the current point on a funded curve, and shows the flat opening rate for an empty reserve. After the decision, the trade controls return to Stash. Wallet management, sending, and Explorer remain available throughout.
 
@@ -26,7 +26,7 @@ Optional node wallets use a separate local database. They are not exposed by the
 
 ## Sending HASH
 
-**Amount** is exactly what the recipient receives. The wallet quotes the required minimum automatically, including account creation when needed, and signs the exact total fee. Optional extra defaults to zero and is added when constructing that quote. Sending 1 hash with a total fee of 0.000001 hash costs exactly 1.000001 hash. If the signed fee is below the required minimum when included, the whole transaction is rejected; a higher signed fee is paid in full.
+**Amount** is exactly what the recipient receives. The wallet quotes the required minimum automatically, including account creation when needed, and signs the exact total fee. Optional extra defaults to zero and is added when constructing that quote. Sending 1 hash with a total fee of 0.001 hash costs exactly 1.001 hash. If the signed fee is below the required minimum when included, the whole transaction is rejected; a higher signed fee is paid in full.
 
 The entire actual fee—mandatory minimum plus optional extra—follows the governed miner/revenue split, initially 50% each. The miner receives the whole-atom floor of its percentage and the revenue receives the remainder. Governance can select any whole percentage from 0% to 100%; an approved change becomes active after rest and both outcomes use the same active split.
 
@@ -109,7 +109,7 @@ For direct startup, optional `run --wallet-key miner.key` or `run --watch-key <a
 
 ## Preparing and broadcasting from PowerShell
 
-Use the online interface's ordinary action forms to prepare transactions in watch-only mode. The CLI supports the same operations through JSON files. CLI amount and fee arguments, RPC amount strings, configuration values, and transaction bytes retain integer hash atoms; the displayed hash conversion is a UI presentation rule. This example sends one raw atom (`0.000000000000000001 hash`). Replace `RECIPIENT_ADDRESS` with the intended recipient’s address on the same chain:
+Use the online interface's ordinary action forms to prepare transactions in watch-only mode. The CLI supports the same operations through JSON files. CLI amount and fee arguments, RPC amount strings, configuration values, and transaction bytes retain integer hash atoms; the displayed hash conversion is a UI presentation rule. This example sends one raw atom (`0.001 hash`). Replace `RECIPIENT_ADDRESS` with the intended recipient’s address on the same chain:
 
 ```powershell
 '{"TransferExact":{"recipient":"RECIPIENT_ADDRESS","amount":"1"}}' | Set-Content -Encoding ascii .\operation.json

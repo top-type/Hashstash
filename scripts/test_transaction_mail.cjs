@@ -78,7 +78,7 @@ async function run() {
   }
   for(const mode of ['deposit','redeem']) {
     const h=await setup(),form=h.get('trade-form');await h.tradeTab(mode);attach(h,form);
-    form.elements.amount.value=mode==='deposit'?amounts.exactInput('25'):shares.exactInput('1000000000000000');
+    form.elements.amount.value=mode==='deposit'?amounts.exactInput('25'):shares.exactInput('25');
     await expectEncrypted(h,form,mode==='deposit'?'Deposit':'Redeem');
   }
   for(const action of ['support','refund','propose']) {

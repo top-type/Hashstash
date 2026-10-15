@@ -40,15 +40,15 @@
       return result;
     }
     function price(parent, ratio) {
-      // Explorer API price ratios use raw hash atoms per 10^18 share atoms.
-      amount(parent, BigInt(ratio.numerator) * 10n ** 18n, 'hash', ratio.denominator);
+      // Price ratios use monetary atoms per share atom.
+      amount(parent, BigInt(ratio.numerator) * root.HashstashShares.DISPLAY_SCALE, 'hash', ratio.denominator);
       amountText(add(parent, 'span', ''), '/stash');
     }
     function work(parent, value) {
       const result = add(parent, 'span', 'explorer-amount');
       try {
         result.textContent = root.HashstashAmounts.formatWork(value);
-        result.title = `${root.HashstashAmounts.exactInput(value)} EH`;
+        result.title = root.HashstashAmounts.formatExactWork(value);
       } catch { result.textContent = '—'; }
       return result;
     }

@@ -9,7 +9,9 @@ Install the [build prerequisites](../README.md) first. The Rust build needs a C 
 ```text
 cargo build --release --locked --bins
 cargo test --all-targets --locked
+cargo test --all-targets --locked --features test-fixtures --target-dir target/fixtures
 cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --all-targets --locked --features test-fixtures --target-dir target/fixtures -- -D warnings
 cargo fmt --check
 node scripts/test_all_frontend.cjs
 ```
@@ -82,3 +84,5 @@ For a protocol change, check the relevant state transition, rejection cases, det
 Review dependency advisories against the exact locked versions separately from functional tests. An empty advisory result is time-dependent and does not establish that dependencies or their uses are safe.
 
 Local tests establish only their exercised behavior. They do not prove economic stability, resistance to coordinated trading, sustained ASIC delivery, hardware location, production uptime or an independent security audit. Deployment claims require observations from the actual processes and chain being described. See [review scope and limitations](AUDIT.md).
+
+Funded economic process tests use a separately built `test-fixtures` executable and an explicit `test_work: true` configuration. Their reports identify the accelerated one-expected-hash-per-atom issuance. Ordinary builds reject those networks. Production issuance is checked separately at one petahash per atom, including zero-reward blocks, per-block rounding and branch changes; accelerated balances do not establish production funding.

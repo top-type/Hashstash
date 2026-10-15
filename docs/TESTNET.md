@@ -19,9 +19,9 @@ Stopping verifies the owned process identities and preserves files. Resuming reu
 
 `config/devnet.json`, `config/testnet.json` and `config/slow-testnet.json` are development presets. They start with a 15-second mining target, 16 KiB block-byte and block-weight limit; transactions use the available block capacity. Decisions last 32, 16 and 240 blocks respectively. Each preset starts with a 10% per-block price-change limit. Auction lead and rest use scheduled seconds; expiry and confirmation depths use blocks. These are development choices, not production guarantees.
 
-Each preset starts with an empty reserve and a Rest phase before the first proposal auction. A first deposit starts a flat curve at the configured share scale. Mining and Stash trading continue through rest, auction and governance. For isolated easy-target tests, operators can use explicitly bounded CLI mining; external ASIC connections use node-level Stratum settings.
+Each preset starts with an empty reserve and a Rest phase before the first proposal auction. A first deposit starts a flat curve at the configured share scale. Mining and Stash trading continue through rest, auction and governance. Bounded CLI mining can check local block propagation. External ASIC connections use node-level Stratum settings.
 
-Each canonical block earns its target's expected-work subsidy. Losing work is unpaid. Timestamp ASERT uses a 900-second half-life, 11-header median and 120-second future allowance. Its anchor is the first mined block of each branch; waiting before mining begins does not lower difficulty. Governance can set a positive whole-second target interval, subject to representable clocks and deadlines. The economic clock advances by the parent's target interval per block for auction lead and rest. Decision length remains a count of blocks when the interval changes. Actual wall time remains dependent on mining; signed transaction expiry and confirmation counts remain height-based.
+Production rules issue one atom per whole petahash of expected work in each block, discarding smaller fractions. Easy local blocks can issue zero atoms and cannot quickly fund wallet tests. Losing work is unpaid. Timestamp ASERT uses a 900-second half-life, 11-header median and 120-second future allowance. Its anchor is the first mined block of each branch; waiting before mining begins does not lower difficulty. Governance can set a positive whole-second target interval, subject to representable clocks and deadlines. The economic clock advances by the parent's target interval per block for auction lead and rest. Decision length remains a count of blocks when the interval changes. Actual wall time remains dependent on mining; signed transaction expiry and confirmation counts remain height-based.
 
 ## Wallet and governance
 
@@ -35,10 +35,14 @@ Chat is a feed of public transaction data. Mail encrypts a message in any transa
 
 ## Repeat isolated checks
 
+Funded integration tests require an explicitly separate build and configuration. Build with `cargo build --release --locked --features test-fixtures --target-dir target/fixtures`. Copy a development configuration into a disposable test directory and set `test_work` to `true`. That flag is part of the chain identity. It enables one atom per expected hash for fast tests; it does not represent production issuance. A normal build rejects that configuration. Never deploy the fixture build or mix its chain data with a normal network.
+
 ```powershell
-.\Start-Testnet.ps1 -Fresh -SeedWallets -NoBrowser -BasePort 28480 -DataRoot .\data\audit
+.\Start-Testnet.ps1 -Fresh -SeedWallets -NoBrowser -BasePort 28480 -DataRoot .\data\audit -Executable .\target\fixtures\release\hashstash.exe -Config <explicit-fixture-config>
 python .\scripts\test_network.py <manifest-path> --report <report-path>
 ```
+
+The committed presets and the ordinary launcher use `test_work: false`. `-SeedWallets` imports fixture wallets; it neither creates funds nor changes issuance. Process reports label accelerated tests separately, and normal-build checks verify zero issuance below one petahash. A report from accelerated testing is not evidence of real mining delivery or production reward amounts.
 
 The network check deliberately transacts and mines on that selected local fixture. It tests supply, fees, Stash, revenue, grants, auctions, partial fills, block-majority decisions, external Stratum headers, relay and reorganization. Its temporary fork process stops afterward; stop the three fixture nodes using their saved manifest when done. The [validation guide](VALIDATION.md) describes the other checks. Use these scripts only with the disposable fixture created for them.
 

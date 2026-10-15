@@ -45,8 +45,8 @@ def transfer_operation(recipient, amount='1'):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--node', type=Path, default=REPO / 'target/release' / ('hashstash.exe' if os.name == 'nt' else 'hashstash'))
-    parser.add_argument('--cold', type=Path, default=REPO / 'target/release' / ('hashstash-cold.exe' if os.name == 'nt' else 'hashstash-cold'))
+    parser.add_argument('--node', type=Path, default=REPO / 'target/fixtures/release' / ('hashstash.exe' if os.name == 'nt' else 'hashstash'))
+    parser.add_argument('--cold', type=Path, default=REPO / 'target/fixtures/release' / ('hashstash-cold.exe' if os.name == 'nt' else 'hashstash-cold'))
     parser.add_argument('--report', type=Path, default=REPO / 'work/wallet-cli-report.json')
     parser.add_argument('--directory', type=Path, default=REPO / 'work')
     options = parser.parse_args()
@@ -59,7 +59,7 @@ def main():
     vector, other = vectors[:2]
     checks, processes, logs = ([], [], [])
     started = time.monotonic()
-    report = {'suite': 'wallet CLI and standalone cold signer', 'artifact_directory': str(directory), 'node_sha256': digest(options.node), 'cold_sha256': digest(options.cold), 'checks': checks}
+    report = {'suite': 'wallet CLI and standalone cold signer', 'artifact_directory': str(directory), 'node_sha256': digest(options.node), 'cold_sha256': digest(options.cold), 'test_work': True, 'issuance_mode': 'accelerated test fixture', 'expected_hashes_per_atom': '1', 'production_issuance_tested': False, 'checks': checks}
 
     def check(description):
         checks.append(description)
@@ -99,6 +99,7 @@ def main():
         initialized_at = int(time.time())
         cli('init', '--config', config)
         configuration = json.loads(config.read_text(encoding='utf-8'))
+        configuration["test_work"] = True
         configuration['network'] = 'wallet-cli-' + uuid.uuid4().hex
 
         assert initialized_at <= configuration['genesis_time'] <= int(time.time())

@@ -2,7 +2,7 @@
 
 Only observed chain values are described as facts. Profiles express policy
 preferences, never promises about delivered work or real people's opinions.
-Display hashes contain 10**18 raw atoms; this module does not format Stash.
+Display hashes contain 1,000 raw atoms; this module does not format Stash.
 """
 from copy import deepcopy
 from decimal import Decimal, localcontext
@@ -241,16 +241,12 @@ def _hashes(raw):
         return "0 hashes"
     with localcontext() as ctx:
         ctx.prec = 180
-        value = Decimal(raw) / Decimal(10**18)
-        text = format(value, ".8f").rstrip("0").rstrip(".")
-        if text == "0":
-            return "less than 0.00000001 hashes"
+        value = Decimal(raw) / Decimal(1000)
+        text = format(value, ".3f").rstrip("0").rstrip(".")
         if len(text) > 18:
             text = format(value, ".5E")
             text = "about " + text
-        elif raw % (10**10):
-            text = "about " + text
-    return text + (" hash" if raw == 10**18 else " hashes")
+    return text + (" hash" if raw == 1000 else " hashes")
 
 
 def _percent(bps):

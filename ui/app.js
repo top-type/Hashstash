@@ -2,7 +2,7 @@
 
 (() => {
     const $ = id => document.getElementById(id);
-    const {parseAmount: parseAmount, formatHash: formatHash, formatExactHash: formatExactHash, formatHashrate: formatHashrate, exactInput: exactInput} = HashstashAmounts;
+    const {parseAmount: parseAmount, formatHash: formatHash, formatExactHash: formatExactHash, formatHashrate: formatHashrate, formatExactWork: formatExactWork, exactInput: exactInput} = HashstashAmounts;
     const state = {
         session: null,
         managing: false,
@@ -1294,7 +1294,7 @@
         }
         const {empty, power, xmax, ymax, clipped, points, supply} = model;
         const price = worldPrice(world);
-        const labelPrice = multiple => curveTick(BigInt(price.numerator) * chartShareUnit * BigInt(Math.round(multiple * Number(chartScale))), BigInt(price.denominator) * 10n ** 18n * chartScale);
+        const labelPrice = multiple => curveTick(BigInt(price.numerator) * chartShareUnit * BigInt(Math.round(multiple * Number(chartScale))), BigInt(price.denominator) * HashstashAmounts.DISPLAY_SCALE * chartScale);
         const labels = Array.from({length: 5}, (_, tick) => labelPrice(ymax * tick / 4));
         const left = Math.max(52, Math.min(90, Math.max(...labels.map(label => label.length)) * 6 + 16));
         const right = 18, top = 34, bottom = 49;
@@ -1406,7 +1406,7 @@
         const requestedSupply = (supply * 5n + 3n) / 4n, supplyStep = 10n ** BigInt(requestedSupply.toString().length - 1);
         const supplyMaximum = (requestedSupply + supplyStep - 1n) / supplyStep * supplyStep;
         const xmax = Number(supplyMaximum) / Number(supply), ymax = Math.max(1.5, Math.min(4, Math.max(...models.map(m => Math.exp(Math.min(Math.log(4), Math.log(m.price) + m.power * Math.log(xmax / m.currentX)))))));
-        const labelPrice = value => curveTick(BigInt(reference.curve_mass) * chartShareUnit * BigInt(Math.round(value * Number(chartScale))), BigInt(reference.shares) * 10n ** 18n * chartScale);
+        const labelPrice = value => curveTick(BigInt(reference.curve_mass) * chartShareUnit * BigInt(Math.round(value * Number(chartScale))), BigInt(reference.shares) * HashstashAmounts.DISPLAY_SCALE * chartScale);
         const labels = [0, 1, 2, 3].map(i => labelPrice(ymax * i / 3));
         const left = Math.max(48, Math.min(90, Math.max(...labels.map(label => label.length)) * 6 + 14)), right = 18, top = 30, bottom = 49;
         const plotW = width - left - right, plotH = height - top - bottom;
@@ -1821,7 +1821,7 @@
         available && stratum.enabled;
         text("mining-workers", available ? commas(data.workers_connected) : "—");
         amountText("mining-hashrate", data?.hashrate_hps == null ? "—" : formatHashrate(data.hashrate_hps));
-        $("mining-hashrate").title = available ? data.hashrate_hps == null ? "Waiting for enough accepted shares to estimate hash rate." : `Estimated from accepted shares over ${duration(data.hashrate_window_seconds)}. ${exactInput(data.hashrate_hps)} EH/s.` : "";
+        $("mining-hashrate").title = available ? data.hashrate_hps == null ? "Waiting for enough accepted shares to estimate hash rate." : `Estimated from accepted shares over ${duration(data.hashrate_window_seconds)}. ${formatExactWork(data.hashrate_hps)}/s.` : "";
         text("mining-shares", available ? `${commas(data.accepted_shares)} / ${commas(data.rejected_shares)}` : "—");
         $("mining-shares").title = available ? `${commas(data.accepted_shares)} accepted; ${commas(data.rejected_shares)} rejected since node start.` : "";
         text("mining-blocks", available ? commas(data.blocks_found) : "—");
@@ -1970,6 +1970,7 @@
             const changedState = state.status?.tip !== status.tip || state.status?.state_root !== status.state_root || state.status?.height !== status.height || previousDecision !== hex(gov.phase?.Governance?.id);
             if (!config || typeof config.network !== "string" || !config.network.length || !/^[1-9][0-9]*$/.test(String(config.quote_scale)) || !/^[1-9][0-9]*$/.test(String(config.share_scale)) || !/^[0-9]+$/.test(String(config.auction_timeout))) throw new Error("Invalid network configuration.");
             state.config = config;
+            $("test-work-notice").hidden = config.test_work !== true;
             settings.BlockBytes[1] = "Block capacity";
             settings.BlockBytes[2] = "weight";
             [ ...$("proposal-parameter").options ].find(option => option.value === "BlockBytes").textContent = settings.BlockBytes[1];
@@ -2295,7 +2296,7 @@
         text("trade-amount-label", kind === "deposit" ? "Spend · hash" : "Sell · stash");
         text("trade-unit", kind === "deposit" ? "hash" : "stash");
         $("trade-amount").inputMode = "decimal";
-        $("trade-amount").title = kind === "deposit" ? "Amount in hashes; up to 18 decimal places." : "Amount in stash; up to 36 decimal places.";
+        $("trade-amount").title = kind === "deposit" ? "Amount in hashes; up to 3 decimal places." : "Amount in stash; up to 3 decimal places.";
         text("quote-label", "Estimated receive");
         text("trade-submit", kind === "deposit" ? "Buy stash" : "Sell stash");
         text("trade-quote", "—");
@@ -2358,7 +2359,7 @@
     }
     function walletSelectorAmount(node, formatted, raw, decimals) {
         compactAmount(node, formatted);
-        if (raw !== null && BigInt(raw) > 0n && BigInt(raw) < 10n ** BigInt(decimals - 6)) node.textContent = "<0.000001";
+        if (raw !== null && BigInt(raw) > 0n && BigInt(raw) * 1000000n < 10n ** BigInt(decimals)) node.textContent = "<0.000001";
     }
     function walletSelectorBalancesView() {
         const node = $("account-summary"), balances = state.ready ? state.balances?.[hex(key()).toLowerCase()] : void 0;
@@ -2370,7 +2371,7 @@
         const cashGroup = append(node, "span", "account-summary-asset");
         if (conditional) append(cashGroup, "span", "sr-only", "Available before fees ");
         const cashValue = append(cashGroup, "span", "account-summary-cash");
-        walletSelectorAmount(cashValue, cash === null ? "— hash" : hashAmount(cash), cash, 18);
+        walletSelectorAmount(cashValue, cash === null ? "— hash" : hashAmount(cash), cash, HashstashAmounts.DISPLAY_DECIMALS);
         cashValue.title = cash === null ? "Unavailable" : `${conditional ? "Available before fees · " : ""}${formatExactHash(cash)}`;
         append(cashGroup, "span", "unit-hash", "hash");
         const sharesGroup = append(node, "span", "account-summary-asset account-summary-shares");
@@ -2895,7 +2896,7 @@
     modeButtons();
     document.querySelectorAll("input[data-exa]").forEach(input => {
         input.inputMode = "decimal";
-        input.title = "Amount in hashes; up to 18 decimal places.";
+        input.title = "Amount in hashes; up to 3 decimal places.";
         input.name === "fee" && (input.title += " Minimum permitted fee: 0 hash.");
     });
     refresh();

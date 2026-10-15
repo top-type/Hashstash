@@ -2,13 +2,15 @@
 
 Hashstash is a proof-of-work blockchain with two kinds of holdings: **hashes**, which you can spend, and **stash**, which you obtain by depositing hashes into a shared reserve. Its governance system uses trading in two possible outcomes—PASS and FAIL—to decide grants and changes to network settings.
 
-This repository contains the node, browser wallet, explorer, messaging tools and an optional faucet service. The current version is **0.40.0**. It is experimental software; its security and economic design have not received a complete independent audit.
+This repository contains the node, browser wallet, explorer, messaging tools and an optional faucet service. The current version is **0.41.0**. It is experimental software; its security and economic design have not received a complete independent audit.
 
 ## How it works
 
 ### Mining creates hashes
 
 Miners compete to find valid SHA256d proofs of work. Nodes check the blocks and follow the valid chain with the most accumulated work. Each block creates hashes in proportion to the expected work required by its difficulty: one exahash of expected work creates one hash. This measures the work implied by the target, rather than a miner's unobservable number of attempts.
+
+One hash contains 1,000 atoms, and one stash contains 1,000 share atoms. Both use at most three decimal places. Each block issues one atom per whole petahash of expected work. Any smaller fraction is discarded.
 
 Hashes pay for transfers, Stash deposits, proposal bids and transaction fees. A wallet holds the private key that authorizes spending; the blockchain records the account's balances. The network starts with zero issued hashes.
 
@@ -71,7 +73,9 @@ To join an existing network, obtain its exact genesis configuration and a reacha
 
 ```text
 cargo test --all-targets --locked
+cargo test --all-targets --locked --features test-fixtures --target-dir target/fixtures
 cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --all-targets --locked --features test-fixtures --target-dir target/fixtures -- -D warnings
 cargo fmt --check
 node scripts/test_all_frontend.cjs
 ```

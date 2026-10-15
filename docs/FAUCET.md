@@ -20,8 +20,8 @@ An example configuration for a local development website is:
   "key_file": "/etc/hashstash-faucet/faucet.key",
   "database": "/var/lib/hashstash-faucet/claims.sqlite",
   "origins": ["http://127.0.0.1:18480"],
-  "payout": "1000000000000000",
-  "max_fee": "1000000",
+  "payout": "1000",
+  "max_fee": "10",
   "cooldown_seconds": 86400,
   "subnet_cooldown_seconds": 60,
   "hourly_claims": 100,
@@ -43,14 +43,14 @@ Changing the ledger's network or signer requires a separate ledger. Changing
 original amounts, and all cooldowns and claim counts are preserved.
 The ledger stores the amount of each payment alongside its claim record.
 
-The example dispenses 0.001 hash per claim (10¹⁵ raw hash atoms) and permits one claim
+The example dispenses 1 hash per claim (1,000 raw hash atoms) and permits one claim
 per address each day. Configuration and API amounts use integer raw hash atoms.
 A shared IPv4 /24 or IPv6 /64 can make a new claim once per minute, so another
 wallet on the same network does not inherit a full day's wait. The separate
 `subnet_cooldown_seconds` setting defaults to 60 when omitted; both cooldowns
 must be positive and at most one year. At this payout, the claim-count caps allow
-up to 0.1 hash per hour, 0.25 hash per day, and 1 hash over the ledger's lifetime.
-The service additionally limits each exact quoted fee to 0.000000000001 hash.
+up to 100 hashes per hour, 250 hashes per day, and 1,000 hashes over the ledger's lifetime.
+The service additionally limits each exact quoted fee to 0.01 hash.
 This is a local spending allowance, not an encoded transaction cap. Pending
 and expired claims consume the allowance too. Changing the payout does not
 reset these counts; historical payments retain the amounts paid at the time. This
@@ -99,7 +99,7 @@ HTTP concurrency, request duration, and request-body size are bounded.
 {
   "enabled": true,
   "chain_id": "...",
-  "amount_hashes": "1000000000000000",
+  "amount_hashes": "1000",
   "available": true,
   "mining_active": true,
   "state": "ready",

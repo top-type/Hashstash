@@ -7,8 +7,8 @@
   'use strict';
 
   // Wire quantities stay integer share atoms; the displayed stash denomination
-  // is 10^36 atoms.
-  const PLACES = 36;
+  // is 1,000 atoms.
+  const PLACES = 3;
   const SCALE = 10n ** BigInt(PLACES);
   const MAX_INPUT_LENGTH = 190;
   const MAX_AMOUNT_DIGITS = 160;
@@ -31,7 +31,7 @@
     const match = /^(\d+(?:\.\d+)?|\.\d+)(?:\s*stash)?$/.exec(text.trim());
     if (!match) throw new Error('Enter a stash amount as a decimal, optionally followed by stash.');
     const [whole, fraction = ''] = match[1].split('.');
-    if (fraction.length > PLACES) throw new Error('Stash supports up to 36 decimal places.');
+    if (fraction.length > PLACES) throw new Error('Stash supports up to 3 decimal places.');
     const digits = (whole + fraction.padEnd(PLACES, '0')).replace(/^0+/, '') || '0';
     if (digits.length > MAX_AMOUNT_DIGITS) throw new RangeError('Stash amount exceeds 160 digits.');
     return digits;

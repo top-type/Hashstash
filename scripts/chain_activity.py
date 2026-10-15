@@ -333,9 +333,9 @@ def config_checked(config):
         if not Path(c[field]).is_absolute():
             raise ValueError('absolute paths required')
     defaults = {'action_seconds': 20, 'chat_seconds': 90 if substantive else 300, 'mining_fresh_seconds': 180,
-                'max_fee_raw': '1' if native else '1000000', 'fee_reserve_raw': '2' if native else '1000000000',
+                'max_fee_raw': '1' if native else '10', 'fee_reserve_raw': '2' if native else '100',
                 'confirmations': 2, 'expiry_blocks': 2, 'max_actions_daily': 4320,
-                'max_consumptive_daily_raw': '1000000000000000' if substantive else '200000000000000',
+                'max_consumptive_daily_raw': '1000' if substantive else '200',
                 'funding_seconds': 86400}
     for key, value in defaults.items():
         c.setdefault(key, value)
@@ -343,9 +343,9 @@ def config_checked(config):
             raise ValueError('positive activity limits required')
     if c['action_seconds'] < 20 or c['chat_seconds'] < (90 if substantive else 300) or c['funding_seconds'] < 86400:
         raise ValueError('activity cannot bypass cadence or funding limits')
-    if substantive and not native and int(c['max_consumptive_daily_raw']) > 1_000_000_000_000_000:
+    if substantive and not native and int(c['max_consumptive_daily_raw']) > 1000:
         raise ValueError('substantive profile exceeds its authorized ceiling')
-    if not native and (int(c['max_fee_raw']) > 1000000 or c['max_actions_daily'] > 4320):
+    if not native and (int(c['max_fee_raw']) > 10 or c['max_actions_daily'] > 4320):
         raise ValueError('activity limit exceeds fixed ceiling')
     if type(c['expiry_blocks']) is not int or not 0 < c['expiry_blocks'] < 1 << 64:
         raise ValueError('expiry blocks must be a positive u64')

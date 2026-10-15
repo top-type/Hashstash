@@ -1,4 +1,4 @@
-use crate::{batch, codec, config::Config, crypto, fees, state::*, types::*};
+use crate::{batch, codec, config::Config, crypto, fees, math, state::*, types::*};
 use anyhow::{Context, Result, bail, ensure};
 use num_traits::Zero;
 use std::collections::BTreeMap;
@@ -885,15 +885,16 @@ fn resolve(c: &Config, s: &mut State) -> Result<bool> {
 /// Execute economic state transitions without a header-history context.
 /// Chain admission, templates and replay additionally validate every signed
 /// anchor's ancestry and lifetime; this helper alone is not block validation.
+/// block_work is raw expected hashes, rounded down to whole monetary atoms.
 pub fn execute(
     c: &Config,
     parent: &State,
     parent_hash: &Hash,
     miner: &PublicKey,
-    subsidy: &Amount,
+    block_work: &Amount,
     transactions: &[Transaction],
 ) -> Result<State> {
-    Ok(execute_with_fills(c, parent, parent_hash, miner, subsidy, transactions)?.0)
+    Ok(execute_with_fills(c, parent, parent_hash, miner, block_work, transactions)?.0)
 }
 
 /// Replay economic transitions once and return actual batch fills.
@@ -904,7 +905,7 @@ pub fn execute_with_fills(
     parent: &State,
     parent_hash: &Hash,
     miner: &PublicKey,
-    subsidy: &Amount,
+    block_work: &Amount,
     transactions: &[Transaction],
 ) -> Result<(State, Vec<TradeFill>)> {
     ensure!(crypto::valid_key(miner), "invalid miner key");
@@ -912,14 +913,14 @@ pub fn execute_with_fills(
         transactions.len() <= c.max_signatures,
         "signature limit exceeded"
     );
-    let mut execution = prepare_block(c, parent, miner)?;
+    let mut execution = prepare_block(c, parent, miner, block_work)?;
     for t in transactions {
         let prepared =
             fees::PreparedTransaction::with_limit(t, c.transaction_bytes(&parent.settings))?;
         crypto::verify(t)?;
         execution.apply_prepared_transaction(c, &prepared)?;
     }
-    finish_block_with_fills(c, parent, parent_hash, miner, subsidy, execution)
+    finish_block_with_fills(c, parent, parent_hash, miner, block_work, execution)
 }
 
 /// Completed time/phase transitions before the first user transaction.
@@ -933,7 +934,7 @@ pub(crate) struct BlockExecution {
     used_weight: u64,
     weight_limit: u64,
     miner: PublicKey,
-    reward_accounts: Vec<PublicKey>,
+    subsidy_expected: bool,
 }
 impl BlockExecution {
     /// Charge accounting is updated only after an atomic transaction succeeds.
@@ -954,11 +955,13 @@ impl BlockExecution {
             Operation::TransferExact { recipient, .. } => Some(*recipient),
             _ => None,
         };
-        let reserved_accounts = self
-            .reward_accounts
-            .iter()
-            .filter(|key| self.state.account(key, None).is_none() && creates.as_ref() != Some(*key))
-            .count() as u64;
+        let reward_expected =
+            self.subsidy_expected || !self.miner_fees.is_zero() || !quote.miner_fee.is_zero();
+        let reserved_accounts = u64::from(
+            reward_expected
+                && self.state.account(&self.miner, None).is_none()
+                && creates != Some(self.miner),
+        );
         let used = self
             .used_weight
             .checked_add(quote.weight)
@@ -977,11 +980,14 @@ pub(crate) fn prepare_block(
     c: &Config,
     parent: &State,
     miner: &PublicKey,
+    block_work: &Amount,
 ) -> Result<BlockExecution> {
     c.validate_fee_percent(&parent.settings)?;
     c.validate_governance_settings(&parent.settings)?;
     ensure!(crypto::valid_key(miner), "invalid miner key");
-    let reward_accounts = vec![*miner];
+    let subsidy = math::issuance(block_work, &c.work_per_atom()?)?;
+    c.check_amount(&subsidy)?;
+    let subsidy_expected = !subsidy.is_zero();
     let mut s = parent.clone();
     s.height = parent
         .height
@@ -1020,10 +1026,7 @@ pub(crate) fn prepare_block(
     let weight_limit = parent.settings.block_bytes;
     ensure!(
         used_weight
-            + reward_accounts
-                .iter()
-                .filter(|key| s.account(key, None).is_none())
-                .count() as u64
+            + u64::from(subsidy_expected && s.account(miner, None).is_none())
                 * fees::ACCOUNT_WEIGHT
             <= weight_limit,
         "protocol account creation exceeds weighted capacity"
@@ -1037,7 +1040,7 @@ pub(crate) fn prepare_block(
         used_weight,
         weight_limit,
         miner: *miner,
-        reward_accounts,
+        subsidy_expected,
     })
 }
 
@@ -1046,10 +1049,10 @@ pub(crate) fn finish_block(
     parent: &State,
     parent_hash: &Hash,
     miner: &PublicKey,
-    subsidy: &Amount,
+    block_work: &Amount,
     execution: BlockExecution,
 ) -> Result<State> {
-    Ok(finish_block_with_fills(c, parent, parent_hash, miner, subsidy, execution)?.0)
+    Ok(finish_block_with_fills(c, parent, parent_hash, miner, block_work, execution)?.0)
 }
 
 fn finish_block_with_fills(
@@ -1057,7 +1060,7 @@ fn finish_block_with_fills(
     parent: &State,
     parent_hash: &Hash,
     miner: &PublicKey,
-    subsidy: &Amount,
+    block_work: &Amount,
     execution: BlockExecution,
 ) -> Result<(State, Vec<TradeFill>)> {
     ensure!(crypto::valid_key(miner), "invalid miner key");
@@ -1070,22 +1073,16 @@ fn finish_block_with_fills(
         mut used_weight,
         weight_limit,
         miner: prepared_miner,
-        reward_accounts: _,
+        subsidy_expected: _,
     } = execution;
     ensure!(
         *miner == prepared_miner,
         "block payout changed during execution"
     );
     let fills = settle_trades(c, &opening, &mut s, &trades)?;
-    c.check_amount(subsidy)?;
-    let accounts_before = s.world.accounts.len();
-    credit(&mut s, miner, subsidy, c)?;
-    used_weight += (s.world.accounts.len() - accounts_before) as u64 * fees::ACCOUNT_WEIGHT;
-    ensure!(
-        used_weight <= weight_limit,
-        "block exceeds weighted capacity"
-    );
-    s.issued += subsidy;
+    let subsidy = math::issuance(block_work, &c.work_per_atom()?)?;
+    c.check_amount(&subsidy)?;
+    s.issued += &subsidy;
     if !miner_fees.is_zero() {
         each_world(&mut s, |w, _| {
             ensure!(
@@ -1095,9 +1092,17 @@ fn finish_block_with_fills(
             w.revenue -= &miner_fees;
             Ok(())
         })?;
-        // The subsidy credit already created the miner, so this cannot charge again.
-        credit(&mut s, miner, &miner_fees, c)?;
     }
+    let reward = subsidy + miner_fees;
+    if !reward.is_zero() {
+        let accounts_before = s.world.accounts.len();
+        credit(&mut s, miner, &reward, c)?;
+        used_weight += (s.world.accounts.len() - accounts_before) as u64 * fees::ACCOUNT_WEIGHT;
+    }
+    ensure!(
+        used_weight <= weight_limit,
+        "block exceeds weighted capacity"
+    );
     each_world(&mut s, |w, _| replenish_reserve(c, w))?;
     auction(c, &mut s, parent_hash)?;
     if let Phase::Rest(r) = &s.phase
@@ -1406,6 +1411,10 @@ mod reserve_model_tests {
         panic!("grant decision did not start");
     }
     #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
     fn immediate_deposit_sets_flat_price_and_keeps_other_hashes_spendable() {
         let c = config();
         let s = funded_curve(&c);
@@ -1419,6 +1428,10 @@ mod reserve_model_tests {
         );
     }
     #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
     fn genesis_stash_redeems_completely_and_reopens_without_balance_conversion() {
         let mut c = config();
         c.initial.max_price_change_bps = 10_000;
@@ -1480,6 +1493,10 @@ mod reserve_model_tests {
         assert_eq!(s.world.curve_mass, s.world.reserve);
     }
     #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
     fn initial_rest_defers_governance_but_not_trading_and_opens_round_zero() {
         let mut c = config();
         c.initial.rest = 2 * c.initial.interval + 1;
@@ -1537,6 +1554,10 @@ mod reserve_model_tests {
         assert_eq!(s.alternative.as_ref().unwrap().grant_escrow, 10u32.into());
     }
     #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
     fn revenue_waits_at_flat_then_restores_backing_without_changing_price_or_supply() {
         let c = config();
         let s = funded_curve(&c);
@@ -1560,6 +1581,10 @@ mod reserve_model_tests {
         assert_eq!(w.shares, original.shares);
     }
     #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
     fn grant_is_fully_reserved_before_first_price_observation() {
         let c = config();
         let s = decision(&c);
@@ -1573,6 +1598,10 @@ mod reserve_model_tests {
         s.audit(&c).unwrap();
     }
     #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
     fn grant_can_never_exhaust_reserve_and_rejection_is_nonmutating() {
         let c = config();
         let s = funded_curve(&c);
@@ -1587,6 +1616,10 @@ mod reserve_model_tests {
         w.validate(&c, &s.issued, &s.auction_escrow).unwrap();
     }
     #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
     fn pass_and_fail_discard_only_the_other_world_and_settle_reserved_grant_once() {
         let c = config();
         let start = decision(&c);
@@ -1693,6 +1726,10 @@ mod reserve_model_tests {
         s
     }
     #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
     fn repeated_funded_grants_reuse_returned_funds_and_replay() {
         let c = short_grant_rounds();
         let mut settled = funded_curve(&c);
@@ -1710,6 +1747,10 @@ mod reserve_model_tests {
         replayed_step(&c, &settled, &[]).audit(&c).unwrap();
     }
     #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
     fn grants_keep_real_backing_and_escrow_invariants() {
         let c = short_grant_rounds();
         let s = funded_curve(&c);

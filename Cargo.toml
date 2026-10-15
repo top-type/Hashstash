@@ -1,10 +1,15 @@
 [package]
 name = "hashstash"
-version = "0.40.0"
+version = "0.41.0"
 edition = "2024"
 default-run = "hashstash"
 description = "Hashstash account-based SHA256d blockchain node"
 license = "MIT"
+
+[features]
+# Explicitly isolated funding for fast local integration fixtures. Normal builds
+# reject configurations that request it; the flag is part of the chain identity.
+test-fixtures = []
 
 [dependencies]
 anyhow = "1"
@@ -31,3 +36,181 @@ tempfile = "3"
 [profile.release]
 overflow-checks = true
 
+
+# Funded end-to-end fixtures need the explicitly marked simulation build.
+
+[[test]]
+name = "address_rpc"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "audit_findings"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "automatic_outcomes"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "batch_consensus"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "browser_wallet_vectors"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "cold_wallet"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "compact_chain"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "exact_fees"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "exact_wallet"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "explorer"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "explorer_address_only"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "explorer_chat_rpc"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "explorer_mail"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "faucet_integration"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "funding"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "governance_arithmetic"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "governance_parameters"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "governed_total_fees"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "half_reserve_grant"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "late_block_rejection"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "mining_adversarial"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "multi_grants"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "network_hostile"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "node_transport"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "node_ui"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "open_genesis"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "open_governance_transport"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "peer_discovery"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "peer_transport_authenticated"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "public_web"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "reorg_stress"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "revenue_buffer"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "selection_budget"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "snapshot_history"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "stratum_shares"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "timestamp_daa"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "transaction_anchors"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "transaction_data"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "transaction_data_node"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "transaction_data_wallet"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "wallet_formats"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "wallet_manager"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "watch_wallet"
+required-features = ["test-fixtures"]
+
+[[example]]
+name = "explorer_fixture"
+required-features = ["test-fixtures"]

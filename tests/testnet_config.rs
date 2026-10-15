@@ -2,11 +2,12 @@ use hashstash::{codec, config::Config, state::State, types::Parameter};
 
 #[test]
 fn checked_in_presets_are_exact_current_configs() {
-    for (name, expected) in [
+    for (name, mut expected) in [
         ("devnet", Config::devnet()),
         ("testnet", Config::testnet()),
         ("slow-testnet", Config::slow_testnet()),
     ] {
+        expected.test_work = false;
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("config")
             .join(format!("{name}.json"));
@@ -25,29 +26,30 @@ fn checked_in_presets_are_exact_current_configs() {
 #[test]
 fn preset_chain_ids_match_independent_encoding() {
     // Independently packed: length-prefixed network name, variable-width
-    // little-endian integers in Config field order, magnitude byte vectors for
+    // a false fixture flag, little-endian integers in Config field order, magnitude byte vectors for
     // amounts, then Settings in declaration order: block_bytes, fee rate,
     // interval, lead, rest, decision_blocks, max_price_change_bps, and the
     // presence-prefixed miner percentage and PASS margin. These vectors were
     // packed with a separate Python integer/byte encoder, not Rust serialization.
     // Expected IDs use SHA256(SHA256(tag) || SHA256(tag) || encoded_config).
-    for (c, encoded, expected) in [
+    for (mut c, encoded, expected) in [
         (
             Config::devnet(),
-            "106861736873746173682d6465766e6574fc800e8069fcffff7f20fcffff7f20fb84030b78fb0010fcfffffffffb0002fb0002fb00200d00000040eaed7446d09c2c9f0c08000064a7b3b6e00dfb8007fb0040010f3cfbc00320fbe80301320100",
-            "346c56f05e5c6be263d1bc62f0962c98bf91d344d919276ebafb26ffbb94a7b3",
+            "106861736873746173682d6465766e657400fc800e8069fcffff7f20fcffff7f20fb84030b78fb0010fcfffffffffb0002fb0002fb00200d00000040eaed7446d09c2c9f0c0101fb8007fb0040010f3cfbc00320fbe80301320100",
+            "197183553428c9fd81631ac214b50cb63fdee0331dcddc3108b4096baeb288db",
         ),
         (
             Config::testnet(),
-            "116861736873746173682d746573746e6574fc800e8069fcffff7f20fcffff7f20fb84030b78fb0010fcfffffffffb0002fb0002fb00200d00000040eaed7446d09c2c9f0c08000064a7b3b6e00dfbe001fb0040010f3cfbe00110fbe80301320100",
-            "9a6078be48527f3b77bd119c7ee5bd1e67d37dcbf5358f2af248f968c7ce0498",
+            "116861736873746173682d746573746e657400fc800e8069fcffff7f20fcffff7f20fb84030b78fb0010fcfffffffffb0002fb0002fb00200d00000040eaed7446d09c2c9f0c0101fbe001fb0040010f3cfbe00110fbe80301320100",
+            "48a1af4cfe99364f96ba5967a02da383de85e3aa888bcd6ef3b25c1243a1b5c7",
         ),
         (
             Config::slow_testnet(),
-            "166861736873746173682d736c6f772d746573746e6574fc800e8069fcffff7f20fcffff7f20fb84030b78fb0010fcfffffffffb0002fb0002fb00200d00000040eaed7446d09c2c9f0c08000064a7b3b6e00dfb100efb0040010ffb2c01fb302af0fbe80301320100",
-            "c92cfeea6d5eb179c053e347ef913f438efb2eadbd5211a9fe3e8b88dd1e12aa",
+            "166861736873746173682d736c6f772d746573746e657400fc800e8069fcffff7f20fcffff7f20fb84030b78fb0010fcfffffffffb0002fb0002fb00200d00000040eaed7446d09c2c9f0c0101fb100efb0040010ffb2c01fb302af0fbe80301320100",
+            "83021890fef7119376e555a018854b30a41282721fe545174156a24f0a6fd782",
         ),
     ] {
+        c.test_work = false;
         c.validate().unwrap();
         assert_eq!(c.consensus_bytes(), hex::decode(encoded).unwrap());
         assert_eq!(hex::encode(c.chain_id()), expected);

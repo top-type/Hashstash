@@ -263,10 +263,12 @@ def run(executable):
               "status": "running", "method": "independent Python standard-library Stratum V1 client",
               "executable_version": cli(executable, "--version"),
               "executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
-              "scope": "isolated ephemeral localhost network; no physical ASIC or external rental tested"}
+              "test_work": True, "issuance_mode": "accelerated test fixture", "expected_hashes_per_atom": "1", "production_issuance_tested": False,
+              "scope": "accelerated test fixture; isolated localhost only; no physical ASIC or external rental tested"}
     with tempfile.TemporaryDirectory(prefix="hashstash-stratum-wire-") as directory:
         temporary = Path(directory)
         config = json.loads((ROOT / "config" / "devnet.json").read_text(encoding="utf-8"))
+        config["test_work"] = True
         config["network"] = "stratum-wire-" + uuid.uuid4().hex
         config["genesis_time"] = int(time.time()) - 1
         config["initial_bits"] = config["limit_bits"] = 0x1F0FFFFF
@@ -353,7 +355,7 @@ def run(executable):
                 block_one_work = solve(candidate(harder, extra1, bytes.fromhex("10111213"), harder_time, 0x2000), lambda value: value <= block_target)
                 success(worker.submit(harder, block_one_work), "accept independently mined first block")
                 block_one, status_one, work_one = verify_block(rpc_port, 1, harder, block_one_work, extra1)
-                check(status_one["issued"] == str(work_one), "first subsidy equals exact expected hashes")
+                check(status_one["issued"] == str(work_one), "fixture quantum-one subsidy equals exact expected hashes")
                 check(rpc(rpc_port, "account", {"key": MINER})["account"]["ordinary"] == str(work_one), "full subsidy paid to configured miner")
                 check(block_one["transactions"] == [], "first block has no user transactions")
                 second = worker.job(lambda job: previous_hash(job) == block_one_work["digest"])
@@ -390,7 +392,7 @@ def run(executable):
                 encoded_tx = transaction_bytes(tx)
                 mandatory_fee = (len(encoded_tx) + 1024 + 1023) // 1024
                 check(int(tx["body"]["fee"]) == mandatory_fee + 3, "independent encoded bytes plus creation weight sets exact fee")
-                check(status_two["issued"] == str(work_one + work_two), "only expected-work subsidies issue HASH")
+                check(status_two["issued"] == str(work_one + work_two), "fixture issuance follows its explicit quantum-one rule")
                 percent = config["initial"]["miner_fee_percent"]
                 miner_fee = (mandatory_fee + 3) * percent // 100
                 revenue_fee = mandatory_fee + 3 - miner_fee
@@ -427,7 +429,7 @@ def run(executable):
                 report["checks"] = ["subscribe_authorize", "BIP310_version_rolling", "difficulty_before_notify", "4_plus_4_extranonce",
                     "Bitcoin_coinbase_HST!_empty_branch", "independent_80_byte_header_SHA256d", "non_block_reporting_shares",
                     "low_difficulty_rejected", "malformed_submit_rejected", "unknown_job_rejected", "duplicate_rejected",
-                    "exact_expected_work_subsidy", "configured_payout", "timestamp_past_future_rejected", "bounded_nTime_rolling", "extranonce_and_version_rolling",
+                    "explicit_fixture_expected_work_subsidy", "configured_payout", "timestamp_past_future_rejected", "bounded_nTime_rolling", "extranonce_and_version_rolling",
                     "clean_work_switch", "old_parent_nonblock_rejected", "old_parent_block_rejected_without_issuance",
                     "no_stale_reward_controls", "signed_arbitrary_data_transfer",
                     "independent_HST!_commitment", "governed_total_fee_payout", "database_restart_persistence"]
@@ -447,7 +449,7 @@ def run(executable):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--executable", type=Path, default=ROOT / "target" / "release" / ("hashstash.exe" if os.name == "nt" else "hashstash"))
+    parser.add_argument("--executable", type=Path, default=ROOT / "target" / "fixtures" / "release" / ("hashstash.exe" if os.name == "nt" else "hashstash"))
     parser.add_argument("--report", type=Path, default=ROOT / "work" / "stratum-wire-check.json")
     options = parser.parse_args()
     report = run(options.executable.resolve())

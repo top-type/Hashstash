@@ -41,6 +41,39 @@ class CampaignPlanTests(unittest.TestCase):
                                                                    started=1500, started_height=100, blocks=60, leading_blocks=0)}
         self.snapshot['governance']['pass'] = dict(self.snapshot['governance']['world'], reserve='4500000', grant_escrow='4500100')
 
+    def test_one_hash_controller_funding_seeds_peers_and_keeps_fee_cash(self):
+        self.policy.update(profile=p.PASS_PROFILE, region="fra", last_chat_at=self.now)
+        self.phase("rest")
+        self.snapshot["campaign"] = dict(checked=True, completed=False, settlement_pending=False)
+        self.accounts[0]["account"].update(ordinary="1000", shares="0")
+        self.accounts[1]["account"] = self.accounts[2]["account"] = None
+        for index in (1, 2):
+            before = int(self.accounts[0]["account"]["ordinary"])
+            action = self.choose()
+            self.assertEqual(action["kind"], "seed")
+            self.assertEqual(action["recipient"], self.accounts[index]["public_key"])
+            fee, amount = int(action["quoted_fee_raw"]), int(action["amount_raw"])
+            self.assertEqual(amount, (before - 4) * 30 // 100)
+            self.assertGreater(amount, fee * 100)
+            self.accounts[0]["account"]["ordinary"] = str(before - amount - fee)
+            self.accounts[0]["account"]["nonce"] += 1
+            self.accounts[index]["account"] = dict(ordinary=str(amount), shares="0", nonce=0)
+            self.policy["history"].append(dict(action, height=self.snapshot["status"]["height"]))
+        self.assertGreater(int(self.accounts[0]["account"]["ordinary"]), 400)
+        self.assertEqual(sum(int(a["account"]["ordinary"]) for a in self.accounts), 996)
+
+    def test_coarse_one_hash_regions_can_prepare_at_one_atom_existing_account_fee(self):
+        self.ready()
+        balances = ((245, 244), (149, 148), (104, 103))
+        self.snapshot["balances"] = {
+            key: {"account": {"ordinary": str(cash), "shares": str(shares)}}
+            for group in REGISTRY.values() for key, (cash, shares) in zip(group, balances)}
+        self.snapshot["governance"]["world"].update(reserve="1485", curve_mass="1485", shares="1485",
+                                                        revenue="21", grant_capacity="1505")
+        self.assertTrue(p.campaign_ready(self.snapshot, REGISTRY, 1))
+        # A higher quoted fee still has to satisfy real readiness; no allowance is invented.
+        self.assertFalse(p.campaign_ready(self.snapshot, REGISTRY, 2))
+
     def test_single_coordinator_proposes_half_reserve_empty_data(self):
         self.ready()
         a = self.choose()

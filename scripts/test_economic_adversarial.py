@@ -165,7 +165,7 @@ def main():
         audit.assert_supply()
         after = reorganized
     check('A reorganization removes a pending transaction whose signed anchor is orphaned; rebroadcast cannot revive it before its lifetime ends')
-    args.report.write_text(json.dumps({'passed': True, 'checks': checks, 'checks_passed': len(checks), 'duplicate_submissions': 48, 'invalid_peer_submissions': len(bad_cases) * 3, 'height': after[0]['status']['height'], 'state_root': after[0]['status']['state_root'], 'tip': after[0]['status']['tip'], 'node_sha256': hashlib.sha256(Path(manifest['executable']).read_bytes()).hexdigest(), 'elapsed_seconds': round(time.monotonic() - started, 3)}, indent=2) + '\n', encoding='utf-8')
+    args.report.write_text(json.dumps({**audit.fixture_mode, 'passed': True, 'checks': checks, 'checks_passed': len(checks), 'duplicate_submissions': 48, 'invalid_peer_submissions': len(bad_cases) * 3, 'height': after[0]['status']['height'], 'state_root': after[0]['status']['state_root'], 'tip': after[0]['status']['tip'], 'node_sha256': hashlib.sha256(Path(manifest['executable']).read_bytes()).hexdigest(), 'elapsed_seconds': round(time.monotonic() - started, 3)}, indent=2) + '\n', encoding='utf-8')
     print('Saved ' + str(args.report), flush=True)
 if __name__ == '__main__':
     main()

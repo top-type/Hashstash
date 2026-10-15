@@ -51,7 +51,7 @@ fn sign(c: &Config, s: &State, operation: Operation) -> Transaction {
 
 #[test]
 fn current_genesis_files_match_the_canonical_work_presets() {
-    for (name, expected) in [
+    for (name, mut expected) in [
         ("devnet", Config::devnet()),
         ("testnet", Config::testnet()),
         ("slow-testnet", Config::slow_testnet()),
@@ -59,6 +59,7 @@ fn current_genesis_files_match_the_canonical_work_presets() {
         let bytes = std::fs::read(format!("config/{name}.json")).unwrap();
         let actual: Config = serde_json::from_slice(&bytes).unwrap();
         actual.validate().unwrap();
+        expected.test_work = false;
         assert_eq!(actual, expected);
     }
 }

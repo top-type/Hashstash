@@ -175,6 +175,7 @@ fn main() -> Result<()> {
     )?;
     let info: Value = json!({
         "isolated":true,"public_experiment_contacted":false,
+        "test_work":true,"production_issuance_tested":false,"expected_hashes_per_atom":"1",
         "chain_id":hex::encode(config.chain_id()), "height":node.status()?["height"],
         "owner_key":hex::encode(owner),"owner":address::encode(&owner,&config.chain_id())?,
         "recipient":address::encode(&recipient,&config.chain_id())?,

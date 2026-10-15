@@ -37,7 +37,7 @@ function harness() {
     explorer_block: { ...ctx, block, transactions: [tx], next_tx_offset: null },
     explorer_transaction: { ...ctx, transaction: tx },
     explorer_transactions: { ...ctx, transactions: [tx], pending: [], next_cursor: '12:0' },
-    explorer_account: { ...ctx, address, public_key: publicKey, account: { ordinary: '1000', shares: '2000000000000000000', nonce: 1 }, stash_value_hash: { numerator: '3000', denominator: '1' }, stash_withdrawal_hash: '2000', history: [{ height: 12, block_hash: blockHash, kind: 'mining_reward', amount: '1000000000000', asset: 'hash' }], pending: [], next_cursor: null },
+    explorer_account: { ...ctx, address, public_key: publicKey, account: { ordinary: '1000', shares: '2', nonce: 1 }, stash_value_hash: { numerator: '3000', denominator: '1' }, stash_withdrawal_hash: '2000', history: [{ height: 12, block_hash: blockHash, kind: 'mining_reward', amount: '1000000000000', asset: 'hash' }], pending: [], next_cursor: null },
     explorer_governance: { ...ctx, phase: 'rest', proposals: [{ id: proposal, round: 0, description: 'f'.repeat(64), action: { Grant: { payments: [{recipient:Array(32).fill(18),amount:'1000'}] } }, support: '100', created_height: 5 }], decisions: [{ id: 'f'.repeat(64), proposal, started: 105, started_height: 7, ended_height: 10, outcome: 'pass', blocks:3, observed_blocks:3, leading_blocks:2, blocks_remaining:0, pass_margin_bps: 0 }], contributions: [{ txid, height: 5, sender: address, amount: '100' }], next_cursor: null, next_before_height: null },
   };
   const api = create({ document, location, amountText: (n, value) => { n.textContent = value; }, rpc: async (method, params) => { calls.push({ method, params }); const value = replies[method]; if (typeof value === 'function') return value(params); if (value instanceof Error) throw value; return value; } });
@@ -59,15 +59,15 @@ async function run() {
   await h.navigate('#explorer?block=12');
   assert.match(h.content.textContent, /Confirmed/); checks++;
   assert.match(h.content.textContent, /Rewards and fees/); checks++;
-  assert.match(h.content.textContent, /Above minimum0\.000000000000000006 hash/); checks++;
-  assert.ok(walk(h.content).some(n => n.textContent === '0.000001 hash' && n.title === '0.000001000000000006 hash'), 'rounded reward retains every paid hash in its tooltip'); checks++;
+  assert.match(h.content.textContent, /Above minimum0\.006 hash/); checks++;
+  assert.ok(walk(h.content).some(n => n.textContent === '1000000000 hash' && n.title === '1000000000.006 hash'), 'rounded reward retains every paid hash in its tooltip'); checks++;
   for (const percent of [0, 50, 100]) {
     const miner = 9n * BigInt(percent) / 100n, revenue = 9n - miner;
     h.replies.explorer_block = { ...ctx, block: { ...block, rewards: { ...block.rewards, miner_fees: String(miner), revenue_fees: String(revenue), miner_total: String(1000000000000n + miner) } }, transactions: [tx] };
     await h.navigate('#explorer?block=12');
     assert.ok(h.content.textContent.includes('Miner fee allocation' + HashstashAmounts.formatExactHash(String(miner)))); checks++;
     assert.ok(h.content.textContent.includes('Revenue fee allocation' + HashstashAmounts.formatExactHash(String(revenue)))); checks++;
-    assert.match(h.content.textContent, /Above minimum0\.000000000000000006 hashMinimum fees0\.000000000000000003 hash/); checks++;
+    assert.match(h.content.textContent, /Above minimum0\.006 hashMinimum fees0\.003 hash/); checks++;
     assert.equal(h.content.textContent.includes('Miner priority'), false); checks++;
   }
   h.replies.explorer_block = { ...ctx, block: { ...block, status: 'orphaned' }, transactions: [{ ...tx, status: 'orphaned' }] };
@@ -93,7 +93,7 @@ async function run() {
   }
   h.replies.explorer_transaction = { ...ctx, transaction: { ...tx, status: 'orphaned', confirmations: 0 } };
   await h.navigate('#explorer?tx=' + txid);
-  assert.match(h.content.textContent, /Recorded fee0\.000000000000000009 hash/); checks++;
+  assert.match(h.content.textContent, /Recorded fee0\.009 hash/); checks++;
   assert.equal(h.content.textContent.includes('Fee paid'), false); checks++;
 
   for (const kind of ['deposit','redeem']) for (const fill of ['full','partial','unfilled']) {
@@ -120,17 +120,17 @@ async function run() {
   assert.equal(h.content.textContent.includes('Pending transactions'), false); checks++;
 
   await h.navigate('#explorer?account=' + address);
-  assert.match(h.content.textContent, /0\.000000000000000002 stash/); checks++;
+  assert.match(h.content.textContent, /0\.002 stash/); checks++;
   assert.match(h.content.textContent, /Mining reward/); checks++;
-  assert.match(h.content.textContent, /Estimated stash value0\.000000000000003 hash/); checks++;
-  h.replies.explorer_account.pass_account = { ordinary: '2000', shares: '2000000000000000000', nonce: 1 };
-  h.replies.explorer_account.account={ordinary:'7000',shares:'1000000000000000000',nonce:2};
-  h.replies.explorer_account.pass_account={ordinary:'2000',shares:'2000000000000000000',nonce:2};
+  assert.match(h.content.textContent, /Estimated stash value3 hash/); checks++;
+  h.replies.explorer_account.pass_account = { ordinary: '2000', shares: '2', nonce: 1 };
+  h.replies.explorer_account.account={ordinary:'7000',shares:'1000',nonce:2};
+  h.replies.explorer_account.pass_account={ordinary:'2000',shares:'2000',nonce:2};
   h.replies.explorer_account.payment_available_hash='2000';
   await h.navigate('#explorer?account=' + address);
-  assert.match(h.content.textContent,/Available for payments0\.000000000000002 hash/,'payments show common spendable cash, not the larger FAIL balance or a sum');checks++;
-  assert.match(h.content.textContent,/PASShashes0\.000000000000002 hash/);checks++;
-  assert.match(h.content.textContent,/FAILhashes0\.000000000000007 hash/);checks++;
+  assert.match(h.content.textContent,/Available for payments2 hash/,'payments show common spendable cash, not the larger FAIL balance or a sum');checks++;
+  assert.match(h.content.textContent,/PASShashes2 hash/);checks++;
+  assert.match(h.content.textContent,/FAILhashes7 hash/);checks++;
   assert.doesNotMatch(h.content.textContent,/Conditional hashes/,'automatic outcomes use each world’s ordinary cash');checks++;
   await h.navigate('#explorer?governance=' + proposal);
   assert.match(h.content.textContent, /Description commitment/); checks++;
@@ -190,18 +190,18 @@ async function run() {
   assert.equal(links(h).some(n => n.href.includes('account=null')), false); checks++;
   h.replies.explorer_transaction = { ...ctx, transaction: { ...tx, amount: '1234567891234567891', fee: '1000000000000000002', minimum_fee: '1000000000000000001',extra_fee:'1' } };
   await h.navigate('#explorer?tx=' + txid);
-  assert.ok(walk(h.content).some(n => n.textContent === '1.23457 hash' && n.title === '1.234567891234567891 hash'), 'transaction amount has an exact hash tooltip'); checks++;
-  assert.ok(walk(h.content).some(n => n.textContent === '0.000000000000000001 hash'), 'one-atom extra never displays as zero'); checks++;
-  assert.ok(walk(h.content).some(n => n.title === '1.000000000000000001 hash'), 'minimum-fee tooltip retains its last atom'); checks++;
+  assert.ok(walk(h.content).some(n => n.textContent === '1234570000000000 hash' && n.title === '1234567891234567.891 hash'), 'transaction amount has an exact hash tooltip'); checks++;
+  assert.ok(walk(h.content).some(n => n.textContent === '0.001 hash'), 'one-atom extra never displays as zero'); checks++;
+  assert.ok(walk(h.content).some(n => n.title === '1000000000000000.001 hash'), 'minimum-fee tooltip retains its last atom'); checks++;
   const operation = walk(h.content).find(n => n.tagName === 'pre');
   assert.equal(operation.textContent,JSON.stringify(tx.operation,null,2),'raw protocol details retain integer hash values'); checks++;
-  h.replies.explorer_account = { ...ctx, address, account: { ordinary: '1', shares: '2000000000000000000', nonce: 1 }, stash_value_hash: { numerator: '1', denominator: '3' }, stash_withdrawal_hash: '1', history: [], pending: [] };
+  h.replies.explorer_account = { ...ctx, address, account: { ordinary: '1', shares: '2', nonce: 1 }, stash_value_hash: { numerator: '1', denominator: '3' }, stash_withdrawal_hash: '1', history: [], pending: [] };
   await h.navigate('#explorer?account=' + address);
-  assert.ok(walk(h.content).some(n => n.textContent === '0.000000000000000000333333 hash' && n.title === '1 / 3000000000000000000 hash'), 'nonterminating price ratio has an exact rational hash tooltip'); checks++;
-  assert.ok(walk(h.content).some(n => n.textContent === '0.000000000000000002 stash' && n.title === '0.000000000000000002 stash'), 'share atoms convert exactly to stash'); checks++;
-  h.replies.explorer_account.account.shares = '1000000000000000000000000000000000001';
+  assert.ok(walk(h.content).some(n => n.textContent === '0.000333333 hash' && n.title === '1 / 3000 hash'), 'nonterminating price ratio has an exact rational hash tooltip'); checks++;
+  assert.ok(walk(h.content).some(n => n.textContent === '0.002 stash' && n.title === '0.002 stash'), 'share atoms convert exactly to stash'); checks++;
+  h.replies.explorer_account.account.shares = '1000000001';
   await h.navigate('#explorer?account=' + address);
-  assert.ok(walk(h.content).some(n => n.textContent === '1 stash' && n.title === '1.000000000000000000000000000000000001 stash'), 'large ownership has a compact display and an exact atom-preserving tooltip'); checks++;
+  assert.ok(walk(h.content).some(n => n.textContent === '1000000 stash' && n.title === '1000000.001 stash'), 'large ownership has a compact display and an exact atom-preserving tooltip'); checks++;
   assert.ok(!h.content.textContent.includes('× 10'), 'ordinary Stash balances do not use scientific notation'); checks++;
   h.replies.explorer_block = { ...ctx, block: { ...block }, transactions: [] };
   await h.navigate('#explorer?block=12');

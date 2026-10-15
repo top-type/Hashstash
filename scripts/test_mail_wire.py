@@ -42,7 +42,7 @@ def run(args):
     vector = json.loads((REPO / "tests/fixtures/mail-v2.json").read_text(encoding="utf-8"))
     report = {"test": "isolated-mail-wire", "passed": False,
               "source_binary_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
-              "private_keys": "published test fixture scalars only", "checks": []}
+              "private_keys": "published test fixture scalars only", "test_work": True, "issuance_mode": "accelerated test fixture", "expected_hashes_per_atom": "1", "production_issuance_tested": False, "checks": []}
     process = None
 
     def check(condition, label):
@@ -70,6 +70,7 @@ def run(args):
         config = fixture / "network.json"
         cli("init", "--config", config, "--preset", "dev")
         configuration = json.loads(config.read_text(encoding="utf-8"))
+        configuration["test_work"] = True
         configuration["network"] = "mail-wire-" + uuid.uuid4().hex
         save(config, configuration)
         sender, recipient = vector["identity"]["sender"], vector["identity"]["recipient"]

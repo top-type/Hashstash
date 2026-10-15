@@ -18,8 +18,8 @@ from test_wallet_cli import REPO, transfer_operation, digest, request, rpc
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--node', type=Path, default=REPO / 'target/release' / ('hashstash.exe' if os.name == 'nt' else 'hashstash'))
-    parser.add_argument('--cold', type=Path, default=REPO / 'target/release' / ('hashstash-cold.exe' if os.name == 'nt' else 'hashstash-cold'))
+    parser.add_argument('--node', type=Path, default=REPO / 'target/fixtures/release' / ('hashstash.exe' if os.name == 'nt' else 'hashstash'))
+    parser.add_argument('--cold', type=Path, default=REPO / 'target/fixtures/release' / ('hashstash-cold.exe' if os.name == 'nt' else 'hashstash-cold'))
     parser.add_argument('--report', type=Path, default=REPO / 'work/wallet-manager-report.json')
     parser.add_argument('--directory', type=Path, default=REPO / 'work')
     args = parser.parse_args()
@@ -32,7 +32,7 @@ def main():
     primary, offline = vectors[:2]
     checks, processes, files = ([], [], [])
     started = time.monotonic()
-    report = {'suite': 'runtime wallet manager', 'artifact_directory': str(directory), 'node_sha256': digest(args.node), 'cold_sha256': digest(args.cold), 'checks': checks}
+    report = {'suite': 'runtime wallet manager', 'artifact_directory': str(directory), 'node_sha256': digest(args.node), 'cold_sha256': digest(args.cold), 'test_work': True, 'issuance_mode': 'accelerated test fixture', 'expected_hashes_per_atom': '1', 'production_issuance_tested': False, 'checks': checks}
 
     def check(message):
         checks.append(message)
@@ -72,6 +72,7 @@ def main():
         cli('init', '--config', configuration_path)
         configuration = json.loads(configuration_path.read_text(encoding='utf-8'))
         fee_fields = {'extra_fee': '0'}
+        configuration["test_work"] = True
         configuration['network'] = 'wallet-manager-' + uuid.uuid4().hex
         configuration['genesis_time'] = int(time.time()) - 10000
         configuration_path.write_text(json.dumps(configuration), encoding='utf-8')

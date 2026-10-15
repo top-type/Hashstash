@@ -6,12 +6,12 @@ async function run() {
   let checks = 0;
   const h = await harness({ empty: true }), s = h.currentSnapshot;
   const proposal = 'ab'.repeat(32), other = 'cd'.repeat(32), key = '12'.repeat(32);
-  s.config.quote_scale = '1000000000000000000000000000000000000';
+  s.config.quote_scale = '1000000';
   Object.assign(s.status.settings, { pass_margin_bps: 0, });
   const decision = { id: 'ef'.repeat(32), proposal_id: proposal, round: 0, started: 240, blocks:16, started_height:16, leading_blocks:3, proposal: { Grant: { payments: [{recipient:key,amount:'10'}] } } };
   s.governance.phase = { Governance: decision };
-  Object.assign(s.governance.world, { reserve: '1000000000000000000', shares: '1000000000000000000000000000000000000', curve_mass: '5000000000000000000' });
-  s.governance.pass = { ...s.governance.world, reserve: '2000000000000000000', curve_mass: '10000000000000000000', grant_escrow: '10' };
+  Object.assign(s.governance.world, { reserve: '1000', shares: '1000', curve_mass: '5000' });
+  s.governance.pass = { ...s.governance.world, reserve: '2000', curve_mass: '10000', grant_escrow: '10' };
   const record = id => ({ id, proposal: { round: 0, action: decision.proposal, description: '00'.repeat(32), support: '10', refund_height: null } });
   s.proposals = [record(proposal), record(other)];
   await h.refresh(); await h.navigate('#governance');
@@ -59,7 +59,7 @@ async function run() {
   assert.equal(h.get('fail-holdings').hidden, false); checks++;
   assert.equal(h.get('governance-trading').hidden, false); checks++;
   assert.equal(h.get('governance-actions').hidden, false); checks++;
-  assert.equal(h.get('pass-cash').textContent, '0.0000000000000001 hash'); checks++;
+  assert.equal(h.get('pass-cash').textContent, '0.1 hash'); checks++;
   assert.equal(h.get('pass-price').textContent, '10', 'account prices never overwrite the same snapshot market'); checks++;
   assert.equal(h.get('proposal-list').children.find(r => r.textContent.includes(other.slice(0,7))).children[1].children[1].disabled, false, 'watch-wallet selection enables read-only refund check'); checks++;
 
@@ -80,11 +80,11 @@ async function run() {
   assert.equal(h.get('pass-leading-blocks').textContent, '0'); checks++;
 
   // A grant changes PASS backing and shape, not its starting spot price.
-  s.governance.world.curve_mass = s.governance.world.reserve = '5000000000000000000';
-  s.governance.pass.curve_mass = '5000000000000000000';
-  s.governance.pass.reserve = '4000000000000000000';
-  s.governance.pass.revenue = '12000000000000000000';
-  s.governance.pass.grant_capacity = '15000000000000000000';
+  s.governance.world.curve_mass = s.governance.world.reserve = '5000';
+  s.governance.pass.curve_mass = '5000';
+  s.governance.pass.reserve = '4000';
+  s.governance.pass.revenue = '12000';
+  s.governance.pass.grant_capacity = '15000';
   await h.refresh();
   assert.equal(h.get('pass-price').textContent, h.get('fail-price').textContent); checks++;
   assert.equal(h.get('pass-ratio').textContent, '80%'); checks++;

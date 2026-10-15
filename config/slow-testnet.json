@@ -24,5 +24,6 @@
     "decision_blocks": 240,
     "max_price_change_bps": 1000
   },
-  "share_scale": "1000000000000000000"
+  "share_scale": "1",
+  "test_work": false
 }

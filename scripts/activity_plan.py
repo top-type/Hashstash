@@ -10,11 +10,11 @@ an intent without advancing any confirmed governance stage.
 import hashlib
 
 
-CHAT = 10**12
-SUPPORT = 10**12
-TRADE = 10**13
-GRANT = 10**13
-SEED = 10**14
+CHAT = 1
+SUPPORT = 1
+TRADE = 10
+GRANT = 10
+SEED = 100
 READ_METHODS = frozenset({"fee_quote", "stash_quote", "grant_quote", "proposals", "support"})
 NATIVE_PROFILE = "native-balance-v1"
 PASS_PROFILE = "pass-campaign-v1"
@@ -275,8 +275,8 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
     decision = status.get("decision")
     if (phase == "governance") != bool(_key(decision)):
         return None
-    max_fee = max(1, _number(policy.get("max_fee_raw"), 10**6))
-    reserve = max(max_fee * 2, _number(policy.get("fee_reserve_raw"), 10**9))
+    max_fee = max(1, _number(policy.get("max_fee_raw"), 10))
+    reserve = max(max_fee * 2, _number(policy.get("fee_reserve_raw"), 100))
     if native:
         # Use a current ordinary transfer quote to keep enough real liquidity
         # for the next operations; each candidate still obtains its exact quote.
@@ -311,7 +311,7 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
         from activity_personas import profile_for, evaluate, compose_message, next_speaker, speaker_sequence
         personas = [profile_for(region, index, profile_name) for index in range(3)]
     minimum_trade = max(max_fee * 100, CHAT) if substantive and not native else 1
-    direct_remaining = _number(policy.get("consumptive_budget_remaining_raw"), 10**15)
+    direct_remaining = _number(policy.get("consumptive_budget_remaining_raw"), 1000)
     quotes = {}
 
     def usable(index):

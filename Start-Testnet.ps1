@@ -198,6 +198,7 @@ try {
         $networkDirectory = Join-Path $resolvedDataRoot ('testnet-' + $suffix)
         New-Item -ItemType Directory -Path $networkDirectory | Out-Null
         $networkPath = Join-Path $networkDirectory 'network.json'
+        if ($configuration.test_work) { Write-Warning 'Accelerated test issuance: this fixture network is not a production network.' }
         $configuration.network = 'hashstash-local-' + $suffix
         $configuration.genesis_time = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - 1
         Save-JsonAtomic $networkPath $configuration
@@ -222,7 +223,7 @@ try {
         $manifest = [PSCustomObject]@{
             schema_version = 1; directory = $networkDirectory; config = $networkPath; executable = $Executable
             base_port = $BasePort; created_utc = [DateTime]::UtcNow.ToString('o'); chain_id = ''; nodes = $records
-            seed_wallets = [bool]$SeedWallets
+            seed_wallets = [bool]$SeedWallets; test_work = [bool]$configuration.test_work
             mining = $miningSettings
         }
         $ManifestPath = Join-Path $networkDirectory 'manifest.json'

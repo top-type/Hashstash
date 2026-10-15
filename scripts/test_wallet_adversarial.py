@@ -37,8 +37,8 @@ def main():
     parser.add_argument('--directory', type=Path, default=REPO / 'work/wallet-adversarial')
     parser.add_argument('--base-port', type=int, default=28480)
     parser.add_argument('--report', type=Path, default=REPO / 'work/wallet-adversarial-report.json')
-    parser.add_argument('--node', type=Path, default=REPO / 'target/release' / ('hashstash.exe' if os.name == 'nt' else 'hashstash'))
-    parser.add_argument('--cold', type=Path, default=REPO / 'target/release' / ('hashstash-cold.exe' if os.name == 'nt' else 'hashstash-cold'))
+    parser.add_argument('--node', type=Path, default=REPO / 'target/fixtures/release' / ('hashstash.exe' if os.name == 'nt' else 'hashstash'))
+    parser.add_argument('--cold', type=Path, default=REPO / 'target/fixtures/release' / ('hashstash-cold.exe' if os.name == 'nt' else 'hashstash-cold'))
     args = parser.parse_args()
     args.directory.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix='adversarial-', dir=args.directory)).resolve()
@@ -47,7 +47,7 @@ def main():
     primary, other = vectors[:2]
     processes, files, checks = ([], [], [])
     started = time.monotonic()
-    report = {'passed': False, 'directory': str(directory), 'checks': checks, 'node_sha256': digest(node), 'cold_sha256': digest(signer)}
+    report = {'passed': False, 'directory': str(directory), 'test_work': True, 'issuance_mode': 'accelerated test fixture', 'expected_hashes_per_atom': '1', 'production_issuance_tested': False, 'checks': checks, 'node_sha256': digest(node), 'cold_sha256': digest(signer)}
 
     def check(message):
         checks.append(message)
@@ -70,6 +70,7 @@ def main():
     try:
         configuration = json.loads((REPO / 'config/devnet.json').read_text())
 
+        configuration["test_work"] = True
         configuration.update(network='wallet-adversarial-' + uuid.uuid4().hex)
         configuration['genesis_time'] = int(time.time()) - 1
         config = directory / 'network.json'

@@ -12,7 +12,7 @@ An orphaned block or transaction was previously indexed on the canonical chain a
 
 Hashstash uses block height for transaction expiry, history ordering and decision length. Each completed block counts once in a decision. Auction lead and rest use a scheduled-seconds clock advanced by the parent’s target interval. Mining timestamps drive difficulty; they do not set governance deadlines. Explorer orders records by height and exposes header time in technical details.
 
-Monetary values use hash, the same fixed unit as the wallet: one displayed hash is 10¹⁸ raw hash atoms. Exact hash values remain available on hover, including fees and fractional price ratios. Stash quantities use stash (one displayed stash is 10³⁶ share atoms), with their marked hash value shown separately on account pages. Mining work uses EH, including small decimal values, with exact EH amounts on hover. Conditional transactions identify their PASS or FAIL context; on-chain inclusion and the eventual selection of an outcome are distinct facts.
+Monetary values use hash, the same fixed unit as the wallet: one displayed hash is 1,000 raw hash atoms. Exact hash values remain available on hover, including fees and fractional price ratios. Stash quantities use stash (one displayed stash is 1,000 share atoms), with their marked hash value shown separately on account pages. Mining work uses EH, including small decimal values, with exact EH amounts on hover. Conditional transactions identify their PASS or FAIL context; on-chain inclusion and the eventual selection of an outcome are distinct facts.
 
 Transaction data is presented as hexadecimal bytes. Valid UTF-8 can be inspected as escaped plain text and appears in the public Chat feed. Encrypted mail stays in its dedicated view. Proposal explanations are plain UTF-8 verified against the signed description commitment, with the verified text exposed as `description_text` on the proposal record. These views never execute data or give it additional consensus effects; a description hash alone cannot reveal its text.
 
@@ -87,7 +87,7 @@ Public queries use separate read-only SQLite snapshots. Each snapshot must match
 The isolated browser fixture can be generated with:
 
 ```text
-cargo run --example explorer_fixture -- <new-output-directory>
+cargo run --features test-fixtures --target-dir target/fixtures --example explorer_fixture -- <new-output-directory>
 ```
 
 It mines only its own local test chain and creates a transfer with uninterpreted data, a completed governance decision, and a prepared pending transaction. It does not contact public peers.

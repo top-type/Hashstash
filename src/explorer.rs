@@ -34,7 +34,7 @@ pub const METHODS: &[&str] = &[
     "explorer_chat",
     "explorer_mail",
 ];
-const SCHEMA: &str = "anchored-batch-fills-leading-blocks";
+const SCHEMA: &str = "petahash-atoms-anchored-batch";
 pub const MAX_PAGE: u64 = 50;
 
 pub struct Explorer {
@@ -1182,12 +1182,12 @@ fn index_block(
     let chain_id = parent.map_or_else(|| c.chain_id(), |s| s.chain_id);
     let hash = codec::block_hash(b);
     let hash_text = hex::encode(hash);
-    let subsidy = if b.height == 0 {
-        Amount::zero()
-    } else {
-        math::work(&math::target_from_bits(b.header.bits)?)
-    };
     let expected = math::work(&math::target_from_bits(b.header.bits)?);
+    let subsidy = if parent.is_some() {
+        math::issuance(&expected, &c.work_per_atom()?)?
+    } else {
+        Amount::zero()
+    };
     let difficulty = expected.to_f64().unwrap_or(f64::MAX) / 4_295_032_833f64;
     let miner = if b.height == 0 {
         None
@@ -1201,7 +1201,9 @@ fn index_block(
     let mut revenue_fees = Amount::zero();
     let mut mandatory = Amount::zero();
     let mut fee_state = parent
-        .map(|p| consensus::prepare_block(c, p, &b.miner).map(|execution| execution.state))
+        .map(|p| {
+            consensus::prepare_block(c, p, &b.miner, &expected).map(|execution| execution.state)
+        })
         .transpose()?;
     let (post, fills) = if let Some(parent) = parent {
         consensus::execute_with_fills(
@@ -1209,7 +1211,7 @@ fn index_block(
             parent,
             &b.header.previous,
             &b.miner,
-            &subsidy,
+            &expected,
             &b.transactions,
         )?
     } else {
@@ -1473,6 +1475,58 @@ fn attach_fill(value: &mut Value, fill: &consensus::TradeFill) {
 mod indexing_tests {
     use super::*;
     use crate::crypto;
+
+    // Index an already validated economic transition without claiming that this
+    // unit test found a high-difficulty proof. The real-PoW production tests
+    // exercise zero-issuance blocks through Chain separately.
+    #[test]
+    fn production_index_separates_physical_work_and_whole_atom_rewards() {
+        let mut c = Config::testnet();
+        c.test_work = false;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("production-index.sqlite");
+        let chain = Chain::open(&path, c.clone()).unwrap();
+        let mut index = Explorer::open(&path, &chain).unwrap();
+        let parent = chain.tip_state();
+        let miner = crypto::public_key(&[93; 32]).unwrap();
+        let quantum = Amount::from(crate::config::WORK_PER_ATOM);
+        let target = (Amount::from(1u32) << 256usize) / (&quantum * 3u32 + &quantum / 2u32);
+        for bits in [c.initial_bits, math::bits_from_target(&target)] {
+            let raw_work = math::work(&math::target_from_bits(bits).unwrap());
+            let atoms = &raw_work / &quantum;
+            let mut block = chain.tip_block().clone();
+            block.height = 1;
+            block.header.previous = chain.tip_hash();
+            block.header.bits = bits;
+            block.miner = miner;
+            let post =
+                consensus::execute(&c, parent, &block.header.previous, &miner, &raw_work, &[])
+                    .unwrap();
+            block.state_root = post.root();
+            block.header.merkle_root = codec::merkle_root(&block).unwrap();
+            let db = index.db.as_mut().unwrap();
+            let transaction = db.transaction().unwrap();
+            assert_eq!(
+                index_block(&transaction, &c, &block, Some(parent))
+                    .unwrap()
+                    .root(),
+                post.root()
+            );
+            let row: String = transaction
+                .query_row(
+                    "SELECT record FROM explorer_blocks WHERE hash=?1",
+                    [hex::encode(codec::block_hash(&block))],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let record: Value = serde_json::from_str(&row).unwrap();
+            assert_eq!(record["expected_hashes"], raw_work.to_str_radix(10));
+            assert_eq!(record["subsidy"], atoms.to_str_radix(10));
+            assert_eq!(record["rewards"]["miner_total"], atoms.to_str_radix(10));
+            assert_eq!(post.issued, atoms);
+            transaction.rollback().unwrap();
+        }
+    }
 
     #[test]
     fn index_records_actual_partial_fills_and_retains_signed_request() {
@@ -1855,6 +1909,10 @@ mod indexing_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
     fn one_pass_index_preserves_fees_and_rolls_back_failed_commitments() {
         let c = Config::testnet();
         let secret = [91; 32];
@@ -1899,7 +1957,8 @@ mod indexing_tests {
             .unwrap()
         };
         let transactions = vec![make(0, 7u32), make(1, 11u32)];
-        let mut expected = consensus::prepare_block(&c, &parent, &owner).unwrap();
+        let raw_work = math::work(&math::target_from_bits(chain.tip_block().header.bits).unwrap());
+        let mut expected = consensus::prepare_block(&c, &parent, &owner, &raw_work).unwrap();
         let mut quotes = Vec::new();
         for tx in &transactions {
             quotes.push(fees::quote(&c, &expected.state, tx).unwrap());
@@ -2052,6 +2111,10 @@ mod chat_tests {
         }
     }
     #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
     fn encrypted_mail_includes_public_payments_and_is_reorg_safe() {
         let c = Config::testnet();
         let secret = [91; 32];
@@ -2261,6 +2324,10 @@ mod chat_tests {
         }
     }
     #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
     fn transaction_text_indexes_pending_paginates_and_follows_reorgs() {
         // Synthetic funded state exercises derived indexing and transaction
         // execution; it never mines or contacts any running chain.

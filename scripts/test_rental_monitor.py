@@ -33,6 +33,8 @@ class RentalMonitorTests(unittest.TestCase):
             calls.append((port, method, params))
             node = next(node for node in selected["nodes"] if node["rpc_port"] == port)
             key = monitor.payout_key(selected, node)
+            if method == "config":
+                return {"test_work": selected.get("test_work", False)}
             if method == "peers":
                 return {"connected": 2}
             if method == "getblock":
@@ -65,16 +67,41 @@ class RentalMonitorTests(unittest.TestCase):
         sample = report["samples"][-1]
         self.assertTrue(sample["peers_match"])
         self.assertTrue(sample["complete_issuance_history_checked"])
-        self.assertTrue(sample["issuance_matches_expected_work"])
+        self.assertTrue(sample["issuance_matches_expected_subsidy"])
         self.assertEqual(len({node["payout_public_key"] for node in sample["nodes"]}), 3)
         self.assertEqual(len({node["mining_account"]["ordinary"] for node in sample["nodes"]}), 3)
         self.assertEqual({call[0] for call in calls}, {20480, 20490, 20500})
-        self.assertEqual({call[1] for call in calls}, {"snapshot", "peers", "getblock"})
+        self.assertEqual({call[1] for call in calls}, {"config", "snapshot", "peers", "getblock"})
         self.assertFalse(report["provenance"]["monitor_submits_work"])
         self.assertFalse(report["provenance"]["mining_source_independently_verified"])
         self.assertTrue(all(node["declared_software_mining"] is False for node in report["monitored_nodes"]))
         self.assertNotIn("must-not-read", json.dumps(report))
         self.assertEqual(report["errors"], [])
+
+    def test_production_rewards_floor_each_block_without_carry(self):
+        quantum = monitor.issuance_quantum({"test_work": False})
+        first = {"expected_work_hash": str(quantum - 3)}
+        second = {"expected_work_hash": "7"}
+        totals = monitor.issuance_totals([first, second], quantum)
+        self.assertEqual(totals, {"physical_expected_work_hashes": str(quantum + 4),
+                                 "expected_issued_atoms": "0"})
+        boundary = {"expected_work_hash": str(quantum + 7)}
+        self.assertEqual(monitor.issuance_totals([boundary, second], quantum)["expected_issued_atoms"], "1")
+        # Replacing a branch drops its rewards as well as its physical work.
+        self.assertEqual(monitor.issuance_totals([second], quantum)["expected_issued_atoms"], "0")
+        self.assertEqual(monitor.issuance_totals([second], 1)["expected_issued_atoms"], "7")
+
+    def test_fixture_mode_is_explicit_and_bound_to_resumed_evidence(self):
+        selected = manifest()
+        selected["test_work"] = True
+        report, _ = self.capture(selected)
+        self.assertEqual(report["issuance_mode"], "accelerated test fixture")
+        self.assertEqual(report["expected_hashes_per_atom"], "1")
+        with self.assertRaises(SystemExit):
+            self.capture(manifest(), prior=report)
+        for bad in ({}, {"test_work": "false"}, {"test_work": 0}):
+            with self.assertRaises(ValueError):
+                monitor.issuance_quantum(bad)
 
     def test_shared_payout_and_resumed_three_node_capture(self):
         report, _ = self.capture(manifest(count=2, independent=False))

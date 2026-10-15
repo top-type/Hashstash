@@ -392,7 +392,7 @@ class ReserveAudit(Audit):
         self.reorganization()
         final = self.agree()
         self.assert_supply()
-        return {'passed': True, 'checks': self.checks, 'checks_passed': len(self.checks),
+        return {**self.fixture_mode, 'passed': True, 'checks': self.checks, 'checks_passed': len(self.checks),
                 'height': final['height'], 'issued_HASH': final['issued'], 'tip': final['tip'],
                 'state_root': final['state_root'], 'reserve': final['reserve'],
                 'curve_mass': final['curve_mass'], 'revenue': final['revenue'],

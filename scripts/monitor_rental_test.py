@@ -3,7 +3,7 @@
 
 Example: python scripts/monitor_rental_test.py --manifest PATH --samples 60 --interval 10
 Writes evidence.json beside the selected manifest unless --output is supplied.
-Only loopback JSON-RPC snapshot, peers, and getblock methods are used.
+Only loopback JSON-RPC config, snapshot, peers, and getblock methods are used.
 Regional nodes may supply their own public_key and mining.advertise fields;
 otherwise the original shared manifest values apply.
 """
@@ -84,7 +84,7 @@ def relay_metadata(manifest_path, manifest):
 
 def rpc(port, method, params=None):
     global LAST_RPC
-    if method not in {"snapshot", "peers", "getblock"}:
+    if method not in {"config", "snapshot", "peers", "getblock"}:
         raise ValueError("monitor permits read-only methods only")
     # One global budget covers all nodes and historical reads: fewer than 8 calls/s.
     time.sleep(max(0, 0.15 - (time.monotonic() - LAST_RPC)))
@@ -118,6 +118,21 @@ def proof(header):
             "expected_work_hash": str((1 << 256) // (target + 1))}
 
 
+def issuance_quantum(config):
+    """The explicit, chain-bound fixture flag is never inferred from difficulty."""
+    fixture = config.get("test_work")
+    if type(fixture) is not bool:
+        raise ValueError("configuration must declare boolean test_work; old configurations cannot be reinterpreted")
+    return 1 if fixture else 10**15
+
+
+def issuance_totals(headers, quantum):
+    headers = list(headers)
+    work = sum(int(item["expected_work_hash"]) for item in headers)
+    issued = sum(int(item["expected_work_hash"]) // quantum for item in headers)
+    return {"physical_expected_work_hashes": str(work), "expected_issued_atoms": str(issued)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
@@ -134,15 +149,19 @@ def main():
         validate_manifest(manifest)
     except ValueError as error:
         parser.error(str(error))
+    config = rpc(manifest["nodes"][0]["rpc_port"], "config")
+    quantum = issuance_quantum(config)
     output = options.output or options.manifest.parent / "evidence.json"
     report = {"format": "hashstash-rental-evidence-v1", "started_utc": utc(), "chain_id": manifest["chain_id"],
               "expected_hashrate": manifest["expected_hashrate"], "initial_bits": manifest["initial_bits"],
               "executable_sha256": manifest["executable_sha256"], "read_only": True,
+              "test_work": config["test_work"], "expected_hashes_per_atom": str(quantum),
+              "issuance_mode": "accelerated test fixture" if config["test_work"] else "production",
               "public_endpoint": manifest["mining"]["advertise"] or None,
               "samples": [], "blocks": [], "errors": []}
     if output.exists():
         existing = json.loads(output.read_text(encoding="utf-8"))
-        if existing.get("format") != report["format"] or existing.get("chain_id") != report["chain_id"]:
+        if any(existing.get(field) != report[field] for field in ("format", "chain_id", "test_work", "expected_hashes_per_atom")):
             parser.error("existing evidence belongs to another network or format; choose another output")
         report = existing
     report["history_limit"] = options.history_limit
@@ -222,9 +241,10 @@ def main():
                 sample["captured_through_height"] = max(captured, default=0)
                 sample["history_limit_reached"] = height > options.history_limit
                 complete = stable and len(captured) == height and (height == 0 or captured[height]["hash"] == before["tip"])
-                expected = sum(int(item["expected_work_hash"]) for item in captured.values())
+                totals = issuance_totals(captured.values(), quantum)
+                sample.update(totals)
                 sample["complete_issuance_history_checked"] = complete
-                sample["issuance_matches_expected_work"] = expected == int(before["issued"]) if complete else None
+                sample["issuance_matches_expected_subsidy"] = totals["expected_issued_atoms"] == before["issued"] if complete else None
                 sample["observed_headers_valid"] = all(item["proof_valid"] for item in captured.values())
                 sample["baseline_only"] = height == 0
             except Exception as error:

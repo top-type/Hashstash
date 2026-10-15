@@ -154,7 +154,7 @@ async function run() {
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
     h.review.fields = [
       {label:'Action',value:'Redeem'},
-      {label:'Shares',value:'95000000000000000000'},
+      {label:'Shares',value:'95000'},
       {label:'Fee · HASH',value:'1234567890000000000'},
       {label:'Outcome',value:'PASS'},
     ];
@@ -163,14 +163,14 @@ async function run() {
     const fields=h.get('review-fields').children[0].children, technical=h.get('review-technical-fields').children[0].children;
     assert.equal(fields[1].textContent,'Withdraw','withdraw terminology does not alter signed Redeem operation');checks++;
     assert.equal(fields[2].textContent,'Amount · stash','withdrawn ownership quantity is visible in primary review');checks++;
-    assert.equal(fields[3].textContent,'0.000000000000000095','raw signed shares display exactly in stash');checks++;
-    assert.equal(fields[3].title,'95000000000000000000 stash atoms');checks++;
+    assert.equal(fields[3].textContent,'95','raw signed shares display exactly in stash');checks++;
+    assert.equal(fields[3].title,'95000 stash atoms');checks++;
     assert.equal(fields[3].className,'stash-amount');checks++;
     assert.match(fields[5].textContent,/ hash$/,'exact signed fee uses the same monetary unit');checks++;
     assert.equal(amounts.parseAmount(fields[5].textContent),'1234567890000000000','fee display never rounds away signed digits');checks++;
     assert.equal(fields[7].textContent,'PASS');checks++;
     assert.equal(fields.some(field=>/minimum received|minimum shares/i.test(field.textContent)),false,'amount-only orders authorize no minimum output');checks++;
-    assert.equal(technical[1].textContent,'95000000000000000000','technical details retain signed raw STASH atom count');checks++;
+    assert.equal(technical[1].textContent,'95000','technical details retain signed raw STASH atom count');checks++;
     assert.equal(technical[0].textContent,'stash atoms');checks++;
     assert.equal(technical[1].className,'stash-amount');checks++;
     assert.equal(h.get('review-details').hidden,false);checks++;
@@ -203,7 +203,7 @@ async function run() {
     await h.get('review-form').fire('submit');
     const fields=h.get('review-fields').children[0].children;
     assert.equal(fields[1].textContent,'Deposit');checks++;
-    assert.equal(fields[3].textContent,'0.000000000001234 hash','deposit amount retains every signed hash');checks++;
+    assert.equal(fields[3].textContent,'1234 hash','deposit amount retains every signed hash');checks++;
     assert.ok(!fields.some(field=>/Minimum/.test(field.textContent)),'deposit review has no minimum-output field');checks++;
     h.get('review-details').open=true;
     h.get('review-data').open=true; h.get('review-bytes').open=true;
@@ -235,14 +235,14 @@ async function run() {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
     h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
-    h.review.fields=[{label:'Shares',value:'95000000000000000000'}];
+    h.review.fields=[{label:'Shares',value:'95000'}];
     await h.get('review-form').fire('submit');h.get('review-details').open=true;
     h.review.fields=[{label:'Action',value:'Transfer'},{label:'Amount · HASH',value:'20'}];
     await h.get('review-form').fire('submit');
     assert.equal(h.get('review-details').hidden,true,'a new ordinary transfer has no stale technical details');checks++;
     assert.equal(h.get('review-details').open,false);checks++;
     assert.equal(h.get('review-technical-fields').children[0].children.length,0);checks++;
-    assert.equal(h.get('review-fields').children[0].children[3].textContent,'0.00000000000000002 hash');checks++;
+    assert.equal(h.get('review-fields').children[0].children[3].textContent,'0.02 hash');checks++;
     await h.get('sign').fire('click');
     assert.equal(h.calls.filter(call=>call.url==='/api/sign').length,1,'fresh non-Stash review remains signable');checks++;
   }
@@ -282,7 +282,7 @@ async function run() {
     await h.get('review-form').fire('submit');
     const fields=h.get('review-fields').children[0].children;
     assert.equal(fields[2].textContent,'Recipient receives'); checks++;
-    assert.equal(fields[3].textContent,'0.0000000000000001 hash'); checks++;
+    assert.equal(fields[3].textContent,'0.1 hash'); checks++;
     assert.equal(fields[4].textContent,'Fee'); checks++;
     assert.equal(amounts.parseAmount(fields[5].textContent),exactFee,'offline exact fee preserves every signed digit'); checks++;
     assert.equal(h.get('review-fee-help').hidden,false);checks++;
@@ -398,11 +398,11 @@ async function run() {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
     h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
-    h.review.fields=[{label:'Amount · HASH',value:'1000000'},{label:'Shares',value:'1000000000000000000000000000000000000'}];
+    h.review.fields=[{label:'Amount · HASH',value:'1000000'},{label:'Shares',value:'1000'}];
     await h.get('review-form').fire('submit');
     const fields=h.get('review-fields').children[0].children;
     assert.equal(fields[0].textContent,'Amount');checks++;
-    assert.equal(fields[1].textContent,'0.000000000001 hash');checks++;
+    assert.equal(fields[1].textContent,'1000 hash');checks++;
     assert.equal(fields[2].textContent,'Amount · stash');checks++;
     assert.equal(fields[3].textContent,'1','cold review converts the signed quantity exactly to stash');checks++;
     assert.equal(shares.parseAmount(fields[3].textContent),h.review.fields[1].value);checks++;
@@ -411,7 +411,7 @@ async function run() {
     const h=await harness(chainA);h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
     h.review.fields=[{label:'Recipient 1',value:'first-full-address'},{label:'Payment 1 · HASH',value:'1000000000000000001'},{label:'Recipient 2',value:'second-full-address'},{label:'Payment 2 · HASH',value:'2'},{label:'Total grant · HASH',value:'1000000000000000003'},{label:'Fee · HASH',value:'7'}];
     await h.get('review-form').fire('submit');const fields=h.get('review-fields').children[0].children;
-    for(const [index,value] of [[1,'first-full-address'],[3,'1.000000000000000001 hash'],[5,'second-full-address'],[7,'0.000000000000000002 hash'],[9,'1.000000000000000003 hash'],[11,'0.000000000000000007 hash']]){assert.equal(fields[index].textContent,value);checks++;}
+    for(const [index,value] of [[1,'first-full-address'],[3,'1000000000000000.001 hash'],[5,'second-full-address'],[7,'0.002 hash'],[9,'1000000000000000.003 hash'],[11,'0.007 hash']]){assert.equal(fields[index].textContent,value);checks++;}
   }
   for (const raw of ['0', '1', '1000000000000000001', '123456789123456789123456789', ((1n << 512n) - 1n).toString()]) {
     const h=await harness(chainA);
@@ -431,7 +431,7 @@ async function run() {
     assert.deepEqual(h.calls.find(call=>call.url==='/api/sign').body,{review_token:'review-token'});checks++;
     assert.equal(h.calls.every(call=>call.url.startsWith('/api/')),true,'exact conversion adds no network dependency');checks++;
   }
-  for (const raw of ['-1', '1 hash', '1.1', '1e18']) {
+  for (const raw of ['-1', '1000000000000000 hash', '1.1', '1e18']) {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
     h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});

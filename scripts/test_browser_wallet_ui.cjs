@@ -41,7 +41,7 @@ async function setup(options={}) {
 async function fill(h,recipient,data='00ff80') {
   const f=h.get('send-form');
   f.elements.data_format.value='hex';await f.fire('change');
-  f.elements.recipient.value=addr(recipient);f.elements.amount.value='0.0000000000000001';f.elements.extra_fee.value='0.000000000000000003';f.elements.data_hex.value=data;
+  f.elements.recipient.value=addr(recipient);f.elements.amount.value='0.1';f.elements.extra_fee.value='0.003';f.elements.data_hex.value=data;
   await f.fire('input');await h.timersDue();
   assert.equal(h.get('send-submit').disabled,false,h.get('send-cost').textContent);
   return f;
@@ -138,7 +138,7 @@ async function run() {
     const c=await setup({chat:true});
     c.handlers.explorer_chat=()=>response({result:{chain_id:c.currentSnapshot.status.chain_id,tip:c.currentSnapshot.status.tip,height:20,ready:true,items:[],pending:[],next_cursor:null}});
     c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();await c.navigate('#send');
-    const f=c.get('send-form');f.elements.recipient.value=addr(alice);f.elements.amount.value='0.000000000000000001';f.elements.data_text.value='Public test message 🌱';await f.fire('input');await c.timersDue();
+    const f=c.get('send-form');f.elements.recipient.value=addr(alice);f.elements.amount.value='0.001';f.elements.data_text.value='Public test message 🌱';await f.fire('input');await c.timersDue();
     assert.equal(c.get('send-submit').disabled,false,c.get('send-cost').textContent);checks++;
     assert.equal(c.hasElement('chat-form'),false,'feed has no separate transaction composer');checks++;
     assert.equal(broadcasts(c).length,0);checks++;

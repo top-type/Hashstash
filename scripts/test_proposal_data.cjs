@@ -16,7 +16,7 @@ async function run(){
 
  s.status.fee_policy={minimum_fee_rate:'1',fee_scale:1024,account_weight:1024};
  h.handlers.fee_quote=params=>{const {chain_id,tip,state_root,height}=s.status,data=params.data_hex||'';return response({result:{miner_fee_percent:50,miner_fee:'0',revenue_fee:'1',chain_id,tip,state_root,height,anchor:tip,anchor_height:height,expiry_blocks:params.expiry_blocks??2,expiry_height:String(BigInt(height)+BigInt(params.expiry_blocks??2)),sender:require('./test_wallet_ui.cjs').addr(params.sender),sender_public_key:params.sender,fee:'1',minimum_fee:'1',account_creation_fee:'0',grant_recipient_fee:'0',extra_fee:'0',weight:'512',minimum_fee_rate:'1',data_hex:data,data_bytes:data.length/2}});};
- await h.refresh();const f=h.get('propose-form');f.elements.type.value='parameter';f.elements.parameter.value='Interval';f.elements.parameter_value.value='5';f.elements.support.value='0.000001';f.elements.description.value='Fund careful experiments, with public results.';
+ await h.refresh();const f=h.get('propose-form');f.elements.type.value='parameter';f.elements.parameter.value='Interval';f.elements.parameter_value.value='5';f.elements.support.value='0.001';f.elements.description.value='Fund careful experiments, with public results.';
  await f.fire('input');await h.timersDue();await wait(()=>h.get('propose-fee-quote').textContent!=='—');await f.requestSubmit();
  eq(h.wallet.length,1);const signed=h.wallet[0];eq(signed.data_hex,api.encode(f.elements.description.value));eq(Buffer.from(signed.operation.Propose.description).toString('hex'),sha(f.elements.description.value));
  const id='ab'.repeat(32),text='<script>Literal public explanation</script>\nShared between visitors.';
@@ -25,9 +25,9 @@ async function run(){
  await h.refresh();await h.navigate('#governance');await settle();ok(h.get('proposal-list').textContent.includes(text),'a fresh browser can read a signed explanation without localStorage');
  s.proposals=[{...s.proposals[0],id:'bc'.repeat(32)}];h.handlers.explorer_governance=()=>response({result:{chain_id:s.status.chain_id,proposals:[{id:'bc'.repeat(32),description:sha(text),description_text:'Altered rationale'}]}});await h.refresh();await settle();
  ok(!h.get('proposal-list').textContent.includes('Altered rationale'));ok(!h.get('proposal-list').textContent.includes('No verified explanation published.'));
- const action={Grant:{payments:[{recipient:'12'.repeat(32),amount:'1000000000000000000'},{recipient:'34'.repeat(32),amount:'2000000000000000000'}]}};
+ const action={Grant:{payments:[{recipient:'12'.repeat(32),amount:'1000'},{recipient:'34'.repeat(32),amount:'2000'}]}};
  const decision={id:'de'.repeat(32),proposal_id:id,round:0,started:240,blocks:16,started_height:16,leading_blocks:0,proposal:action};
- s.governance.phase={Governance:decision};s.governance.pass={...s.governance.world,grant_escrow:'3000000000000000000'};
+ s.governance.phase={Governance:decision};s.governance.pass={...s.governance.world,grant_escrow:'3000'};
  s.proposals=[{id,proposal:{round:0,support:'10',description:sha(text),action,refund_height:null}}];await h.refresh();await settle();
  const payouts=h.get('gov-grant-payments').children;
  eq(payouts.length,2,'the current decision shows every recipient, not just a total or first destination');

@@ -7,8 +7,9 @@
   'use strict';
 
   const PREFIXES = ['', 'k', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y'];
-  const PLACES = 18;
+  const PLACES = 3;
   const SCALE = 10n ** BigInt(PLACES);
+  const WORK_SCALE = 10n ** 18n;
   const MAX_INPUT_LENGTH = 190;
   const MAX_AMOUNT_DIGITS = 160;
 
@@ -19,7 +20,7 @@
     if (!match) throw new Error('Enter a hash amount as a decimal, optionally followed by hash.');
     const parts = match[1].split('.');
     const fraction = parts[1] || '';
-    if (fraction.length > PLACES) throw new Error('Hash amounts support up to 18 decimal places.');
+    if (fraction.length > PLACES) throw new Error('Hash amounts support up to 3 decimal places.');
     const digits = (parts[0] + fraction.padEnd(PLACES, '0')).replace(/^0+/, '') || '0';
     if (digits.length > MAX_AMOUNT_DIGITS) throw new RangeError('Amount exceeds 160 digits.');
     return digits;
@@ -87,7 +88,11 @@
   }
 
   function formatWork(numerator, denominator = 1n) {
-    return formatHash(numerator, denominator).replace(/ hash$/, ' EH');
+    return formatScaled(numerator, denominator, WORK_SCALE, 'EH');
+  }
+
+  function formatExactWork(numerator, denominator = 1n) {
+    return formatExactScaled(numerator, denominator, WORK_SCALE, 'EH');
   }
 
   function formatHashrate(numerator, denominator = 1n) {
@@ -97,18 +102,22 @@
   // Monetary displays stay in hash. Significant-digit rounding is performed with
   // integer arithmetic, including values smaller than one atomic unit in price ratios.
   function formatHash(numerator, denominator = 1n) {
+    return formatScaled(numerator, denominator, SCALE, 'hash');
+  }
+
+  function formatScaled(numerator, denominator, scale, unit) {
     numerator = integer(numerator); denominator = integer(denominator);
     if (denominator <= 0n) throw new RangeError('Denominator must be positive.');
-    if (numerator === 0n) return '0 hash';
+    if (numerator === 0n) return `0 ${unit}`;
     const sign = numerator < 0n ? '-' : '';
     if (numerator < 0n) numerator = -numerator;
-    denominator *= SCALE;
+    denominator *= scale;
     const exponent = decimalExponent(numerator, denominator), shift = 5 - exponent;
     if (shift >= 0) numerator *= power10(shift);
     else denominator *= power10(-shift);
     const rounded = numerator / denominator + (2n * (numerator % denominator) >= denominator ? 1n : 0n);
     // decimalText normally takes a three-digit significand; offset for six.
-    return sign + decimalText(rounded, exponent - 3) + ' hash';
+    return sign + decimalText(rounded, exponent - 3) + ` ${unit}`;
   }
 
   function exactInput(value) {
@@ -121,24 +130,27 @@
   }
 
   function formatExactHash(numerator, denominator = 1n) {
+    return formatExactScaled(numerator, denominator, SCALE, 'hash');
+  }
+
+  function formatExactScaled(numerator, denominator, scale, unit) {
     numerator = integer(numerator); denominator = integer(denominator);
     if (denominator <= 0n) throw new RangeError('Denominator must be positive.');
-    if (denominator === 1n) return (numerator < 0n ? '-' + exactInput(-numerator) : exactInput(numerator)) + ' hash';
     const sign = numerator < 0n ? '-' : '';
     if (numerator < 0n) numerator = -numerator;
-    if (numerator === 0n) return '0 hash';
-    denominator *= SCALE;
+    if (numerator === 0n) return `0 ${unit}`;
+    denominator *= scale;
     let a = numerator, b = denominator;
     while (b) { const remainder = a % b; a = b; b = remainder; }
     numerator /= a; denominator /= a;
     let reduced = denominator, twos = 0, fives = 0;
     while (reduced % 2n === 0n) { reduced /= 2n; twos++; }
     while (reduced % 5n === 0n) { reduced /= 5n; fives++; }
-    if (reduced !== 1n) return `${sign}${numerator} / ${denominator} hash`;
+    if (reduced !== 1n) return `${sign}${numerator} / ${denominator} ${unit}`;
     const places = Math.max(twos, fives);
     const digits = (numerator * power10(places) / denominator).toString().padStart(places + 1, '0');
-    return sign + (places ? trimDecimal(digits.slice(0, -places) + '.' + digits.slice(-places)) : digits) + ' hash';
+    return sign + (places ? trimDecimal(digits.slice(0, -places) + '.' + digits.slice(-places)) : digits) + ` ${unit}`;
   }
 
-  return Object.freeze({ parseAmount, formatAmount, formatHash, formatExactHash, formatWork, formatHashrate, exactInput });
+  return Object.freeze({ parseAmount, formatAmount, formatHash, formatExactHash, formatWork, formatExactWork, formatHashrate, exactInput, DISPLAY_DECIMALS: PLACES, DISPLAY_SCALE: SCALE });
 });

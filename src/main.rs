@@ -128,10 +128,10 @@ enum Command {
         operation: Option<String>,
         #[arg(long)]
         operation_file: Option<PathBuf>,
-        /// Exact total fee; quote the minimum when omitted.
+        /// Exact total fee in whole atoms (1000 atoms = 1 hash); quote the minimum when omitted.
         #[arg(long, conflicts_with = "extra_fee")]
         fee: Option<String>,
-        /// Optional extra fee, shared using the governed fee split; zero when omitted.
+        /// Extra fee in whole atoms, shared using the governed fee split; zero when omitted.
         #[arg(long)]
         extra_fee: Option<String>,
         /// Optional uninterpreted bytes, encoded as hexadecimal.
@@ -157,10 +157,10 @@ enum Command {
         operation: Option<String>,
         #[arg(long)]
         operation_file: Option<PathBuf>,
-        /// Exact total fee; quote the minimum when omitted.
+        /// Exact total fee in whole atoms (1000 atoms = 1 hash); quote the minimum when omitted.
         #[arg(long, conflicts_with = "extra_fee")]
         fee: Option<String>,
-        /// Optional extra fee, shared using the governed fee split; zero when omitted.
+        /// Extra fee in whole atoms, shared using the governed fee split; zero when omitted.
         #[arg(long)]
         extra_fee: Option<String>,
         /// Optional uninterpreted bytes, encoded as hexadecimal.
@@ -276,11 +276,12 @@ enum Command {
         #[arg(long)]
         recipient: String,
         #[arg(long)]
+        /// Whole monetary atoms (1000 atoms = 1 hash).
         amount: String,
-        /// Exact total fee; quote the minimum when omitted.
+        /// Exact total fee in whole atoms (1000 atoms = 1 hash); quote the minimum when omitted.
         #[arg(long, conflicts_with = "extra_fee")]
         fee: Option<String>,
-        /// Optional extra fee, shared using the governed fee split; zero when omitted.
+        /// Extra fee in whole atoms, shared using the governed fee split; zero when omitted.
         #[arg(long)]
         extra_fee: Option<String>,
         /// Optional uninterpreted bytes, encoded as hexadecimal.

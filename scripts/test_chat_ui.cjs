@@ -33,7 +33,7 @@ async function run() {
     h.feed.items=[
       h.message({txid:hash(5),height:21,position:4,kind:'refund',amount:null,asset:null,recipient:null,text:'Refund explanation'}),
       h.message({txid:hash(4),height:21,position:3,kind:'propose',amount:'0',text:'Proposal rationale'}),
-      h.message({txid:hash(3),height:21,position:2,kind:'redeem',amount:'1000000000000000000000000000000000000',asset:'stash',text:'Selling some stash'}),
+      h.message({txid:hash(3),height:21,position:2,kind:'redeem',amount:'1000',asset:'stash',text:'Selling some stash'}),
       h.message({txid:hash(2),height:21,position:1,kind:'deposit',amount:'1',text:'Buying stash'}),
       h.message({txid:hash(1),height:20,position:8,text:'One atom transfer'})
     ];

@@ -10,10 +10,10 @@ class PersonaTests(unittest.TestCase):
         self.snapshot = {"status": {"phase": "governance", "height": 900,
                                     "auction_round": None},
                          "governance": {"phase": {"Governance": {"round": 4}},
-                                        "world": {"reserve": str(20 * 10**18),
-                                                  "grant_capacity": str(10**18)}}}
-        self.metrics = {"grant_amount_raw": str(3 * 10**16),
-                        "grant_funded_raw": str(3 * 10**16), "grant_feasible": True,
+                                        "world": {"reserve": str(20 * 1000),
+                                                  "grant_capacity": str(1000)}}}
+        self.metrics = {"grant_amount_raw": str(30),
+                        "grant_funded_raw": str(30), "grant_feasible": True,
                         "pass_price_numerator": "100", "pass_price_denominator": "3",
                         "fail_price_numerator": "100", "fail_price_denominator": "3"}
 
@@ -44,7 +44,7 @@ class PersonaTests(unittest.TestCase):
         self.assertIn("fits", builder["reasons"][0])
 
     def test_native_half_backing_grant_keeps_opposing_preferences_without_cutoff(self):
-        metrics = dict(self.metrics, grant_amount_raw=str(5 * 10**17), grant_funded_raw=str(5 * 10**17))
+        metrics = dict(self.metrics, grant_amount_raw=str(500), grant_funded_raw=str(500))
         conservative = p.evaluate(self.snapshot, p.profile_for("fra", 0, "native-balance-v1"), metrics)
         builder = p.evaluate(self.snapshot, p.profile_for("sgp", 0, "native-balance-v1"), metrics)
         self.assertEqual(conservative["preferred_outcome"], "Fail")
@@ -52,7 +52,7 @@ class PersonaTests(unittest.TestCase):
         self.assertTrue(all("grant allocation" not in reason for reason in conservative["reasons"] + builder["reasons"]))
 
     def test_native_composition_preserves_native_strategy_and_short_explicit_label(self):
-        metrics = dict(self.metrics, grant_amount_raw=str(5 * 10**17), grant_funded_raw=str(5 * 10**17))
+        metrics = dict(self.metrics, grant_amount_raw=str(500), grant_funded_raw=str(500))
         profile = p.profile_for('sgp', 0, 'native-balance-v1')
         text = p.compose_message(self.snapshot, profile, metrics=metrics)
         self.assertTrue(text.startswith('Rook · Automated — '))
@@ -61,7 +61,8 @@ class PersonaTests(unittest.TestCase):
         self.assertEqual(p.profile_for('sgp', 0)['label'], 'Automated Demo · Rook')
 
     def test_native_large_grant_rationale_does_not_call_it_small(self):
-        metrics = dict(self.metrics, grant_amount_raw=str(5168 * 10**14), grant_funded_raw=str(5168 * 10**14))
+        self.snapshot["governance"]["world"]["grant_capacity"] = "10000"
+        metrics = dict(self.metrics, grant_amount_raw="5168", grant_funded_raw="5168")
         profile = p.profile_for('fra', 0, 'native-balance-v1')
         result = p.evaluate(self.snapshot, profile, metrics)
         self.assertEqual(result['observed']['grant_fraction_bps'], 5168)
@@ -115,11 +116,12 @@ class PersonaTests(unittest.TestCase):
         self.assertIn("equal to FAIL's", combined)
         self.assertIn("funding round 4", combined)
         self.assertNotIn("exa", combined)
-        self.assertEqual(p._hashes(10**18), "1 hash")
-        self.assertEqual(p._hashes(10**15), "0.001 hashes")
-        self.assertEqual(p._hashes(1), "less than 0.00000001 hashes")
+        self.assertEqual(p._hashes(1000), "1 hash")
+        self.assertEqual(p._hashes(1), "0.001 hashes")
+        self.assertEqual(p._hashes(1), "0.001 hashes")
 
     def test_nonzero_small_grant_does_not_claim_zero_percent(self):
+        self.snapshot["governance"]["world"]["grant_capacity"] = "100000"
         metrics = dict(self.metrics, grant_amount_raw="1")
         text = p.compose_message(self.snapshot, p.profile_for("sgp", 0), metrics=metrics)
         self.assertIn("less than 0.01%", text)
@@ -138,7 +140,7 @@ class PersonaTests(unittest.TestCase):
         metrics = dict(self.metrics, pass_price_numerator="103251", fail_price_numerator="100000")
         facts = " ".join(p._facts(self.snapshot, p.evaluate(self.snapshot, p.profile_for("ewr", 1), metrics)))
         self.assertIn("about 3.25% above", facts)
-        self.assertTrue(p._hashes(1771029337642).startswith("about "))
+        self.assertTrue(p._hashes(10**30).startswith("about "))
 
     def test_chat_rotation_uses_only_region_confirmed_chats(self):
         history = []

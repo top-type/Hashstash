@@ -766,7 +766,7 @@ impl Node {
     }
     fn status_locked(inner: &ReadView) -> Value {
         let s = inner.chain.tip_state();
-        json!({"chain_id":hex::encode(inner.chain.chain_id()), "height":inner.chain.tip_height(), "tip":hex::encode(inner.chain.tip_hash()), "state_root":hex::encode(s.root()), "clock":s.clock, "time_unit":"seconds", "clock_basis":"target_interval", "issued":s.issued.to_str_radix(10), "phase":s.phase_name(), "decision":s.decision_id().map(hex::encode), "auction_round":s.auction_round(), "settings":s.settings, "mempool":inner.mempool.len(), "reserve":s.world.reserve.to_str_radix(10), "shares":s.world.shares.to_str_radix(10), "curve_mass":s.world.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(&s.world).to_str_radix(10), "revenue":s.world.revenue.to_str_radix(10), "fee_policy":json!({"minimum_fee_rate":s.settings.minimum_fee_rate.to_string(),"fee_scale":crate::fees::FEE_SCALE,"account_weight":crate::fees::ACCOUNT_WEIGHT})})
+        json!({"chain_id":hex::encode(inner.chain.chain_id()), "height":inner.chain.tip_height(), "tip":hex::encode(inner.chain.tip_hash()), "state_root":hex::encode(s.root()), "clock":s.clock, "time_unit":"seconds", "clock_basis":"target_interval", "issued":s.issued.to_str_radix(10), "test_work":inner.chain.config.test_work, "phase":s.phase_name(), "decision":s.decision_id().map(hex::encode), "auction_round":s.auction_round(), "settings":s.settings, "mempool":inner.mempool.len(), "reserve":s.world.reserve.to_str_radix(10), "shares":s.world.shares.to_str_radix(10), "curve_mass":s.world.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(&s.world).to_str_radix(10), "revenue":s.world.revenue.to_str_radix(10), "fee_policy":json!({"minimum_fee_rate":s.settings.minimum_fee_rate.to_string(),"fee_scale":crate::fees::FEE_SCALE,"account_weight":crate::fees::ACCOUNT_WEIGHT})})
     }
     pub fn template(&self) -> Result<Block> {
         let mut block = self.template_shared()?.as_ref().clone();
@@ -4375,6 +4375,10 @@ async fn stratum_session(
 mod tests {
     use super::*;
     #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
     fn exact_wallet_quote_preserves_fee_and_exact_payment() {
         let directory = tempfile::tempdir().unwrap();
         let secret = [71; 32];
@@ -4475,6 +4479,10 @@ mod tests {
         quote
     }
     #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
     fn wallet_preparation_binds_quoted_tip_and_two_block_lifetime() {
         let directory = tempfile::tempdir().unwrap();
         let key = crypto::public_key(&[73; 32]).unwrap();
@@ -5567,6 +5575,10 @@ mod tests {
         assert_eq!(next.world.reserve, 10u32.into());
     }
     #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
     fn genesis_rpc_quotes_stash_and_keeps_mining_rewards_spendable() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::testnet();

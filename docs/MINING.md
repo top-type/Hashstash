@@ -14,7 +14,7 @@ For a fresh network, `init --preset slow --hashrate 100T` calibrates initial wor
 
 Share difficulty is a reporting threshold, not block difficulty or a payout contract. The assigned reporting target is capped at the network difficulty so valid blocks can be reported. Each job retains its own assigned difficulty. `mining.suggest_difficulty` respects the configured reporting floor before that cap. BIP310 minimum-difficulty requests are accepted only if compatible with the easiest representable network target; otherwise they return false.
 
-Only canonical blocks earn issuance, exactly floor(2^256/(target+1)) raw hash atoms each. Losing-parent jobs are rejected; losing blocks cannot later earn rewards. Transaction fees transfer existing hashes: the miner receives the governed percentage of each entire actual paid fee and revenue receives the remainder.
+Only canonical blocks earn issuance. Each block contributes floor(2^256/(target+1)) physical expected hashes. The block issues one atom (0.001 hash) per whole petahash of expected work and discards any smaller fraction. A low-work block can therefore issue zero atoms. Losing-parent jobs are rejected; losing blocks cannot later earn rewards. Transaction fees transfer existing hashes: the miner receives the governed percentage of each entire actual paid fee and revenue receives the remainder.
 
 Accepted/rejected shares, workers and estimated hashrate are local statistics and reset on process restart. A found block may be removed by reorganization. Worker labels and counters do not authenticate hardware or geographical location. Short hashrate estimates are noisy.
 

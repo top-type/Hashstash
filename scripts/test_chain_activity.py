@@ -746,7 +746,7 @@ class NativeBalanceTests(unittest.TestCase):
         action.update(kind='propose_grant',
             operation={'Propose': {'round': 2, 'description': list(ca.hashlib.sha256(text).digest()),
                 'proposal': {'Grant': {'payments': [{'recipient': list(bytes.fromhex(KEYS[2])), 'amount': str(5 * 10**17)}]}},
-                'support': str(10**12)}})
+                'support': '1'}})
         return action
 
     def test_profile_is_explicit_idempotent_and_removes_only_value_limits(self):
@@ -763,7 +763,7 @@ class NativeBalanceTests(unittest.TestCase):
     def test_large_native_grant_rechecks_capacity_registry_description_and_cash(self):
         action = self.grant()
         self.activity.allowed_action(action, self.accounts, self.activity.policy(self.snapshot), self.snapshot)
-        self.assertEqual(action['reserved_cost_raw'], str(10**12 + 1))
+        self.assertEqual(action['reserved_cost_raw'], str(1 + 1))
         too_small = copy.deepcopy(self.snapshot)
         too_small['governance']['world']['grant_capacity'] = str(4 * 10**17)
         with self.assertRaises(ca.Pause):
@@ -845,7 +845,7 @@ class SubstantiveTests(ActivityTests):
         action.update(kind='propose_grant', sender_index=sender, round=2,
             operation={'Propose': {'round': 2, 'description': [8] * 32,
                 'proposal': {'Grant': {'payments': [{'recipient': list(bytes.fromhex(KEYS[2])), 'amount': str(n)}]}},
-                'support': str(10**12)}})
+                'support': '1'}})
         return action
 
     def described_grant(self):
@@ -859,7 +859,7 @@ class SubstantiveTests(ActivityTests):
         action = self.described_grant()
         policy = self.activity.policy(self.snapshot)
         self.activity.allowed_action(action, self.accounts, policy, self.snapshot)
-        self.assertEqual(action['reserved_cost_raw'], str(10**12 + int(self.activity.c['max_fee_raw'])))
+        self.assertEqual(action['reserved_cost_raw'], str(1 + int(self.activity.c['max_fee_raw'])))
         for altered in ('text', 'commitment', 'region'):
             changed = copy.deepcopy(action)
             if altered == 'text':
@@ -897,8 +897,8 @@ class SubstantiveTests(ActivityTests):
         bounded = config(self.root)
         self.assertEqual(ca.config_checked(bounded)['chat_seconds'], 300)
         self.assertEqual(self.activity.c['chat_seconds'], 90)
-        self.assertEqual(self.activity.c['max_consumptive_daily_raw'], str(10**15))
-        for field, value in [('max_consumptive_daily_raw', 10**15 + 1),
+        self.assertEqual(self.activity.c['max_consumptive_daily_raw'], '1000')
+        for field, value in [('max_consumptive_daily_raw', 1001),
                 ('chat_seconds', 89), ('funding_seconds', 86399)]:
             with self.subTest(field=field), self.assertRaises(ValueError):
                 ca.config_checked(dict(self.cfg, **{field: value}))
@@ -916,7 +916,7 @@ class SubstantiveTests(ActivityTests):
     def test_grant_current_capacity_and_feasibility_are_independent_of_metadata(self):
         action = self.grant()
         self.activity.allowed_action(action, self.accounts, self.activity.policy(self.snapshot), self.snapshot)
-        self.assertEqual(action['reserved_cost_raw'], str(10**12 + 10**6))
+        self.assertEqual(action['reserved_cost_raw'], str(1 + 10))
         small = copy.deepcopy(self.snapshot)
         small['governance']['world']['grant_capacity'] = str(10**15)
         with self.assertRaises(ca.Pause):
@@ -950,7 +950,7 @@ class SubstantiveTests(ActivityTests):
         self.node.proposals = [{'id': proposal_id, 'proposal': {'round': 2,
             'action': {'Grant': {'payments': payments}}}}]
         action = self.action()
-        action['operation'] = {'Support': {'round': 2, 'proposal': list(bytes.fromhex(proposal_id)), 'amount': str(10**12)}}
+        action['operation'] = {'Support': {'round': 2, 'proposal': list(bytes.fromhex(proposal_id)), 'amount': '1'}}
         self.activity.allowed_action(action, self.accounts, self.activity.policy(self.snapshot), self.snapshot)
         payments[1]['recipient'] = [255] * 32
         with self.assertRaisesRegex(ca.Fault, 'outside activity registry'):
@@ -975,7 +975,7 @@ class SubstantiveTests(ActivityTests):
         proposal_id = 'bb' * 32
         action = self.action()
         action.update(kind='support', grant_amount_raw='1', round=2,
-                      operation={'Support': {'round': 2, 'proposal': list(bytes.fromhex(proposal_id)), 'amount': str(10**12)}})
+                      operation={'Support': {'round': 2, 'proposal': list(bytes.fromhex(proposal_id)), 'amount': '1'}})
         grant = self.grant()['operation']['Propose']['proposal']['Grant']
         self.node.proposals = [{'id': proposal_id, 'proposal': {'round': 2, 'action': {'Grant': grant}}}]
         self.activity.allowed_action(action, self.accounts, self.activity.policy(self.snapshot), self.snapshot)

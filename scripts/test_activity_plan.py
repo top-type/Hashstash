@@ -384,7 +384,7 @@ class PlannerTest(unittest.TestCase):
         self.substantive("sgp")
         self.policy["history"] = [{"kind": "deposit"}] * 3
         action = self.choose()
-        spendable = int(self.accounts[0]["account"]["ordinary"]) - 10**9
+        spendable = int(self.accounts[0]["account"]["ordinary"]) - 100
         self.assertEqual(action["kind"], "transfer")
         self.assertEqual(int(action["amount_raw"]), spendable * 2500 // 10000)
         self.assertGreater(int(action["amount_raw"]), planner.TRADE * 20)
@@ -611,8 +611,10 @@ class PlannerTest(unittest.TestCase):
 
     def test_current_buys_selected_cash_without_limiting_it_to_other_world_cash(self):
         self.full_cash_governance()
+        self.policy["fee_reserve_raw"] = "4"
+        self.policy["max_fee_raw"] = "2"
         self.accounts[1]["pending"] = self.accounts[2]["pending"] = True
-        self.accounts[0]["account"]["ordinary"] = str(2 * 10**9)
+        self.accounts[0]["account"]["ordinary"] = "9"
         self.accounts[0]["pass_account"]["ordinary"] = str(10**15)
         before = int(self.accounts[0]["account"]["ordinary"])
         action = self.choose()
@@ -630,7 +632,7 @@ class PlannerTest(unittest.TestCase):
         before = [int(self.accounts[0][field]["ordinary"]) for field in ("account", "pass_account")]
         action = self.choose()
         self.assertEqual(action["kind"], "transfer")
-        self.assertLess(int(action["amount_raw"]), min(before) - 10**9)
+        self.assertLess(int(action["amount_raw"]), min(before) - 100)
         self.confirm_full_cash(action)
         for field, cash in zip(("account", "pass_account"), before):
             self.assertEqual(int(self.accounts[0][field]["ordinary"]), cash - int(action["amount_raw"]) - int(self.fee))

@@ -61,9 +61,9 @@ try {
     $created = Invoke-RestMethod -Uri ($origin+'/api/wallet/manage') -Method Post -ContentType 'application/json' -Headers @{'Origin'=$origin;'X-Hashstash-Token'=$restarted[0].token} -Body (@{action='create';name='First wallet';revision=$restarted[0].wallet_revision}|ConvertTo-Json) -TimeoutSec 5
     Check ($created.wallets.Count -eq 1 -and $created.wallet_mode -eq 'hot') 'First explicit wallet creation adds exactly one hot account'
     [void](Call-Node $node 'mine' @{count=1;recipient=$created.public_key})
-    $account = Call-Node $node 'account' @{key=$created.public_key}
+    $minedStatus = Call-Node $node 'status'
     $selected = (Sessions $empty)[0]
-    Check ([bigint]$account.account.ordinary -gt 0 -and $selected.miner -eq $node.public_key -and $selected.public_key -eq $created.public_key) 'Local mining can fund the selected account while the configured Stratum recipient stays unchanged'
+    Check ($minedStatus.issued -eq '0' -and $selected.miner -eq $node.public_key -and $selected.public_key -eq $created.public_key) 'An easy production block issues zero atoms; wallet selection leaves the configured mining recipient unchanged'
     & $stop -ManifestPath $emptyPath
     & $start -ManifestPath $emptyPath -DataRoot $emptyRoot -Executable $Executable -NoBrowser
     $empty = Load-Manifest $emptyRoot

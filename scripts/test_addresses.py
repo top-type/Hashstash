@@ -12,18 +12,20 @@ from test_wallet_cli import REPO, digest, request, rpc
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--node', type=Path, default=REPO / 'target/release' / ('hashstash.exe' if os.name == 'nt' else 'hashstash'))
-    parser.add_argument('--cold', type=Path, default=REPO / 'target/release' / ('hashstash-cold.exe' if os.name == 'nt' else 'hashstash-cold'))
+    parser.add_argument('--node', type=Path, default=REPO / 'target/fixtures/release' / ('hashstash.exe' if os.name == 'nt' else 'hashstash'))
+    parser.add_argument('--cold', type=Path, default=REPO / 'target/fixtures/release' / ('hashstash-cold.exe' if os.name == 'nt' else 'hashstash-cold'))
     parser.add_argument('--report', type=Path, default=REPO / 'work/address-live-report.json')
+    parser.add_argument('--directory', type=Path, default=REPO / 'work')
     args = parser.parse_args()
     args.node, args.cold = (args.node.resolve(), args.cold.resolve())
-    scratch = REPO / 'work'
+    scratch = args.directory.resolve()
     scratch.mkdir(parents=True, exist_ok=True)
-    directory = Path(tempfile.mkdtemp(prefix='addresses-', dir=scratch))
+    directory = Path(tempfile.mkdtemp(prefix='addresses-', dir=scratch)).resolve()
+    assert directory.is_relative_to(scratch)
     vectors = json.loads((REPO / 'tests/data/passphrase-v1.json').read_text(encoding='utf-8'))['vectors'][:2]
     processes, logs, checks = ([], [], [])
     started = time.monotonic()
-    report = {'suite': 'checksummed addresses', 'passed': False, 'directory': str(directory), 'checks': checks, 'node_sha256': digest(args.node), 'cold_sha256': digest(args.cold)}
+    report = {'suite': 'checksummed addresses', 'passed': False, 'directory': str(directory), 'test_work': True, 'issuance_mode': 'accelerated test fixture', 'expected_hashes_per_atom': '1', 'production_issuance_tested': False, 'checks': checks, 'node_sha256': digest(args.node), 'cold_sha256': digest(args.cold)}
 
     def cli(*values, good=True):
         result = subprocess.run([str(args.node), *map(str, values)], cwd=directory, capture_output=True, text=True, timeout=30, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
@@ -52,6 +54,7 @@ def main():
         config = directory / 'network.json'
         cli('init', '--config', config)
         value = json.loads(config.read_text())
+        value['test_work'] = True
         value['network'] = 'address-test-' + uuid.uuid4().hex
         value['genesis_time'] = int(time.time()) - 10000
         config.write_text(json.dumps(value))

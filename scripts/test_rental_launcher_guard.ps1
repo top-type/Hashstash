@@ -14,10 +14,14 @@ if ($errors.Count) { throw 'Rental launcher has parse errors.' }
 $source = $ast.Extent.Text
 $validation = $source.IndexOf('& $Executable network --config $configPath')
 $keyCreation = $source.IndexOf('& $Executable keygen')
+$fixtureGuard = $source.IndexOf('if ($configuration.test_work)')
+if ($fixtureGuard -lt 0 -or $fixtureGuard -ge $validation) { throw 'Rental mining must reject accelerated test issuance before validation, keys, or services.' }
 if ($validation -lt 0 -or $validation -ge $keyCreation) { throw 'The rental configuration must be validated before keys or services are created.' }
 $identities = @()
 foreach ($preset in 'devnet.json', 'testnet.json', 'slow-testnet.json') {
     $path = Join-Path $repository ('config/' + $preset)
+    $presetConfiguration = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    if ($presetConfiguration.test_work -ne $false) { throw 'Committed presets must use production issuance.' }
     $identity = & $Executable network --config $path | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0 -or $identity.chain_id -notmatch '^[0-9a-f]{64}$') { throw "Invalid preset: $preset" }
     $identities += $identity.chain_id

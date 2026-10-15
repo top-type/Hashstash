@@ -6,7 +6,7 @@ const vm = require('node:vm');
 const { harness } = require('./test_wallet_ui.cjs');
 const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
 const html = fs.readFileSync(path.join(__dirname, '../ui/index.html'), 'utf8');
-const shareUnit = 10n ** 36n, hashUnit = 10n ** 18n;
+const shareUnit = 1000n, hashUnit = 1000n;
 // Exercise the shipped model rather than maintaining another implementation.
 const context = vm.createContext({chartShareUnit: shareUnit});
 vm.runInContext(source.slice(source.indexOf('    function curveModel('), source.indexOf('    function curveWorld(')), context);
@@ -72,10 +72,10 @@ async function run() {
   const initialPath = nodes(svg,'curve-line')[0];
   await h.refresh(); eq(nodes(svg,'curve-line')[0], initialPath, 'unchanged polling retains the existing SVG');
 
-  s.config.share_scale = '2000000000000000000'; await h.refresh();
+  s.config.share_scale = '2'; await h.refresh();
   eq(h.get('curve-price').textContent,'0.5');
   ok(svg.children.some(child => child.id === 'curve-plot-title' && child.textContent.includes('0.5 hash/stash')), 'opening scale change invalidates the SVG cache');
-  s.config.share_scale = String(hashUnit);
+  s.config.share_scale = '1';
   s.governance.world = world(hashUnit,3n*hashUnit);
   Object.assign(s.status,s.governance.world,{height:1}); await h.refresh();
   eq(svg.dataset.preview,'funded');eq(svg.dataset.exponent,'2');eq(nodes(svg,'curve-current').length,1);

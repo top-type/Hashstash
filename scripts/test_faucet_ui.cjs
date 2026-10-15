@@ -3,9 +3,9 @@
 const assert = require('node:assert/strict');
 const { harness, response, settle, addr, deferred } = require('./test_wallet_ui.cjs');
 const chain = 'a'.repeat(64), origin = 'https://192.0.2.10', first = '12'.repeat(32), second = '34'.repeat(32);
-const claim = (status = 'pending') => ({ chain_id: chain, status, txid: 'd'.repeat(64), amount_hashes: '1000000000000', retry_after_seconds: 3600 });
+const claim = (status = 'pending') => ({ chain_id: chain, status, txid: 'd'.repeat(64), amount_hashes: '1', retry_after_seconds: 3600 });
 function service() {
-  const api = { config: { url: origin, chain_id: chain }, status: { enabled: true, chain_id: chain, amount_hashes: '1000000000000', available: true, mining_active: true, state: 'ready', retry_after_seconds: 0, address: addr(second) }, claims: new Map(), post: null, get: null };
+  const api = { config: { url: origin, chain_id: chain }, status: { enabled: true, chain_id: chain, amount_hashes: '1', available: true, mining_active: true, state: 'ready', retry_after_seconds: 0, address: addr(second) }, claims: new Map(), post: null, get: null };
   api.fetch = async (url, options) => {
     if (url === '/faucet-config.json') return response(api.config);
     if (url.includes('/faucet/status?address=')) {
@@ -37,7 +37,7 @@ async function run() {
   assert.equal(h.get('wallet-faucet').hidden, false); checks++;
   assert.equal(h.get('faucet-claim').disabled, false); checks++;
   assert.equal(h.get('faucet-claim').textContent, 'Get test hashes'); checks++;
-  assert.equal(h.get('faucet-amount').textContent, '0.000001 hash'); checks++;
+  assert.equal(h.get('faucet-amount').textContent, '0.001 hash'); checks++;
   assert.equal(h.get('faucet-status').hidden, true); checks++;
   await h.get('faucet-claim').click(); await settle();
   assert.equal(posts(h).length, 1); checks++;
@@ -47,7 +47,7 @@ async function run() {
   await h.get('faucet-claim').click();
   assert.equal(posts(h).length, 1, 'repeated click cannot duplicate a claim'); checks++;
   api.claims.set(addr(first), claim('confirmed')); h.wallClock += 11000; await h.refresh(); await settle();
-  assert.match(h.get('faucet-status').textContent, /^0\.000001 hash received\. Available in /); checks++;
+  assert.match(h.get('faucet-status').textContent, /^0\.001 hash received\. Available in /); checks++;
   assert.equal(h.get('faucet-claim').disabled, true); checks++;
   for (const c of h.faucetCalls) {
     assert.equal(c.options.credentials, 'omit'); checks++;
@@ -124,18 +124,18 @@ async function run() {
 
   // A new advertised payout must not rewrite receipts from earlier claims.
   const raisedApi = service();
-  raisedApi.status.amount_hashes = '1000000000000000';
+  raisedApi.status.amount_hashes = '10';
   raisedApi.status.address = addr('56'.repeat(32));
   raisedApi.claims.set(addr(first), claim('confirmed'));
   const raised = await harness({ faucetTransport: raisedApi.fetch }); await settle();
-  assert.equal(raised.get('faucet-amount').textContent, '0.001 hash', 'one petahash is advertised in the fixed hash unit'); checks++;
-  assert.match(raised.get('faucet-status').textContent, /^0\.000001 hash received\./, 'the old receipt retains its actual payout'); checks++;
+  assert.equal(raised.get('faucet-amount').textContent, '0.01 hash', 'the new advertised amount uses three decimal places'); checks++;
+  assert.match(raised.get('faucet-status').textContent, /^0\.001 hash received\./, 'the old receipt retains its actual payout'); checks++;
   assert.equal(raised.get('faucet-claim').disabled, true, 'a higher payout does not bypass an existing cooldown'); checks++;
   assert.equal(posts(raised).length, 0, 'a changed advertised payout never automatically claims again'); checks++;
   raised.currentSession = { ...raised.currentSession, public_key: second, wallet_id: `watch:${second}`, wallet_enabled: false, wallet_mode: 'watch', wallets: [{ id: `watch:${second}`, public_key: second, mode: 'watch' }] };
   await raised.refresh(); await settle();
   assert.equal(raised.get('faucet-status').hidden, true, 'the old payout receipt stays with its original wallet'); checks++;
-  assert.equal(raised.get('faucet-amount').textContent, '0.001 hash'); checks++;
+  assert.equal(raised.get('faucet-amount').textContent, '0.01 hash'); checks++;
   raisedApi.post = body => {
     const receipt = { ...claim(), txid: 'e'.repeat(64), amount_hashes: raisedApi.status.amount_hashes };
     raisedApi.claims.set(body.address, receipt); return response(receipt);
@@ -145,8 +145,8 @@ async function run() {
   assert.match(raised.get('faucet-status').textContent, /Pending/); checks++;
   raisedApi.claims.get(addr(second)).status = 'confirmed';
   raised.wallClock += 11000; await raised.refresh(); await settle();
-  assert.match(raised.get('faucet-status').textContent, /^0\.001 hash received\./, 'the new receipt reports its own larger payout'); checks++;
-  assert.equal(raisedApi.claims.get(addr(first)).amount_hashes, '1000000000000'); checks++;
+  assert.match(raised.get('faucet-status').textContent, /^0\.01 hash received\./, 'the new receipt reports its own larger payout'); checks++;
+  assert.equal(raisedApi.claims.get(addr(first)).amount_hashes, '1'); checks++;
 
   const realApi = service(), real = await harness({ realWallet: true, publicWeb: true, faucetTransport: realApi.fetch });
   await real.get('wallet-create').click(); await settle(); const walletA = real.browserStore.snapshot();

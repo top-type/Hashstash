@@ -156,11 +156,11 @@ function snapshot(chain = 'a'.repeat(64)) {
 
   const settings = { block_bytes: 1048576, interval: 15, lead: 60, rest: 480, decision_blocks: 16, miner_fee_percent:50, pass_margin_bps:0, minimum_fee_rate:1, max_price_change_bps:1000 };
 
-  const config = { network: 'hashstash-ui-test', auction_timeout: 480, quote_scale: '1000000', share_scale: '1000000000000000000' };
+  const config = { network: 'hashstash-ui-test', auction_timeout: 480, quote_scale: '1000000', share_scale: '1' };
 
 
 
-  const world = { reserve: '1000', curve_mass: '5000', shares: '1000000000000000000', revenue: '0', grant_escrow: '0' };
+  const world = { reserve: '1000', curve_mass: '5000', shares: '1000', revenue: '0', grant_escrow: '0' };
 
   return {
 
@@ -170,7 +170,7 @@ function snapshot(chain = 'a'.repeat(64)) {
 
     governance: { phase: { Auction: { round: 0, opened: 0, leader: null, lead_since: 0 } }, clock: 300, time_unit:'seconds', clock_basis:'target_interval', frozen: settings, settings, world, pass: null },
 
-    account: { account: { ordinary: '1000', shares: '100000000000000000', nonce: 0 }, stash_withdrawal_hash:'409', stash_value_hash: { numerator: '500', denominator: '1' }, price_hash_per_share: { numerator: '5000', denominator: world.shares } },
+    account: { account: { ordinary: '1000', shares: '100', nonce: 0 }, stash_withdrawal_hash:'409', stash_value_hash: { numerator: '500', denominator: '1' }, price_hash_per_share: { numerator: '5000', denominator: world.shares } },
 
     pass: null, fail: null, mempool: [], proposals: [],
 
@@ -774,6 +774,14 @@ async function run() {
   personal.selectSession({id:'watch:third',public_key:'56'.repeat(32),mode:'watch'});await personal.refresh();
   eq(personal.get('activity-panel').hidden,true,'a third account with no pending sends gets no global fallback');
   eq(personal.wallet.length,0,'reading and switching personal activity cannot sign or submit');
+ }
+ {
+  const fixture=await harness();
+  eq(fixture.get('test-work-notice').hidden,true,'normal mining has no simulated-issuance notice');
+  fixture.currentSnapshot.config.test_work=true;await fixture.refresh();
+  eq(fixture.get('test-work-notice').hidden,false,'fixture mining is clearly identified');
+  fixture.currentSnapshot.config.test_work=false;await fixture.refresh();
+  eq(fixture.get('test-work-notice').hidden,true,'normal network removes the fixture notice');
  }
  console.log(`Wallet UI: ${checks} current-protocol assertions passed.`);
 }

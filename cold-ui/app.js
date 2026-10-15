@@ -202,7 +202,7 @@
         if (field.label === 'Action' && field.value === 'Redeem') value.textContent = 'Withdraw';
         if (/· hashes$/.test(field.label)) {
           name.textContent = field.label.replace(/ · hashes$/, '');
-          value.textContent = `${HashstashAmounts.exactInput(field.value)} EH`;
+          value.textContent = HashstashAmounts.formatExactWork(field.value);
           value.title = value.textContent;
         } else if (/· HASH$/.test(field.label)) {
           name.textContent = field.label.replace(/ · HASH$/, '');

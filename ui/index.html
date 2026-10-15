@@ -41,6 +41,7 @@
   <main class="main" id="main-content" tabindex="-1">
     <header class="topbar"><button type="button" id="account-select" class="account-select" aria-label="Active wallet" aria-describedby="account-label account-summary" aria-haspopup="dialog" aria-controls="wallet-switcher" disabled hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h14a2 2 0 0 1 2 2v13H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h13v2M20 10h-6v5h6"/><path d="M16 12.5h.01"/></svg><span class="account-select-copy"><strong id="account-label"></strong><span id="account-summary" class="account-summary"></span></span><svg class="account-chevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m5 6 3 3 3-3"/></svg></button><div class="topbar-right"><span class="live-label"><span class="status-dot" id="connection-dot"></span><span id="connection-label">Connecting</span></span></div></header>
     <div id="global-alert" class="alert" role="alert" hidden></div>
+    <div id="test-work-notice" class="alert" role="status" hidden>Test fixture: simulated issuance. These balances do not represent real mining work.</div>
 
     <section id="view-overview" class="view">
 <h1>Home</h1>
@@ -227,9 +228,9 @@
         </div>
         <div id="guide-technical-panel" role="tabpanel" aria-labelledby="guide-technical-tab" hidden>
           <details class="guide-section guide-disclosure disclosure"><summary>Units and encoding</summary><div class="disclosure-body">
-            <p>Amounts are stored as integers: one hash equals 10¹⁸ raw balance units and one stash equals 10³⁶ raw share units. The command-line interface (CLI) and node API (RPC) use these raw amounts; the wallet converts them to displayed units.</p>
+            <p>Amounts are stored as integers: one hash equals 1,000 monetary atoms and one stash equals 1,000 share atoms. Each monetary atom represents one petahash (10¹⁵ hashing attempts) of expected mining work. The command-line interface (CLI) and node API (RPC) use these raw amounts; the wallet converts them to displayed units.</p>
             <p>Each amount uses its shortest unsigned little-endian byte sequence, preceded by its length. Zero has no amount bytes. Other integers, lengths and operation tags use variable-length encoding. Public keys and cryptographic hash digests occupy 32 bytes; signatures occupy 64 bytes.</p>
-            <p>Arithmetic uses integers with explicit rounding. The encoding takes nine bytes for one hash and sixteen bytes for one stash.</p>
+            <p>Arithmetic uses integers with explicit rounding. The encoding takes three bytes for one hash or one stash: one length byte and two amount bytes.</p>
           </div></details>
           <details class="guide-section guide-disclosure disclosure"><summary>Transactions, signatures and fees</summary><div class="disclosure-body">
             <p>A public key identifies an account; its private key signs transactions using BIP340 on secp256k1. Each transaction includes a nonce, the sender's next sequence number, a reference block and a lifetime in blocks. The default is two blocks: a transaction prepared from block 100 can be included in 101 or 102. If a reorganization removes the reference block, the transaction becomes invalid on that branch.</p>
@@ -247,7 +248,7 @@
           </div></details>
           <details class="guide-section guide-disclosure disclosure"><summary>Mining and issuance</summary><div class="disclosure-body">
             <p>Mining hashes an 80-byte Bitcoin-compatible header twice with SHA256. A result is valid when it is at most the required target <code>T</code>. A smaller target means higher difficulty.</p>
-            <p>Expected work is <code>floor(2²⁵⁶ / (T + 1))</code>, rounded down to an integer. A block creates that many raw hash units. Nodes follow the valid chain with the greatest sum of this work.</p>
+            <p>Expected work is <code>floor(2²⁵⁶ / (T + 1))</code>, rounded down to an integer. A block creates one monetary atom per complete 10¹⁵ units of expected work. Any remainder below one petahash is ignored. Nodes follow the valid chain with the greatest sum of this work.</p>
             <p id="guide-difficulty"></p>
           </div></details>
           <details class="guide-section guide-disclosure disclosure"><summary>Blocks and validation</summary><div class="disclosure-body">

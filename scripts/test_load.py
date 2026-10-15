@@ -43,6 +43,9 @@ def prepare_load(port, key, rounds, block_limit, transactions=TRANSACTIONS_PER_W
     status = rpc(port, 'status')
     return {'initial_height': initial['height'], 'initial_phase': initial['phase'], 'mined_blocks': mined, 'height': status['height'], 'phase': status['phase'], 'required_ordinary': str(required), 'funded_ordinary': str(ordinary)}
 
+from fixture_support import require_test_work
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('manifest', type=Path)
@@ -57,6 +60,7 @@ def main():
     manifest = json.loads(args.manifest.read_text(encoding='utf-8-sig'))
     nodes = manifest['nodes']
     port = nodes[0]['rpc_port']
+    fixture_mode = require_test_work(rpc(port, 'config'))
     key = nodes[0]['public_key']
     session = http(port, '/api/session')
     assert session['wallet_enabled'] and session['public_key'] == key, 'Start the audit network with -SeedWallets.'
@@ -145,7 +149,7 @@ def main():
         assert 'fee_market' not in status
         empty_rates.append(rate)
     print('PASS loaded and empty blocks preserve the governed fee rate', flush=True)
-    report = {'passed': True, 'node_sha256': hashlib.sha256(Path(manifest['executable']).read_bytes()).hexdigest(), 'transactions': transactions * args.rounds, 'setup': setup, 'empty_block_minimum_rates': empty_rates, 'rounds': batches, 'elapsed_seconds': round(time.monotonic() - started, 2), 'final_status': rpc(port, 'status')}
+    report = {**fixture_mode, 'passed': True, 'node_sha256': hashlib.sha256(Path(manifest['executable']).read_bytes()).hexdigest(), 'transactions': transactions * args.rounds, 'setup': setup, 'empty_block_minimum_rates': empty_rates, 'rounds': batches, 'elapsed_seconds': round(time.monotonic() - started, 2), 'final_status': rpc(port, 'status')}
     args.report.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
 if __name__ == '__main__':
     main()

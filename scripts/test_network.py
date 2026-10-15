@@ -48,6 +48,9 @@ def target(bits):
     exponent, mantissa = (bits >> 24, bits & 8388607)
     return mantissa << 8 * (exponent - 3) if exponent >= 3 else mantissa >> 8 * (3 - exponent)
 
+from fixture_support import require_test_work
+
+
 class Audit:
 
     def __init__(self, manifest):
@@ -59,6 +62,7 @@ class Audit:
         assert self.session['wallet_enabled'] and self.session['public_key'] == self.key, 'This audit needs a fresh network started with -SeedWallets.'
         self.checks = []
         self.config = rpc(self.port, 'config')
+        self.fixture_mode = require_test_work(self.config)
 
     def check(self, description):
         self.checks.append(description)

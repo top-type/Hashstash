@@ -70,6 +70,7 @@ try {
     & $Executable init --preset slow --hashrate $ExpectedHashrate --config $configPath | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Initial hashrate calibration failed.' }
     $configuration = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+    if ($configuration.test_work) { throw 'Rental mining requires production issuance. Supply a normal build without test-fixtures.' }
     $configuration.network = 'hashstash-rental-' + $suffix
     # The initial work estimate seeds timestamp DAA; it is not an easing floor.
     Save-Manifest $configPath $configuration

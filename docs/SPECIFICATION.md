@@ -8,9 +8,9 @@ This document describes the current rules. The [consensus format](CONSENSUS.md) 
 
 An account is identified by a 32-byte BIP340 public key and holds spendable hashes and stash shares. Its nonce counts outgoing transactions and prevents a signed transaction from being spent twice. A transaction requires the sender's signature, exact next nonce, full chain identity, an ancestor block reference and a positive lifetime measured from that block. If the reference is block 100 and the lifetime is 2, inclusion is valid in blocks 101–102. A reference removed by a reorganization is invalid on that branch. The reference and lifetime are signed and cannot slide forward during retries. Payments credit the exact signed recipient amount; the signed fee is charged separately. Stash cannot be transferred between accounts.
 
-Each canonical non-genesis block creates `floor(2^256 / (target + 1))` raw hash atoms. This is the expected number of hashing attempts represented by its required target, rounded down. Actual attempts are not measurable from the resulting proof. Losing blocks receive no reward. Nodes select the valid branch with greatest accumulated expected work and retain their current tip on equality.
+Each canonical non-genesis block contributes `W = floor(2^256 / (target + 1))` expected hashing attempts. It creates `floor(W / 10^15)` atoms: one atom per whole petahash of expected work, discarding any smaller fraction for that block. A block below one petahash issues zero atoms. Total issuance adds the independently rounded rewards of canonical blocks. Actual attempts are not measurable from a proof. Losing blocks receive no reward. Nodes select the valid branch with greatest accumulated physical expected work and retain their current tip on equality; monetary rounding never changes fork choice.
 
-One displayed hash equals 10^18 raw hash atoms; one displayed stash equals 10^36 raw share atoms. RPC and CLI use integer atoms. Mining work and hashrate use EH and EH/s. Display units do not change consensus arithmetic.
+One displayed hash equals 1,000 raw hash atoms; one displayed stash equals 1,000 raw share atoms. RPC and CLI use integer atoms. Mining work and hashrate use EH and EH/s. Display units do not change consensus arithmetic.
 
 ## 2 Starting the reserve
 
@@ -25,7 +25,7 @@ curve mass M = d
 depositor's stash increases by q * d
 ```
 
-The fixed genesis parameter `q = Config.share_scale` defaults to 10^18 raw shares per raw hash. The opening ratio is 1 and the opening marginal price is `1/q`. Under the standard display units, one displayed hash initially obtains one displayed stash, excluding fees. Subsequent deposits and withdrawals use the current curve and require their owner's signature.
+The fixed genesis parameter `q = Config.share_scale` defaults to one raw share per raw hash. The opening ratio is 1 and the opening marginal price is `1/q`. Under the standard display units, one displayed hash initially obtains one displayed stash, excluding fees. Subsequent deposits and withdrawals use the current curve and require their owner's signature.
 
 Fee revenue waits outside an empty or flat reserve. A decision requires an eligible auction winner; a grant must be fully backed at activation.
 

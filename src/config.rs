@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 /// An empty block must be able to create its miner account.
 pub const MIN_GOVERNED_BLOCK_BYTES: u64 = crate::fees::ACCOUNT_WEIGHT;
 
+/// One spendable monetary atom represents one petahash of expected work.
+pub const WORK_PER_ATOM: u64 = 1_000_000_000_000_000;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -66,6 +69,10 @@ pub const PARAMETERS: [Parameter; 9] = [
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub network: String,
+    /// Explicit fixture denomination. Rejected by builds without test-fixtures.
+    /// It changes the chain identity and never changes proof of work or fork weight.
+    #[serde(default)]
+    pub test_work: bool,
     pub genesis_time: u32,
     pub initial_bits: u32,
     pub limit_bits: u32,
@@ -89,6 +96,7 @@ impl Config {
     pub fn devnet() -> Self {
         Self {
             network: "hashstash-devnet".into(),
+            test_work: cfg!(feature = "test-fixtures"),
             genesis_time: 1_770_000_000,
             initial_bits: 0x207fffff,
             limit_bits: 0x207fffff,
@@ -101,7 +109,7 @@ impl Config {
             share_bits: 512,
             max_integer_bits: 8192,
             quote_scale: Amount::from(10u32).pow(30),
-            share_scale: Amount::from(10u32).pow(18),
+            share_scale: Amount::one(),
             auction_timeout: 128 * 15,
             initial: Settings {
                 block_bytes: 16_384,
@@ -135,6 +143,15 @@ impl Config {
     }
     pub fn progress_increment(&self, settings: &Settings) -> u64 {
         settings.interval
+    }
+    /// Raw expected hashes per monetary atom. The production denomination is
+    /// fixed; only an explicitly different fixture chain can use one-work atoms.
+    pub fn work_per_atom(&self) -> Result<Amount> {
+        ensure!(
+            !self.test_work || cfg!(feature = "test-fixtures"),
+            "test_work requires an explicit test-fixtures build"
+        );
+        Ok(Amount::from(if self.test_work { 1 } else { WORK_PER_ATOM }))
     }
     pub fn governance_parameters(&self) -> Vec<Parameter> {
         PARAMETERS.to_vec()
@@ -214,6 +231,7 @@ impl Config {
         self.validate_governance_settings_at(&changed, clock)
     }
     pub fn validate(&self) -> Result<()> {
+        let work_per_atom = self.work_per_atom()?;
         ensure!(
             self.genesis_time < u32::MAX,
             "genesis timestamp is exhausted"
@@ -254,7 +272,8 @@ impl Config {
         );
         ensure!(!self.quote_scale.is_zero(), "invalid quote precision");
         self.validate_governance_settings_at(&self.initial, 0)?;
-        let max_issued = Amount::from(self.max_height) * (Amount::one() << 255usize);
+        let max_issued =
+            Amount::from(self.max_height) * ((Amount::one() << 255usize) / work_per_atom);
         ensure!(
             max_issued.bits() <= self.money_bits,
             "supply range too small"

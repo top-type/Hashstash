@@ -189,7 +189,7 @@
         [tx.fee_estimated ? 'Current minimum fee' : 'Minimum fee', tx.minimum_fee !== null && tx.minimum_fee !== undefined ? cell => amount(cell, tx.minimum_fee) : undefined],
         ['Above minimum', tx.extra_fee !== null && tx.extra_fee !== undefined ? cell => amount(cell, tx.extra_fee) : undefined],
         ['Expiry block', grouped(tx.expiry_height)],
-        ['Nonce', grouped(tx.nonce)],
+        ['Transaction number', grouped(tx.nonce)],
         ['Outcome', operation.outcome ? String(operation.outcome).toUpperCase() : undefined],
         ['Settlement', effects[tx.settlement?.effect]],
         ['Resolved outcome', tx.settlement?.resolved_outcome ? String(tx.settlement.resolved_outcome).toUpperCase() : undefined],
@@ -217,13 +217,13 @@
         if (data.pass_account) {
           for (const [label, account, marked, withdrawal] of [['PASS', data.pass_account, data.pass_stash_value_hash, data.pass_stash_withdrawal_hash], ['FAIL', data.account, data.stash_value_hash, data.stash_withdrawal_hash]]) {
             const outcome = add(parent, 'section', 'explorer-account-outcome'); add(outcome, 'h3', '', label);
-            record(outcome, [['hashes', cell => amount(cell, account.ordinary)], ['stash', cell => amount(cell, account.shares, 'stash')], ['Marked value', marked ? cell => amount(cell, marked.numerator, 'hash', marked.denominator) : undefined], ['Withdrawal value', withdrawal !== undefined ? cell => amount(cell, withdrawal) : undefined]]);
+            record(outcome, [['hashes', cell => amount(cell, account.ordinary)], ['stash', cell => amount(cell, account.shares, 'stash')], ['Estimated stash value', marked ? cell => amount(cell, marked.numerator, 'hash', marked.denominator) : undefined], ['Withdrawal before fees', withdrawal !== undefined ? cell => amount(cell, withdrawal) : undefined]]);
           }
         }
         record(parent, [
-          ['Stash marked value', !data.pass_account && data.stash_value_hash ? cell => amount(cell, data.stash_value_hash.numerator, 'hash', data.stash_value_hash.denominator) : undefined],
-          ['Stash withdrawal value', !data.pass_account && data.stash_withdrawal_hash !== undefined ? cell => amount(cell, data.stash_withdrawal_hash) : undefined],
-          ['Nonce', grouped(data.account.nonce)],
+          ['Estimated stash value', !data.pass_account && data.stash_value_hash ? cell => amount(cell, data.stash_value_hash.numerator, 'hash', data.stash_value_hash.denominator) : undefined],
+          ['Stash withdrawal before fees', !data.pass_account && data.stash_withdrawal_hash !== undefined ? cell => amount(cell, data.stash_withdrawal_hash) : undefined],
+          ['Transaction counter', grouped(data.account.nonce)],
         ]);
       }
       if (data.pending?.length) transactions(panel('Pending transactions'), data.pending);

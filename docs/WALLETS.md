@@ -52,13 +52,15 @@ If the proposal reaches a decision, PASS escrows the combined amount. If PASS wi
 
 ## Governance settings
 
-**Target block interval** accepts whole seconds from 1 through 60. **Miner fee share** accepts a whole percentage from 0 through 100; the revenue receives the remainder. **PASS margin** accepts percentages in 0.01% steps, including zero and values above 100%. The active decision and rest period keep their frozen settings; approved changes affect the following cycle. Capacity, minimum fee rate and phase-duration controls propose halving or doubling the current value. The minimum fee rate is raw hash atoms per 1,024 transaction weight, initially one; block usage does not adjust it. Phase durations are scheduled seconds, so changing the block interval adjusts their number of blocks automatically. Grants are fully escrowed when a decision starts. Protocol validation checks necessary capacity, grant-budget and deadline constraints.
+**Target block interval** accepts whole seconds from 1 through 60. **Miner fee share** accepts a whole percentage from 0 through 100; the revenue receives the remainder. **PASS margin** accepts percentages in 0.01% steps, including zero and values above 100%, up to the protocol's unsigned 64-bit basis-point limit. The active decision and rest period keep their frozen settings; approved changes affect the following cycle. Capacity, minimum fee rate and phase-duration controls propose halving or doubling the current value. Block capacity must stay between 2 KiB and 32 MiB. The minimum fee rate is raw hash atoms per 1,024 transaction weight, initially one; block usage does not adjust it. Phase durations are scheduled seconds, so changing the block interval adjusts their number of blocks automatically. Decision duration must exceed the block interval.
+
+These ranges and change steps are enforced by the protocol. The node also checks representable deadlines and, for grants, backing and any enabled grant limits. Grants are fully escrowed when a decision starts. See the [parameter rules](CONSENSUS.md#transactions-and-parameters) for the exact limits.
 
 Offline review shows the exact old and proposed values and units, including every digit of a margin percentage. The signer validates structural encodings; the node checks the proposal against the current settings and phase before accepting it.
 
-## Stash from the start
+## Deposits and withdrawals
 
-Mining rewards are ordinary hashes. Account balances stay ordinary until their owner signs a deposit or spends them. Deposits and withdrawals are available during Rest, Auction and Governance. The first deposit starts the reserve with one raw hash creating `Config.share_scale` raw stash units at a flat price. The initial rest period delays proposal submission only.
+Deposits exchange hashes for stash; withdrawals burn stash and return hashes. During Rest and Auction, trades use the shared reserve. During Governance, each trade selects the PASS or FAIL reserve. A deposit into an empty reserve opens a flat curve at the configured share scale.
 
 Outside governance, a Stash withdrawal can pay its fee from the returned hashes. Preparing or signing a transaction does not freeze its balances, quote or inclusion conditions.
 
@@ -84,14 +86,14 @@ Choose **Export watch-only account** to save the watch-only descriptor. Copy onl
 
 ## Prepare, sign, broadcast
 
-1. In the watch-only interface, use Send, Stash, or governance forms as usual. **Prepare transaction** opens an unsigned export. Copy it or download its file.
+1. In the watch-only interface, use Payments, Stash, or Governance forms. **Prepare transaction** opens an unsigned export. Copy it or download its file.
 2. Bring the export to the cold computer. Import or paste it, then choose **Review**. The tool decodes the transaction itself and displays every signed field. Hash amounts, fees, and minimums use exact hash decimals with every signed raw hash atom preserved; Stash quantities use exact stash decimals with every share atom preserved. Raw share atoms remain in the collapsed technical details.
 3. Choose **Sign transaction**, then copy or export the signed result.
-4. On the online computer, open **Send & receive → Broadcast signed transaction**, paste or import the signed result, and choose **Broadcast**.
+4. On the online computer, open **Payments → Advanced → Broadcast signed transaction**, paste or import the signed result, and choose **Broadcast**.
 
 The signer checks the transaction format and matching sender. It cannot check live balances, governance state, or whether a nonce or expiry is still usable; the online node validates those when broadcasting and including the transaction. Editing or replacing the unsigned input clears its previous review. Signing consumes that review.
 
-Both modes offer raw broadcast. Transaction expiry is configurable under **Send & receive → Transaction expiry** in blocks and defaults to 100.
+Both hot and watch-only wallets offer this broadcast control. Transaction expiry is configurable under **Payments → Advanced → Transaction expiry** in blocks and defaults to 100.
 
 ## Advanced startup options
 

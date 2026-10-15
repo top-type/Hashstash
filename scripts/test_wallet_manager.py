@@ -18,13 +18,13 @@ from test_wallet_cli import REPO, transfer_operation, digest, request, rpc
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--node', type=Path, default=REPO / 'target/release/hashstash.exe')
-    parser.add_argument('--cold', type=Path, default=REPO / 'target/release/hashstash-cold.exe')
+    parser.add_argument('--node', type=Path, default=REPO / 'target/release' / ('hashstash.exe' if os.name == 'nt' else 'hashstash'))
+    parser.add_argument('--cold', type=Path, default=REPO / 'target/release' / ('hashstash-cold.exe' if os.name == 'nt' else 'hashstash-cold'))
     parser.add_argument('--report', type=Path, default=REPO / 'work/wallet-manager-report.json')
     args = parser.parse_args()
     args.node, args.cold = (args.node.resolve(), args.cold.resolve())
-    scratch = REPO.parents[1] / 'work'
-    scratch.mkdir(exist_ok=True)
+    scratch = REPO / 'work'
+    scratch.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix='wallet-manager-', dir=scratch)).resolve()
     assert directory.is_relative_to(scratch.resolve())
     vectors = json.loads((REPO / 'tests/data/passphrase-v1.json').read_text(encoding='utf-8'))['vectors']

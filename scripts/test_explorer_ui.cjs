@@ -107,7 +107,7 @@ async function run() {
   await h.navigate('#explorer?account=' + address);
   assert.match(h.content.textContent, /0\.000000000000000002 stash/); checks++;
   assert.match(h.content.textContent, /Mining reward/); checks++;
-  assert.match(h.content.textContent, /Stash marked value0\.000000000000003 hash/); checks++;
+  assert.match(h.content.textContent, /Estimated stash value0\.000000000000003 hash/); checks++;
   h.replies.explorer_account.pass_account = { ordinary: '2000', shares: '2000000000000000000', nonce: 1 };
   h.replies.explorer_account.protocol_version=26;
   h.replies.explorer_account.account={ordinary:'7000',shares:'1000000000000000000',nonce:2};

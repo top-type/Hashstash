@@ -14,7 +14,7 @@ The current release supports protocol 26. A fresh network has a different chain 
 
 ## Wallet use
 
-Use **Copy address** on Wallet or Send & receive. Checksummed recipients must match the connected network. Send, encrypted Mail, grant proposals and Watch account require a checksummed address. Raw public keys remain in private backups and technical interfaces. Explicit imports of older public-key descriptor files remain supported and are converted into addresses for the connected chain.
+Use **Copy address** on Wallet or Payments. Checksummed recipients must match the connected network. Payments, encrypted Mail, grant proposals and Watch account require a checksummed address. Raw public keys remain in private backups and technical interfaces. Explicit imports of public-key descriptor files are converted into addresses for the connected chain.
 
 The offline signer obtains its network from a local configuration, a pasted chain ID, or the public descriptor exported under Explorer → Network → Identity. No node connection is needed. Its transaction review displays sender and recipient addresses derived from the actual signed body. Selecting another network invalidates any previous review.
 

@@ -12,6 +12,7 @@ import collections
 import datetime
 import hashlib
 import json
+import os
 from pathlib import Path
 import socket
 import struct
@@ -447,10 +448,11 @@ def run(executable):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--executable", type=Path, default=ROOT / "bin" / "hashstash.exe")
-    parser.add_argument("--report", type=Path, default=ROOT / "docs" / "stratum-wire-check.json")
+    parser.add_argument("--executable", type=Path, default=ROOT / "target" / "release" / ("hashstash.exe" if os.name == "nt" else "hashstash"))
+    parser.add_argument("--report", type=Path, default=ROOT / "work" / "stratum-wire-check.json")
     options = parser.parse_args()
     report = run(options.executable.resolve())
+    options.report.parent.mkdir(parents=True, exist_ok=True)
     options.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(f"Stratum wire: {report['assertions']} assertions passed; {len(report['checks'])} checks; {report['elapsed_seconds']} seconds.")
     print(f"Report: {options.report}")

@@ -57,7 +57,7 @@ async function run(){
   eq(rows.map(row=>row.children[0].textContent),['Available','PASS','FAIL']);
   ok(rows.every(row=>!row.textContent.includes('hash')&&!row.textContent.includes('stash')),'amounts do not repeat their column units');
   eq(h.get('overview-total-pass')['aria-label'],amounts.formatHash('1500'),'compact Home balances retain accessible units');
-  eq(h.get('overview-total').hidden,true);eq(h.get('overview-total-pass').textContent,amounts.formatHash('1500').replace(/ hash$/,''),'PASS total includes its own cash once');eq(h.get('overview-total-fail').textContent,amounts.formatHash('900').replace(/ hash$/,''),'FAIL total includes its own cash once');ok(h.get('governance-outcome-help').textContent.includes('only the winner survives'));
+  eq(h.get('overview-total').hidden,true);eq(h.get('overview-total-pass').textContent,amounts.formatHash('1500').replace(/ hash$/,''),'PASS total includes its own cash once');eq(h.get('overview-total-fail').textContent,amounts.formatHash('900').replace(/ hash$/,''),'FAIL total includes its own cash once');ok(h.get('governance-outcome-help').textContent.includes('balances continue from the winning side'));
   h.currentSnapshot.pass.account.ordinary='100';await h.refresh();eq(h.get('send-available').textContent,amounts.formatHash('100'),'smaller PASS replaces default FAIL as payment ceiling');
   h.currentSnapshot.pass.account.ordinary='9007199254740993';h.currentSnapshot.fail.account.ordinary='9007199254740994';await h.refresh();ok(h.get('send-available').title.startsWith('0.009007199254740993 hash'),'ceiling remains exact beyond JS safe integers');
  }

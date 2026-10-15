@@ -1,58 +1,80 @@
-# Hashstash 0.34.0 validation
+# Validation guide
 
-This is a historical record, retained with its original results and subsequent review notes. The repository now contains version 0.36.0; the totals below do not claim that version was rerun against every historical check. Referenced `work/...` receipts belong to the original private workspace and are not distributed with the source. See [the current development commands](../README.md#develop-and-test) to repeat the maintained checks.
+Run checks from the repository root using the source and lockfiles you intend to ship. Record the commit, operating system, compiler versions, commands, failures and skips with the results. A passing run applies to that build and platform; it does not establish results for another release or deployment.
 
-Validation covers immediate trading from genesis, reserve accounting, governance and the current record domains. Transactions share the governed block capacity. Grant lists have no independent recipient-count cap: their signed bytes and prepaid execution weight must fit the proposal block.
+## Build and core checks
 
-Run `cargo test --all-targets --locked`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo fmt --check`, and `node scripts/test_all_frontend.cjs` from the project root. Maintained Python tests use the rebuilt executable selected by `HASHSTASH_TEST_BINARY`. Independent network scenarios use disposable loopback chains.
+Install the [build prerequisites](../README.md) first. The Rust build needs a C compiler and linker compatible with the selected Rust target. Windows GNU builds need the matching MinGW tools on `PATH`; MSVC builds need the Visual C++ build tools.
 
-The baseline full local run on October 15, 2026 passed these checks. Each Rust total is one complete all-target run; the separate release benchmark repeats an existing test and is not added to the total.
+```text
+cargo build --release --locked --bins
+cargo test --all-targets --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo fmt --check
+node scripts/test_all_frontend.cjs
+```
 
-| Check | Result |
+The Rust command runs library, binary and integration tests. Some tests launch temporary local nodes or exercise large grant lists and can take several minutes. Keep the complete output: a total from one test executable is not the total for the all-target run.
+
+The frontend runner discovers the maintained JavaScript suites and fails if its suite list is incomplete. It covers address and amount handling, signing, transaction review, wallet state, governance views, fees, quote refreshes, Explorer, Chat, Mail, faucet and mixer interfaces. Browser mocks and cryptographic fixtures exercise logic; they do not replace a manual browser check of layout and interaction.
+
+## Python checks
+
+Point `HASHSTASH_TEST_BINARY` at the executable just built. Without it, the installed-CLI compatibility test skips rather than validating that interface.
+
+PowerShell:
+
+```powershell
+$env:HASHSTASH_TEST_BINARY = (Resolve-Path .\target\release\hashstash.exe).Path
+python -B -m unittest discover -s scripts -p 'test_*.py'
+```
+
+Bash:
+
+```bash
+HASHSTASH_TEST_BINARY="$PWD/target/release/hashstash" \
+  python3 -B -m unittest discover -s scripts -p 'test_*.py'
+```
+
+Discovery runs the Python unit tests, including activity planning, custody and retry rules, campaign completion checks, and rental-monitor parsing. Several `test_*.py` files are standalone integration programs rather than unittest suites; discovery alone does not run their scenarios.
+
+## What the regression tests cover
+
+| Area | Representative tests |
 | --- | --- |
-| Rust, Windows | 391 tests passed; no failures or skips |
-| Rust, Linux | 391 tests passed; no failures or skips |
-| Frontend | 24 suites, 15,007 assertions passed |
-| Python unit discovery with rebuilt CLI | 142 tests passed, no skips |
-| Wallet and address integration | 28 checks passed |
-| Adversarial wallet validation | 44 checks passed |
-| Encrypted-mail wire integration | 16 checks passed |
-| Stratum wire integration | 24 scenarios, 202 assertions passed |
-| Independent reserve network | 11 checks passed |
-| Independent adversarial economics | 8 checks passed |
-| Clippy and formatting | Windows all-target warnings denied; formatting check passed |
-| Release executables | Windows and Linux builds passed |
-| Windows launchers | 62 checks across five suites; rental-version guard and 15 script parse checks passed |
-| Linux launchers and installer preflights | 46 launcher, 12 node installer and 7 mixer installer checks passed |
-| Three-node load | 3,072 transactions in 12 waves; 66.4-67.2% execution-weight occupancy; balances, fees and node agreement verified |
-| Restart after load | All three nodes reopened at height 306 with identical tip, state root, balances and governance |
+| Issuance, canonical work and timestamp difficulty | [canonical work](../tests/canonical_work.rs), [timestamp DAA](../tests/timestamp_daa.rs), [reorganization](../tests/reorg_stress.rs) |
+| Reserve trades, integer rounding and revenue | [dynamic curve](../tests/dynamic_curve.rs), [revenue buffer](../tests/revenue_buffer.rs), [empty genesis](../tests/open_genesis.rs) |
+| Grant funding, outcome selection and atomic payouts | [multiple recipients](../tests/multi_grants.rs), [half-reserve grant](../tests/half_reserve_grant.rs), [automatic outcomes](../tests/automatic_outcomes.rs) |
+| Governed settings, exact fees and capacity | [parameters](../tests/governance_parameters.rs), [fees](../tests/exact_fees.rs), [total fee allocation](../tests/governed_total_fees.rs), [block selection](../tests/selection_budget.rs) |
+| Canonical encoding and signing | [codec vectors](../tests/codec_vectors.rs), [browser vectors](../tests/browser_wallet_vectors.rs), [cold wallet](../tests/cold_wallet.rs), [wallet formats](../tests/wallet_formats.rs) |
+| Peer authentication, discovery and hostile input | [authenticated transport](../tests/peer_transport_authenticated.rs), [discovery](../tests/peer_discovery.rs), [hostile network input](../tests/network_hostile.rs) |
+| Mining protocol and share accounting | [Stratum shares](../tests/stratum_shares.rs), [adversarial mining](../tests/mining_adversarial.rs) |
+| Explorer, public RPC and application data | [snapshot history](../tests/snapshot_history.rs), [public web](../tests/public_web.rs), [Chat RPC](../tests/explorer_chat_rpc.rs), [Mail index](../tests/explorer_mail.rs) |
+| Controller signing boundaries and campaign decisions | [controller tests](../scripts/test_chain_activity.py), [planning tests](../scripts/test_activity_plan.py), [campaign tests](../scripts/test_pass_campaign.py) |
 
-Rust documentation tests ran on both platforms and collected zero examples. All six Linux shell scripts passed Bash syntax checks. The browser cryptography bundle reproduced byte-for-byte from its installed pinned dependencies.
+The executable tests and their assertions define the coverage. Public fixture keys are deterministic test inputs and must never hold real funds. Test vectors prove agreement on specific inputs; they do not by themselves establish interoperability with every external implementation.
 
-Grant tests cover canonical ordering, duplicates, aggregate funding and budgets, upfront recipient work, miner overlap, exact PASS payments, FAIL with no payments, atomic rejection, rollback and deterministic replay. The largest capacity-derived list has 31,714 recipients; the next recipient is rejected. Settlement is tested over 10,000 existing accounts with an actual 2,048-byte closing block body fully occupied by ordinary transaction data. Mandatory settlement does not consume that block's ordinary capacity.
+## Isolated process and network scenarios
 
-Capacity checks cover transactions larger than the former 4 KiB limit, a real browser signature over 256 KiB of data, large cold-signer imports, governed capacity reductions, peer relay, and historical messages after a capacity reduction. RPC proposal pages are bounded before generic JSON allocation; wallet snapshots omit full pending payloads, while hex retrieval preserves complete signed records. Paging tests check that no overflow row is skipped or repeated.
+The [local testnet guide](TESTNET.md) describes creating a disposable three-node network with its own configuration, databases, keys and ports. Use the manifest from that fixture for scripts that accept a manifest. These scripts deliberately submit transactions, mine easy-target blocks or create competing branches; never point them at a live chain.
 
-The reserve-network scenarios cover immediate voluntary trading, fee conservation, waiting revenue, a buffered grant that resolves as a price tie, a reserve-funded grant paying every recipient, and exact rollback and replay across competing branches. Browser signing checks use an independent encoder and reject changed recipients, amounts, ordering and stale asynchronous reviews.
+| Program | Purpose and required inputs |
+| --- | --- |
+| [test_network.py](../scripts/test_network.py) | End-to-end transactions, governance, relay and reorganization; takes a fixture manifest and an optional report path |
+| [test_reserve_network.py](../scripts/test_reserve_network.py) | Reserve, revenue and grant accounting across nodes; takes a fixture manifest and required report path |
+| [test_economic_adversarial.py](../scripts/test_economic_adversarial.py) | Specific adversarial economic scenarios; takes a fixture manifest and required report path |
+| [test_load.py](../scripts/test_load.py) | Transaction waves, occupancy and conservation; takes a fixture manifest, required report path and bounded workload options |
+| [test_stratum_wire.py](../scripts/test_stratum_wire.py) | Stratum protocol scenarios using an explicitly selected node executable and report path |
+| [test_wallet_adversarial.py](../scripts/test_wallet_adversarial.py) | Wallet and cold-signer rejection scenarios; select the rebuilt executables, disposable directory, unused ports and report path |
 
-This run found and fixed CRLF line endings in the Linux deployment files and stale assumptions in the load-test setup. Linux deployment text now uses LF, with a repository line-ending policy and archive verification. No Rust, consensus or wallet implementation changes were required.
+Read each program's `--help` before running it. Pass explicit paths for generated reports and fixture directories. Use a fresh fixture for independent scenarios whose setup expects an empty chain. Stop test nodes through their owning launcher and manifest when finished.
 
-An immediate pre-restart comparison failed without retaining its differing snapshots. A subsequent probe captured nodes at heights 306/303/303 converging to identical state within 0.5 seconds; the controlled restart then preserved exact state. The original comparison's exact cause was not established retrospectively.
+PowerShell launcher tests are separate from Rust, JavaScript and Python unittest discovery. They cover process ownership, configuration and startup/shutdown behavior; inspect their inputs and run them only in a disposable local environment. Linux shell and service-installation checks likewise require the intended platform. Report unrun platform checks as unrun.
 
-Workspace logs and receipts are under `work/local-test-current`. Python and independent network checks used Windows node SHA256 `c08a6534b5e2e98e94a14f9cd683b14520ff65d930f7d3589af5f615493f281a`. Disposable processes were stopped and generated fixture databases and keys removed. Cloud services were not accessed or changed.
+## Interpreting results
 
-The subsequent local correctness review fixed mixer status after refunds: unfilled payout slots are cancelled when the refund confirms, and the queue excludes refunded or completed requests. Its regression first reproduced three phantom queued outputs after one payout and two refunds, then passed with exact customer balances and the earned service fee preserved. Block-persistence tests interrupt three SQL write stages and verify unchanged history after reopening and successful identical retry.
+For a protocol change, check the relevant state transition, rejection cases, deterministic replay and reorganization behavior, then run the full Rust suite. For wallet changes, check both hot and offline signing paths and rerun the frontend suites. For wire-format changes, verify canonical vectors and peer/CLI interoperability as well as local round trips.
 
-The Mail sender-verification gap was reproduced and fixed locally. The feed now carries canonical signed transaction bytes. Before decryption or cache advancement, the browser verifies BIP340 signatures, transaction IDs, chain identity and the signed sender, nonce, ciphertext and operation. Cache restoration repeats verification; unsigned checkpoints are not reused. Tests cover fabricated feed metadata, unsigned or damaged records, cache corruption, all operation layouts, Rust/browser signing interoperability, large grant carriers and derived-index rebuilds. This authenticates the publishing key but does not independently prove chain inclusion, confirmation counts or completeness of the node's history. Browser assets remain trusted.
+Review dependency advisories against the exact locked versions separately from functional tests. An empty advisory result is time-dependent and does not establish that dependencies or their uses are safe.
 
-Further pagination checks fixed account-event cursors above 100,000 and block transaction offsets above the former hardcoded 4,096 limit. Existing response count and byte bounds remain. Four new mixer tests cover 11 injected SQL failures across deposits, outgoing journals, payouts, refunds and expiry; each checks rollback, reopening and retry. These simulate statement failures, not disk corruption or power loss.
-
-After these changes, Windows and Linux each passed all 400 Rust tests with no failures or skips. All 24 frontend suites passed (15,357 assertions); Windows Clippy with warnings denied and formatting passed. Both platforms' release executables and local packages were rebuilt. Current receipts are under `work/bug-hunt-current`; the baseline integration receipts remain under `work/local-test-current`.
-
-The dependency review queried the npm registry for 29 locked browser packages and OSV for 225 crates.io versions. The browser audit reported no known advisories. Rustls was updated from 0.23.45 to 0.23.46; the precise lockfile update changes only that package. The subsequent OSV check no longer matches the four rustls advisories. Bincode 1.3.3 retains [an informational unmaintained notice](https://rustsec.org/advisories/RUSTSEC-2025-0141.html); replacing its protocol encoding requires a separate review. Cargo-audit was unavailable, so this is package/version advisory matching, not complete reachability analysis or a guarantee of safety. Evidence and official release sources are in `work/bug-hunt-current/dependencies`.
-
-The broad security review remains incomplete. Automated cybersecurity filtering interrupted the earlier delegated consensus, network and wallet reviews. The specifically requested Mail remediation and the local correctness checks above are complete; they do not substitute for a complete independent security audit. Cloud services were not accessed or changed.
-
-A same-chain deployment preflight found that an idle genesis was counted as ASERT delay: the day spent waiting before mining would have reduced the second block to the easiest target. ASERT now anchors each branch to its first mined block while retaining the economic schedule. The first two blocks use initial difficulty. Delayed-start, competing-anchor, reorganization, reopen and interval-governance regressions passed, followed by 402 Rust tests on each platform, 24 frontend suites (15,357 assertions), Clippy, formatting and both release builds. Receipts are under `work/testnet-current`. This changes consensus validation: all existing height-zero nodes must be upgraded before any mining starts. It does not change ASERT behavior after later mining outages.
-
-Local tests do not establish production security or physical ASIC delivery.
+Local tests establish only their exercised behavior. They do not prove economic stability, resistance to coordinated trading, sustained ASIC delivery, hardware location, production uptime or an independent security audit. Deployment claims require observations from the actual processes and chain being described. See [review scope and limitations](AUDIT.md).

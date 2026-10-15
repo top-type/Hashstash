@@ -88,6 +88,4 @@ The isolated browser fixture can be generated with:
 cargo run --example explorer_fixture -- <new-output-directory>
 ```
 
-It mines only its own local test chain and creates a transfer with uninterpreted data, a completed governance decision, and a prepared pending transaction. It does not contact public peers or the rented mining experiment.
-
-The address-only index schema retires former alias tables when rebuilding an older index. Historical transaction bytes remain ordinary transaction data; they are not registrations or account labels. This derived-index change does not change protocol 26, chain identity, canonical transaction execution, account nonces, fees or balances.
+It mines only its own local test chain and creates a transfer with uninterpreted data, a completed governance decision, and a prepared pending transaction. It does not contact public peers.

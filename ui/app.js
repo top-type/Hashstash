@@ -46,7 +46,7 @@
         overview: "Overview",
         wallet: "Wallet",
         stash: "Stash",
-        send: "Send & receive",
+        send: "Payments",
         governance: "Governance",
         chat: "Chat",
         mail: "Mail",
@@ -1097,7 +1097,7 @@
             $(id).title = "Unavailable";
         } else number(id, balance);
         text("overview-cash-label", activeDecision() ? "Available" : "hash");
-        const paymentHelp = activeDecision() ? "Payments debit both outcomes. This is the smaller cash balance, before fees; it is already included in each outcome below." : "Ordinary hashes available before fees.";
+        const paymentHelp = activeDecision() ? "A payment spends hashes in both outcomes. This is the smaller of those balances, before fees." : "Hashes available to spend, before fees.";
         if (activeDecision()) for (const id of [ "overview-cash", "send-available" ]) $(id).title = `${balance === null ? "Unavailable" : formatExactHash(balance)}. ${paymentHelp}`;
         if ($("governance-common-cash")) {
             selectedWallet && balance !== null ? number("governance-common-cash", balance) : text("governance-common-cash", "—");
@@ -1117,7 +1117,8 @@
         const selected = outcome === "Pass" ? state.pass : outcome === "Fail" ? state.fail : state.account;
         stashNumber("stash-total", selected?.account?.shares || "0");
         rational("stash-marked", selected?.stash_value_hash);
-        text("overview-nonce", a ? `Nonce ${commas(a.nonce)}` : "");
+        text("overview-nonce", a ? `Transaction counter ${commas(a.nonce)}` : "");
+        $("overview-nonce").title = "The account's next transaction number. It prevents a signed transaction from being used twice.";
         $("governance-wallet-help").hidden = selectedWallet;
         $("governance-common").hidden = !selectedWallet;
         $("governance-actions").hidden = !selectedWallet;
@@ -1151,7 +1152,7 @@
         const conditional = state.ready && !!activeDecision();
         $("overview-conversion-ordinary").hidden = conditional;
         $("overview-conversion-pass").hidden = $("overview-conversion-fail").hidden = !conditional;
-        const note = "Current marginal price used for total value. Withdrawal proceeds depend on the amount and fees.";
+        const note = "Estimated value uses the current price. Withdrawal proceeds depend on trade size and fees.";
         $("overview-conversion").title = note;
         for (const [id, world] of [ [ "overview-price", state.gov?.world ], [ "overview-price-pass", state.gov?.pass ], [ "overview-price-fail", state.gov?.world ] ]) {
             const available = state.ready && world;
@@ -1819,10 +1820,10 @@
             text(`${id}-ratio`, reserveRatio(world));
             number(`${id}-revenue`, world?.revenue || "0");
         }
-        text("guide-fees", `The rate stays fixed until governance changes it. The entire fee, including any extra, currently goes ${s.settings.miner_fee_percent}% to the miner and ${100 - Number(s.settings.miner_fee_percent)}% to revenue. Governance can also change this split.`);
-        text("guide-proposals", "Governance can approve grants; set the target block time to 1–60 seconds, the miner fee percentage or the required PASS price advantage; and halve or double the minimum fee rate, block size and weight limit, auction lead period, decision duration or rest period.");
-        text("guide-revenue-flow", "Revenue replenishes a curved reserve immediately, raising its reserve ratio toward 100% without changing the current marginal price or stash supply. Any excess waits outside the reserve. At 100%, all new revenue waits.");
-        text("guide-grant-flow", "A grant lists recipients and amounts. At decision start, PASS sets aside their full total from waiting revenue first, then the reserve. A reserve withdrawal lowers the reserve ratio while preserving the current marginal price and stash supply. All listed payments happen together if PASS wins. FAIL keeps its own balances.");
+        text("guide-fees", `Transaction weight determines the minimum fee. Governance sets its rate and the miner's share. The entire fee, including any extra, currently goes ${s.settings.miner_fee_percent}% to the miner and ${100 - Number(s.settings.miner_fee_percent)}% to revenue.`);
+        text("guide-proposals", "A proposal requests a grant or changes one setting. Target block time accepts 1–60 whole seconds; the miner's fee share accepts 0–100%; the PASS margin accepts 0.01% steps. Block capacity, minimum fee rate and the lead, decision and rest periods change by half or double, within the protocol's valid ranges.");
+        text("guide-revenue-flow", "Revenue fills the gap between reserve and curve mass. This raises the reserve ratio toward 100%, making the curve flatter while keeping its current price and stash supply unchanged. Once the gap is filled, further revenue waits outside the reserve.");
+        text("guide-grant-flow", "At the start of a grant decision, PASS sets aside the proposed payments from waiting revenue, then reserve. Drawing from reserve lowers its ratio and makes the curve steeper, while the current price and stash supply stay unchanged. If PASS wins, the recipients receive those payments. If FAIL wins, its reserve and balances continue.");
         text("network-height", commas(s.height));
         number("network-issued", s.issued);
         text("network-clock", protocolDuration(s.clock));
@@ -1830,14 +1831,14 @@
         text("timing-help", "Scheduled time");
         text("governance-common-label", "Available");
         $("governance-common-label").title = "Available for payments, before fees.";
-        const outcomeHelp = "Alternative balances · only the winner survives.";
+        const outcomeHelp = "Two possible outcomes. Your balances continue from the winning side.";
         text("governance-outcome-help", outcomeHelp);
-        text("guide-outcome-balances", "A Stash trade changes the selected outcome's holdings. Payments and fees affect both outcomes and must be affordable in both.");
+        text("guide-outcome-balances", "You can trade stash separately in PASS and FAIL. Payments and fees spend hashes in both, so the amount available for a payment is the smaller hash balance, less its fee.");
         document.querySelectorAll(".outcome-cash-label").forEach(node => {
             node.textContent = "Hashes";
         });
-        text("guide-average", "Each completed block's stash price is weighted by the scheduled seconds it covers. The full decision period counts. The PASS margin, frozen for the decision, is the required price advantage in basis points (1 basis point = 0.01%). PASS requires average(PASS) > average(FAIL) × (1 + margin / 10,000). A tie selects FAIL.");
-        text("guide-clock", "Scheduled time advances by the target block interval with each block. Proposal deadlines and grant-budget periods use this clock. Changing the target changes the number of blocks needed, not the scheduled duration; actual elapsed time may differ. Transaction expiry and confirmations count blocks instead.");
+        text("guide-average", "The average uses each completed block's stash price, weighted by the scheduled seconds it covers, across the full decision. PASS wins when its average exceeds the FAIL average by the required margin. For example, a 5% margin requires PASS to exceed 1.05 times FAIL. Equality means FAIL. The margin is fixed when the decision begins.");
+        text("guide-clock", "Each block advances the governance clock by the target block interval. With a 15-second target, a 900-second decision spans 60 block intervals. Mining can make the actual wait longer or shorter. Auctions, decisions, rest periods and grant budgets use this clock; transaction expiry and confirmations use block counts.");
         text("guide-difficulty", "ASERT, the difficulty-adjustment algorithm, uses block timestamps to aim for the governed average block interval. Only blocks on the accepted chain create new hashes; losing blocks receive no reward.");
         for (const field of [ "reserve", "revenue", "grant_capacity" ]) {
             const node = $(`network-${field}`);
@@ -2365,7 +2366,7 @@
             await navigator.clipboard.writeText(address());
             toast("Address copied.");
         } catch {
-            toast("Copy the address shown in Send & receive.");
+            toast("Copy the address shown in Payments.");
             location.hash = "send";
         }
     }

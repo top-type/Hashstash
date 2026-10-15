@@ -1,6 +1,7 @@
 """Malformed offline exports and cross-network/replay rejection on disposable nodes."""
 import argparse
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -33,11 +34,11 @@ def read_uint(raw, offset):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--directory', type=Path, default=REPO.parents[1] / 'work/wallet-adversarial')
+    parser.add_argument('--directory', type=Path, default=REPO / 'work/wallet-adversarial')
     parser.add_argument('--base-port', type=int, default=28480)
     parser.add_argument('--report', type=Path, default=REPO / 'work/wallet-adversarial-report.json')
-    parser.add_argument('--node', type=Path, default=REPO / 'target/release/hashstash.exe')
-    parser.add_argument('--cold', type=Path, default=REPO / 'target/release/hashstash-cold.exe')
+    parser.add_argument('--node', type=Path, default=REPO / 'target/release' / ('hashstash.exe' if os.name == 'nt' else 'hashstash'))
+    parser.add_argument('--cold', type=Path, default=REPO / 'target/release' / ('hashstash-cold.exe' if os.name == 'nt' else 'hashstash-cold'))
     args = parser.parse_args()
     args.directory.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix='adversarial-', dir=args.directory)).resolve()

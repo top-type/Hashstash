@@ -45,10 +45,10 @@ def transfer_operation(recipient, amount='1'):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--node', type=Path, default=REPO / 'target/release/hashstash.exe')
-    parser.add_argument('--cold', type=Path, default=REPO / 'target/release/hashstash-cold.exe')
+    parser.add_argument('--node', type=Path, default=REPO / 'target/release' / ('hashstash.exe' if os.name == 'nt' else 'hashstash'))
+    parser.add_argument('--cold', type=Path, default=REPO / 'target/release' / ('hashstash-cold.exe' if os.name == 'nt' else 'hashstash-cold'))
     parser.add_argument('--report', type=Path, default=REPO / 'work/wallet-cli-report.json')
-    parser.add_argument('--directory', type=Path, default=REPO.parents[1] / 'work')
+    parser.add_argument('--directory', type=Path, default=REPO / 'work')
     options = parser.parse_args()
     options.node, options.cold = (options.node.resolve(), options.cold.resolve())
     scratch = options.directory.resolve()

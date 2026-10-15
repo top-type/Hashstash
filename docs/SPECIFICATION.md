@@ -6,17 +6,17 @@ This document describes the current rules. The [consensus format](CONSENSUS.md) 
 
 ## 1 Accounts, payments and issuance
 
-An account is keyed by a 32-byte BIP340 public key. Its record contains ordinary hash balance, stash share balance, nonce and epoch. The epoch identifies its materialization context. A transaction requires the sender's signature, exact next nonce, full chain identity and an unexpired inclusive block height. Payments credit the exact signed recipient amount; the signed fee is charged separately. Stash cannot be transferred between accounts.
+An account is identified by a 32-byte BIP340 public key and holds spendable hashes and stash shares. Its nonce counts outgoing transactions and prevents a signed transaction from being spent twice. A transaction requires the sender's signature, exact next nonce, full chain identity and an unexpired inclusive block height. Payments credit the exact signed recipient amount; the signed fee is charged separately. Stash cannot be transferred between accounts.
 
-Each accepted non-genesis block creates `floor(2^256 / (target + 1))` raw hash atoms. This is the expected number of hashing attempts represented by its required target, rounded down. Actual attempts are not measurable from the resulting proof. Only canonical work earns issuance; losing blocks receive no reward. Nodes select the valid branch with greatest accumulated expected work and retain their current tip on equality.
+Each canonical non-genesis block creates `floor(2^256 / (target + 1))` raw hash atoms. This is the expected number of hashing attempts represented by its required target, rounded down. Actual attempts are not measurable from the resulting proof. Losing blocks receive no reward. Nodes select the valid branch with greatest accumulated expected work and retain their current tip on equality.
 
 One displayed hash equals 10^18 raw hash atoms; one displayed stash equals 10^36 raw share atoms. RPC and CLI use integer atoms. Mining work and hashrate use EH and EH/s. Display units do not change consensus arithmetic.
 
 ## 2 Starting the reserve
 
-Genesis has no account balances, reserve, stash or issued hashes. It begins with an ordinary Rest phase that delays the first proposal auction. Mining, payments and Stash trading are available immediately; an account must first obtain hashes to spend or deposit them.
+Genesis starts with empty accounts and reserve, zero stash and zero issued hashes. Its initial Rest phase ends when the scheduled clock reaches the configured rest duration, opening the first proposal auction. Mining creates the hashes that accounts can spend or deposit.
 
-Account hashes never convert automatically. A signed deposit of `d` raw hashes into an empty reserve establishes:
+A signed deposit of `d` raw hashes into an empty reserve establishes:
 
 ```text
 reserve R = d
@@ -25,13 +25,13 @@ curve mass M = d
 depositor's stash increases by q * d
 ```
 
-The fixed genesis parameter `q = Config.share_scale` defaults to 10^18 raw shares per raw hash. The opening ratio is 1 and the opening marginal price is `1/q`. Under the standard display units, one displayed hash initially obtains one displayed stash, excluding fees. Subsequent deposits use the current curve; while it stays flat, buying earlier does not obtain a cheaper rate. Every deposit and withdrawal requires its owner's signature.
+The fixed genesis parameter `q = Config.share_scale` defaults to 10^18 raw shares per raw hash. The opening ratio is 1 and the opening marginal price is `1/q`. Under the standard display units, one displayed hash initially obtains one displayed stash, excluding fees. Subsequent deposits and withdrawals use the current curve and require their owner's signature.
 
-Fee revenue remains outside an empty or flat reserve. Hashes mined at any time are ordinary spendable balances. The first proposal auction opens after the initial rest period, subject to the normal reserve and eligibility requirements for a decision.
+Fee revenue waits outside an empty or flat reserve. Proposal decisions require the configured minimum reserve and an eligible auction winner.
 
 ## 3 The reserve curve
 
-Each world stores:
+Each outcome state, called a world in the implementation, stores:
 
 | Field | Meaning |
 | --- | --- |
@@ -108,7 +108,9 @@ M and S remain unchanged
 
 The reserve shortfall lowers the ratio without changing the marginal price or any account's stash quantity. Waiting revenue is spent first. FAIL has no corresponding grant debit. Recipients cannot spend escrow before resolution. If PASS wins, every listed amount is paid once in the same atomic transition; if FAIL wins, the PASS state is discarded.
 
-Eligibility applies the configured reserve minimum, maximum grant fraction, available backing and remaining period budget to the combined amount G. The budget period begins with the first decision; each period fixes an allowance from the reserve and tracks reserved and spent grants. A proposal's registration does not reserve funding or guarantee eligibility. A grant cannot empty a live curve's reserve. Revenue already inside the reserve is not also available as waiting revenue.
+Eligibility requires the configured reserve minimum and enough backing for the combined amount G. Available backing is waiting revenue plus reserve above the retained minimum. Two optional genesis limits can further restrict G: a fraction of the current reserve per grant, and a remaining allowance for the current budget period. Each fraction is enabled by `0 < numerator < denominator`; exactly `0/0` disables that limit. The supplied presets enable both. These limits cannot be changed by a governance proposal.
+
+Budget periods begin with the first decision and use scheduled seconds. With the period cap enabled, each new period fixes an allowance from the reserve and tracks reserved and spent grants without carrying unused allowance forward. Disabling the cap retains the reservation and spending records but imposes no allowance ceiling. A proposal's registration does not reserve funding or guarantee eligibility. A grant cannot empty a live curve's reserve. Revenue already inside the reserve is not also available as waiting revenue.
 
 Grants reduce withdrawal backing while preserving the price at that moment. Revenue and grants change the curve's shape rather than trading along it. Ordinary trades, revenue transfers and grants conserve existing hashes.
 
@@ -122,14 +124,16 @@ Governance may change one of:
 
 | Setting | Permitted change |
 | --- | --- |
-| Block size and weight limit | Exact half or double |
-| Minimum fee rate | Positive exact half or double |
+| Block size and weight limit | Exact half or double, within 2 KiB through 32 MiB |
+| Minimum fee rate | Positive exact half or double, in raw hash atoms per 1,024 weight |
 | Target block interval | A changed whole second from 1 to 60 |
 | Auction lead, decision duration, rest duration | Positive exact half or double in scheduled seconds |
 | Miner fee percentage | A changed whole percent from 0 to 100 |
-| Required PASS margin | A changed unsigned basis-point value |
+| Required PASS margin | A changed value from 0 through 2^64 − 1 basis points; one basis point is 0.01% |
 
-The reserve ratio is state derived from R and M, not a governed fixed parameter. Issuance, proof of work, authentication, timestamp-validation policy, ASERT half-life and opening share scale remain fixed by the protocol or genesis configuration. Changes must satisfy capacity, arithmetic and deadline bounds. Approved settings activate after rest, with the activating block still using its parent's settings.
+The 60-second interval ceiling and half/double steps are protocol policy choices. The block-capacity range is an implementation resource limit. They are enforced by nodes, not only by the wallet. In addition, all settings and deadlines must fit their integer representation, and decision duration must exceed the target interval so that a later block can accept outcome trades before settlement.
+
+The reserve ratio is state derived from R and M, not a governed fixed parameter. Issuance, proof of work, authentication, timestamp-validation policy, ASERT half-life and opening share scale remain fixed by the protocol or genesis configuration. Approved settings activate after rest, with the activating block still using its parent's settings.
 
 ## 6 PASS and FAIL
 
@@ -195,7 +199,7 @@ Each branch anchors ASERT at its first mined block, excluding the wait between c
 
 ## 10 Authenticated state and execution
 
-Accounts and protocol indexes use persistent authenticated treaps. Keys determine deterministic priorities; map roots are independent of insertion order. Updates copy changed paths and share untouched immutable subtrees. Starting a decision shares a root; settlement selects one. Governance context avoids full account scans at phase boundaries.
+Accounts and protocol indexes use persistent authenticated treaps. Keys determine deterministic priorities; map roots are independent of insertion order. Updates copy changed paths and share untouched immutable subtrees. Starting a decision shares a root; settlement selects one. These operations avoid scanning or rewriting every account at phase boundaries.
 
 Block execution validates its parent, encoding, target and resource limits; advances scheduled time and parent-price integrals; settles a due decision; applies ordered user transactions and fees; pays the mining subsidy and collected miner fees; replenishes reserves from revenue; processes auctions and complete grant escrow; applies due rest activation; and verifies the resulting committed state. Activation and revenue processing are deterministic and operate independently on active outcomes. The exact ordering is defined by the maintained consensus implementation and corresponding integration tests.
 
@@ -212,7 +216,7 @@ account hashes + reserve + waiting revenue + grant escrow
 total stash = sum of account stash
 ```
 
-Curve mass, marginal marked values, price integrals and withdrawal quotes are not additional money pools. Count alternative worlds separately, never together. Materializing an account in its current governance context cannot credit aggregate supply a second time. Reserve, stash and mass are empty together; a nonempty world has M >= R > 0.
+Curve mass, marginal marked values, price integrals and withdrawal quotes are not additional money pools. Count alternative worlds separately, never together: only the selected outcome survives settlement. Reserve, stash and mass are empty together; a nonempty world has M >= R > 0.
 
 Balances, shares, curve state, intermediate arithmetic, price integrals, clocks, deadlines and collection sizes have explicit bounds. Nonces and heights never wrap. Genesis validation ensures the maximum expected-work issuance and opening stash allocation fit configured amounts. Voluntary operations exceeding bounds are rejected. Compact encoding does not remove execution or storage limits.
 
@@ -224,7 +228,7 @@ A block contains the header, height, miner key, state root, eight-byte mining ex
 
 SQLite stores accepted blocks and active-chain metadata transactionally. The node publishes tip and state together. Restart validates history and rebuilds state and derived indexes; history is not pruned. Reorganizations restore every accounting and governance field together and revalidate pending transactions. Neither checkpoint retention nor governance settlement creates finality.
 
-Configured peers exchange bounded compact binary frames carrying canonical records. Block locators find a common ancestor. Optional pinned transport keys authenticate sessions, direction and sequence; pinned mode cannot silently fall back to unauthenticated transport. Authentication does not encrypt traffic or prevent an eclipse by compromised peers or routing. Connection limits, per-IP work budgets, timeouts and bounded decoders constrain local resource use. State, disk history and replay time still grow. RPC and Stratum remain JSON services. See [node operation](RUNNING.md) and [network limits](NETWORK-HARDENING.md).
+Peers exchange bounded compact binary frames carrying canonical records. Block locators find a common ancestor. Nodes can use explicit peers, a closed set of pinned transport identities, or authenticated peer discovery. Authenticated sessions bind messages to their direction and sequence; authenticated modes cannot silently fall back to unauthenticated transport. A discovered public key proves control of that key, not a trusted operator or independent participant. Authentication does not encrypt traffic or prevent an eclipse by compromised peers or routing. Connection limits, per-IP work budgets, timeouts and bounded decoders constrain local resource use. State, disk history and replay time still grow. RPC and Stratum remain JSON services. See [node operation](RUNNING.md) and [network limits](NETWORK-HARDENING.md).
 
 ## 13 Applications and security scope
 

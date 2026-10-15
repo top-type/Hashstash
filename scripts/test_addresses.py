@@ -12,12 +12,14 @@ from test_wallet_cli import REPO, digest, request, rpc
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--node', type=Path, default=REPO / 'target/release/hashstash.exe')
-    parser.add_argument('--cold', type=Path, default=REPO / 'target/release/hashstash-cold.exe')
+    parser.add_argument('--node', type=Path, default=REPO / 'target/release' / ('hashstash.exe' if os.name == 'nt' else 'hashstash'))
+    parser.add_argument('--cold', type=Path, default=REPO / 'target/release' / ('hashstash-cold.exe' if os.name == 'nt' else 'hashstash-cold'))
     parser.add_argument('--report', type=Path, default=REPO / 'work/address-live-report.json')
     args = parser.parse_args()
     args.node, args.cold = (args.node.resolve(), args.cold.resolve())
-    directory = Path(tempfile.mkdtemp(prefix='addresses-', dir=REPO.parents[1] / 'work'))
+    scratch = REPO / 'work'
+    scratch.mkdir(parents=True, exist_ok=True)
+    directory = Path(tempfile.mkdtemp(prefix='addresses-', dir=scratch))
     vectors = json.loads((REPO / 'tests/data/passphrase-v1.json').read_text(encoding='utf-8'))['vectors'][:2]
     processes, logs, checks = ([], [], [])
     started = time.monotonic()

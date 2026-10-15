@@ -1,6 +1,6 @@
 # Review scope and limitations
 
-Hashstash is experimental software. The maintained tests exercise protocol 28 accounting, execution and interfaces. This document describes their scope and the risks those checks do not resolve; it is not an independent audit report.
+Hashstash is experimental software. The maintained tests exercise accounting, execution and interfaces. This document describes their scope and the risks those checks do not resolve; it is not an independent audit report.
 
 Accounting and consensus tests cover conservation in each outcome, deposits into an empty flat reserve, price preservation for protocol reserve movements, directed integer curve bounds, grant eligibility and escrow, PASS/FAIL price comparison, settlement, reorganization and overflow limits. Multi-recipient cases include bounded decoding, canonical recipient ordering, aggregate funding limits, prepaid execution weight, atomic credits and miner-account overlap. The [validation guide](VALIDATION.md) explains how to repeat the maintained checks and record their results.
 
@@ -10,7 +10,7 @@ The flat baseline deliberately permits equal-price outcomes that resolve FAIL. D
 
 Authenticated peers prove possession of transport keys and protect message integrity. They cannot prevent all partitions, compromised peers, eclipse attacks or distributed resource attacks. Discovery can find peers, but a public key alone does not establish an independent or trustworthy operator. Account state, retained history and restart replay still grow.
 
-Difficulty adjustment anchors each branch at its first mined block, so waiting before mining starts does not lower the initial difficulty. Pauses after mining begins do affect ASERT's elapsed time. Timestamp checks constrain the inputs but do not eliminate manipulation. Agreement on a configuration or protocol number alone is insufficient if implementations execute different consensus rules.
+Difficulty adjustment anchors each branch at its first mined block, so waiting before mining starts does not lower the initial difficulty. Pauses after mining begins do affect ASERT's elapsed time. Timestamp checks constrain the inputs but do not eliminate manipulation. Nodes must execute the same consensus rules as well as share the same genesis configuration.
 
 Browser wallets trust the serving origin; stored keys are unencrypted. Public transaction actions and senders remain visible. Mail verifies the publishing transaction signature locally before decrypting contents; inclusion and confirmation counts still depend on the connected node. It does not hide the ledger, and static-key compromise can expose historical mail.
 

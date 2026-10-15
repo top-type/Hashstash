@@ -228,7 +228,7 @@ async fn compact_transaction_worker_roundtrip(mut c: Config, data: Vec<u8>) {
     let job = worker.authorize(true).await;
     assert!(job["params"][4].as_array().unwrap().is_empty());
     let suffix = hex::decode(job["params"][3].as_str().unwrap()).unwrap();
-    assert!(suffix.windows(4).any(|p| p == b"HST6"));
+    assert!(suffix.windows(4).any(|p| p == b"HST!"));
     let target = math::target_from_bits(c.initial_bits).unwrap();
     let a = header(&job, &worker.extra, [1; 4]);
     let b = header(&job, &worker.extra, [2; 4]);

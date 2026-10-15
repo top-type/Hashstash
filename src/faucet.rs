@@ -137,11 +137,6 @@ fn amount(value: &str) -> Result<Amount> {
 fn snapshot_payment_funds(snapshot: &Value) -> Result<Amount> {
     // New outcome balances can differ. The default account is FAIL and must
     // never be mistaken for the amount an ordinary payment can spend in both.
-    ensure!(
-        snapshot["status"]["protocol_version"].as_u64()
-            == Some(u64::from(crate::config::PROTOCOL_VERSION)),
-        "unsupported protocol version"
-    );
     let value = &snapshot["payment_available_hash"];
     amount(value.as_str().context("missing payment balance")?)
 }
@@ -1135,7 +1130,6 @@ mod tests {
     #[test]
     fn faucet_uses_common_payment_capacity_and_fails_closed_without_it() {
         let mut snapshot = json!({
-            "status":{"protocol_version":crate::config::PROTOCOL_VERSION},
             "account":{"account":{"ordinary":"1000"}},
             "pass":{"account":{"ordinary":"250"}},
             "payment_available_hash":"250"
@@ -1148,8 +1142,10 @@ mod tests {
             .unwrap()
             .remove("payment_available_hash");
         assert!(snapshot_payment_funds(&snapshot).is_err());
-        snapshot["status"]["protocol_version"] = json!(13);
-        assert!(snapshot_payment_funds(&snapshot).is_err());
+        for malformed in [json!(250), json!(null), json!("-1"), json!("1.5")] {
+            snapshot["payment_available_hash"] = malformed;
+            assert!(snapshot_payment_funds(&snapshot).is_err());
+        }
     }
 
     #[test]
@@ -1776,7 +1772,7 @@ mod tests {
         let p = &request["params"];
         let result = match request["method"].as_str().unwrap() {
             "snapshot" => {
-                json!({"status":{"protocol_version":crate::config::PROTOCOL_VERSION,"chain_id":hex::encode([7;32]),"height":node.height},"payment_available_hash":"1000000000000000000","account":{"account":{"ordinary":"1000000000000000000","nonce":node.nonce}}})
+                json!({"status":{"chain_id":hex::encode([7;32]),"height":node.height},"payment_available_hash":"1000000000000000000","account":{"account":{"ordinary":"1000000000000000000","nonce":node.nonce}}})
             }
             "preparetransaction" => {
                 let mut operation: Operation =

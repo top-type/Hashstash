@@ -486,7 +486,7 @@ async fn bounded_seeded_peer_mutations_and_invalid_transactions_preserve_state()
         let limits = Limits::from_config(&configuration());
         let mut payload = peer_wire::encode(&PeerPacket::Sync(valid.clone()), limits).unwrap();
         match i % 8 {
-            0 => payload[rng as usize % 8] ^= 1, // wrong transport magic/version
+            0 => payload[rng as usize % 8] ^= 1, // wrong transport magic
             1 => payload[41] = 129,              // excessive locators, before reading their bytes
             2 => payload[74] = 33,               // excessive blocks, before reading any record
             3 => {

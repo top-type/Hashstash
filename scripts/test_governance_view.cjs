@@ -6,7 +6,7 @@ async function run() {
   let checks = 0;
   const h = await harness({ empty: true }), s = h.currentSnapshot;
   const proposal = 'ab'.repeat(32), other = 'cd'.repeat(32), key = '12'.repeat(32);
-  s.config.protocol_version=28; s.config.quote_scale = '1000000000000000000000000000000000000';
+  s.config.quote_scale = '1000000000000000000000000000000000000';
   Object.assign(s.status.settings, { pass_margin_bps: 0, });
   const decision = { id: 'ef'.repeat(32), proposal_id: proposal, round: 0, started: 240, duration: 240,
     start_integral: '0', proposal: { Grant: { payments: [{recipient:key,amount:'10'}] } } };

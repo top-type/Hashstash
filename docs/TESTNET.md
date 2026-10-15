@@ -1,6 +1,6 @@
 # Local testnet
 
-The maintained presets and launcher use Hashstash 0.38.0 protocol 28. A fresh launch creates a distinct configuration and database.
+A fresh launch creates a distinct configuration and database.
 
 ```powershell
 .\Start-Testnet.ps1 -Fresh -NoBrowser

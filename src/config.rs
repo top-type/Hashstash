@@ -3,7 +3,6 @@ use anyhow::{Context, Result, ensure};
 use num_traits::{One, Zero};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 28;
 /// An empty block must be able to create its miner account.
 pub const MIN_GOVERNED_BLOCK_BYTES: u64 = crate::fees::ACCOUNT_WEIGHT;
 
@@ -61,7 +60,6 @@ pub const PARAMETERS: [Parameter; 8] = [
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub protocol_version: u32,
     pub network: String,
     pub genesis_time: u32,
     pub initial_bits: u32,
@@ -85,8 +83,7 @@ impl Config {
     /// Local test difficulty; never a public mainnet preset.
     pub fn devnet() -> Self {
         Self {
-            protocol_version: PROTOCOL_VERSION,
-            network: "hashstash-devnet-v28".into(),
+            network: "hashstash-devnet".into(),
             genesis_time: 1_770_000_000,
             initial_bits: 0x207fffff,
             limit_bits: 0x207fffff,
@@ -115,7 +112,7 @@ impl Config {
     }
     pub fn testnet() -> Self {
         let mut config = Self::devnet();
-        config.network = "hashstash-testnet-v28".into();
+        config.network = "hashstash-testnet".into();
         config.auction_timeout = 32 * 15;
         config.initial.rest = 32 * 15;
         config.initial.duration = 16 * 15;
@@ -123,7 +120,7 @@ impl Config {
     }
     pub fn slow_testnet() -> Self {
         let mut config = Self::testnet();
-        config.network = "hashstash-slow-testnet-v28".into();
+        config.network = "hashstash-slow-testnet".into();
         config.auction_timeout = 240 * 15;
         config.initial.lead = 20 * 15;
         config.initial.rest = 720 * 15;
@@ -206,10 +203,6 @@ impl Config {
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.protocol_version == PROTOCOL_VERSION,
-            "unsupported protocol version"
-        );
-        ensure!(
             self.genesis_time < u32::MAX,
             "genesis timestamp is exhausted"
         );
@@ -280,7 +273,7 @@ impl Config {
         codec::encode(self)
     }
     pub fn chain_id(&self) -> Hash {
-        crypto::tagged_hash("Hashstash/chain/v28", &self.consensus_bytes())
+        crypto::tagged_hash("Hashstash/chain", &self.consensus_bytes())
     }
     pub fn check_amount(&self, x: &Amount) -> Result<()> {
         ensure!(x.bits() <= self.money_bits, "HASH range exceeded");

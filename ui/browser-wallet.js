@@ -185,8 +185,6 @@
   }
   function expectedBytes(expected) {
     if (!expected || typeof expected !== 'object') fail('Transaction intent is required.');
-    const version = Number(u64(expected.protocol_version, 'Protocol version'));
-    if (version !== 28) fail('Unsupported protocol version.');
     const nonce = u64(expected.nonce, 'Nonce'), expiry = u64(expected.expiry_height, 'Expiry height');
     if (nonce === MAX_U64 || !expiry) fail('Invalid nonce or expiry height.');
     if (expected.current_height !== undefined && expiry <= u64(expected.current_height)) fail('Transaction has expired.');
@@ -210,7 +208,7 @@
     const bytes = fromHex(raw, undefined, 'Signed transaction');
     if (bytes.length <= 64) fail('Invalid signed transaction.');
     const body = bytes.subarray(0, -64), decoded = decodeBody(body);
-    if (!noble.schnorr.verify(bytes.subarray(-64), tagged('Hashstash/Transaction/v26', body), bytes32(decoded.sender))) fail('Invalid transaction signature.');
+    if (!noble.schnorr.verify(bytes.subarray(-64), tagged('Hashstash/Transaction', body), bytes32(decoded.sender))) fail('Invalid transaction signature.');
     const txid = hex(noble.sha256(noble.sha256(bytes)));
     for (const field of ['chain_id','sender','data_hex']) {
       if (expected[field] !== undefined && expected[field] !== decoded[field]) fail('Signed transaction does not match the message.');
@@ -336,7 +334,7 @@
         verifyUnsigned(envelope,expected);
         const secret=secretBytes(w.private_key), aux=random(32);
         try {
-          const body=fromHex(envelope.body), signature=noble.schnorr.sign(tagged('Hashstash/Transaction/v26',body),secret,aux);
+          const body=fromHex(envelope.body), signature=noble.schnorr.sign(tagged('Hashstash/Transaction',body),secret,aux);
           const raw=concat(body,signature);
           guard(read(),expected);
           return {raw:hex(raw),transaction_id:hex(noble.sha256(noble.sha256(raw)))};

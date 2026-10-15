@@ -42,7 +42,7 @@ class RentalMonitorTests(unittest.TestCase):
             self.assertEqual(method, "snapshot")
             self.assertEqual(params, {"key": key})
             value = {"status": {"chain_id": selected["chain_id"], "height": 0, "tip": "genesis",
-                                "state_root": "root", "issued": "0", "protocol_version": 28,
+                                "state_root": "root", "issued": "0",
                                 "settings": {"interval": 15}},
                      "mining": {"payout_public_key": key, "accepted_shares": "7", "blocks_found": "0"},
                      "account": {"public_key": key, "ordinary": str(port)}}

@@ -792,7 +792,6 @@
             nonce: nonce.toString(),
             expiry_height: expiryHeight.toString(),
             chain_id: state.status.chain_id,
-            protocol_version: state.config.protocol_version,
             data_hex: dataFields.data_hex || "",
             wallet_id: state.session.wallet_id,
             wallet_revision: state.session.wallet_revision
@@ -848,7 +847,7 @@
         form.id === "trade-form" && (values.all = state.tradeAll);
         form.id === "send-form" && (values.quoteIdentity = sendIdentity());
         values.nonce = nextNonce().toString();
-        form.id === "propose-form" && values.type === "parameter" && (values.currentSetting = [ state.config?.protocol_version, state.status?.settings?.[settings[values.parameter]?.[0]] ]);
+        form.id === "propose-form" && values.type === "parameter" && (values.currentSetting = [ state.status?.settings?.[settings[values.parameter]?.[0]] ]);
         return JSON.stringify([ walletIdentity(), state.session?.wallet_enabled, $("wallet-expiry").value, state.status?.chain_id, phaseName(), activeDecision()?.id, state.gov?.phase?.Auction?.round, form.id === "trade-form" ? state.trade : null, values ]);
     }
     function bindForm(id, operationBuilder) {
@@ -875,7 +874,7 @@
         });
     }
     function feeIdentity(form) {
-        return JSON.stringify([ submissionIdentity(form), state.status?.tip, state.status?.state_root, state.status?.height, state.status?.fee_policy, state.config?.protocol_version, state.status?.settings?.miner_fee_percent, state.status?.settings?.minimum_fee_rate ]);
+        return JSON.stringify([ submissionIdentity(form), state.status?.tip, state.status?.state_root, state.status?.height, state.status?.fee_policy, state.status?.settings?.miner_fee_percent, state.status?.settings?.minimum_fee_rate ]);
     }
     function checkQuoteSnapshot(result) {
         if (!/^[0-9a-f]{64}$/.test(result.tip) || !/^[0-9a-f]{64}$/.test(result.state_root) || !Number.isSafeInteger(result.height) || result.height < 0) throw new Error("Invalid quote context.");
@@ -1644,7 +1643,7 @@
         const records = state.proposals.filter(p => round === void 0 || p.proposal.round === round);
         text("proposal-heading", name === "Rest" ? "Proposal history" : "Proposals");
         text("proposal-count", `${records.length} proposal${records.length === 1 ? "" : "s"}`);
-        if (!renderChanged(list, [ name, phase.leader, phase.proposal_id, key(), records, records.map(record => savedDescription(record.proposal.description, proposalExplanations.get(`${state.status.chain_id}:${hex(record.id)}`))), state.config?.protocol_version, state.status?.settings ])) return;
+        if (!renderChanged(list, [ name, phase.leader, phase.proposal_id, key(), records, records.map(record => savedDescription(record.proposal.description, proposalExplanations.get(`${state.status.chain_id}:${hex(record.id)}`))), state.status?.settings ])) return;
         list.replaceChildren();
         if (!records.length) {
             const empty = append(list, "div", "panel empty-state");
@@ -1801,7 +1800,7 @@
         text("network-root", s.state_root);
         $("network-height").href = `#explorer?block=${encodeURIComponent(s.height)}`;
         const dl = $("network-settings");
-        if (renderChanged(dl, [ state.config?.protocol_version, s.settings ])) {
+        if (renderChanged(dl, [ s.settings ])) {
             dl.replaceChildren();
             for (const [parameter, [field, label, unit]] of Object.entries(settings)) {
                 if (!parameterAvailable(parameter)) continue;
@@ -1970,7 +1969,7 @@
             state.status && status.chain_id !== state.status.chain_id && resetContext();
             const previousDecision = hex(activeDecision()?.id), previousNonce = nextNonce();
             const changedState = state.status?.tip !== status.tip || state.status?.state_root !== status.state_root || state.status?.height !== status.height || previousDecision !== hex(gov.phase?.Governance?.id);
-            if (config.protocol_version !== 28) throw new Error("Unsupported protocol version.");
+            if (!config || typeof config.network !== "string" || !config.network.length || !/^[1-9][0-9]*$/.test(String(config.quote_scale)) || !/^[1-9][0-9]*$/.test(String(config.share_scale)) || !/^[0-9]+$/.test(String(config.auction_timeout))) throw new Error("Invalid network configuration.");
             state.config = config;
             settings.BlockBytes[1] = "Block capacity";
             settings.BlockBytes[2] = "weight";
@@ -2164,7 +2163,7 @@
     }
     function sendIdentity() {
         const v = formValues($("send-form"));
-        return JSON.stringify([ walletIdentity(), state.config?.protocol_version, state.status?.chain_id, state.status?.tip, state.status?.state_root, state.status?.height, state.status?.settings?.miner_fee_percent, state.status?.settings?.minimum_fee_rate, v.recipient, v.amount, v.extra_fee, v.data_format, v.data_text, v.data_hex, attachmentIdentity($("send-form")), $("wallet-expiry").value ]);
+        return JSON.stringify([ walletIdentity(), state.status?.chain_id, state.status?.tip, state.status?.state_root, state.status?.height, state.status?.settings?.miner_fee_percent, state.status?.settings?.minimum_fee_rate, v.recipient, v.amount, v.extra_fee, v.data_format, v.data_text, v.data_hex, attachmentIdentity($("send-form")), $("wallet-expiry").value ]);
     }
     async function previewSend() {
         const version = ++sendVersion, identity = sendIdentity(), form = $("send-form"), v = formValues(form);

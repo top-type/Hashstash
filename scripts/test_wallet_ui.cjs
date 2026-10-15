@@ -148,7 +148,7 @@ function snapshot(chain = 'a'.repeat(64)) {
 
   const settings = { block_bytes: 1048576, interval: 15, lead: 60, rest: 480, duration: 240, miner_fee_percent:50, pass_margin_bps:0, minimum_fee_rate:1 };
 
-  const config = { protocol_version:28, network: 'hashstash-ui-test', auction_timeout: 480, quote_scale: '1000000', share_scale: '1000000000000000000' };
+  const config = { network: 'hashstash-ui-test', auction_timeout: 480, quote_scale: '1000000', share_scale: '1000000000000000000' };
 
 
 
@@ -158,7 +158,7 @@ function snapshot(chain = 'a'.repeat(64)) {
 
     config,
 
-    status: { protocol_version:28, fee_policy:{minimum_fee_rate:'1',fee_scale:1024,account_weight:1024}, chain_id: chain, tip: 'b'.repeat(64), state_root: 'c'.repeat(64), height: 20, clock: 300, time_unit:'seconds', clock_basis:'target_interval', issued: '2000', settings, mempool: 0, reserve: world.reserve, curve_mass: world.curve_mass, shares: world.shares, revenue: '0' },
+    status: { fee_policy:{minimum_fee_rate:'1',fee_scale:1024,account_weight:1024}, chain_id: chain, tip: 'b'.repeat(64), state_root: 'c'.repeat(64), height: 20, clock: 300, time_unit:'seconds', clock_basis:'target_interval', issued: '2000', settings, mempool: 0, reserve: world.reserve, curve_mass: world.curve_mass, shares: world.shares, revenue: '0' },
 
     governance: { phase: { Auction: { round: 0, opened: 0, leader: null, lead_since: 0 } }, clock: 300, time_unit:'seconds', clock_basis:'target_interval', frozen: settings, settings, world, pass: null },
 
@@ -742,7 +742,10 @@ async function run() {
  h.handlers.snapshot=()=>response({error:{message:'offline'}});await h.refresh();eq(h.get('sidebar-height-value').textContent,'—');eq(h.get('network-status').dataset.ready,'false');
  delete h.handlers.snapshot;s.status.height=1234;await h.refresh();eq(h.get('sidebar-height-value').textContent,'1,234');eq(h.get('sidebar-height').href,'#explorer?block=1234');
  s.status.height=1229;s.status.tip='e'.repeat(64);await h.refresh();eq(h.get('sidebar-height-value').textContent,'1,229');
- s.config.protocol_version=18;await h.refresh();eq(h.get('connection-label').textContent,'Offline');ok(h.get('global-alert').textContent.includes('Unsupported protocol'));
+ h.handlers.snapshot=p=>response({result:{...h.snapshotResult(p),status:{...s.status,chain_id:'f'.repeat(64)}}});
+ await h.refresh();eq(h.get('connection-label').textContent,'Offline');ok(h.get('global-alert').textContent.includes('Address network changed'),h.get('global-alert').textContent);
+ delete h.handlers.snapshot;s.config.quote_scale='0';await h.refresh();eq(h.get('connection-label').textContent,'Offline');ok(h.get('global-alert').textContent.includes('Invalid network configuration'),h.get('global-alert').textContent);
+ s.config.quote_scale='1000000';await h.refresh();
  {
   const personal=await harness(),state=personal.currentSnapshot;
   const pending=(sender,amount,nonce=0)=>({body:{sender,nonce,operation:{TransferExact:{recipient:publicKey,amount}}}});

@@ -1,9 +1,7 @@
 //! Cross-language browser signing regression. Requires Node.js on PATH (or
 //! HASHSTASH_NODE); no server, funded wallets or external network are involved.
 use hashstash::{
-    codec,
-    config::PROTOCOL_VERSION,
-    crypto,
+    codec, crypto,
     types::{Amount, Operation, Outcome, Parameter, Proposal, TransactionBody},
     wallet,
 };
@@ -88,7 +86,7 @@ fn browser_signatures_verify_in_rust_for_every_current_operation() {
     ];
     let mut rows = Vec::new();
     let mut bodies = Vec::new();
-    let mut add = |operation: Operation, version: u64, data: Vec<u8>| {
+    let mut add = |operation: Operation, data: Vec<u8>| {
         let mut operation_json = serde_json::to_value(&operation).unwrap();
         string_u64_fields(&mut operation_json);
         let body = TransactionBody {
@@ -105,19 +103,15 @@ fn browser_signatures_verify_in_rust_for_every_current_operation() {
         let mut expected = json!({
             "chain_id":hex::encode(body.chain_id), "sender":hex::encode(sender),
             "nonce":body.nonce.to_string(), "expiry_height":body.expiry_height.to_string(),
-            "protocol_version":version, "operation":operation_json, "data_hex":hex::encode(data)
+            "operation":operation_json, "data_hex":hex::encode(data)
         });
         expected["fee"] = json!(body.fee.to_str_radix(10));
         rows.push(json!({"secret":hex::encode(secret),"envelope":unsigned,"expected":expected}));
         bodies.push(body);
     };
     for operation in operations {
-        add(operation.clone(), u64::from(PROTOCOL_VERSION), Vec::new());
-        add(
-            operation,
-            u64::from(PROTOCOL_VERSION),
-            (0..=255).cycle().take(3000).collect(),
-        );
+        add(operation.clone(), Vec::new());
+        add(operation, (0..=255).cycle().take(3000).collect());
     }
     for parameter in [
         Parameter::BlockBytes,
@@ -144,7 +138,6 @@ fn browser_signatures_verify_in_rust_for_every_current_operation() {
                 },
                 support: large.clone(),
             },
-            u64::from(PROTOCOL_VERSION),
             Vec::new(),
         );
     }

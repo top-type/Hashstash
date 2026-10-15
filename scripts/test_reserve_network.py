@@ -106,7 +106,6 @@ class ReserveAudit(Audit):
     def assert_supply(self, port=None):
         port = port or self.port
         state, governance = rpc(port, 'status'), rpc(port, 'governance')
-        assert state['protocol_version'] == 28
         assert state['time_unit'] == 'seconds' and state['clock_basis'] == 'target_interval'
         assert state['height'] <= state['clock'] <= state['height'] * 60
         for outcome in (['Pass', 'Fail'] if governance['pass'] is not None else [None]):
@@ -307,7 +306,6 @@ class ReserveAudit(Audit):
 
     def run(self):
         assert self.status()['height'] == 0, 'audit requires a fresh disposable network'
-        assert self.config['protocol_version'] == 28
         self.open_curve()
         self.payments()
         self.buffered_revenue()
@@ -321,7 +319,7 @@ class ReserveAudit(Audit):
                 'height': final['height'], 'issued_HASH': final['issued'], 'tip': final['tip'],
                 'state_root': final['state_root'], 'reserve': final['reserve'],
                 'curve_mass': final['curve_mass'], 'revenue': final['revenue'],
-                'protocol_version': self.config['protocol_version'],
+
                 'node_sha256': hashlib.sha256(Path(self.manifest['executable']).read_bytes()).hexdigest()}
 
 

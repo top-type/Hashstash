@@ -51,7 +51,7 @@ The result envelope always contains `chain_id`, `tip`, `height`, and `state_root
 | `explorer_block` | Exactly one of `height` or `hash`; `limit`, `tx_offset` | `block`, `transactions`, `next_tx_offset`; transactions in block order |
 | `explorer_transactions` | `limit`, `before` | `transactions`, `pending`, `next_cursor`; canonical transactions descending by height and position |
 | `explorer_transaction` | `txid` | `transaction`; canonical inclusion takes precedence, then the current mempool, then a previously indexed detached inclusion |
-| `explorer_account` | `address`, `limit`, `before` | `protocol_version`, `account`, `pass_account`, `payment_available_hash`, `stash_value_hash`, `stash_withdrawal_hash`, corresponding optional `pass_…` valuations, `history`, `pending`, `next_cursor` |
+| `explorer_account` | `address`, `limit`, `before` | `account`, `pass_account`, `payment_available_hash`, `stash_value_hash`, `stash_withdrawal_hash`, corresponding optional `pass_…` valuations, `history`, `pending`, `next_cursor` |
 | `explorer_governance` | `limit`, optional `proposal`, and the three independent cursors below | `phase`, `current`, `proposals`, `decisions`, `contributions` |
 | `explorer_chat` | `limit`, optional `cursor` | `items`, `pending`, `next_cursor`, `available`, `ready`, `indexed_height`, `message_bytes` |
 | `explorer_mail` | `limit`, optional paired `after`, `anchor` | Ascending confirmed `messages`, `next_cursor`, `scan_cursor`; global stream, no recipient fields or address filter |

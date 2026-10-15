@@ -21,7 +21,7 @@ class PlannerTest(unittest.TestCase):
                        "last_action_height": 1, "last_chat_at": 900,
                        "history": [], "cursor": 0}
         self.snapshot = {
-            "status": {"chain_id": CHAIN, "protocol_version": 28, "height": 100, "clock": 1500,
+            "status": {"chain_id": CHAIN, "height": 100, "clock": 1500,
                        "phase": "rest", "decision": None, "auction_round": None,
                        "settings": {"interval": 15}},
             "governance": {"world": {"reserve": str(10**18), "grant_capacity": str(10**17)}},
@@ -151,12 +151,10 @@ class PlannerTest(unittest.TestCase):
         self.policy["pending_public_keys"] = REGISTRY["fra"]
         self.assertIsNone(self.choose())
 
-    def check_timestamp_chain_outcomes(self, version):
-        self.snapshot["status"]["protocol_version"] = version
+    def check_timestamp_chain_outcomes(self):
         self.snapshot["status"]["settings"] = {"interval": 15}
         self.assertIsNotNone(self.choose())
         self.full_cash_governance(substantive=True)
-        self.snapshot["status"]["protocol_version"] = version
         self.snapshot["status"]["settings"] = {"interval": 137}
         self.accounts[1]["pending"] = self.accounts[2]["pending"] = True
         action = self.choose()
@@ -164,12 +162,12 @@ class PlannerTest(unittest.TestCase):
         for kind in ("Unknown", "NotAnOperation"):
             self.assertEqual(planner.cash_guard(self.snapshot, self.accounts[0], {kind: {}}, 1),
                              "unsupported_activity_operation")
-        for unsupported in (27, 29):
-            self.snapshot["status"]["protocol_version"] = unsupported
+        for invalid in ("unknown", None):
+            self.snapshot["status"]["phase"] = invalid
             self.assertIsNone(self.choose())
 
     def test_current_timestamp_chain_preserves_outcome_rules(self):
-        self.check_timestamp_chain_outcomes(28)
+        self.check_timestamp_chain_outcomes()
 
 
     def test_fee_cap_and_no_spending_last_fee_reserve(self):
@@ -554,7 +552,6 @@ class PlannerTest(unittest.TestCase):
             self.substantive_governance()
         else:
             self.phase("governance")
-        self.snapshot["status"]["protocol_version"] = 28
 
     def confirm_full_cash(self, action):
         actor = self.accounts[action["sender_index"]]
@@ -585,7 +582,6 @@ class PlannerTest(unittest.TestCase):
 
     def test_current_trade_policy_pays_full_fee_and_does_not_govern_fee_parameter(self):
         self.full_cash_governance(substantive=True)
-        self.snapshot['status']['protocol_version'] = 28
         self.accounts[1]['pending'] = self.accounts[2]['pending'] = True
         rpc = self.rpc
         for percent in (0, 37, 100):

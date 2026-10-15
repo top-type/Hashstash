@@ -10,7 +10,7 @@ const walk = node => [node,...(node.children||[]).flatMap(walk)];
 const hash = value => BigInt(value).toString(16).padStart(64,'0');
 async function setup(options = {}) {
   const h = await harness({chat:true,...options}), s=h.currentSnapshot;
-  s.config.protocol_version=28; s.status.settings.block_bytes=16384;
+  s.status.settings.block_bytes=16384;
 
   s.status.fee_policy={minimum_fee_rate:'1',fee_scale:1024,account_weight:1024};
   h.feed={chain_id:s.status.chain_id,tip:s.status.tip,height:s.status.height,ready:true,items:[],pending:[],next_cursor:null,message_bytes:16384};

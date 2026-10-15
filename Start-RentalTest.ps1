@@ -70,7 +70,6 @@ try {
     & $Executable init --preset slow --hashrate $ExpectedHashrate --config $configPath | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Initial hashrate calibration failed.' }
     $configuration = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
-    if ($configuration.protocol_version -ne 26) { throw 'The rental launcher requires the current protocol v26.' }
     $configuration.network = 'hashstash-rental-' + $suffix
     # The initial work estimate seeds timestamp DAA; it is not an easing floor.
     Save-Manifest $configPath $configuration

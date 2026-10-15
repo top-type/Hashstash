@@ -7,7 +7,7 @@ use anyhow::{Result, ensure};
 use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey, schnorr::Signature};
 use sha2::{Digest, Sha256};
 
-pub const TRANSACTION_TAG: &str = "Hashstash/Transaction/v26";
+pub const TRANSACTION_TAG: &str = "Hashstash/Transaction";
 
 pub fn sha256d(bytes: &[u8]) -> Hash {
     Sha256::digest(Sha256::digest(bytes)).into()

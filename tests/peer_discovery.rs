@@ -80,7 +80,7 @@ async fn join_from_one_dns_seed_learn_another_survive_seed_loss_and_restart_with
     until(|| verified(&c, ab)).await;
     assert_eq!(
         c.peer_status().unwrap()["transport"],
-        "authenticated-discovery-v2"
+        "authenticated-discovery"
     );
     sa.stop().await;
     drop(a);

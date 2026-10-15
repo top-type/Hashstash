@@ -1,6 +1,6 @@
-# Hashstash consensus format · protocol 28 · implementation 0.38.0
+# Hashstash consensus format
 
-This implementation accepts protocol 28 configurations and records. The complete genesis configuration fixes the chain identity and must match the database. [The specification](SPECIFICATION.md) describes economic transitions.
+The complete genesis configuration fixes the chain identity and must match the database. [The specification](SPECIFICATION.md) describes economic transitions.
 
 ## Canonical encoding
 
@@ -22,9 +22,9 @@ One displayed hash is 10^18 raw hash atoms; one displayed stash is 10^36 share a
 
 ## Genesis configuration
 
-The chain ID is `tagged_hash("Hashstash/chain/v28", codec::encode(&config))`. Every Config field participates in declaration order. Config and Settings reject unknown JSON fields. The encoded configuration fixes the chain identity, and transaction signatures bind that identity.
+The chain ID is `tagged_hash("Hashstash/chain", codec::encode(&config))`. Every Config field participates in declaration order. Config and Settings reject unknown JSON fields. The encoded configuration fixes the chain identity, and transaction signatures bind that identity.
 
-Config fields are: protocol_version, network, genesis_time, initial_bits, limit_bits, daa_half_life, timestamp_window, future_seconds, max_signatures, max_height, money_bits, share_bits, max_integer_bits, quote_scale, share_scale, auction_timeout, initial. The source types define each width and amount annotation.
+Config fields are: network, genesis_time, initial_bits, limit_bits, daa_half_life, timestamp_window, future_seconds, max_signatures, max_height, money_bits, share_bits, max_integer_bits, quote_scale, share_scale, auction_timeout, initial. The source types define each width and amount annotation.
 
 Settings fields are block_bytes, minimum_fee_rate, interval, lead, rest, duration, miner_fee_percent, pass_margin_bps, in that order. The first six are u64; interval, lead, rest and duration use seconds. Config's auction_timeout also uses seconds. Both percentages are Option<u64> and must be present. MinerFeePercent is a whole percentage from 0 through 100; PassMarginBps is an unsigned basis-point margin. Config.share_scale is a positive, fixed genesis amount defining the initial raw stash per raw hash. It is not governable.
 
@@ -32,7 +32,7 @@ The three maintained presets use a 15-second target, 900-second ASERT half-life,
 
 ## Transactions and parameters
 
-A signed transaction contains its body followed by exactly 64 BIP340 signature bytes, with no signature-length prefix. Body order is chain_id[32], sender[32], nonce:u64, fee:Amount, expiry_height:u64, operation, data:Vec<u8>. The nonce and expiry use compact unsigned encoding. The body fee is the exact total charged when included. The BIP340 signing message is tagged_hash("Hashstash/Transaction/v26", codec::encode(body)), binding every body field and the full chain identity. Transaction IDs are SHA256d of the complete signed record. Expiry is inclusive.
+A signed transaction contains its body followed by exactly 64 BIP340 signature bytes, with no signature-length prefix. Body order is chain_id[32], sender[32], nonce:u64, fee:Amount, expiry_height:u64, operation, data:Vec<u8>. The nonce and expiry use compact unsigned encoding. The body fee is the exact total charged when included. The BIP340 signing message is tagged_hash("Hashstash/Transaction", codec::encode(body)), binding every body field and the full chain identity. Transaction IDs are SHA256d of the complete signed record. Expiry is inclusive.
 
 The operation is a direct six-variant enum followed by a length-prefixed data byte vector, including a zero length for empty data. Transaction data has no consensus text format; all bytes count toward the block-byte and fee-weight limits. Chat interprets readable UTF-8, and [Mail](MAIL.md) defines an encrypted application envelope.
 
@@ -90,9 +90,9 @@ Grant eligibility requires positive, representable payments fully backed by avai
 
 ## State commitments
 
-World root is tagged_hash("Hashstash/world/v26", encode((accounts.root(), reserve, shares, revenue, grant_escrow, price_integral, curve_mass, account_cash, account_shares))). Each dynamic curve field is committed.
+World root is tagged_hash("Hashstash/world", encode((accounts.root(), reserve, shares, revenue, grant_escrow, price_integral, curve_mass, account_cash, account_shares))). Each dynamic curve field is committed.
 
-The state root is tagged_hash("Hashstash/state/v28", encode((A,B))). A contains chain_id, height, clock, issued, settings, frozen, world.root(), optional alternative.root(), phase. Clock is cumulative scheduled seconds. B contains proposal/support/round/ranking roots, auction_escrow, last_round, last_epoch. Field and tuple ordering is consensus-critical.
+The state root is tagged_hash("Hashstash/state", encode((A,B))). A contains chain_id, height, clock, issued, settings, frozen, world.root(), optional alternative.root(), phase. Clock is cumulative scheduled seconds. B contains proposal/support/round/ranking roots, auction_escrow, last_round, last_epoch. Field and tuple ordering is consensus-critical.
 
 Tree domains are Hashstash/TreeEmpty, Hashstash/TreeValue, Hashstash/TreePriority and Hashstash/TreeNode. Protocol roots commit to authenticated map roots rather than their in-memory representation. All changes, including fees and protocol payments, must reproduce the declared state root.
 
@@ -100,7 +100,7 @@ Tree domains are Hashstash/TreeEmpty, Hashstash/TreeValue, Hashstash/TreePriorit
 
 The Bitcoin-style header is 80 bytes: version:u32 at offset 0, previous digest[32] at 4, Merkle root[32] at 36, timestamp:u32 at 68, bits:u32 at 72, nonce:u32 at 76. Integers are little endian; digest bytes are raw. Fixed version bits are 0x20000005, with rolling mask 0x1fffe000. Outside that mask the version must match exactly.
 
-The sole Merkle leaf is a Bitcoin-serialized system coinbase. It has transaction version 1, one zero-prevout input (index and sequence 0xffffffff), a minimally encoded height plus PUSH8 and eight extranonce bytes, one zero-value output, and locktime 0. Its output script is OP_RETURN, PUSH68, ASCII HST6, miner key[32], commitment[32]. The commitment is tagged_hash("Hashstash/block-commitment/v26", encode((transactions,state_root))). There is no optional proof field or padding. Coinbase transaction counts and script lengths use canonical CompactSize.
+The sole Merkle leaf is a Bitcoin-serialized system coinbase. It has transaction version 1, one zero-prevout input (index and sequence 0xffffffff), a minimally encoded height plus PUSH8 and eight extranonce bytes, one zero-value output, and locktime 0. Its output script is OP_RETURN, PUSH68, ASCII HST!, miner key[32], commitment[32]. The commitment is tagged_hash("Hashstash/block-commitment", encode((transactions,state_root))). There is no optional proof field or padding. Coinbase transaction counts and script lengths use canonical CompactSize.
 
 The header Merkle root is SHA256d of this coinbase, so Stratum supplies an empty Merkle branch. The complete ordered signed transaction vector is bound inside the commitment. Verifying that commitment needs the full vector; it does not provide short transaction-inclusion proofs.
 

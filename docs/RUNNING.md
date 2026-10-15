@@ -1,6 +1,6 @@
 # Node operation
 
-Hashstash 0.38.0 accepts protocol 28 configurations and compact binary records. The node requires a 64-bit target. Genesis identifies the chain. A database must use its exact genesis configuration; changing that configuration creates a different identity, affecting addresses, application caches and chain-scoped faucet ledgers.
+The node requires a 64-bit target. Genesis identifies the chain. A database must use its exact genesis configuration; changing that configuration creates a different identity, affecting addresses, application caches and chain-scoped faucet ledgers.
 
 Source builds place executables in `target/release`; packaged releases place them in `bin`. The PowerShell launchers prefer the source build when present. Examples using `bin` assume the packaged layout.
 
@@ -50,7 +50,7 @@ Open discovery can retain known pins: add `--peer-discovery` alongside the dedic
 
 ## Mining and transactions
 
-Stratum V1 serves an HST6 coinbase as the sole Merkle leaf of a Bitcoin-format 80-byte header. External miners supply nonce/extranonce/version rolling and valid timestamps. Current jobs retain their reporting target. Non-block shares are statistics; only accepted canonical work creates hashes. Losing-parent work is rejected. Process counters reset on restart and a found block can later be reorganized out.
+Stratum V1 serves an HST! coinbase as the sole Merkle leaf of a Bitcoin-format 80-byte header. External miners supply nonce/extranonce/version rolling and valid timestamps. Current jobs retain their reporting target. Non-block shares are statistics; only accepted canonical work creates hashes. Losing-parent work is rejected. Process counters reset on restart and a found block can later be reorganized out.
 
 Mempool holds at most 4096 transactions. Selection accepts at most 8192 candidates, verifies each unique candidate once, applies operations atomically with bounded retries, and prioritizes fee rate subject to nonce/state dependencies. A pending transaction is not guaranteed inclusion. The declared exact fee is paid in full and must meet the governed weight-based minimum. All of it is split by the governed miner percentage. Block usage does not change the minimum rate.
 

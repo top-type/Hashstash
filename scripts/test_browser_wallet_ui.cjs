@@ -26,9 +26,6 @@ function fee(h,p) {
 }
 async function setup(options={}) {
   const h=await harness({realWallet:true,publicWeb:true,...options});
-  h.currentSnapshot.config.protocol_version=28;
-
-
   h.currentSnapshot.status.settings.pass_margin_bps=0;
 
 
@@ -88,7 +85,7 @@ async function run() {
   assert.equal(broadcasts(a).length,1,a.get('send-form').querySelector().textContent);checks++;
   const raw=Buffer.from(broadcasts(a)[0].body.params.raw,'hex'),body=raw.subarray(0,-64),signature=raw.subarray(-64);
   assert.equal(raw.length,body.length+64);checks++;
-  const tag=sha(Buffer.from('Hashstash/Transaction/v26')),message=sha(Buffer.concat([tag,tag,body]));
+  const tag=sha(Buffer.from('Hashstash/Transaction')),message=sha(Buffer.concat([tag,tag,body]));
   assert.equal(a.noble.schnorr.verify(Uint8Array.from(signature),Uint8Array.from(message),Uint8Array.from(Buffer.from(alice,'hex'))),true);checks++;
   const decoded=a.browserApi.decodeUnsigned({format:'hashstash-unsigned-v1',body:body.toString('hex')});
   assert.equal(decoded.sender,alice);checks++;
@@ -115,7 +112,7 @@ async function run() {
   assert.equal(reloaded.browserStore.snapshot().wallets.length,2);checks++;
   assert.equal(reloaded.browserStore.snapshot().wallet_enabled,false);checks++;
   // A watch export can be signed in the other independent browser holding its key.
-  const local=b.browserStore.snapshot(),signed=b.browserStore.signUnsigned(watchEnvelope,{chain_id:b.currentSnapshot.status.chain_id,sender:bob,nonce:'0',expiry_height:'120',operation:{TransferExact:{recipient:alice,amount:'100'}},protocol_version:28,fee:'4',data_hex:'00ff80',wallet_id:local.wallet_id,wallet_revision:local.wallet_revision});
+  const local=b.browserStore.snapshot(),signed=b.browserStore.signUnsigned(watchEnvelope,{chain_id:b.currentSnapshot.status.chain_id,sender:bob,nonce:'0',expiry_height:'120',operation:{TransferExact:{recipient:alice,amount:'100'}},fee:'4',data_hex:'00ff80',wallet_id:local.wallet_id,wallet_revision:local.wallet_revision});
   reloaded.get('broadcast-raw').value=signed.raw;await reloaded.get('broadcast-form').requestSubmit();
   assert.equal(broadcasts(reloaded).length,1);checks++;
   for(const h of [a,b,reloaded]) {
@@ -132,7 +129,6 @@ async function run() {
   // Public text uses an ordinary Send transaction and the real browser signer.
   {
     const c=await setup({chat:true});
-    c.currentSnapshot.config.protocol_version=28;
     c.handlers.explorer_chat=()=>response({result:{chain_id:c.currentSnapshot.status.chain_id,tip:c.currentSnapshot.status.tip,height:20,ready:true,items:[],pending:[],next_cursor:null}});
     c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();await c.navigate('#send');
     const f=c.get('send-form');f.elements.recipient.value=addr(alice);f.elements.amount.value='0.000000000000000001';f.elements.data_text.value='Public test message 🌱';await f.fire('input');await c.timersDue();
@@ -145,11 +141,11 @@ async function run() {
     assert.equal(decoded.operation.TransferExact.amount,'1','public text has no special payment threshold');checks++;
     assert.equal(decoded.fee,'1');checks++;
     assert.equal(Buffer.from(decoded.data_hex,'hex').toString(),'Public test message 🌱');checks++;
-    const tag=sha(Buffer.from('Hashstash/Transaction/v26')),message=sha(Buffer.concat([tag,tag,body]));
+    const tag=sha(Buffer.from('Hashstash/Transaction')),message=sha(Buffer.concat([tag,tag,body]));
     assert.equal(c.noble.schnorr.verify(Uint8Array.from(raw.subarray(-64)),Uint8Array.from(message),Uint8Array.from(Buffer.from(bob,'hex'))),true);checks++;
-    const intent={chain_id:c.currentSnapshot.status.chain_id,sender:bob,nonce:'0',expiry_height:'120',operation:{Donate:{amount:'1',decision:null,outcome:null}},protocol_version:28,fee:'1',data_hex:''};
+    const intent={chain_id:c.currentSnapshot.status.chain_id,sender:bob,nonce:'0',expiry_height:'120',operation:{Donate:{amount:'1',decision:null,outcome:null}},fee:'1',data_hex:''};
     assert.throws(()=>c.browserApi.verifyUnsigned(envelope,intent),/unsupported fields/i);checks++;
-    assert.throws(()=>c.browserApi.verifyUnsigned(envelope,{...intent,protocol_version:intent.protocol_version+1}),/Unsupported/);checks++;
+    assert.throws(()=>c.browserApi.verifyUnsigned(envelope,{...decoded,chain_id:'not-a-chain'}),/Invalid|hex/i);checks++;
     c.handlers.preparetransaction=p=>response({result:prepare(c.currentSnapshot.status.chain_id,{...p,operation:{TransferExact:{...p.operation.TransferExact,recipient:bob}}})});
     f.elements.data_text.value='Do not redirect';await f.fire('input');await c.timersDue();await f.requestSubmit();
     assert.equal(broadcasts(c).length,1,'redirected ordinary transfer is never signed');checks++;

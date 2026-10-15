@@ -77,7 +77,7 @@ async fn pinned_nodes_sync_and_recover_after_hostile_legacy_and_truncated_client
     })
     .await
     .unwrap();
-    assert_eq!(a.peer_status().unwrap()["transport"], "pinned-signed-v2");
+    assert_eq!(a.peer_status().unwrap()["transport"], "pinned-signed");
     assert_eq!(a.peer_status().unwrap()["encrypted"], false);
     let before = a.status().unwrap();
     let mut attacker = TcpStream::connect(sa.p2p).await.unwrap();
@@ -91,7 +91,7 @@ async fn pinned_nodes_sync_and_recover_after_hostile_legacy_and_truncated_client
     assert_eq!(a.status().unwrap()["tip"], before["tip"]);
     // A partial unauthenticated greeting closes on disconnect; it never reaches block decoding.
     let mut partial = TcpStream::connect(sa.p2p).await.unwrap();
-    partial.write_all(b"HSP2PA02").await.unwrap();
+    partial.write_all(b"HSP2PAUT").await.unwrap();
     drop(partial);
     b.mine(100_000).unwrap();
     timeout(Duration::from_secs(8), async {

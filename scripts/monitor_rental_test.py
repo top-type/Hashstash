@@ -172,7 +172,7 @@ def main():
                 key = payout_key(manifest, record)
                 snapshot = rpc(record["rpc_port"], "snapshot", {"key": key})
                 status = snapshot["status"]
-                if status["chain_id"] != manifest["chain_id"] or status["protocol_version"] != 28:
+                if status["chain_id"] != manifest["chain_id"]:
                     raise RuntimeError("RPC chain identity differs from selected rental manifest")
                 if snapshot["mining"].get("payout_public_key", "").lower() != key:
                     raise RuntimeError("RPC mining payout differs from selected node manifest")

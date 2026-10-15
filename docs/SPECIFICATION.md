@@ -237,4 +237,4 @@ Signed transaction data is raw bytes. Chat interprets readable UTF-8 and Mail de
 
 Browser wallets sign locally and trust their serving origin. Keys stored in browser storage are unencrypted. Peer authentication and consensus validation do not establish application privacy, independent participation, economic stability or a guarantee against manipulation. HASH represents expected-work issuance rather than stable external purchasing power. Governance compares an internal stash/hash price, not an independently measured public benefit.
 
-Implementation 0.38.0 accepts protocol 28 configurations and records. A database must use its exact genesis configuration. Chain and state commitments use the `v28` domains and their current field layouts. Transaction, world and block commitments retain their `v26` domains. Signed transactions bind the complete chain identity.
+A database must use its exact genesis configuration. Chain, state, transaction, world and block commitments use the domains and field layouts in [CONSENSUS.md](CONSENSUS.md). Signed transactions bind the complete chain identity.

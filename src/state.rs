@@ -65,7 +65,7 @@ impl World {
     }
     pub fn root(&self) -> Hash {
         crypto::tagged_hash(
-            "Hashstash/world/v26",
+            "Hashstash/world",
             &codec::encode(&(
                 self.accounts.root(),
                 &self.reserve,
@@ -313,7 +313,7 @@ impl State {
     }
     pub fn root(&self) -> Hash {
         crypto::tagged_hash(
-            "Hashstash/state/v28",
+            "Hashstash/state",
             &codec::encode(&(
                 (
                     self.chain_id,
@@ -669,12 +669,12 @@ impl State {
 }
 pub fn proposal_id(chain: &Hash, round: u64, description: &Hash, proposal: &Proposal) -> Hash {
     crypto::tagged_hash(
-        "Hashstash/proposal/v1",
+        "Hashstash/proposal",
         &codec::encode(&(chain, round, description, proposal)),
     )
 }
 pub fn support_key(round: u64, id: &Hash, sender: &PublicKey) -> Vec<u8> {
-    crypto::tagged_hash("Hashstash/support/v1", &codec::encode(&(round, id, sender))).to_vec()
+    crypto::tagged_hash("Hashstash/support", &codec::encode(&(round, id, sender))).to_vec()
 }
 pub fn rank_key(amount: &Amount, id: &Hash) -> Vec<u8> {
     let mut key = vec![0u8; 64];

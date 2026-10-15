@@ -1,4 +1,4 @@
-//! Versioned peer envelopes around unchanged canonical block/transaction records.
+//! Peer envelopes around canonical block and transaction records.
 //! Lengths and nested collection counts are checked before record allocation.
 use crate::{
     codec,
@@ -8,7 +8,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
-pub const MAGIC: &[u8; 8] = b"HSP2PB01";
+pub const MAGIC: &[u8; 8] = b"HSP2PBIN";
 pub const MAX_LOCATORS: usize = 128;
 pub const MAX_BLOCKS: usize = 32;
 pub const MAX_TRANSACTIONS: usize = 256;
@@ -372,10 +372,7 @@ fn preflight_block(bytes: &[u8], limits: Limits) -> Result<()> {
 pub fn decode(bytes: &[u8], limits: Limits) -> Result<Message> {
     ensure!(bytes.len() <= limits.frame_bytes(), "peer frame too large");
     let mut r = Cursor::new(bytes);
-    ensure!(
-        r.take(MAGIC.len())? == MAGIC,
-        "unsupported peer wire version"
-    );
+    ensure!(r.take(MAGIC.len())? == MAGIC, "invalid peer message format");
     let message = match r.byte()? {
         1 => Message::Ack,
         2 => {
@@ -667,7 +664,7 @@ mod tests {
         );
     }
     #[test]
-    fn rejects_every_truncation_trailing_data_wrong_version_and_message_type() {
+    fn rejects_every_truncation_trailing_data_wrong_magic_and_message_type() {
         let (limits, sync) = fixture();
         let wire = encode(&Message::Sync(sync), limits).unwrap();
         for end in 0..wire.len() {
@@ -679,11 +676,11 @@ mod tests {
         let mut trailing = wire.clone();
         trailing.push(0);
         assert!(decode(&trailing, limits).is_err());
-        let mut old = wire.clone();
-        old[7] = b'0';
-        assert!(decode(&old, limits).is_err());
+        let mut bad_magic = wire.clone();
+        bad_magic[0] ^= 1;
+        assert!(decode(&bad_magic, limits).is_err());
         let mut unknown = wire;
-        unknown[8] = 2;
+        unknown[8] = u8::MAX;
         assert!(decode(&unknown, limits).is_err());
         let ack = encode(&Message::Ack, limits).unwrap();
         assert_eq!(ack.len(), ACK_BYTES);

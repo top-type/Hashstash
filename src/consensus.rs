@@ -554,7 +554,7 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
             s.ranking = crate::tree::Map::new();
             let pre = s.root();
             let decision_id = crypto::tagged_hash(
-                "Hashstash/decision/v1",
+                "Hashstash/decision",
                 &codec::encode(&(s.chain_id, a.round, &p.action, s.height, parent_hash, pre)),
             );
             s.last_epoch = s
@@ -1061,7 +1061,7 @@ mod transaction_batch_tests {
                         let mut expected = s.clone();
                         sequential_payment(&c, &mut expected, &tx);
                         apply_transaction(&c, &mut s, &tx).unwrap();
-                        assert_eq!(s.root(), expected.root(), "protocol {}", c.protocol_version);
+                        assert_eq!(s.root(), expected.root());
                         assert_eq!(codec::encode(&s), codec::encode(&expected));
                     }
                 }

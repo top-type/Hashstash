@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use hashstash::{
     address,
-    config::{Config, PROTOCOL_VERSION},
+    config::Config,
     crypto, fees, math,
     node::{self, Node, ServerOptions},
     types::{Amount, Hash, Operation, PublicKey, TransactionBody},
@@ -379,7 +379,7 @@ fn initial_config(preset: InitPreset, hashrate: Option<&str>) -> Result<Config> 
         calibrate_initial_target(&mut config, rate)?;
         let mut unique = [0u8; 8];
         getrandom::fill(&mut unique).map_err(|e| anyhow!("randomness unavailable: {e}"))?;
-        config.network = format!("hashstash-private-v28-{}", hex::encode(unique));
+        config.network = format!("hashstash-private-{}", hex::encode(unique));
     }
     config.validate()?;
     Ok(config)
@@ -495,15 +495,7 @@ fn operation_addresses(mut operation: Value, chain_id: &Hash) -> Result<Value> {
     Ok(operation)
 }
 
-fn transaction_fee_request(
-    protocol: u64,
-    fee: Option<String>,
-    extra_fee: Option<String>,
-) -> Result<Value> {
-    ensure!(
-        protocol == u64::from(PROTOCOL_VERSION),
-        "unsupported protocol version"
-    );
+fn transaction_fee_request(fee: Option<String>, extra_fee: Option<String>) -> Result<Value> {
     ensure!(
         fee.is_none() || extra_fee.is_none(),
         "choose an exact fee or an extra fee, not both"
@@ -548,12 +540,8 @@ fn requested_data(input: &str) -> Result<Vec<u8>> {
     hex::decode(input).context("transaction data must be hexadecimal bytes")
 }
 
-fn add_requested_data(request: &mut Value, protocol: u64, input: Option<String>) -> Result<()> {
+fn add_requested_data(request: &mut Value, input: Option<String>) -> Result<()> {
     let data = requested_data(input.as_deref().unwrap_or(""))?;
-    ensure!(
-        protocol == u64::from(PROTOCOL_VERSION),
-        "unsupported protocol version"
-    );
     if !data.is_empty() {
         request["data_hex"] = json!(hex::encode(data));
     }
@@ -713,11 +701,8 @@ async fn send_operation(
 ) -> Result<Value> {
     let (secret, sender) = key_file(key)?;
     let status = node::call_rpc(url, "status", json!({})).await?;
-    let protocol = status["protocol_version"]
-        .as_u64()
-        .context("missing protocol version")?;
-    let mut fee_request = transaction_fee_request(protocol, fee, extra_fee)?;
-    add_requested_data(&mut fee_request, protocol, data_hex)?;
+    let mut fee_request = transaction_fee_request(fee, extra_fee)?;
+    add_requested_data(&mut fee_request, data_hex)?;
     let chain_id = node::parse_hash(status["chain_id"].as_str().context("missing chain id")?)?;
     let operation = operation_addresses(operation, &chain_id)?;
     let account = node::call_rpc(url, "account", json!({"key":hex::encode(sender)})).await?;
@@ -959,14 +944,11 @@ async fn main() -> Result<()> {
                 serde_json::from_str(operation.as_deref().context("operation missing")?)?
             };
             let status = node::call_rpc(&url, "status", json!({})).await?;
-            let protocol = status["protocol_version"]
-                .as_u64()
-                .context("missing protocol version")?;
             let chain_id =
                 node::parse_hash(status["chain_id"].as_str().context("missing chain id")?)?;
             let operation = operation_addresses(operation, &chain_id)?;
-            let mut request = transaction_fee_request(protocol, fee, extra_fee)?;
-            add_requested_data(&mut request, protocol, data_hex)?;
+            let mut request = transaction_fee_request(fee, extra_fee)?;
+            add_requested_data(&mut request, data_hex)?;
             request["sender"] = json!(sender);
             request["operation"] = operation;
             request["expiry_blocks"] = json!(expiry_blocks);
@@ -1173,14 +1155,6 @@ async fn main() -> Result<()> {
             extra_fee,
             data_hex,
         } => {
-            let status = node::call_rpc(&url, "status", json!({})).await?;
-            let protocol = status["protocol_version"]
-                .as_u64()
-                .context("missing protocol version")?;
-            ensure!(
-                protocol == u64::from(PROTOCOL_VERSION),
-                "unsupported protocol version"
-            );
             let operation = json!({"TransferExact":{"recipient":recipient,"amount":amount}});
             println!(
                 "{}",
@@ -1253,29 +1227,21 @@ mod tests {
     #[test]
     fn fee_arguments_are_exact_or_quoted_and_reject_obsolete_flags() {
         assert_eq!(
-            transaction_fee_request(u64::from(PROTOCOL_VERSION), None, None).unwrap(),
+            transaction_fee_request(None, None).unwrap(),
             json!({"extra_fee":"0"})
         );
         assert_eq!(
-            transaction_fee_request(u64::from(PROTOCOL_VERSION), Some("20".into()), None).unwrap(),
+            transaction_fee_request(Some("20".into()), None).unwrap(),
             json!({"fee":"20"})
         );
         assert_eq!(
-            transaction_fee_request(u64::from(PROTOCOL_VERSION), None, Some("3".into())).unwrap(),
+            transaction_fee_request(None, Some("3".into())).unwrap(),
             json!({"extra_fee":"3"})
         );
-        assert!(
-            transaction_fee_request(
-                u64::from(PROTOCOL_VERSION),
-                Some("20".into()),
-                Some("3".into())
-            )
-            .is_err()
-        );
-        for protocol in
-            (0..u64::from(PROTOCOL_VERSION)).chain([u64::from(PROTOCOL_VERSION) + 1, u64::MAX])
-        {
-            assert!(transaction_fee_request(protocol, None, None).is_err());
+        assert!(transaction_fee_request(Some("20".into()), Some("3".into())).is_err());
+        for malformed in ["-1", "1.5", "", "one"] {
+            assert!(transaction_fee_request(Some(malformed.into()), None).is_err());
+            assert!(transaction_fee_request(None, Some(malformed.into())).is_err());
         }
         for command in ["send", "transfer", "prepare"] {
             let mut args = vec!["hashstash", command];
@@ -1387,37 +1353,20 @@ mod tests {
     }
 
     #[test]
-    fn cli_data_request_requires_current_protocol_and_omits_empty_payloads() {
+    fn cli_data_request_omits_empty_payloads_and_rejects_malformed_bytes() {
         let base = json!({"fee":"20"});
-        for protocol in [u64::from(PROTOCOL_VERSION)] {
-            for input in [None, Some(String::new())] {
-                let mut request = base.clone();
-                add_requested_data(&mut request, protocol, input).unwrap();
-                assert_eq!(request, base);
-                assert!(request.get("data_hex").is_none());
-            }
+        for input in [None, Some(String::new())] {
+            let mut request = base.clone();
+            add_requested_data(&mut request, input).unwrap();
+            assert_eq!(request, base);
+            assert!(request.get("data_hex").is_none());
         }
-        let mut legacy = base.clone();
-        assert!(add_requested_data(&mut legacy, 9, Some("00".into())).is_err());
-        assert_eq!(legacy, base);
-        let mut current = base.clone();
-        add_requested_data(
-            &mut current,
-            u64::from(PROTOCOL_VERSION),
-            Some("0000AaFF".into()),
-        )
-        .unwrap();
-        assert_eq!(current, json!({"fee":"20","data_hex":"0000aaff"}));
+        let mut request = base.clone();
+        add_requested_data(&mut request, Some("0000AaFF".into())).unwrap();
+        assert_eq!(request, json!({"fee":"20","data_hex":"0000aaff"}));
         for malformed in ["a", "zz"] {
             let mut request = base.clone();
-            assert!(
-                add_requested_data(
-                    &mut request,
-                    u64::from(PROTOCOL_VERSION),
-                    Some(malformed.into())
-                )
-                .is_err()
-            );
+            assert!(add_requested_data(&mut request, Some(malformed.into())).is_err());
             assert_eq!(request, base);
         }
     }
@@ -1670,13 +1619,12 @@ mod tests {
     fn calibrated_networks_have_timestamp_target_and_fresh_identity() {
         let first = initial_config(InitPreset::Slow, Some("100T")).unwrap();
         let second = initial_config(InitPreset::Slow, Some("100T")).unwrap();
-        assert_eq!(first.protocol_version, PROTOCOL_VERSION);
+        assert!(first.network.starts_with("hashstash-private-"));
         assert_ne!(first.chain_id(), second.chain_id());
         assert_eq!(first.initial.interval, 15);
         assert!(first.genesis_time > 1_770_000_000);
         let ordinary = initial_config(InitPreset::Dev, None).unwrap();
         assert_eq!(ordinary.initial.interval, 15);
-        assert_eq!(ordinary.protocol_version, PROTOCOL_VERSION);
     }
 
     #[test]

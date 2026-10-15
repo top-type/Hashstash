@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Independent stdlib Stratum worker against the packaged Hashstash executable.
 
-Runs only its own temporary v28 network on ephemeral loopback ports. Header,
+Runs only its own temporary network on ephemeral loopback ports. Header,
 coinbase, transaction-commitment, and SHA256d calculations are Python code; no
 node template/hash/mining RPC is used. The CLI signs one transfer using the
 publicly known secp256k1 scalar-one test fixture. Never fund that test key.
@@ -55,7 +55,7 @@ def share_target(difficulty):
 
 
 def compact_uint(value):
-    """Independent bincode 1 unsigned varint encoder for protocol 28."""
+    """Independent bincode 1 unsigned varint encoder for consensus records."""
     check(type(value) is int and 0 <= value < 1 << 64, "bounded unsigned wire integer")
     if value <= 250:
         return bytes([value])
@@ -91,7 +91,7 @@ def commitment(block):
     data = compact_uint(len(transactions))
     data += b"".join(transaction_bytes(tx) for tx in transactions)
     data += bytes(block["state_root"])
-    tag = hashlib.sha256(b"Hashstash/block-commitment/v26").digest()
+    tag = hashlib.sha256(b"Hashstash/block-commitment").digest()
     return hashlib.sha256(tag + tag + data).digest()
 
 
@@ -133,7 +133,7 @@ def header_bytes(header):
 
 
 def inspect_coinbase(raw, height, extra):
-    """Parse the actual Bitcoin transaction framing, not just search for HST6."""
+    """Parse the actual Bitcoin transaction framing, not just search for HST!."""
     offset = 0
 
     def take(count):
@@ -155,7 +155,7 @@ def inspect_coinbase(raw, height, extra):
     check(take(4) == b"\xff" * 4, "coinbase sequence")
     check(compact_size() == 1 and take(8) == bytes(8), "one zero-value output")
     output = take(compact_size())
-    check(len(output) == 70 and output[:6] == b"\x6a\x44HST6", "HST6 OP_RETURN framing")
+    check(len(output) == 70 and output[:6] == b"\x6a\x44HST!", "HST! OP_RETURN framing")
     check(output[6:38].hex() == MINER, "authenticated configured payout key")
     check(take(4) == bytes(4) and offset == len(raw), "coinbase locktime and no trailing bytes")
     return output[38:70]
@@ -250,7 +250,7 @@ def verify_block(port, height, job, work, extra1):
     check(bytes(block["miner"]).hex() == MINER, "stored miner matches configured payout")
     check(sha256d(work["coinbase"]) == bytes(block["header"]["merkle_root"]), "coinbase SHA256d is sole Merkle root")
     combined = inspect_coinbase(work["coinbase"], height, extra1 + work["extra2"])
-    check(combined == commitment(block), "independent HST6 commitment binds stored transactions and state")
+    check(combined == commitment(block), "independent HST! commitment binds stored transactions and state")
     status = rpc(port, "status")
     check(status["height"] == height and status["tip"] == work["digest"].hex(), "RPC tip equals independently hashed header")
     expected_work = (1 << 256) // (target(int(job["params"][6], 16)) + 1)
@@ -263,14 +263,13 @@ def run(executable):
               "status": "running", "method": "independent Python standard-library Stratum V1 client",
               "executable_version": cli(executable, "--version"),
               "executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
-              "scope": "isolated ephemeral localhost v28 network; no physical ASIC or external rental tested"}
+              "scope": "isolated ephemeral localhost network; no physical ASIC or external rental tested"}
     with tempfile.TemporaryDirectory(prefix="hashstash-stratum-wire-") as directory:
         temporary = Path(directory)
         config = json.loads((ROOT / "config" / "devnet.json").read_text(encoding="utf-8"))
         config["network"] = "stratum-wire-" + uuid.uuid4().hex
         config["genesis_time"] = int(time.time()) - 1
         config["initial_bits"] = config["limit_bits"] = 0x1F0FFFFF
-        check(config["protocol_version"] == 28, "test runs current protocol v28")
         config_path, key_path = temporary / "network.json", temporary / "public-test-fixture.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")
         # Scalar one is a published, non-secret fixture; it never leaves this temporary test network.
@@ -408,7 +407,7 @@ def run(executable):
                       "valid job timestamps and bounded nTime rolling reach stored headers")
                 check(block_one["header"]["version"] != block_two["header"]["version"], "negotiated version rolling reaches stored headers")
                 telemetry = rpc(rpc_port, "mining")
-                report.update({"protocol_version": config["protocol_version"], "block_target_bits": "1f0fffff", "reporting_difficulties": [first["difficulty"], harder["difficulty"]],
+                report.update({"block_target_bits": "1f0fffff", "reporting_difficulties": [first["difficulty"], harder["difficulty"]],
                                "blocks": [{"height": 1, "hash": block_one_work["digest"].hex(), "expected_work_hash": str(work_one),
                                            "nonce_attempts": block_one_work["attempts"]},
                                           {"height": 2, "hash": block_two_work["digest"].hex(), "expected_work_hash": str(work_two),
@@ -426,12 +425,12 @@ def run(executable):
                 check(restored["tip"] == status_two["tip"] and restored["state_root"] == status_two["state_root"], "database replay restores exact tip and state")
                 check(rpc(rpc_port, "getblock", {"height": 2}) == block_two, "stored header and signed data survive process restart")
                 report["checks"] = ["subscribe_authorize", "BIP310_version_rolling", "difficulty_before_notify", "4_plus_4_extranonce",
-                    "Bitcoin_coinbase_HST6_empty_branch", "independent_80_byte_header_SHA256d", "non_block_reporting_shares",
+                    "Bitcoin_coinbase_HST!_empty_branch", "independent_80_byte_header_SHA256d", "non_block_reporting_shares",
                     "low_difficulty_rejected", "malformed_submit_rejected", "unknown_job_rejected", "duplicate_rejected",
                     "exact_expected_work_subsidy", "configured_payout", "timestamp_past_future_rejected", "bounded_nTime_rolling", "extranonce_and_version_rolling",
                     "clean_work_switch", "old_parent_nonblock_rejected", "old_parent_block_rejected_without_issuance",
                     "no_stale_reward_controls", "signed_arbitrary_data_transfer",
-                    "independent_HST6_commitment", "governed_total_fee_payout", "database_restart_persistence"]
+                    "independent_HST!_commitment", "governed_total_fee_payout", "database_restart_persistence"]
                 report.update(status="passed", assertions=ASSERTIONS, elapsed_seconds=round(time.monotonic() - started, 3))
                 return report
             finally:

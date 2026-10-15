@@ -1,6 +1,5 @@
 {
-  "protocol_version": 28,
-  "network": "hashstash-testnet-v28",
+  "network": "hashstash-testnet",
   "genesis_time": 1770000000,
   "initial_bits": 545259519,
   "limit_bits": 545259519,

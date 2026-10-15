@@ -9,7 +9,7 @@ const amount=n=>{n=BigInt(n);const out=[];while(n){out.push(Number(n&255n));n>>=
 function signMailRow(noble,chain,secret,row,fee=1){
   const key=Uint8Array.from(Buffer.from(secret,'hex')),sender=Buffer.from(noble.schnorr.getPublicKey(key)).toString('hex');
   const body=Buffer.concat([Buffer.from(chain,'hex'),Buffer.from(sender,'hex'),uint(row.nonce??0),amount(fee),uint(1000000),uint(0),Buffer.from(sender,'hex'),amount(1),vector(Buffer.from(row.data_hex,'hex'))]);
-  const tag=digest('Hashstash/Transaction/v26'),message=digest(Buffer.concat([tag,tag,body]));
+  const tag=digest('Hashstash/Transaction'),message=digest(Buffer.concat([tag,tag,body]));
   const signature=noble.schnorr.sign(Uint8Array.from(message),key,new Uint8Array(32));
   const raw=Buffer.concat([body,Buffer.from(signature)]);
   return {...row,sender_public_key:sender,nonce:String(row.nonce??0),raw:raw.toString('hex'),txid:digest(digest(raw)).toString('hex')};

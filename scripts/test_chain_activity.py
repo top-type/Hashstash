@@ -44,7 +44,6 @@ class FakeNode:
         self.height = 10
         self.chain = CHAIN
         self.phase = 'rest'
-        self.protocol = 28
         self.receipt = None
         self.account_values = {k: dict(nonce=0, ordinary=str(10**15), shares='0') for k in KEYS}
         self.pass_account_values = {}
@@ -55,7 +54,7 @@ class FakeNode:
         self.grant_feasible = True
 
     def snapshot(self):
-        return {'status': {'chain_id': self.chain, 'protocol_version': self.protocol, 'height': self.height,
+        return {'status': {'chain_id': self.chain, 'height': self.height,
                           'clock': self.height * 15, 'settings': {'interval': 15, 'block_bytes': 16384},
                           'tip': f'{self.height:064x}', 'phase': self.phase, 'decision': None, 'auction_round': None},
                 'balances': {k: {'account': a, 'pass': self.pass_account_values.get(k)} for k, a in self.account_values.items()}}
@@ -184,26 +183,25 @@ class ActivityTests(unittest.TestCase):
             self.activity.record_error(ca.RpcError(secret))
         self.assertEqual(self.activity.diagnostic['consecutive_errors'], 2_147_483_647)
 
-    def test_current_observation_and_unknown_protocol_guard(self):
+    def test_observation_rejects_wrong_or_malformed_chain(self):
         original = self.node.snapshot
         self.activity.observe()
-        for version in (27, 29):
-            with self.subTest(protocol=version):
-                def unsupported(version=version):
+        for chain in ('bb' * 32, None, 'not-a-chain'):
+            with self.subTest(chain=chain):
+                def mismatched(chain=chain):
                     value = original()
-                    value['status']['protocol_version'] = version
+                    value['status']['chain_id'] = chain
                     return value
-                self.node.snapshot = unsupported
+                self.node.snapshot = mismatched
                 with self.assertRaises(ca.Fault): self.activity.observe()
 
     def full_cash_governance(self):
-        self.node.protocol, self.node.phase = 28, 'governance'
+        self.node.phase = 'governance'
         self.node.pass_account_values = copy.deepcopy(self.node.account_values)
         self.snapshot, self.accounts = self.activity.observe()
 
     def test_current_rejects_unaffordable_other_world_before_signing(self):
         self.full_cash_governance()
-        self.node.protocol = 28
         self.snapshot, self.accounts = self.activity.observe()
         action = self.action()
         action['guard']['phase'] = 'governance'

@@ -2,7 +2,7 @@
 
 Hashstash is a proof-of-work blockchain with two kinds of holdings: **hashes**, which you can spend, and **stash**, which you obtain by depositing hashes into a shared reserve. Its governance system uses trading in two possible outcomes—PASS and FAIL—to decide grants and changes to network settings.
 
-This repository contains the node, browser wallet, explorer, messaging tools and an optional faucet service. The current version is **0.38.0**, implementing protocol **28**. It is experimental software; its security and economic design have not received a complete independent audit.
+This repository contains the node, browser wallet, explorer, messaging tools and an optional faucet service. The current version is **0.38.0**. It is experimental software; its security and economic design have not received a complete independent audit.
 
 ## How it works
 

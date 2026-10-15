@@ -152,8 +152,8 @@ fn offline_review_discloses_exact_fee_for_every_operation() {
 #[test]
 fn offline_exports_reject_invalid_values_and_removed_operation_tags() {
     let recipient = crypto::public_key(&[20; 32]).unwrap();
-    // Offline bodies do not carry a protocol number. The signer validates the
-    // current parameter's values; network consensus enforces its availability.
+    // The signer validates parameter values; network consensus checks them
+    // against the current chain state.
     assert!(
         wallet::decode_unsigned(&wallet::unsigned(&body(Operation::Propose {
             round: 2,

@@ -261,7 +261,6 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
     chain = _key(status.get("chain_id"))
     region = policy.get("region")
     if (chain is None or chain != policy.get("chain_id")
-            or status.get("protocol_version") != 28
             or phase not in {"auction", "governance", "rest"}
             or region not in registry or len(accounts) != 3):
         return None

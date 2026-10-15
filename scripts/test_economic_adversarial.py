@@ -1,7 +1,7 @@
 """Atomic rejection and replay accounting on an already funded isolated testnet.
 
 Uses only the fixture's mining key files. It does not create/stop nodes or contact
-any network other than the explicit manifest. Requires protocol28 and no pending
+any network other than the explicit manifest. Requires no pending
 transactions. Ordinary, conditional and governance accounting is checked through
 the reserve audit's independent supply reconciliation.
 """
@@ -25,7 +25,6 @@ def main():
     manifest = json.loads(args.manifest.read_text(encoding='utf-8-sig'))
     nodes = manifest['nodes']
     audit = ReserveAudit(manifest)
-    assert audit.config['protocol_version'] == 28
     directory = Path(manifest['directory']) / ('economic-adversarial-' + str(time.time_ns()))
     directory.mkdir()
     started, checks = (time.monotonic(), [])
@@ -142,7 +141,7 @@ def main():
     assert all_snapshots() == after
     audit.assert_supply()
     check('The payment is included once, credits the exact amount, allocates its fee once and cannot be replayed after mining')
-    args.report.write_text(json.dumps({'passed': True, 'protocol_version': audit.config['protocol_version'], 'checks': checks, 'checks_passed': len(checks), 'duplicate_submissions': 48, 'invalid_peer_submissions': len(bad_cases) * 3, 'height': after[0]['status']['height'], 'state_root': after[0]['status']['state_root'], 'tip': after[0]['status']['tip'], 'node_sha256': hashlib.sha256(Path(manifest['executable']).read_bytes()).hexdigest(), 'elapsed_seconds': round(time.monotonic() - started, 3)}, indent=2) + '\n', encoding='utf-8')
+    args.report.write_text(json.dumps({'passed': True, 'checks': checks, 'checks_passed': len(checks), 'duplicate_submissions': 48, 'invalid_peer_submissions': len(bad_cases) * 3, 'height': after[0]['status']['height'], 'state_root': after[0]['status']['state_root'], 'tip': after[0]['status']['tip'], 'node_sha256': hashlib.sha256(Path(manifest['executable']).read_bytes()).hexdigest(), 'elapsed_seconds': round(time.monotonic() - started, 3)}, indent=2) + '\n', encoding='utf-8')
     print('Saved ' + str(args.report), flush=True)
 if __name__ == '__main__':
     main()

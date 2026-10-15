@@ -117,7 +117,7 @@ pub fn coinbase_parts(height: u64, miner: &PublicKey, commitment: &Hash) -> (Vec
     suffix.extend_from_slice(&0u64.to_le_bytes());
     suffix.push(70);
     suffix.extend_from_slice(&[0x6a, 68]);
-    suffix.extend_from_slice(b"HST6");
+    suffix.extend_from_slice(b"HST!");
     suffix.extend_from_slice(miner);
     suffix.extend_from_slice(commitment);
     suffix.extend_from_slice(&0u32.to_le_bytes());
@@ -128,7 +128,7 @@ pub fn coinbase_parts(height: u64, miner: &PublicKey, commitment: &Hash) -> (Vec
 /// Mining fields are excluded so extranonce rolling never reexecutes state.
 pub fn combined_commitment(block: &Block) -> Hash {
     crate::crypto::tagged_hash(
-        "Hashstash/block-commitment/v26",
+        "Hashstash/block-commitment",
         &encode(&(&block.transactions, &block.state_root)),
     )
 }
@@ -257,7 +257,7 @@ mod tests {
         let c = coinbase(&b).unwrap();
         assert_eq!(&c[..4], &1u32.to_le_bytes());
         assert_eq!(c[4], 1);
-        assert!(c.windows(4).any(|x| x == b"HST6"));
+        assert!(c.windows(4).any(|x| x == b"HST!"));
         assert_eq!(body_size(&b).unwrap(), 32 + 1 + 1 + c.len());
         let (prefix, suffix) = coinbase_parts_for_block(&b);
         assert_eq!(c, [prefix, b.extranonce.to_vec(), suffix].concat());

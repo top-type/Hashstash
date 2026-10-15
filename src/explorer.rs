@@ -558,7 +558,6 @@ impl Explorer {
                 fields(&p, &["address", "limit", "before"])?;
                 let key = address::decode(string(&p, "address")?, &s.chain_id)?;
                 let encoded = address::encode(&key, &s.chain_id)?;
-                result["protocol_version"] = json!(c.protocol_version);
                 result["address"] = json!(encoded);
                 result["public_key"] = json!(hex::encode(key));
                 let account = s.account(&key, None);
@@ -1565,7 +1564,6 @@ mod indexing_tests {
                     .unwrap()
             };
             let single = query(&state, &key);
-            assert_eq!(single["protocol_version"], c.protocol_version);
             assert_eq!(single["payment_available_hash"], "900");
             assert!(single["pass_account"].is_null());
             let mut pass = state.world.clone();

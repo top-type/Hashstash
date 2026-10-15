@@ -23,10 +23,10 @@ use tokio::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-const MAGIC: &[u8; 8] = b"HSP2PA02";
-const HANDSHAKE_TAG: &str = "Hashstash/PeerHandshake/v2";
-const SESSION_TAG: &str = "Hashstash/PeerSession/v2";
-const FRAME_TAG: &str = "Hashstash/PeerFrame/v2";
+const MAGIC: &[u8; 8] = b"HSP2PAUT";
+const HANDSHAKE_TAG: &str = "Hashstash/PeerHandshake";
+const SESSION_TAG: &str = "Hashstash/PeerSession";
+const FRAME_TAG: &str = "Hashstash/PeerFrame";
 const KEY_FORMAT: &str = "hashstash-peer-v1";
 const FRAME_HEADER: usize = 4 + 8 + 64;
 
@@ -385,7 +385,7 @@ impl Channel {
         admission.bytes(hello.len())?;
         ensure!(
             &hello[..8] == MAGIC && hello[8..40] == chain,
-            "peer authentication protocol or chain mismatch"
+            "peer authentication format or chain mismatch"
         );
         let client = hello[40..72].try_into()?;
         ensure!(policy.allows(ip, client), "unpinned incoming peer identity");

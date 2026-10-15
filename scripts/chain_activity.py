@@ -385,8 +385,8 @@ class Activity:
                     for group in self.c['registry'].values() for entry in group]
         snapshot = self.rpc('snapshot', {'keys': keys})
         status = snapshot['status']
-        if status.get('chain_id') != self.c['chain_id'] or status.get('protocol_version') != 28:
-            raise Fault('activity is pinned to another chain or protocol')
+        if status.get('chain_id') != self.c['chain_id']:
+            raise Fault('activity is pinned to another chain')
         height = int(status['height'])
         if self.observed_height is not None and height > self.observed_height:
             self.advanced_at = self.clock()

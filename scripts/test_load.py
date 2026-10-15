@@ -61,10 +61,7 @@ def main():
     assert session['wallet_enabled'] and session['public_key'] == key, 'Start the audit network with -SeedWallets.'
     started = time.monotonic()
     transactions = args.transactions_per_wave
-    protocol = rpc(port, 'config')['protocol_version']
-    shipped_config = Path(__file__).resolve().parent.parent / 'config' / 'testnet.json'
-    expected_protocol = json.loads(shipped_config.read_text(encoding='utf-8-sig'))['protocol_version']
-    assert protocol == expected_protocol, (protocol, expected_protocol)
+    assert rpc(port, 'status')['chain_id'] == manifest['chain_id'], 'Network differs from selected manifest'
     setup = prepare_load(port, key, args.rounds, args.setup_block_limit, transactions)
     transfer = {'TransferExact': {'recipient': list(bytes.fromhex(key)), 'amount': '1'}}
     print(f"PASS load setup: {setup['funded_ordinary']} ordinary HASH covers the fee budget", flush=True)
@@ -147,7 +144,7 @@ def main():
         assert 'fee_market' not in status
         empty_rates.append(rate)
     print('PASS loaded and empty blocks preserve the governed fee rate', flush=True)
-    report = {'passed': True, 'protocol_version': protocol, 'node_sha256': hashlib.sha256(Path(manifest['executable']).read_bytes()).hexdigest(), 'transactions': transactions * args.rounds, 'setup': setup, 'empty_block_minimum_rates': empty_rates, 'rounds': batches, 'elapsed_seconds': round(time.monotonic() - started, 2), 'final_status': rpc(port, 'status')}
+    report = {'passed': True, 'node_sha256': hashlib.sha256(Path(manifest['executable']).read_bytes()).hexdigest(), 'transactions': transactions * args.rounds, 'setup': setup, 'empty_block_minimum_rates': empty_rates, 'rounds': batches, 'elapsed_seconds': round(time.monotonic() - started, 2), 'final_status': rpc(port, 'status')}
     args.report.write_text(json.dumps(report, indent=2) + '\n')
 if __name__ == '__main__':
     main()

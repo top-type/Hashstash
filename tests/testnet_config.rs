@@ -1,9 +1,4 @@
-use hashstash::{
-    codec,
-    config::{Config, PROTOCOL_VERSION},
-    state::State,
-    types::Parameter,
-};
+use hashstash::{codec, config::Config, state::State, types::Parameter};
 
 #[test]
 fn checked_in_presets_are_exact_current_configs() {
@@ -18,7 +13,6 @@ fn checked_in_presets_are_exact_current_configs() {
         let stored: Config = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(stored, expected);
         stored.validate().unwrap();
-        assert_eq!(stored.protocol_version, PROTOCOL_VERSION);
         assert_eq!(stored.initial.interval, 15);
     }
     assert_ne!(Config::devnet().chain_id(), Config::testnet().chain_id());
@@ -29,35 +23,36 @@ fn checked_in_presets_are_exact_current_configs() {
 }
 
 #[test]
-fn protocol28_preset_chain_ids_match_independent_encoding() {
-    // Independently packed from the current field order and varints.
-    // Protocol and preset changes separate these chains from prior releases.
-    for (c, expected) in [
+fn preset_chain_ids_match_independent_encoding() {
+    // Independently packed: length-prefixed network name, variable-width
+    // little-endian integers in Config field order, magnitude byte vectors for
+    // amounts, and presence bytes before the two optional percentages.
+    // Expected IDs use SHA256(SHA256(tag) || SHA256(tag) || encoded_config).
+    for (c, encoded, expected) in [
         (
             Config::devnet(),
-            "f1c3b5f5e8145ff107ce4637fb933037fc762c69527e55a4d33fe8b9d6fbd2b9",
+            "106861736873746173682d6465766e6574fc800e8069fcffff7f20fcffff7f20fb84030b78fb0010fcfffffffffb0002fb0002fb00200d00000040eaed7446d09c2c9f0c08000064a7b3b6e00dfb8007fb0040010f3cfbc003fbe00101320100",
+            "511c2a230ca56b8e88761191e4b3dce0bd615fc356cb64d12766f6315857b6ac",
         ),
         (
             Config::testnet(),
-            "fd26b784e3e31ef3167bebe783ee416a0945e942ff26f502435c0d0fb91cabfd",
+            "116861736873746173682d746573746e6574fc800e8069fcffff7f20fcffff7f20fb84030b78fb0010fcfffffffffb0002fb0002fb00200d00000040eaed7446d09c2c9f0c08000064a7b3b6e00dfbe001fb0040010f3cfbe001f001320100",
+            "bb57388852720849e037ee5181cb8dff588b253c4fe8e66e2b9a87f83ebe99c4",
         ),
         (
             Config::slow_testnet(),
-            "3d4c6da867563401f28fc4a9e220c71a923111fc96ecfbff12b49c9fe7023433",
+            "166861736873746173682d736c6f772d746573746e6574fc800e8069fcffff7f20fcffff7f20fb84030b78fb0010fcfffffffffb0002fb0002fb00200d00000040eaed7446d09c2c9f0c08000064a7b3b6e00dfb100efb0040010ffb2c01fb302afb100e01320100",
+            "888fcdfda274eacc884acb4f7507c351afd4980d73df0bc5b331a57fbf48b174",
         ),
     ] {
         c.validate().unwrap();
+        assert_eq!(c.consensus_bytes(), hex::decode(encoded).unwrap());
         assert_eq!(hex::encode(c.chain_id()), expected);
     }
 }
 
 #[test]
-fn unsupported_protocols_and_unknown_settings_fail_closed() {
-    for version in [0, PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1, u32::MAX] {
-        let mut config = Config::devnet();
-        config.protocol_version = version;
-        assert!(config.validate().is_err());
-    }
+fn unknown_settings_fail_closed() {
     for location in ["initial", ""] {
         let mut value = serde_json::to_value(Config::devnet()).unwrap();
         let object = if location.is_empty() {
@@ -68,6 +63,10 @@ fn unsupported_protocols_and_unknown_settings_fail_closed() {
         object["unexpected_setting"] = 1.into();
         assert!(serde_json::from_value::<Config>(value).is_err());
     }
+    let mut value = serde_json::to_value(Config::devnet()).unwrap();
+    assert!(value.get("protocol_version").is_none());
+    value["protocol_version"] = 1.into();
+    assert!(serde_json::from_value::<Config>(value).is_err());
 }
 
 #[test]
@@ -179,27 +178,39 @@ fn obsolete_grant_cap_config_and_state_fields_are_rejected() {
 }
 
 #[test]
-fn prior_serialized_config_and_genesis_state_fail_closed() {
+fn incompatible_serialized_config_and_genesis_state_fail_closed() {
     let config = Config::devnet();
-    let mut old_config = config.consensus_bytes();
-    // Protocol 27 put reserve minimum, four ratio integers and the period
-    // between auction_timeout and initial Settings in the canonical encoding.
-    let offset = old_config.len() - codec::encode(&config.initial).len();
-    let removed = codec::encode(&(vec![100u8], 0u64, 0u64, 0u64, 0u64, 30_720u64));
-    old_config.splice(offset..offset, removed);
-    old_config[0] = 27;
-    let network_suffix = old_config.windows(3).position(|w| w == b"v28").unwrap();
-    old_config[network_suffix + 2] = b'7';
-    assert!(codec::decode::<Config>(&old_config, old_config.len()).is_err());
+    // A leading field from a different schema must not be silently ignored.
+    let mut incompatible_config = codec::encode(&u64::MAX);
+    incompatible_config.extend(config.consensus_bytes());
+    assert!(codec::decode::<Config>(&incompatible_config, incompatible_config.len()).is_err());
 
     let state = State::genesis(&config);
     let mut old_state = codec::encode(&state);
-    // The old empty map, absent start, and epoch zero precede last_round and
-    // last_epoch. Even an empty old snapshot must not silently lose fields.
+    // The old empty budget map, absent start, and epoch zero precede last_round
+    // and last_epoch. Even an empty old snapshot must not silently lose fields.
     let offset = old_state.len() - codec::encode(&(state.last_round, state.last_epoch)).len();
     old_state.splice(offset..offset, [0u8; 3]);
-    old_state[..32].copy_from_slice(
-        &hex::decode("f62127c60825be20ee7c19f6d5ef79712ab2f4c525c6e179091407f5c082dac2").unwrap(),
-    );
     assert!(codec::decode::<State>(&old_state, old_state.len()).is_err());
+}
+
+#[test]
+fn database_reopen_requires_the_exact_genesis_configuration() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("chain.sqlite");
+    let config = Config::devnet();
+    let chain = hashstash::chain::Chain::open(&path, config.clone()).unwrap();
+    let genesis = chain.tip_hash();
+    drop(chain);
+
+    let mut changed = config.clone();
+    changed.genesis_time += 1;
+    assert!(hashstash::chain::Chain::open(&path, changed).is_err());
+    let mut changed = config.clone();
+    changed.initial.duration += 1;
+    assert!(hashstash::chain::Chain::open(&path, changed).is_err());
+
+    let chain = hashstash::chain::Chain::open(&path, config).unwrap();
+    assert_eq!(chain.tip_hash(), genesis);
+    assert_eq!(chain.tip_state().height, 0);
 }

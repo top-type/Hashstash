@@ -148,6 +148,7 @@ pub struct Auction {
     pub replacement_height: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Decision {
     pub id: Hash,
     pub epoch: u64,
@@ -158,7 +159,6 @@ pub struct Decision {
     pub duration: u64,
     #[serde(with = "amount")]
     pub start_integral: Amount,
-    pub budget_epoch: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Rest {
@@ -200,16 +200,7 @@ pub struct SupportRecord {
     pub amount: Amount,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Budget {
-    #[serde(with = "amount")]
-    pub allowance: Amount,
-    #[serde(with = "amount")]
-    pub reserved: Amount,
-    #[serde(with = "amount")]
-    pub spent: Amount,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct State {
     pub chain_id: Hash,
     pub height: u64,
@@ -227,9 +218,6 @@ pub struct State {
     pub ranking: Map<Hash>,
     #[serde(with = "amount")]
     pub auction_escrow: Amount,
-    pub budgets: Map<Budget>,
-    pub budget_start: Option<u64>,
-    pub budget_epoch: u64,
     pub last_round: u64,
     pub last_epoch: u64,
 }
@@ -272,9 +260,6 @@ impl State {
             rounds,
             ranking: Map::new(),
             auction_escrow: 0u32.into(),
-            budgets: Map::new(),
-            budget_start: None,
-            budget_epoch: 0,
             last_round: 0,
             last_epoch: 0,
         }
@@ -328,7 +313,7 @@ impl State {
     }
     pub fn root(&self) -> Hash {
         crypto::tagged_hash(
-            "Hashstash/state/v26",
+            "Hashstash/state/v28",
             &codec::encode(&(
                 (
                     self.chain_id,
@@ -347,9 +332,6 @@ impl State {
                     self.rounds.root(),
                     self.ranking.root(),
                     &self.auction_escrow,
-                    self.budgets.root(),
-                    self.budget_start,
-                    self.budget_epoch,
                     self.last_round,
                     self.last_epoch,
                 ),
@@ -428,10 +410,7 @@ impl State {
                     && self.proposals.is_empty()
                     && self.supports.is_empty()
                     && self.ranking.is_empty()
-                    && self.auction_escrow.is_zero()
-                    && self.budgets.is_empty()
-                    && self.budget_start.is_none()
-                    && self.budget_epoch == 0,
+                    && self.auction_escrow.is_zero(),
                 "initial rest invariant"
             );
         }
@@ -587,8 +566,6 @@ impl State {
                 ),
             }
         }
-        let mut reserved = Amount::zero();
-        let mut reserved_epoch = None;
         match &self.phase {
             Phase::Auction(a) => {
                 ensure!(
@@ -651,11 +628,6 @@ impl State {
                     matches!(self.rounds.get(&d.round.to_be_bytes()).map(|r| &r.status), Some(RoundStatus::Won(id)) if *id == d.proposal_id),
                     "decision round winner mismatch"
                 );
-                ensure!(
-                    d.budget_epoch <= self.budget_epoch
-                        && self.budgets.get(&d.budget_epoch.to_be_bytes()).is_some(),
-                    "decision budget epoch mismatch"
-                );
                 let pass = self.alternative.as_ref().unwrap();
                 ensure!(
                     d.start_integral <= self.world.price_integral
@@ -664,9 +636,10 @@ impl State {
                 );
                 match &d.proposal {
                     Proposal::Grant { payments } => {
-                        reserved = c.validate_grant(payments)?;
-                        reserved_epoch = Some(d.budget_epoch);
-                        ensure!(pass.grant_escrow == reserved, "grant escrow mismatch");
+                        ensure!(
+                            pass.grant_escrow == c.validate_grant(payments)?,
+                            "grant escrow mismatch"
+                        );
                     }
                     Proposal::Parameter {
                         parameter,
@@ -690,58 +663,6 @@ impl State {
                     c.parameter_change(&self.frozen, p, self.frozen.get(p), new)?;
                 }
             }
-        }
-        if let Some(start) = self.budget_start {
-            ensure!(
-                start <= self.clock && (self.clock - start) / c.budget_period == self.budget_epoch,
-                "budget clock mismatch"
-            );
-            ensure!(
-                self.budgets.get(&0u64.to_be_bytes()).is_some()
-                    && self.budgets.get(&self.budget_epoch.to_be_bytes()).is_some()
-                    && u64::try_from(self.budgets.len())? <= self.height.saturating_add(1),
-                "budget history does not cover visited epochs"
-            );
-        } else {
-            ensure!(
-                self.budgets.is_empty() && self.budget_epoch == 0 && reserved.is_zero(),
-                "unstarted budget mismatch"
-            );
-        }
-        for (key, b) in self.budgets.iter() {
-            let epoch = u64::from_be_bytes(key.try_into()?);
-            ensure!(epoch <= self.budget_epoch, "budget epoch is in the future");
-            // An optional cap is a non-circulating arithmetic value. Ratios
-            // above one may exceed supply, while actual spending cannot.
-            ensure!(
-                b.allowance.bits() <= c.money_bits + 64,
-                "budget allowance exceeds product range"
-            );
-            // Spent is cumulative: the same HASH can be returned and paid
-            // again. At most one grant settles per block, so supply times the
-            // u64 height range bounds it independently of circulating balances.
-            ensure!(
-                b.spent.bits() <= c.money_bits + 64,
-                "budget spending exceeds cumulative range"
-            );
-            c.check_amount(&b.reserved)?;
-            if c.grant_budget_enabled() {
-                ensure!(
-                    &b.reserved + &b.spent <= b.allowance,
-                    "grant budget overdrawn"
-                );
-            } else {
-                ensure!(
-                    b.allowance.is_zero(),
-                    "disabled grant budget has an allowance"
-                );
-            }
-            let expected = if reserved_epoch == Some(epoch) {
-                reserved.clone()
-            } else {
-                Amount::zero()
-            };
-            ensure!(b.reserved == expected, "grant budget reservation mismatch");
         }
         Ok(())
     }

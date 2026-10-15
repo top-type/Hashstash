@@ -2,7 +2,7 @@
 const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');
 const {setup:outcomeSetup}=require('./test_outcome_wallet.cjs'),{deferred,settle,response}=require('./test_wallet_ui.cjs');
 const amounts=require('../ui/amounts.js');let checks=0;const eq=(a,b,m)=>{assert.deepEqual(a,b,m);checks++;},ok=(v,m)=>{assert.ok(v,m);checks++;};
-async function setup(percent=50){const h=await outcomeSetup('1000000','1000000'),s=h.currentSnapshot;s.config.protocol_version=s.status.protocol_version=27;s.status.settings.miner_fee_percent=percent;const previous=h.fee;
+async function setup(percent=50){const h=await outcomeSetup('1000000','1000000'),s=h.currentSnapshot;s.config.protocol_version=s.status.protocol_version=28;s.status.settings.miner_fee_percent=percent;const previous=h.fee;
  h.fee=p=>{const r=previous(p),n=BigInt(s.status.settings.miner_fee_percent),miner=BigInt(r.fee)*n/100n;return {...r,miner_fee_percent:s.status.settings.miner_fee_percent,miner_fee:String(miner),revenue_fee:String(BigInt(r.fee)-miner)};};await h.refresh();return h;}
 async function run(){
  const html=fs.readFileSync(path.join(__dirname,'../ui/index.html'),'utf8');ok(!html.includes('Miner priority'));ok(html.includes('Optional extra'));

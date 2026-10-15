@@ -81,7 +81,7 @@ pub struct GrantPayment {
     pub amount: Amount,
 }
 
-/// This is the only aggregate used for grant budgets, escrow and settlement.
+/// The total amount locked in escrow and paid on a successful grant.
 pub fn grant_total(payments: &[GrantPayment]) -> anyhow::Result<Amount> {
     anyhow::ensure!(
         !payments.is_empty(),

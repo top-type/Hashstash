@@ -184,7 +184,7 @@ fn fork_at(source: &Chain, mut tip: Hash) -> (TempDir, Chain) {
 fn same(actual: &Chain, expected: &Chain) {
     assert_eq!(actual.tip_hash(), expected.tip_hash());
     assert_eq!(actual.tip_state().root(), expected.tip_state().root());
-    // This includes raw lazy account epochs, refund records, budgets, frozen
+    // This includes raw lazy account epochs, refund records, frozen
     // settings, accumulated TWAP, reserve and revenue, not only displayed balances.
     assert_eq!(
         codec::encode(actual.tip_state()),

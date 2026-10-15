@@ -8,7 +8,7 @@ const wait=async(predicate,h)=>{for(let i=0;i<400&&!predicate();i++){if(h)await 
 async function setup(options={}){
  const h=await harness({mail:true,...options}),s=h.currentSnapshot;h.pub=k=>Buffer.from(h.noble.schnorr.getPublicKey(Uint8Array.from(Buffer.from(k,'hex')))).toString('hex');
  h.sender=h.pub(a);h.recipient=h.pub(b);h.other=h.pub(c);h.selectSession({id:'hot:'+h.sender,public_key:h.sender,mode:'hot'});
- s.config.protocol_version=27;s.status.settings.block_bytes=16384;s.status.settings.pass_margin_bps=0;
+ s.config.protocol_version=28;s.status.settings.block_bytes=16384;s.status.settings.pass_margin_bps=0;
  s.status.fee_policy={minimum_fee_rate:'1',fee_scale:1024,account_weight:1024};
  s.account.account.ordinary='1000000000000000000';
  h.history=options.history||[];h.canonicalAnchors=new Set([s.status.tip]);h.invalidAnchor=!!options.invalidAnchor;

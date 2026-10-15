@@ -98,7 +98,7 @@ try {
     & $start -Fresh -DataRoot $fixture -Executable $Executable -BasePort $BasePort -StratumBindIPAddress '127.0.0.2' -ShareDifficulty 1024 -StratumAdvertise $advertised -StratumPasswordFile $passwordFile -NoBrowser
     $manifest = Load-Manifest
     $networkConfig = Get-Content -LiteralPath $manifest.config -Raw | ConvertFrom-Json
-    Check ($networkConfig.protocol_version -eq 27) 'Mining launcher uses the current protocol v27 preset'
+    Check ($networkConfig.protocol_version -eq 28) 'Mining launcher uses the current protocol v28 preset'
     $identity = $manifest.chain_id; $files = Files $manifest
     Check ($manifest.mining.bind_ip -eq '127.0.0.2' -and $manifest.mining.share_difficulty -eq 1024 -and $manifest.mining.advertise -eq $advertised -and $manifest.mining.password_file -eq $passwordFile) 'Fresh network saves explicit mining connection settings'
     Check-Stratum '127.0.0.2' ($BasePort + 2) 'launcher-test-password' $BasePort 1024 'Node 1 binds the selected interface and caps work at its network difficulty'

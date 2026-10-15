@@ -148,7 +148,7 @@ function snapshot(chain = 'a'.repeat(64)) {
 
   const settings = { block_bytes: 1048576, interval: 15, lead: 60, rest: 480, duration: 240, miner_fee_percent:50, pass_margin_bps:0, minimum_fee_rate:1 };
 
-  const config = { protocol_version:27, network: 'hashstash-ui-test', auction_timeout: 480, quote_scale: '1000000', share_scale: '1000000000000000000' };
+  const config = { protocol_version:28, network: 'hashstash-ui-test', auction_timeout: 480, quote_scale: '1000000', share_scale: '1000000000000000000' };
 
 
 
@@ -158,7 +158,7 @@ function snapshot(chain = 'a'.repeat(64)) {
 
     config,
 
-    status: { protocol_version:27, fee_policy:{minimum_fee_rate:'1',fee_scale:1024,account_weight:1024}, chain_id: chain, tip: 'b'.repeat(64), state_root: 'c'.repeat(64), height: 20, clock: 300, time_unit:'seconds', clock_basis:'target_interval', issued: '2000', settings, mempool: 0, reserve: world.reserve, curve_mass: world.curve_mass, shares: world.shares, revenue: '0' },
+    status: { protocol_version:28, fee_policy:{minimum_fee_rate:'1',fee_scale:1024,account_weight:1024}, chain_id: chain, tip: 'b'.repeat(64), state_root: 'c'.repeat(64), height: 20, clock: 300, time_unit:'seconds', clock_basis:'target_interval', issued: '2000', settings, mempool: 0, reserve: world.reserve, curve_mass: world.curve_mass, shares: world.shares, revenue: '0' },
 
     governance: { phase: { Auction: { round: 0, opened: 0, leader: null, lead_since: 0 } }, clock: 300, time_unit:'seconds', clock_basis:'target_interval', frozen: settings, settings, world, pass: null },
 
@@ -617,6 +617,17 @@ async function harness(options = {}) {
 
   };
 
+  h.waitForFee = async name => {
+    // Proposal commitments use native WebCrypto, which completes outside the
+    // microtask queue. Wait for its visible quote result before submitting.
+    const quote = get(`${name}-fee-quote`), error = get(`${name}-fee-error`);
+    const deadline = Date.now() + 5000;
+    while (quote.textContent === '—' && !error.textContent && Date.now() < deadline)
+      await new Promise(resolve => setTimeout(resolve, 1));
+    assert.equal(error.textContent, '', `${name} fee quote failed`);
+    assert.notEqual(quote.textContent, '—', `${name} fee quote did not complete`);
+  };
+
   h.refresh = async () => { await get('refresh-now').fire('click'); await settle(); };
 
   h.location = context.location;
@@ -690,7 +701,7 @@ async function run() {
  const settingNames={BlockBytes:'block_bytes',Interval:'interval',Lead:'lead',Rest:'rest',Duration:'duration',MinerFeePercent:'miner_fee_percent',PassMarginBps:'pass_margin_bps',MinimumFeeRate:'minimum_fee_rate'};
  for(const [parameter,inputs] of Object.entries(values)) for(const value of inputs) {
   const form=h.get('propose-form'),before=h.wallet.length;form.elements.type.value='parameter';form.elements.parameter.value=parameter;form.elements.parameter_value.value=value;form.elements.support.value=amounts.exactInput('1');
-  await h.get('proposal-parameter').fire('change');await form.fire('input');await h.timersDue();await form.requestSubmit();
+  await h.get('proposal-parameter').fire('change');await form.fire('input');await h.timersDue();await h.waitForFee('propose');await form.requestSubmit();
   eq(h.wallet.length,before+1,`${parameter}=${value}: ${form.feedback.textContent}`);
   const [whole,fraction='']=value.split('.'),next=parameter==='PassMarginBps'?BigInt(whole)*100n+BigInt(fraction.padEnd(2,'0')):BigInt(value);
   eq(h.wallet.at(-1)?.operation.Propose.proposal.Parameter,{parameter,old:s.status.settings[settingNames[parameter]],new:next>BigInt(Number.MAX_SAFE_INTEGER)?String(next):Number(next)});

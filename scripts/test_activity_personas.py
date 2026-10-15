@@ -40,7 +40,7 @@ class PersonaTests(unittest.TestCase):
         self.assertEqual(builder["preferred_outcome"], "Pass")
         self.assertEqual(builder["observed"]["grant_fraction_bps"], 300)
         self.assertEqual(builder["observed"]["funding_bps"], 10000)
-        self.assertIn("exceeds", conservative["reasons"][0])
+        self.assertIn("larger than my preferred", conservative["reasons"][0])
         self.assertIn("fits", builder["reasons"][0])
 
     def test_native_half_backing_grant_keeps_opposing_preferences_without_cutoff(self):
@@ -49,7 +49,7 @@ class PersonaTests(unittest.TestCase):
         builder = p.evaluate(self.snapshot, p.profile_for("sgp", 0, "native-balance-v1"), metrics)
         self.assertEqual(conservative["preferred_outcome"], "Fail")
         self.assertEqual(builder["preferred_outcome"], "Pass")
-        self.assertTrue(all("allocation limit" not in reason for reason in conservative["reasons"] + builder["reasons"]))
+        self.assertTrue(all("grant allocation" not in reason for reason in conservative["reasons"] + builder["reasons"]))
 
     def test_native_composition_preserves_native_strategy_and_short_explicit_label(self):
         metrics = dict(self.metrics, grant_amount_raw=str(5 * 10**17), grant_funded_raw=str(5 * 10**17))

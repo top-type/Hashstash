@@ -8,7 +8,7 @@ const walk=n=>[n,...(n.children||[]).flatMap(walk)],cash=n=>walk(n).find(x=>x.cl
 const balanceRows=n=>n.children.filter(row=>row.className==='wallet-balance-row');
 const selectorValues=h=>walk(h.get('account-summary')).filter(n=>['account-summary-cash','account-summary-stash'].includes(n.className));
 const recipient='34'.repeat(32),exact=amounts.exactInput;
-async function setup(pass='1000',fail='400',version=27,options={}){
+async function setup(pass='1000',fail='400',version=28,options={}){
  const h=await harness(options),s=h.currentSnapshot;
  if(options.mail){const sender=Buffer.from(h.noble.schnorr.getPublicKey(Uint8Array.from(Buffer.from('01'.padStart(64,'0'),'hex')))).toString('hex');h.selectSession({id:'hot:'+sender,public_key:sender,mode:'hot'});}
  h.handlers.explorer_mail=()=>response({result:{chain_id:s.status.chain_id,ready:true,tip:s.status.tip,anchor:s.status.tip,indexed_height:s.status.height,messages:[],next_cursor:null,scan_cursor:`${s.status.height}:9223372036854775807`}});
@@ -134,7 +134,7 @@ async function run(){
   eq(selectorValues(h).map(n=>n['aria-label']),[amounts.formatHash('123'),stash('100000000000000000')],'resolution returns the top selector to the surviving ordinary balances');
  }
  for(const channel of ['send','mail']){
-  const h=await setup('1000000000010',channel==='mail'?'1':'1000000000000',27,channel==='mail'?{mail:true}:{}),s=h.currentSnapshot,f=h.get(`${channel}-form`);
+  const h=await setup('1000000000010',channel==='mail'?'1':'1000000000000',28,channel==='mail'?{mail:true}:{}),s=h.currentSnapshot,f=h.get(`${channel}-form`);
   if(channel==='send'){f.elements.data_text.value='Public test fixture message';f.elements.recipient.value=addr(recipient);}else{f.elements.message.value='Private test fixture message';}
   if(channel==='send')f.elements.amount.value='0.000001';
   if(channel==='mail'){f.elements.subject.value='Published fixture';f.elements.recipient.value=addr('79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798');}

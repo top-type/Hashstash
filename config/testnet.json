@@ -1,6 +1,6 @@
 {
-  "protocol_version": 27,
-  "network": "hashstash-testnet-v27",
+  "protocol_version": 28,
+  "network": "hashstash-testnet-v28",
   "genesis_time": 1770000000,
   "initial_bits": 545259519,
   "limit_bits": 545259519,
@@ -14,12 +14,6 @@
   "max_integer_bits": 8192,
   "quote_scale": "1000000000000000000000000000000",
   "auction_timeout": 480,
-  "reserve_min": "20",
-  "grant_numerator": 0,
-  "grant_denominator": 0,
-  "budget_numerator": 0,
-  "budget_denominator": 0,
-  "budget_period": 1920,
   "initial": {
     "block_bytes": 16384,
     "interval": 15,

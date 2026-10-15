@@ -764,7 +764,7 @@ impl Node {
     }
     fn status_locked(inner: &ReadView) -> Value {
         let s = inner.chain.tip_state();
-        json!({"chain_id":hex::encode(inner.chain.chain_id()), "protocol_version":inner.chain.config.protocol_version, "height":inner.chain.tip_height(), "tip":hex::encode(inner.chain.tip_hash()), "state_root":hex::encode(s.root()), "clock":s.clock, "time_unit":"seconds", "clock_basis":"target_interval", "issued":s.issued.to_str_radix(10), "phase":s.phase_name(), "decision":s.decision_id().map(hex::encode), "auction_round":s.auction_round(), "settings":s.settings, "mempool":inner.mempool.len(), "reserve":s.world.reserve.to_str_radix(10), "shares":s.world.shares.to_str_radix(10), "curve_mass":s.world.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(&inner.chain.config, &s.world).to_str_radix(10), "revenue":s.world.revenue.to_str_radix(10), "fee_policy":json!({"minimum_fee_rate":s.settings.minimum_fee_rate.to_string(),"fee_scale":crate::fees::FEE_SCALE,"account_weight":crate::fees::ACCOUNT_WEIGHT})})
+        json!({"chain_id":hex::encode(inner.chain.chain_id()), "protocol_version":inner.chain.config.protocol_version, "height":inner.chain.tip_height(), "tip":hex::encode(inner.chain.tip_hash()), "state_root":hex::encode(s.root()), "clock":s.clock, "time_unit":"seconds", "clock_basis":"target_interval", "issued":s.issued.to_str_radix(10), "phase":s.phase_name(), "decision":s.decision_id().map(hex::encode), "auction_round":s.auction_round(), "settings":s.settings, "mempool":inner.mempool.len(), "reserve":s.world.reserve.to_str_radix(10), "shares":s.world.shares.to_str_radix(10), "curve_mass":s.world.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(&s.world).to_str_radix(10), "revenue":s.world.revenue.to_str_radix(10), "fee_policy":json!({"minimum_fee_rate":s.settings.minimum_fee_rate.to_string(),"fee_scale":crate::fees::FEE_SCALE,"account_weight":crate::fees::ACCOUNT_WEIGHT})})
     }
     pub fn template(&self) -> Result<Block> {
         let mut block = self.template_shared()?.as_ref().clone();
@@ -1261,7 +1261,7 @@ impl Node {
             }
             "governance" => {
                 let s = i.chain.tip_state();
-                let world = |w: &crate::state::World| json!({"reserve":w.reserve.to_str_radix(10),"shares":w.shares.to_str_radix(10),"curve_mass":w.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(&i.chain.config, w).to_str_radix(10),"account_shares":w.account_shares.to_str_radix(10),"revenue":w.revenue.to_str_radix(10),"grant_escrow":w.grant_escrow.to_str_radix(10),"price_integral":w.price_integral.to_str_radix(10)});
+                let world = |w: &crate::state::World| json!({"reserve":w.reserve.to_str_radix(10),"shares":w.shares.to_str_radix(10),"curve_mass":w.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(w).to_str_radix(10),"account_shares":w.account_shares.to_str_radix(10),"revenue":w.revenue.to_str_radix(10),"grant_escrow":w.grant_escrow.to_str_radix(10),"price_integral":w.price_integral.to_str_radix(10)});
                 Ok(
                     json!({"phase":s.phase,"height":s.height,"state_root":hex::encode(s.root()),"clock":s.clock,"time_unit":"seconds","clock_basis":"target_interval","settings":s.settings,"frozen":s.frozen,"pass_margin_bps":s.frozen.pass_margin_bps.unwrap_or(0).to_string(),"world":world(&s.world),"pass":s.alternative.as_ref().map(world),"auction_escrow":s.auction_escrow.to_str_radix(10)}),
                 )
@@ -1662,7 +1662,7 @@ impl Node {
                 let amount = parse_amount(required_str(&params, "amount")?)?;
                 i.chain.config.check_amount(&amount)?;
                 let s = i.chain.tip_state();
-                let capacity = crate::consensus::grant_capacity(&i.chain.config, &s.world);
+                let capacity = crate::consensus::grant_capacity(&s.world);
                 let funded = amount.clone().min(capacity.clone());
                 Ok(
                     json!({"funded":funded.to_str_radix(10),"capacity":capacity.to_str_radix(10),"feasible":funded==amount,"tip":hex::encode(i.chain.tip_hash())}),
@@ -4893,7 +4893,6 @@ mod tests {
             duration: 64,
 
             start_integral: 0u32.into(),
-            budget_epoch: 0,
         });
         s.alternative = Some(s.world.clone());
         view.chain.state = Arc::new(stash_test_apply(
@@ -4954,7 +4953,6 @@ mod tests {
             duration: 64,
 
             start_integral: 0u32.into(),
-            budget_epoch: 0,
         });
         state.alternative = Some(state.world.clone());
         view.chain.config = Arc::new(config);
@@ -5249,7 +5247,6 @@ mod tests {
             duration: 64,
 
             start_integral: 0u32.into(),
-            budget_epoch: 0,
         });
         s.alternative = Some(s.world.clone());
         view.chain.state = Arc::new(stash_test_apply(

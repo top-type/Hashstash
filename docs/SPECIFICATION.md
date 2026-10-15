@@ -27,7 +27,7 @@ depositor's stash increases by q * d
 
 The fixed genesis parameter `q = Config.share_scale` defaults to 10^18 raw shares per raw hash. The opening ratio is 1 and the opening marginal price is `1/q`. Under the standard display units, one displayed hash initially obtains one displayed stash, excluding fees. Subsequent deposits and withdrawals use the current curve and require their owner's signature.
 
-Fee revenue waits outside an empty or flat reserve. Proposal decisions require the configured minimum reserve and an eligible auction winner.
+Fee revenue waits outside an empty or flat reserve. A decision requires an eligible auction winner; a grant must be fully backed at activation.
 
 ## 3 The reserve curve
 
@@ -108,9 +108,7 @@ M and S remain unchanged
 
 The reserve shortfall lowers the ratio without changing the marginal price or any account's stash quantity. Waiting revenue is spent first. FAIL has no corresponding grant debit. Recipients cannot spend escrow before resolution. If PASS wins, every listed amount is paid once in the same atomic transition; if FAIL wins, the PASS state is discarded.
 
-Eligibility requires the configured reserve minimum and enough backing for the combined amount G. Available backing is waiting revenue plus reserve above the retained minimum. Two optional genesis limits can further restrict G: a fraction of the current reserve per grant, and a remaining allowance for the current budget period. A positive denominator enables a cap: a zero numerator sets it to zero, and positive ratios can equal or exceed one. Exactly `0/0` disables that limit; a positive numerator with a zero denominator is invalid. The supplied presets disable both. These limits cannot be changed by a governance proposal.
-
-Budget periods begin with the first decision and use scheduled seconds. With the period cap enabled, each new period fixes an allowance from the reserve and tracks reserved and spent grants without carrying unused allowance forward. Disabling the cap retains the reservation and spending records but imposes no allowance ceiling. A proposal's registration does not reserve funding or guarantee eligibility. A grant cannot empty a live curve's reserve: at least one raw hash remains even when the configured retained minimum is zero. Revenue already inside the reserve is not also available as waiting revenue.
+Eligibility requires enough available funds for the combined amount G: waiting revenue plus reserve, keeping one raw hash atom in a live Stash reserve so its curve remains valid. Registering a proposal does not reserve funding or guarantee eligibility. Revenue already inside the reserve is not counted again as waiting revenue.
 
 Grants reduce withdrawal backing while preserving the price at that moment. Revenue and grants change the curve's shape rather than trading along it. Ordinary trades, revenue transfers and grants conserve existing hashes.
 
@@ -132,7 +130,7 @@ Governance may change one of:
 | Miner fee percentage | Whole percent from 0 to 100 |
 | Required PASS margin | From 0 through 2^64 − 1 basis points; one basis point is 0.01% |
 
-A proposal signs the exact old and new values, and the new value must differ. Every setting fits unsigned 64-bit representation; block capacity must also fit the host's allocation representation. The 1,024 minimum lets an otherwise empty block create its mining account. Genesis choices for timestamp-window size, ASERT half-life and optional grant ratios also retain only their required positive/representation rules; the preset values are not mandatory bounds.
+A proposal signs the exact old and new values, and the new value must differ. Every setting fits unsigned 64-bit representation; block capacity must also fit the host's allocation representation. The 1,024 minimum lets an otherwise empty block create its mining account. Genesis choices for timestamp-window size and ASERT half-life also retain only their required positive/representation rules; the preset values are not mandatory bounds.
 
 Scheduled time and deadlines must remain representable. The effective auction timeout is the greater of the configured timeout and `lead + interval`; all additions and rounding to future block boundaries are checked. The node checks proposed settings at submission and their projected activation, then checks again when applying them. A positive decision duration may be shorter than a block interval, allowing resolution in the first subsequent block before any conditional trade can be included.
 
@@ -186,7 +184,7 @@ Node policy selects executable transactions by miner fee per weight, respecting 
 
 ## 9 Scheduled time, timestamps and difficulty
 
-Each block advances the economic clock by its parent's target interval. Auction lead, decision, rest and grant-budget periods use these scheduled seconds. Changing target interval preserves their nominal duration; actual elapsed time still varies with mining. Transaction expiry, confirmation depths and timestamp samples remain counts of blocks.
+Each block advances the economic clock by its parent's target interval. Auction lead, decision and rest periods use these scheduled seconds. Changing target interval preserves their nominal duration; actual elapsed time still varies with mining. Transaction expiry, confirmation depths and timestamp samples remain counts of blocks.
 
 Mining uses a fixed 80-byte Bitcoin-style SHA256d header. The timestamp must exceed median past time and remain within the future allowance relative to the validating node's clock. Too-far-future blocks remain retryable. Presets use an 11-header median, 120-second future allowance, 900-second ASERT half-life and 15-second initial target interval.
 
@@ -206,7 +204,7 @@ Accounts and protocol indexes use persistent authenticated treaps. Keys determin
 
 Block execution validates its parent, encoding, target and resource limits; advances scheduled time and parent-price integrals; settles a due decision; applies ordered user transactions and fees; pays the mining subsidy and collected miner fees; replenishes reserves from revenue; processes auctions and complete grant escrow; applies due rest activation; and verifies the resulting committed state. Activation and revenue processing are deterministic and operate independently on active outcomes. The exact ordering is defined by the maintained consensus implementation and corresponding integration tests.
 
-The world commitment includes the account root, reserve, stash supply, curve mass, waiting revenue, grant escrow, price integral, account aggregates. The top-level commitment includes worlds, chain identity, height, clock, issuance, settings, phase, proposal/support/refund indexes, budgets. Every accepted block must reproduce its declared state root.
+The world commitment includes the account root, reserve, stash supply, curve mass, waiting revenue, grant escrow, price integral, account aggregates. The top-level commitment includes worlds, chain identity, height, clock, issuance, settings, phase, proposal/support/refund indexes. Every accepted block must reproduce its declared state root.
 
 ## 11 Conservation and bounds
 
@@ -239,4 +237,4 @@ Signed transaction data is raw bytes. Chat interprets readable UTF-8 and Mail de
 
 Browser wallets sign locally and trust their serving origin. Keys stored in browser storage are unencrypted. Peer authentication and consensus validation do not establish application privacy, independent participation, economic stability or a guarantee against manipulation. HASH represents expected-work issuance rather than stable external purchasing power. Governance compares an internal stash/hash price, not an independently measured public benefit.
 
-Implementation 0.37.1 accepts protocol 27 configurations and records. A database must use its exact genesis configuration. The existing `v26` hash-domain strings and record layout remain unchanged. Protocol 27 is included in the genesis configuration and therefore changes chain identity; signed transactions bind that identity.
+Implementation 0.38.0 accepts protocol 28 configurations and records. A database must use its exact genesis configuration. Chain and state commitments use the `v28` domains and their current field layouts. Transaction, world and block commitments retain their `v26` domains. Signed transactions bind the complete chain identity.

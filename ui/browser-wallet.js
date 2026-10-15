@@ -186,7 +186,7 @@
   function expectedBytes(expected) {
     if (!expected || typeof expected !== 'object') fail('Transaction intent is required.');
     const version = Number(u64(expected.protocol_version, 'Protocol version'));
-    if (version !== 27) fail('Unsupported protocol version.');
+    if (version !== 28) fail('Unsupported protocol version.');
     const nonce = u64(expected.nonce, 'Nonce'), expiry = u64(expected.expiry_height, 'Expiry height');
     if (nonce === MAX_U64 || !expiry) fail('Invalid nonce or expiry height.');
     if (expected.current_height !== undefined && expiry <= u64(expected.current_height)) fail('Transaction has expired.');

@@ -152,14 +152,6 @@ fn whole_grant_is_reserved_at_opening_and_tied_prices_fail() {
         );
         assert!(closed.account(&recipient(), None).is_none());
         assert!(closed.world.grant_escrow.is_zero());
-        assert!(
-            closed
-                .budgets
-                .get(&0u64.to_be_bytes())
-                .unwrap()
-                .spent
-                .is_zero()
-        );
     }
 }
 
@@ -204,10 +196,6 @@ fn pass_trade_can_win_and_release_escrow_exactly_once() {
         1207u64.into()
     );
     assert!(s.world.grant_escrow.is_zero());
-    assert_eq!(
-        s.budgets.get(&0u64.to_be_bytes()).unwrap().spent,
-        1207u64.into()
-    );
     let before = s.account(&recipient(), None).unwrap().ordinary;
     s = step(&c, &s, 1, &[]);
     assert_eq!(s.account(&recipient(), None).unwrap().ordinary, before);
@@ -239,7 +227,7 @@ fn fee_revenue_replenishes_each_world_after_miner_split() {
 }
 
 #[test]
-fn impossible_grant_and_overlarge_budget_are_rejected_without_mutation() {
+fn unfunded_grant_cannot_open_or_remove_backing() {
     let c = config(4);
     let mut s = funded_curve(&c);
     let before = codec::encode(&s);
@@ -251,7 +239,7 @@ fn impossible_grant_and_overlarge_budget_are_rejected_without_mutation() {
             proposal: Proposal::Grant {
                 payments: vec![hashstash::types::GrantPayment {
                     recipient: recipient(),
-                    amount: s.world.reserve.clone(),
+                    amount: s.issued.clone(),
                 }],
             },
             support: 10u64.into(),

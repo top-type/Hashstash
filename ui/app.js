@@ -1785,7 +1785,7 @@
             node.textContent = "Hashes";
         });
         text("guide-average", "The average uses each completed block's stash price, weighted by the scheduled seconds it covers, across the full decision. PASS wins when its average exceeds the FAIL average by the required margin. For example, a 5% margin requires PASS to exceed 1.05 times FAIL. Equality means FAIL. The margin is fixed when the decision begins.");
-        text("guide-clock", "Each block advances the governance clock by the target block interval. With a 15-second target, a 900-second decision spans 60 block intervals. Mining can make the actual wait longer or shorter. Auctions, decisions, rest periods and grant budgets use this clock; transaction expiry and confirmations use block counts.");
+        text("guide-clock", "Each block advances the governance clock by the target block interval. With a 15-second target, a 900-second decision spans 60 block intervals. Mining can make the actual wait longer or shorter. Auctions, decisions and rest periods use this clock; transaction expiry and confirmations use block counts.");
         text("guide-difficulty", "ASERT, the difficulty-adjustment algorithm, uses block timestamps to aim for the governed average block interval. Only blocks on the accepted chain create new hashes; losing blocks receive no reward.");
         for (const field of [ "reserve", "revenue", "grant_capacity" ]) {
             const node = $(`network-${field}`);
@@ -1970,7 +1970,7 @@
             state.status && status.chain_id !== state.status.chain_id && resetContext();
             const previousDecision = hex(activeDecision()?.id), previousNonce = nextNonce();
             const changedState = state.status?.tip !== status.tip || state.status?.state_root !== status.state_root || state.status?.height !== status.height || previousDecision !== hex(gov.phase?.Governance?.id);
-            if (config.protocol_version !== 27) throw new Error("Unsupported protocol version.");
+            if (config.protocol_version !== 28) throw new Error("Unsupported protocol version.");
             state.config = config;
             settings.BlockBytes[1] = "Block capacity";
             settings.BlockBytes[2] = "weight";

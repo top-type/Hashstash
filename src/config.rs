@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use num_traits::{One, Zero};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 27;
+pub const PROTOCOL_VERSION: u32 = 28;
 /// An empty block must be able to create its miner account.
 pub const MIN_GOVERNED_BLOCK_BYTES: u64 = crate::fees::ACCOUNT_WEIGHT;
 
@@ -79,15 +79,6 @@ pub struct Config {
     #[serde(with = "amount")]
     pub share_scale: Amount,
     pub auction_timeout: u64,
-    #[serde(with = "amount")]
-    pub reserve_min: Amount,
-    /// A nonnegative ratio limits each grant; exactly 0/0 disables this cap.
-    pub grant_numerator: u64,
-    pub grant_denominator: u64,
-    /// A nonnegative ratio limits each epoch; exactly 0/0 disables this cap.
-    pub budget_numerator: u64,
-    pub budget_denominator: u64,
-    pub budget_period: u64,
     pub initial: Settings,
 }
 impl Config {
@@ -95,7 +86,7 @@ impl Config {
     pub fn devnet() -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
-            network: "hashstash-devnet-v27".into(),
+            network: "hashstash-devnet-v28".into(),
             genesis_time: 1_770_000_000,
             initial_bits: 0x207fffff,
             limit_bits: 0x207fffff,
@@ -110,12 +101,6 @@ impl Config {
             quote_scale: Amount::from(10u32).pow(30),
             share_scale: Amount::from(10u32).pow(18),
             auction_timeout: 128 * 15,
-            reserve_min: 100u32.into(),
-            grant_numerator: 0,
-            grant_denominator: 0,
-            budget_numerator: 0,
-            budget_denominator: 0,
-            budget_period: 2048 * 15,
             initial: Settings {
                 block_bytes: 16_384,
                 minimum_fee_rate: 1,
@@ -130,19 +115,16 @@ impl Config {
     }
     pub fn testnet() -> Self {
         let mut config = Self::devnet();
-        config.network = "hashstash-testnet-v27".into();
+        config.network = "hashstash-testnet-v28".into();
         config.auction_timeout = 32 * 15;
-        config.reserve_min = 20u32.into();
-        config.budget_period = 128 * 15;
         config.initial.rest = 32 * 15;
         config.initial.duration = 16 * 15;
         config
     }
     pub fn slow_testnet() -> Self {
         let mut config = Self::testnet();
-        config.network = "hashstash-slow-testnet-v27".into();
+        config.network = "hashstash-slow-testnet-v28".into();
         config.auction_timeout = 240 * 15;
-        config.budget_period = 5760 * 15;
         config.initial.lead = 20 * 15;
         config.initial.rest = 720 * 15;
         config.initial.duration = 240 * 15;
@@ -150,12 +132,6 @@ impl Config {
     }
     pub fn progress_increment(&self, settings: &Settings) -> u64 {
         settings.interval
-    }
-    pub fn grant_fraction_enabled(&self) -> bool {
-        (self.grant_numerator, self.grant_denominator) != (0, 0)
-    }
-    pub fn grant_budget_enabled(&self) -> bool {
-        (self.budget_numerator, self.budget_denominator) != (0, 0)
     }
     pub fn governance_parameters(&self) -> Vec<Parameter> {
         PARAMETERS.to_vec()
@@ -272,21 +248,7 @@ impl Config {
             "monetary products exceed intermediate range"
         );
         ensure!(!self.quote_scale.is_zero(), "invalid quote precision");
-        ensure!(
-            self.reserve_min.bits() <= self.money_bits,
-            "invalid minimum governance reserve"
-        );
-        for (n, d) in [
-            (self.grant_numerator, self.grant_denominator),
-            (self.budget_numerator, self.budget_denominator),
-        ] {
-            ensure!(
-                (n == 0 && d == 0) || d > 0,
-                "ratio denominator must be positive, or exactly 0/0 to disable its cap"
-            );
-        }
         self.validate_governance_settings_at(&self.initial, 0)?;
-        ensure!(self.budget_period > 0, "budget period must be positive");
         let max_clock = u64::MAX;
         let max_issued = Amount::from(self.max_height) * (Amount::one() << 255usize);
         ensure!(
@@ -318,7 +280,7 @@ impl Config {
         codec::encode(self)
     }
     pub fn chain_id(&self) -> Hash {
-        crypto::tagged_hash("Hashstash/chain/v26", &self.consensus_bytes())
+        crypto::tagged_hash("Hashstash/chain/v28", &self.consensus_bytes())
     }
     pub fn check_amount(&self, x: &Amount) -> Result<()> {
         ensure!(x.bits() <= self.money_bits, "HASH range exceeded");
@@ -354,41 +316,6 @@ impl Config {
 #[cfg(test)]
 mod capacity_tests {
     use super::*;
-
-    #[test]
-    fn grant_caps_accept_nonnegative_ratios_or_explicit_zero_pairs() {
-        for budget in [false, true] {
-            for (n, d, valid) in [
-                (0, 0, true),
-                (0, 1, true),
-                (1, 0, false),
-                (1, 1, true),
-                (2, 1, true),
-                (u64::MAX, 1, true),
-                (1, 10, true),
-                (u64::MAX - 1, u64::MAX, true),
-            ] {
-                let mut c = Config::testnet();
-                if budget {
-                    c.budget_numerator = n;
-                    c.budget_denominator = d;
-                } else {
-                    c.grant_numerator = n;
-                    c.grant_denominator = d;
-                }
-                assert_eq!(c.validate().is_ok(), valid, "budget={budget}, {n}/{d}");
-                if valid {
-                    let bytes = c.consensus_bytes();
-                    let decoded: Config = codec::decode(&bytes, bytes.len()).unwrap();
-                    assert_eq!(decoded, c);
-                    assert_eq!(decoded.chain_id(), c.chain_id());
-                    if n != 0 {
-                        assert_ne!(c.chain_id(), Config::testnet().chain_id());
-                    }
-                }
-            }
-        }
-    }
 
     #[test]
     fn transaction_capacity_tracks_governed_capacity_without_transport_policy() {

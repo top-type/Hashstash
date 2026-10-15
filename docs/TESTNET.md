@@ -1,6 +1,6 @@
 # Local testnet
 
-The maintained presets and launcher use Hashstash 0.37.1 protocol 27. A fresh launch creates a distinct configuration and database.
+The maintained presets and launcher use Hashstash 0.38.0 protocol 28. A fresh launch creates a distinct configuration and database.
 
 ```powershell
 .\Start-Testnet.ps1 -Fresh -NoBrowser
@@ -17,11 +17,11 @@ Stopping verifies the owned process identities and preserves files. Resuming reu
 
 ## Presets and phases
 
-`config/devnet.json`, `config/testnet.json` and `config/slow-testnet.json` are development presets. They start with a 15-second mining target, 16 KiB block-byte and block-weight limit; transactions use the available block capacity. Both optional grant-ratio and budget-allowance caps are disabled (`0/0`) in these presets; reserve backing and the retained minimum still apply. Phase durations are scheduled seconds; transaction expiry and confirmation depths remain block counts. The slow preset makes governance phases longer; none of the presets promises production safety.
+`config/devnet.json`, `config/testnet.json` and `config/slow-testnet.json` are development presets. They start with a 15-second mining target, 16 KiB block-byte and block-weight limit; transactions use the available block capacity. Phase durations are scheduled seconds; transaction expiry and confirmation depths remain block counts. The slow preset makes governance phases longer; none of the presets promises production safety.
 
 Each preset starts with an empty reserve and a Rest phase before the first proposal auction. A first deposit starts a flat curve at the configured share scale. Mining and Stash trading continue through rest, auction and governance. For isolated easy-target tests, operators can use explicitly bounded CLI mining; external ASIC connections use node-level Stratum settings.
 
-Each canonical block earns its target's expected-work subsidy. Losing work is unpaid. Timestamp ASERT uses a 900-second half-life, 11-header median and 120-second future allowance. Its anchor is the first mined block of each branch; waiting before mining begins does not lower difficulty. Governance can set a positive whole-second target interval, subject to representable clocks and deadlines. The economic clock advances by the parent's target interval per block, preserving nominal phase durations and grant-budget periods as the interval changes. Actual wall time remains dependent on mining; signed transaction expiry and confirmation counts remain height-based.
+Each canonical block earns its target's expected-work subsidy. Losing work is unpaid. Timestamp ASERT uses a 900-second half-life, 11-header median and 120-second future allowance. Its anchor is the first mined block of each branch; waiting before mining begins does not lower difficulty. Governance can set a positive whole-second target interval, subject to representable clocks and deadlines. The economic clock advances by the parent's target interval per block, preserving nominal phase durations as the interval changes. Actual wall time remains dependent on mining; signed transaction expiry and confirmation counts remain height-based.
 
 ## Wallet and governance
 

@@ -1,5 +1,7 @@
 use hashstash::{
+    codec,
     config::{Config, PROTOCOL_VERSION},
+    state::State,
     types::Parameter,
 };
 
@@ -27,21 +29,21 @@ fn checked_in_presets_are_exact_current_configs() {
 }
 
 #[test]
-fn protocol27_preset_chain_ids_match_independent_encoding() {
-    // Independently packed from the unchanged field order and varints.
+fn protocol28_preset_chain_ids_match_independent_encoding() {
+    // Independently packed from the current field order and varints.
     // Protocol and preset changes separate these chains from prior releases.
     for (c, expected) in [
         (
             Config::devnet(),
-            "f62127c60825be20ee7c19f6d5ef79712ab2f4c525c6e179091407f5c082dac2",
+            "f1c3b5f5e8145ff107ce4637fb933037fc762c69527e55a4d33fe8b9d6fbd2b9",
         ),
         (
             Config::testnet(),
-            "e7cea4e17c601540e5c96ae4f7b51310c53395eba5429158356e295150954567",
+            "fd26b784e3e31ef3167bebe783ee416a0945e942ff26f502435c0d0fb91cabfd",
         ),
         (
             Config::slow_testnet(),
-            "0b2613506d8bf0b0fd26c3f6c9f32ad39e22f8031eb5529b3473a6b438d53d69",
+            "3d4c6da867563401f28fc4a9e220c71a923111fc96ecfbff12b49c9fe7023433",
         ),
     ] {
         c.validate().unwrap();
@@ -124,9 +126,7 @@ fn genesis_settings_use_defined_domains_without_policy_limits() {
     c.max_height = i64::MAX as u64;
     c.max_integer_bits = u64::MAX;
     c.quote_scale = hashstash::types::Amount::from(1u32) << 300usize;
-    c.reserve_min = 0u32.into();
     c.auction_timeout = 0;
-    c.budget_period = 1;
     c.initial.rest = 0;
     c.initial.lead = 0;
     c.initial.minimum_fee_rate = 0;
@@ -134,7 +134,7 @@ fn genesis_settings_use_defined_domains_without_policy_limits() {
     c.daa_half_life = u64::MAX;
     c.timestamp_window = usize::MAX;
     c.validate().unwrap();
-    for field in ["timestamp_window", "daa_half_life", "budget_period"] {
+    for field in ["timestamp_window", "daa_half_life"] {
         let mut value = serde_json::to_value(&c).unwrap();
         value[field] = 0.into();
         assert!(
@@ -149,4 +149,57 @@ fn genesis_settings_use_defined_domains_without_policy_limits() {
     c = Config::devnet();
     c.genesis_time = u32::MAX;
     assert!(c.validate().is_err());
+}
+
+#[test]
+fn obsolete_grant_cap_config_and_state_fields_are_rejected() {
+    let config = Config::devnet();
+    for (field, value) in [
+        ("reserve_min", serde_json::json!("100")),
+        ("grant_numerator", serde_json::json!(0)),
+        ("grant_denominator", serde_json::json!(0)),
+        ("budget_numerator", serde_json::json!(0)),
+        ("budget_denominator", serde_json::json!(0)),
+        ("budget_period", serde_json::json!(30720)),
+    ] {
+        let mut old = serde_json::to_value(&config).unwrap();
+        old[field] = value;
+        assert!(serde_json::from_value::<Config>(old).is_err(), "{field}");
+    }
+    let state = State::genesis(&config);
+    for (field, value) in [
+        ("budgets", serde_json::json!([])),
+        ("budget_start", serde_json::Value::Null),
+        ("budget_epoch", serde_json::json!(0)),
+    ] {
+        let mut old = serde_json::to_value(&state).unwrap();
+        old[field] = value;
+        assert!(serde_json::from_value::<State>(old).is_err(), "{field}");
+    }
+}
+
+#[test]
+fn prior_serialized_config_and_genesis_state_fail_closed() {
+    let config = Config::devnet();
+    let mut old_config = config.consensus_bytes();
+    // Protocol 27 put reserve minimum, four ratio integers and the period
+    // between auction_timeout and initial Settings in the canonical encoding.
+    let offset = old_config.len() - codec::encode(&config.initial).len();
+    let removed = codec::encode(&(vec![100u8], 0u64, 0u64, 0u64, 0u64, 30_720u64));
+    old_config.splice(offset..offset, removed);
+    old_config[0] = 27;
+    let network_suffix = old_config.windows(3).position(|w| w == b"v28").unwrap();
+    old_config[network_suffix + 2] = b'7';
+    assert!(codec::decode::<Config>(&old_config, old_config.len()).is_err());
+
+    let state = State::genesis(&config);
+    let mut old_state = codec::encode(&state);
+    // The old empty map, absent start, and epoch zero precede last_round and
+    // last_epoch. Even an empty old snapshot must not silently lose fields.
+    let offset = old_state.len() - codec::encode(&(state.last_round, state.last_epoch)).len();
+    old_state.splice(offset..offset, [0u8; 3]);
+    old_state[..32].copy_from_slice(
+        &hex::decode("f62127c60825be20ee7c19f6d5ef79712ab2f4c525c6e179091407f5c082dac2").unwrap(),
+    );
+    assert!(codec::decode::<State>(&old_state, old_state.len()).is_err());
 }

@@ -1,6 +1,6 @@
 [package]
 name = "hashstash"
-version = "0.37.1"
+version = "0.38.0"
 edition = "2024"
 default-run = "hashstash"
 description = "Hashstash account-based SHA256d blockchain node"

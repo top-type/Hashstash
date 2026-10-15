@@ -204,32 +204,41 @@ fn grant_execution_weight_is_fixed_even_for_existing_recipients() {
 }
 
 #[test]
-fn aggregate_grant_fraction_and_period_budget_cannot_be_split_away() {
-    for budget_limited in [false, true] {
-        let mut c = config();
-        c.grant_numerator = 1;
-        c.grant_denominator = 10;
-        c.budget_numerator = 1;
-        c.budget_denominator = 4;
-        if budget_limited {
-            c.budget_numerator = 1;
-            c.budget_denominator = 100;
-        }
-        c.validate().unwrap();
-        let mut s = funded(&c);
-        // Each payment fits its bound independently; the sum does not.
-        let amount = if budget_limited { 6000 } else { 60_000 };
-        let entries = payments(&[amount, amount]);
-        let tx = propose(&s, entries);
-        s = step(&c, &s, key(181), 0, &[tx]);
-        for _ in 0..20 {
-            s = step(&c, &s, key(181), 0, &[]);
-            assert!(s.decision_id().is_none());
-            assert!(s.world.grant_escrow.is_zero());
-        }
-        assert!(s.account(&key(182), None).is_none());
-        assert!(s.account(&key(183), None).is_none());
+fn aggregate_grant_cannot_exceed_funds_by_splitting_payments() {
+    let c = config();
+    let mut s = funded(&c);
+    // Each payment fits independently; their total exceeds the available funds.
+    let entries = payments(&[600_000, 600_000]);
+    let tx = propose(&s, entries);
+    s = step(&c, &s, key(181), 0, &[tx]);
+    let backing = &s.world.reserve + &s.world.revenue;
+    for _ in 0..20 {
+        s = step(&c, &s, key(181), 0, &[]);
+        assert!(s.decision_id().is_none());
+        assert!(s.world.grant_escrow.is_zero());
+        assert!(&s.world.reserve + &s.world.revenue >= backing);
     }
+    assert!(s.account(&key(182), None).is_none());
+    assert!(s.account(&key(183), None).is_none());
+}
+
+#[test]
+fn multi_recipient_grant_can_spend_more_than_half_the_reserve() {
+    let c = config();
+    let entries = payments(&[300_000, 300_000]);
+    let opening = active(&c, entries.clone());
+    let escrow = &opening.alternative.as_ref().unwrap().grant_escrow;
+    assert_eq!(escrow, &Amount::from(600_000u32));
+    assert!(escrow * 2u32 > opening.world.reserve);
+    let closing = before_resolution(&c, opening, true);
+    let settled = step(&c, &closing, key(181), 0, &[]);
+    for payment in entries {
+        assert_eq!(
+            settled.account(&payment.recipient, None).unwrap().ordinary,
+            payment.amount
+        );
+    }
+    assert!(settled.world.grant_escrow.is_zero());
 }
 
 #[test]
@@ -257,9 +266,6 @@ fn pass_pays_every_exact_amount_once_and_fail_pays_none() {
                 assert!(settled.account(&payment.recipient, None).is_none());
             }
         }
-        let budget = settled.budgets.get(&0u64.to_be_bytes()).unwrap();
-        assert!(budget.reserved.is_zero());
-        assert_eq!(budget.spent, Amount::from(if won { 9000u32 } else { 0 }));
         let cash = settled.world.account_cash.clone();
         settled = step(&c, &settled, key(181), 0, &[]);
         assert_eq!(settled.world.account_cash, cash);

@@ -379,7 +379,7 @@ fn initial_config(preset: InitPreset, hashrate: Option<&str>) -> Result<Config> 
         calibrate_initial_target(&mut config, rate)?;
         let mut unique = [0u8; 8];
         getrandom::fill(&mut unique).map_err(|e| anyhow!("randomness unavailable: {e}"))?;
-        config.network = format!("hashstash-private-v27-{}", hex::encode(unique));
+        config.network = format!("hashstash-private-v28-{}", hex::encode(unique));
     }
     config.validate()?;
     Ok(config)

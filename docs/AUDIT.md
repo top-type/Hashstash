@@ -1,6 +1,6 @@
 # Review scope and limitations
 
-Hashstash is experimental software. The maintained tests exercise protocol 27 accounting, execution and interfaces. This document describes their scope and the risks those checks do not resolve; it is not an independent audit report.
+Hashstash is experimental software. The maintained tests exercise protocol 28 accounting, execution and interfaces. This document describes their scope and the risks those checks do not resolve; it is not an independent audit report.
 
 Accounting and consensus tests cover conservation in each outcome, deposits into an empty flat reserve, price preservation for protocol reserve movements, directed integer curve bounds, grant eligibility and escrow, PASS/FAIL price comparison, settlement, reorganization and overflow limits. Multi-recipient cases include bounded decoding, canonical recipient ordering, aggregate funding limits, prepaid execution weight, atomic credits and miner-account overlap. The [validation guide](VALIDATION.md) explains how to repeat the maintained checks and record their results.
 

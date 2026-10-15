@@ -5,7 +5,6 @@ use serde_json::json;
 fn governance_snapshot_keeps_current_proposal_after_more_than_one_page_of_history() {
     let directory = tempfile::tempdir().unwrap();
     let mut config = Config::devnet();
-    config.reserve_min = 20u32.into();
     config.initial_bits = 0x2000ffff;
     config.limit_bits = 0x2000ffff;
     config.initial.block_bytes = 262144;

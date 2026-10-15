@@ -12,7 +12,7 @@ async function run(){
  const readable='First line\nSecond line\r\n\tIndented.';eq(Buffer.from(api.encode(readable),'hex').toString(),readable);eq(api.verifiedText(readable,sha(readable)),readable);
  api.encode('é'.repeat(1024));checks++;
  eq(Buffer.from(api.encode('"'.repeat(2048)),'hex').toString(),'"'.repeat(2048),'plain text does not incur JSON escaping overhead');
- const s=h.currentSnapshot;s.config.protocol_version=27;s.status.settings.block_bytes=16384;
+ const s=h.currentSnapshot;s.config.protocol_version=28;s.status.settings.block_bytes=16384;
 
  s.status.fee_policy={minimum_fee_rate:'1',fee_scale:1024,account_weight:1024};
  h.handlers.fee_quote=params=>{const {chain_id,tip,state_root,height}=s.status,data=params.data_hex||'';return response({result:{miner_fee_percent:50,miner_fee:'0',revenue_fee:'1',chain_id,tip,state_root,height,sender:require('./test_wallet_ui.cjs').addr(params.sender),sender_public_key:params.sender,fee:'1',minimum_fee:'1',account_creation_fee:'0',grant_recipient_fee:'0',extra_fee:'0',weight:'512',minimum_fee_rate:'1',data_hex:data,data_bytes:data.length/2}});};

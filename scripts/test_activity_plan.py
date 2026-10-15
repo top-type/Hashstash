@@ -21,7 +21,7 @@ class PlannerTest(unittest.TestCase):
                        "last_action_height": 1, "last_chat_at": 900,
                        "history": [], "cursor": 0}
         self.snapshot = {
-            "status": {"chain_id": CHAIN, "protocol_version": 27, "height": 100, "clock": 1500,
+            "status": {"chain_id": CHAIN, "protocol_version": 28, "height": 100, "clock": 1500,
                        "phase": "rest", "decision": None, "auction_round": None,
                        "settings": {"interval": 15}},
             "governance": {"world": {"reserve": str(10**18), "grant_capacity": str(10**17)}},
@@ -75,8 +75,7 @@ class PlannerTest(unittest.TestCase):
 
     def substantive(self, region="fra", heavy=False):
         self.policy.update(profile="substantive-v1", region=region, last_chat_at=self.now,
-                           max_grant_raw=str(planner.SUBSTANTIVE_GRANT_CAP),
-                           grant_budget_remaining_raw=str(10**17), consumptive_budget_remaining_raw=str(10**15))
+                           consumptive_budget_remaining_raw=str(10**15))
         for index, actor in enumerate(self.accounts):
             actor["public_key"] = REGISTRY[region][index]
             if heavy:
@@ -165,12 +164,12 @@ class PlannerTest(unittest.TestCase):
         for kind in ("Unknown", "NotAnOperation"):
             self.assertEqual(planner.cash_guard(self.snapshot, self.accounts[0], {kind: {}}, 1),
                              "unsupported_activity_operation")
-        for unsupported in (26, 28):
+        for unsupported in (27, 29):
             self.snapshot["status"]["protocol_version"] = unsupported
             self.assertIsNone(self.choose())
 
     def test_current_timestamp_chain_preserves_outcome_rules(self):
-        self.check_timestamp_chain_outcomes(27)
+        self.check_timestamp_chain_outcomes(28)
 
 
     def test_fee_cap_and_no_spending_last_fee_reserve(self):
@@ -262,7 +261,7 @@ class PlannerTest(unittest.TestCase):
         self.assertEqual(self.choose()["kind"], "support")
         saved = copy.deepcopy(row)
         for recipient, amount, description in (("ff" * 32, planner.GRANT, desc),
-                                               (REGISTRY["fra"][0], planner.GRANT + 1, desc),
+                                               (REGISTRY["fra"][0], 10**17 + 1, desc),
                                                (REGISTRY["fra"][0], planner.GRANT, b"x" * 32)):
             row["proposal"]["description"] = list(description)
             row["proposal"]["action"]["Grant"] = {"payments": [{"recipient": list(bytes.fromhex(recipient)), "amount": str(amount)}]}
@@ -306,7 +305,7 @@ class PlannerTest(unittest.TestCase):
         for mutation in ("outside", "aggregate", "order", "zero"):
             saved = copy.deepcopy(payments)
             if mutation == "outside": payments[1]["recipient"] = [255] * 32
-            elif mutation == "aggregate": payments[1]["amount"] = str(planner.GRANT)
+            elif mutation == "aggregate": payments[1]["amount"] = str(10**17)
             elif mutation == "order": payments.reverse()
             else: payments[1]["amount"] = "0"
             self.assertNotEqual(self.choose()["kind"], "support", mutation)
@@ -429,7 +428,7 @@ class PlannerTest(unittest.TestCase):
         self.assertEqual(next_action["preferred_outcome"], "Pass")
         self.assertNotEqual(next_action["strategy_leg"], "trim_unfavored")
 
-    def test_substantive_grants_use_real_capacity_and_profile_caps(self):
+    def test_substantive_grant_targets_scale_with_real_backing(self):
         self.substantive("sgp")
         self.phase("auction")
         action = self.choose()
@@ -440,12 +439,7 @@ class PlannerTest(unittest.TestCase):
         self.assertNotEqual(self.choose()["kind"], "propose_grant")
         self.policy["pending_actions"] = []
         self.snapshot["governance"]["world"].update(reserve=str(10**21), grant_capacity=str(10**20))
-        self.assertEqual(int(self.choose()["grant_amount_raw"]), planner.SUBSTANTIVE_GRANT_CAP)
-        self.policy["grant_budget_remaining_raw"] = str(2 * 10**15)
-        self.assertEqual(int(self.choose()["grant_amount_raw"]), 2 * 10**15)
-        self.policy["grant_budget_remaining_raw"] = "0"
-        self.assertNotEqual(self.choose()["kind"], "propose_grant")
-        self.policy["grant_budget_remaining_raw"] = str(10**17)
+        self.assertEqual(int(self.choose()["grant_amount_raw"]), 5 * 10**18)
         self.policy["consumptive_budget_remaining_raw"] = "0"
         self.assertNotEqual(self.choose()["kind"], "propose_grant")
 
@@ -560,7 +554,7 @@ class PlannerTest(unittest.TestCase):
             self.substantive_governance()
         else:
             self.phase("governance")
-        self.snapshot["status"]["protocol_version"] = 27
+        self.snapshot["status"]["protocol_version"] = 28
 
     def confirm_full_cash(self, action):
         actor = self.accounts[action["sender_index"]]
@@ -591,7 +585,7 @@ class PlannerTest(unittest.TestCase):
 
     def test_current_trade_policy_pays_full_fee_and_does_not_govern_fee_parameter(self):
         self.full_cash_governance(substantive=True)
-        self.snapshot['status']['protocol_version'] = 27
+        self.snapshot['status']['protocol_version'] = 28
         self.accounts[1]['pending'] = self.accounts[2]['pending'] = True
         rpc = self.rpc
         for percent in (0, 37, 100):
@@ -709,9 +703,7 @@ class PlannerTest(unittest.TestCase):
 
     def native(self):
         self.substantive()
-        self.policy.update(profile=planner.NATIVE_PROFILE,
-                           consumptive_budget_remaining_raw="0", grant_budget_remaining_raw="0",
-                           max_grant_raw="1")
+        self.policy.update(profile=planner.NATIVE_PROFILE, consumptive_budget_remaining_raw="0")
 
     def test_native_grant_uses_revenue_support_and_half_reserve_without_demo_caps(self):
         self.native()
@@ -722,7 +714,6 @@ class PlannerTest(unittest.TestCase):
         self.assertEqual(action["kind"], "propose_grant")
         support = int(action["operation"]["Propose"]["support"])
         self.assertEqual(int(action["grant_amount_raw"]), 7 * 10**17 + support + int(action['quoted_fee_raw']))
-        self.assertGreater(int(action["grant_amount_raw"]), planner.SUBSTANTIVE_GRANT_CAP)
         self.assertNotIn("data_hex", action)
         text = planner.proposal_description("fra", 0, planner.NATIVE_PROFILE).encode()
         self.assertEqual(hashlib.sha256(text).digest(), bytes(action["operation"]["Propose"]["description"]))

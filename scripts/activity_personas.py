@@ -11,7 +11,7 @@ MAX_TEXT_BYTES = 512
 REGIONS = ("fra", "sgp", "ewr")
 
 # name, role, commitment, circulation, ordinary Stash target, grant ask,
-# maximum acceptable grant/capacity fraction, base PASS bias, price sensitivity
+# preferred grant/capacity fraction, base PASS bias, price sensitivity
 _ROWS = {
     "fra": (
         ("Mara", "Reserve guardian", 2500, 1000, 6000, 100, 100, -22, 8),
@@ -111,7 +111,7 @@ def profile_for(region, index, strategy="substantive-v1"):
     if region not in REGIONS or type(index) is not int or not 0 <= index < 3:
         raise ValueError("unknown demo persona")
     fields = ("name", "role", "commitment_bps", "circulation_bps", "stash_adjustment_bps",
-              "grant_request_bps", "grant_fraction_limit_bps", "base_pass_bias", "price_sensitivity")
+              "grant_request_bps", "grant_fraction_preference_bps", "base_pass_bias", "price_sensitivity")
     result = dict(zip(fields, _ROWS[region][index]))
     result.update(region=region, index=index, label="Automated Demo · " + result["name"])
     result["minimum_funding_bps"] = 8000 if region == "sgp" else 10000
@@ -190,12 +190,12 @@ def evaluate(snapshot, profile, metrics=None):
         if profile.get("native_balance_strategy"):
             score -= fraction * profile["grant_cost_sensitivity"] // 10000
             reasons.append("the request uses " + str(fraction / 100) + "% of available grant backing")
-        elif fraction > profile["grant_fraction_limit_bps"]:
+        elif fraction > profile["grant_fraction_preference_bps"]:
             score -= 40
-            reasons.append("the request exceeds my grant allocation limit")
+            reasons.append("the request is larger than my preferred grant allocation")
         else:
             score += 12
-            reasons.append("the request fits my grant allocation limit")
+            reasons.append("the request fits my preferred grant allocation")
     if observed.get("grant_feasible") is False:
         score -= 65
         reasons.append("the current funding quote cannot cover the request")

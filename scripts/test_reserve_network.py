@@ -106,7 +106,7 @@ class ReserveAudit(Audit):
     def assert_supply(self, port=None):
         port = port or self.port
         state, governance = rpc(port, 'status'), rpc(port, 'governance')
-        assert state['protocol_version'] == 27
+        assert state['protocol_version'] == 28
         assert state['time_unit'] == 'seconds' and state['clock_basis'] == 'target_interval'
         assert state['height'] <= state['clock'] <= state['height'] * 60
         for outcome in (['Pass', 'Fail'] if governance['pass'] is not None else [None]):
@@ -119,7 +119,7 @@ class ReserveAudit(Audit):
             reserve, mass = int(world['reserve']), int(world['curve_mass'])
             assert 0 <= reserve <= mass
             assert (reserve == 0) == (shares == 0) == (mass == 0)
-            capacity = int(world['revenue']) + max(0, reserve - int(self.config['reserve_min']))
+            capacity = int(world['revenue']) + max(0, reserve - 1)
             assert int(world['grant_capacity']) == capacity
             if shares and int(world['revenue']):
                 assert reserve == mass
@@ -218,18 +218,16 @@ class ReserveAudit(Audit):
         self.check('A cash-buffered grant is reserved immediately; buying a flat PASS curve leaves a tie, so the existing decision rule resolves FAIL')
 
     def prepare_sloped_grant(self):
-        # The grant must exceed buffered fees, including its own proposal fee,
-        # while remaining below the unchanged per-grant and epoch limits.
+        # Fund a grant that draws from the reserve after waiting revenue.
         state = self.status()
-        target_reserve = (int(state['revenue']) + 50) * self.config['grant_denominator'] // self.config['grant_numerator'] + int(self.config['reserve_min'])
+        target_reserve = 2 * (int(state['revenue']) + 100)
         deposit = max(0, target_reserve - int(state['reserve']))
         self.ensure_cash(deposit + target_reserve + 100)
         if deposit:
             self.send({'Deposit': {'amount': str(deposit), 'min_shares': '1', 'decision': None, 'outcome': None}})
-        self.mine(self.config['budget_period'] // self.status()['settings']['interval'] + 1)
         self.wait_open_auction()
         state = self.status()
-        grant = int(state['reserve']) * self.config['grant_numerator'] // self.config['grant_denominator']
+        grant = int(state['revenue']) + int(state['reserve']) // 2
         assert grant > int(state['revenue']) + 10
         assert rpc(self.port, 'grant_quote', {'amount': str(grant)})['feasible']
         return grant
@@ -309,7 +307,7 @@ class ReserveAudit(Audit):
 
     def run(self):
         assert self.status()['height'] == 0, 'audit requires a fresh disposable network'
-        assert self.config['protocol_version'] == 27
+        assert self.config['protocol_version'] == 28
         self.open_curve()
         self.payments()
         self.buffered_revenue()

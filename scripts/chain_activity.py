@@ -286,13 +286,15 @@ class Ledger:
 
 def config_checked(config):
     c = dict(config)
+    if {'max_grant_raw', 'max_grant_exposure_daily_raw'} & c.keys():
+        raise ValueError('grant spending cap settings are not supported')
     c.setdefault('profile', 'bounded-v1')
     if c['profile'] not in ('bounded-v1', 'substantive-v1', *NATIVE_PROFILES):
         raise ValueError('unknown activity profile')
     native = c['profile'] in NATIVE_PROFILES
     substantive = c['profile'] in ('substantive-v1', *NATIVE_PROFILES)
     if native:
-        for field in ('max_grant_raw', 'max_grant_exposure_daily_raw', 'max_consumptive_daily_raw', 'max_actions_daily',
+        for field in ('max_consumptive_daily_raw', 'max_actions_daily',
                       'max_fee_raw', 'fee_reserve_raw'):
             c.pop(field, None)
     key_bytes(c['chain_id'])
@@ -330,17 +332,13 @@ def config_checked(config):
                 'confirmations': 2, 'expiry_blocks': 20, 'max_actions_daily': 4320,
                 'max_consumptive_daily_raw': '1000000000000000' if substantive else '200000000000000',
                 'funding_seconds': 86400}
-    if substantive:
-        defaults.update(max_grant_raw='50000000000000000', max_grant_exposure_daily_raw='100000000000000000')
     for key, value in defaults.items():
         c.setdefault(key, value)
         if int(c[key]) <= 0:
             raise ValueError('positive activity limits required')
     if c['action_seconds'] < 20 or c['chat_seconds'] < (90 if substantive else 300) or c['funding_seconds'] < 86400:
         raise ValueError('activity cannot bypass cadence or funding limits')
-    if substantive and not native and (int(c['max_grant_raw']) > 50_000_000_000_000_000
-            or int(c['max_grant_exposure_daily_raw']) > 100_000_000_000_000_000
-            or int(c['max_consumptive_daily_raw']) > 1_000_000_000_000_000):
+    if substantive and not native and int(c['max_consumptive_daily_raw']) > 1_000_000_000_000_000:
         raise ValueError('substantive profile exceeds its authorized ceiling')
     if not native and (int(c['max_fee_raw']) > 1000000 or c['max_actions_daily'] > 4320):
         raise ValueError('activity limit exceeds fixed ceiling')
@@ -349,7 +347,7 @@ def config_checked(config):
     if native:
         # Null records that these inherited budget knobs are inactive. Cadence,
         # identity, journaling and actual backing/fee checks remain mandatory.
-        for field in ('max_grant_raw', 'max_grant_exposure_daily_raw', 'max_consumptive_daily_raw', 'max_actions_daily'):
+        for field in ('max_consumptive_daily_raw', 'max_actions_daily'):
             c[field] = None
         c['fee_policy'] = 'live_quote_affordability'
     return c
@@ -387,7 +385,7 @@ class Activity:
                     for group in self.c['registry'].values() for entry in group]
         snapshot = self.rpc('snapshot', {'keys': keys})
         status = snapshot['status']
-        if status.get('chain_id') != self.c['chain_id'] or status.get('protocol_version') != 27:
+        if status.get('chain_id') != self.c['chain_id'] or status.get('protocol_version') != 28:
             raise Fault('activity is pinned to another chain or protocol')
         height = int(status['height'])
         if self.observed_height is not None and height > self.observed_height:
@@ -485,20 +483,9 @@ class Activity:
         # there is no finality guarantee that a reorg cannot restore validity.
         rows = [r for r in self.ledger.rows(('preparing', 'pending', 'confirmed', 'expired'))
                 if r['state'] in ('preparing', 'pending') or r['created'] > self.clock() - 86400]
-        used, grants = 0, 0
-        for row in rows:
-            action = json.loads(row['action'])
-            used += int(action.get('reserved_cost_raw', self.c['max_fee_raw']))
-            proposal = action.get('operation', {}).get('Propose')
-            if 'reserved_grant_raw' in action:
-                grants += int(action['reserved_grant_raw'])
-            elif proposal:
-                grants += validated_grant(proposal['proposal']['Grant'])[1]
-            elif 'Support' in action.get('operation', {}):
-                # Historical bounded-profile support did not store a separate
-                # reservation. Its planner permitted grants of at most 1e13.
-                grants += int(action.get('grant_amount_raw', 10_000_000_000_000))
-        return rows, used, grants
+        used = sum(int(json.loads(row['action']).get('reserved_cost_raw', self.c['max_fee_raw']))
+                   for row in rows)
+        return rows, used
 
     def policy(self, snapshot=None):
         history = []
@@ -519,7 +506,7 @@ class Activity:
                 or h.get('kind') in ('propose_grant', 'support', 'refund')
                 or decision is not None and h.get('decision') == decision
                 or round_id is not None and h.get('round') == round_id]
-        _, used, grants = self.reservations()
+        _, used = self.reservations()
         result = dict(self.c, history=keep, cursor=len(history),
                     confirmed_chat_count=sum(chat_counts), confirmed_chat_counts=chat_counts,
                     pending_actions=[json.loads(r['action']) for r in rows if r['state'] in ('preparing', 'pending')],
@@ -528,7 +515,6 @@ class Activity:
                     last_chat_at=max((r['created'] for r in rows if json.loads(r['action']).get('kind') == 'chat'), default=0))
         if self.c['profile'] not in NATIVE_PROFILES:
             result['consumptive_budget_remaining_raw'] = str(max(0, int(self.c['max_consumptive_daily_raw']) - used))
-            result['grant_budget_remaining_raw'] = str(max(0, int(self.c.get('max_grant_exposure_daily_raw', 100_000_000_000_000_000)) - grants))
         return result
 
     def recover_preparing(self):
@@ -665,26 +651,11 @@ class Activity:
             recipient = recipient if isinstance(recipient, str) else recipient['public_key']
             if payments != [(recipient, n)] or not campaign_ready(snapshot, self.c['registry'], max(1, fee)):
                 raise Pause('campaign requires nine backed accounts with real buying power')
-            draw = n - int(world.get('revenue', 0)) - int(op['support']) - fee
-            # Re-quote/re-observe drift may reduce the draw slightly; never sign
-            # an almost-revenue-only grant or draw more than half current reserve.
-            if not int(world['reserve']) * 45 // 100 <= draw <= int(world['reserve']) // 2:
-                raise Pause('campaign grant must draw 45 to 50 percent of current reserve')
             if (snapshot.get('campaign', {}).get('checked') is not True
                     or snapshot.get('campaign', {}).get('completed') or snapshot.get('campaign', {}).get('settlement_pending')):
                 raise Pause('campaign is already settled or awaiting confirmation')
-        # This demo's reserve-size cap is additional to protocol grant capacity.
-        maximum = (min(int(self.c['max_grant_raw']), int(world['reserve']) // 20,
-                       int(world['grant_capacity']) // 20) if self.c['profile'] == 'substantive-v1'
-                   else min(10_000_000_000_000, int(world['grant_capacity'])))
-        if self.c['profile'] in NATIVE_PROFILES:
-            maximum = int(world['grant_capacity'])
-            if kind == 'Propose' and (int(world.get('reserve', 0)) <= 0
-                    or int(world.get('curve_mass', 0)) <= 0
-                    or n <= int(world.get('revenue', 0)) + int(op['support']) + int(fee)):
-                raise Pause('curve proposal requires real reserve draw after revenue and support')
-        if n <= 0 or n > maximum:
-            raise Pause('grant exceeds current grant capacity or profile cap')
+        if n <= 0 or n > int(world['grant_capacity']):
+            raise Pause('grant exceeds current backing')
         quote = self.rpc('grant_quote', {'amount': str(n)})
         if quote.get('feasible') is not True:
             raise Pause('grant cannot be funded by current reserve rules')
@@ -729,9 +700,8 @@ class Activity:
                 raise Fault('activity recipient outside public test registry')
         if kind == 'Propose':
             grant = op['proposal']['Grant']
-            payments, total = validated_grant(grant)
-            maximum = int(self.c['max_grant_raw']) if self.c['profile'] == 'substantive-v1' else 10_000_000_000_000
-            if any(recipient not in allowed for recipient, _ in payments) or (not native and total > maximum):
+            payments, _ = validated_grant(grant)
+            if any(recipient not in allowed for recipient, _ in payments):
                 raise Fault('grant exceeds activity scope')
             spending += int(op['support'])
         elif kind == 'Support':
@@ -760,17 +730,11 @@ class Activity:
                 raise Fault('activity messages must be bounded plain text labelled automated')
             if self.clock() - policy['last_chat_at'] < self.c['chat_seconds']:
                 raise Pause('chat cadence')
-        recent, used, grants = self.reservations()
+        recent, used = self.reservations()
         if not native and (len(recent) >= self.c['max_actions_daily'] or used + spending > int(self.c['max_consumptive_daily_raw'])):
             raise Pause('daily activity budget reached')
         action['reserved_cost_raw'] = str(spending)
-        exposure = self.grant_check(operation, allowed, snapshot, int(action['quoted_fee_raw']))
-        if kind in ('Propose', 'Support'):
-            action['reserved_grant_raw'] = str(exposure)
-        if self.c['profile'] == 'substantive-v1':
-            if grants + exposure > int(self.c['max_grant_exposure_daily_raw']):
-                raise Pause('daily grant exposure limit reached')
-            action['reserved_grant_raw'] = str(exposure)
+        self.grant_check(operation, allowed, snapshot, int(action['quoted_fee_raw']))
 
     def check_cash(self, action, snapshot, account):
         native = self.c['profile'] in NATIVE_PROFILES
@@ -899,16 +863,14 @@ class Activity:
 
     def write_status(self):
         counts = {r[0]: r[1] for r in self.ledger.db.execute('SELECT state,COUNT(*) FROM intents GROUP BY state')}
-        _, spent, grants = self.reservations()
+        _, spent = self.reservations()
         atomic_json(self.work / 'status.json', {'chain_id': self.c['chain_id'], 'region': self.c['region'],
             'observed_at': self.clock(), 'height': self.observed_height, 'mining_active': self.mining(),
             'state': self.state, 'counts': counts, 'fault': self.ledger.get('fault'),
             'diagnostic': self.diagnostic,
             'funding_requests': self.ledger.db.execute('SELECT COUNT(*) FROM funding').fetchone()[0],
             'profile': self.c['profile'], 'consumptive_reserved_24h_raw': str(spent),
-            'grant_exposure_reserved_24h_raw': str(grants),
-            'campaign': self.ledger.get('pass_campaign_completion') if self.c['profile'] == PASS_PROFILE else None,
-            'grant_exposure_is_awarded_value': False})
+            'campaign': self.ledger.get('pass_campaign_completion') if self.c['profile'] == PASS_PROFILE else None})
 
 
 class SingleInstance:

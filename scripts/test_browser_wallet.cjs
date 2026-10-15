@@ -40,7 +40,7 @@ const vector=b=>Buffer.concat([compact(b.length),b]);
 const amt=n=>{n=BigInt(n);if(n===0n)return vector(Buffer.alloc(0));let h=n.toString(16);if(h.length%2)h='0'+h;return vector(Buffer.from(h,'hex').reverse());};
 function transferFixture(api,changes={}) {
   const secret='13'.repeat(32),sender=api.publicKey(secret),recipient=api.publicKey('14'.repeat(32));
-  const expected={chain_id:'27'.repeat(32),sender,nonce:'18446744073709551614',expiry_height:'18446744073709551615',protocol_version:27,fee:'1200',data_hex:'000180ff3c7363726970743e',operation:{TransferExact:{recipient,amount:'100'}},...changes};
+  const expected={chain_id:'27'.repeat(32),sender,nonce:'18446744073709551614',expiry_height:'18446744073709551615',protocol_version:28,fee:'1200',data_hex:'000180ff3c7363726970743e',operation:{TransferExact:{recipient,amount:'100'}},...changes};
   const t=expected.operation.TransferExact;
   const inner=Buffer.concat([compact(0),Buffer.from(t.recipient,'hex'),amt(t.amount)]);
   const data=Buffer.from(expected.data_hex,'hex');
@@ -117,7 +117,7 @@ async function run() {
     throws(()=>b.api.verifyUnsigned(f.envelope,intent),/Unknown parameter/);
   }
   for (const percent of [0,1,49,50,51,99,100]) {
-    const intent={...expected,protocol_version:27,data_hex:'',operation:{Propose:{round:'0',description:'44'.repeat(32),proposal:{Parameter:{parameter:'MinerFeePercent',old:'50',new:String(percent)}},support:'1'}}};
+    const intent={...expected,protocol_version:28,data_hex:'',operation:{Propose:{round:'0',description:'44'.repeat(32),proposal:{Parameter:{parameter:'MinerFeePercent',old:'50',new:String(percent)}},support:'1'}}};
     const inner=Buffer.concat([compact(3),compact(0),Buffer.from('44'.repeat(32),'hex'),compact(1),compact(5),compact(50),compact(percent),amt(1)]);
     const outer=Buffer.concat([inner,vector(Buffer.alloc(0))]);
     const body=Buffer.concat([Buffer.from(intent.chain_id,'hex'),Buffer.from(intent.sender,'hex'),compact(intent.nonce),amt(intent.fee),compact(intent.expiry_height),outer]);

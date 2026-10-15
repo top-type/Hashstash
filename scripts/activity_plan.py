@@ -15,7 +15,6 @@ SUPPORT = 10**12
 TRADE = 10**13
 GRANT = 10**13
 SEED = 10**14
-SUBSTANTIVE_GRANT_CAP = 5 * 10**16
 READ_METHODS = frozenset({"fee_quote", "stash_quote", "grant_quote", "proposals", "support"})
 NATIVE_PROFILE = "native-balance-v1"
 PASS_PROFILE = "pass-campaign-v1"
@@ -262,7 +261,7 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
     chain = _key(status.get("chain_id"))
     region = policy.get("region")
     if (chain is None or chain != policy.get("chain_id")
-            or status.get("protocol_version") != 27
+            or status.get("protocol_version") != 28
             or phase not in {"auction", "governance", "rest"}
             or region not in registry or len(accounts) != 3):
         return None
@@ -746,22 +745,9 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
             return None
         gov = snapshot.get("governance", {})
         world = gov.get("world", {})
-        # The bounded profile uses small fixed amounts. The substantive profile requests a
-        # persona-sized fraction of grant capacity, capped by reserve size as a
-        # conservative demo policy. Consensus also permits waiting-revenue funding.
-        capacity = min(_number(world.get("grant_capacity")), _number(world.get("reserve")))
-        grant = min(GRANT, capacity // 1000)
-        grant_cap = GRANT
-        if substantive:
-            grant_cap = min(SUBSTANTIVE_GRANT_CAP, _number(policy.get("max_grant_raw"), SUBSTANTIVE_GRANT_CAP),
-                            capacity // 20)
-            grant = grant_cap
-        if native:
-            capacity = _number(world.get("grant_capacity"))
-            grant = grant_cap = capacity
-        if not native and "grant_budget_remaining_raw" in policy:
-            grant = min(grant, _number(policy["grant_budget_remaining_raw"]))
-            grant_cap = min(grant_cap, _number(policy["grant_budget_remaining_raw"]))
+        capacity = _number(world.get("grant_capacity"))
+        # Profiles choose proposal amounts; eligibility follows actual backing.
+        grant = capacity if substantive else min(GRANT, capacity // 1000)
         if grant and not completed_or_reserved("propose_grant", round=round_id):
             rationale = proposal_description(region, round_id, profile_name).encode("utf-8")
             description = hashlib.sha256(rationale).hexdigest()
@@ -835,7 +821,7 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
                         or record.get("round") != round_id or record.get("refund_height") is not None
                         or desc in own_descriptions or desc not in peer_descriptions
                         or any(recipient not in allowed_recipients for recipient, _ in payments)
-                        or total > grant_cap):
+                        or total > capacity):
                     continue
                 funding = _read(rpc, "grant_quote", {"amount": str(total)})
                 if not isinstance(funding, dict) or funding.get("feasible") is not True:

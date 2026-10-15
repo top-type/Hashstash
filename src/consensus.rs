@@ -435,11 +435,14 @@ pub fn replenish_reserve(c: &Config, w: &mut World) -> Result<()> {
     Ok(())
 }
 
-/// Spendable cash plus backing above the mandatory retained reserve.
-pub fn grant_capacity(c: &Config, w: &World) -> Amount {
+/// Cash available for a grant. Outstanding Stash needs nonzero backing for
+/// its redemption and price arithmetic, so one raw unit remains while shares exist.
+pub fn grant_capacity(w: &World) -> Amount {
     &w.revenue
-        + if w.reserve > c.reserve_min.clone().max(Amount::from(1u32)) {
-            &w.reserve - c.reserve_min.clone().max(Amount::from(1u32))
+        + if w.shares.is_zero() {
+            w.reserve.clone()
+        } else if w.reserve > Amount::from(1u32) {
+            &w.reserve - 1u32
         } else {
             Amount::zero()
         }
@@ -451,10 +454,7 @@ pub fn grant_reserve(c: &Config, w: &mut World, amount: &Amount) -> Result<()> {
     c.check_amount(amount)?;
     ensure!(!amount.is_zero(), "empty grant");
     ensure!(w.grant_escrow.is_zero(), "grant already reserved");
-    ensure!(
-        *amount <= grant_capacity(c, w),
-        "insufficient grant backing"
-    );
+    ensure!(*amount <= grant_capacity(w), "insufficient grant backing");
     let cash = w.revenue.clone().min(amount.clone());
     let shortfall = amount - &cash;
     w.revenue -= cash;
@@ -462,59 +462,15 @@ pub fn grant_reserve(c: &Config, w: &mut World, amount: &Amount) -> Result<()> {
     w.grant_escrow = amount.clone();
     Ok(())
 }
-fn new_budget(c: &Config, s: &mut State, epoch: u64, reserve: &Amount) {
-    s.budgets.insert(
-        epoch.to_be_bytes().to_vec(),
-        Budget {
-            // Disabled budgets retain exact reservation/spending history. Zero is
-            // metadata for an absent cap, not a spendable or replenished allowance.
-            allowance: if c.grant_budget_enabled() {
-                reserve * Amount::from(c.budget_numerator) / Amount::from(c.budget_denominator)
-            } else {
-                Amount::zero()
-            },
-            reserved: Amount::zero(),
-            spent: Amount::zero(),
-        },
-    );
-    s.budget_epoch = epoch;
-}
-
-fn remaining_budget(c: &Config, s: &State) -> Option<Amount> {
-    if !c.grant_budget_enabled() {
-        return None;
-    }
-    Some(if s.budget_start.is_none() {
-        &s.world.reserve * Amount::from(c.budget_numerator) / Amount::from(c.budget_denominator)
-    } else {
-        let b = s.budgets.get(&s.budget_epoch.to_be_bytes()).unwrap();
-        &b.allowance - &b.reserved - &b.spent
-    })
-}
 fn eligible(c: &Config, s: &State, p: &Proposal) -> Result<()> {
-    ensure!(
-        s.world.reserve >= c.reserve_min,
-        "reserve below governance minimum"
-    );
     match p {
         Proposal::Grant { payments } => {
             let amount = c.validate_grant(payments)?;
             ensure!(!amount.is_zero(), "empty grant");
-            if c.grant_fraction_enabled() {
-                ensure!(
-                    amount
-                        <= &s.world.reserve * Amount::from(c.grant_numerator)
-                            / Amount::from(c.grant_denominator),
-                    "grant fraction exceeded"
-                );
-            }
             ensure!(
-                amount <= grant_capacity(c, &s.world),
+                amount <= grant_capacity(&s.world),
                 "insufficient grant backing"
             );
-            if let Some(remaining) = remaining_budget(c, s) {
-                ensure!(amount <= remaining, "grant budget exhausted");
-            }
         }
         Proposal::Parameter {
             parameter,
@@ -585,22 +541,6 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
         let schedule_valid = rounded_deadline(s.clock, s.frozen.duration, s.frozen.interval)
             .and_then(|resolution| rounded_deadline(resolution, s.frozen.rest, s.frozen.interval));
         if schedule_valid.is_ok() && eligible(c, s, &p.action).is_ok() {
-            if s.budget_start.is_none() {
-                s.budget_start = Some(s.clock);
-                let r = s.world.reserve.clone();
-                new_budget(c, s, 0, &r);
-            }
-            if let Proposal::Grant { payments } = &p.action {
-                let amount = c.validate_grant(payments)?;
-                let mut budget = s
-                    .budgets
-                    .get(&s.budget_epoch.to_be_bytes())
-                    .unwrap()
-                    .clone();
-                budget.reserved += amount;
-                s.budgets
-                    .insert(s.budget_epoch.to_be_bytes().to_vec(), budget);
-            }
             s.auction_escrow -= &p.support;
             s.world.revenue += &p.support;
             replenish_reserve(c, &mut s.world)?;
@@ -630,7 +570,6 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
                 started: s.clock,
                 duration: s.frozen.duration,
                 start_integral: s.world.price_integral.clone(),
-                budget_epoch: s.budget_epoch,
             };
             let mut pass = s.world.clone();
             if let Proposal::Grant { payments } = &d.proposal {
@@ -700,7 +639,6 @@ mod margin_tests {
             started: 0,
             duration: 100,
             start_integral: Amount::zero(),
-            budget_epoch: 0,
         });
         (c, state)
     }
@@ -771,19 +709,6 @@ fn resolve(c: &Config, s: &mut State) -> Result<bool> {
         s.world = alternative;
     }
     let mut pending = None;
-    if let Proposal::Grant { payments } = &d.proposal {
-        let amount = c.validate_grant(payments)?;
-        let mut b = s
-            .budgets
-            .get(&d.budget_epoch.to_be_bytes())
-            .unwrap()
-            .clone();
-        b.reserved -= &amount;
-        if won {
-            b.spent += amount;
-        }
-        s.budgets.insert(d.budget_epoch.to_be_bytes().to_vec(), b);
-    }
     // Clear the conditional context before interpreting a paid recipient's settled balance.
     rest(s, None)?;
     if won {
@@ -898,19 +823,6 @@ pub(crate) fn prepare_block(
     s.world.price_integral += parent.world.quote(c) * Amount::from(tau);
     if let Some(w) = &mut s.alternative {
         w.price_integral += parent.alternative.as_ref().unwrap().quote(c) * Amount::from(tau);
-    }
-    if let Some(start) = s.budget_start {
-        let epoch = (s.clock - start) / c.budget_period;
-        // Epochs skipped by a long block interval had no opportunities to spend.
-        // Materialize only the newly visited epoch; retain past reservation records.
-        if epoch > s.budget_epoch {
-            let reserve = if let Some(w) = &parent.alternative {
-                parent.world.reserve.clone().min(w.reserve.clone())
-            } else {
-                parent.world.reserve.clone()
-            };
-            new_budget(c, &mut s, epoch, &reserve);
-        }
     }
     if let Phase::Governance(d) = &parent.phase
         && s.clock
@@ -1315,7 +1227,7 @@ mod reserve_model_tests {
         let genesis = State::genesis(&c);
         genesis.audit(&c).unwrap();
         assert!(matches!(&genesis.phase, Phase::Rest(r) if r.until == c.initial.rest));
-        assert!(genesis.rounds.is_empty() && genesis.budgets.is_empty());
+        assert!(genesis.rounds.is_empty());
         let mut s = advance(&c, &genesis, 1_000, &[]);
         let deposit = signed(
             &s,
@@ -1372,8 +1284,6 @@ mod reserve_model_tests {
     #[test]
     fn initial_rest_defers_governance_but_not_trading_and_opens_round_zero() {
         let mut c = config();
-        c.budget_numerator = 1;
-        c.budget_denominator = 4;
         c.initial.rest = 2 * c.initial.interval + 1;
         c.validate().unwrap();
         let mut s = advance(&c, &State::genesis(&c), 1000, &[]);
@@ -1418,7 +1328,6 @@ mod reserve_model_tests {
         s = advance(&c, &s, 0, &[]);
         assert_eq!(s.auction_round(), Some(0));
         assert_eq!(s.rounds.len(), 1);
-        assert!(s.budget_start.is_none() && s.budgets.is_empty());
         s = advance(&c, &s, 0, &[proposal]);
         for _ in 0..10 {
             if s.decision_id().is_some() {
@@ -1427,11 +1336,7 @@ mod reserve_model_tests {
             s = advance(&c, &s, 0, &[]);
         }
         assert!(s.decision_id().is_some());
-        assert_eq!(s.budgets.len(), 1);
-        assert_eq!(
-            s.budgets.get(&0u64.to_be_bytes()).unwrap().allowance,
-            75u32.into()
-        );
+        assert_eq!(s.alternative.as_ref().unwrap().grant_escrow, 10u32.into());
     }
     #[test]
     fn revenue_waits_at_flat_then_restores_backing_without_changing_price_or_supply() {
@@ -1475,12 +1380,13 @@ mod reserve_model_tests {
         let s = funded_curve(&c);
         let mut w = s.world.clone();
         let before = w.root();
-        assert!(grant_reserve(&c, &mut w, &s.world.reserve).is_err());
+        let capacity = grant_capacity(&w);
+        assert!(grant_reserve(&c, &mut w, &(&capacity + 1u32)).is_err());
         assert_eq!(w.root(), before);
-        let capacity = grant_capacity(&c, &w);
         grant_reserve(&c, &mut w, &capacity).unwrap();
-        assert_eq!(w.reserve, c.reserve_min);
+        assert_eq!(w.reserve, 1u32.into());
         assert_eq!(w.curve_mass, s.world.curve_mass);
+        w.validate(&c, &s.issued, &s.auction_escrow).unwrap();
     }
     #[test]
     fn pass_and_fail_discard_only_the_other_world_and_settle_reserved_grant_once() {
@@ -1491,13 +1397,8 @@ mod reserve_model_tests {
             fail = advance(&c, &fail, 0, &[]);
         }
         assert!(fail.world.grant_escrow.is_zero());
-        assert!(
-            fail.budgets
-                .get(&0u64.to_be_bytes())
-                .unwrap()
-                .spent
-                .is_zero()
-        );
+        assert_eq!(fail.world.reserve, start.world.reserve);
+        assert_eq!(fail.world.accounts.root(), start.world.accounts.root());
         let mut pass = start;
         let tx = signed(
             &pass,
@@ -1513,20 +1414,12 @@ mod reserve_model_tests {
         while matches!(pass.phase, Phase::Governance(_)) {
             pass = advance(&c, &pass, 0, &[]);
         }
-        assert_eq!(
-            pass.budgets.get(&0u64.to_be_bytes()).unwrap().spent,
-            10u32.into()
-        );
         assert!(pass.world.grant_escrow.is_zero());
         assert_ne!(pass.root(), fail.root());
     }
 
-    fn without_grant_caps() -> Config {
+    fn short_grant_rounds() -> Config {
         let mut c = config();
-        c.grant_numerator = 0;
-        c.grant_denominator = 0;
-        c.budget_numerator = 0;
-        c.budget_denominator = 0;
         c.initial.lead = c.initial.interval;
         c.initial.duration = 3 * c.initial.interval;
         c.validate().unwrap();
@@ -1542,8 +1435,7 @@ mod reserve_model_tests {
     }
     fn replayed_step(c: &Config, s: &State, txs: &[Transaction]) -> State {
         let next = advance(c, s, 0, txs);
-        // Replay from a serialized checkpoint, including epochs already beyond
-        // the old allowance. Both execution and full audit must still agree.
+        // Both execution and full audit must agree after checkpoint replay.
         let bytes = codec::encode(s);
         let checkpoint: State = codec::decode(&bytes, bytes.len()).unwrap();
         checkpoint.audit(c).unwrap();
@@ -1588,65 +1480,40 @@ mod reserve_model_tests {
         );
         s = replayed_step(c, &s, &[tx]);
         while matches!(s.phase, Phase::Governance(_)) {
+            let pass = s.alternative.as_ref().unwrap();
+            let expected =
+                &pass.account(&owner(), s.epoch()).unwrap().ordinary + &pass.grant_escrow;
             s = replayed_step(c, &s, &[]);
+            if s.decision_id().is_none() {
+                assert_eq!(s.account(&owner(), None).unwrap().ordinary, expected);
+                let after = replayed_step(c, &s, &[]);
+                assert_eq!(after.account(&owner(), None).unwrap().ordinary, expected);
+            }
         }
         s
     }
     #[test]
-    fn disabled_grant_caps_accept_large_funded_grants_and_replay_over_old_epoch_limit() {
-        let c = without_grant_caps();
-        let start = funded_curve(&c);
-        let old_fraction = &start.world.reserve / 10u32;
-        let old_budget = &start.world.reserve / 4u32;
-        assert!(Amount::from(150_000u32) > old_fraction);
-        let first = open_large_grant(&c, start, 150_000);
-        assert!(remaining_budget(&c, &first).is_none());
-        let first = pass_large_grant(&c, first);
-        assert_eq!(
-            first.budgets.get(&0u64.to_be_bytes()).unwrap().spent,
-            150_000u32.into()
-        );
-        let second = open_large_grant(&c, first, 150_000);
-        let b = second.budgets.get(&0u64.to_be_bytes()).unwrap();
-        assert_eq!(&b.reserved + &b.spent, 300_000u32.into());
-        assert!(&b.reserved + &b.spent > old_budget);
-        let settled = pass_large_grant(&c, second);
-        let b = settled.budgets.get(&0u64.to_be_bytes()).unwrap();
-        assert!(b.allowance.is_zero() && b.reserved.is_zero());
-        assert_eq!(b.spent, 300_000u32.into());
-        assert!(settled.world.grant_escrow.is_zero());
-        replayed_step(&c, &settled, &[]).audit(&c).unwrap();
-    }
-    #[test]
-    fn disabled_budget_rollover_keeps_originating_reservation_and_spending() {
-        let mut c = without_grant_caps();
-        c.budget_period = 2;
-        c.validate().unwrap();
-        let start = open_large_grant(&c, funded_curve(&c), 200_000);
-        let next = replayed_step(&c, &start, &[]);
-        assert!(next.budget_epoch >= 7);
-        assert_eq!(
-            next.budgets.get(&0u64.to_be_bytes()).unwrap().reserved,
-            200_000u32.into()
-        );
-        for (key, b) in next.budgets.iter() {
-            assert!(b.allowance.is_zero());
-            if key != 0u64.to_be_bytes() {
-                assert!(b.reserved.is_zero() && b.spent.is_zero());
-            }
+    fn repeated_funded_grants_reuse_returned_funds_and_replay() {
+        let c = short_grant_rounds();
+        let mut settled = funded_curve(&c);
+        let issued = settled.issued.clone();
+        // Each award exceeds the former per-grant fraction. The following
+        // deposits return part of earlier awards to Stash for later grants.
+        assert!(Amount::from(150_000u32) > &settled.world.reserve / 10u32);
+        for _ in 0..8 {
+            let opened = open_large_grant(&c, settled, 150_000);
+            settled = pass_large_grant(&c, opened);
+            assert!(settled.world.grant_escrow.is_zero());
+            assert_eq!(settled.issued, issued);
         }
-        let settled = pass_large_grant(&c, next);
-        assert!(settled.budget_epoch > 7);
-        let b = settled.budgets.get(&0u64.to_be_bytes()).unwrap();
-        assert!(b.reserved.is_zero());
-        assert_eq!(b.spent, 200_000u32.into());
+        assert!(Amount::from(8 * 150_000u32) > issued);
         replayed_step(&c, &settled, &[]).audit(&c).unwrap();
     }
     #[test]
-    fn disabled_grant_caps_keep_backing_and_accounting_invariants() {
-        let c = without_grant_caps();
+    fn grants_keep_real_backing_and_escrow_invariants() {
+        let c = short_grant_rounds();
         let s = funded_curve(&c);
-        let capacity = grant_capacity(&c, &s.world);
+        let capacity = grant_capacity(&s.world);
         let too_large = Proposal::Grant {
             payments: vec![GrantPayment {
                 recipient: owner(),
@@ -1664,66 +1531,64 @@ mod reserve_model_tests {
         assert!(grant_reserve(&c, &mut world, &(&capacity + 1u32)).is_err());
         assert_eq!(before, world.root());
         grant_reserve(&c, &mut world, &capacity).unwrap();
-        assert_eq!(world.reserve, c.reserve_min);
+        assert_eq!(world.reserve, 1u32.into());
+        let reserved = world.root();
+        assert!(grant_reserve(&c, &mut world, &1u32.into()).is_err());
+        assert_eq!(reserved, world.root());
 
         let opened = open_large_grant(&c, s, 200_000);
-        for (allowance, reserved, spent) in [
-            (Amount::from(1u32), Amount::from(200_000u32), Amount::zero()),
-            (Amount::zero(), Amount::from(199_999u32), Amount::zero()),
-            (
-                Amount::zero(),
-                Amount::from(200_000u32),
-                Amount::from(1u32) << (c.money_bits + 64) as usize,
-            ),
-        ] {
-            let mut corrupt = opened.clone();
-            corrupt.budgets.insert(
-                0u64.to_be_bytes().to_vec(),
-                Budget {
-                    allowance,
-                    reserved,
-                    spent,
-                },
-            );
-            assert!(corrupt.audit(&c).is_err());
-        }
+        let mut corrupt = opened.clone();
+        let pass = corrupt.alternative.as_mut().unwrap();
+        pass.grant_escrow -= 1u32;
+        pass.revenue += 1u32;
+        // Conservation still holds, but the award must be fully funded.
+        assert!(
+            corrupt
+                .audit(&c)
+                .unwrap_err()
+                .to_string()
+                .contains("escrow")
+        );
+        let mut corrupt = opened;
+        corrupt.alternative.as_mut().unwrap().grant_escrow += 1u32;
+        assert!(corrupt.validate(&c).is_err());
     }
     #[test]
-    fn grant_caps_remain_independent_and_explicit_limits_still_reject() {
-        let mut c = config();
-        c.grant_numerator = 1;
-        c.grant_denominator = 10;
-        c.budget_numerator = 1;
-        c.budget_denominator = 4;
-        let s = funded_curve(&c);
-        assert!(eligible(&c, &s, &grant(80_000)).is_ok());
+    fn grant_capacity_retains_only_nonzero_stash_backing() {
+        let c = config();
+        for (reserve, revenue, shares, expected) in [
+            (0u32, 0u32, 0u32, 0u32),
+            (0, 5, 0, 5),
+            (1, 0, 1, 0),
+            (1, 5, 1, 5),
+            (2, 0, 1, 1),
+            (19, 0, 1, 18),
+        ] {
+            let mut w = World {
+                reserve: reserve.into(),
+                revenue: revenue.into(),
+                shares: shares.into(),
+                ..World::default()
+            };
+            assert_eq!(grant_capacity(&w), expected.into());
+            if expected > 0 {
+                grant_reserve(&c, &mut w, &expected.into()).unwrap();
+                assert_eq!(w.reserve, u32::from(shares > 0).into());
+                assert!(w.revenue.is_zero());
+            }
+        }
+        let empty = State::genesis(&c);
         assert!(
-            eligible(&c, &s, &grant(80_001))
-                .unwrap_err()
-                .to_string()
-                .contains("fraction")
+            eligible(
+                &c,
+                &empty,
+                &Proposal::Parameter {
+                    parameter: Parameter::Duration,
+                    old: c.initial.duration,
+                    new: c.initial.duration + 1,
+                }
+            )
+            .is_ok()
         );
-        let mut budget_disabled = c.clone();
-        budget_disabled.budget_numerator = 0;
-        budget_disabled.budget_denominator = 0;
-        assert!(eligible(&budget_disabled, &s, &grant(80_001)).is_err());
-        let mut fraction_disabled = c.clone();
-        fraction_disabled.grant_numerator = 0;
-        fraction_disabled.grant_denominator = 0;
-        assert!(eligible(&fraction_disabled, &s, &grant(200_000)).is_ok());
-        assert!(
-            eligible(&fraction_disabled, &s, &grant(200_001))
-                .unwrap_err()
-                .to_string()
-                .contains("budget")
-        );
-        let mut accounted = s;
-        accounted.budget_start = Some(accounted.clock);
-        new_budget(&fraction_disabled, &mut accounted, 0, &800_000u32.into());
-        let mut b = accounted.budgets.get(&0u64.to_be_bytes()).unwrap().clone();
-        b.spent = 150_000u32.into();
-        accounted.budgets.insert(0u64.to_be_bytes().to_vec(), b);
-        assert!(eligible(&fraction_disabled, &accounted, &grant(50_000)).is_ok());
-        assert!(eligible(&fraction_disabled, &accounted, &grant(50_001)).is_err());
     }
 }

@@ -56,10 +56,6 @@ fn signed_outcome_trades_pass_half_reserve_grant_and_keep_a_bent_curve() {
     c.initial.lead = 90;
     c.initial.duration = 900;
     c.auction_timeout = 120;
-    c.grant_numerator = 0;
-    c.grant_denominator = 0;
-    c.budget_numerator = 0;
-    c.budget_denominator = 0;
     c.validate().unwrap();
     let mut chain = Chain::open(&path, c.clone()).unwrap();
     for _ in 0..40 {
@@ -177,10 +173,6 @@ fn signed_outcome_trades_pass_half_reserve_grant_and_keep_a_bent_curve() {
     );
     assert!(settled.world.grant_escrow.is_zero());
     assert!(settled.world.reserve < settled.world.curve_mass);
-    assert_eq!(
-        settled.budgets.get(&0u64.to_be_bytes()).unwrap().spent,
-        grant
-    );
     let root = settled.root();
     drop(chain);
     let replayed = Chain::open(&path, c.clone()).unwrap();

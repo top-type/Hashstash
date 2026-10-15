@@ -477,58 +477,6 @@ fn time_policies_preserve_nominal_duration_at_different_intervals() {
 }
 
 #[test]
-fn multiple_budget_boundaries_materialize_only_visited_epochs() {
-    let mut c = config();
-    c.budget_period = 2;
-    let mut s = State::genesis(&c);
-    for _ in 0..30 {
-        s = consensus::execute(&c, &s, &s.root(), &miner(), &1000u32.into(), &[]).unwrap();
-        s.audit(&c).unwrap();
-    }
-    assert!(s.budget_start.is_none());
-    let deposit = sign(
-        &s,
-        Operation::Deposit {
-            amount: 10_000u32.into(),
-            min_shares: 1u32.into(),
-            decision: None,
-            outcome: None,
-        },
-    );
-    s = consensus::execute(&c, &s, &s.root(), &miner(), &0u32.into(), &[deposit]).unwrap();
-    let proposal = sign(
-        &s,
-        Operation::Propose {
-            round: s.auction_round().unwrap(),
-            description: [41; 32],
-            proposal: Proposal::Parameter {
-                parameter: Parameter::Lead,
-                old: s.settings.lead,
-                new: s.settings.lead * 2,
-            },
-            support: 1u32.into(),
-        },
-    );
-    s = consensus::execute(&c, &s, &s.root(), &miner(), &0u32.into(), &[proposal]).unwrap();
-    for _ in 0..100 {
-        if s.budget_start.is_some() {
-            break;
-        }
-        s = consensus::execute(&c, &s, &s.root(), &miner(), &0u32.into(), &[]).unwrap();
-    }
-    assert!(s.budget_start.is_some());
-    let old_epoch = s.budget_epoch;
-    let old_records = s.budgets.len();
-    s.settings.interval = 60;
-    s.frozen.interval = 60;
-    s = consensus::execute(&c, &s, &s.root(), &miner(), &1000u32.into(), &[]).unwrap();
-    s.audit(&c).unwrap();
-    assert_eq!(s.budget_epoch, old_epoch + 30);
-    assert_eq!(s.budgets.len(), old_records + 1);
-    assert!(s.budgets.get(&old_epoch.to_be_bytes()).is_some());
-}
-
-#[test]
 fn decision_duration_is_independent_of_removed_funding_steps() {
     let c = config();
     let mut settings = c.initial.clone();
@@ -617,7 +565,7 @@ fn non_multiple_grant_duration_reserves_upfront_and_clips_final_price_observatio
     };
     assert_eq!(decision.duration, 37);
     assert_eq!(s.alternative.as_ref().unwrap().grant_escrow, grant);
-    assert!(consensus::grant_capacity(&c, &s.world) >= grant);
+    assert!(consensus::grant_capacity(&s.world) >= grant);
     s.audit(&c).unwrap();
     let deposit = sign(
         &s,

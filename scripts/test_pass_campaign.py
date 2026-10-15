@@ -289,7 +289,7 @@ class CampaignCustodyTests(unittest.TestCase):
     def proposal_action(self):
         snapshot, accounts = self.activity.observe()
         snapshot['status'].update(phase='auction', auction_round=0)
-        snapshot['governance']['world'].update(reserve=str(9*10**15), curve_mass=str(9*10**15), revenue='0')
+        snapshot['governance']['world'].update(reserve=str(9*10**15), curve_mass=str(9*10**15), revenue='0', grant_capacity=str(9*10**15-1))
         snapshot['balances'] = {key: {'account': dict(ordinary=str(10**15), shares=str(10**15), nonce=0)}
                                for group in self.cfg['registry'].values() for key in group}
         desc = hashlib.sha256(p.proposal_description('sgp', 0, p.PASS_PROFILE).encode()).digest()
@@ -301,21 +301,26 @@ class CampaignCustodyTests(unittest.TestCase):
                 proposal={'Grant': {'payments': [dict(recipient=list(bytes.fromhex(recipient)), amount=str(45*10**14+1001))]}})})
         return action, snapshot, accounts
 
-    def test_signing_boundary_rechecks_coordinator_scope_backing_and_half_reserve_draw(self):
+    def test_signing_boundary_rechecks_coordinator_scope_and_real_backing(self):
         action, snapshot, accounts = self.proposal_action()
         self.activity.allowed_action(action, accounts, self.activity.policy(snapshot), snapshot)
-        self.assertEqual(action['reserved_grant_raw'], str(45*10**14+1001))
-        for change in ('sender', 'recipient', 'too_large', 'too_small', 'missing_actor', 'settled', 'data'):
+        for change in ('sender', 'recipient', 'unbacked', 'missing_actor', 'settled', 'data'):
             a, s, actors = self.proposal_action()
             if change == 'sender': a['sender_index'] = 1
             elif change == 'recipient': a['operation']['Propose']['proposal']['Grant']['payments'][0]['recipient'] = [255]*32
-            elif change in ('too_large', 'too_small'):
-                a['operation']['Propose']['proposal']['Grant']['payments'][0]['amount'] = str((5 if change == 'too_large' else 3)*10**15)
+            elif change == 'unbacked':
+                a['operation']['Propose']['proposal']['Grant']['payments'][0]['amount'] = str(9*10**15)
             elif change == 'missing_actor': s['balances'].pop(self.cfg['registry']['ewr'][0])
             elif change == 'settled': s['campaign']['completed'] = True
             else: a['data_hex'] = b'undesired boilerplate'.hex()
             with self.subTest(change=change), self.assertRaises((ca.Fault, ca.Pause)):
                 self.activity.allowed_action(a, actors, self.activity.policy(s), s)
+
+    def test_campaign_accepts_backed_grants_outside_planner_target(self):
+        for amount in (3 * 10**15, 8 * 10**15):
+            action, snapshot, accounts = self.proposal_action()
+            action['operation']['Propose']['proposal']['Grant']['payments'][0]['amount'] = str(amount)
+            self.activity.allowed_action(action, accounts, self.activity.policy(snapshot), snapshot)
 
     def test_full_signed_campaign_intent_retries_identically_across_restart(self):
         action, snapshot, accounts = self.proposal_action()

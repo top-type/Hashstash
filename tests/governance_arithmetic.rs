@@ -19,8 +19,6 @@ fn config() -> Config {
     c.initial.lead = 0;
     c.initial.rest = 0;
     c.initial.duration = 45;
-    c.reserve_min = 0u32.into();
-    c.budget_period = 1;
     c.validate().unwrap();
     c
 }
@@ -165,7 +163,7 @@ fn sub_block_decisions_fail_ties_and_restore_grant_escrow() {
 }
 
 #[test]
-fn long_intervals_skip_empty_budget_epochs_without_looping_or_losing_reservations() {
+fn long_intervals_resolve_escrow_without_losing_funds() {
     let c = config();
     let s = funded(&c);
     let tx = propose(
@@ -178,23 +176,22 @@ fn long_intervals_skip_empty_budget_epochs_without_looping_or_losing_reservation
         },
     );
     let mut opened = step(&c, &s, 0, &[tx]);
-    let records = opened.budgets.len();
-    let origin = opened.budget_epoch;
+    assert_eq!(
+        opened.alternative.as_ref().unwrap().grant_escrow,
+        100u32.into()
+    );
     let huge_interval = 1u64 << 48;
     opened.settings.interval = huge_interval;
     opened.frozen.interval = huge_interval;
     let closed = step(&c, &opened, 0, &[]);
     assert_eq!(closed.clock, opened.clock + huge_interval);
-    assert_eq!(closed.budget_epoch, origin + huge_interval);
-    assert_eq!(closed.budgets.len(), records + 1);
-    assert_eq!(
-        closed.budgets.get(&origin.to_be_bytes()).unwrap().reserved,
-        0u32.into()
-    );
-    assert_eq!(
-        closed.budgets.get(&origin.to_be_bytes()).unwrap().spent,
-        0u32.into()
-    );
+    assert!(closed.decision_id().is_none());
+    assert!(closed.alternative.is_none());
+    assert_eq!(closed.world.reserve, opened.world.reserve);
+    assert_eq!(closed.world.revenue, opened.world.revenue);
+    assert_eq!(closed.world.account_cash, opened.world.account_cash);
+    assert_eq!(closed.world.grant_escrow, 0u32.into());
+    assert_eq!(closed.issued, opened.issued);
 }
 
 #[test]
@@ -252,10 +249,10 @@ fn clock_and_deadline_exhaustion_are_errors_without_mutating_parent() {
 }
 
 #[test]
-fn zero_reserve_minimum_retains_the_last_atom_of_nonempty_stash() {
+fn grant_retains_the_last_atom_required_by_nonempty_stash() {
     let c = config();
     let s = funded(&c);
-    let capacity = consensus::grant_capacity(&c, &s.world);
+    let capacity = consensus::grant_capacity(&s.world);
     assert_eq!(capacity, &s.world.revenue + &s.world.reserve - 1u32);
     let mut world = s.world.clone();
     consensus::grant_reserve(&c, &mut world, &capacity).unwrap();
@@ -285,90 +282,82 @@ fn zero_signature_capacity_still_mines_empty_blocks_and_rejects_transactions() {
 }
 
 #[test]
-fn cumulative_budget_spending_can_exceed_circulating_money_range() {
-    for enabled in [false, true] {
-        let mut c = config();
-        c.max_height = 1000;
-        c.money_bits = 265;
-        c.initial.miner_fee_percent = Some(0);
-        c.budget_period = 10_000;
-        if enabled {
-            c.budget_numerator = 10;
-            c.budget_denominator = 1;
-        }
-        c.validate().unwrap();
-        let unit = Amount::from(1u32) << 255usize;
-        let mut s = State::genesis(&c);
-        // The largest per-block subsidy, within the configured lifetime proof.
-        for _ in 0..600 {
-            s = consensus::execute(&c, &s, &s.root(), &owner(), &unit, &[]).unwrap();
-        }
-        s.audit(&c).unwrap();
-        let tx = sign(
+fn replenished_reserve_funds_repeated_grants_without_historical_spending_limits() {
+    let mut c = config();
+    c.max_height = 1000;
+    c.money_bits = 265;
+    c.initial.miner_fee_percent = Some(0);
+    c.validate().unwrap();
+    let unit = Amount::from(1u32) << 255usize;
+    let mut s = State::genesis(&c);
+    // Fund through normal issuance, within the configured lifetime proof.
+    for _ in 0..600 {
+        s = consensus::execute(&c, &s, &s.root(), &owner(), &unit, &[]).unwrap();
+    }
+    s.audit(&c).unwrap();
+    let issued = s.issued.clone();
+    let tx = sign(
+        &s,
+        Operation::Deposit {
+            amount: &unit * 400u32,
+            min_shares: 1u32.into(),
+            decision: None,
+            outcome: None,
+        },
+    );
+    s = step(&c, &s, 0, &[tx]);
+    let grant = &unit * 300u32;
+    for _ in 0..4 {
+        assert!(consensus::grant_capacity(&s.world) >= grant);
+        let tx = propose(
             &s,
-            Operation::Deposit {
-                amount: &unit * 400u32,
-                min_shares: 1u32.into(),
-                decision: None,
-                outcome: None,
+            Proposal::Grant {
+                payments: vec![GrantPayment {
+                    recipient: owner(),
+                    amount: grant.clone(),
+                }],
             },
         );
         s = step(&c, &s, 0, &[tx]);
-        for _ in 0..4 {
-            let tx = propose(
-                &s,
-                Proposal::Grant {
-                    payments: vec![GrantPayment {
-                        recipient: owner(),
-                        amount: &unit * 300u32,
-                    }],
-                },
-            );
-            s = step(&c, &s, 0, &[tx]);
-            assert!(s.decision_id().is_some());
-            let buy = sign(
-                &s,
-                Operation::Deposit {
-                    amount: unit.clone(),
-                    min_shares: 1u32.into(),
-                    decision: s.decision_id(),
-                    outcome: Some(Outcome::Pass),
-                },
-            );
-            s = step(&c, &s, 0, &[buy]);
-            while s.decision_id().is_some() {
-                s = step(&c, &s, 0, &[]);
-            }
-            // Return the payment through Revenue, less the outcome purchase.
-            // Revenue replenishes existing backing without inflating curve mass.
-            let mut tx = sign(
-                &s,
-                Operation::TransferExact {
-                    recipient: owner(),
-                    amount: 1u32.into(),
-                },
-            );
-            tx.body.fee = &unit * 299u32;
-            tx = crypto::sign(&tx.body, &SECRET).unwrap();
-            s = step(&c, &s, 0, &[tx]);
+        assert!(s.decision_id().is_some());
+        assert_eq!(s.alternative.as_ref().unwrap().grant_escrow, grant);
+        let buy = sign(
+            &s,
+            Operation::Deposit {
+                amount: unit.clone(),
+                min_shares: 1u32.into(),
+                decision: s.decision_id(),
+                outcome: Some(Outcome::Pass),
+            },
+        );
+        s = step(&c, &s, 0, &[buy]);
+        let pass_cash = s.account(&owner(), Some(Outcome::Pass)).unwrap().ordinary;
+        while s.decision_id().is_some() {
+            s = step(&c, &s, 0, &[]);
         }
-        let epoch = s.budget_epoch;
-        assert_eq!(epoch, 0);
-        let mut budget = s.budgets.get(&epoch.to_be_bytes()).unwrap().clone();
-        assert_eq!(budget.spent, &unit * 1200u32);
-        assert!(budget.spent.bits() > c.money_bits);
-        s.audit(&c).unwrap();
-        let bytes = codec::encode(&s);
-        let restored: State = codec::decode(&bytes, bytes.len()).unwrap();
-        assert_eq!(restored.root(), s.root());
-        restored.audit(&c).unwrap();
-        budget.spent = Amount::from(1u32) << (c.money_bits + 64) as usize;
-        if enabled {
-            budget.allowance = &budget.spent + &budget.reserved;
-        }
-        s.budgets.insert(epoch.to_be_bytes().to_vec(), budget);
-        assert!(s.audit(&c).is_err());
+        assert_eq!(
+            s.account(&owner(), None).unwrap().ordinary,
+            pass_cash + &grant
+        );
+        assert_eq!(s.world.grant_escrow, 0u32.into());
+        assert_eq!(s.issued, issued);
+        // A normal fee returns cash to reserve backing for the next grant.
+        let mut tx = sign(
+            &s,
+            Operation::TransferExact {
+                recipient: owner(),
+                amount: 1u32.into(),
+            },
+        );
+        tx.body.fee = &unit * 299u32;
+        tx = crypto::sign(&tx.body, &SECRET).unwrap();
+        s = step(&c, &s, 0, &[tx]);
     }
+    s.audit(&c).unwrap();
+    let bytes = codec::encode(&s);
+    let restored: State = codec::decode(&bytes, bytes.len()).unwrap();
+    assert_eq!(restored.root(), s.root());
+    restored.audit(&c).unwrap();
 }
 
 #[test]

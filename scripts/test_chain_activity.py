@@ -44,7 +44,7 @@ class FakeNode:
         self.height = 10
         self.chain = CHAIN
         self.phase = 'rest'
-        self.protocol = 27
+        self.protocol = 28
         self.receipt = None
         self.account_values = {k: dict(nonce=0, ordinary=str(10**15), shares='0') for k in KEYS}
         self.pass_account_values = {}
@@ -187,7 +187,7 @@ class ActivityTests(unittest.TestCase):
     def test_current_observation_and_unknown_protocol_guard(self):
         original = self.node.snapshot
         self.activity.observe()
-        for version in (26, 28):
+        for version in (27, 29):
             with self.subTest(protocol=version):
                 def unsupported(version=version):
                     value = original()
@@ -197,13 +197,13 @@ class ActivityTests(unittest.TestCase):
                 with self.assertRaises(ca.Fault): self.activity.observe()
 
     def full_cash_governance(self):
-        self.node.protocol, self.node.phase = 27, 'governance'
+        self.node.protocol, self.node.phase = 28, 'governance'
         self.node.pass_account_values = copy.deepcopy(self.node.account_values)
         self.snapshot, self.accounts = self.activity.observe()
 
     def test_current_rejects_unaffordable_other_world_before_signing(self):
         self.full_cash_governance()
-        self.node.protocol = 27
+        self.node.protocol = 28
         self.snapshot, self.accounts = self.activity.observe()
         action = self.action()
         action['guard']['phase'] = 'governance'
@@ -697,7 +697,7 @@ class NativeBalanceTests(unittest.TestCase):
 
     def test_profile_is_explicit_idempotent_and_removes_only_value_limits(self):
         self.assertEqual(ca.config_checked(self.activity.c), self.activity.c)
-        for field in ('max_grant_raw', 'max_grant_exposure_daily_raw', 'max_consumptive_daily_raw', 'max_actions_daily'):
+        for field in ('max_consumptive_daily_raw', 'max_actions_daily'):
             self.assertIsNone(self.activity.c[field])
         policy = self.activity.policy(self.snapshot)
         self.assertNotIn('consumptive_budget_remaining_raw', policy)
@@ -709,7 +709,6 @@ class NativeBalanceTests(unittest.TestCase):
     def test_large_native_grant_rechecks_capacity_registry_description_and_cash(self):
         action = self.grant()
         self.activity.allowed_action(action, self.accounts, self.activity.policy(self.snapshot), self.snapshot)
-        self.assertEqual(action['reserved_grant_raw'], str(5 * 10**17))
         self.assertEqual(action['reserved_cost_raw'], str(10**12 + 1))
         too_small = copy.deepcopy(self.snapshot)
         too_small['governance']['world']['grant_capacity'] = str(4 * 10**17)
@@ -727,7 +726,7 @@ class NativeBalanceTests(unittest.TestCase):
         with self.assertRaises(ca.Pause):
             self.activity.allowed_action(self.grant(), self.accounts, self.activity.policy(self.snapshot), self.snapshot)
 
-    def test_native_signature_recovery_is_identical_and_preserves_large_exposure_evidence(self):
+    def test_native_signature_recovery_preserves_the_exact_grant(self):
         action = self.grant()
         self.activity.submit(action, self.snapshot, self.accounts)
         row = self.activity.ledger.rows(('pending',))[0]
@@ -744,8 +743,8 @@ class NativeBalanceTests(unittest.TestCase):
         self.assertEqual(self.cli.broadcasts, [row['raw'], row['raw']])
         self.activity.write_status()
         status = json.loads((self.activity.work / 'status.json').read_text())
-        self.assertEqual(status['grant_exposure_reserved_24h_raw'], str(5 * 10**17))
-        self.assertFalse(status['grant_exposure_is_awarded_value'])
+        self.assertEqual(json.loads(row['action'])['operation'], action['operation'])
+        self.assertNotIn('grant_exposure_reserved_24h_raw', status)
 
     def test_native_proposal_guard_rejects_message_or_wrong_region_round_commitment(self):
         for altered in ('message', 'empty_hash', 'region', 'round', 'commitment'):
@@ -766,12 +765,14 @@ class NativeBalanceTests(unittest.TestCase):
         self.assertFalse(self.cli.broadcasts)
 
 
-    def test_native_signing_boundary_rejects_fee_dust_or_newly_missing_backing(self):
-        for field, value in (('reserve', '0'), ('curve_mass', '0'), ('revenue', str(6 * 10**17))):
-            changed = copy.deepcopy(self.snapshot)
-            changed['governance']['world'][field] = value
-            with self.subTest(field=field), self.assertRaises(ca.Pause):
-                self.activity.allowed_action(self.grant(), self.accounts, self.activity.policy(changed), changed)
+    def test_native_signing_boundary_uses_current_backing(self):
+        changed = copy.deepcopy(self.snapshot)
+        changed['governance']['world']['grant_capacity'] = str(4 * 10**17)
+        with self.assertRaises(ca.Pause):
+            self.activity.allowed_action(self.grant(), self.accounts, self.activity.policy(changed), changed)
+        # Waiting revenue is also real backing; no reserve-draw threshold applies.
+        changed['governance']['world'].update(reserve='0', curve_mass='0', revenue=str(6 * 10**17), grant_capacity=str(6 * 10**17))
+        self.activity.allowed_action(self.grant(), self.accounts, self.activity.policy(changed), changed)
 
 
 class SubstantiveTests(ActivityTests):
@@ -804,7 +805,6 @@ class SubstantiveTests(ActivityTests):
         action = self.described_grant()
         policy = self.activity.policy(self.snapshot)
         self.activity.allowed_action(action, self.accounts, policy, self.snapshot)
-        self.assertEqual(action['reserved_grant_raw'], str(4 * 10**16))
         self.assertEqual(action['reserved_cost_raw'], str(10**12 + int(self.activity.c['max_fee_raw'])))
         for altered in ('text', 'commitment', 'region'):
             changed = copy.deepcopy(action)
@@ -844,21 +844,24 @@ class SubstantiveTests(ActivityTests):
         self.assertEqual(ca.config_checked(bounded)['chat_seconds'], 300)
         self.assertEqual(self.activity.c['chat_seconds'], 90)
         self.assertEqual(self.activity.c['max_consumptive_daily_raw'], str(10**15))
-        for field, value in [('max_grant_raw', 5 * 10**16 + 1),
-                ('max_grant_exposure_daily_raw', 10**17 + 1), ('max_consumptive_daily_raw', 10**15 + 1),
+        for field, value in [('max_consumptive_daily_raw', 10**15 + 1),
                 ('chat_seconds', 89), ('funding_seconds', 86399)]:
             with self.subTest(field=field), self.assertRaises(ValueError):
                 ca.config_checked(dict(self.cfg, **{field: value}))
         with self.assertRaises(ValueError):
             ca.config_checked(dict(bounded, chat_seconds=90))
         self.activity.c = ca.config_checked(bounded)
-        with self.assertRaises(ca.Fault):
-            self.activity.allowed_action(self.grant(), self.accounts, self.activity.policy(self.snapshot), self.snapshot)
+        self.activity.allowed_action(self.grant(), self.accounts, self.activity.policy(self.snapshot), self.snapshot)
+
+    def test_obsolete_grant_cap_settings_are_rejected(self):
+        for profile in ('bounded-v1', 'substantive-v1', ca.NATIVE_PROFILE, ca.PASS_PROFILE):
+            for field in ('max_grant_raw', 'max_grant_exposure_daily_raw'):
+                with self.subTest(profile=profile, field=field), self.assertRaisesRegex(ValueError, 'not supported'):
+                    ca.config_checked(dict(self.cfg, profile=profile, **{field: '1'}))
 
     def test_grant_current_capacity_and_feasibility_are_independent_of_metadata(self):
         action = self.grant()
         self.activity.allowed_action(action, self.accounts, self.activity.policy(self.snapshot), self.snapshot)
-        self.assertEqual(action['reserved_grant_raw'], str(4 * 10**16))
         self.assertEqual(action['reserved_cost_raw'], str(10**12 + 10**6))
         small = copy.deepcopy(self.snapshot)
         small['governance']['world']['grant_capacity'] = str(10**15)
@@ -872,18 +875,18 @@ class SubstantiveTests(ActivityTests):
         action = self.grant()
         payments = [dict(recipient=list(bytes.fromhex(key)), amount=str(2 * 10**16)) for key in KEYS[1:]]
         action['operation']['Propose']['proposal']['Grant'] = {'payments': payments}
-        action['grant_amount_raw'] = action['reserved_grant_raw'] = '1'
+        action['grant_amount_raw'] = '1'
         self.activity.submit(action, self.snapshot, self.accounts)
         recorded = json.loads(self.activity.ledger.rows(('pending',))[0]['action'])
-        self.assertEqual(recorded['reserved_grant_raw'], str(4 * 10**16))
-        self.assertEqual(self.activity.policy(self.snapshot)['grant_budget_remaining_raw'], str(6 * 10**16))
+        self.assertEqual(ca.validated_grant(recorded['operation']['Propose']['proposal']['Grant'])[1], 4 * 10**16)
+        self.assertNotIn('reserved_grant_raw', recorded)
         for mutation in ('outside', 'aggregate'):
             changed = copy.deepcopy(action)
             changed['sender_index'] = 1
             payouts = changed['operation']['Propose']['proposal']['Grant']['payments']
             if mutation == 'outside': payouts[1]['recipient'] = [255] * 32
-            else: payouts[1]['amount'] = str(4 * 10**16)
-            with self.assertRaises(ca.Fault):
+            else: payouts[1]['amount'] = str(10**18)
+            with self.assertRaises((ca.Fault, ca.Pause)):
                 self.activity.allowed_action(changed, self.accounts, self.activity.policy(self.snapshot), self.snapshot)
 
     def test_bounded_profile_support_also_rechecks_every_registered_recipient(self):
@@ -895,29 +898,24 @@ class SubstantiveTests(ActivityTests):
         action = self.action()
         action['operation'] = {'Support': {'round': 2, 'proposal': list(bytes.fromhex(proposal_id)), 'amount': str(10**12)}}
         self.activity.allowed_action(action, self.accounts, self.activity.policy(self.snapshot), self.snapshot)
-        self.assertEqual(action['reserved_grant_raw'], str(8 * 10**12))
         payments[1]['recipient'] = [255] * 32
         with self.assertRaisesRegex(ca.Fault, 'outside activity registry'):
             self.activity.allowed_action(action, self.accounts, self.activity.policy(self.snapshot), self.snapshot)
 
-    def test_rolling_exposure_counts_pending_and_confirmed_without_claiming_awards(self):
-        self.activity.submit(self.grant(sender=0), self.snapshot, self.accounts)
-        self.activity.submit(self.grant(sender=1), self.snapshot, self.accounts)
+    def test_prior_proposals_do_not_reduce_current_grant_backing(self):
+        for sender in range(3):
+            self.activity.submit(self.grant(n=6 * 10**17, sender=sender), self.snapshot, self.accounts)
         rows = self.activity.ledger.rows(('pending',))
+        self.assertEqual(len(rows), 3)
         self.activity.ledger.update(rows[0]['id'], state='confirmed', confirmed=self.now, receipt_height=10, receipt_hash=self.node.anchor)
-        with self.assertRaises(ca.Pause):
-            self.activity.allowed_action(self.grant(sender=2), self.accounts, self.activity.policy(self.snapshot), self.snapshot)
         self.activity.ledger.db.close()
         self.activity = ca.Activity(self.cfg, Planner, self.cli, self.node, clock=lambda: self.now)
-        self.assertEqual(self.activity.policy(self.snapshot)['grant_budget_remaining_raw'], str(2 * 10**16))
+        self.assertNotIn('grant_budget_remaining_raw', self.activity.policy(self.snapshot))
         self.activity.write_status()
         status = json.loads((self.activity.work / 'status.json').read_text())
-        self.assertEqual(status['grant_exposure_reserved_24h_raw'], str(8 * 10**16))
-        self.assertFalse(status['grant_exposure_is_awarded_value'])
-        self.now += 86401
-        # A confirmed reservation ages out, but unresolved signed authority
-        # cannot disappear merely because the local wall clock advanced.
-        self.assertEqual(self.activity.policy(self.snapshot)['grant_budget_remaining_raw'], str(6 * 10**16))
+        self.assertNotIn('grant_exposure_reserved_24h_raw', status)
+        self.assertNotIn('grant_exposure_is_awarded_value', status)
+        self.assertEqual(len(self.activity.ledger.rows(('pending', 'confirmed'))), 3)
 
     def test_support_looks_up_actual_grant_instead_of_trusting_amount_hint(self):
         proposal_id = 'bb' * 32
@@ -927,20 +925,18 @@ class SubstantiveTests(ActivityTests):
         grant = self.grant()['operation']['Propose']['proposal']['Grant']
         self.node.proposals = [{'id': proposal_id, 'proposal': {'round': 2, 'action': {'Grant': grant}}}]
         self.activity.allowed_action(action, self.accounts, self.activity.policy(self.snapshot), self.snapshot)
-        self.assertEqual(action['reserved_grant_raw'], str(4 * 10**16))
         self.node.proposals[0]['proposal']['action'] = {'Parameter': {'new': 5}}
         with self.assertRaises(ca.Pause):
             self.activity.allowed_action(action, self.accounts, self.activity.policy(self.snapshot), self.snapshot)
 
-    def test_expired_reserves_remain_conservative_but_unsigned_abandoned_does_not(self):
+    def test_expired_fee_reservations_remain_but_unsigned_abandoned_does_not(self):
         self.activity.submit(self.grant(), self.snapshot, self.accounts)
         row = self.activity.ledger.rows(('pending',))[0]
+        cost = json.loads(row['action'])['reserved_cost_raw']
         self.activity.ledger.update(row['id'], state='expired')
-        self.assertEqual(self.activity.policy(self.snapshot)['grant_budget_remaining_raw'], str(6 * 10**16))
-        # Only unsigned abandonment is excluded in production; this checks the
-        # accounting state distinction without broadcasting a replacement.
+        self.assertEqual(self.activity.reservations()[1], int(cost))
         self.activity.ledger.update(row['id'], state='abandoned')
-        self.assertEqual(self.activity.policy(self.snapshot)['grant_budget_remaining_raw'], str(10**17))
+        self.assertEqual(self.activity.reservations()[1], 0)
 
     def test_context_survives_more_than512_confirmed_actions(self):
         decision = 'de' * 32

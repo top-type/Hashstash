@@ -106,7 +106,7 @@ class ReserveAudit(Audit):
     def assert_supply(self, port=None):
         port = port or self.port
         state, governance = rpc(port, 'status'), rpc(port, 'governance')
-        assert state['protocol_version'] == 26
+        assert state['protocol_version'] == 27
         assert state['time_unit'] == 'seconds' and state['clock_basis'] == 'target_interval'
         assert state['height'] <= state['clock'] <= state['height'] * 60
         for outcome in (['Pass', 'Fail'] if governance['pass'] is not None else [None]):
@@ -309,7 +309,7 @@ class ReserveAudit(Audit):
 
     def run(self):
         assert self.status()['height'] == 0, 'audit requires a fresh disposable network'
-        assert self.config['protocol_version'] == 26
+        assert self.config['protocol_version'] == 27
         self.open_curve()
         self.payments()
         self.buffered_revenue()

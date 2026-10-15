@@ -29,7 +29,7 @@ fn work(block: &Block) -> Amount {
 fn current_presets_govern_block_time_and_the_whole_fee_split() {
     for c in [Config::devnet(), Config::testnet(), Config::slow_testnet()] {
         c.validate().unwrap();
-        assert_eq!(c.protocol_version, 26);
+        assert_eq!(c.protocol_version, 27);
         assert_eq!(c.initial.interval, 15);
         assert_eq!(c.progress_increment(&c.initial), c.initial.interval);
         for p in [
@@ -43,7 +43,7 @@ fn current_presets_govern_block_time_and_the_whole_fee_split() {
             assert_eq!(
                 c.parameter_change(&c.initial, Parameter::Interval, 15, seconds)
                     .is_ok(),
-                (1..=60).contains(&seconds) && seconds != 15
+                seconds > 0 && seconds != 15
             );
         }
         assert!(

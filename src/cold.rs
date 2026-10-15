@@ -28,7 +28,6 @@ use tokio::{
 use zeroize::{Zeroize, Zeroizing};
 
 pub const MAX_CONTROL_REQUEST: usize = 128 * 1024;
-pub const MAX_REQUEST: usize = wallet::MAX_RAW_TRANSACTION_BYTES * 2 + MAX_CONTROL_REQUEST;
 const INDEX: &str = include_str!("../cold-ui/index.html");
 const SCRIPT: &str = include_str!("../cold-ui/app.js");
 const SHARES: &str = include_str!("../ui/shares.js");
@@ -208,7 +207,7 @@ pub async fn serve_with_chain(address: SocketAddr, chain_id: Option<Hash>) -> Re
         .route("/api/lock", post(lock))
         .route(
             "/api/review",
-            post(review).layer(DefaultBodyLimit::max(MAX_REQUEST)),
+            post(review).layer(DefaultBodyLimit::disable()),
         )
         .route("/api/cancel", post(cancel))
         .route("/api/sign", post(sign))

@@ -31,7 +31,8 @@ pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
 
 pub fn decode<T: DeserializeOwned + Serialize>(bytes: &[u8], max: usize) -> Result<T> {
     ensure!(bytes.len() <= max, "encoded record exceeds limit");
-    let value: T = options().with_limit(max as u64).deserialize(bytes)?;
+    let available = u64::try_from(bytes.len())?;
+    let value: T = options().with_limit(available).deserialize(bytes)?;
     ensure!(encode(&value) == bytes, "noncanonical encoding");
     Ok(value)
 }

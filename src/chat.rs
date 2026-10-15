@@ -1,5 +1,5 @@
 //! A read-only conversation view of ordinary UTF-8 transaction data, not consensus.
-use crate::{codec, config::Config, types::*};
+use crate::{config::Config, types::*};
 
 pub fn decode(data: &[u8], max_bytes: usize) -> Option<&str> {
     if data.len() > max_bytes {
@@ -22,12 +22,10 @@ pub fn decode(data: &[u8], max_bytes: usize) -> Option<&str> {
 }
 
 pub fn from_transaction<'a>(c: &Config, tx: &'a Transaction) -> Option<&'a str> {
-    if tx.body.chain_id != c.chain_id()
-        || codec::encode(tx).len() > crate::config::MAX_BLOCK_RECORD_BYTES
-    {
+    if tx.body.chain_id != c.chain_id() {
         return None;
     }
-    decode(&tx.body.data, crate::config::MAX_BLOCK_RECORD_BYTES)
+    decode(&tx.body.data, tx.body.data.len())
 }
 
 #[cfg(test)]

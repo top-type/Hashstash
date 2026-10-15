@@ -85,10 +85,7 @@ fn genesis_revenue_and_bounded_empty_feed_are_consistent() {
     assert_eq!(feed["ready"], true);
     assert_eq!(feed["indexed_height"], 0);
     assert!(feed.get("min_contribution").is_none());
-    assert_eq!(
-        feed["message_bytes"],
-        hashstash::config::MAX_BLOCK_RECORD_BYTES
-    );
+    assert_eq!(feed["message_bytes"], c.transaction_bytes(&c.initial));
     assert!(feed["items"].as_array().unwrap().is_empty());
     assert!(feed["pending"].as_array().unwrap().is_empty());
     for p in [

@@ -44,7 +44,7 @@ class FakeNode:
         self.height = 10
         self.chain = CHAIN
         self.phase = 'rest'
-        self.protocol = 26
+        self.protocol = 27
         self.receipt = None
         self.account_values = {k: dict(nonce=0, ordinary=str(10**15), shares='0') for k in KEYS}
         self.pass_account_values = {}
@@ -187,7 +187,7 @@ class ActivityTests(unittest.TestCase):
     def test_current_observation_and_unknown_protocol_guard(self):
         original = self.node.snapshot
         self.activity.observe()
-        for version in (25, 27):
+        for version in (26, 28):
             with self.subTest(protocol=version):
                 def unsupported(version=version):
                     value = original()
@@ -197,13 +197,13 @@ class ActivityTests(unittest.TestCase):
                 with self.assertRaises(ca.Fault): self.activity.observe()
 
     def full_cash_governance(self):
-        self.node.protocol, self.node.phase = 26, 'governance'
+        self.node.protocol, self.node.phase = 27, 'governance'
         self.node.pass_account_values = copy.deepcopy(self.node.account_values)
         self.snapshot, self.accounts = self.activity.observe()
 
     def test_current_rejects_unaffordable_other_world_before_signing(self):
         self.full_cash_governance()
-        self.node.protocol = 26
+        self.node.protocol = 27
         self.snapshot, self.accounts = self.activity.observe()
         action = self.action()
         action['guard']['phase'] = 'governance'

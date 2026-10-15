@@ -487,6 +487,29 @@ mod tests {
         assert!(asert(&initial, -3, 172800, &limit) < initial);
     }
     #[test]
+    fn asert_supports_every_positive_half_life_without_intermediate_overflow() {
+        let limit = target_from_bits(0x1d00ffff).unwrap();
+        let initial = target_from_bits(0x1c0ffff0).unwrap();
+        for half_life in [1, 899, 900, i64::MAX as u64 + 1, u64::MAX] {
+            let half_life_i128 = i128::from(half_life);
+            assert_eq!(asert(&initial, 0, half_life, &limit), initial);
+            assert_eq!(
+                asert(&initial, half_life_i128, half_life, &limit),
+                &initial * 2u32
+            );
+            assert_eq!(
+                asert(&initial, -half_life_i128, half_life, &limit),
+                &initial / 2u32
+            );
+            assert_eq!(asert(&initial, i128::MAX, half_life, &limit), limit);
+            assert_eq!(asert(&initial, i128::MIN, half_life, &limit), Amount::one());
+            for error in [half_life_i128 * 512 - 1, -half_life_i128 * 512 + 1] {
+                let target = asert(&initial, error, half_life, &limit);
+                assert!(!target.is_zero() && target <= limit);
+            }
+        }
+    }
+    #[test]
     fn curve_inequalities_and_no_profitable_round_trip() {
         for (u, v) in [(1, 2), (1, 3), (1, 5), (2, 3), (3, 7)] {
             for r0 in 1..=19u32 {

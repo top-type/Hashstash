@@ -457,6 +457,14 @@ async function run() {
     await h.get('sign').fire('click');
     assert.equal(h.calls.some(call=>call.url==='/api/sign'),false);checks++;
   }
+  {
+    const h=await harness(chainA);h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.review.fields=[{label:'Parameter',value:'Rest period'},{label:'Expected value',value:'18446744073709551615'},{label:'Proposed value',value:'9007199254740993'}];
+    await h.get('review-form').fire('submit');
+    assert.ok(h.get('review-fields').textContent.includes('18446744073709551615'));checks++;
+    assert.ok(h.get('review-fields').textContent.includes('9007199254740993'));checks++;
+  }
   for(const margin of ['0.00%','150.01%','184467440737095516.15%']) {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
@@ -484,8 +492,8 @@ async function run() {
     assert.equal(h.get('unsigned').value,source,'unsigned imports may exceed the former128KiB file ceiling');checks++;
     let read=false;h.get('unsigned-file').files=[{size:2*32*1024*1024+128*1024+1,text:async()=>{read=true;return source;}}];
     await h.get('unsigned-file').fire('change');
-    assert.equal(read,false,'oversized record files are rejected before reading');checks++;
-    assert.match(h.get('message').textContent,/record limit/);checks++;
+    assert.equal(read,true,'unsigned imports have no fixed32MiB policy ceiling');checks++;
+    assert.equal(h.get('unsigned').value,source);checks++;
   }
   assert.match(html, /id="import-method"><option value="private">Private key/);checks++;
   assert.ok(html.includes('entering it here derives a different account'));checks++;

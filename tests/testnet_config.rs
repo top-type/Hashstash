@@ -27,21 +27,21 @@ fn checked_in_presets_are_exact_current_configs() {
 }
 
 #[test]
-fn legacy_preset_chain_ids_keep_the_protocol26_encoding() {
-    // Independently packed from the documented v26 field order and varints;
-    // accepting previously invalid 0/0 caps must not change existing identities.
+fn protocol27_preset_chain_ids_match_independent_encoding() {
+    // Independently packed from the unchanged field order and varints.
+    // Protocol and preset changes separate these chains from prior releases.
     for (c, expected) in [
         (
             Config::devnet(),
-            "f6a2e38a4758f1ccf50dd18c1b59db136b657fdf57e728b6a5b8f5232adb3c27",
+            "f62127c60825be20ee7c19f6d5ef79712ab2f4c525c6e179091407f5c082dac2",
         ),
         (
             Config::testnet(),
-            "949b5f3c38f6e67b48dd569c6c113377714e582ff3a550bf3ff2e743912938e9",
+            "e7cea4e17c601540e5c96ae4f7b51310c53395eba5429158356e295150954567",
         ),
         (
             Config::slow_testnet(),
-            "fcb3cebcf9384d80b20277985d7cd1ad35b93d03791d9a39b3d7dcc8463f2586",
+            "0b2613506d8bf0b0fd26c3f6c9f32ad39e22f8031eb5529b3473a6b438d53d69",
         ),
     ] {
         c.validate().unwrap();
@@ -93,48 +93,57 @@ fn changed_genesis_identity_and_every_setting_are_committed() {
 }
 
 #[test]
-fn governance_interval_and_duration_limits_are_enforced() {
+fn governance_timing_uses_arithmetic_domains() {
     let config = Config::testnet();
-    for interval in 1..=60 {
+    for interval in [1, 15, 60, 61, 86_400, 1 << 40] {
         let mut changed = config.clone();
         changed.initial.interval = interval;
         changed.validate().unwrap();
-        if interval != 15 {
-            config
-                .parameter_change(&config.initial, Parameter::Interval, 15, interval)
-                .unwrap();
-        }
     }
-    for interval in [0, 61, u64::MAX] {
+    for interval in [0, u64::MAX] {
         assert!(
             config
                 .parameter_change(&config.initial, Parameter::Interval, 15, interval)
                 .is_err()
         );
     }
-    let mut invalid = config.clone();
-    invalid.initial.duration = invalid.initial.interval;
-    assert!(invalid.validate().is_err());
-    invalid.initial.duration = u64::MAX;
-    assert!(invalid.validate().is_err());
-    // Duration no longer controls a loop of funding installments.
-    let mut long = config;
-    long.initial.duration = 100_000;
-    long.validate().unwrap();
+    for duration in [1, config.initial.interval, u64::MAX] {
+        let mut changed = config.clone();
+        changed.initial.duration = duration;
+        changed.validate().unwrap();
+    }
 }
 
 #[test]
-fn timestamp_safety_limits_cannot_be_disabled_by_genesis() {
+fn genesis_settings_use_defined_domains_without_policy_limits() {
     let mut c = Config::devnet();
-    c.daa_half_life = 899;
-    assert!(c.validate().is_err());
-    c = Config::devnet();
-    c.timestamp_window = 9;
-    assert!(c.validate().is_err());
-    c = Config::devnet();
-    c.future_seconds = 121;
-    assert!(c.validate().is_err());
-    c = Config::devnet();
+    c.daa_half_life = 1;
+    c.timestamp_window = 2;
+    c.future_seconds = u32::MAX;
+    c.max_signatures = usize::MAX;
+    c.max_height = i64::MAX as u64;
+    c.max_integer_bits = u64::MAX;
+    c.quote_scale = hashstash::types::Amount::from(1u32) << 300usize;
+    c.reserve_min = 0u32.into();
+    c.auction_timeout = 0;
+    c.budget_period = 1;
+    c.initial.rest = 0;
+    c.initial.lead = 0;
+    c.initial.minimum_fee_rate = 0;
+    c.validate().unwrap();
+    c.daa_half_life = u64::MAX;
+    c.timestamp_window = usize::MAX;
+    c.validate().unwrap();
+    for field in ["timestamp_window", "daa_half_life", "budget_period"] {
+        let mut value = serde_json::to_value(&c).unwrap();
+        value[field] = 0.into();
+        assert!(
+            serde_json::from_value::<Config>(value)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
     c.initial.block_bytes = u64::MAX;
     assert!(c.validate().is_err());
     c = Config::devnet();

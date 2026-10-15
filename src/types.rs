@@ -23,13 +23,10 @@ pub mod amount {
         if d.is_human_readable() {
             let s = String::deserialize(d)?;
             if s.is_empty()
-                || s.len() > 20_000
                 || (s.len() > 1 && s.starts_with('0'))
                 || !s.bytes().all(|b| b.is_ascii_digit())
             {
-                return Err(D::Error::custom(
-                    "noncanonical or oversized unsigned amount",
-                ));
+                return Err(D::Error::custom("noncanonical unsigned amount"));
             }
             Amount::parse_bytes(s.as_bytes(), 10).ok_or_else(|| D::Error::custom("invalid amount"))
         } else {
@@ -37,20 +34,14 @@ pub mod amount {
             impl<'de> serde::de::Visitor<'de> for Bytes {
                 type Value = Amount;
                 fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                    f.write_str("a minimal unsigned integer of at most 8192 bytes")
+                    f.write_str("a minimal unsigned integer")
                 }
                 fn visit_seq<A: serde::de::SeqAccess<'de>>(
                     self,
                     mut seq: A,
                 ) -> Result<Amount, A::Error> {
-                    if seq.size_hint().is_some_and(|n| n > 8192) {
-                        return Err(A::Error::custom("oversized unsigned amount"));
-                    }
                     let mut bytes = Vec::new();
                     while let Some(byte) = seq.next_element::<u8>()? {
-                        if bytes.len() == 8192 {
-                            return Err(A::Error::custom("oversized unsigned amount"));
-                        }
                         bytes.push(byte);
                     }
                     if bytes.last() == Some(&0) {
@@ -90,22 +81,11 @@ pub struct GrantPayment {
     pub amount: Amount,
 }
 
-/// Structural ceiling implied by the existing block-capacity bound, not an
-/// additional consensus count parameter. Each positive payment needs 32 key
-/// bytes, an amount length and at least one amount byte, plus prepaid work.
-pub fn grant_payment_capacity() -> usize {
-    crate::config::MAX_BLOCK_RECORD_BYTES / (crate::fees::ACCOUNT_WEIGHT as usize + 34)
-}
-
 /// This is the only aggregate used for grant budgets, escrow and settlement.
 pub fn grant_total(payments: &[GrantPayment]) -> anyhow::Result<Amount> {
     anyhow::ensure!(
         !payments.is_empty(),
         "grant must have at least one recipient"
-    );
-    anyhow::ensure!(
-        payments.len() <= grant_payment_capacity(),
-        "grant settlement exceeds block capacity"
     );
     let mut total = Amount::default();
     let mut previous = None;
@@ -129,42 +109,27 @@ pub fn grant_total(payments: &[GrantPayment]) -> anyhow::Result<Amount> {
 /// allocation. The enclosing record/request byte limit bounds the input; the
 /// transaction's encoded bytes and prepaid work bound its admitted capacity.
 mod grant_payments {
-    use super::{GrantPayment, grant_payment_capacity};
+    use super::GrantPayment;
     use serde::{
         Deserializer,
-        de::{DeserializeSeed, Error, SeqAccess, Visitor},
+        de::{Error, SeqAccess, Visitor},
     };
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<GrantPayment>, D::Error> {
         struct Payments;
-        struct RejectExtra;
-        impl<'de> DeserializeSeed<'de> for RejectExtra {
-            type Value = ();
-            fn deserialize<D: Deserializer<'de>>(self, _: D) -> Result<(), D::Error> {
-                Err(D::Error::custom("grant settlement exceeds block capacity"))
-            }
-        }
         impl<'de> Visitor<'de> for Payments {
             type Value = Vec<GrantPayment>;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 f.write_str("a nonempty grant payment list")
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let capacity = grant_payment_capacity();
-                if seq.size_hint().is_some_and(|n| n > capacity) {
-                    return Err(A::Error::custom("grant settlement exceeds block capacity"));
-                }
                 let mut payments = Vec::new();
-                while payments.len() < capacity {
-                    let Some(payment) = seq.next_element::<GrantPayment>()? else {
-                        if payments.is_empty() {
-                            return Err(A::Error::custom("empty grant"));
-                        }
-                        return Ok(payments);
-                    };
+                while let Some(payment) = seq.next_element::<GrantPayment>()? {
                     payments.push(payment);
                 }
-                seq.next_element_seed(RejectExtra)?;
+                if payments.is_empty() {
+                    return Err(A::Error::custom("empty grant"));
+                }
                 Ok(payments)
             }
         }
@@ -199,6 +164,30 @@ mod grant_tests {
     use super::*;
     use crate::{codec, config::Config, crypto};
 
+    #[test]
+    fn amount_decoding_uses_actual_record_bytes_instead_of_a_fixed_precision_ceiling() {
+        let amount = Amount::from(1u32) << 70_000usize;
+        let payment = GrantPayment {
+            recipient: crypto::public_key(&[1; 32]).unwrap(),
+            amount,
+        };
+        let bytes = codec::encode(&payment);
+        assert!(bytes.len() > 8192);
+        assert_eq!(
+            codec::decode::<GrantPayment>(&bytes, bytes.len()).unwrap(),
+            payment
+        );
+        let json = serde_json::to_string(&payment).unwrap();
+        assert!(json.len() > 20_000);
+        assert_eq!(
+            serde_json::from_str::<GrantPayment>(&json).unwrap(),
+            payment
+        );
+        let mut truncated = payment.recipient.to_vec();
+        truncated.extend(codec::encode(&u64::MAX));
+        assert!(codec::decode::<GrantPayment>(&truncated, truncated.len()).is_err());
+    }
+
     fn payments(count: usize) -> Vec<GrantPayment> {
         let mut payments: Vec<_> = (1..=count)
             .map(|i| GrantPayment {
@@ -224,14 +213,9 @@ mod grant_tests {
         assert!(codec::decode::<Proposal>(&bytes, bytes.len() - 1).is_err());
         let mut hostile = vec![0, 253];
         hostile.extend_from_slice(&u64::MAX.to_le_bytes());
-        // A huge declared length is impossible under the existing block work
-        // limit and must fail before any nested payment fields are inspected.
-        assert!(
-            codec::decode::<Proposal>(&hostile, 1024)
-                .unwrap_err()
-                .to_string()
-                .contains("grant settlement exceeds block capacity")
-        );
+        // A forged count never becomes an allocation request. Decoding fails
+        // on the missing first payment, using only the supplied input bytes.
+        assert!(codec::decode::<Proposal>(&hostile, 1024).is_err());
         let mut json = serde_json::to_string(&valid).unwrap();
         assert_eq!(serde_json::from_str::<Proposal>(&json).unwrap(), valid);
         let end = json.rfind(']').unwrap();

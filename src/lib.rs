@@ -1,3 +1,8 @@
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!(
+    "Hashstash requires a 64-bit target for canonical capacity and configuration ranges"
+);
+
 pub mod address;
 pub mod chain;
 pub mod chat;

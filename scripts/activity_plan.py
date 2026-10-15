@@ -262,7 +262,7 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
     chain = _key(status.get("chain_id"))
     region = policy.get("region")
     if (chain is None or chain != policy.get("chain_id")
-            or status.get("protocol_version") != 26
+            or status.get("protocol_version") != 27
             or phase not in {"auction", "governance", "rest"}
             or region not in registry or len(accounts) != 3):
         return None
@@ -594,7 +594,7 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
             if _number((snapshot.get("governance", {}).get("pass") or {}).get("grant_escrow")) != grant:
                 return None
             timing = (active.get("started"), active.get("duration"), status.get("clock"), status.get("settings", {}).get("interval"))
-            if (not all(type(n) is int and n >= 0 for n in timing) or not 1 <= timing[3] <= 60
+            if (not all(type(n) is int and n >= 0 for n in timing) or timing[3] <= 0
                     or not timing[0] <= timing[2] < timing[0] + timing[1]
                     or timing[0] + timing[1] - timing[2] < 2 * timing[3]):
                 return None
@@ -875,7 +875,7 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
         timing = (active.get("started"), active.get("duration"), status.get("clock"),
                   status.get("settings", {}).get("interval"))
         valid_timing = (all(type(value) is int and value >= 0 for value in timing)
-                        and timing[1] > 0 and 1 <= timing[3] <= 60
+                        and timing[1] > 0 and timing[3] > 0
                         and timing[0] <= timing[2] < timing[0] + timing[1])
         remaining = timing[0] + timing[1] - timing[2] if valid_timing else None
         minimum_cycle_seconds = 6 * timing[3] if valid_timing else None

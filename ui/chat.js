@@ -7,11 +7,10 @@
   'use strict';
   const PAGE_SIZE = 20, MAX_PAGES = 10;
   const validId = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
-  function validateText(text, limit) {
+  function validateText(text) {
     if (typeof text !== 'string' || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(text)) throw new Error('Message contains invalid Unicode.');
     if (/[\u0000-\u0008\u000B-\u000C\u000E-\u001F\u007F-\u009F]/u.test(text)) throw new Error('Messages allow line breaks and tabs, but no other control characters.');
-    const length = new TextEncoder().encode(text).length;
-    if (!text.trim() || length > limit) throw new Error('Message exceeds this network’s transaction data limit.');
+    if (!text.trim()) throw new Error('Message is empty.');
   }
   const unsigned = value => /^(0|[1-9]\d{0,19})$/.test(String(value)) && BigInt(value) <= 18446744073709551615n;
   const chronological = (left, right) => {
@@ -108,9 +107,9 @@
       if (record.recipient != null) root.HashstashAddress.decode(record.recipient, 'hsh' + chain.slice(0, 16));
       if (record.amount != null && (typeof record.amount !== 'string' || !/^(0|[1-9]\d{0,159})$/.test(record.amount) || !['hash', 'stash'].includes(record.asset))) throw new Error('Invalid message amount.');
       if (record.amount == null && record.asset != null) throw new Error('Invalid message amount.');
-      const limit = context.message_bytes ?? 32 * 1024 * 1024;
-      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 32 * 1024 * 1024) throw new Error('Invalid transaction data limit.');
-      validateText(record.text, limit);
+      // Historical records can exceed today's governed capacity. The node has
+      // already validated their size against the block that included them.
+      validateText(record.text);
       if (!unsigned(record.confirmations) || (unconfirmed ? record.status !== 'pending' || record.height != null || record.position != null : record.status !== 'confirmed' || !unsigned(record.height) || !unsigned(record.position))) throw new Error('Invalid message status.');
       return record;
     }

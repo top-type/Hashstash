@@ -14,6 +14,8 @@ const vm = require('node:vm');
 
 const { webcrypto } = require('node:crypto');
 
+const parseExact = source => JSON.parse(source, (_key, value, context) => typeof value === 'number' && !Number.isSafeInteger(value) && /^\d+$/.test(context?.source || '') ? context.source : value);
+
 const amounts = require('../ui/amounts.js');
 
 const shares = require('../ui/shares.js');
@@ -146,7 +148,7 @@ function snapshot(chain = 'a'.repeat(64)) {
 
   const settings = { block_bytes: 1048576, interval: 15, lead: 60, rest: 480, duration: 240, miner_fee_percent:50, pass_margin_bps:0, minimum_fee_rate:1 };
 
-  const config = { protocol_version:26, network: 'hashstash-ui-test', auction_timeout: 480, quote_scale: '1000000', share_scale: '1000000000000000000' };
+  const config = { protocol_version:27, network: 'hashstash-ui-test', auction_timeout: 480, quote_scale: '1000000', share_scale: '1000000000000000000' };
 
 
 
@@ -156,7 +158,7 @@ function snapshot(chain = 'a'.repeat(64)) {
 
     config,
 
-    status: { protocol_version:26, fee_policy:{minimum_fee_rate:'1',fee_scale:1024,account_weight:1024}, chain_id: chain, tip: 'b'.repeat(64), state_root: 'c'.repeat(64), height: 20, clock: 300, time_unit:'seconds', clock_basis:'target_interval', issued: '2000', settings, mempool: 0, reserve: world.reserve, curve_mass: world.curve_mass, shares: world.shares, revenue: '0' },
+    status: { protocol_version:27, fee_policy:{minimum_fee_rate:'1',fee_scale:1024,account_weight:1024}, chain_id: chain, tip: 'b'.repeat(64), state_root: 'c'.repeat(64), height: 20, clock: 300, time_unit:'seconds', clock_basis:'target_interval', issued: '2000', settings, mempool: 0, reserve: world.reserve, curve_mass: world.curve_mass, shares: world.shares, revenue: '0' },
 
     governance: { phase: { Auction: { round: 0, opened: 0, leader: null, lead_since: 0 } }, clock: 300, time_unit:'seconds', clock_basis:'target_interval', frozen: settings, settings, world, pass: null },
 
@@ -441,7 +443,7 @@ async function harness(options = {}) {
     HashstashBrowserWallet: {
       publicKey() { return '9a'.repeat(32); },
       verifyUnsigned(envelope) {
-        if (envelope?.format !== 'hashstash-unsigned-v1' || !/^[a-f0-9]+$/i.test(envelope.body || '') || envelope.body.length > 2 * 32 * 1024 * 1024 || envelope.body.length % 2) throw new Error('The node returned an invalid unsigned transaction.');
+        if (envelope?.format !== 'hashstash-unsigned-v1' || !/^[a-f0-9]+$/i.test(envelope.body || '') || envelope.body.length % 2) throw new Error('The node returned an invalid unsigned transaction.');
       },
       createStore() {
         const manage = async (action, values, guard) => {
@@ -463,7 +465,7 @@ async function harness(options = {}) {
           decryptMail: (...args) => h.decryptMail(...args),
           async signUnsigned(envelope, expected) {
             const { operation, fee, data_hex, expiry_blocks, sender, wallet_revision } = expected;
-            const body = JSON.parse(JSON.stringify({operation, fee, ...(data_hex ? {data_hex} : {}), expiry_blocks, expected_sender:sender, wallet_revision}));
+            const body = parseExact(JSON.stringify({operation, fee, ...(data_hex ? {data_hex} : {}), expiry_blocks, expected_sender:sender, wallet_revision}));
             wallet.push(body);
             const reply = h.handlers.wallet ? await h.handlers.wallet(body) : response({transaction_id:'d'.repeat(64)});
             const data = JSON.parse(await reply.text());
@@ -535,7 +537,7 @@ async function harness(options = {}) {
         return h.faucetTransport ? h.faucetTransport(url,options) : response({},404);
       }
 
-      const body = JSON.parse(options.body); calls.push({ url, body, options });
+      const body = parseExact(options.body); calls.push({ url, body, options });
 
       if (url === '/api/wallet' || url === '/api/wallet/manage') throw new Error('Browser wallets must not call server key endpoints');
 
@@ -681,13 +683,38 @@ async function run() {
  await h.get('guide-technical-tab').fire('keydown',{key:'Home'});eq(h.get('guide-overview-panel').hidden,false);eq(h.get('guide-technical-panel').hidden,true);eq(h.get('guide-overview-tab').tabIndex,0);
  await h.navigate('#mixer');eq(h.get('view-mixer').hidden,false);eq(h.get('view-send').hidden,true);ok(h.navLinks.some(link=>link.dataset.route==='mixer'));
  await h.navigate('#governance');
- for(const value of ['1','20','60']) {
-  const form=h.get('propose-form');form.elements.type.value='parameter';form.elements.parameter.value='Interval';form.elements.parameter_value.value=value;form.elements.support.value=amounts.exactInput('1');
+ const values = {
+  BlockBytes:['1024','1537','33554433','18446744073709551615'],
+  Interval:['1','61','9007199254740993','18446744073709551615'],
+  Lead:['0','17','18446744073709551615'], Rest:['0','19','18446744073709551615'],
+  Duration:['1','73','18446744073709551615'], MinerFeePercent:['0','37','100'],
+  PassMarginBps:['0.01','150.01','184467440737095516.15'], MinimumFeeRate:['0','3','18446744073709551615']
+ };
+ const settingNames={BlockBytes:'block_bytes',Interval:'interval',Lead:'lead',Rest:'rest',Duration:'duration',MinerFeePercent:'miner_fee_percent',PassMarginBps:'pass_margin_bps',MinimumFeeRate:'minimum_fee_rate'};
+ for(const [parameter,inputs] of Object.entries(values)) for(const value of inputs) {
+  const form=h.get('propose-form'),before=h.wallet.length;form.elements.type.value='parameter';form.elements.parameter.value=parameter;form.elements.parameter_value.value=value;form.elements.support.value=amounts.exactInput('1');
   await h.get('proposal-parameter').fire('change');await form.fire('input');await h.timersDue();await form.requestSubmit();
-  eq(h.wallet.at(-1)?.operation.Propose.proposal.Parameter,{parameter:'Interval',old:15,new:Number(value)});
+  eq(h.wallet.length,before+1,`${parameter}=${value}: ${form.feedback.textContent}`);
+  const [whole,fraction='']=value.split('.'),next=parameter==='PassMarginBps'?BigInt(whole)*100n+BigInt(fraction.padEnd(2,'0')):BigInt(value);
+  eq(h.wallet.at(-1)?.operation.Propose.proposal.Parameter,{parameter,old:s.status.settings[settingNames[parameter]],new:next>BigInt(Number.MAX_SAFE_INTEGER)?String(next):Number(next)});
  }
- for(const value of ['0','61','1.5','-1']) {
-  const count=h.wallet.length,form=h.get('propose-form');form.elements.parameter_value.value=value;await form.fire('submit');eq(h.wallet.length,count);
+ ok(!/proposal-direction|proposal-miner-fee|halve|double|1–60/.test(html),'all settings use one direct value field');
+ for(const [parameter,value] of [['BlockBytes','1023'],['BlockBytes','0'],['Interval','0'],['Duration','0'],['MinerFeePercent','101'],['Lead','-1'],['Rest','1.5'],['MinimumFeeRate','18446744073709551616'],['PassMarginBps','184467440737095516.16'],['PassMarginBps','0.001'],['Interval','15']]) {
+  const count=h.wallet.length,form=h.get('propose-form');form.elements.parameter.value=parameter;form.elements.parameter_value.value=value;
+  await form.fire('input');await h.timersDue();await form.requestSubmit();eq(h.wallet.length,count,`${parameter}=${value} cannot sign`);
+ }
+ {
+  const zero=await harness(),form=zero.get('send-form');zero.currentSnapshot.status.settings.minimum_fee_rate=0;await zero.refresh();
+  form.elements.recipient.value=addr(recipient);form.elements.amount.value=amounts.exactInput('10');
+  await form.fire('input');await zero.timersDue();await form.requestSubmit();
+  eq(zero.wallet.length,1,form.feedback.textContent);eq(zero.wallet[0].fee,'0','zero rate permits a zero fee');
+ }
+ {
+  const large=await harness(),form=large.get('propose-form');large.currentSnapshot.status.settings.rest='18446744073709551615';large.currentSnapshot.status.settings.block_bytes='18446744073709551615';await large.refresh();
+  form.elements.type.value='parameter';form.elements.parameter.value='Rest';form.elements.parameter_value.value='9007199254740993';form.elements.support.value=amounts.exactInput('1');
+  await form.fire('input');await large.timersDue();await form.requestSubmit();
+  eq(large.wallet.at(-1)?.operation.Propose.proposal.Parameter,{parameter:'Rest',old:'18446744073709551615',new:'9007199254740993'},'both old and new retain exact u64 digits');
+  ok(large.get('network-settings').textContent.includes('18,446,744,073,709,551,615'),'network setting display retains every digit');
  }
  const count=h.wallet.length, form=h.get('propose-form');form.elements.parameter.value='UncleFinderPercent';await form.fire('submit');eq(h.wallet.length,count);
  const initial=initialSnapshot();h.currentSnapshot=initial;await h.refresh();

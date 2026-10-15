@@ -2,7 +2,7 @@
 const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');
 const {setup:outcomeSetup}=require('./test_outcome_wallet.cjs'),{deferred,settle,response}=require('./test_wallet_ui.cjs');
 const amounts=require('../ui/amounts.js');let checks=0;const eq=(a,b,m)=>{assert.deepEqual(a,b,m);checks++;},ok=(v,m)=>{assert.ok(v,m);checks++;};
-async function setup(percent=50){const h=await outcomeSetup('1000000','1000000'),s=h.currentSnapshot;s.config.protocol_version=s.status.protocol_version=26;s.status.settings.miner_fee_percent=percent;const previous=h.fee;
+async function setup(percent=50){const h=await outcomeSetup('1000000','1000000'),s=h.currentSnapshot;s.config.protocol_version=s.status.protocol_version=27;s.status.settings.miner_fee_percent=percent;const previous=h.fee;
  h.fee=p=>{const r=previous(p),n=BigInt(s.status.settings.miner_fee_percent),miner=BigInt(r.fee)*n/100n;return {...r,miner_fee_percent:s.status.settings.miner_fee_percent,miner_fee:String(miner),revenue_fee:String(BigInt(r.fee)-miner)};};await h.refresh();return h;}
 async function run(){
  const html=fs.readFileSync(path.join(__dirname,'../ui/index.html'),'utf8');ok(!html.includes('Miner priority'));ok(html.includes('Optional extra'));
@@ -15,12 +15,12 @@ async function run(){
  for(const value of [0,1,49,51,99,100]){
   const h=await setup(),s=h.currentSnapshot;s.governance.phase={Auction:{round:0,opened:0,leader:null,lead_since:0}};s.governance.pass=null;s.pass=s.fail=null;await h.refresh();
   const option=h.get('proposal-parameter').options.find(o=>o.value==='MinerFeePercent');eq(Boolean(option.hidden),false);eq(Boolean(option.disabled),false);
-  const f=h.get('propose-form');f.elements.type.value='parameter';f.elements.parameter.value='MinerFeePercent';f.elements.miner_fee_percent.value=String(value);f.elements.support.value=amounts.exactInput('1');await h.get('proposal-parameter').fire('change');await f.fire('input');await h.timersDue();
-  eq(h.get('proposal-direction-field').hidden,true,'fee share accepts direct percentages, not halve/double');ok(/id="proposal-miner-fee"[^>]*step="1"/.test(html));ok(h.get('parameter-preview').textContent.includes(`${value}% miners`));ok(h.get('parameter-preview').title.includes('after rest'));
+  const f=h.get('propose-form');f.elements.type.value='parameter';f.elements.parameter.value='MinerFeePercent';f.elements.parameter_value.value=String(value);f.elements.support.value=amounts.exactInput('1');await h.get('proposal-parameter').fire('change');await f.fire('input');await h.timersDue();
+  ok(!html.includes('proposal-direction'),'fee share uses the common direct-value field');eq(h.get('proposal-value').step,'1');ok(h.get('parameter-preview').textContent.includes(`→ ${value}%`));ok(h.get('parameter-preview').title.includes('after rest'));
   await f.requestSubmit();eq(h.wallet.at(-1).operation.Propose.proposal.Parameter,{parameter:'MinerFeePercent',old:50,new:value});
  }
  for(const invalid of ['-1','100.1','101','1.5','NaN']){
-  const h=await setup(),s=h.currentSnapshot;s.governance.phase={Auction:{round:0,opened:0,leader:null,lead_since:0}};s.governance.pass=null;s.pass=s.fail=null;await h.refresh();const f=h.get('propose-form');f.elements.type.value='parameter';f.elements.parameter.value='MinerFeePercent';f.elements.miner_fee_percent.value=invalid;f.elements.support.value=amounts.exactInput('1');await f.fire('input');await h.timersDue();await f.fire('submit');eq(h.wallet.length,0,'invalid percent cannot sign');
+  const h=await setup(),s=h.currentSnapshot;s.governance.phase={Auction:{round:0,opened:0,leader:null,lead_since:0}};s.governance.pass=null;s.pass=s.fail=null;await h.refresh();const f=h.get('propose-form');f.elements.type.value='parameter';f.elements.parameter.value='MinerFeePercent';f.elements.parameter_value.value=invalid;f.elements.support.value=amounts.exactInput('1');await f.fire('input');await h.timersDue();await f.fire('submit');eq(h.wallet.length,0,'invalid percent cannot sign');
  }
  for(const mutation of [{fee:'6'},{minimum_fee:'2'},{extra_fee:'5'},{weight:'1025'},{account_creation_fee:'1'},{minimum_fee_rate:'2'},{minimum_fee_rate:'0'},{minimum_fee_rate:'18446744073709551616'},{miner_fee:'3',revenue_fee:'2'},{miner_fee:'2',revenue_fee:'4'},{miner_fee:'2.0'},{miner_fee_percent:51},{miner_fee_percent:101},{miner_fee_percent:'50.0'},{miner_fee:null},{revenue_fee:3}]){
   const h=await setup(),original=h.fee;h.fee=p=>({...original(p),...mutation});const f=h.get('send-form');f.elements.extra_fee.value=amounts.exactInput('4');await h.send('10');eq(h.get('send-submit').disabled,true,JSON.stringify(mutation));eq(h.get('send-fee-allocation').hidden,true);await f.fire('submit');eq(h.wallet.length,0);
@@ -38,8 +38,8 @@ async function run(){
 
  {
   const h=await setup(),s=h.currentSnapshot;s.status.settings.minimum_fee_rate=2;s.status.fee_policy.minimum_fee_rate='2';s.governance.phase={Auction:{round:0,opened:0,leader:null,lead_since:0}};s.governance.pass=null;s.pass=s.fail=null;await h.refresh();
-  for(const direction of ['double','halve']) {
-   const f=h.get('propose-form');f.elements.type.value='parameter';f.elements.parameter.value='MinimumFeeRate';f.elements.direction.value=direction;f.elements.support.value=amounts.exactInput('1');await h.get('proposal-parameter').fire('change');await f.fire('input');await h.timersDue();await f.requestSubmit();eq(h.wallet.at(-1).operation.Propose.proposal.Parameter,{parameter:'MinimumFeeRate',old:2,new:direction==='double'?4:1});
+  for(const value of ['0','3','1']) {
+   const f=h.get('propose-form');f.elements.type.value='parameter';f.elements.parameter.value='MinimumFeeRate';f.elements.parameter_value.value=value;f.elements.support.value=amounts.exactInput('1');await h.get('proposal-parameter').fire('change');await f.fire('input');await h.timersDue();await f.requestSubmit();eq(h.wallet.at(-1).operation.Propose.proposal.Parameter,{parameter:'MinimumFeeRate',old:2,new:Number(value)});
   }
  }
  {

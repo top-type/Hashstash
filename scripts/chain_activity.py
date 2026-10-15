@@ -27,7 +27,6 @@ from activity_plan import (cash_guard, common_cash, full_cash_governance, world_
                            CAMPAIGN_COORDINATOR, CAMPAIGN_RECIPIENT, campaign_proposal, campaign_ready, proposal_description)
 
 MAX_RESPONSE = 4 * 1024 * 1024
-MAX_RECORD_BYTES = 32 * 1024 * 1024
 
 
 class Pause(Exception):
@@ -153,11 +152,12 @@ def make_body(chain, sender, nonce, fee, expiry, operation, data_hex=''):
 
 
 def verified_prepared(envelope, chain, sender, nonce, fee, operation, data_hex, height, expiry_blocks,
-                      max_bytes=MAX_RECORD_BYTES):
+                      max_bytes=None):
     if envelope.get('format') != 'hashstash-unsigned-v1':
         raise Fault('unexpected unsigned format')
     raw = bytes.fromhex(envelope.get('body', ''))
-    if not 0 < max_bytes <= MAX_RECORD_BYTES or len(raw) < 70 or len(raw) + 64 > max_bytes:
+    if len(raw) < 70 or (max_bytes is not None and
+                       (type(max_bytes) is not int or max_bytes <= 0 or len(raw) + 64 > max_bytes)):
         raise Fault('invalid unsigned length')
     _, offset = read_u64(raw, 64)
     fee_length, offset = read_u64(raw, offset)
@@ -387,7 +387,7 @@ class Activity:
                     for group in self.c['registry'].values() for entry in group]
         snapshot = self.rpc('snapshot', {'keys': keys})
         status = snapshot['status']
-        if status.get('chain_id') != self.c['chain_id'] or status.get('protocol_version') != 26:
+        if status.get('chain_id') != self.c['chain_id'] or status.get('protocol_version') != 27:
             raise Fault('activity is pinned to another chain or protocol')
         height = int(status['height'])
         if self.observed_height is not None and height > self.observed_height:

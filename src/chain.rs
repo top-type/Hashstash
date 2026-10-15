@@ -106,6 +106,7 @@ pub struct Chain {
     invalid_blocks: BTreeMap<Hash, String>,
     invalid_order: VecDeque<(Hash, Instant)>,
     replay_budget: Cell<Option<usize>>,
+    known_block_bytes: Cell<u64>,
 }
 impl Chain {
     pub fn open(path: &Path, config: Config) -> Result<Self> {
@@ -191,6 +192,7 @@ impl Chain {
             invalid_blocks: BTreeMap::new(),
             invalid_order: VecDeque::new(),
             replay_budget: Cell::new(None),
+            known_block_bytes: Cell::new(state.settings.block_bytes),
         };
         chain.cache_entry(genesis_hash, genesis_entry);
         chain.cache_state(genesis_hash, state);
@@ -205,7 +207,7 @@ impl Chain {
                 break;
             };
             sequence = seq;
-            let block: Block = codec::decode_block(&bytes, chain.config.max_block_record_bytes())?;
+            let block: Block = codec::decode_block(&bytes, bytes.len())?;
             let hash = codec::block_hash(&block);
             ensure!(raw_hash == hash, "stored block hash mismatch");
             let (entry, state) = chain
@@ -372,11 +374,14 @@ impl Chain {
                 |r| r.get(0),
             )
             .optional()?;
-        bytes
-            .map(|b| codec::decode_block(&b, self.config.max_block_record_bytes()))
-            .transpose()
+        bytes.map(|b| codec::decode_block(&b, b.len())).transpose()
+    }
+    pub fn max_known_block_bytes(&self) -> u64 {
+        self.known_block_bytes.get()
     }
     fn cache_state(&self, hash: Hash, state: Arc<State>) {
+        self.known_block_bytes
+            .set(self.known_block_bytes.get().max(state.settings.block_bytes));
         let mut cache = self.cache.borrow_mut();
         if cache.states.contains_key(&hash) {
             return;
@@ -478,7 +483,7 @@ impl Chain {
             .and_then(|bytes| bytes.as_slice().try_into().ok())
     }
     fn median(&self, parent: Hash) -> Result<u32> {
-        let mut times = Vec::with_capacity(self.config.timestamp_window);
+        let mut times = Vec::new();
         let mut hash = parent;
         for _ in 0..self.config.timestamp_window {
             let e = self.load_entry(&hash)?.context("median ancestor absent")?;
@@ -609,10 +614,6 @@ impl Chain {
             return Ok(false);
         }
         let bytes = codec::encode(&block);
-        ensure!(
-            bytes.len() <= self.config.max_block_record_bytes(),
-            "serialized block too large"
-        );
         // A header digest alone cannot identify an invalid body: a peer may send
         // another payload carrying the same valid header. Hash the whole record.
         let identity = crypto::sha256d(&bytes);
@@ -702,10 +703,6 @@ impl Chain {
         ensure!(
             codec::body_size(&block)? as u64 <= self.tip_state.settings.block_bytes,
             "block body exceeds byte limit"
-        );
-        ensure!(
-            codec::encode(&block).len() <= self.config.max_block_record_bytes(),
-            "serialized block too large"
         );
         Ok(block)
     }

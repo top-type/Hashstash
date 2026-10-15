@@ -100,7 +100,7 @@ def main():
         cli('init', '--config', config)
         configuration = json.loads(config.read_text(encoding='utf-8'))
         configuration['network'] = 'wallet-cli-' + uuid.uuid4().hex
-        assert configuration['protocol_version'] == 26
+        assert configuration['protocol_version'] == 27
         assert initialized_at <= configuration['genesis_time'] <= int(time.time())
         assert configuration['initial']['interval'] == 15
         assert set(configuration['initial']) == {'block_bytes', 'minimum_fee_rate', 'interval', 'lead', 'rest', 'duration', 'miner_fee_percent', 'pass_margin_bps'}
@@ -116,8 +116,8 @@ def main():
         _, base = start(options.node, run, 'watch', 'RPC: (http://127\\.0\\.0\\.1:\\d+)/rpc')
         cold_process, cold_base = start(options.cold, ['--port', '0'], 'cold', 'cold signer: (http://127\\.0\\.0\\.1:\\d+)/')
         status = rpc(base, 'status')
-        assert status['protocol_version'] == 26 and status['time_unit'] == 'seconds'
-        check('Default CLI creates a v26 canonical-only timestamp DAA network with scheduled-second phase progress')
+        assert status['protocol_version'] == 27 and status['time_unit'] == 'seconds'
+        check('Default CLI creates a v27 canonical-only timestamp DAA network with scheduled-second phase progress')
         _, session = request(base, '/api/session')
         assert session['wallet_mode'] == 'watch' and session['wallet_enabled'] is False
         assert session['public_key'] == vector['public_key']

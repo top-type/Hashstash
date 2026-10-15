@@ -21,7 +21,7 @@ class PlannerTest(unittest.TestCase):
                        "last_action_height": 1, "last_chat_at": 900,
                        "history": [], "cursor": 0}
         self.snapshot = {
-            "status": {"chain_id": CHAIN, "protocol_version": 26, "height": 100, "clock": 1500,
+            "status": {"chain_id": CHAIN, "protocol_version": 27, "height": 100, "clock": 1500,
                        "phase": "rest", "decision": None, "auction_round": None,
                        "settings": {"interval": 15}},
             "governance": {"world": {"reserve": str(10**18), "grant_capacity": str(10**17)}},
@@ -158,19 +158,19 @@ class PlannerTest(unittest.TestCase):
         self.assertIsNotNone(self.choose())
         self.full_cash_governance(substantive=True)
         self.snapshot["status"]["protocol_version"] = version
-        self.snapshot["status"]["settings"] = {"interval": 30}
+        self.snapshot["status"]["settings"] = {"interval": 137}
         self.accounts[1]["pending"] = self.accounts[2]["pending"] = True
         action = self.choose()
         self.assertEqual(action["strategy_leg"], "trim_unfavored")
         for kind in ("Unknown", "NotAnOperation"):
             self.assertEqual(planner.cash_guard(self.snapshot, self.accounts[0], {kind: {}}, 1),
                              "unsupported_activity_operation")
-        for unsupported in (25, 27):
+        for unsupported in (26, 28):
             self.snapshot["status"]["protocol_version"] = unsupported
             self.assertIsNone(self.choose())
 
     def test_current_timestamp_chain_preserves_outcome_rules(self):
-        self.check_timestamp_chain_outcomes(26)
+        self.check_timestamp_chain_outcomes(27)
 
 
     def test_fee_cap_and_no_spending_last_fee_reserve(self):
@@ -560,7 +560,7 @@ class PlannerTest(unittest.TestCase):
             self.substantive_governance()
         else:
             self.phase("governance")
-        self.snapshot["status"]["protocol_version"] = 26
+        self.snapshot["status"]["protocol_version"] = 27
 
     def confirm_full_cash(self, action):
         actor = self.accounts[action["sender_index"]]
@@ -591,7 +591,7 @@ class PlannerTest(unittest.TestCase):
 
     def test_current_trade_policy_pays_full_fee_and_does_not_govern_fee_parameter(self):
         self.full_cash_governance(substantive=True)
-        self.snapshot['status']['protocol_version'] = 26
+        self.snapshot['status']['protocol_version'] = 27
         self.accounts[1]['pending'] = self.accounts[2]['pending'] = True
         rpc = self.rpc
         for percent in (0, 37, 100):

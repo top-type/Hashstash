@@ -43,7 +43,7 @@ async function run() {
   equal(h.get('timing-auction').textContent, '1m 1s lead · 1m 31s limit');
   equal(h.get('gov-countdown').textContent, '4 blocks', 'ceil division handles policy durations not divisible by the interval');
   const form = h.get('propose-form');
-  form.elements.type.value = 'parameter'; form.elements.parameter.value = 'Duration'; form.elements.direction.value = 'double';
+  form.elements.type.value = 'parameter'; form.elements.parameter.value = 'Duration'; form.elements.parameter_value.value = '1200';
   await h.get('proposal-parameter').fire('change');
   equal(h.get('parameter-preview').textContent, '10m 0s → 20m 0s');
   form.elements.parameter.value = 'Interval'; form.elements.parameter_value.value = '15';

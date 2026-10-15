@@ -3,11 +3,9 @@ use anyhow::{Context, Result, ensure};
 use num_traits::{One, Zero};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 26;
-pub const MAX_INTERVAL_SECONDS: u64 = 60;
-pub const MAX_BLOCK_RECORD_BYTES: usize = 32 * 1024 * 1024;
-/// Leave room for an ordinary account write and the canonical miner.
-pub const MIN_GOVERNED_BLOCK_BYTES: u64 = 2 * crate::fees::ACCOUNT_WEIGHT;
+pub const PROTOCOL_VERSION: u32 = 27;
+/// An empty block must be able to create its miner account.
+pub const MIN_GOVERNED_BLOCK_BYTES: u64 = crate::fees::ACCOUNT_WEIGHT;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,10 +81,10 @@ pub struct Config {
     pub auction_timeout: u64,
     #[serde(with = "amount")]
     pub reserve_min: Amount,
-    /// A proper positive fraction limits each grant; exactly 0/0 disables this cap.
+    /// A nonnegative ratio limits each grant; exactly 0/0 disables this cap.
     pub grant_numerator: u64,
     pub grant_denominator: u64,
-    /// A proper positive fraction limits each epoch; exactly 0/0 disables this cap.
+    /// A nonnegative ratio limits each epoch; exactly 0/0 disables this cap.
     pub budget_numerator: u64,
     pub budget_denominator: u64,
     pub budget_period: u64,
@@ -97,7 +95,7 @@ impl Config {
     pub fn devnet() -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
-            network: "hashstash-devnet-v26".into(),
+            network: "hashstash-devnet-v27".into(),
             genesis_time: 1_770_000_000,
             initial_bits: 0x207fffff,
             limit_bits: 0x207fffff,
@@ -113,10 +111,10 @@ impl Config {
             share_scale: Amount::from(10u32).pow(18),
             auction_timeout: 128 * 15,
             reserve_min: 100u32.into(),
-            grant_numerator: 1,
-            grant_denominator: 10,
-            budget_numerator: 1,
-            budget_denominator: 4,
+            grant_numerator: 0,
+            grant_denominator: 0,
+            budget_numerator: 0,
+            budget_denominator: 0,
             budget_period: 2048 * 15,
             initial: Settings {
                 block_bytes: 16_384,
@@ -132,7 +130,7 @@ impl Config {
     }
     pub fn testnet() -> Self {
         let mut config = Self::devnet();
-        config.network = "hashstash-testnet-v26".into();
+        config.network = "hashstash-testnet-v27".into();
         config.auction_timeout = 32 * 15;
         config.reserve_min = 20u32.into();
         config.budget_period = 128 * 15;
@@ -142,7 +140,7 @@ impl Config {
     }
     pub fn slow_testnet() -> Self {
         let mut config = Self::testnet();
-        config.network = "hashstash-slow-testnet-v26".into();
+        config.network = "hashstash-slow-testnet-v27".into();
         config.auction_timeout = 240 * 15;
         config.budget_period = 5760 * 15;
         config.initial.lead = 20 * 15;
@@ -170,15 +168,13 @@ impl Config {
         Ok(())
     }
     pub fn valid_block_bytes(&self, bytes: u64) -> bool {
-        (MIN_GOVERNED_BLOCK_BYTES..=MAX_BLOCK_RECORD_BYTES as u64).contains(&bytes)
-    }
-    pub fn max_block_record_bytes(&self) -> usize {
-        MAX_BLOCK_RECORD_BYTES
+        bytes >= MIN_GOVERNED_BLOCK_BYTES
+            && usize::try_from(bytes).is_ok_and(|value| value <= isize::MAX as usize)
     }
     /// A transaction may occupy the current block capacity. Its weighted work
     /// and the complete block body's framing are checked separately at admission.
     pub fn transaction_bytes(&self, settings: &Settings) -> usize {
-        settings.block_bytes.min(MAX_BLOCK_RECORD_BYTES as u64) as usize
+        usize::try_from(settings.block_bytes).expect("validated block capacity fits this platform")
     }
     pub fn auction_timeout_for(&self, settings: &Settings) -> Result<u64> {
         Ok(self.auction_timeout.max(
@@ -191,41 +187,46 @@ impl Config {
     pub fn validate_governance_settings(&self, settings: &Settings) -> Result<()> {
         self.validate_fee_percent(settings)?;
         ensure!(
-            settings.minimum_fee_rate >= 1,
-            "minimum fee rate must be positive"
-        );
-        ensure!(
-            (1..=MAX_INTERVAL_SECONDS).contains(&settings.interval),
-            "target block interval must be 1..60 seconds"
+            settings.interval > 0,
+            "target block interval must be positive"
         );
         ensure!(settings.pass_margin_bps.is_some(), "missing PASS margin");
         ensure!(
             self.valid_block_bytes(settings.block_bytes),
             "block capacity cannot cover mandatory account creation or fit this implementation"
         );
+        ensure!(settings.duration > 0, "decision duration must be positive");
+        self.auction_timeout_for(settings)?;
+        Ok(())
+    }
+    /// Validate a new schedule where it can actually begin, not against an
+    /// invented lifetime upper bound on the governed block interval.
+    pub fn validate_governance_settings_at(&self, settings: &Settings, clock: u64) -> Result<()> {
+        self.validate_governance_settings(settings)?;
         for duration in [
-            settings.lead,
-            settings.rest,
+            settings.interval,
             settings.duration,
+            settings.rest,
             self.auction_timeout_for(settings)?,
         ] {
-            ensure!(
-                duration > 0
-                    && self
-                        .max_height
-                        .checked_mul(MAX_INTERVAL_SECONDS)
-                        .and_then(|clock| clock.checked_add(duration))
-                        .is_some(),
-                "phase duration must be positive with a representable deadline"
-            );
+            clock
+                .checked_add(duration)
+                .context("schedule deadline overflow")?;
         }
-        // The opening block creates the two worlds after its transactions.
-        // At least one later block must accept outcome trades before resolution.
-        ensure!(
-            settings.duration > settings.interval,
-            "decision duration must exceed the target block interval"
-        );
         Ok(())
+    }
+    pub fn parameter_change_at(
+        &self,
+        settings: &Settings,
+        p: Parameter,
+        old: u64,
+        new: u64,
+        clock: u64,
+    ) -> Result<()> {
+        self.parameter_change(settings, p, old, new)?;
+        let mut changed = settings.clone();
+        changed.set(p, new);
+        self.validate_governance_settings_at(&changed, clock)
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
@@ -241,45 +242,38 @@ impl Config {
             "invalid network name"
         );
         ensure!(
-            (11..=1001).contains(&self.timestamp_window) && self.timestamp_window % 2 == 1,
-            "timestamp window must be odd and in 11..1001"
+            self.timestamp_window > 0,
+            "timestamp window must be positive"
         );
         ensure!(
-            (900..=i64::MAX as u64).contains(&self.daa_half_life),
-            "difficulty half life must be at least 900 seconds"
-        );
-        ensure!(
-            self.future_seconds <= 120,
-            "timestamp future allowance exceeds 120 seconds"
+            self.daa_half_life > 0,
+            "difficulty half life must be positive"
         );
         let limit = math::target_from_bits(self.limit_bits)?;
         let initial = math::target_from_bits(self.initial_bits)?;
         ensure!(initial <= limit, "initial target exceeds limit");
         ensure!(
-            self.max_height > 0 && self.max_height <= u32::MAX as u64,
+            self.max_height > 0 && self.max_height <= i64::MAX as u64,
             "invalid height range"
         );
         ensure!(
-            self.money_bits >= 320
+            self.money_bits > 0
                 && self.money_bits <= 512
                 && self.share_bits > 0
                 && self.share_bits <= 512,
             "unsupported numeric ranges"
         );
         ensure!(
-            self.max_integer_bits >= self.money_bits && self.max_integer_bits <= 65536,
+            self.max_integer_bits >= self.money_bits,
             "invalid intermediate range"
         );
         ensure!(
             self.money_bits + 64 <= self.max_integer_bits,
             "monetary products exceed intermediate range"
         );
+        ensure!(!self.quote_scale.is_zero(), "invalid quote precision");
         ensure!(
-            !self.quote_scale.is_zero() && self.quote_scale.bits() <= 256,
-            "invalid quote precision"
-        );
-        ensure!(
-            !self.reserve_min.is_zero() && self.reserve_min.bits() <= self.money_bits,
+            self.reserve_min.bits() <= self.money_bits,
             "invalid minimum governance reserve"
         );
         for (n, d) in [
@@ -287,33 +281,13 @@ impl Config {
             (self.budget_numerator, self.budget_denominator),
         ] {
             ensure!(
-                (n == 0 && d == 0) || (n > 0 && n < d),
-                "fraction must be in (0,1), or exactly 0/0 to disable its cap"
+                (n == 0 && d == 0) || d > 0,
+                "ratio denominator must be positive, or exactly 0/0 to disable its cap"
             );
         }
-        self.validate_governance_settings(&self.initial)?;
-        ensure!(
-            self.max_signatures > 0 && self.max_signatures <= 100_000,
-            "invalid signature limit"
-        );
-        ensure!(self.auction_timeout > 0, "zero auction timeout");
-        ensure!(
-            self.budget_period > 1,
-            "budget period must exceed one second"
-        );
-        let max_clock = self
-            .max_height
-            .checked_mul(MAX_INTERVAL_SECONDS)
-            .context("maximum nominal clock overflow")?;
-        let max_offset = self
-            .auction_timeout_for(&self.initial)?
-            .max(self.initial.duration)
-            .max(self.initial.rest)
-            .max(self.budget_period);
-        ensure!(
-            max_clock.checked_add(max_offset).is_some(),
-            "deadline overflow"
-        );
+        self.validate_governance_settings_at(&self.initial, 0)?;
+        ensure!(self.budget_period > 0, "budget period must be positive");
+        let max_clock = u64::MAX;
         let max_issued = Amount::from(self.max_height) * (Amount::one() << 255usize);
         ensure!(
             max_issued.bits() <= self.money_bits,
@@ -371,19 +345,6 @@ impl Config {
     ) -> Result<()> {
         ensure!(old == settings.get(p), "stale parameter proposal");
         ensure!(new != old, "parameter must change");
-        if matches!(
-            p,
-            Parameter::BlockBytes
-                | Parameter::Lead
-                | Parameter::Rest
-                | Parameter::Duration
-                | Parameter::MinimumFeeRate
-        ) {
-            ensure!(
-                old.checked_mul(2) == Some(new) || new.checked_mul(2) == Some(old),
-                "parameter must halve or double"
-            );
-        }
         let mut changed = settings.clone();
         changed.set(p, new);
         self.validate_governance_settings(&changed)
@@ -395,14 +356,15 @@ mod capacity_tests {
     use super::*;
 
     #[test]
-    fn grant_caps_accept_only_proper_fractions_or_explicit_zero_pairs() {
+    fn grant_caps_accept_nonnegative_ratios_or_explicit_zero_pairs() {
         for budget in [false, true] {
             for (n, d, valid) in [
                 (0, 0, true),
-                (0, 1, false),
+                (0, 1, true),
                 (1, 0, false),
-                (1, 1, false),
-                (2, 1, false),
+                (1, 1, true),
+                (2, 1, true),
+                (u64::MAX, 1, true),
                 (1, 10, true),
                 (u64::MAX - 1, u64::MAX, true),
             ] {
@@ -420,7 +382,7 @@ mod capacity_tests {
                     let decoded: Config = codec::decode(&bytes, bytes.len()).unwrap();
                     assert_eq!(decoded, c);
                     assert_eq!(decoded.chain_id(), c.chain_id());
-                    if n == 0 {
+                    if n != 0 {
                         assert_ne!(c.chain_id(), Config::testnet().chain_id());
                     }
                 }
@@ -429,22 +391,24 @@ mod capacity_tests {
     }
 
     #[test]
-    fn transaction_capacity_tracks_governed_block_capacity_within_record_ceiling() {
+    fn transaction_capacity_tracks_governed_capacity_without_transport_policy() {
         let c = Config::devnet();
         let mut settings = c.initial.clone();
         for bytes in [
             MIN_GOVERNED_BLOCK_BYTES,
+            1_025,
             16_384,
             65_536,
-            MAX_BLOCK_RECORD_BYTES as u64,
+            64 * 1024 * 1024,
+            isize::MAX as u64,
         ] {
             settings.block_bytes = bytes;
             c.validate_governance_settings(&settings).unwrap();
             assert_eq!(c.transaction_bytes(&settings), bytes as usize);
         }
-        settings.block_bytes = MAX_BLOCK_RECORD_BYTES as u64 + 1;
-        assert!(c.validate_governance_settings(&settings).is_err());
-        assert_eq!(c.transaction_bytes(&settings), MAX_BLOCK_RECORD_BYTES);
-        assert_eq!(c.max_block_record_bytes(), MAX_BLOCK_RECORD_BYTES);
+        for bytes in [0, MIN_GOVERNED_BLOCK_BYTES - 1, u64::MAX] {
+            settings.block_bytes = bytes;
+            assert!(c.validate_governance_settings(&settings).is_err());
+        }
     }
 }

@@ -109,6 +109,6 @@ fn wallet_rejects_removed_operation_tags_and_oversized_fields() {
     let mut candidate = body(vec![0, 255]);
     candidate.fee = Amount::from(1u32) << 512usize;
     assert!(wallet::decode_unsigned(&wallet::unsigned(&candidate)).is_err());
-    candidate = body(vec![0; wallet::MAX_RAW_TRANSACTION_BYTES]);
-    assert!(wallet::decode_unsigned(&wallet::unsigned(&candidate)).is_err());
+    candidate = body(vec![0; 32 * 1024 * 1024 + 1]);
+    assert!(wallet::decode_unsigned(&wallet::unsigned(&candidate)).is_ok());
 }

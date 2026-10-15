@@ -45,10 +45,6 @@ impl<'a> PreparedTransaction<'a> {
                 !payments.is_empty(),
                 "grant must have at least one recipient"
             );
-            ensure!(
-                payments.len() <= grant_payment_capacity(),
-                "grant settlement exceeds block capacity"
-            );
         }
         let encoded_len = codec::encode(transaction).len();
         ensure!(encoded_len <= max_bytes, "transaction exceeds byte limit");
@@ -99,10 +95,6 @@ impl<'a> PreparedTransaction<'a> {
             .checked_add(if creates_account { ACCOUNT_WEIGHT } else { 0 })
             .and_then(|n| n.checked_add(grant_weight))
             .ok_or_else(|| anyhow::anyhow!("transaction weight overflow"))?;
-        ensure!(
-            s.settings.minimum_fee_rate >= 1,
-            "minimum fee rate must be positive"
-        );
         let rate = Amount::from(s.settings.minimum_fee_rate);
         let minimum_fee = (Amount::from(weight) * &rate + Amount::from(FEE_SCALE - 1)) / FEE_SCALE;
         c.check_amount(&minimum_fee)?;

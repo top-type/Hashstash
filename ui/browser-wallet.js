@@ -7,8 +7,7 @@
 })(globalThis, function (root, noble, addresses) {
   'use strict';
   if (!noble || !addresses) throw new Error('Wallet cryptography is unavailable.');
-  const MAX_RAW = 32 * 1024 * 1024, MAX_U64 = (1n << 64n) - 1n, MAX_AMOUNT = (1n << 512n) - 1n;
-  const GRANT_PAYMENT_MIN_WEIGHT = 32 + 2 + 1024;
+  const MAX_U64 = (1n << 64n) - 1n, MAX_AMOUNT = (1n << 512n) - 1n;
   const operations = ['TransferExact','Deposit','Redeem','Propose','Support','Refund'];
   const parameters = ['BlockBytes','Interval','Lead','Rest','Duration','MinerFeePercent','PassMarginBps','MinimumFeeRate'];
   const utf8 = new TextEncoder();
@@ -19,7 +18,7 @@
     return parts.join('');
   };
   function fromHex(value, size, label = 'Hexadecimal value') {
-    if (typeof value !== 'string' || value.length > MAX_RAW * 2 || value.length % 2 || (size !== undefined && value.length !== size * 2) || !/^[0-9a-f]*$/i.test(value)) fail(`${label} is invalid.`);
+    if (typeof value !== 'string' || value.length % 2 || (size !== undefined && value.length !== size * 2) || !/^[0-9a-f]*$/i.test(value)) fail(`${label} is invalid.`);
     const bytes = new Uint8Array(value.length / 2);
     for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(value.slice(i * 2, i * 2 + 2), 16);
     return bytes;
@@ -59,7 +58,7 @@
   }
   class Writer {
     constructor() { this.parts = []; this.length = 0; }
-    raw(v) { if (v.length > MAX_RAW - this.length) fail('Transaction is too large.'); this.parts.push(v instanceof Uint8Array ? v : Uint8Array.from(v)); this.length += v.length; }
+    raw(v) { if (!Number.isSafeInteger(this.length + v.length)) fail('Transaction exceeds browser representation.'); this.parts.push(v instanceof Uint8Array ? v : Uint8Array.from(v)); this.length += v.length; }
     int(v, size) { v = BigInt(v); const bytes = new Uint8Array(size); for (let i = 0; i < size; i++) { bytes[i] = Number(v & 255n); v >>= 8n; } this.raw(bytes); }
     uint(v) {
       v = u64(v);
@@ -88,7 +87,7 @@
       if (value > max) fail('Integer is too large.');
       return value;
     }
-    vector(max = MAX_RAW) { const n = this.uint(); if (n > BigInt(max)) fail('Transaction field is too large.'); return this.raw(Number(n)); }
+    vector(max = this.data.length - this.offset) { const n = this.uint(); if (n > BigInt(max)) fail('Transaction field is too large.'); return this.raw(Number(n)); }
     amount() { const b = this.vector(64); if (b.length && b[b.length - 1] === 0) fail('Noncanonical amount.'); let v = 0n; for (let i = b.length - 1; i >= 0; i--) v = (v << 8n) | BigInt(b[i]); return String(v); }
     hash(key = false) { const b = this.raw(32); if (key) publicBytes(b); return hex(b); }
     option(read) { const tag = this.int(1); if (tag === 0n) return null; if (tag !== 1n) fail('Invalid optional field.'); return read(); }
@@ -123,7 +122,6 @@
       // Even an invalid zero amount needs its length byte after the 32-byte key.
       // Bound the allocation by the actual input before decoding any recipients.
       if (count > BigInt(Math.floor((r.data.length - r.offset) / 33))) fail('Truncated grant payments.');
-      if (count > BigInt(Math.floor(MAX_RAW / GRANT_PAYMENT_MIN_WEIGHT))) fail('Grant exceeds the block capacity.');
       const payments = Array.from({length:Number(count)},()=>({recipient:r.hash(true),amount:r.amount()}));
       validatePayments(payments); return {Grant:{payments}};
     }
@@ -133,9 +131,6 @@
   }
   function validatePayments(payments) {
     if (!Array.isArray(payments) || payments.length < 1) fail('Grant needs at least one payment.');
-    // Each positive payment needs at least 34 encoded bytes plus its prepaid
-    // execution weight. Reject impossible records before checking their keys.
-    if (payments.length > Math.floor(MAX_RAW / GRANT_PAYMENT_MIN_WEIGHT)) fail('Grant exceeds the block capacity.');
     let previous = '', total = 0n;
     for (const payment of payments) {
       fields(payment, ['recipient','amount'], 'Grant payment'); const recipient = hex(publicBytes(payment.recipient)), value = amount(payment.amount);
@@ -185,24 +180,24 @@
     return decoded;
   }
   function decodeUnsigned(envelope) {
-    if (!envelope || envelope.format !== 'hashstash-unsigned-v1' || typeof envelope.body !== 'string' || !envelope.body.length || envelope.body.length > (MAX_RAW - 64) * 2) fail('Invalid unsigned transaction.');
+    if (!envelope || envelope.format !== 'hashstash-unsigned-v1' || typeof envelope.body !== 'string' || !envelope.body.length) fail('Invalid unsigned transaction.');
     return decodeBody(fromHex(envelope.body));
   }
   function expectedBytes(expected) {
     if (!expected || typeof expected !== 'object') fail('Transaction intent is required.');
     const version = Number(u64(expected.protocol_version, 'Protocol version'));
-    if (version !== 26) fail('Unsupported protocol version.');
+    if (version !== 27) fail('Unsupported protocol version.');
     const nonce = u64(expected.nonce, 'Nonce'), expiry = u64(expected.expiry_height, 'Expiry height');
     if (nonce === MAX_U64 || !expiry) fail('Invalid nonce or expiry height.');
     if (expected.current_height !== undefined && expiry <= u64(expected.current_height)) fail('Transaction has expired.');
     const parameter = expected.operation?.Propose?.proposal?.Parameter;
     if (parameter?.parameter === 'MinerFeePercent' && (u64(parameter.old) > 100n || u64(parameter.new) > 100n)) fail('Miner fee share must be from 0 to 100 percent.');
-    if (parameter?.parameter === 'Interval' && (u64(parameter.new) < 1n || u64(parameter.new) > 60n)) fail('Target block time must be from 1 to 60 seconds.');
-    if (parameter?.parameter === 'MinimumFeeRate' && (!u64(parameter.old) || !u64(parameter.new) || !(u64(parameter.new) === u64(parameter.old) * 2n || u64(parameter.new) * 2n === u64(parameter.old)))) fail('Minimum fee rate must halve or double and stay positive.');
+    if (parameter && ['Interval','Duration','BlockBytes'].includes(parameter.parameter) && (!u64(parameter.old) || !u64(parameter.new))) fail('This setting must be positive.');
+    if (parameter?.parameter === 'BlockBytes' && (u64(parameter.old) < 1024n || u64(parameter.new) < 1024n)) fail('Block capacity must cover the miner account’s 1,024 weight.');
     const op = encodeOperation(expected.operation), data = fromHex(expected.data_hex ?? '', undefined, 'Transaction data');
     const fee = amount(expected.fee);
     const w = new Writer(); w.hash(expected.chain_id); w.hash(expected.sender,true); w.uint(nonce); w.amount(fee); w.uint(expiry); w.raw(op); w.vector(data);
-    const bytes = w.finish(); if (bytes.length + 64 > MAX_RAW) fail('Signed transaction is too large.'); return bytes;
+    return w.finish();
   }
   function verifyUnsigned(envelope, expected) {
     const decoded = decodeUnsigned(envelope), bytes = expectedBytes(expected);

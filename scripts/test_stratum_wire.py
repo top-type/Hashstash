@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Independent stdlib Stratum worker against the packaged Hashstash executable.
 
-Runs only its own temporary v26 network on ephemeral loopback ports. Header,
+Runs only its own temporary v27 network on ephemeral loopback ports. Header,
 coinbase, transaction-commitment, and SHA256d calculations are Python code; no
 node template/hash/mining RPC is used. The CLI signs one transfer using the
 publicly known secp256k1 scalar-one test fixture. Never fund that test key.
@@ -55,7 +55,7 @@ def share_target(difficulty):
 
 
 def compact_uint(value):
-    """Independent bincode 1 unsigned varint encoder for protocol 26."""
+    """Independent bincode 1 unsigned varint encoder for protocol 27."""
     check(type(value) is int and 0 <= value < 1 << 64, "bounded unsigned wire integer")
     if value <= 250:
         return bytes([value])
@@ -263,14 +263,14 @@ def run(executable):
               "status": "running", "method": "independent Python standard-library Stratum V1 client",
               "executable_version": cli(executable, "--version"),
               "executable_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
-              "scope": "isolated ephemeral localhost v26 network; no physical ASIC or external rental tested"}
+              "scope": "isolated ephemeral localhost v27 network; no physical ASIC or external rental tested"}
     with tempfile.TemporaryDirectory(prefix="hashstash-stratum-wire-") as directory:
         temporary = Path(directory)
         config = json.loads((ROOT / "config" / "devnet.json").read_text(encoding="utf-8"))
         config["network"] = "stratum-wire-" + uuid.uuid4().hex
         config["genesis_time"] = int(time.time()) - 1
         config["initial_bits"] = config["limit_bits"] = 0x1F0FFFFF
-        check(config["protocol_version"] == 26, "test runs current protocol v26")
+        check(config["protocol_version"] == 27, "test runs current protocol v27")
         config_path, key_path = temporary / "network.json", temporary / "public-test-fixture.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")
         # Scalar one is a published, non-secret fixture; it never leaves this temporary test network.

@@ -10,7 +10,7 @@ config=$(realpath -e -- "$3")
 [[ "$expected" =~ ^[0-9a-f]{64}$ && -f "$binary" && -x "$binary" ]] || fail 'invalid binary or checksum'
 actual=$(sha256sum -- "$binary"); actual=${actual%% *}
 [[ "$actual" == "$expected" ]] || fail 'binary checksum differs'
-[[ $("$binary" --version) == 'hashstash-mixer 0.36.0' ]] || fail 'unexpected mixer version'
+[[ $("$binary" --version) == 'hashstash-mixer 0.37.0' ]] || fail 'unexpected mixer version'
 "$binary" check-config --config "$config"
 if [[ ${4:-} == --check ]]; then printf '%s\n' 'Mixer input validation passed; no changes made.'; exit 0; fi
 (( EUID == 0 )) || fail 'requires root; --check is read-only'

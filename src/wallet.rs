@@ -6,7 +6,6 @@ use zeroize::Zeroizing;
 
 pub const UNSIGNED_FORMAT: &str = "hashstash-unsigned-v1";
 pub const PASSPHRASE_SCHEME: &str = "hashstash-passphrase-v1";
-pub const MAX_RAW_TRANSACTION_BYTES: usize = crate::config::MAX_BLOCK_RECORD_BYTES;
 pub const MAX_PASSPHRASE_BYTES: usize = 4096;
 
 /// Exact UTF-8, followed by a little-endian u32 retry counter, starting at zero.
@@ -45,7 +44,7 @@ pub fn unsigned(body: &TransactionBody) -> UnsignedEnvelope {
 
 fn validate_raw_length(hex_bytes: usize) -> Result<()> {
     ensure!(
-        hex_bytes > 0 && hex_bytes <= MAX_RAW_TRANSACTION_BYTES * 2,
+        hex_bytes > 0 && hex_bytes <= isize::MAX as usize,
         "transaction length is invalid"
     );
     ensure!(
@@ -57,8 +56,10 @@ fn validate_raw_length(hex_bytes: usize) -> Result<()> {
 
 fn validate_unsigned_length(bytes: usize) -> Result<()> {
     ensure!(
-        bytes <= MAX_RAW_TRANSACTION_BYTES - 64,
-        "signed transaction exceeds byte limit"
+        bytes
+            .checked_add(64)
+            .is_some_and(|signed| signed <= isize::MAX as usize),
+        "signed transaction length is not representable"
     );
     Ok(())
 }
@@ -75,10 +76,10 @@ pub fn decode_unsigned(envelope: &UnsignedEnvelope) -> Result<TransactionBody> {
         "unsupported unsigned transaction format"
     );
     let bytes = raw_bytes(&envelope.body)?;
-    // A canonical BIP340 signature is exactly 64 bytes. The
-    // unsigned export must fit the same limit after that suffix is added.
+    // A canonical BIP340 signature adds exactly 64 bytes. Check the actual
+    // allocation boundary; block capacity is evaluated against chain state.
     validate_unsigned_length(bytes.len())?;
-    let body: TransactionBody = codec::decode(&bytes, MAX_RAW_TRANSACTION_BYTES)?;
+    let body: TransactionBody = codec::decode(&bytes, bytes.len())?;
     validate_body(&body)?;
     Ok(body)
 }
@@ -88,7 +89,8 @@ pub fn signed_hex(transaction: &Transaction) -> String {
 }
 
 pub fn decode_signed(raw: &str) -> Result<Transaction> {
-    let transaction: Transaction = codec::decode(&raw_bytes(raw)?, MAX_RAW_TRANSACTION_BYTES)?;
+    let bytes = raw_bytes(raw)?;
+    let transaction: Transaction = codec::decode(&bytes, bytes.len())?;
     validate_body(&transaction.body)?;
     crypto::verify(&transaction)?;
     Ok(transaction)
@@ -173,12 +175,7 @@ fn validate_body(body: &TransactionBody) -> Result<()> {
                 new,
             } = proposal
             {
-                ensure!(
-                    *old >= 1
-                        && *new >= 1
-                        && (old.checked_mul(2) == Some(*new) || new.checked_mul(2) == Some(*old)),
-                    "minimum fee rate must halve or double and remain positive"
-                );
+                ensure!(old != new, "minimum fee rate must change");
             }
             if let Proposal::Parameter {
                 parameter: Parameter::PassMarginBps,
@@ -384,17 +381,12 @@ mod governance_review_tests {
 
     #[test]
     fn raw_record_bounds_reserve_signatures_and_reject_overflow_without_allocation() {
-        assert_eq!(
-            MAX_RAW_TRANSACTION_BYTES,
-            crate::config::MAX_BLOCK_RECORD_BYTES
-        );
-        assert!(validate_raw_length(MAX_RAW_TRANSACTION_BYTES * 2).is_ok());
-        assert!(validate_raw_length((MAX_RAW_TRANSACTION_BYTES + 1) * 2).is_err());
+        assert!(validate_raw_length(128 * 1024 * 1024).is_ok());
         assert!(validate_raw_length(usize::MAX).is_err());
         assert!(validate_raw_length(0).is_err());
         assert!(validate_raw_length(3).is_err());
-        assert!(validate_unsigned_length(MAX_RAW_TRANSACTION_BYTES - 64).is_ok());
-        assert!(validate_unsigned_length(MAX_RAW_TRANSACTION_BYTES - 63).is_err());
+        assert!(validate_unsigned_length(isize::MAX as usize - 64).is_ok());
+        assert!(validate_unsigned_length(isize::MAX as usize - 63).is_err());
         assert!(validate_unsigned_length(usize::MAX).is_err());
     }
 

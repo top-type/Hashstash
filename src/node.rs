@@ -47,11 +47,26 @@ fn mempool_limit(_config: &Config) -> usize {
     MAX_ADAPTIVE_MEMPOOL
 }
 pub const MAX_FRAME: usize = 32 * 1024 * 1024;
-// Hex-encoded signed records plus bounded JSON framing. Admission narrows this
-// further to the current governed capacity before allocating a request body.
-pub const MAX_TRANSACTION_REQUEST_BYTES: usize =
-    2 * crate::config::MAX_BLOCK_RECORD_BYTES + 128 * 1024;
-// Six JSON bytes per binary byte plus framing covers numeric byte arrays.
+// Service pagination target only. It never bounds a canonical record.
+const JSON_PAGE_BYTES: usize = 32 * 1024 * 1024;
+fn transaction_request_bytes(transaction_bytes: usize) -> Result<usize> {
+    // A representable small request remains usable even when governance chose
+    // a capacity whose largest possible hexadecimal envelope cannot fit a Vec.
+    Ok(transaction_bytes
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(128 * 1024))
+        .unwrap_or(isize::MAX as usize)
+        .min(isize::MAX as usize))
+}
+fn admission_frame_bytes(config: &Config, capacity: u64) -> Result<usize> {
+    let peer = peer_wire::Limits::for_capacity(config, capacity).frame_bytes();
+    let bytes = usize::try_from(capacity).unwrap_or(isize::MAX as usize);
+    let http = transaction_request_bytes(bytes)?
+        .saturating_add(16 * 1024)
+        .min(isize::MAX as usize);
+    Ok(peer.max(http))
+}
+// Local response service limit; independent of canonical record validity.
 pub(crate) const MAX_RESPONSE_FRAME: usize = 193 * 1024 * 1024;
 
 /// Bound collection responses before constructing their generic JSON trees.
@@ -66,7 +81,7 @@ impl JsonPage {
     fn new() -> Self {
         Self {
             items: Vec::new(),
-            bytes_left: crate::config::MAX_BLOCK_RECORD_BYTES,
+            bytes_left: JSON_PAGE_BYTES,
             values_left: network_guard::MAX_JSON_VALUES,
         }
     }
@@ -170,30 +185,20 @@ fn mempool_hex_page(pool: &[Transaction], offset: usize, limit: usize) -> Result
     let mut size = 0usize;
     for transaction in pool.iter().skip(offset).take(limit) {
         let bytes = codec::encode(transaction);
-        ensure!(
-            bytes.len() <= crate::config::MAX_BLOCK_RECORD_BYTES,
-            "pending transaction exceeds record capacity"
-        );
-        let row_bytes = bytes.len().saturating_mul(2).saturating_add(128);
-        if !items.is_empty()
-            && size.saturating_add(row_bytes) > crate::config::MAX_BLOCK_RECORD_BYTES
-        {
+        let row_bytes = bytes
+            .len()
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(128))
+            .context("hex record length overflow")?;
+        if !items.is_empty() && size.saturating_add(row_bytes) > JSON_PAGE_BYTES {
             break;
         }
-        // One full-size record remains retrievable without a JSON number for
-        // each data byte. This is below the existing transaction HTTP envelope.
-        ensure!(
-            row_bytes <= MAX_TRANSACTION_REQUEST_BYTES,
-            "hex record exceeds response capacity"
-        );
+        // Return one large record alone, without turning a page target into a
+        // transaction-size limit or silently skipping an accepted record.
         items.push(json!({"txid":hex::encode(crypto::sha256d(&bytes)),"raw":hex::encode(bytes)}));
         size = size.saturating_add(row_bytes);
     }
     Ok(Value::Array(items))
-}
-
-fn peer_frame_limit(config: &Config) -> usize {
-    peer_wire::Limits::from_config(config).frame_bytes()
 }
 
 const MAX_BATCH: usize = peer_wire::MAX_BLOCKS;
@@ -536,9 +541,10 @@ impl Node {
         });
         let published = Arc::new(RwLock::new(Arc::new(ReadView::capture(&inner))));
         let wallets = WalletStore::open(path, inner.chain.chain_id())?;
-        let guard = Arc::new(NetworkGuard::with_frame_limit(peer_frame_limit(
+        let guard = Arc::new(NetworkGuard::with_frame_limit(admission_frame_bytes(
             &inner.chain.config,
-        )));
+            inner.chain.max_known_block_bytes(),
+        )?));
         let explorer_config = inner.chain.config.clone();
         let discovery_path = peer_discovery::path_for(path, inner.chain.chain_id());
         let mut discovery_id = [0; 32];
@@ -636,6 +642,10 @@ impl Node {
         )
     }
     fn publish(&self, inner: &Inner) -> Result<()> {
+        self.guard.allow_frame(admission_frame_bytes(
+            &inner.chain.config,
+            inner.chain.max_known_block_bytes(),
+        )?)?;
         let next = Arc::new(ReadView::capture(inner));
         let mut published = self
             .published
@@ -656,6 +666,29 @@ impl Node {
             .read()
             .map_err(|_| anyhow!("snapshot lock poisoned"))?
             .clone())
+    }
+    fn peer_limits(&self) -> Result<peer_wire::Limits> {
+        let inner = self.locked()?;
+        let limits = peer_wire::Limits::for_capacity(
+            &inner.chain.config,
+            inner.chain.max_known_block_bytes(),
+        );
+        self.guard.allow_frame(admission_frame_bytes(
+            &inner.chain.config,
+            inner.chain.max_known_block_bytes(),
+        )?)?;
+        Ok(limits)
+    }
+    fn peer_exchange_timeout(&self) -> Result<Duration> {
+        let inner = self.locked()?;
+        // A peer may be validating the block we just sent before it answers.
+        // Keep the ordinary deadline, adding one second per governed MiB;
+        // the actual wire representation bounds this allowance as well.
+        let bytes = inner
+            .chain
+            .max_known_block_bytes()
+            .min(peer_wire::MAX_WIRE_PAYLOAD_BYTES as u64);
+        Ok(IO_TIMEOUT + Duration::from_secs(bytes / (1024 * 1024)))
     }
 
     /// Seed a fresh wallet store. A saved runtime selection survives startup flags.
@@ -959,7 +992,7 @@ impl Node {
         }
         out
     }
-    fn blocks_after(chain: &Chain, locator: &[Hash]) -> Result<Vec<Block>> {
+    fn blocks_after(chain: &Chain, locator: &[Hash]) -> Result<(Vec<Block>, peer_wire::Limits)> {
         ensure!(
             !locator.is_empty() && locator.len() <= 128,
             "invalid locator length"
@@ -972,8 +1005,26 @@ impl Node {
             .map(|(_, h)| h)
             .context("no common ancestor")?;
         let mut out = Vec::new();
-        let mut size = 0;
-        let block_budget = chain.config.max_block_record_bytes() + MAX_BATCH * 9;
+        let mut size = 0usize;
+        // The recipient has validated this common ancestor. Stop before a
+        // larger newly governed block so it can first validate the transition
+        // and increase its admission allowance on the next synchronization.
+        let ancestor = chain
+            .hash_at_height(height)
+            .context("common ancestor missing")?;
+        let parent = chain
+            .state_at(&ancestor)
+            .context("common ancestor state missing")?;
+        let limits = peer_wire::Limits::for_capacity(&chain.config, parent.settings.block_bytes);
+        let block_budget = limits
+            .block_bytes
+            .checked_add(MAX_BATCH * 9)
+            .context("peer block batch budget overflow")?
+            .min(
+                limits
+                    .frame_bytes()
+                    .saturating_sub(peer_wire::SYNC_OVERHEAD_BYTES),
+            );
         for h in height + 1..=chain.tip_height() {
             if out.len() >= MAX_BATCH {
                 break;
@@ -981,41 +1032,79 @@ impl Node {
             let b = chain
                 .block(&chain.hash_at_height(h).context("active height missing")?)
                 .context("active block missing")?;
-            let bytes = peer_wire::record_size(codec::encode(&b).len());
-            ensure!(
-                bytes <= block_budget,
-                "block exceeds peer binary batch capacity"
-            );
-            if size + bytes > block_budget {
+            let bytes = peer_wire::record_size(codec::encode(&b).len())?;
+            if bytes > block_budget && out.is_empty() {
+                bail!(
+                    "valid block exceeds local peer wire capacity; import requires a larger transport representation"
+                );
+            }
+            let next_size = size
+                .checked_add(bytes)
+                .context("peer block batch length overflow")?;
+            if next_size > block_budget {
                 break;
             }
-            size += bytes;
+            size = next_size;
             out.push(b);
         }
-        Ok(out)
+        Ok((out, limits))
     }
     fn peer_snapshot(&self, locator: Option<&[Hash]>) -> Result<PeerMessage> {
         let mut i = self.locked()?;
-        let transaction_budget =
-            peer_wire::Limits::from_config(&i.chain.config).transaction_batch_bytes();
-        let mut transaction_bytes = 0;
+        let (blocks, peer_limits) = match locator {
+            Some(l) => Self::blocks_after(&i.chain, l)?,
+            None => (Vec::new(), peer_wire::Limits::from_config(&i.chain.config)),
+        };
+        let blocks_bytes = blocks
+            .iter()
+            .try_fold(0usize, |total, block| -> Result<usize> {
+                total
+                    .checked_add(peer_wire::record_size(codec::encode(block).len())?)
+                    .context("peer block framing length overflow")
+            })?;
+        let transaction_budget = peer_limits.transaction_batch_bytes().min(
+            peer_limits
+                .frame_bytes()
+                .saturating_sub(blocks_bytes)
+                .saturating_sub(peer_wire::SYNC_OVERHEAD_BYTES),
+        );
+        let mut transaction_bytes = 0usize;
         let start = i.relay_cursor.min(i.mempool.len().saturating_sub(1));
-        let transactions = i
+        let mut visited = 0;
+        let mut transactions = Vec::new();
+        // Preserve normal simultaneous block/mempool relay, while postponing
+        // records larger than the recipient's validated admission allowance.
+        for tx in i
             .mempool
             .iter()
             .cycle()
             .skip(start)
             .take(i.mempool.len().min(MAX_MEMPOOL))
-            .take_while(|tx| {
-                transaction_bytes += peer_wire::record_size(codec::encode(tx).len());
-                transaction_bytes <= transaction_budget
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        {
+            let raw_bytes = codec::encode(tx).len();
+            if raw_bytes > peer_limits.transaction_bytes {
+                visited += 1;
+                continue;
+            }
+            let bytes = peer_wire::record_size(raw_bytes)?;
+            let next = transaction_bytes
+                .checked_add(bytes)
+                .context("peer transaction batch length overflow")?;
+            if next > transaction_budget {
+                if transactions.is_empty() {
+                    visited += 1;
+                    continue;
+                }
+                break;
+            }
+            visited += 1;
+            transaction_bytes = next;
+            transactions.push(tx.clone());
+        }
         i.relay_cursor = if i.mempool.is_empty() {
             0
         } else {
-            (start + transactions.len()) % i.mempool.len()
+            (start + visited) % i.mempool.len()
         };
         let active = Self::locator(&i.chain);
         let mut request_locator: Vec<Hash> = i.downloads.iter().copied().collect();
@@ -1031,10 +1120,7 @@ impl Node {
         Ok(PeerMessage {
             chain: i.chain.chain_id(),
             locator: request_locator,
-            blocks: match locator {
-                Some(l) => Self::blocks_after(&i.chain, l)?,
-                None => Vec::new(),
-            },
+            blocks,
             transactions,
         })
     }
@@ -1864,7 +1950,7 @@ async fn bounded_line_buf<R: AsyncBufRead + Unpin>(
         }
         let end = buf.iter().position(|c| *c == b'\n').map(|p| p + 1);
         let take = end.unwrap_or(buf.len());
-        ensure!(out.len() + take <= max, "frame too large");
+        ensure!(take <= max.saturating_sub(out.len()), "frame too large");
         out.extend_from_slice(&buf[..take]);
         r.consume(take);
         if end.is_some() {
@@ -1900,7 +1986,7 @@ async fn write_peer<W: AsyncWrite + Unpin>(
         PeerPacket::Addresses { addresses, .. } => addresses.len().max(1),
     };
     admission.work(work.max(1))?;
-    let limits = peer_wire::Limits::from_config(&node.read_view()?.chain.config);
+    let limits = node.peer_limits()?;
     let permit = timeout(IO_TIMEOUT, node.peer_workers.clone().acquire_owned()).await??;
     let mut channel = auth.take();
     let (bytes, channel) = tokio::task::spawn_blocking(move || -> Result<_> {
@@ -1948,12 +2034,8 @@ async fn parse_value_with_slots(
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         match body_kind {
-            JsonBody::HotWallet => {
-                network_guard::parse_wallet_json(&bytes, wallet::MAX_RAW_TRANSACTION_BYTES * 2)
-            }
-            JsonBody::Rpc => {
-                network_guard::parse_rpc_json(&bytes, wallet::MAX_RAW_TRANSACTION_BYTES * 2)
-            }
+            JsonBody::HotWallet => network_guard::parse_wallet_json(&bytes, bytes.len()),
+            JsonBody::Rpc => network_guard::parse_rpc_json(&bytes, bytes.len()),
             JsonBody::Ordinary => network_guard::parse_json(&bytes),
         }
     })
@@ -1978,22 +2060,27 @@ async fn read_peer_packet_bounded<R: AsyncBufRead + Unpin>(
     bound: Option<usize>,
 ) -> Result<PeerPacket> {
     admission.request()?;
-    let limits = peer_wire::Limits::from_config(&node.read_view()?.chain.config);
+    let limits = node.peer_limits()?;
     let maximum = if acknowledgment {
         peer_wire::ACK_BYTES
     } else {
         bound.unwrap_or_else(|| limits.frame_bytes())
     };
+    let exchange_timeout = if bound.is_some() {
+        IO_TIMEOUT
+    } else {
+        node.peer_exchange_timeout()?
+    };
     let result = if let Some(auth) = auth {
         timeout(
-            IO_TIMEOUT,
+            exchange_timeout,
             auth.read(r, maximum, admission, node.peer_parsers.clone()),
         )
         .await
         .map_err(anyhow::Error::from)
         .and_then(|v| v)
     } else {
-        timeout(IO_TIMEOUT, read_peer_frame(r, maximum, admission))
+        timeout(exchange_timeout, read_peer_frame(r, maximum, admission))
             .await
             .map_err(anyhow::Error::from)
             .and_then(|v| v)
@@ -2421,7 +2508,12 @@ async fn discovery_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
         for peer in candidates {
             let n = node.clone();
             workers.spawn(async move {
-                let result = timeout(Duration::from_secs(75), sync_peer(&n, peer)).await;
+                // Keep the former five-stage overall budget, but grow it with
+                // the same validated capacity as individual exchanges.
+                let Ok(exchange_timeout) = n.peer_exchange_timeout() else {
+                    return (peer, false);
+                };
+                let result = timeout(exchange_timeout.saturating_mul(5), sync_peer(&n, peer)).await;
                 let success = matches!(result, Ok(Ok(())));
                 if success {
                     let query = n
@@ -3074,10 +3166,7 @@ async fn read_http<R: AsyncBufRead + Unpin>(
     ensure!(
         length
             <= if path == "/rpc" || path == "/api/wallet" {
-                transaction_bytes
-                    .saturating_mul(2)
-                    .saturating_add(128 * 1024)
-                    .min(MAX_TRANSACTION_REQUEST_BYTES)
+                transaction_request_bytes(transaction_bytes)?
             } else if public || path == "/api/wallet/manage" {
                 128 * 1024
             } else {
@@ -3530,7 +3619,7 @@ fn rpc_cost(method: &str, params: &Value) -> usize {
     let raw_work = params.get("raw").and_then(Value::as_str).map_or(0, |raw| {
         // A raw grant may carry one key validation per 34 encoded bytes.
         // Ordinary large data pays the same bounded parsing-work allowance.
-        raw.len().min(wallet::MAX_RAW_TRANSACTION_BYTES * 2) / (2 * 34)
+        raw.len() / (2 * 34)
     });
     base.saturating_add(recipients).saturating_add(raw_work)
 }
@@ -3538,6 +3627,23 @@ fn rpc_cost(method: &str, params: &Value) -> usize {
 #[cfg(test)]
 mod capacity_work_tests {
     use super::*;
+
+    #[test]
+    fn transaction_http_allowance_tracks_capacity_and_never_wraps() {
+        let capacity = 40 * 1024 * 1024 + 173;
+        assert_eq!(
+            transaction_request_bytes(capacity).unwrap(),
+            capacity * 2 + 128 * 1024
+        );
+        assert_eq!(
+            transaction_request_bytes(usize::MAX).unwrap(),
+            isize::MAX as usize
+        );
+        assert!(
+            admission_frame_bytes(&Config::devnet(), capacity as u64).unwrap()
+                >= transaction_request_bytes(capacity).unwrap() + 16 * 1024
+        );
+    }
 
     #[test]
     fn large_grant_preparation_reserves_work_for_every_recipient() {

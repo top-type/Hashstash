@@ -10,7 +10,7 @@ Encoders produce lowercase. Decoders accept all-uppercase addresses too, reject 
 
 The checksum detects accidental changes; it does not establish who owns an address. Transactions continue to commit to the complete 32-byte chain ID. Watch-only descriptor files also include that complete ID and validate it independently of the fingerprint.
 
-The current release supports protocol 26. A fresh network has a different chain ID and therefore different addresses, even when using the same private keys. Depositing or withdrawing Stash preserves addresses and account keys.
+The current release supports protocol 27. A fresh network has a different chain ID and therefore different addresses, even when using the same private keys. Depositing or withdrawing Stash preserves addresses and account keys.
 
 ## Wallet use
 

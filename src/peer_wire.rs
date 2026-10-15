@@ -5,7 +5,7 @@ use crate::{
     config::Config,
     types::{Block, Hash, Transaction},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 pub const MAGIC: &[u8; 8] = b"HSP2PB01";
@@ -15,6 +15,12 @@ pub const MAX_TRANSACTIONS: usize = 256;
 pub const TRANSACTION_BATCH_BYTES: usize = 512 * 1024;
 pub const ACK_BYTES: usize = 9;
 pub const DISCOVERY_BYTES: usize = 8 + 1 + 32 + 32 + 1 + 32 * 18;
+/// Initial local admission allowance. Governance may increase it; this is not
+/// a block-validity limit. The four-byte peer envelope has its own wire bound.
+pub const DEFAULT_RECORD_ADMISSION_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_WIRE_PAYLOAD_BYTES: usize = u32::MAX as usize;
+pub const SYNC_OVERHEAD_BYTES: usize = MAGIC.len() + 1 + 32 + 9 + MAX_LOCATORS * 32 + 9 + 9;
+const RECORD_OVERHEAD: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sync {
@@ -72,27 +78,47 @@ pub struct Limits {
 }
 impl Limits {
     pub fn from_config(config: &Config) -> Self {
+        Self::for_capacity(config, config.initial.block_bytes)
+    }
+    pub fn for_capacity(config: &Config, capacity: u64) -> Self {
+        // Saturation is intentional at the wire representation boundary;
+        // oversized payloads receive a transport error, never a consensus one.
+        let record_bytes = usize::try_from(capacity)
+            .unwrap_or(usize::MAX)
+            .saturating_add(RECORD_OVERHEAD)
+            .clamp(DEFAULT_RECORD_ADMISSION_BYTES, MAX_WIRE_PAYLOAD_BYTES);
         Self {
-            block_bytes: config.max_block_record_bytes(),
-            transaction_bytes: config.max_block_record_bytes(),
+            block_bytes: record_bytes,
+            transaction_bytes: record_bytes,
             block_transactions: config.max_signatures,
         }
     }
     pub fn frame_bytes(self) -> usize {
         self.block_bytes
             .saturating_add((1024 * 1024).max(self.transaction_bytes.saturating_add(32 * 1024)))
+            .min(MAX_WIRE_PAYLOAD_BYTES)
     }
     pub fn transaction_batch_bytes(self) -> usize {
-        TRANSACTION_BATCH_BYTES.max(record_size(self.transaction_bytes))
+        TRANSACTION_BATCH_BYTES.max(self.transaction_bytes.saturating_add(9))
     }
 }
 
-pub fn record_size(bytes: usize) -> usize {
-    codec::encode(&(bytes as u64)).len() + bytes
+pub fn record_size(bytes: usize) -> Result<usize> {
+    let length = u64::try_from(bytes)?;
+    codec::encode(&length)
+        .len()
+        .checked_add(bytes)
+        .ok_or_else(|| anyhow::anyhow!("peer record framing length overflow"))
 }
-fn push_record(out: &mut Vec<u8>, bytes: &[u8]) {
+fn push_record(out: &mut Vec<u8>, bytes: &[u8], maximum: usize) -> Result<()> {
+    let next = out
+        .len()
+        .checked_add(record_size(bytes.len())?)
+        .context("peer frame length overflow")?;
+    ensure!(next <= maximum, "peer frame too large");
     out.extend(codec::encode(&(bytes.len() as u64)));
     out.extend_from_slice(bytes);
+    Ok(())
 }
 pub fn encode(message: &Message, limits: Limits) -> Result<Vec<u8>> {
     let mut out = MAGIC.to_vec();
@@ -152,7 +178,7 @@ pub fn encode(message: &Message, limits: Limits) -> Result<Vec<u8>> {
                     bytes.len() <= limits.block_bytes,
                     "peer block record too large"
                 );
-                push_record(&mut out, &bytes);
+                push_record(&mut out, &bytes, limits.frame_bytes())?;
                 ensure!(out.len() <= limits.frame_bytes(), "peer frame too large");
             }
             out.extend(codec::encode(&(sync.transactions.len() as u64)));
@@ -162,7 +188,7 @@ pub fn encode(message: &Message, limits: Limits) -> Result<Vec<u8>> {
                     bytes.len() <= limits.transaction_bytes,
                     "peer transaction too large"
                 );
-                push_record(&mut out, &bytes);
+                push_record(&mut out, &bytes, limits.frame_bytes())?;
                 ensure!(out.len() <= limits.frame_bytes(), "peer frame too large");
             }
         }
@@ -230,7 +256,7 @@ impl<'a> Cursor<'a> {
         self.take(length)
     }
     fn amount(&mut self) -> Result<()> {
-        let length = self.count(8192)?;
+        let length = self.count(self.bytes.len() - self.at)?;
         let bytes = self.take(length)?;
         ensure!(bytes.last() != Some(&0), "noncanonical amount");
         Ok(())
@@ -271,10 +297,6 @@ impl<'a> Cursor<'a> {
                 match self.integer()? {
                     0 => {
                         let payments = self.integer()?;
-                        ensure!(
-                            payments <= crate::types::grant_payment_capacity() as u64,
-                            "peer grant settlement exceeds block capacity"
-                        );
                         // Every payment needs a 32-byte key and at least an
                         // amount-length byte. Bound the declared count by the
                         // actual record and remaining transaction byte budget
@@ -335,6 +357,12 @@ fn preflight_block(bytes: &[u8], limits: Limits) -> Result<()> {
     r.integer()?; // height
     r.take(32 + 32 + 8)?; // miner, state root, fixed extranonce
     let transactions = r.count(limits.block_transactions)?;
+    // Even the shortest signed transaction requires its 64-byte signature.
+    // A forged count cannot cause a long walk through nonexistent records.
+    ensure!(
+        transactions <= (bytes.len() - r.at) / 64,
+        "peer transaction count exceeds remaining block bytes"
+    );
     for _ in 0..transactions {
         r.transaction(limits.transaction_bytes)?;
     }
@@ -433,7 +461,11 @@ pub fn frame(payload: &[u8], maximum: usize) -> Result<Vec<u8>> {
         "peer frame too large or empty"
     );
     let length = u32::try_from(payload.len())?;
-    let mut frame = Vec::with_capacity(4 + payload.len());
+    let capacity = payload
+        .len()
+        .checked_add(4)
+        .context("peer frame length overflow")?;
+    let mut frame = Vec::with_capacity(capacity);
     frame.extend_from_slice(&length.to_be_bytes());
     frame.extend_from_slice(payload);
     Ok(frame)
@@ -443,6 +475,21 @@ pub fn frame(payload: &[u8], maximum: usize) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::{crypto, types::*};
+
+    #[test]
+    fn governed_capacity_expands_admission_without_framing_overflow() {
+        let config = Config::devnet();
+        let old = Limits::from_config(&config);
+        let larger = Limits::for_capacity(&config, 40 * 1024 * 1024 + 173);
+        assert!(larger.block_bytes > DEFAULT_RECORD_ADMISSION_BYTES);
+        assert!(larger.frame_bytes() > old.frame_bytes());
+        let boundary = Limits::for_capacity(&config, u64::MAX);
+        assert_eq!(boundary.frame_bytes(), MAX_WIRE_PAYLOAD_BYTES);
+        assert!(record_size(usize::MAX).is_err());
+        let bytes = [1u8; 16];
+        assert!(frame(&bytes, bytes.len() - 1).is_err());
+        assert_eq!(frame(&bytes, bytes.len()).unwrap().len(), bytes.len() + 4);
+    }
 
     #[test]
     fn discovery_addresses_are_fixed_width_bounded_and_strict() {
@@ -767,13 +814,13 @@ mod tests {
             let error = Cursor::new(&bad)
                 .transaction(limits.transaction_bytes)
                 .unwrap_err();
-            assert!(error.to_string().contains(if count == u64::MAX {
-                "grant settlement exceeds block capacity"
-            } else {
-                "grant count exceeds remaining transaction bytes"
-            }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("grant count exceeds remaining transaction bytes")
+            );
             let mut wire = [MAGIC.as_slice(), &[0], &sync.chain, &[0, 0, 1]].concat();
-            push_record(&mut wire, &bad);
+            push_record(&mut wire, &bad, limits.frame_bytes()).unwrap();
             assert!(decode(&wire, limits).is_err());
             let mut block = sync.blocks[0].clone();
             block.transactions.clear();

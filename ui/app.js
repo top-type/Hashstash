@@ -2,7 +2,6 @@
 
 (() => {
     const $ = id => document.getElementById(id);
-    const MAX_TRANSACTION_BYTES = 32 * 1024 * 1024;
     const {parseAmount: parseAmount, formatHash: formatHash, formatExactHash: formatExactHash, formatHashrate: formatHashrate, exactInput: exactInput} = HashstashAmounts;
     const state = {
         session: null,
@@ -40,7 +39,6 @@
         PassMarginBps: [ "pass_margin_bps", "PASS margin", "bps" ],
         MinimumFeeRate: [ "minimum_fee_rate", "Minimum fee rate", "hash / 1,024 weight" ]
     };
-    const isDirectParameter = parameter => [ "Interval", "PassMarginBps" ].includes(parameter);
     const parameterAvailable = parameter => Object.hasOwn(settings, parameter);
     const titles = {
         overview: "Overview",
@@ -79,8 +77,7 @@
     function recipientKey(form) { return addressKey(form.elements.recipient.value); }
     const grantRows = [];
     function transactionByteLimit() {
-        const capacity = BigInt(state.status?.settings?.block_bytes || 0);
-        return Number(capacity > BigInt(MAX_TRANSACTION_BYTES) ? BigInt(MAX_TRANSACTION_BYTES) : capacity);
+        return BigInt(state.status?.settings?.block_bytes || 0);
     }
     let grantRowNumber = 0;
     function grantDraft() { return grantRows.map(row => [row.elements.recipient.value, row.elements.amount.value]); }
@@ -236,13 +233,6 @@
         if (n <= BigInt(Number.MAX_SAFE_INTEGER)) return Number(n);
         if (JSON.rawJSON) return JSON.rawJSON(n.toString());
         throw new Error("This browser cannot submit this large setting exactly.");
-    }
-    function changedParameter(parameter, old, doubling) {
-        if (![ "BlockBytes", "Lead", "Rest", "Duration", "MinimumFeeRate" ].includes(parameter)) throw new Error("This setting requires a direct value.");
-        const amount = BigInt(old), next = doubling ? amount * 2n : amount / 2n;
-        if (!doubling && amount % 2n !== 0n || next < 1n || next > 18446744073709551615n) throw new Error("That change cannot be represented as a positive whole setting.");
-        if (parameter === "BlockBytes" && next < 2048n) throw new Error("Block capacity must cover mandatory account creation.");
-        return next;
     }
     function hexBytes(value, label = "Public key") {
         const h = String(value ?? "").trim();
@@ -583,8 +573,11 @@
         $(form.id.replace("-form", "-message-field")).hidden = raw || encrypted;
         $(form.id.replace("-form", "-hex-field")).hidden = !raw;
         if (enabled) {
-            form.elements.data_text.maxLength = transactionByteLimit();
-            form.elements.data_hex.maxLength = transactionByteLimit() * 2;
+            for (const [field, multiplier] of [["data_text", 1n], ["data_hex", 2n]]) {
+                const limit = transactionByteLimit() * multiplier;
+                if (limit <= 2147483647n) form.elements[field].maxLength = Number(limit);
+                else form.elements[field].removeAttribute("maxlength");
+            }
         }
     }
     function append(parent, tag, className, content) {
@@ -914,7 +907,7 @@
             const data = transactionData(form).data_hex || "";
             if (result.data_hex !== data || result.data_bytes !== data.length / 2) throw new Error("Fee quote does not match the transaction data.");
         }
-        if (BigInt(result.fee) !== BigInt(result.minimum_fee) + BigInt(extra) || BigInt(result.account_creation_fee) > BigInt(result.minimum_fee) || BigInt(result.weight) === 0n || BigInt(result.minimum_fee_rate) === 0n || BigInt(result.minimum_fee) === 0n) throw new Error("Invalid fee quote totals.");
+        if (BigInt(result.fee) !== BigInt(result.minimum_fee) + BigInt(extra) || BigInt(result.account_creation_fee) > BigInt(result.minimum_fee) || BigInt(result.weight) === 0n) throw new Error("Invalid fee quote totals.");
         const price = BigInt(result.minimum_fee_rate), weight = BigInt(result.weight), creation = BigInt(result.account_creation_fee);
         if (weight > BigInt(transactionByteLimit())) throw new Error("Transaction exceeds the block capacity.");
         if (price !== BigInt(state.status.settings.minimum_fee_rate) || price > 18446744073709551615n) throw new Error("Minimum fee rate changed. Refresh for the current rate.");
@@ -1614,9 +1607,7 @@
     function proposalTitle(action) {
         if (action.Grant) return action.Grant.payments.map(payment => `${shortAddress(payment.recipient)} · ${hashAmount(payment.amount)}`).join(" / ");
         const p = action.Parameter;
-        if (isDirectParameter(p.parameter)) return `Set ${settings[p.parameter][1].toLowerCase()} to ${settingValue(settings[p.parameter][0], p.new, settings[p.parameter][2])}`;
-        if (p.parameter === "MinerFeePercent") return `Set miner fee share to ${p.new}%`;
-        return `${BigInt(p.new) > BigInt(p.old) ? "Double" : "Halve"} ${settings[p.parameter][1].toLowerCase()}`;
+        return `Set ${settings[p.parameter][1].toLowerCase()} to ${settingValue(settings[p.parameter][0], p.new, settings[p.parameter][2])}`;
     }
     function renderGrantPayments(parent, grant) {
         for(const payment of grant.payments){const row=append(parent,"div","grant-payout"),recipient=address(payment.recipient),link=append(row,"a","explorer-link",recipient);link.href=`#explorer?account=${encodeURIComponent(recipient)}`;link.title=recipient;appendAmount(row,"span","",formatExactHash(payment.amount));}
@@ -1742,67 +1733,41 @@
         if (!state.status) return;
         const select = $("proposal-parameter");
         parameterAvailable(select.value) || (select.value = "BlockBytes");
-        const parameter = select.value, direct = isDirectParameter(parameter), feeSplit = parameter === "MinerFeePercent";
-        const setting = settings[parameter], old = state.status.settings[setting[0]];
-        $("proposal-value-field").hidden = !direct;
-        $("proposal-value").required = direct && $("proposal-type").value === "parameter";
-        $("proposal-direction-field").hidden = feeSplit || direct;
-        $("proposal-miner-fee-field").hidden = !feeSplit;
-        $("proposal-miner-fee").required = feeSplit && $("proposal-type").value === "parameter";
-        if (direct) {
-            const interval = parameter === "Interval", input = $("proposal-value");
-            text("proposal-value-label", interval ? "Target block time · seconds" : "PASS margin · %");
-            input.min = interval ? "1" : "0";
-            input.max = interval ? "60" : "184467440737095516.15";
-            input.step = interval ? "1" : "0.01";
-            let next;
-            try {
-                next = directParameterValue(parameter, input.value);
-            } catch {
-                text("parameter-preview", `Current: ${settingValue(setting[0], old, setting[2])}`);
-                $("parameter-preview").title = interval ? "1–60 whole seconds" : "Required PASS premium · 0.01% steps";
-                return;
-            }
-            text("parameter-preview", `${settingValue(setting[0], old, setting[2])} → ${settingValue(setting[0], next, setting[2])}`);
-        } else if (feeSplit) {
-            let next;
-            try {
-                next = minerFeePercent($("proposal-miner-fee").value);
-            } catch {
-                text("parameter-preview", `Current: ${old}% miners · ${100 - Number(old)}% revenue`);
-                $("parameter-preview").title = "Enter a whole percentage from 0 to 100.";
-                return;
-            }
-            text("parameter-preview", `${old}% → ${next}% miners · ${100 - next}% revenue`);
-        } else {
-            let next;
-            try {
-                next = changedParameter(parameter, old, $("proposal-direction").value === "double");
-            } catch (error) {
-                text("parameter-preview", `Current: ${settingValue(setting[0], old, setting[2])}`);
-                $("parameter-preview").title = error.message;
-                return;
-            }
-            text("parameter-preview", `${settingValue(setting[0], old, setting[2])} → ${settingValue(setting[0], next, setting[2])}`);
+        const parameter = select.value, setting = settings[parameter], old = state.status.settings[setting[0]], input = $("proposal-value");
+        const margin = parameter === "PassMarginBps", positive = ["Interval", "Duration", "BlockBytes"].includes(parameter);
+        input.required = $("proposal-type").value === "parameter";
+        text("proposal-value-label", parameter === "MinimumFeeRate" ? "Minimum fee rate · raw hashes / 1,024 weight" : `${setting[1]} · ${margin ? "%" : setting[2]}`);
+        input.inputMode = margin ? "decimal" : "numeric";
+        input.min = parameter === "BlockBytes" ? "1024" : positive ? "1" : "0";
+        input.max = margin ? "184467440737095516.15" : parameter === "MinerFeePercent" ? "100" : "18446744073709551615";
+        input.step = margin ? "0.01" : "1";
+        let next;
+        try {
+            next = directParameterValue(parameter, input.value);
+        } catch (error) {
+            text("parameter-preview", `Current: ${settingValue(setting[0], old, setting[2])}`);
+            $("parameter-preview").title = error.message;
+            return;
         }
+        text("parameter-preview", `${settingValue(setting[0], old, setting[2])} → ${settingValue(setting[0], next, setting[2])}`);
         $("parameter-preview").title = "Applies after rest if approved.";
     }
     function directParameterValue(parameter, value) {
-        if (!isDirectParameter(parameter)) throw new Error("This network does not support this parameter.");
-        if (parameter === "Interval") {
-            const next = safeInteger(value, "Target block time");
-            if (next < 1 || next > 60) throw new Error("Target block time must be from 1 to 60 seconds.");
-            return BigInt(next);
-        }
+        if (!parameterAvailable(parameter)) throw new Error("This network does not support this parameter.");
         const raw = String(value ?? "").trim();
-        if (raw.length > 24 || !/^\d+(?:\.\d{1,2})?$/.test(raw)) throw new Error("PASS margin needs at most two decimal places.");
-        const [whole, decimals = ""] = raw.split("."), next = BigInt(whole) * 100n + BigInt(decimals.padEnd(2, "0"));
-        if (next > 18446744073709551615n) throw new Error("PASS margin exceeds the supported integer range.");
-        return next;
-    }
-    function minerFeePercent(value) {
-        const next = safeInteger(value, "Miner fee share");
-        if (next > 100) throw new Error("Miner fee share must be between 0 and 100%.");
+        let next;
+        if (parameter === "PassMarginBps") {
+            if (raw.length > 24 || !/^\d+(?:\.\d{1,2})?$/.test(raw)) throw new Error("PASS margin needs at most two decimal places.");
+            const [whole, decimals = ""] = raw.split(".");
+            next = BigInt(whole) * 100n + BigInt(decimals.padEnd(2, "0"));
+        } else {
+            if (raw.length > 20 || !/^\d+$/.test(raw)) throw new Error(`${settings[parameter][1]} must be a whole number without a unit suffix.`);
+            next = BigInt(raw);
+        }
+        if (next > 18446744073709551615n) throw new Error("Setting exceeds the supported integer range.");
+        if (["Interval", "Duration", "BlockBytes"].includes(parameter) && next === 0n) throw new Error(`${settings[parameter][1]} must be positive.`);
+        if (parameter === "BlockBytes" && next < 1024n) throw new Error("Block capacity must cover the miner account’s 1,024 weight.");
+        if (parameter === "MinerFeePercent" && next > 100n) throw new Error("Miner fee share must be between 0 and 100%.");
         return next;
     }
     function networkView() {
@@ -1821,7 +1786,7 @@
             number(`${id}-revenue`, world?.revenue || "0");
         }
         text("guide-fees", `Transaction weight determines the minimum fee. Governance sets its rate and the miner's share. The entire fee, including any extra, currently goes ${s.settings.miner_fee_percent}% to the miner and ${100 - Number(s.settings.miner_fee_percent)}% to revenue.`);
-        text("guide-proposals", "A proposal requests a grant or changes one setting. Target block time accepts 1–60 whole seconds; the miner's fee share accepts 0–100%; the PASS margin accepts 0.01% steps. Block capacity, minimum fee rate and the lead, decision and rest periods change by half or double, within the protocol's valid ranges.");
+        text("guide-proposals", "A proposal requests a grant or sets a new value for one network setting. Time periods use whole seconds, the miner's fee share uses whole percentages from 0 to 100, and the PASS margin uses 0.01% steps. Block capacity uses weight; the minimum fee rate uses raw hashes per 1,024 weight.");
         text("guide-revenue-flow", "Revenue fills the gap between reserve and curve mass. This raises the reserve ratio toward 100%, making the curve flatter while keeping its current price and stash supply unchanged. Once the gap is filled, further revenue waits outside the reserve.");
         text("guide-grant-flow", "At the start of a grant decision, PASS sets aside the proposed payments from waiting revenue, then reserve. Drawing from reserve lowers its ratio and makes the curve steeper, while the current price and stash supply stay unchanged. If PASS wins, the recipients receive those payments. If FAIL wins, its reserve and balances continue.");
         text("network-height", commas(s.height));
@@ -2024,7 +1989,7 @@
             state.status && status.chain_id !== state.status.chain_id && resetContext();
             const previousDecision = hex(activeDecision()?.id), previousNonce = nextNonce();
             const changedState = state.status?.tip !== status.tip || state.status?.state_root !== status.state_root || state.status?.height !== status.height || previousDecision !== hex(gov.phase?.Governance?.id);
-            if (config.protocol_version !== 26) throw new Error("Unsupported protocol version.");
+            if (config.protocol_version !== 27) throw new Error("Unsupported protocol version.");
             state.config = config;
             settings.BlockBytes[1] = "Block capacity";
             settings.BlockBytes[2] = "weight";
@@ -2088,7 +2053,7 @@
                 chain_id: status.chain_id,
                 tip: status.tip,
                 height: status.height,
-                message_bytes: MAX_TRANSACTION_BYTES
+                message_bytes: transactionByteLimit().toString()
             });
             mixer?.update();
             $("mail-nav").hidden = false;
@@ -2700,7 +2665,7 @@
         try {
             if (!state.ready) throw new Error("Wait for the node connection to refresh.");
             const raw = $("broadcast-raw").value.trim();
-            if (!raw || raw.length % 2 || raw.length > transactionByteLimit() * 2 || !/^[a-f0-9]+$/i.test(raw)) throw new Error("Enter a signed transaction within the block capacity, in hexadecimal format.");
+            if (!raw || raw.length % 2 || BigInt(raw.length) > transactionByteLimit() * 2n || !/^[a-f0-9]+$/i.test(raw)) throw new Error("Enter a signed transaction within the block capacity, in hexadecimal format.");
             state.broadcasting = true;
             modeButtons();
             feedback(form, "Broadcasting…");
@@ -2722,7 +2687,7 @@
         try {
             const file = $("broadcast-file").files[0];
             if (!file) return;
-            if (file.size > transactionByteLimit() * 2 + 2) throw new Error("Signed transaction file exceeds the block capacity.");
+            if (BigInt(file.size) > transactionByteLimit() * 2n + 2n) throw new Error("Signed transaction file exceeds the block capacity.");
             $("broadcast-raw").value = (await file.text()).trim();
             feedback($("broadcast-form"), "");
         } catch (error) {
@@ -2815,29 +2780,10 @@
                     payments
                 }
             };
-        } else if (isDirectParameter(v.parameter)) {
-            const current = BigInt(state.status.settings[settings[v.parameter][0]]), next = directParameterValue(v.parameter, v.parameter_value);
-            if (next === current) throw new Error("Choose a different value.");
-            proposal = {
-                Parameter: {
-                    parameter: v.parameter,
-                    old: jsonInteger(current),
-                    new: jsonInteger(next)
-                }
-            };
-        } else if (v.parameter === "MinerFeePercent") {
-            const current = Number(state.status.settings.miner_fee_percent), next = minerFeePercent(v.miner_fee_percent);
-            if (next === current) throw new Error("Choose a different miner fee share.");
-            proposal = {
-                Parameter: {
-                    parameter: v.parameter,
-                    old: current,
-                    new: next
-                }
-            };
         } else {
             if (!parameterAvailable(v.parameter)) throw new Error("This network does not support this parameter.");
-            const current = BigInt(state.status.settings[settings[v.parameter][0]]), next = changedParameter(v.parameter, current, v.direction === "double");
+            const current = BigInt(state.status.settings[settings[v.parameter][0]]), next = directParameterValue(v.parameter, v.parameter_value);
+            if (next === current) throw new Error("Choose a different value.");
             proposal = {
                 Parameter: {
                     parameter: v.parameter,
@@ -2948,8 +2894,6 @@
         parameterPreview();
     });
     $("proposal-parameter").addEventListener("change", parameterPreview);
-    $("proposal-direction").addEventListener("change", parameterPreview);
-    $("proposal-miner-fee").addEventListener("input", parameterPreview);
     $("proposal-value").addEventListener("input", parameterPreview);
     $("wallet-expiry").addEventListener("input", () => {
         feeForms.forEach(name => feeSoon($(`${name}-form`)));

@@ -395,7 +395,7 @@ fn raw_broadcast_rejects_wrong_network_expiry_signature_and_encoding() {
         "g0".into(),
         "0".into(),
         String::new(),
-        "00".repeat(wallet::MAX_RAW_TRANSACTION_BYTES + 1),
+        "00".repeat(32 * 1024 * 1024 + 1),
     ] {
         assert!(
             node.rpc("broadcasttransaction", json!({"raw":raw}))

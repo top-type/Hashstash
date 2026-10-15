@@ -121,9 +121,7 @@ fn indexed_key(prefix: u8, index: usize) -> PublicKey {
 /// Return the last admissible list and the first list exceeding an existing
 /// transaction-byte or block-weight limit. No recipient-count ceiling is used.
 fn capacity_grants(c: &Config, s: &State) -> (Vec<GrantPayment>, Transaction, Transaction) {
-    let mut high = ((s.settings.block_bytes / fees::ACCOUNT_WEIGHT) as usize)
-        .min(grant_payment_capacity())
-        + 1;
+    let mut high = (s.settings.block_bytes / fees::ACCOUNT_WEIGHT) as usize + 1;
     let mut entries: Vec<_> = (0..high)
         .map(|index| GrantPayment {
             recipient: indexed_key(0xa7, index),
@@ -133,11 +131,7 @@ fn capacity_grants(c: &Config, s: &State) -> (Vec<GrantPayment>, Transaction, Tr
     entries.sort_by_key(|p| p.recipient);
     let make = |count| {
         let tx = propose(s, entries[..count].to_vec());
-        if count > grant_payment_capacity() {
-            tx
-        } else {
-            cover_fee(c, s, tx)
-        }
+        cover_fee(c, s, tx)
     };
     let mut low = 0;
     while low + 1 < high {
@@ -213,6 +207,10 @@ fn grant_execution_weight_is_fixed_even_for_existing_recipients() {
 fn aggregate_grant_fraction_and_period_budget_cannot_be_split_away() {
     for budget_limited in [false, true] {
         let mut c = config();
+        c.grant_numerator = 1;
+        c.grant_denominator = 10;
+        c.budget_numerator = 1;
+        c.budget_denominator = 4;
         if budget_limited {
             c.budget_numerator = 1;
             c.budget_denominator = 100;
@@ -413,7 +411,7 @@ fn grant_lists_use_existing_transaction_bytes_and_prepaid_block_weight() {
 #[test]
 fn maximum_grant_settles_once_with_full_small_block_and_large_account_tree() {
     let mut c = config();
-    c.initial.block_bytes = hashstash::config::MAX_BLOCK_RECORD_BYTES as u64;
+    c.initial.block_bytes = 40 * 1024 * 1024 + 37;
     c.validate().unwrap();
     let mut s = funded_amount(&c, 100_000_000);
     // Populate a realistic existing tree before the fork. Settlement must only
@@ -425,12 +423,12 @@ fn maximum_grant_settles_once_with_full_small_block_and_large_account_tree() {
     }
     s.audit(&c).unwrap();
     let (entries, _, oversized) = capacity_grants(&c, &s);
-    assert!(entries.len() > 30_000);
+    assert!(entries.len() > 32 * 1024 * 1024 / (fees::ACCOUNT_WEIGHT as usize + 34));
     assert!(
         consensus::execute(&c, &s, &s.root(), &key(181), &0u32.into(), &[oversized])
             .unwrap_err()
             .to_string()
-            .contains("grant settlement exceeds block capacity")
+            .contains("weighted capacity")
     );
     let opening = activate(&c, s, entries.clone());
     for won in [false, true] {

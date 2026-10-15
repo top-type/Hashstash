@@ -69,7 +69,7 @@ def main():
         raise AssertionError(label + ' did not start')
     try:
         configuration = json.loads((REPO / 'config/devnet.json').read_text())
-        assert configuration['protocol_version'] == 26
+        assert configuration['protocol_version'] == 27
         configuration.update(network='wallet-adversarial-' + uuid.uuid4().hex)
         configuration['genesis_time'] = int(time.time()) - 1
         config = directory / 'network.json'
@@ -77,8 +77,8 @@ def main():
         base = start(node, ['run', '--config', config, '--data', directory / 'chain.sqlite', '--miner', primary['public_key'], '--watch-key', primary['public_key'], '--rpc', f'127.0.0.1:{args.base_port}', '--p2p', f'127.0.0.1:{args.base_port + 1}', '--stratum', f'127.0.0.1:{args.base_port + 2}'], 'node', 'RPC: (http://127\\.0\\.0\\.1:\\d+)/rpc')
         cold_base = start(signer, ['--port', args.base_port + 3, '--config', config], 'cold', 'cold signer: (http://127\\.0\\.0\\.1:\\d+)/')
         status = rpc(base, 'status')
-        assert status['protocol_version'] == 26 and status['time_unit'] == 'seconds'
-        check('Adversarial wallet fixture uses v26 canonical-only mining and immediate reserve-grant funding consensus')
+        assert status['protocol_version'] == 27 and status['time_unit'] == 'seconds'
+        check('Adversarial wallet fixture uses v27 canonical-only mining and immediate reserve-grant funding consensus')
         token = request(cold_base, '/api/session')[1]['token']
 
         def cold(action, value=None, expected=200):

@@ -235,7 +235,28 @@ pub struct State {
 }
 impl State {
     pub fn genesis(c: &Config) -> Self {
-        let rounds = Map::new();
+        let mut rounds = Map::new();
+        let phase = if c.initial.rest == 0 {
+            rounds.insert(
+                0u64.to_be_bytes().to_vec(),
+                RoundRecord {
+                    status: RoundStatus::Open,
+                    refund_height: 0,
+                },
+            );
+            Phase::Auction(Auction {
+                round: 0,
+                opened: 0,
+                leader: None,
+                lead_since: 0,
+                replacement_height: 0,
+            })
+        } else {
+            Phase::Rest(Rest {
+                until: c.initial.rest,
+                pending: None,
+            })
+        };
         Self {
             chain_id: c.chain_id(),
             height: 0,
@@ -245,10 +266,7 @@ impl State {
             frozen: c.initial.clone(),
             world: World::default(),
             alternative: None,
-            phase: Phase::Rest(Rest {
-                until: c.initial.rest,
-                pending: None,
-            }),
+            phase,
             proposals: Map::new(),
             supports: Map::new(),
             rounds,
@@ -347,16 +365,53 @@ impl State {
         ensure!(
             self.height <= c.max_height
                 && self.clock >= self.height
-                && self
-                    .height
-                    .checked_mul(crate::config::MAX_INTERVAL_SECONDS)
-                    .is_some_and(|maximum| self.clock <= maximum),
-            "nominal clock is outside the block interval bounds"
+                && (self.height != 0 || self.clock == 0),
+            "nominal clock is outside the representable block history"
         );
         if let Phase::Rest(r) = &self.phase
             && let Some((parameter, new)) = r.pending
         {
-            c.parameter_change(&self.frozen, parameter, self.frozen.get(parameter), new)?;
+            let remaining = r
+                .until
+                .checked_sub(self.clock)
+                .ok_or_else(|| anyhow::anyhow!("expired pending rest"))?;
+            let activation =
+                crate::consensus::rounded_deadline(self.clock, remaining, self.frozen.interval)?;
+            c.parameter_change_at(
+                &self.frozen,
+                parameter,
+                self.frozen.get(parameter),
+                new,
+                activation,
+            )?;
+        }
+        match &self.phase {
+            Phase::Auction(a) => {
+                a.opened
+                    .checked_add(c.auction_timeout_for(&self.frozen)?)
+                    .ok_or_else(|| anyhow::anyhow!("auction deadline overflow"))?;
+            }
+            Phase::Governance(d) => {
+                let resolution = crate::consensus::rounded_deadline(
+                    d.started,
+                    d.duration,
+                    self.frozen.interval,
+                )?;
+                let activation = crate::consensus::rounded_deadline(
+                    resolution,
+                    self.frozen.rest,
+                    self.frozen.interval,
+                )?;
+                if let Proposal::Parameter {
+                    parameter,
+                    old,
+                    new,
+                } = d.proposal
+                {
+                    c.parameter_change_at(&self.frozen, parameter, old, new, activation)?;
+                }
+            }
+            Phase::Rest(_) => {}
         }
         c.check_amount(&self.issued)?;
         c.check_amount(&self.auction_escrow)?;
@@ -642,8 +697,10 @@ impl State {
                 "budget clock mismatch"
             );
             ensure!(
-                u64::try_from(self.budgets.len())? == self.budget_epoch + 1,
-                "budget history length mismatch"
+                self.budgets.get(&0u64.to_be_bytes()).is_some()
+                    && self.budgets.get(&self.budget_epoch.to_be_bytes()).is_some()
+                    && u64::try_from(self.budgets.len())? <= self.height.saturating_add(1),
+                "budget history does not cover visited epochs"
             );
         } else {
             ensure!(
@@ -654,9 +711,20 @@ impl State {
         for (key, b) in self.budgets.iter() {
             let epoch = u64::from_be_bytes(key.try_into()?);
             ensure!(epoch <= self.budget_epoch, "budget epoch is in the future");
-            for amount in [&b.allowance, &b.reserved, &b.spent] {
-                c.check_amount(amount)?;
-            }
+            // An optional cap is a non-circulating arithmetic value. Ratios
+            // above one may exceed supply, while actual spending cannot.
+            ensure!(
+                b.allowance.bits() <= c.money_bits + 64,
+                "budget allowance exceeds product range"
+            );
+            // Spent is cumulative: the same HASH can be returned and paid
+            // again. At most one grant settles per block, so supply times the
+            // u64 height range bounds it independently of circulating balances.
+            ensure!(
+                b.spent.bits() <= c.money_bits + 64,
+                "budget spending exceeds cumulative range"
+            );
+            c.check_amount(&b.reserved)?;
             if c.grant_budget_enabled() {
                 ensure!(
                     &b.reserved + &b.spent <= b.allowance,

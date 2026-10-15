@@ -109,7 +109,7 @@ async function run() {
   assert.match(h.content.textContent, /Mining reward/); checks++;
   assert.match(h.content.textContent, /Estimated stash value0\.000000000000003 hash/); checks++;
   h.replies.explorer_account.pass_account = { ordinary: '2000', shares: '2000000000000000000', nonce: 1 };
-  h.replies.explorer_account.protocol_version=26;
+  h.replies.explorer_account.protocol_version=27;
   h.replies.explorer_account.account={ordinary:'7000',shares:'1000000000000000000',nonce:2};
   h.replies.explorer_account.pass_account={ordinary:'2000',shares:'2000000000000000000',nonce:2};
   h.replies.explorer_account.payment_available_hash='2000';

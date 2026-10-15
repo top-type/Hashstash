@@ -1,16 +1,22 @@
 //! Governance has arithmetic/construction bounds, not policy grids.
 use hashstash::{
-    config::{Config, MAX_BLOCK_RECORD_BYTES, MAX_INTERVAL_SECONDS, MIN_GOVERNED_BLOCK_BYTES},
+    config::{Config, MIN_GOVERNED_BLOCK_BYTES},
     consensus, crypto, math,
     state::{Phase, State},
     types::Parameter,
 };
 
 #[test]
-fn block_capacity_halves_to_mandatory_weight_and_can_grow_beyond_old_transport_policy() {
+fn block_capacity_has_only_account_work_and_representation_bounds() {
     let c = Config::testnet();
     let mut settings = c.initial.clone();
-    for capacity in [8_192, 4_096, 2_048] {
+    for capacity in [
+        MIN_GOVERNED_BLOCK_BYTES,
+        1_025,
+        12_345,
+        64 * 1024 * 1024,
+        isize::MAX as u64,
+    ] {
         c.parameter_change(
             &settings,
             Parameter::BlockBytes,
@@ -19,22 +25,19 @@ fn block_capacity_halves_to_mandatory_weight_and_can_grow_beyond_old_transport_p
         )
         .unwrap();
         settings.block_bytes = capacity;
+        assert_eq!(c.transaction_bytes(&settings), capacity as usize);
     }
-    assert_eq!(settings.block_bytes, MIN_GOVERNED_BLOCK_BYTES);
-    assert!(
-        c.parameter_change(&settings, Parameter::BlockBytes, 2_048, 1_024)
+    for capacity in [0, MIN_GOVERNED_BLOCK_BYTES - 1, u64::MAX] {
+        assert!(
+            c.parameter_change(
+                &settings,
+                Parameter::BlockBytes,
+                settings.block_bytes,
+                capacity
+            )
             .is_err()
-    );
-    while settings.block_bytes < MAX_BLOCK_RECORD_BYTES as u64 {
-        let next = settings.block_bytes * 2;
-        c.parameter_change(&settings, Parameter::BlockBytes, settings.block_bytes, next)
-            .unwrap();
-        settings.block_bytes = next;
+        );
     }
-    assert!(
-        c.parameter_change(&settings, Parameter::BlockBytes, settings.block_bytes, 0)
-            .is_err()
-    );
     assert!(
         c.parameter_change(&settings, Parameter::BlockBytes, 2_048, 4_096)
             .is_err()
@@ -48,134 +51,108 @@ fn block_capacity_halves_to_mandatory_weight_and_can_grow_beyond_old_transport_p
         )
         .is_err()
     );
-    assert_eq!(c.max_block_record_bytes(), MAX_BLOCK_RECORD_BYTES);
-    assert_eq!(c.transaction_bytes(&settings), MAX_BLOCK_RECORD_BYTES);
-    assert!(
-        c.parameter_change(
-            &settings,
-            Parameter::BlockBytes,
-            settings.block_bytes,
-            settings.block_bytes * 2
-        )
-        .is_err()
-    );
-    let mut huge_capacity = c.clone();
-    huge_capacity.initial.block_bytes = 1u64 << 63;
-    assert!(huge_capacity.validate().is_err());
-    let mut huge_record = c.clone();
-    huge_record.max_signatures = 100_000;
-    huge_record.validate().unwrap();
-    huge_record.max_signatures = 100_001;
-    assert!(huge_record.validate().is_err());
+    let mut config = c;
+    config.max_signatures = usize::MAX;
+    config.validate().unwrap();
+    config.max_signatures = 0;
+    config.validate().unwrap();
 }
 
 #[test]
-fn phase_parameters_have_no_legacy_grid_or_configured_timeout_ceiling() {
+fn parameters_accept_direct_values_and_zero_where_defined() {
     let c = Config::testnet();
-    for parameter in [Parameter::Lead, Parameter::Rest] {
-        let mut settings = c.initial.clone();
-        for _ in 0..30 {
-            let old = settings.get(parameter);
-            c.parameter_change(&settings, parameter, old, old * 2)
-                .unwrap();
-            settings.set(parameter, old * 2);
-        }
-        c.validate_governance_settings(&settings).unwrap();
-    }
-    let mut odd = c.clone();
-    odd.initial.lead = 3;
-    odd.initial.rest = 7;
-    odd.initial.duration = 17;
-    odd.validate().unwrap();
-    for (parameter, old, next) in [
-        (Parameter::Lead, 3, 6),
-        (Parameter::Rest, 7, 14),
-        (Parameter::Duration, 17, 34),
+    for (parameter, next) in [
+        (Parameter::Lead, 3),
+        (Parameter::Lead, 0),
+        (Parameter::Rest, 7),
+        (Parameter::Rest, 0),
+        (Parameter::Duration, 17),
+        (Parameter::Duration, 1),
+        (Parameter::Interval, 61),
+        (Parameter::Interval, 1 << 40),
+        (Parameter::MinimumFeeRate, 0),
+        (Parameter::MinimumFeeRate, 7),
     ] {
-        odd.parameter_change(&odd.initial, parameter, old, next)
+        c.parameter_change(&c.initial, parameter, c.initial.get(parameter), next)
             .unwrap();
+        let mut changed = c.clone();
+        changed.initial.set(parameter, next);
+        changed.validate().unwrap();
+    }
+    for parameter in [Parameter::Interval, Parameter::Duration] {
         assert!(
-            odd.parameter_change(&odd.initial, parameter, old, next + 1)
+            c.parameter_change(&c.initial, parameter, c.initial.get(parameter), 0)
                 .is_err()
         );
     }
     let mut lead = c.initial.clone();
     lead.lead = c.auction_timeout * 8;
-    c.validate_governance_settings(&lead).unwrap();
     assert_eq!(
         c.auction_timeout_for(&lead).unwrap(),
         lead.lead + lead.interval
     );
-    for parameter in [Parameter::Lead, Parameter::Rest, Parameter::Duration] {
-        let mut invalid = c.initial.clone();
-        invalid.set(parameter, 0);
-        assert!(c.validate_governance_settings(&invalid).is_err());
-        invalid.set(parameter, u64::MAX);
-        assert!(c.validate_governance_settings(&invalid).is_err());
-    }
-    let mut short = c.initial.clone();
-    short.duration = 4;
-    assert!(c.validate_governance_settings(&short).is_err());
-    short.duration = 2;
-    assert!(c.validate_governance_settings(&short).is_err());
-    let mut long = c.initial.clone();
-    long.duration = 1 << 20;
-    c.validate_governance_settings(&long).unwrap();
-    // There is no per-block grant-funding loop. Only the largest possible
-    // scheduled clock plus the duration must still fit in its integer.
-    long.duration = u64::MAX - c.max_height * MAX_INTERVAL_SECONDS;
-    c.validate_governance_settings(&long).unwrap();
-    long.duration += 1;
-    assert!(c.validate_governance_settings(&long).is_err());
+    lead.lead = u64::MAX;
+    assert!(c.validate_governance_settings(&lead).is_err());
 }
 
 #[test]
-fn governance_cannot_remove_the_outcome_trading_window() {
+fn deadlines_are_checked_at_the_actual_activation_clock() {
     let c = Config::testnet();
-    let mut settings = c.initial.clone();
-    for duration in [1, settings.interval - 1, settings.interval] {
-        settings.duration = duration;
-        assert!(c.validate_governance_settings(&settings).is_err());
-        let mut invalid_genesis = c.clone();
-        invalid_genesis.initial = settings.clone();
-        assert!(invalid_genesis.validate().is_err());
-    }
-    settings.duration = settings.interval + 1;
-    c.validate_governance_settings(&settings).unwrap();
-    let mut minimum_genesis = c.clone();
-    minimum_genesis.initial = settings.clone();
-    minimum_genesis.validate().unwrap();
-
-    // Halving a valid duration must not make the next decision untradeable.
-    settings.duration = settings.interval * 2;
+    let clock = 1_000;
+    let duration = u64::MAX - clock;
+    c.parameter_change_at(
+        &c.initial,
+        Parameter::Duration,
+        c.initial.duration,
+        duration,
+        clock,
+    )
+    .unwrap();
     assert!(
-        c.parameter_change(
-            &settings,
+        c.parameter_change_at(
+            &c.initial,
             Parameter::Duration,
-            settings.duration,
-            settings.interval,
+            c.initial.duration,
+            duration + 1,
+            clock
         )
         .is_err()
     );
-    settings.duration = (settings.interval + 1) * 2;
+    // The same value can be arithmetically valid earlier, then become stale.
     c.parameter_change(
-        &settings,
+        &c.initial,
         Parameter::Duration,
-        settings.duration,
-        settings.interval + 1,
+        c.initial.duration,
+        duration + 1,
     )
     .unwrap();
+    assert!(
+        c.parameter_change_at(
+            &c.initial,
+            Parameter::Duration,
+            c.initial.duration,
+            duration,
+            clock + 1
+        )
+        .is_err()
+    );
+}
 
-    // Increasing the block interval has the same liveness constraint.
-    settings.duration = 30;
-    for interval in [30, 31] {
-        assert!(
-            c.parameter_change(&settings, Parameter::Interval, settings.interval, interval)
-                .is_err()
-        );
+#[test]
+fn decision_duration_can_be_shorter_than_one_block() {
+    let c = Config::testnet();
+    for duration in [1, c.initial.interval - 1, c.initial.interval] {
+        let mut changed = c.clone();
+        changed.initial.duration = duration;
+        changed.validate().unwrap();
     }
-    c.parameter_change(&settings, Parameter::Interval, settings.interval, 29)
-        .unwrap();
+    c.parameter_change(
+        &c.initial,
+        Parameter::Interval,
+        c.initial.interval,
+        c.initial.duration + 1,
+    )
+    .unwrap();
 }
 
 #[test]

@@ -70,8 +70,8 @@ def run(args):
         config = fixture / "network.json"
         cli("init", "--config", config, "--preset", "dev")
         configuration = json.loads(config.read_text(encoding="utf-8"))
-        check(configuration["protocol_version"] == 26,
-              "Fresh generated configuration uses protocol 26")
+        check(configuration["protocol_version"] == 27,
+              "Fresh generated configuration uses protocol 27")
         configuration["network"] = "mail-wire-" + uuid.uuid4().hex
         save(config, configuration)
         sender, recipient = vector["identity"]["sender"], vector["identity"]["recipient"]

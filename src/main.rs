@@ -379,7 +379,7 @@ fn initial_config(preset: InitPreset, hashrate: Option<&str>) -> Result<Config> 
         calibrate_initial_target(&mut config, rate)?;
         let mut unique = [0u8; 8];
         getrandom::fill(&mut unique).map_err(|e| anyhow!("randomness unavailable: {e}"))?;
-        config.network = format!("hashstash-private-v26-{}", hex::encode(unique));
+        config.network = format!("hashstash-private-v27-{}", hex::encode(unique));
     }
     config.validate()?;
     Ok(config)
@@ -541,10 +541,6 @@ fn prepared_envelope(mut response: Value) -> Result<hashstash::wallet::UnsignedE
 }
 
 fn requested_data(input: &str) -> Result<Vec<u8>> {
-    ensure!(
-        input.len() <= hashstash::wallet::MAX_RAW_TRANSACTION_BYTES * 2,
-        "transaction data is too large"
-    );
     ensure!(
         input.len().is_multiple_of(2),
         "transaction data must contain complete hex bytes"
@@ -1030,11 +1026,6 @@ async fn main() -> Result<()> {
         }
         Command::Broadcast { url, raw, raw_file } => {
             let raw = if let Some(file) = raw_file {
-                ensure!(
-                    fs::metadata(&file)?.len()
-                        <= (hashstash::wallet::MAX_RAW_TRANSACTION_BYTES * 2 + 2) as u64,
-                    "signed transaction file too large"
-                );
                 fs::read_to_string(file)?
             } else {
                 raw.context("signed transaction missing")?
@@ -1281,7 +1272,9 @@ mod tests {
             )
             .is_err()
         );
-        for protocol in [0, 2, 8, 17, 19, 20, 21, 22, 23, 24, 25, 27, u64::MAX] {
+        for protocol in
+            (0..u64::from(PROTOCOL_VERSION)).chain([u64::from(PROTOCOL_VERSION) + 1, u64::MAX])
+        {
             assert!(transaction_fee_request(protocol, None, None).is_err());
         }
         for command in ["send", "transfer", "prepare"] {
@@ -1382,12 +1375,12 @@ mod tests {
             requested_data(&hex::encode(&every_byte)).unwrap(),
             every_byte
         );
-        let maximum = "ab".repeat(hashstash::wallet::MAX_RAW_TRANSACTION_BYTES);
+        let maximum = "ab".repeat(32 * 1024 * 1024 + 1);
         assert_eq!(
             requested_data(&maximum).unwrap().len(),
-            hashstash::wallet::MAX_RAW_TRANSACTION_BYTES
+            32 * 1024 * 1024 + 1
         );
-        assert!(requested_data(&(maximum + "00")).is_err());
+        assert!(requested_data(&(maximum + "00")).is_ok());
         for malformed in ["0", "000", "gg", "0x01", "00 01", " 00", "00\n", "００"] {
             assert!(requested_data(malformed).is_err(), "{malformed:?}");
         }

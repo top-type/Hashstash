@@ -4,7 +4,10 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     net::IpAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -38,7 +41,7 @@ impl Surface {
                 requests: 512,
                 request_burst: 1024,
                 bytes: 32 * MIB,
-                byte_burst: 2 * crate::config::MAX_BLOCK_RECORD_BYTES as u64 + 2 * MIB,
+                byte_burst: 66 * MIB,
                 work: 131_072,
                 work_burst: 1_048_576,
             },
@@ -47,7 +50,7 @@ impl Surface {
                 requests: 32,
                 request_burst: 64,
                 bytes: 8 * MIB,
-                byte_burst: 2 * crate::config::MAX_BLOCK_RECORD_BYTES as u64 + 2 * MIB,
+                byte_burst: 66 * MIB,
                 work: 16_384,
                 work_burst: 65_536,
             },
@@ -135,7 +138,7 @@ impl Record {
 }
 #[derive(Default)]
 pub struct NetworkGuard {
-    max_frame_bytes: u64,
+    max_frame_bytes: AtomicU64,
     loopback_rpc_is_proxy: bool,
     records: Mutex<HashMap<(IpAddr, Surface), Record>>,
 }
@@ -157,16 +160,39 @@ impl NetworkGuard {
     }
     pub fn with_frame_limit(maximum: usize) -> Self {
         Self {
-            max_frame_bytes: maximum as u64,
+            max_frame_bytes: AtomicU64::new(maximum as u64),
             ..Default::default()
         }
     }
     fn policy(&self, surface: Surface) -> Policy {
         let mut policy = surface.policy();
         if surface != Surface::Stratum {
-            policy.byte_burst = policy.byte_burst.max(self.max_frame_bytes);
+            policy.byte_burst = policy
+                .byte_burst
+                .max(self.max_frame_bytes.load(Ordering::Relaxed));
         }
         policy
+    }
+    /// A validated historical capacity increase extends the one-frame burst.
+    /// Throughput, connection, request and work quotas remain local policy.
+    pub fn allow_frame(&self, maximum: usize) -> Result<()> {
+        let maximum = u64::try_from(maximum)?;
+        let previous = self.max_frame_bytes.fetch_max(maximum, Ordering::Relaxed);
+        if maximum <= previous {
+            return Ok(());
+        }
+        let mut records = self
+            .records
+            .lock()
+            .map_err(|_| anyhow!("network accounting lock poisoned"))?;
+        for ((_, surface), record) in records.iter_mut() {
+            if *surface != Surface::Stratum {
+                let old = surface.policy().byte_burst.max(previous);
+                let new = surface.policy().byte_burst.max(maximum);
+                record.bytes.tokens = record.bytes.tokens.saturating_add(new - old).min(new);
+            }
+        }
+        Ok(())
     }
     fn penalize(&self, ip: IpAddr, surface: Surface, record: &mut Record, now: Instant) {
         if !(self.loopback_rpc_is_proxy && surface == Surface::Rpc && ip.is_loopback()) {
@@ -498,6 +524,21 @@ pub fn retry_delay(failures: u32, jitter: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn validated_capacity_growth_extends_existing_sessions_once() {
+        let guard = Arc::new(NetworkGuard::default());
+        let peer = guard
+            .admit("127.0.0.1".parse().unwrap(), Surface::Peer)
+            .unwrap();
+        let expanded = 100 * 1024 * 1024;
+        guard.allow_frame(expanded).unwrap();
+        assert!(peer.bytes(expanded).is_ok());
+        guard.allow_frame(expanded).unwrap();
+        assert!(
+            peer.bytes(expanded).is_err(),
+            "unchanged allowance must not refill tokens"
+        );
+    }
     #[test]
     fn larger_peer_frames_receive_one_bounded_burst_without_relaxing_other_quotas() {
         const FRAME: usize = 97 * 1024 * 1024;

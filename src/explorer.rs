@@ -16,6 +16,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{collections::VecDeque, path::Path, sync::Arc};
 
+// A pagination target, never a record or consensus validity limit. A single
+// larger record is returned alone so cursors cannot hide valid history.
+const PAGE_BYTES: usize = 32 * 1024 * 1024;
+
 pub const METHODS: &[&str] = &[
     "explorer_blocks",
     "explorer_transactions",
@@ -409,7 +413,7 @@ impl Explorer {
                 result["available"] = json!(true);
                 result["ready"] = json!(true);
                 result["indexed_height"] = json!(s.height);
-                result["message_bytes"] = json!(crate::config::MAX_BLOCK_RECORD_BYTES);
+                result["message_bytes"] = json!(c.transaction_bytes(&s.settings));
             }
             "explorer_blocks" => {
                 fields(&p, &["limit", "before_height"])?;
@@ -858,14 +862,7 @@ fn paged<P: rusqlite::Params>(
     limit: u64,
     tip: u64,
 ) -> Result<(Vec<Value>, Value)> {
-    paged_with_budget(
-        statement,
-        p,
-        limit,
-        tip,
-        false,
-        crate::config::MAX_BLOCK_RECORD_BYTES,
-    )
+    paged_with_budget(statement, p, limit, tip, false, PAGE_BYTES)
 }
 fn paged_more<P: rusqlite::Params>(
     statement: &mut rusqlite::Statement<'_>,
@@ -873,14 +870,7 @@ fn paged_more<P: rusqlite::Params>(
     limit: u64,
     tip: u64,
 ) -> Result<(Vec<Value>, Value)> {
-    paged_with_budget(
-        statement,
-        p,
-        limit,
-        tip,
-        true,
-        crate::config::MAX_BLOCK_RECORD_BYTES,
-    )
+    paged_with_budget(statement, p, limit, tip, true, PAGE_BYTES)
 }
 
 fn paged_with_budget<P: rusqlite::Params>(
@@ -950,15 +940,14 @@ mod page_capacity_tests {
     #[test]
     fn signed_mail_grant_carriers_remain_bounded_and_page_without_losing_raw_bytes() {
         let mut c = Config::testnet();
-        c.initial.block_bytes = crate::config::MAX_BLOCK_RECORD_BYTES as u64;
+        c.initial.block_bytes = PAGE_BYTES as u64;
         let s = State::genesis(&c);
         let secret = [91; 32];
         let owner = crate::crypto::public_key(&secret).unwrap();
         let data = crate::mail::tests::fixture();
         // Exercise a near-capacity recipient list with this mail payload,
         // reserving space for transaction/block framing and the miner.
-        let count = (crate::config::MAX_BLOCK_RECORD_BYTES - data.len() - 2048)
-            / (crate::fees::ACCOUNT_WEIGHT as usize + 34);
+        let count = (PAGE_BYTES - data.len() - 2048) / (crate::fees::ACCOUNT_WEIGHT as usize + 34);
         let mut payments: Vec<_> = (0..count)
             .map(|i| {
                 let mut recipient_secret = [83; 32];
@@ -988,7 +977,7 @@ mod page_capacity_tests {
         assert!(count > 31_000);
         assert!(
             codec::encode(&first).len() + count * crate::fees::ACCOUNT_WEIGHT as usize + 1024
-                <= crate::config::MAX_BLOCK_RECORD_BYTES
+                <= PAGE_BYTES
         );
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE items(record TEXT,height INTEGER,position INTEGER)")
@@ -1009,7 +998,7 @@ mod page_capacity_tests {
             .unwrap()
             .to_string();
             largest = largest.max(record.len());
-            assert!(record.len() < crate::config::MAX_BLOCK_RECORD_BYTES);
+            assert!(record.len() < PAGE_BYTES);
             db.execute(
                 "INSERT INTO items VALUES(?1,?2,0)",
                 params![record, nonce + 1],
@@ -1455,7 +1444,7 @@ mod indexing_tests {
         // bug. These are valid event ordinals from the existing indexing rules;
         // producing thousands of signed transactions would test nothing extra.
         let positions = [
-            c.max_signatures as u64 * 4 + 12 + grant_payment_capacity() as u64 - 1,
+            c.max_signatures as u64 * 4 + 12 + 31_000,
             25_001 * 4 + 10,
             0,
         ];

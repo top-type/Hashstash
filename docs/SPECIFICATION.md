@@ -108,9 +108,9 @@ M and S remain unchanged
 
 The reserve shortfall lowers the ratio without changing the marginal price or any account's stash quantity. Waiting revenue is spent first. FAIL has no corresponding grant debit. Recipients cannot spend escrow before resolution. If PASS wins, every listed amount is paid once in the same atomic transition; if FAIL wins, the PASS state is discarded.
 
-Eligibility requires the configured reserve minimum and enough backing for the combined amount G. Available backing is waiting revenue plus reserve above the retained minimum. Two optional genesis limits can further restrict G: a fraction of the current reserve per grant, and a remaining allowance for the current budget period. Each fraction is enabled by `0 < numerator < denominator`; exactly `0/0` disables that limit. The supplied presets enable both. These limits cannot be changed by a governance proposal.
+Eligibility requires the configured reserve minimum and enough backing for the combined amount G. Available backing is waiting revenue plus reserve above the retained minimum. Two optional genesis limits can further restrict G: a fraction of the current reserve per grant, and a remaining allowance for the current budget period. A positive denominator enables a cap: a zero numerator sets it to zero, and positive ratios can equal or exceed one. Exactly `0/0` disables that limit; a positive numerator with a zero denominator is invalid. The supplied presets disable both. These limits cannot be changed by a governance proposal.
 
-Budget periods begin with the first decision and use scheduled seconds. With the period cap enabled, each new period fixes an allowance from the reserve and tracks reserved and spent grants without carrying unused allowance forward. Disabling the cap retains the reservation and spending records but imposes no allowance ceiling. A proposal's registration does not reserve funding or guarantee eligibility. A grant cannot empty a live curve's reserve. Revenue already inside the reserve is not also available as waiting revenue.
+Budget periods begin with the first decision and use scheduled seconds. With the period cap enabled, each new period fixes an allowance from the reserve and tracks reserved and spent grants without carrying unused allowance forward. Disabling the cap retains the reservation and spending records but imposes no allowance ceiling. A proposal's registration does not reserve funding or guarantee eligibility. A grant cannot empty a live curve's reserve: at least one raw hash remains even when the configured retained minimum is zero. Revenue already inside the reserve is not also available as waiting revenue.
 
 Grants reduce withdrawal backing while preserving the price at that moment. Revenue and grants change the curve's shape rather than trading along it. Ordinary trades, revenue transfers and grants conserve existing hashes.
 
@@ -122,16 +122,19 @@ The winning proposal's full bid becomes revenue even if the later decision rejec
 
 Governance may change one of:
 
-| Setting | Permitted change |
+| Setting | Permitted direct value |
 | --- | --- |
-| Block size and weight limit | Exact half or double, within 2 KiB through 32 MiB |
-| Minimum fee rate | Positive exact half or double, in raw hash atoms per 1,024 weight |
-| Target block interval | A changed whole second from 1 to 60 |
-| Auction lead, decision duration, rest duration | Positive exact half or double in scheduled seconds |
-| Miner fee percentage | A changed whole percent from 0 to 100 |
-| Required PASS margin | A changed value from 0 through 2^64 − 1 basis points; one basis point is 0.01% |
+| Block size and weight limit | At least 1,024, subject to allocation representation |
+| Minimum fee rate | Any unsigned 64-bit number of raw hash atoms per 1,024 weight, including zero |
+| Target block interval | Positive whole scheduled seconds |
+| Auction lead and rest duration | Whole scheduled seconds, including zero |
+| Decision duration | Positive whole scheduled seconds |
+| Miner fee percentage | Whole percent from 0 to 100 |
+| Required PASS margin | From 0 through 2^64 − 1 basis points; one basis point is 0.01% |
 
-The 60-second interval ceiling and half/double steps are protocol policy choices. The block-capacity range is an implementation resource limit. They are enforced by nodes, not only by the wallet. In addition, all settings and deadlines must fit their integer representation, and decision duration must exceed the target interval so that a later block can accept outcome trades before settlement.
+A proposal signs the exact old and new values, and the new value must differ. Every setting fits unsigned 64-bit representation; block capacity must also fit the host's allocation representation. The 1,024 minimum lets an otherwise empty block create its mining account. Genesis choices for timestamp-window size, ASERT half-life and optional grant ratios also retain only their required positive/representation rules; the preset values are not mandatory bounds.
+
+Scheduled time and deadlines must remain representable. The effective auction timeout is the greater of the configured timeout and `lead + interval`; all additions and rounding to future block boundaries are checked. The node checks proposed settings at submission and their projected activation, then checks again when applying them. A positive decision duration may be shorter than a block interval, allowing resolution in the first subsequent block before any conditional trade can be included.
 
 The reserve ratio is state derived from R and M, not a governed fixed parameter. Issuance, proof of work, authentication, timestamp-validation policy, ASERT half-life and opening share scale remain fixed by the protocol or genesis configuration. Approved settings activate after rest, with the activating block still using its parent's settings.
 
@@ -177,9 +180,9 @@ miner_fee = floor(signed_fee * miner_fee_percent / 100)
 revenue_fee = signed_fee - miner_fee
 ```
 
-The entire signed fee is charged. If an earlier transaction has already created a transfer recipient, its creation weight and required minimum can fall but the signed payment stays unchanged. Grant proposal execution weight is fixed per recipient, whether or not that account exists. The proposal fee is not refunded when a grant loses or never activates, or when recipients receive accounts before settlement. This fee is separate from refundable auction support. Its miner share goes to the proposal's inclusion miner; no further fee is deducted from payouts. An optional extra is a quote-builder input, not a separately signed amount. Empty or full blocks do not change the governed minimum rate. Allocation conserves each fee exactly, including rounding.
+The entire signed fee is charged. If an earlier transaction has already created a transfer recipient, its creation weight and required minimum can fall but the signed payment stays unchanged. Grant proposal execution weight is fixed per recipient, whether or not that account exists. The proposal fee is not refunded when a grant loses or never activates, or when recipients receive accounts before settlement. This fee is separate from refundable auction support. Its miner share goes to the proposal's inclusion miner; no further fee is deducted from payouts. An optional extra is a quote-builder input, not a separately signed amount. The minimum rate can be zero. Empty or full blocks do not change it. Allocation conserves each fee exactly, including rounding.
 
-Node policy selects executable transactions by miner fee per weight, respecting nonce dependencies. At a zero miner share, fee-ranking ties use transaction IDs. Other valid transaction selections remain consensus-valid. The governed body limit also bounds transaction weight, including prepaid grant execution, and new mining-account weight. Only mandatory grant settlement writes are exempt from this weight limit; their number was bounded by the proposal’s admitted bytes and prepaid execution weight. There is no separate recipient-count limit. A complete signed proposal may use the including block’s available byte and weight capacity. There is no separate transaction-size setting. Maintained presets start with 16 KiB of capacity; governance may change it within the implementation’s 32 MiB record ceiling. Block framing and any mining-account creation also consume capacity. During governance, one logical payment-account creation counts once.
+Node policy selects executable transactions by miner fee per weight, respecting nonce dependencies. At a zero miner share, fee-ranking ties use transaction IDs. Other valid transaction selections remain consensus-valid. The governed body limit also bounds transaction weight, including prepaid grant execution, and new mining-account weight. Only mandatory grant settlement writes are exempt from this weight limit; their number was bounded by the proposal’s admitted bytes and prepaid execution weight. There is no separate recipient-count limit. A complete signed proposal may use the including block’s available byte and weight capacity. There is no separate transaction-size setting. Maintained presets start with 16 KiB of capacity; governance can set a different representable capacity. Transport and API admission apply separate resource limits. Block framing and any mining-account creation also consume capacity. During governance, one logical payment-account creation counts once.
 
 ## 9 Scheduled time, timestamps and difficulty
 
@@ -236,4 +239,4 @@ Signed transaction data is raw bytes. Chat interprets readable UTF-8 and Mail de
 
 Browser wallets sign locally and trust their serving origin. Keys stored in browser storage are unencrypted. Peer authentication and consensus validation do not establish application privacy, independent participation, economic stability or a guarantee against manipulation. HASH represents expected-work issuance rather than stable external purchasing power. Governance compares an internal stash/hash price, not an independently measured public benefit.
 
-Implementation 0.36.0 accepts protocol 26 configurations and records. A database must use its exact genesis configuration. The specified chain and transaction domains bind compact records and signed application data to that protocol and network.
+Implementation 0.37.0 accepts protocol 27 configurations and records. A database must use its exact genesis configuration. The existing `v26` hash-domain strings and record layout remain unchanged. Protocol 27 is included in the genesis configuration and therefore changes chain identity; signed transactions bind that identity.

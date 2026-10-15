@@ -1,7 +1,7 @@
 """Atomic rejection and replay accounting on an already funded isolated testnet.
 
 Uses only the fixture's mining key files. It does not create/stop nodes or contact
-any network other than the explicit manifest. Requires protocol26 and no pending
+any network other than the explicit manifest. Requires protocol27 and no pending
 transactions. Ordinary, conditional and governance accounting is checked through
 the reserve audit's independent supply reconciliation.
 """
@@ -25,7 +25,7 @@ def main():
     manifest = json.loads(args.manifest.read_text(encoding='utf-8-sig'))
     nodes = manifest['nodes']
     audit = ReserveAudit(manifest)
-    assert audit.config['protocol_version'] == 26
+    assert audit.config['protocol_version'] == 27
     directory = Path(manifest['directory']) / ('economic-adversarial-' + str(time.time_ns()))
     directory.mkdir()
     started, checks = (time.monotonic(), [])

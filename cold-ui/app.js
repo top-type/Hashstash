@@ -178,7 +178,6 @@
     await api('cancel');
     const file = $('unsigned-file').files[0];
     if (!file) return;
-    if (file.size > 2 * 32 * 1024 * 1024 + 128 * 1024) throw new Error('Unsigned transaction file exceeds the record limit');
     $('unsigned').value = await file.text();
   }));
   $('review-form').addEventListener('submit', event => {

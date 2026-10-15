@@ -1,5 +1,5 @@
 use crate::{codec, config::Config, crypto, fees, math, state::*, types::*};
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use num_traits::Zero;
 use std::collections::BTreeMap;
 
@@ -313,7 +313,7 @@ fn transaction_inner(
                     parameter,
                     old,
                     new,
-                } => c.parameter_change(&s.frozen, *parameter, *old, *new)?,
+                } => c.parameter_change_at(&s.frozen, *parameter, *old, *new, s.clock)?,
             }
             let id = proposal_id(&s.chain_id, *round, description, proposal);
             ensure!(
@@ -438,8 +438,8 @@ pub fn replenish_reserve(c: &Config, w: &mut World) -> Result<()> {
 /// Spendable cash plus backing above the mandatory retained reserve.
 pub fn grant_capacity(c: &Config, w: &World) -> Amount {
     &w.revenue
-        + if w.reserve > c.reserve_min {
-            &w.reserve - &c.reserve_min
+        + if w.reserve > c.reserve_min.clone().max(Amount::from(1u32)) {
+            &w.reserve - c.reserve_min.clone().max(Amount::from(1u32))
         } else {
             Amount::zero()
         }
@@ -520,17 +520,35 @@ fn eligible(c: &Config, s: &State, p: &Proposal) -> Result<()> {
             parameter,
             old,
             new,
-        } => c.parameter_change(&s.frozen, *parameter, *old, *new)?,
+        } => {
+            let resolution = rounded_deadline(s.clock, s.frozen.duration, s.frozen.interval)?;
+            let activation = rounded_deadline(resolution, s.frozen.rest, s.frozen.interval)?;
+            c.parameter_change_at(&s.frozen, *parameter, *old, *new, activation)?;
+        }
     }
     Ok(())
 }
-fn rest(s: &mut State, pending: Option<(Parameter, u64)>) {
+pub(crate) fn rounded_deadline(clock: u64, duration: u64, interval: u64) -> Result<u64> {
+    ensure!(interval > 0, "zero schedule interval");
+    let elapsed = duration
+        .div_ceil(interval)
+        .checked_mul(interval)
+        .context("rounded schedule overflow")?;
+    clock
+        .checked_add(elapsed)
+        .context("schedule deadline overflow")
+}
+fn rest(s: &mut State, pending: Option<(Parameter, u64)>) -> Result<()> {
     s.phase = Phase::Rest(Rest {
-        until: s.clock + s.frozen.rest,
+        until: s
+            .clock
+            .checked_add(s.frozen.rest)
+            .context("rest deadline overflow")?,
         pending,
     });
+    Ok(())
 }
-fn timeout(s: &mut State, round: u64) {
+fn timeout(s: &mut State, round: u64) -> Result<()> {
     s.rounds.insert(
         round.to_be_bytes().to_vec(),
         RoundRecord {
@@ -539,7 +557,7 @@ fn timeout(s: &mut State, round: u64) {
         },
     );
     s.ranking = crate::tree::Map::new();
-    rest(s, None);
+    rest(s, None)
 }
 fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
     let Phase::Auction(mut a) = s.phase.clone() else {
@@ -564,7 +582,9 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
         && s.clock - a.lead_since >= s.frozen.lead
     {
         let p = s.proposals.get(&id).unwrap().clone();
-        if eligible(c, s, &p.action).is_ok() {
+        let schedule_valid = rounded_deadline(s.clock, s.frozen.duration, s.frozen.interval)
+            .and_then(|resolution| rounded_deadline(resolution, s.frozen.rest, s.frozen.interval));
+        if schedule_valid.is_ok() && eligible(c, s, &p.action).is_ok() {
             if s.budget_start.is_none() {
                 s.budget_start = Some(s.clock);
                 let r = s.world.reserve.clone();
@@ -630,7 +650,7 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
         }
     }
     if s.clock - a.opened >= c.auction_timeout_for(&s.frozen)? {
-        timeout(s, a.round);
+        timeout(s, a.round)?;
     }
     Ok(())
 }
@@ -731,7 +751,11 @@ fn resolve(c: &Config, s: &mut State) -> Result<bool> {
         bail!("resolution outside governance");
     };
     let pass = s.alternative.as_ref().unwrap();
-    let excess = s.clock - (d.started + d.duration);
+    let end = d
+        .started
+        .checked_add(d.duration)
+        .context("decision deadline overflow")?;
+    let excess = s.clock.checked_sub(end).context("decision has not ended")?;
     let pass_score =
         &pass.price_integral - pass.quote(c) * Amount::from(excess) - &d.start_integral;
     let fail_score =
@@ -761,7 +785,7 @@ fn resolve(c: &Config, s: &mut State) -> Result<bool> {
         s.budgets.insert(d.budget_epoch.to_be_bytes().to_vec(), b);
     }
     // Clear the conditional context before interpreting a paid recipient's settled balance.
-    rest(s, None);
+    rest(s, None)?;
     if won {
         match d.proposal {
             Proposal::Grant { payments } => {
@@ -777,7 +801,7 @@ fn resolve(c: &Config, s: &mut State) -> Result<bool> {
             Proposal::Parameter { parameter, new, .. } => pending = Some((parameter, new)),
         }
     }
-    rest(s, pending);
+    rest(s, pending)?;
     Ok(won)
 }
 
@@ -877,20 +901,22 @@ pub(crate) fn prepare_block(
     }
     if let Some(start) = s.budget_start {
         let epoch = (s.clock - start) / c.budget_period;
-        // A short budget period can cross more than one epoch in one block.
-        // Keep the history contiguous without granting carry-over spending.
-        // With intervals <= 60 and periods > 1 this creates at most 30 entries.
-        for next in s.budget_epoch + 1..=epoch {
+        // Epochs skipped by a long block interval had no opportunities to spend.
+        // Materialize only the newly visited epoch; retain past reservation records.
+        if epoch > s.budget_epoch {
             let reserve = if let Some(w) = &parent.alternative {
                 parent.world.reserve.clone().min(w.reserve.clone())
             } else {
                 parent.world.reserve.clone()
             };
-            new_budget(c, &mut s, next, &reserve);
+            new_budget(c, &mut s, epoch, &reserve);
         }
     }
     if let Phase::Governance(d) = &parent.phase
-        && s.clock >= d.started + d.duration
+        && s.clock
+            >= d.started
+                .checked_add(d.duration)
+                .context("decision deadline overflow")?
     {
         resolve(c, &mut s)?;
     }
@@ -967,11 +993,11 @@ pub(crate) fn finish_block(
     }
     each_world(&mut s, |w, _| replenish_reserve(c, w))?;
     auction(c, &mut s, parent_hash)?;
-    if let Phase::Rest(r) = &parent.phase
+    if let Phase::Rest(r) = &s.phase
         && s.clock >= r.until
     {
         if let Some((p, v)) = r.pending {
-            c.parameter_change(&parent.frozen, p, parent.frozen.get(p), v)?;
+            c.parameter_change_at(&parent.frozen, p, parent.frozen.get(p), v, s.clock)?;
             s.settings.set(p, v);
         }
         c.validate_governance_settings(&s.settings)?;
@@ -1346,6 +1372,8 @@ mod reserve_model_tests {
     #[test]
     fn initial_rest_defers_governance_but_not_trading_and_opens_round_zero() {
         let mut c = config();
+        c.budget_numerator = 1;
+        c.budget_denominator = 4;
         c.initial.rest = 2 * c.initial.interval + 1;
         c.validate().unwrap();
         let mut s = advance(&c, &State::genesis(&c), 1000, &[]);
@@ -1645,7 +1673,7 @@ mod reserve_model_tests {
             (
                 Amount::zero(),
                 Amount::from(200_000u32),
-                Amount::from(1u32) << c.money_bits as usize,
+                Amount::from(1u32) << (c.money_bits + 64) as usize,
             ),
         ] {
             let mut corrupt = opened.clone();
@@ -1661,8 +1689,12 @@ mod reserve_model_tests {
         }
     }
     #[test]
-    fn grant_caps_remain_independent_and_legacy_limits_still_reject() {
-        let c = config();
+    fn grant_caps_remain_independent_and_explicit_limits_still_reject() {
+        let mut c = config();
+        c.grant_numerator = 1;
+        c.grant_denominator = 10;
+        c.budget_numerator = 1;
+        c.budget_denominator = 4;
         let s = funded_curve(&c);
         assert!(eligible(&c, &s, &grant(80_000)).is_ok());
         assert!(

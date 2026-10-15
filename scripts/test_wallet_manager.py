@@ -70,7 +70,7 @@ def main():
         configuration_path = directory / 'devnet.json'
         cli('init', '--config', configuration_path)
         configuration = json.loads(configuration_path.read_text(encoding='utf-8'))
-        assert configuration['protocol_version'] == 26
+        assert configuration['protocol_version'] == 27
         fee_fields = {'extra_fee': '0'}
         configuration['network'] = 'wallet-manager-' + uuid.uuid4().hex
         configuration['genesis_time'] = int(time.time()) - 10000

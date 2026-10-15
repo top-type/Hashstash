@@ -10,7 +10,7 @@ const walk = node => [node,...(node.children||[]).flatMap(walk)];
 const hash = value => BigInt(value).toString(16).padStart(64,'0');
 async function setup(options = {}) {
   const h = await harness({chat:true,...options}), s=h.currentSnapshot;
-  s.config.protocol_version=26; s.status.settings.block_bytes=16384;
+  s.config.protocol_version=27; s.status.settings.block_bytes=16384;
 
   s.status.fee_policy={minimum_fee_rate:'1',fee_scale:1024,account_weight:1024};
   h.feed={chain_id:s.status.chain_id,tip:s.status.tip,height:s.status.height,ready:true,items:[],pending:[],next_cursor:null,message_bytes:16384};
@@ -178,7 +178,8 @@ async function run() {
   }
   {
     const h=await setup();h.feed.items=[h.message({text:'é'.repeat(16384)})];await h.feedRefresh();equal(h.get('chat-messages').children.length,1,'historical plaintext remains readable even above the current governed block capacity');
-    for(const invalid of [{text:' '},{text:'a\u0000b'},{text:'a\u0085b'},{text:'\ud800'},{text:'a'.repeat(32*1024*1024+1)},{sender:'<script>'},{amount:'-1'},{amount:'0',asset:'bitcoin'},{amount:null,asset:'hash'},{position:null},{position:'18446744073709551616'}, {kind:'<script>'}]){
+    h.feed.items=[h.message({text:'a'.repeat(32*1024*1024+1)})];await h.feedRefresh();equal(h.get('chat-messages').children.length,1,'historical messages above32MiB remain readable');
+    for(const invalid of [{text:' '},{text:'a\u0000b'},{text:'a\u0085b'},{text:'\ud800'},{sender:'<script>'},{amount:'-1'},{amount:'0',asset:'bitcoin'},{amount:null,asset:'hash'},{position:null},{position:'18446744073709551616'}, {kind:'<script>'}]){
       h.feed.items=[h.message(invalid)];await h.feedRefresh();ok(h.get('chat-status').textContent.includes('Messages unavailable'),'malformed message metadata is rejected');
     }
     h.feed.items=Array.from({length:21},(_,n)=>h.message({txid:hash(n)}));await h.feedRefresh();ok(h.get('chat-status').textContent.includes('Messages unavailable'),'oversized pages are rejected');

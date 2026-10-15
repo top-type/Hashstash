@@ -48,7 +48,7 @@ fn address_aliases_cannot_bypass_quotas_and_peer_limits_do_not_apply_to_rpc() {
     }
     assert!(guard.tracked_addresses() <= network_guard::MAX_TRACKED_IPS);
     assert!(guard.admit(mapped, Surface::Peer).is_err());
-    let byte_burst = 2 * hashstash::config::MAX_BLOCK_RECORD_BYTES + 2 * 1024 * 1024;
+    let byte_burst = 66 * 1024 * 1024;
     assert!(held[0].bytes(byte_burst + 1).is_err());
     assert!(held[1].request().is_err());
     assert!(guard.admit(ipv4, Surface::Rpc).is_ok());

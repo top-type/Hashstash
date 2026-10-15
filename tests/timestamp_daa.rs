@@ -477,7 +477,7 @@ fn time_policies_preserve_nominal_duration_at_different_intervals() {
 }
 
 #[test]
-fn multiple_budget_boundaries_in_one_block_keep_complete_history() {
+fn multiple_budget_boundaries_materialize_only_visited_epochs() {
     let mut c = config();
     c.budget_period = 2;
     let mut s = State::genesis(&c);
@@ -518,12 +518,14 @@ fn multiple_budget_boundaries_in_one_block_keep_complete_history() {
     }
     assert!(s.budget_start.is_some());
     let old_epoch = s.budget_epoch;
+    let old_records = s.budgets.len();
     s.settings.interval = 60;
     s.frozen.interval = 60;
     s = consensus::execute(&c, &s, &s.root(), &miner(), &1000u32.into(), &[]).unwrap();
     s.audit(&c).unwrap();
     assert_eq!(s.budget_epoch, old_epoch + 30);
-    assert_eq!(s.budgets.len() as u64, s.budget_epoch + 1);
+    assert_eq!(s.budgets.len(), old_records + 1);
+    assert!(s.budgets.get(&old_epoch.to_be_bytes()).is_some());
 }
 
 #[test]

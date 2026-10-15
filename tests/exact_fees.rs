@@ -192,9 +192,9 @@ fn invalid_transfer_operations_are_rejected_atomically_and_direct_data_is_bound(
 }
 
 #[test]
-fn empty_blocks_preserve_positive_governed_rate_at_the_u64_boundary() {
+fn empty_blocks_preserve_every_governed_rate_including_zero() {
     let mut c = config();
-    for rate in [1, 2, 1024, u64::MAX] {
+    for rate in [0, 1, 2, 1024, u64::MAX] {
         c.initial.minimum_fee_rate = rate;
         c.validate().unwrap();
         let mut s = State::genesis(&c);
@@ -210,7 +210,7 @@ fn empty_blocks_preserve_positive_governed_rate_at_the_u64_boundary() {
         );
     }
     c.initial.minimum_fee_rate = 0;
-    assert!(c.validate().is_err());
+    c.validate().unwrap();
 }
 
 #[test]

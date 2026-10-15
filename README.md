@@ -2,7 +2,7 @@
 
 Hashstash is a proof-of-work blockchain with two kinds of holdings: **hashes**, which you can spend, and **stash**, which you obtain by depositing hashes into a shared reserve. Its governance system uses trading in two possible outcomes—PASS and FAIL—to decide grants and changes to network settings.
 
-This repository contains the node, browser wallet, explorer, messaging tools and optional faucet and mixer services. The current version is **0.36.0**, implementing protocol **26**. It is experimental software; its security and economic design have not received a complete independent audit.
+This repository contains the node, browser wallet, explorer, messaging tools and optional faucet and mixer services. The current version is **0.37.0**, implementing protocol **27**. It is experimental software; its security and economic design have not received a complete independent audit.
 
 ## How it works
 
@@ -49,7 +49,7 @@ The browser **Wallet** creates or imports keys, displays balances and signs tran
 
 ## Build and run
 
-Use a Rust toolchain supporting edition 2024, a C compiler and linker, Node.js 20.19 or newer, and Python 3.12. Windows launchers require PowerShell 7. Keep the committed lockfiles when building.
+Use a 64-bit target with a Rust toolchain supporting edition 2024, a C compiler and linker, Node.js 20.19 or newer, and Python 3.12. Windows launchers require PowerShell 7. Keep the committed lockfiles when building.
 
 ```text
 cargo build --release --locked --bins

@@ -1,0 +1,29 @@
+# Reserve and revenue
+
+The shared reserve backs stash withdrawals. Every stash unit belongs to an account. Waiting revenue is a separate hash buffer governed through proposals.
+
+## Curve state
+
+For reserve R, stash supply S and curve mass M, the reserve ratio is r = R/M and marginal price is M/S. A deposit into an empty reserve starts with M = R and S = deposit × Config.share_scale, giving a flat curve. Ordinary buys and sells follow the current ratio; grants reduce reserve without reducing mass, and revenue replenishes reserve without increasing mass. Accounts keep their stash quantities through those protocol movements.
+
+A grant drawn from reserve reduces withdrawal backing while preserving the marginal price at that moment. A grant covered entirely by waiting revenue leaves the curve unchanged. The specification gives the ideal trade formulas and deterministic rounding rules.
+
+## Waiting revenue
+
+Each transaction signs its exact fee. The governed miner percentage splits the entire fee, including any extra: the miner receives the rounded-down percentage and revenue receives the remainder. The initial split is 50/50. Winning auction bids also become revenue. These are transfers of existing hashes, not issuance.
+
+Each block's revenue-processing step replenishes the reserve by min(waiting revenue, M - R). This moves the ratio toward 100% without changing the marginal price. Excess revenue stays in the waiting buffer; a flat curve consumes none.
+
+## Grants and governance
+
+A grant lists distinct recipients and a positive hash amount for each. The proposal’s block-byte and block-weight limits bound the list; there is no separate recipient-count limit. The combined amount must satisfy current reserve, maximum grant fraction and budget-period checks when activated. PASS immediately escrows that total, using waiting revenue first and reserve for any shortfall. Mass and stash supply do not change. FAIL retains its own funds.
+
+Only a passing decision pays the recipients, together and once, from escrow. Each receives the exact listed amount. The proposal transaction pays a fixed execution charge per recipient in advance; no settlement fee is deducted from their payouts. FAIL discards the alternate debit and escrow together. Fees received during a decision act separately in each world, and settlement keeps only the selected world's reserve, curve mass, waiting revenue and account balances.
+
+Governance compares full-window averages of M/S. Exact equality resolves FAIL. If both curves stay flat at the same price, trades cannot separate those averages. This is part of the mechanism, not a guarantee of grant approval or economically sound decisions.
+
+## RPC and conservation
+
+Status and governance expose `reserve`, `shares`, `curve_mass`, `revenue` and `grant_capacity`; each governance world also exposes `grant_escrow`. Grant capacity is waiting revenue plus reserve above the retained minimum; individual grant and budget limits apply separately. Revenue is the waiting amount outside reserve; it has no account view. Curve mass is price state, not an additional hash balance. Each outcome separately conserves account hashes + reserve + revenue + grant escrow + live auction escrow/refunds = issued hashes. Never add PASS and FAIL balances together.
+
+The RPC quote and browser display use the current world's curve, including its ratio. Integer consensus execution conservatively rounds deposit issuance, retained reserve and mass; see [CONSENSUS.md](CONSENSUS.md) and [the specification](SPECIFICATION.md).

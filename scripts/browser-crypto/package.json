@@ -1,0 +1,8 @@
+{
+  "name": "hashstash-browser-crypto-build",
+  "private": true,
+  "type": "module",
+  "scripts": { "build": "node build.mjs" },
+  "dependencies": { "@noble/curves": "2.4.0", "@noble/hashes": "2.4.0" },
+  "devDependencies": { "esbuild": "0.28.2" }
+}

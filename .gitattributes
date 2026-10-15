@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.sh text eol=lf
+deploy/linux/* text eol=lf
+# Preserve exact bytes of checksummed assets and interoperability fixtures.
+ui/vendor/noble.js -text
+tests/data/** -text
+tests/fixtures/** -text

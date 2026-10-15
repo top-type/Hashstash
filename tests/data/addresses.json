@@ -1,0 +1,22 @@
+[
+  {
+    "chain_id": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+    "public_key": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "address": "hsh000102030405060710xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqfmc46h"
+  },
+  {
+    "chain_id": "0000000000000000000000000000000000000000000000000000000000000000",
+    "public_key": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+    "address": "hsh00000000000000001lycg5qvjtrp3qjf5f7zl382j9x6nrjz9sdhenvyxq8c3808qxmuscfm6tn"
+  },
+  {
+    "chain_id": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "public_key": "98611bd68fd0c08b2dec51c1bfd6d7141fb5b6f27aceb8541c8dfcca836a18c5",
+    "address": "hshffffffffffffffff1nps3h4506rqgkt0v28qml4khzs0mtdhj0t8ts4qu3h7v4qm2rrzs0xq7as"
+  },
+  {
+    "chain_id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "public_key": "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "address": "hsh0123456789abcdef10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqn4qkvk"
+  }
+]

@@ -1,0 +1,192 @@
+'use strict';
+
+// Full UI with the real local wallet/crypto modules in independent VM browsers.
+// Only DOM and public RPC transport are doubled; no node wallet endpoint exists.
+const assert = require('node:assert/strict');
+const {createHash} = require('node:crypto');
+const {harness,response,settle,addr,deferred} = require('./test_wallet_ui.cjs');
+const sha = bytes => createHash('sha256').update(bytes).digest();
+const integer = (value,size) => { let n=BigInt(value); const b=Buffer.alloc(size); for(let i=0;i<size;i++){b[i]=Number(n&255n);n>>=8n;} return b; };
+const compact = value => { const n=BigInt(value);return n<251n?integer(n,1):n<=0xffffn?Buffer.concat([integer(251,1),integer(n,2)]):n<=0xffffffffn?Buffer.concat([integer(252,1),integer(n,4)]):Buffer.concat([integer(253,1),integer(n,8)]); };
+const vector = bytes => Buffer.concat([compact(bytes.length),bytes]);
+const amount = value => {let n=BigInt(value),out=[];while(n){out.push(Number(n&255n));n>>=8n;}return vector(Buffer.from(out));};
+const bytes = value => typeof value==='string'?Buffer.from(value,'hex'):Buffer.from(value);
+
+// Independent Rust bincode layout for a current exact transfer, including opaque data.
+function prepare(chain, p) {
+  const tx=p.operation.TransferExact;
+  const inner=Buffer.concat([compact(0),bytes(tx.recipient),amount(tx.amount)]);
+  const data=Buffer.from(p.data_hex||'','hex');
+  const envelope=Buffer.concat([inner,vector(data)]);
+  return {format:'hashstash-unsigned-v1',body:Buffer.concat([bytes(chain),bytes(p.sender),compact(p.nonce),amount(p.fee),compact(p.expiry_height),envelope]).toString('hex')};
+}
+function fee(h,p) {
+  const {chain_id,tip,state_root,height}=h.currentSnapshot.status, priority=p.extra_fee||'0';
+  const paid=1n+BigInt(priority),miner=paid/2n;return {miner_fee_percent:50,miner_fee:String(miner),revenue_fee:String(paid-miner),chain_id,tip,state_root,height,sender:addr(p.sender),sender_public_key:p.sender,fee:String(1n+BigInt(priority)),minimum_fee:'1',account_creation_fee:'0',grant_recipient_fee:'0',extra_fee:priority,weight:'512',minimum_fee_rate:'1',pending:false,nonce:0,expiry_height:height+100,operation:p.operation,data_hex:p.data_hex||'',data_bytes:(p.data_hex||'').length/2};
+}
+async function setup(options={}) {
+  const h=await harness({realWallet:true,publicWeb:true,...options});
+  h.currentSnapshot.config.protocol_version=26;
+
+
+  h.currentSnapshot.status.settings.pass_margin_bps=0;
+
+
+
+  h.currentSnapshot.status.fee_policy={minimum_fee_rate:'1',fee_scale:1024,account_weight:1024};
+
+  h.handlers.fee_quote=p=>response({result:fee(h,p)});
+  h.handlers.transfer_quote=p=>{const f=fee(h,p);return response({result:{...f,recipient:addr(p.recipient),public_key:p.recipient,amount:p.amount,recipient_receives:p.amount,total_debit:String(BigInt(p.amount)+BigInt(f.fee))}});};
+  h.handlers.preparetransaction=p=>response({result:prepare(h.currentSnapshot.status.chain_id,p)});
+  h.handlers.broadcasttransaction=p=>response({result:{transaction_id:sha(sha(Buffer.from(p.raw,'hex'))).toString('hex')}});
+  await h.refresh(); return h;
+}
+async function fill(h,recipient,data='00ff80') {
+  const f=h.get('send-form');
+  f.elements.data_format.value='hex';await f.fire('change');
+  f.elements.recipient.value=addr(recipient);f.elements.amount.value='0.0000000000000001';f.elements.extra_fee.value='0.000000000000000003';f.elements.data_hex.value=data;
+  await f.fire('input');await h.timersDue();
+  assert.equal(h.get('send-submit').disabled,false,h.get('send-cost').textContent);
+  return f;
+}
+const broadcasts=h=>h.calls.filter(c=>c.body.method==='broadcasttransaction');
+async function run() {
+  let checks=0;
+  const a=await setup(),b=await setup();
+  assert.equal(a.location.hash,'#overview');checks++;
+  assert.equal(a.browserStore.snapshot().wallets.length,0,'server wallet fixture is never imported into browser');checks++;
+  assert.equal(b.browserStore.snapshot().wallets.length,0);checks++;
+  assert.equal(a.hasElement('test-mining'),false);checks++;
+  assert.equal(a.hasElement('guide-test-mining'),false);checks++;
+  for(const button of a.mineButtons){assert.equal(button.disabled,true);await button.click();checks++;}
+  assert.equal(a.calls.some(c=>c.body.method==='mine'),false);checks++;
+  await a.get('wallet-create').click();
+  const original=a.browserStore.snapshot(), alice=original.public_key;
+  assert.equal(original.wallets.length,1,a.get('wallet-feedback').textContent);checks++;
+  assert.equal(b.browserStore.snapshot().wallets.length,0);checks++;
+  await a.get('export-private').click();const aliceSecret=a.get('backup-private').value;
+  assert.match(aliceSecret,/^[0-9a-f]{64}$/);checks++;
+  assert.equal(a.browserApi.publicKey(aliceSecret),alice);checks++;
+  const bobSecret='0'.repeat(63)+'3'; // Published BIP340 test key, never a real wallet.
+  b.get('import-private-key').value=bobSecret;await b.get('wallet-import-form').requestSubmit();
+  const bob=b.browserStore.snapshot().public_key;
+  assert.equal(bob,b.browserApi.publicKey(bobSecret),b.get('wallet-feedback').textContent);checks++;
+  assert.equal(b.get('import-private-key').value,'');checks++;
+  assert.equal(a.browserStore.snapshot().public_key,alice);checks++;
+  a.get('watch-key').value=addr(bob);await a.get('watch-form').requestSubmit();
+  assert.equal(a.browserStore.snapshot().wallet_enabled,false);checks++;
+  assert.equal(a.browserStore.snapshot().wallets.length,2);checks++;
+  assert.equal(b.browserStore.snapshot().wallets.length,1);checks++;
+  await (await fill(a,alice)).requestSubmit();
+  assert.equal(a.get('unsigned-dialog').open,true,a.get('send-form').querySelector().textContent);checks++;
+  const watchEnvelope=JSON.parse(a.get('unsigned-output').value);
+  assert.equal(a.browserApi.decodeUnsigned(watchEnvelope).sender,bob);checks++;
+  assert.equal(broadcasts(a).length,0);checks++;
+  await a.chooseWallet(alice);
+  assert.equal(a.browserStore.snapshot().wallet_enabled,true);checks++;
+  await (await fill(a,bob)).requestSubmit();
+  assert.equal(broadcasts(a).length,1,a.get('send-form').querySelector().textContent);checks++;
+  const raw=Buffer.from(broadcasts(a)[0].body.params.raw,'hex'),body=raw.subarray(0,-64),signature=raw.subarray(-64);
+  assert.equal(raw.length,body.length+64);checks++;
+  const tag=sha(Buffer.from('Hashstash/Transaction/v26')),message=sha(Buffer.concat([tag,tag,body]));
+  assert.equal(a.noble.schnorr.verify(Uint8Array.from(signature),Uint8Array.from(message),Uint8Array.from(Buffer.from(alice,'hex'))),true);checks++;
+  const decoded=a.browserApi.decodeUnsigned({format:'hashstash-unsigned-v1',body:body.toString('hex')});
+  assert.equal(decoded.sender,alice);checks++;
+  assert.equal(decoded.operation.TransferExact.recipient,bob);checks++;
+  assert.equal(decoded.operation.TransferExact.amount,'100');checks++;
+  assert.equal(decoded.fee,'4');checks++;
+  assert.equal(Object.hasOwn(decoded,'extra_fee'),false);checks++;
+  assert.equal(decoded.data_hex,'00ff80');checks++;
+  assert.equal(decoded.nonce,'0');checks++;
+  assert.equal(decoded.expiry_height,'120');checks++;
+  a.handlers.preparetransaction=p=>response({result:prepare(a.currentSnapshot.status.chain_id,{...p,fee:'500'})});
+  await (await fill(a,bob)).requestSubmit();
+  assert.equal(broadcasts(a).length,1,'malicious prepared fee cannot be signed or broadcast');checks++;
+  assert.match(a.get('send-form').querySelector().textContent,/does not match/);checks++;
+  const pending=deferred();a.handlers.preparetransaction=()=>pending.promise;
+  const form=await fill(a,bob),sending=form.requestSubmit();await settle();
+  const req=a.calls.filter(c=>c.body.method==='preparetransaction').at(-1).body.params;
+  await a.browserStore.select(bob,{wallet_revision:a.browserStore.snapshot().wallet_revision});a.storageChanged();
+  pending.resolve(response({result:prepare(a.currentSnapshot.status.chain_id,req)}));await sending;
+  assert.equal(broadcasts(a).length,1,'selection change cancels pending signing');checks++;
+  assert.equal(b.browserStore.snapshot().public_key,bob);checks++;
+  const reloaded=await setup({savedStorage:a.savedStorage});
+  assert.equal(reloaded.browserStore.snapshot().public_key,bob);checks++;
+  assert.equal(reloaded.browserStore.snapshot().wallets.length,2);checks++;
+  assert.equal(reloaded.browserStore.snapshot().wallet_enabled,false);checks++;
+  // A watch export can be signed in the other independent browser holding its key.
+  const local=b.browserStore.snapshot(),signed=b.browserStore.signUnsigned(watchEnvelope,{chain_id:b.currentSnapshot.status.chain_id,sender:bob,nonce:'0',expiry_height:'120',operation:{TransferExact:{recipient:alice,amount:'100'}},protocol_version:26,fee:'4',data_hex:'00ff80',wallet_id:local.wallet_id,wallet_revision:local.wallet_revision});
+  reloaded.get('broadcast-raw').value=signed.raw;await reloaded.get('broadcast-form').requestSubmit();
+  assert.equal(broadcasts(reloaded).length,1);checks++;
+  for(const h of [a,b,reloaded]) {
+    const requests=JSON.stringify(h.calls);
+    assert.equal(requests.includes(aliceSecret),false,'generated private key never leaves browser');checks++;
+    assert.equal(requests.includes(bobSecret),false,'imported private key never leaves browser');checks++;
+    assert.equal(h.calls.some(c=>c.url.startsWith('/api/wallet')),false);checks++;
+    for(const c of h.calls.filter(c=>['fee_quote','transfer_quote','preparetransaction'].includes(c.body.method))) {assert.ok(c.body.params.sender);checks++;}
+  }
+  b.handlers.snapshot=params=>response({result:{...b.snapshotResult(params),status:{...b.currentSnapshot.status,chain_id:'a'.repeat(63)+'b'}}});
+  await b.refresh();
+  assert.equal(b.get('connection-label').textContent,'Offline','full chain mismatch fails even when its address fingerprint matches');checks++;
+  assert.equal(b.get('send-submit').disabled,true);checks++;
+  // Public text uses an ordinary Send transaction and the real browser signer.
+  {
+    const c=await setup({chat:true});
+    c.currentSnapshot.config.protocol_version=26;
+    c.handlers.explorer_chat=()=>response({result:{chain_id:c.currentSnapshot.status.chain_id,tip:c.currentSnapshot.status.tip,height:20,ready:true,items:[],pending:[],next_cursor:null}});
+    c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();await c.navigate('#send');
+    const f=c.get('send-form');f.elements.recipient.value=addr(alice);f.elements.amount.value='0.000000000000000001';f.elements.data_text.value='Public test message 🌱';await f.fire('input');await c.timersDue();
+    assert.equal(c.get('send-submit').disabled,false,c.get('send-cost').textContent);checks++;
+    assert.equal(c.hasElement('chat-form'),false,'feed has no separate transaction composer');checks++;
+    assert.equal(broadcasts(c).length,0);checks++;
+    await f.requestSubmit();assert.equal(broadcasts(c).length,1,f.querySelector().textContent);checks++;
+    const raw=Buffer.from(broadcasts(c)[0].body.params.raw,'hex'),body=raw.subarray(0,-64),envelope={format:'hashstash-unsigned-v1',body:body.toString('hex')},decoded=c.browserApi.decodeUnsigned(envelope);
+    assert.equal(decoded.operation.TransferExact.recipient,alice);checks++;
+    assert.equal(decoded.operation.TransferExact.amount,'1','public text has no special payment threshold');checks++;
+    assert.equal(decoded.fee,'1');checks++;
+    assert.equal(Buffer.from(decoded.data_hex,'hex').toString(),'Public test message 🌱');checks++;
+    const tag=sha(Buffer.from('Hashstash/Transaction/v26')),message=sha(Buffer.concat([tag,tag,body]));
+    assert.equal(c.noble.schnorr.verify(Uint8Array.from(raw.subarray(-64)),Uint8Array.from(message),Uint8Array.from(Buffer.from(bob,'hex'))),true);checks++;
+    const intent={chain_id:c.currentSnapshot.status.chain_id,sender:bob,nonce:'0',expiry_height:'120',operation:{Donate:{amount:'1',decision:null,outcome:null}},protocol_version:26,fee:'1',data_hex:''};
+    assert.throws(()=>c.browserApi.verifyUnsigned(envelope,intent),/unsupported fields/i);checks++;
+    assert.throws(()=>c.browserApi.verifyUnsigned(envelope,{...intent,protocol_version:intent.protocol_version+1}),/Unsupported/);checks++;
+    c.handlers.preparetransaction=p=>response({result:prepare(c.currentSnapshot.status.chain_id,{...p,operation:{TransferExact:{...p.operation.TransferExact,recipient:bob}}})});
+    f.elements.data_text.value='Do not redirect';await f.fire('input');await c.timersDue();await f.requestSubmit();
+    assert.equal(broadcasts(c).length,1,'redirected ordinary transfer is never signed');checks++;
+    assert.match(f.querySelector().textContent,/does not match/);checks++;
+  }
+  // The Mixer has its own route; preparing a deposit carries encrypted
+  // instructions into Send for explicit signing, without broadcasting itself.
+  {
+    const c=await setup({mixer:true});c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();
+    const pub=n=>Buffer.from(c.noble.schnorr.getPublicKey(Uint8Array.from(Buffer.from(BigInt(n).toString(16).padStart(64,'0'),'hex')))).toString('hex');
+    const custodian=pub(6),destinations=[addr(pub(8)),addr(pub(9))],terms={version:1,chain_id:c.currentSnapshot.status.chain_id,public_key:custodian,denomination_atoms:'100',service_fee_bps:100,payout_fee_cap_atoms:'2',minimum_deposits:2,confirmations:2,timeout_seconds:3600,max_addresses:8};
+    const termsId=sha(Buffer.from(JSON.stringify(Object.fromEntries(Object.keys(terms).sort().map(k=>[k,terms[k]]))))).toString('hex');
+    c.mixerTransport=()=>response({terms,terms_id:termsId,address:addr(custodian)});
+    assert.equal((c.mixerCalls||[]).length,0,'other app pages do not fetch mixer metadata');checks++;
+    await c.navigate('#mixer');for(let i=0;i<100&&!c.get('mixer-terms').textContent;i++)await new Promise(r=>setTimeout(r,5));
+    assert.equal(c.get('view-mixer').hidden,false);checks++;assert.equal(c.get('view-send').hidden,true);checks++;assert.ok(c.get('mixer-terms').textContent);checks++;
+    const f=c.get('mixer-form');f.elements.amount.value='0.00000000000000022';f.elements.addresses.value=destinations.join('\n');f.elements.trust.checked=true;await f.requestSubmit();
+    assert.equal(c.location.hash,'#send',c.get('mixer-feedback').textContent);checks++;assert.equal(c.get('view-send').hidden,false);checks++;
+    const send=c.get('send-form');assert.equal(send.elements.recipient.value,addr(custodian));checks++;assert.equal(send.elements.data_format.value,'private');checks++;assert.equal(send.elements.mail_subject.value,'hashstash.mix/1');checks++;assert.deepEqual(JSON.parse(send.elements.mail_body.value),{terms:termsId,addresses:destinations});checks++;
+    assert.equal(broadcasts(c).length,0,'review never broadcasts a deposit');checks++;
+    await c.timersDue();for(let i=0;i<100&&c.get('send-submit').disabled;i++)await new Promise(r=>setTimeout(r,5));assert.equal(c.get('send-submit').disabled,false,c.get('send-cost').textContent);checks++;
+    for(const destination of destinations){assert.equal(JSON.stringify(c.calls).includes(destination),false,'payout addresses are not disclosed in RPC before encryption');checks++;}
+    await send.requestSubmit();assert.equal(broadcasts(c).length,1,send.querySelector().textContent);checks++;
+    const raw=Buffer.from(broadcasts(c)[0].body.params.raw,'hex'),tx=c.browserApi.decodeUnsigned({format:'hashstash-unsigned-v1',body:raw.subarray(0,-64).toString('hex')});
+    assert.equal(tx.operation.TransferExact.recipient,custodian);checks++;assert.equal(tx.operation.TransferExact.amount,'220');checks++;assert.ok(tx.data_hex.length>0);checks++;
+    for(const destination of destinations){assert.equal(Buffer.from(tx.data_hex,'hex').includes(Buffer.from(destination)),false,'destination is inside authenticated ciphertext');checks++;}
+  }
+  // Fresh mixing destinations are local-only until explicitly selected. A
+  // periodic snapshot must not disclose the whole browser wallet collection.
+  {
+    const c=await setup();c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();const before=c.browserStore.snapshot(),start=c.calls.length;
+    const receiving=await c.browserStore.createReceiving(3,{chain_id:c.currentSnapshot.status.chain_id,wallet_id:before.wallet_id,wallet_revision:before.wallet_revision});await c.refresh();await settle();
+    assert.equal(c.browserStore.snapshot().wallet_id,before.wallet_id,'generating destinations keeps depositing wallet selected');checks++;
+    const requests=JSON.stringify(c.calls.slice(start));for(const key of receiving){assert.equal(requests.includes(key),false,'unselected receiving key never enters RPC');checks++;assert.equal(requests.includes(addr(key)),false,'unselected receiving address never enters RPC');checks++;}
+    const snapshots=c.calls.slice(start).filter(call=>call.body.method==='snapshot');assert.ok(snapshots.length>0);checks++;for(const request of snapshots){assert.deepEqual(request.body.params.keys,[before.public_key],'snapshot queries selected wallet only');checks++;}
+    const next=c.calls.length;await c.chooseWallet(receiving[0]);await c.refresh();const selectedRequests=JSON.stringify(c.calls.slice(next));assert.ok(selectedRequests.includes(receiving[0]),'explicit selection permits reading that account');checks++;for(const key of receiving.slice(1)){assert.equal(selectedRequests.includes(key),false,'selecting one destination does not reveal its siblings');checks++;}
+  }
+  console.log(`Browser wallet UI: ${checks} integration assertions passed.`);
+}
+run().catch(error=>{console.error(error);process.exitCode=1;});

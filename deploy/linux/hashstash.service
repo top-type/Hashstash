@@ -1,0 +1,37 @@
+[Unit]
+Description=Hashstash validating node (optional solo Stratum)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=hashstash
+Group=hashstash
+WorkingDirectory=/var/lib/hashstash
+ExecStart=/usr/local/libexec/hashstash/run-node.sh run
+Restart=on-failure
+RestartSec=5
+# The node handles Ctrl+C/SIGINT for a graceful listener shutdown.
+KillSignal=SIGINT
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/hashstash
+CapabilityBoundingSet=
+MemoryHigh=512M
+MemoryMax=1G
+# These are operator resource limits, not proof that every valid chain fits.
+# Monitor pressure/OOM restarts and raise them for measured legitimate demand.
+TasksMax=128
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SyslogIdentifier=hashstash
+
+[Install]
+WantedBy=multi-user.target

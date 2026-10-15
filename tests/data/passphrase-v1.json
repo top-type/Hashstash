@@ -1,0 +1,63 @@
+{
+  "scheme": "hashstash-passphrase-v1",
+  "tag": "Hashstash/Passphrase/v1",
+  "source": "Independent Python hashlib SHA256 plus integer secp256k1 point addition; public test secrets only, never fund these accounts.",
+  "vectors": [
+    {
+      "passphrase": "hashstash test vector",
+      "utf8_hex": "686173687374617368207465737420766563746f72",
+      "counter": 0,
+      "secret": "c7d0d2768696327e1880fe9e544814fc3e8f377b1320b3bd5762401eef923da0",
+      "public_key": "98611bd68fd0c08b2dec51c1bfd6d7141fb5b6f27aceb8541c8dfcca836a18c5"
+    },
+    {
+      "passphrase": " hashstash test vector",
+      "utf8_hex": "20686173687374617368207465737420766563746f72",
+      "counter": 0,
+      "secret": "4dfdbdde6dba5867ee8ef1fe48e3e1c63bb0511b7960dc90b0e734b0c2d90f6e",
+      "public_key": "7283d07bf7aa592a461199a0a24ec9201dfd4e877c160c43222844adbcbcda7c"
+    },
+    {
+      "passphrase": "hashstash test vector ",
+      "utf8_hex": "686173687374617368207465737420766563746f7220",
+      "counter": 0,
+      "secret": "eb067dd4899377597758d4659b54610e9cf3b4cd36e165d8fa2a8d81d3e84400",
+      "public_key": "c99a9340f4cec6f3b28c3162d86e88e6baac2d1209993d9a8b3e6c8af8120c50"
+    },
+    {
+      "passphrase": "hashstash  test vector",
+      "utf8_hex": "68617368737461736820207465737420766563746f72",
+      "counter": 0,
+      "secret": "fff1c35a32c139ab34680bfa4af53f55202e7bf7a1cd7baae53111f8db993cb9",
+      "public_key": "a07a99f3bebe133cfd5820c8bf43c22a5bb76855819ede2278a0d4e325a3e40a"
+    },
+    {
+      "passphrase": "café",
+      "utf8_hex": "636166c3a9",
+      "counter": 0,
+      "secret": "9626893b8b9a6890d0d77b4dc2dd64c90b3bd173046b36b6233a950d14a7d5f3",
+      "public_key": "afeb0c946fc17bd230f1fbb9a5c37aa6a19d763795d8904749487008c2bc4d90"
+    },
+    {
+      "passphrase": "café",
+      "utf8_hex": "63616665cc81",
+      "counter": 0,
+      "secret": "2a1bb509f5455b9df23715ba3b0fc30759808faa54e04b25b388128e75de344a",
+      "public_key": "b74608ac0e49e650949ccb2ee2b6a7f0378807d5cceef2a83520e344e9784503"
+    },
+    {
+      "passphrase": "หิมะ 🔑",
+      "utf8_hex": "e0b8abe0b8b4e0b8a1e0b8b020f09f9491",
+      "counter": 0,
+      "secret": "1af55462d781a02b85863f427ac55caf4dad1a85f0f115df2b97020230cca2c3",
+      "public_key": "a29dc3419d415ca74d46a683d1a391e1aa06368db07dc6eccbb9b3713eaf7386"
+    },
+    {
+      "passphrase": "\tleading and trailing\t",
+      "utf8_hex": "096c656164696e6720616e6420747261696c696e6709",
+      "counter": 0,
+      "secret": "796398d871c83817454cbdcee9d4eb14ebf995008de246bb338148436489de4d",
+      "public_key": "952b20563e23e6249bcd6e762d1a13359ce43555fad4173dc49f6fe911989853"
+    }
+  ]
+}

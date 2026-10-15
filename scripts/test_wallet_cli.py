@@ -117,7 +117,7 @@ def main():
         cold_process, cold_base = start(options.cold, ['--port', '0'], 'cold', 'cold signer: (http://127\\.0\\.0\\.1:\\d+)/')
         status = rpc(base, 'status')
         assert status['time_unit'] == 'seconds'
-        check('Default CLI creates a canonical-only timestamp DAA network with scheduled-second phase progress')
+        check('Default CLI creates a timestamp DAA network with block-count decisions and scheduled-second auction/rest timing')
         _, session = request(base, '/api/session')
         assert session['wallet_mode'] == 'watch' and session['wallet_enabled'] is False
         assert session['public_key'] == vector['public_key']
@@ -130,7 +130,7 @@ def main():
         operation_file = directory / 'operation.json'
         operation_file.write_text(json.dumps(payment), encoding='utf-8')
 
-        def prepare(name, expiry=100):
+        def prepare(name, expiry=2):
             path = directory / name
             command = ['prepare', '--url', base + '/rpc', '--sender', vector['public_key'], '--operation-file', operation_file, '--expiry-blocks', expiry, '--out', path]
             cli(*command)

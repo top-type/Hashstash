@@ -139,7 +139,7 @@ enum Command {
         data_hex: Option<String>,
         #[arg(long)]
         nonce: Option<u64>,
-        /// Inclusion deadline: defaults to 2 blocks for trades, 100 otherwise.
+        /// Validity after the signed anchor block; defaults to 2 blocks.
         #[arg(long)]
         expiry_blocks: Option<u64>,
     },
@@ -166,7 +166,7 @@ enum Command {
         /// Optional uninterpreted bytes, encoded as hexadecimal.
         #[arg(long)]
         data_hex: Option<String>,
-        /// Inclusion deadline: defaults to 2 blocks for trades, 100 otherwise.
+        /// Validity after the signed anchor block; defaults to 2 blocks.
         #[arg(long)]
         expiry_blocks: Option<u64>,
         #[arg(long)]
@@ -592,7 +592,6 @@ fn verify_automatic_fee(
             .as_str()
             .context("missing minimum fee rate")?,
     )?;
-    ensure!(!price.is_zero(), "invalid minimum fee rate");
     ensure!(
         quoted("minimum_fee_rate")? == price,
         "fee setting changed while preparing; retry the transaction"
@@ -612,12 +611,6 @@ fn verify_automatic_fee(
         quoted("grant_recipient_fee")? == &price * grant_recipients,
         "invalid grant recipient fee quote"
     );
-    ensure!(
-        creation.is_zero()
-            || (creation == price
-                && matches!(&body.operation, Operation::TransferExact { recipient, .. } if *recipient != body.sender)),
-        "invalid account creation fee quote"
-    );
     let encoded_len = hashstash::codec::encode(&hashstash::types::Transaction {
         body: body.clone(),
         signature: [0; 64],
@@ -626,21 +619,38 @@ fn verify_automatic_fee(
     let grant_weight = grant_recipients
         .checked_mul(fees::ACCOUNT_WEIGHT)
         .context("grant weight overflow")?;
-    let weight = u64::try_from(encoded_len)?
+    let base_weight = u64::try_from(encoded_len)?
         .checked_add(grant_weight)
-        .and_then(|weight| {
-            weight.checked_add(if creation.is_zero() {
-                0
-            } else {
-                fees::ACCOUNT_WEIGHT
-            })
-        })
         .context("transaction weight overflow")?;
+    let reported_weight = quoted("weight")?;
+    // Account creation still consumes weight when its governed fee is zero.
+    // Infer its presence from the only two valid weights, then verify the fee.
+    let creates_account = reported_weight != Amount::from(base_weight);
+    let weight = if creates_account {
+        ensure!(
+            matches!(&body.operation, Operation::TransferExact { recipient, .. } if *recipient != body.sender),
+            "invalid account creation weight quote"
+        );
+        base_weight
+            .checked_add(fees::ACCOUNT_WEIGHT)
+            .context("transaction weight overflow")?
+    } else {
+        base_weight
+    };
+    ensure!(
+        creation
+            == if creates_account {
+                price.clone()
+            } else {
+                Amount::zero()
+            },
+        "invalid account creation fee quote"
+    );
     let minimum = (Amount::from(weight) * price + Amount::from(fees::FEE_SCALE - 1))
         / Amount::from(fees::FEE_SCALE);
     let exact = &minimum + extra;
     ensure!(
-        quoted("weight")? == Amount::from(weight)
+        reported_weight == Amount::from(weight)
             && quoted("minimum_fee")? == minimum
             && quoted("extra_fee")? == *extra
             && quoted("fee")? == exact
@@ -657,7 +667,8 @@ fn verify_prepared_body(
     sender: PublicKey,
     operation: &Operation,
     nonce: u64,
-    expiry_height: u64,
+    anchor: Hash,
+    expiry_blocks: u64,
     request: &Value,
 ) -> Result<()> {
     verify_prepared_data(body, request)?;
@@ -674,8 +685,8 @@ fn verify_prepared_body(
         "prepared transaction has another nonce"
     );
     ensure!(
-        body.expiry_height == expiry_height,
-        "prepared transaction has another expiry"
+        body.anchor == anchor && body.expiry_blocks == expiry_blocks,
+        "prepared transaction has another anchor or lifetime"
     );
     ensure!(
         body.operation == *operation,
@@ -687,6 +698,33 @@ fn verify_prepared_body(
             "prepared transaction has another fee"
         );
     }
+    Ok(())
+}
+
+fn verify_prepared_snapshot(body: &TransactionBody, quote: &Value, status: &Value) -> Result<()> {
+    let tip = node::parse_hash(status["tip"].as_str().context("missing status tip")?)?;
+    let height = status["height"].as_u64().context("invalid status height")?;
+    let expiry = height
+        .checked_add(body.expiry_blocks)
+        .context("expiry height overflow")?;
+    ensure!(
+        body.anchor == tip,
+        "prepared transaction has another anchor"
+    );
+    for field in ["chain_id", "tip", "state_root", "height"] {
+        ensure!(
+            !status[field].is_null() && quote[field] == status[field],
+            "preparation snapshot changed; refresh before preparing"
+        );
+    }
+    ensure!(
+        quote["anchor"].as_str() == Some(hex::encode(body.anchor).as_str())
+            && quote["anchor_height"].as_u64() == Some(height)
+            && quote["expiry_blocks"].as_u64() == Some(body.expiry_blocks)
+            && quote["expiry_height"].as_u64() == Some(expiry)
+            && quote["nonce"].as_u64() == Some(body.nonce),
+        "prepared transaction metadata differs from its signed anchor or lifetime"
+    );
     Ok(())
 }
 
@@ -712,7 +750,7 @@ async fn send_operation(
         expiry_blocks.unwrap_or_else(|| hashstash::wallet::default_expiry_blocks(&operation));
     ensure!(expiry_blocks > 0, "expiry blocks must be positive");
     let account = node::call_rpc(url, "account", json!({"key":hex::encode(sender)})).await?;
-    let height = status["height"].as_u64().context("invalid status height")?;
+    let anchor = node::parse_hash(status["tip"].as_str().context("missing status tip")?)?;
     let nonce = if let Some(n) = nonce {
         n
     } else {
@@ -742,15 +780,13 @@ async fn send_operation(
         }
         n
     };
-    let expiry_height = height
-        .checked_add(expiry_blocks)
-        .context("height overflow")?;
     let body: TransactionBody = {
         let mut request = fee_request;
         request["sender"] = json!(hex::encode(sender));
         request["operation"] = serde_json::to_value(&operation)?;
         request["nonce"] = json!(nonce);
-        request["expiry_height"] = json!(expiry_height);
+        request["anchor"] = json!(hex::encode(anchor));
+        request["expiry_blocks"] = json!(expiry_blocks);
         let response = node::call_rpc(url, "preparetransaction", request.clone()).await?;
         let quote = response.get("fee_quote").cloned().unwrap_or(Value::Null);
         let envelope = prepared_envelope(response)?;
@@ -761,9 +797,11 @@ async fn send_operation(
             sender,
             &operation,
             nonce,
-            expiry_height,
+            anchor,
+            expiry_blocks,
             &request,
         )?;
+        verify_prepared_snapshot(&body, &quote, &status)?;
         if request.get("fee").is_none() {
             verify_automatic_fee(
                 &body,
@@ -960,6 +998,8 @@ async fn main() -> Result<()> {
             add_requested_data(&mut request, data_hex)?;
             request["sender"] = json!(sender);
             request["operation"] = operation;
+            let anchor = node::parse_hash(status["tip"].as_str().context("missing status tip")?)?;
+            request["anchor"] = json!(hex::encode(anchor));
             request["expiry_blocks"] = json!(expiry_blocks);
             let automatic = request.get("fee").is_none();
             let response = node::call_rpc(&url, "preparetransaction", request.clone()).await?;
@@ -986,14 +1026,10 @@ async fn main() -> Result<()> {
                 "prepared transaction has another operation"
             );
             ensure!(
-                body.expiry_height
-                    == status["height"]
-                        .as_u64()
-                        .context("invalid status height")?
-                        .checked_add(expiry_blocks)
-                        .context("height overflow")?,
-                "prepared transaction has another expiry"
+                body.anchor == anchor && body.expiry_blocks == expiry_blocks,
+                "prepared transaction has another anchor or lifetime"
             );
+            verify_prepared_snapshot(&body, &quote, &status)?;
             if automatic {
                 verify_automatic_fee(
                     &body,
@@ -1168,17 +1204,8 @@ async fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &send_operation(
-                        &url,
-                        &key,
-                        operation,
-                        fee,
-                        extra_fee,
-                        data_hex,
-                        None,
-                        Some(100)
-                    )
-                    .await?
+                    &send_operation(&url, &key, operation, fee, extra_fee, data_hex, None, None)
+                        .await?
                 )?
             );
         }
@@ -1301,23 +1328,50 @@ mod tests {
             chain_id: [9; 32],
             sender,
             nonce: 4,
-            expiry_height: 25,
+            anchor: [38; 32],
+            expiry_blocks: 25,
             fee: 20u32.into(),
             operation: operation.clone(),
             data: vec![],
         };
         let request = json!({"fee":"20"});
         let check = |body: &TransactionBody| {
-            verify_prepared_body(body, [9; 32], sender, &operation, 4, 25, &request)
+            verify_prepared_body(body, [9; 32], sender, &operation, 4, [38; 32], 25, &request)
         };
         assert!(check(&body).is_ok());
-        for field in 0..7 {
+        let status = json!({"chain_id":hex::encode(body.chain_id),"tip":hex::encode(body.anchor),"height":20,"state_root":hex::encode([44;32])});
+        let mut snapshot_quote = status.clone();
+        snapshot_quote["anchor"] = json!(hex::encode(body.anchor));
+        snapshot_quote["anchor_height"] = json!(20);
+        snapshot_quote["expiry_blocks"] = json!(25);
+        snapshot_quote["expiry_height"] = json!(45);
+        snapshot_quote["nonce"] = json!(body.nonce);
+        assert!(verify_prepared_snapshot(&body, &snapshot_quote, &status).is_ok());
+        for (field, value) in [
+            ("chain_id", json!(hex::encode([8; 32]))),
+            ("tip", json!(hex::encode([8; 32]))),
+            ("state_root", json!(hex::encode([8; 32]))),
+            ("height", json!(21)),
+            ("anchor", json!(hex::encode([8; 32]))),
+            ("anchor_height", json!(21)),
+            ("expiry_blocks", json!(26)),
+            ("expiry_height", json!(46)),
+            ("nonce", json!(body.nonce + 1)),
+        ] {
+            let mut changed = snapshot_quote.clone();
+            changed[field] = value;
+            assert!(
+                verify_prepared_snapshot(&body, &changed, &status).is_err(),
+                "accepted altered {field}"
+            );
+        }
+        for field in 0..8 {
             let mut changed = body.clone();
             match field {
                 0 => changed.chain_id = [8; 32],
                 1 => changed.sender = crypto::public_key(&[8; 32]).unwrap(),
                 2 => changed.nonce += 1,
-                3 => changed.expiry_height += 1,
+                3 => changed.expiry_blocks += 1,
                 4 => changed.fee += 1u32,
                 5 => changed.data.push(1),
                 6 => {
@@ -1326,6 +1380,7 @@ mod tests {
                         proposal: [4; 32],
                     }
                 }
+                7 => changed.anchor[0] ^= 1,
                 _ => unreachable!(),
             }
             assert!(check(&changed).is_err());
@@ -1400,7 +1455,8 @@ mod tests {
             chain_id: [9; 32],
             sender,
             nonce: 4,
-            expiry_height: 25,
+            anchor: [38; 32],
+            expiry_blocks: 25,
             fee: 20u32.into(),
             operation: operation.clone(),
             data,
@@ -1409,7 +1465,10 @@ mod tests {
         for spelling in ["00AAFF", "00aAfF", "00aaff"] {
             let request = json!({"fee":"20","data_hex":spelling});
             verify_prepared_data(&body, &request).unwrap();
-            verify_prepared_body(&body, [9; 32], sender, &operation, 4, 25, &request).unwrap();
+            verify_prepared_body(
+                &body, [9; 32], sender, &operation, 4, [38; 32], 25, &request,
+            )
+            .unwrap();
             for changed in [
                 vec![0, 171, 255],
                 vec![0, 170],
@@ -1420,8 +1479,10 @@ mod tests {
                 let changed = make_body(changed);
                 assert!(verify_prepared_data(&changed, &request).is_err());
                 assert!(
-                    verify_prepared_body(&changed, [9; 32], sender, &operation, 4, 25, &request)
-                        .is_err()
+                    verify_prepared_body(
+                        &changed, [9; 32], sender, &operation, 4, [38; 32], 25, &request
+                    )
+                    .is_err()
                 );
             }
         }
@@ -1457,7 +1518,8 @@ mod tests {
                 chain_id: [9; 32],
                 sender,
                 nonce: 0,
-                expiry_height: 100,
+                anchor: [38; 32],
+                expiry_blocks: 100,
                 fee: 0u32.into(),
                 operation: Operation::TransferExact {
                     recipient,
@@ -1509,6 +1571,50 @@ mod tests {
                     verify_automatic_fee(&body, &altered, &status, &extra).is_err(),
                     "missing {field}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn cli_zero_fee_rate_preserves_creation_weight_and_exact_extra() {
+        let sender = crypto::public_key(&[7; 32]).unwrap();
+        let other = crypto::public_key(&[8; 32]).unwrap();
+        let status = json!({"fee_policy":{"minimum_fee_rate":"0"}});
+        for (recipient, creation_weight) in [(sender, 0), (other, 0), (other, 1024)] {
+            for extra in [0u32, 7] {
+                let body = TransactionBody {
+                    chain_id: [9; 32],
+                    sender,
+                    nonce: 0,
+                    anchor: [38; 32],
+                    expiry_blocks: 100,
+                    fee: extra.into(),
+                    operation: Operation::TransferExact {
+                        recipient,
+                        amount: 1u32.into(),
+                    },
+                    data: vec![],
+                };
+                let weight = hashstash::codec::encode(&hashstash::types::Transaction {
+                    body: body.clone(),
+                    signature: [0; 64],
+                })
+                .len() as u64
+                    + creation_weight;
+                let quote = json!({"minimum_fee_rate":"0","weight":weight.to_string(),
+                    "minimum_fee":"0","account_creation_fee":"0","grant_recipient_fee":"0",
+                    "extra_fee":extra.to_string(),"fee":extra.to_string()});
+                verify_automatic_fee(&body, &quote, &status, &extra.into()).unwrap();
+                for (field, value) in [
+                    ("weight", (weight + 1).to_string()),
+                    ("account_creation_fee", "1".into()),
+                    ("minimum_fee", "1".into()),
+                    ("fee", (extra + 1).to_string()),
+                ] {
+                    let mut changed = quote.clone();
+                    changed[field] = json!(value);
+                    assert!(verify_automatic_fee(&body, &changed, &status, &extra.into()).is_err());
+                }
             }
         }
     }
@@ -1570,7 +1676,8 @@ mod tests {
             sender: crypto::public_key(&[6; 32]).unwrap(),
             nonce: 0,
             fee: 0u32.into(),
-            expiry_height: 100,
+            anchor: [38; 32],
+            expiry_blocks: 100,
             data: vec![],
             operation: Operation::Propose {
                 round: 0,

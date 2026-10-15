@@ -15,7 +15,7 @@ from pathlib import Path
 import subprocess
 import time
 from test_network import rpc
-from test_reserve_network import ReserveAudit
+from test_reserve_network import Fork, ReserveAudit
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -72,7 +72,7 @@ def main():
     account = before[0]['account']['account']
     assert int(account['ordinary']) > 20
     recipient = nodes[1]['public_key']
-    body = {'chain_id': list(bytes.fromhex(status['chain_id'])), 'sender': list(bytes.fromhex(nodes[0]['public_key'])), 'nonce': account['nonce'], 'fee': '100', 'expiry_height': status['height'] + 100, 'operation': {'TransferExact': {'recipient': list(bytes.fromhex(recipient)), 'amount': '7'}}}
+    body = {'chain_id': list(bytes.fromhex(status['chain_id'])), 'sender': list(bytes.fromhex(nodes[0]['public_key'])), 'nonce': account['nonce'], 'fee': '100', 'anchor': list(bytes.fromhex(status['tip'])), 'expiry_blocks': 2, 'operation': {'TransferExact': {'recipient': list(bytes.fromhex(recipient)), 'amount': '7'}}}
     # Quote before constructing the exact signed fee; later recipient creation
     # may lower the minimum, but it never reduces that signed fee.
     terms = audit.payment_terms(body['operation'], 3)
@@ -84,8 +84,13 @@ def main():
     overdraft['fee'] = body['fee']
     bad_cases.append(('fee-after-transfer-overdraft', sign(overdraft, 'overdraft')))
     expired = copy.deepcopy(body)
-    expired['expiry_height'] = status['height'] - 1
+    old_block = rpc(nodes[0]['rpc_port'], 'explorer_block', {'height': status['height'] - 2, 'limit': 1})
+    expired['anchor'] = list(bytes.fromhex(old_block['block']['hash']))
+    expired['expiry_blocks'] = 1
     bad_cases.append(('expired', sign(expired, 'expired')))
+    unknown_anchor = copy.deepcopy(body)
+    unknown_anchor['anchor'] = [42] * 32
+    bad_cases.append(('unknown-anchor', sign(unknown_anchor, 'unknown-anchor')))
     wrong_chain = copy.deepcopy(body)
     wrong_chain['chain_id'][0] ^= 1
     bad_cases.append(('wrong-chain', sign(wrong_chain, 'wrong-chain')))
@@ -141,6 +146,25 @@ def main():
     assert all_snapshots() == after
     audit.assert_supply()
     check('The payment is included once, credits the exact amount, allocates its fee once and cannot be replayed after mining')
+    current = after[0]['status']
+    orphan_body = copy.deepcopy(body)
+    orphan_body.update(nonce=actual_sender['nonce'], anchor=list(bytes.fromhex(current['tip'])),
+                       expiry_blocks=10)  # Keep time open while isolating the wrong-branch failure.
+    orphaned = sign(orphan_body, 'orphan-anchor')
+    rpc(nodes[0]['rpc_port'], 'submittransaction', orphaned)
+    wait_pending(1)
+    with Fork(audit, current['height'] - 1, 'transaction-anchor') as fork:
+        fork.overtake(current['height'])
+        audit.agree()
+        wait_pending(0)
+        reorganized = all_snapshots()
+        assert reorganized[0]['status']['height'] <= current['height'] + orphan_body['expiry_blocks']
+        for node in nodes:
+            rejected(node['rpc_port'], orphaned)
+        assert all_snapshots() == reorganized
+        audit.assert_supply()
+        after = reorganized
+    check('A reorganization removes a pending transaction whose signed anchor is orphaned; rebroadcast cannot revive it before its lifetime ends')
     args.report.write_text(json.dumps({'passed': True, 'checks': checks, 'checks_passed': len(checks), 'duplicate_submissions': 48, 'invalid_peer_submissions': len(bad_cases) * 3, 'height': after[0]['status']['height'], 'state_root': after[0]['status']['state_root'], 'tip': after[0]['status']['tip'], 'node_sha256': hashlib.sha256(Path(manifest['executable']).read_bytes()).hexdigest(), 'elapsed_seconds': round(time.monotonic() - started, 3)}, indent=2) + '\n', encoding='utf-8')
     print('Saved ' + str(args.report), flush=True)
 if __name__ == '__main__':

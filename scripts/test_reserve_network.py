@@ -13,6 +13,14 @@ import subprocess
 import time
 from test_network import Audit, rpc
 
+
+def pass_leads(passed, failed, margin_bps):
+    """Compare M/S exactly; empty worlds have a zero price."""
+    pn, pd = (int(passed['curve_mass']), int(passed['shares'])) if int(passed['shares']) else (0, 1)
+    fn, fd = (int(failed['curve_mass']), int(failed['shares'])) if int(failed['shares']) else (0, 1)
+    return pn * fd * 10000 > fn * pd * (10000 + margin_bps)
+
+
 class Fork:
 
     def __init__(self, audit, height, label):
@@ -150,8 +158,7 @@ class ReserveAudit(Audit):
     def mine_counted(self):
         before, status = rpc(self.port, 'governance'), self.status()
         decision = before['phase']['Governance']
-        quote = lambda world: int(self.config['quote_scale']) * int(world['curve_mass']) // int(world['shares']) if int(world['shares']) else 0
-        leads = quote(before['pass']) * 10000 > quote(before['world']) * (10000 + before['frozen']['pass_margin_bps'])
+        leads = pass_leads(before['pass'], before['world'], before['frozen']['pass_margin_bps'])
         expected = decision['leading_blocks'] + int(leads)
         self.mine()
         after = rpc(self.port, 'governance')

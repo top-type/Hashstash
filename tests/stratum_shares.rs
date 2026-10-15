@@ -211,7 +211,8 @@ async fn compact_transaction_worker_roundtrip(mut c: Config, data: Vec<u8>) {
             sender: miner,
             nonce: 0,
             fee: 100u32.into(),
-            expiry_height: 100,
+            anchor: hashstash::codec::block_hash(&hashstash::codec::genesis_block(&c).unwrap()),
+            expiry_blocks: 100,
             operation: Operation::TransferExact {
                 recipient,
                 amount: 7u32.into(),

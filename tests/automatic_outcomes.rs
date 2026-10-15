@@ -31,7 +31,7 @@ fn step(c: &Config, s: &State, subsidy: u64, txs: &[Transaction]) -> State {
     s.audit(c).unwrap();
     s
 }
-fn sign(s: &State, secret: &[u8; 32], op: Operation) -> Transaction {
+fn sign(c: &Config, s: &State, secret: &[u8; 32], op: Operation) -> Transaction {
     support::sign_minimum(
         s,
         TransactionBody {
@@ -39,7 +39,8 @@ fn sign(s: &State, secret: &[u8; 32], op: Operation) -> Transaction {
             sender: key(secret),
             nonce: s.account(&key(secret), None).unwrap().nonce,
             fee: 100u64.into(),
-            expiry_height: s.height + 100,
+            anchor: hashstash::codec::block_hash(&hashstash::codec::genesis_block(c).unwrap()),
+            expiry_blocks: s.height + 100,
             operation: op,
             data: vec![],
         },
@@ -48,14 +49,14 @@ fn sign(s: &State, secret: &[u8; 32], op: Operation) -> Transaction {
     )
 }
 fn apply(c: &Config, s: &mut State, secret: &[u8; 32], op: Operation) -> Amount {
-    let tx = sign(s, secret, op);
+    let tx = sign(c, s, secret, op);
     let fee = fees::quote(c, s, &tx).unwrap().fee;
     consensus::apply_transaction(c, s, &tx).unwrap();
     s.audit(c).unwrap();
     fee
 }
 fn rejected(c: &Config, s: &mut State, secret: &[u8; 32], op: Operation) {
-    let tx = sign(s, secret, op);
+    let tx = sign(c, s, secret, op);
     let before = codec::encode(s);
     assert!(consensus::apply_transaction(c, s, &tx).is_err());
     assert_eq!(
@@ -88,10 +89,11 @@ fn sell(s: &State, outcome: Outcome, shares: Amount) -> Operation {
 }
 fn funded_curve(c: &Config) -> State {
     let mut s = step(c, &State::genesis(c), 1_000_000, &[]);
-    let tx = sign(&s, &OWNER, transfer(key(&SAVER), 10_000u32));
+    let tx = sign(c, &s, &OWNER, transfer(key(&SAVER), 10_000u32));
     s = step(c, &s, 1, &[tx]);
     for (secret, amount) in [(&OWNER, 800_000u32), (&SAVER, 9_999u32)] {
         let tx = sign(
+            c,
             &s,
             secret,
             Operation::Deposit {
@@ -115,6 +117,7 @@ fn funded_curve(c: &Config) -> State {
 fn activate(c: &Config, mut s: State) -> State {
     assert!(matches!(s.phase, Phase::Auction(_)));
     let tx = sign(
+        c,
         &s,
         &OWNER,
         Operation::Propose {
@@ -325,7 +328,7 @@ fn selected_world_settles_directly_and_next_decision_clones_it_again() {
             closing.common_spendable(&key(&OWNER)),
             Some(settled.ordinary)
         );
-        let invalid = sign(&s, &OWNER, buy(&s, winner, 1u32));
+        let invalid = sign(&c, &s, &OWNER, buy(&s, winner, 1u32));
         assert!(
             consensus::execute(&c, &s, &s.root(), &key(&MINER), &1u32.into(), &[invalid]).is_err()
         );
@@ -401,6 +404,7 @@ fn automatic_outcomes_grant_payment_reorg_and_reopen_are_exact() {
         append(&mut main, vec![], 100 + n);
     }
     let deposit = sign(
+        &c,
         main.tip_state(),
         &OWNER,
         Operation::Deposit {
@@ -413,6 +417,7 @@ fn automatic_outcomes_grant_payment_reorg_and_reopen_are_exact() {
     append(&mut main, vec![deposit], 150);
     let s = main.tip_state();
     let tx = sign(
+        &c,
         s,
         &OWNER,
         Operation::Propose {
@@ -438,7 +443,7 @@ fn automatic_outcomes_grant_payment_reorg_and_reopen_are_exact() {
     let mut fail = Chain::open(&dir.path().join("fail.sqlite"), c.clone()).unwrap();
     copy(&main, &mut fail, 0);
     let s = main.tip_state();
-    let tx = sign(s, &OWNER, buy(s, Outcome::Pass, 1900u32));
+    let tx = sign(&c, s, &OWNER, buy(s, Outcome::Pass, 1900u32));
     append(&mut main, vec![tx], 300);
     let after_trade_pass = main
         .tip_state()

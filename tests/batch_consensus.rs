@@ -58,7 +58,8 @@ fn sign(s: &State, secret: &[u8; 32], nonce_offset: u64, operation: Operation) -
             sender: key(secret),
             nonce: s.account(&key(secret), None).unwrap().nonce + nonce_offset,
             fee: 20u32.into(),
-            expiry_height: s.height + 2,
+            anchor: [0; 32],
+            expiry_blocks: s.height + 2,
             operation,
             data: vec![],
         },
@@ -241,6 +242,38 @@ fn governance_counts_leads_not_the_size_or_timestamp_of_a_price_spike() {
         }
         assert_eq!(s.height - opening, 5);
     }
+}
+
+#[test]
+fn governance_counts_actual_price_leads_when_both_displayed_quotes_are_zero() {
+    let (c, s) = fixture();
+    let mut s = decision(&c, &s);
+    let epoch = s.epoch();
+    let supply = Amount::from(1u32) << 500usize;
+    for world in [&mut s.world, s.alternative.as_mut().unwrap()] {
+        let mut account = world.account(&key(&A), epoch).unwrap();
+        account.shares = supply.clone();
+        world.put(key(&A), account, &c).unwrap();
+        world.shares = supply.clone();
+    }
+    s.alternative.as_mut().unwrap().curve_mass += 1u32;
+    s.audit(&c).unwrap();
+    assert!(s.world.quote(&c).is_zero());
+    assert!(s.alternative.as_ref().unwrap().quote(&c).is_zero());
+    for observed in 1..=4 {
+        s = run(&c, &s, &[]).0;
+        let Phase::Governance(d) = &s.phase else {
+            panic!("early settlement")
+        };
+        assert_eq!(d.leading_blocks, observed);
+    }
+    let pass_cash = s.account(&key(&A), Some(Outcome::Pass)).unwrap().ordinary;
+    s = run(&c, &s, &[]).0;
+    assert!(s.alternative.is_none());
+    assert_eq!(
+        s.account(&key(&A), None).unwrap().ordinary,
+        pass_cash + 500_000u32
+    );
 }
 
 #[test]

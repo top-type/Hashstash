@@ -49,7 +49,7 @@ async function run() {
   form.elements.parameter.value = 'Interval'; form.elements.parameter_value.value = '15';
   await h.get('proposal-parameter').fire('change');
   match(h.get('parameter-preview').title, /after rest if approved/);
-  equal(h.get('wallet-expiry').value, '100', 'signed transaction expiry keeps its explicit block-count policy');
+  equal(h.get('wallet-expiry').value, '2', 'signed transaction expiry keeps its explicit block-count policy');
   s.status.height = s.status.clock = s.governance.clock = 0;
   s.status.settings.interval = 15; s.governance.frozen = { ...s.status.settings };
   s.governance.phase = { Rest:{ until:480,pending:null } };

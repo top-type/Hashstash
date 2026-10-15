@@ -62,6 +62,14 @@ const html = fs.readFileSync(path.join(__dirname, '../ui/index.html'), 'utf8');
 
 const source = fs.readFileSync(path.join(__dirname, '../ui/app.js'), 'utf8');
 
+// The fixture can create nodes for dynamic UI, but a literal app lookup must
+// refer to an element in the real page. Otherwise the double would hide a
+// removed element and the next real browser refresh could fail on null.
+const staticPageIds = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map(match => match[1]));
+const staticLookups = [...source.matchAll(/\$\(\s*(["'])([^"']+)\1\s*\)/g)];
+assert.deepEqual([...new Set(staticLookups.map(match => match[2]).filter(id => !staticPageIds.has(id)))], [],
+  'Every literal app element lookup must exist in ui/index.html');
+
 const publicKey = '12'.repeat(32), recipient = '34'.repeat(32);
 
 function deferred() {
@@ -209,7 +217,7 @@ async function harness(options = {}) {
 
   });
 
-  get('wallet-expiry').value = '100';
+  get('wallet-expiry').value = '2';
   get('trade-expiry').value = '2';
 
   const navLinks = [...html.matchAll(/<a\b([^>]*data-route="[^"]+"[^>]*)>/g)].map(match => {
@@ -429,7 +437,7 @@ async function harness(options = {}) {
   h.fee = (params={}) => {
     const {chain_id,tip,state_root,height,settings}=h.currentSnapshot.status;
     const rate=BigInt(settings.minimum_fee_rate),recipients=BigInt(params.operation?.Propose?.proposal?.Grant?.payments?.length||0),weight=512n+1024n*recipients,base=(rate*weight+1023n)/1024n,paid=params.fee===undefined?base+BigInt(params.extra_fee||'0'):BigInt(params.fee),priority=String(paid-base),data=params.data_hex||'',percent=settings.miner_fee_percent,miner=paid*BigInt(percent)/100n;
-    return {chain_id,tip,state_root,height,sender:addr(params.sender),sender_public_key:params.sender,fee:String(paid),minimum_fee:String(base),account_creation_fee:'0',grant_recipient_fee:String(rate*recipients),extra_fee:priority,weight:String(weight),minimum_fee_rate:String(rate),miner_fee_percent:percent,miner_fee:String(miner),revenue_fee:String(paid-miner),data_hex:data,data_bytes:data.length/2};
+    return {chain_id,tip,state_root,height,anchor:tip,anchor_height:height,expiry_blocks:params.expiry_blocks??2,expiry_height:String(BigInt(height)+BigInt(params.expiry_blocks??2)),sender:addr(params.sender),sender_public_key:params.sender,fee:String(paid),minimum_fee:String(base),account_creation_fee:'0',grant_recipient_fee:String(rate*recipients),extra_fee:priority,weight:String(weight),minimum_fee_rate:String(rate),miner_fee_percent:percent,miner_fee:String(miner),revenue_fee:String(paid-miner),data_hex:data,data_bytes:data.length/2};
   };
   h.transferQuote = (params={},overrides={}) => {
     const f=h.fee(params);return {...f,recipient:addr(params.recipient),public_key:params.recipient,amount:params.amount,recipient_receives:params.amount,total_debit:String(BigInt(params.amount)+BigInt(f.fee)),pending:false,...overrides};
@@ -465,8 +473,8 @@ async function harness(options = {}) {
           async acknowledgeBackup() {},
           decryptMail: (...args) => h.decryptMail(...args),
           async signUnsigned(envelope, expected) {
-            const { operation, fee, data_hex, expiry_blocks, sender, wallet_revision } = expected;
-            const body = parseExact(JSON.stringify({operation, fee, ...(data_hex ? {data_hex} : {}), expiry_blocks, expected_sender:sender, wallet_revision}));
+            const { operation, fee, data_hex, anchor, expiry_blocks, sender, wallet_revision } = expected;
+            const body = parseExact(JSON.stringify({operation, fee, ...(data_hex ? {data_hex} : {}), anchor, expiry_blocks, expected_sender:sender, wallet_revision}));
             wallet.push(body);
             const reply = h.handlers.wallet ? await h.handlers.wallet(body) : response({transaction_id:'d'.repeat(64)});
             const data = JSON.parse(await reply.text());

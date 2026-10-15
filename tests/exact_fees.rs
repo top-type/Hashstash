@@ -22,6 +22,7 @@ fn config() -> Config {
     c
 }
 fn sign(
+    c: &Config,
     s: &State,
     secret: &[u8; 32],
     operation: Operation,
@@ -36,7 +37,8 @@ fn sign(
             sender: key(secret),
             nonce: s.account(&key(secret), None).map_or(0, |a| a.nonce) + offset,
             fee: (fee + extra).into(),
-            expiry_height: s.height + 10_000,
+            anchor: hashstash::codec::block_hash(&hashstash::codec::genesis_block(c).unwrap()),
+            expiry_blocks: s.height + 10_000,
             operation,
         },
         secret,
@@ -44,6 +46,7 @@ fn sign(
     .unwrap()
 }
 fn transfer(
+    c: &Config,
     s: &State,
     recipient: PublicKey,
     amount: u64,
@@ -52,6 +55,7 @@ fn transfer(
     offset: u64,
 ) -> Transaction {
     sign(
+        c,
         s,
         &ALICE,
         Operation::TransferExact {
@@ -85,7 +89,7 @@ fn rejected_unchanged(c: &Config, s: &State, tx: &Transaction) {
 fn whole_exact_paid_fee_is_split_without_automatic_discount() {
     let c = config();
     let s = funded(&c);
-    let tx = transfer(&s, key(&BOB), 100, 100_000, 7, 0);
+    let tx = transfer(&c, &s, key(&BOB), 100, 100_000, 7, 0);
     let quote = fees::quote(&c, &s, &tx).unwrap();
     assert_eq!(
         quote.weight,
@@ -107,7 +111,7 @@ fn whole_exact_paid_fee_is_split_without_automatic_discount() {
     assert_eq!(next.world.revenue, &s.world.revenue + &quote.revenue_fee);
     assert_eq!(next.issued, &s.issued + 11u32);
     assert_eq!(next.settings.minimum_fee_rate, s.settings.minimum_fee_rate);
-    let repeated = transfer(&next, key(&BOB), 100, 100_000, 0, 0);
+    let repeated = transfer(&c, &next, key(&BOB), 100, 100_000, 0, 0);
     let quote = fees::quote(&c, &next, &repeated).unwrap();
     assert!(quote.account_creation_fee.is_zero());
     assert_eq!(quote.weight, codec::encode(&repeated).len() as u64);
@@ -117,15 +121,15 @@ fn whole_exact_paid_fee_is_split_without_automatic_discount() {
 fn increasing_governed_rate_rejects_underpayment_without_partial_state() {
     let c = config();
     let s = funded(&c);
-    let tx = transfer(&s, key(&BOB), 100, 2, 0, 0);
+    let tx = transfer(&c, &s, key(&BOB), 100, 2, 0, 0);
     assert!(fees::quote(&c, &s, &tx).unwrap().fee <= tx.body.fee);
     let mut high = s.clone();
     high.settings.minimum_fee_rate = 1000;
     rejected_unchanged(&c, &high, &tx);
     assert!(high.account(&key(&BOB), None).is_none());
-    let insufficient = transfer(&s, key(&BOB), 1_000_000, 100_000, 0, 0);
+    let insufficient = transfer(&c, &s, key(&BOB), 1_000_000, 100_000, 0, 0);
     rejected_unchanged(&c, &s, &insufficient);
-    let below_minimum = transfer(&s, key(&BOB), 1, 1, 0, 0);
+    let below_minimum = transfer(&c, &s, key(&BOB), 1, 1, 0, 0);
     rejected_unchanged(&c, &s, &below_minimum);
 }
 
@@ -133,9 +137,10 @@ fn increasing_governed_rate_rejects_underpayment_without_partial_state() {
 fn account_creation_minimum_is_recomputed_but_exact_fee_stays_paid() {
     let c = config();
     let s = funded(&c);
-    let pending = transfer(&s, key(&BOB), 100, 100, 0, 0);
+    let pending = transfer(&c, &s, key(&BOB), 100, 100, 0, 0);
     let original = fees::quote(&c, &s, &pending).unwrap();
     let earlier = sign(
+        &c,
         &s,
         &MINER,
         Operation::TransferExact {
@@ -163,7 +168,7 @@ fn account_creation_minimum_is_recomputed_but_exact_fee_stays_paid() {
 fn invalid_transfer_operations_are_rejected_atomically_and_direct_data_is_bound() {
     let c = config();
     let s = funded(&c);
-    let tx = transfer(&s, key(&BOB), 1, 100, 0, 0);
+    let tx = transfer(&c, &s, key(&BOB), 1, 100, 0, 0);
     for operation in [
         Operation::TransferExact {
             recipient: key(&BOB),
@@ -206,7 +211,7 @@ fn empty_blocks_preserve_every_governed_rate_including_zero() {
             s = step(&c, &s, &ALICE, 100, &[]);
             assert_eq!(s.settings.minimum_fee_rate, rate);
         }
-        let tx = transfer(&s, key(&BOB), 1, 0, 0, 0);
+        let tx = transfer(&c, &s, key(&BOB), 1, 0, 0, 0);
         let q = fees::quote(&c, &s, &tx).unwrap();
         assert_eq!(
             q.minimum_fee,
@@ -235,6 +240,7 @@ fn new_miner_is_fee_exempt_at_maximum_governed_rate() {
 fn funded_curve(c: &Config) -> State {
     let mut s = step(c, &State::genesis(c), &ALICE, 1_000_000, &[]);
     let tx = sign(
+        c,
         &s,
         &ALICE,
         Operation::Deposit {
@@ -264,6 +270,7 @@ fn redemption_requires_preexisting_fee_cash() {
     assert!(balance(&s, &ALICE).is_zero());
     let shares = s.account(&key(&ALICE), None).unwrap().shares / 100u32;
     let tx = sign(
+        &c,
         &s,
         &ALICE,
         Operation::Redeem {
@@ -312,6 +319,7 @@ fn decision(c: &Config, grant: bool) -> State {
         }
     };
     let tx = sign(
+        c,
         &s,
         &ALICE,
         Operation::Propose {
@@ -338,6 +346,7 @@ fn conditional_trades_pay_one_common_fee_and_both_outcomes_preserve_account_stat
     let id = s.decision_id().unwrap();
     let before = balance(&s, &ALICE);
     let tx = sign(
+        &c,
         &s,
         &ALICE,
         Operation::Deposit {
@@ -378,6 +387,7 @@ fn successful_grant_creates_recipient_even_when_minimum_rate_exceeds_grant_amoun
     let mut s = decision(&c, true);
     let id = s.decision_id().unwrap();
     let tx = sign(
+        &c,
         &s,
         &ALICE,
         Operation::Deposit {
@@ -425,8 +435,8 @@ fn weighted_selection_reserves_miner_space_and_prefers_higher_exact_fee() {
         append(&mut chain, vec![]);
     }
     let s = chain.tip_state();
-    let low = transfer(s, key(&BOB), 1, 2, 0, 0);
-    let high = transfer(s, key(&BOB), 1, 7, 0, 0);
+    let low = transfer(&c, s, key(&BOB), 1, 2, 0, 0);
+    let high = transfer(&c, s, key(&BOB), 1, 7, 0, 0);
     let selected = chain
         .select_transactions(key(&MINER), &[low, high.clone()], 1)
         .unwrap();
@@ -436,7 +446,7 @@ fn weighted_selection_reserves_miner_space_and_prefers_higher_exact_fee() {
             let mut secret = [0u8; 32];
             secret[0] = 1;
             secret[31] = n as u8;
-            transfer(s, key(&secret), 1, 2, 0, n)
+            transfer(&c, s, key(&secret), 1, 2, 0, n)
         })
         .collect();
     let selected = chain.select_transactions(key(&MINER), &batch, 100).unwrap();
@@ -488,7 +498,7 @@ fn reorg_and_database_replay_restore_fee_charges_and_created_accounts() {
             let mut secret = [0u8; 32];
             secret[0] = 2;
             secret[31] = n as u8;
-            transfer(s, key(&secret), 1, 2, 0, n)
+            transfer(&c, s, key(&secret), 1, 2, 0, n)
         })
         .collect();
     let heavy = append(&mut main, txs);
@@ -531,7 +541,7 @@ fn ordinary_heavy_transaction_queue_does_not_change_minimum_fee_rate() {
     let opening_revenue = s.world.revenue.clone();
     assert!(opening_cash >= Amount::from(6000u32));
     let transactions: Vec<_> = (0..3000u64)
-        .map(|nonce| transfer(s, key(&ALICE), 1, 1, 0, nonce))
+        .map(|nonce| transfer(&c, s, key(&ALICE), 1, 1, 0, nonce))
         .collect();
     let started = std::time::Instant::now();
     let selection = chain
@@ -570,6 +580,7 @@ fn governed_capacity_change_applies_next_block_without_repricing_activation_tran
     let old_limit = s.settings.block_bytes;
     let new_limit = old_limit / 2;
     let tx = sign(
+        &c,
         &s,
         &ALICE,
         Operation::Propose {
@@ -592,6 +603,7 @@ fn governed_capacity_change_applies_next_block_without_repricing_activation_tran
     }
     let id = s.decision_id().unwrap();
     let tx = sign(
+        &c,
         &s,
         &ALICE,
         Operation::Deposit {
@@ -621,7 +633,7 @@ fn governed_capacity_change_applies_next_block_without_repricing_activation_tran
             let mut secret = [0u8; 32];
             secret[0] = 3;
             secret[30..].copy_from_slice(&(n as u16).to_be_bytes());
-            transfer(&s, key(&secret), 1, 100, 0, n)
+            transfer(&c, &s, key(&secret), 1, 100, 0, n)
         })
         .collect();
     let weight: u64 = transactions
@@ -671,6 +683,7 @@ fn governed_minimum_rate_changes_only_after_rest_and_leaves_signed_fee_exact() {
     s = step(&c, &s, &ALICE, 1_000_000, &[]);
     s = curved::state(&c, s, &ALICE);
     let propose = sign(
+        &c,
         &s,
         &ALICE,
         Operation::Propose {
@@ -692,6 +705,7 @@ fn governed_minimum_rate_changes_only_after_rest_and_leaves_signed_fee_exact() {
         s = step(&c, &s, &ALICE, 0, &[]);
     }
     let buy = sign(
+        &c,
         &s,
         &ALICE,
         Operation::Deposit {
@@ -721,14 +735,14 @@ fn governed_minimum_rate_changes_only_after_rest_and_leaves_signed_fee_exact() {
         assert_eq!(s.settings.minimum_fee_rate, 1);
         s = step(&c, &s, &ALICE, 0, &[]);
     }
-    let tx = transfer(&s, key(&BOB), 1, 2, 0, 0);
+    let tx = transfer(&c, &s, key(&BOB), 1, 2, 0, 0);
     assert_eq!(fees::quote(&c, &s, &tx).unwrap().minimum_fee, 2u32.into());
     let before = balance(&s, &ALICE);
     let activated = step(&c, &s, &MINER, 0, &[tx]);
     assert_eq!(activated.settings.minimum_fee_rate, 2);
     assert_eq!(activated.frozen.minimum_fee_rate, 2);
     assert_eq!(balance(&activated, &ALICE), before - 3u32);
-    let tx = transfer(&activated, key(&[64; 32]), 1, 2, 0, 0);
+    let tx = transfer(&c, &activated, key(&[64; 32]), 1, 2, 0, 0);
     assert!(fees::quote(&c, &activated, &tx).unwrap().minimum_fee > tx.body.fee);
     rejected_unchanged(&c, &activated, &tx);
     let next = step(&c, &activated, &MINER, 0, &[]);
@@ -742,6 +756,7 @@ fn prepaid_grant_settlement_leaves_capacity_but_new_miner_still_counts() {
     c.validate().unwrap();
     let mut s = decision(&c, true);
     let buy = sign(
+        &c,
         &s,
         &ALICE,
         Operation::Deposit {
@@ -766,14 +781,14 @@ fn prepaid_grant_settlement_leaves_capacity_but_new_miner_still_counts() {
     }
     assert!(s.account(&key(&BOB), None).is_none());
     assert!(s.account(&key(&MINER), None).is_none());
-    let payment = transfer(&s, key(&ALICE), 1, 2, 0, 0);
+    let payment = transfer(&c, &s, key(&ALICE), 1, 2, 0, 0);
     // Grant work was prepaid. Only the new miner consumes mandatory capacity.
     let quote = fees::quote(&c, &s, &payment).unwrap();
     let both = step(&c, &s, &MINER, 1, std::slice::from_ref(&payment));
     assert_eq!(balance(&both, &BOB), 1_000u32.into());
     assert_eq!(balance(&both, &MINER), Amount::from(1u32) + quote.miner_fee);
     // A separate new payment recipient plus the new miner still exceeds 2048.
-    let new_account = transfer(&s, key(&[64; 32]), 1, 2, 0, 0);
+    let new_account = transfer(&c, &s, key(&[64; 32]), 1, 2, 0, 0);
     assert!(
         consensus::execute(
             &c,

@@ -156,6 +156,13 @@ async function malformedQuotesStillShowErrors() {
 }
 
 async function amountOnlyPartialFillsRemainEstimates() {
+  {
+    const h = await setup();
+    h.get('trade-form').elements.extra_fee.value = 'invalid';
+    await h.get('trade-max').click();
+    ok(h.get('trade-form').querySelector('.form-feedback').textContent.includes('Optional extra'), 'Use max identifies an invalid extra fee instead of calling it the expiry value');
+    equal(h.wallet.length, 0, 'invalid extra fee never signs');
+  }
   for (const kind of ['deposit', 'redeem']) for (const filled of ['0', '4', '10']) {
     const h = await setup(), form = h.get('trade-form');
     await h.tradeTab(kind);
@@ -169,10 +176,12 @@ async function amountOnlyPartialFillsRemainEstimates() {
     form.elements.amount.value = kind === 'deposit' ? amounts.exactInput('10') : shares.exactInput('10');
     await h.get('trade-amount').fire('input');await h.timersDue();await h.timersDue();
     equal(visible(h,'quote-label'),'Estimated receive');
-    ok(visible(h,'quote-height').includes('partial fills possible'));
+    ok(visible(h,'quote-height').includes(filled === '0' ? 'A fee still applies if included' : 'Final amount may differ'));
+    if (filled !== '10') ok(visible(h,'quote-remaining').includes('Estimated unused:'), 'unfilled input is shown without becoming a minimum-output promise');
     equal(h.get('trade-submit').disabled,false,`${kind} ${filled} estimate can authorize the requested order`);
     await form.requestSubmit();
     equal(h.wallet.at(-1).expiry_blocks,2,'trade orders default to two-block expiry');
+    equal(h.wallet.at(-1).anchor,h.currentSnapshot.status.tip,'the reviewed block reference is signed');
     const operation=h.wallet.at(-1).operation[kind === 'deposit' ? 'Deposit' : 'Redeem'];
     equal(operation[kind === 'deposit' ? 'amount' : 'shares'],'10','the requested amount is signed, not the preview fill');
     equal(Object.keys(operation).sort().join(','),kind === 'deposit' ? 'amount,decision,outcome' : 'decision,outcome,shares');
@@ -180,7 +189,12 @@ async function amountOnlyPartialFillsRemainEstimates() {
   {
     const h=await setup();await h.trade('10');h.get('trade-expiry').value='5';await h.get('trade-expiry').fire('input');await h.timersDue();await h.timersDue();await h.get('trade-form').requestSubmit();
     equal(h.wallet.at(-1).expiry_blocks,5,'explicit trade expiry is retained');
-    await h.send('10');await h.get('send-form').requestSubmit();equal(h.wallet.at(-1).expiry_blocks,100,'other transactions keep their independent expiry');
+    await h.send('10');await h.get('send-form').requestSubmit();equal(h.wallet.at(-1).expiry_blocks,2,'other transactions also default to two-block expiry');
+  }
+  {
+    const h=await setup();await h.trade('10');h.get('trade-expiry').value='9007199254740993';await h.get('trade-expiry').fire('input');await h.timersDue();await h.timersDue();await h.get('trade-form').requestSubmit();
+    equal(h.wallet.at(-1).expiry_blocks,'9007199254740993','an explicit lifetime is preserved exactly beyond the JS number range');
+    equal(h.calls.filter(c=>c.body.method==='preparetransaction').at(-1).body.params.expiry_blocks,'9007199254740993','wire JSON carries the exact large integer');
   }
   for (const mutation of [{input_requested:'11'},{input_filled:'11',input_unfilled:'0'}, {input_filled:'4',input_unfilled:'5'}, {output:'999'}, {share_after:'0'}, {kind:'redeem'}, {indicative:false}, {partial_fill_possible:false}, {execution:'immediate'}]) {
     const h=await setup();h.handlers.stash_quote=p=>response({result:h.stashQuote(p,mutation)});await h.trade('10');
@@ -236,8 +250,18 @@ async function staleAsyncRepliesCannotOverwriteNewerResults() {
   }
 }
 
+async function delayedPreparationRechecksTheAnchorSnapshot() {
+  for(const advance of [0,2]) {
+    const h=await setup();await h.trade('10');const held=deferred();let request;
+    h.handlers.preparetransaction=p=>{request=p;return held.promise;};const sending=h.get('trade-form').requestSubmit();await settle();ok(request,'trade preparation reached the held request');
+    h.currentSnapshot.status.height+=advance;h.currentSnapshot.status.tip='74'.repeat(32);h.currentSnapshot.status.state_root='75'.repeat(32);await h.refresh();
+    held.resolve(response({result:{format:'hashstash-unsigned-v1',body:'abab'}}));await sending;
+    equal(h.wallet.length,0,'the signer is never called after the preparation snapshot changes');equal(h.calls.filter(c=>c.body.method==='broadcasttransaction').length,0);
+  }
+}
+
 async function run() {
-  for (const test of [paymentDisplaySurvivesOverlappingRefreshes, tradeDisplaySurvivesOverlappingRefreshes, errorsRemainStableWhileRetrying, feeErrorsRemainStableWhileRetrying, chainMovementIsPendingRatherThanInvalidInput, malformedQuotesStillShowErrors, amountOnlyPartialFillsRemainEstimates, realFailuresReplacePreservedSuccess, pendingFeeRetriesWithoutAnotherBlock, staleAsyncRepliesCannotOverwriteNewerResults]) await test();
+  for (const test of [delayedPreparationRechecksTheAnchorSnapshot, paymentDisplaySurvivesOverlappingRefreshes, tradeDisplaySurvivesOverlappingRefreshes, errorsRemainStableWhileRetrying, feeErrorsRemainStableWhileRetrying, chainMovementIsPendingRatherThanInvalidInput, malformedQuotesStillShowErrors, amountOnlyPartialFillsRemainEstimates, realFailuresReplacePreservedSuccess, pendingFeeRetriesWithoutAnotherBlock, staleAsyncRepliesCannotOverwriteNewerResults]) await test();
   console.log(`Quote refresh UI: ${checks} behavior checks passed`);
 }
 run().catch(error => { console.error(error); process.exitCode = 1; });

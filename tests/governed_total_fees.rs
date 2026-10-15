@@ -27,7 +27,7 @@ fn config(percent: u64) -> Config {
     c
 }
 fn sign(
-    s: &State,
+    context: (&Config, &State),
     secret: &[u8; 32],
     op: Operation,
     extra: u64,
@@ -35,12 +35,14 @@ fn sign(
     offset: u64,
     data: Vec<u8>,
 ) -> Transaction {
+    let (c, s) = context;
     let mut body = TransactionBody {
         chain_id: s.chain_id,
         sender: key(secret),
         nonce: s.account(&key(secret), None).map_or(0, |a| a.nonce) + offset,
         fee: 0u32.into(),
-        expiry_height: s.height + 10000,
+        anchor: hashstash::codec::block_hash(&hashstash::codec::genesis_block(c).unwrap()),
+        expiry_blocks: s.height + 10000,
         operation: op,
         data,
     };
@@ -55,9 +57,9 @@ fn sign(
     }
     panic!("fee fixture did not converge")
 }
-fn transfer(s: &State, recipient: PublicKey, extra: u64, offset: u64) -> Transaction {
+fn transfer(c: &Config, s: &State, recipient: PublicKey, extra: u64, offset: u64) -> Transaction {
     sign(
-        s,
+        (c, s),
         &OWNER,
         Operation::TransferExact {
             recipient,
@@ -84,7 +86,7 @@ fn funded(c: &Config) -> State {
 fn funded_curve(c: &Config) -> State {
     let mut s = funded(c);
     let tx = sign(
-        &s,
+        (c, &s),
         &OWNER,
         Operation::Deposit {
             amount: 800_000u32.into(),
@@ -115,7 +117,7 @@ fn full_actual_fee_including_creation_weight_and_extra_is_split_once() {
             let mut s = funded(&c);
             s.settings.minimum_fee_rate = 17;
             s.frozen.minimum_fee_rate = 17;
-            let tx = transfer(&s, key(&BOB), extra, 0);
+            let tx = transfer(&c, &s, key(&BOB), extra, 0);
             let q = fees::quote(&c, &s, &tx).unwrap();
             assert_eq!(q.miner_fee_percent, Some(percent));
             assert_eq!(
@@ -144,8 +146,8 @@ fn full_actual_fee_including_creation_weight_and_extra_is_split_once() {
 fn creation_cost_is_requoted_once_and_each_paid_fee_rounds_separately() {
     let c = config(50);
     let s = funded(&c);
-    let first = transfer(&s, key(&BOB), 0, 0);
-    let second = transfer(&s, key(&BOB), 0, 1);
+    let first = transfer(&c, &s, key(&BOB), 0, 0);
+    let second = transfer(&c, &s, key(&BOB), 0, 1);
     let q1 = fees::quote(&c, &s, &first).unwrap();
     let mut staged = s.clone();
     consensus::apply_transaction(&c, &mut staged, &first).unwrap();
@@ -162,8 +164,8 @@ fn creation_cost_is_requoted_once_and_each_paid_fee_rounds_separately() {
         &s.world.revenue + &q1.revenue_fee + &q2.revenue_fee
     );
     assert_eq!(next.settings.minimum_fee_rate, s.settings.minimum_fee_rate);
-    let one = transfer(&next, key(&OWNER), 0, 0);
-    let two = transfer(&next, key(&OWNER), 0, 1);
+    let one = transfer(&c, &next, key(&OWNER), 0, 0);
+    let two = transfer(&c, &next, key(&OWNER), 0, 1);
     let q = fees::quote(&c, &next, &one).unwrap();
     assert_eq!(q.fee, 1u32.into());
     assert!(q.miner_fee.is_zero());
@@ -171,7 +173,7 @@ fn creation_cost_is_requoted_once_and_each_paid_fee_rounds_separately() {
     assert_eq!(balance(&after, &MINER), balance(&next, &MINER));
     assert_eq!(after.world.revenue, &next.world.revenue + 2u32);
     let bad = sign(
-        &after,
+        (&c, &after),
         &OWNER,
         Operation::TransferExact {
             recipient: key(&BOB),
@@ -198,7 +200,7 @@ fn activate(c: &Config, mut s: State, new: u64) -> State {
         },
         support: 10u32.into(),
     };
-    let tx = sign(&s, &OWNER, op, 0, 100, 0, vec![]);
+    let tx = sign((c, &s), &OWNER, op, 0, 100, 0, vec![]);
     s = step(c, &s, &OWNER, 1, &[tx]);
     for _ in 0..100 {
         if s.decision_id().is_some() {
@@ -224,7 +226,7 @@ fn the_same_fee_allocation_is_conserved_in_both_automatic_outcomes() {
             decision: s.decision_id(),
             outcome: Some(Outcome::Pass),
         };
-        let tx = sign(&s, &OWNER, op, 5, 100, 0, vec![]);
+        let tx = sign((&c, &s), &OWNER, op, 5, 100, 0, vec![]);
         let q = fees::quote(&c, &s, &tx).unwrap();
         let baseline = step(&c, &s, &MINER, 0, &[]);
         s = step(&c, &s, &MINER, 0, &[tx]);
@@ -265,7 +267,7 @@ fn a_winning_percentage_stays_frozen_through_rest_and_activates_after_its_last_b
     let prior = curved::state(&c, funded_curve(&c), &OWNER);
     let mut s = activate(&c, prior, 100);
     let buy = sign(
-        &s,
+        (&c, &s),
         &OWNER,
         Operation::Deposit {
             amount: 200_000u32.into(),
@@ -294,7 +296,7 @@ fn a_winning_percentage_stays_frozen_through_rest_and_activates_after_its_last_b
     while s.clock + s.settings.interval < until {
         s = step(&c, &s, &OWNER, 1, &[]);
     }
-    let tx = transfer(&s, key(&OWNER), 6, 0);
+    let tx = transfer(&c, &s, key(&OWNER), 6, 0);
     let old_quote = fees::quote(&c, &s, &tx).unwrap();
     assert_eq!(old_quote.miner_fee_percent, Some(50));
     let miner_before = balance(&s, &MINER);
@@ -305,7 +307,7 @@ fn a_winning_percentage_stays_frozen_through_rest_and_activates_after_its_last_b
     );
     assert_eq!(s.settings.miner_fee_percent, Some(100));
     assert_eq!(s.frozen.miner_fee_percent, Some(100));
-    let next = fees::quote(&c, &s, &transfer(&s, key(&OWNER), 6, 0)).unwrap();
+    let next = fees::quote(&c, &s, &transfer(&c, &s, key(&OWNER), 6, 0)).unwrap();
     assert_eq!(next.miner_fee, next.fee);
     assert!(next.revenue_fee.is_zero());
 }
@@ -341,8 +343,8 @@ fn selection_ranks_whole_exact_miner_earnings_per_weight() {
         recipient: key(&OWNER),
         amount: 1u32.into(),
     };
-    let tiny = sign(s, &OWNER, op.clone(), 0, 1_000_000, 0, vec![]);
-    let larger = sign(s, &OWNER, op, 0, 100, 0, vec![7; 1100]);
+    let tiny = sign((&c, s), &OWNER, op.clone(), 0, 1_000_000, 0, vec![]);
+    let larger = sign((&c, s), &OWNER, op, 0, 100, 0, vec![7; 1100]);
     let tinyq = fees::quote(&c, s, &tiny).unwrap();
     let largerq = fees::quote(&c, s, &larger).unwrap();
     assert!(tinyq.miner_fee.is_zero());
@@ -361,8 +363,8 @@ fn zero_percent_selection_has_deterministic_nonmonetary_ties() {
     let mut chain = Chain::open(&d.path().join("zero.sqlite"), c.clone()).unwrap();
     append(&mut chain, vec![], 0);
     let s = chain.tip_state();
-    let small = transfer(s, key(&OWNER), 0, 0);
-    let big = transfer(s, key(&OWNER), 50, 0);
+    let small = transfer(&c, s, key(&OWNER), 0, 0);
+    let big = transfer(&c, s, key(&OWNER), 50, 0);
     assert!(balance(s, &OWNER) > fees::quote(&c, s, &big).unwrap().fee);
     assert!(fees::quote(&c, s, &small).unwrap().miner_fee.is_zero());
     assert!(fees::quote(&c, s, &big).unwrap().miner_fee.is_zero());
@@ -389,10 +391,10 @@ fn selection_reweights_new_accounts_without_changing_fees_and_revisits_nonces() 
     let mut chain = Chain::open(&d.path().join("dependencies.sqlite"), c.clone()).unwrap();
     append(&mut chain, vec![], 0);
     let s = chain.tip_state();
-    let create = transfer(s, key(&BOB), 100, 0);
-    let to_bob = transfer(s, key(&BOB), 0, 1);
+    let create = transfer(&c, s, key(&BOB), 100, 0);
+    let to_bob = transfer(&c, s, key(&BOB), 0, 1);
     let alternative = sign(
-        s,
+        (&c, s),
         &OWNER,
         Operation::TransferExact {
             recipient: key(&OWNER),
@@ -428,8 +430,8 @@ fn selection_reweights_new_accounts_without_changing_fees_and_revisits_nonces() 
             .template(key(&OWNER), selected.transactions.clone(), 0)
             .unwrap()
     );
-    let first = transfer(s, key(&OWNER), 1, 0);
-    let later = transfer(s, key(&OWNER), 50, 1);
+    let first = transfer(&c, s, key(&OWNER), 1, 0);
+    let later = transfer(&c, s, key(&OWNER), 50, 1);
     let (selected, template) = chain
         .select_template(key(&OWNER), &[later.clone(), first.clone()], 2, 0)
         .unwrap();
@@ -470,7 +472,7 @@ fn governed_fee_activation_reorg_and_database_reopen_are_exact() {
     curved::chain(&mut main, &OWNER);
     let s = main.tip_state();
     let tx = sign(
-        s,
+        (&c, s),
         &OWNER,
         Operation::Propose {
             round: s.auction_round().unwrap(),
@@ -500,7 +502,7 @@ fn governed_fee_activation_reorg_and_database_reopen_are_exact() {
     copy(&main, &mut fail, 0);
     let s = main.tip_state();
     let tx = sign(
-        s,
+        (&c, s),
         &OWNER,
         Operation::Deposit {
             amount: 1900u32.into(),
@@ -521,7 +523,7 @@ fn governed_fee_activation_reorg_and_database_reopen_are_exact() {
         append(&mut main, vec![], 400 + n);
     }
     assert_eq!(main.tip_state().settings.miner_fee_percent, Some(100));
-    let tx = transfer(main.tip_state(), key(&OWNER), 17, 0);
+    let tx = transfer(&c, main.tip_state(), key(&OWNER), 17, 0);
     let q = fees::quote(&c, main.tip_state(), &tx).unwrap();
     assert_eq!(q.miner_fee, q.fee);
     assert!(q.revenue_fee.is_zero());

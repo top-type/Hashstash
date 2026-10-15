@@ -185,7 +185,7 @@ try {
         $templatePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Config)
         if (-not (Test-Path -LiteralPath $templatePath -PathType Leaf)) { throw "The genesis configuration template is missing: $templatePath" }
         # Validate before creating any network directory, keys, or databases.
-        # The node remains the authority for supported versions and bounds.
+        # The node remains the authority for valid configuration and arithmetic bounds.
         try {
             $configuration = Get-Content -LiteralPath $templatePath -Raw | ConvertFrom-Json
             & $Executable network --config $templatePath | Out-Null

@@ -174,7 +174,7 @@ async fn public_wallet_prepares_exact_unsigned_intent_and_broadcasts_only_signed
         recipient,
         amount: 5u32.into(),
     };
-    let mut params = json!({"operation":operation,"extra_fee":"1","nonce":0,"expiry_height":100,"data_hex":"ab".repeat(600)});
+    let mut params = json!({"operation":operation,"extra_fee":"1","nonce":0,"expiry_blocks":100,"data_hex":"ab".repeat(600)});
     // A public quote must never use the selected server wallet as sender.
     let quote = request(&client, &public, "fee_quote", params.clone())
         .await
@@ -222,7 +222,7 @@ async fn public_wallet_prepares_exact_unsigned_intent_and_broadcasts_only_signed
     let body = wallet::decode_unsigned(&unsigned).unwrap();
     assert_eq!(body.sender, sender);
     assert_eq!(body.nonce, 0);
-    assert_eq!(body.expiry_height, 100);
+    assert_eq!(body.expiry_blocks, 100);
     assert_eq!(body.data, vec![0xab; 600]);
     assert_eq!(node.status().unwrap()["mempool"], 0);
     let mut signed = crypto::sign(&body, &secret).unwrap();

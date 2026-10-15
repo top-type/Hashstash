@@ -71,10 +71,8 @@ fn preparing_uses_pending_nonces_without_reserving_them() {
     let again = prepare(&node, sender, donation());
     assert_eq!(first, again);
     assert_eq!(first.nonce, 0);
-    assert_eq!(
-        first.expiry_height,
-        before["height"].as_u64().unwrap() + 100
-    );
+    assert_eq!(first.expiry_blocks, 2);
+    assert_eq!(hex::encode(first.anchor), before["tip"]);
     assert_eq!(node.status().unwrap(), before);
     let first = cold_submit(&node, &secret, donation());
     assert_eq!(first.body.nonce, 0);
@@ -153,7 +151,7 @@ async fn watch_only_http_exports_and_broadcasts_but_never_signs() {
     package.as_object_mut().unwrap().remove("fee_quote");
     let body = wallet::decode_unsigned(&serde_json::from_value(package).unwrap()).unwrap();
     assert_eq!(body.sender, watched);
-    assert_eq!(body.expiry_height, 20);
+    assert_eq!(body.expiry_blocks, 7);
     let signed = crypto::sign(&body, &secret).unwrap();
     let response = node::call_rpc(
         &format!("{base}/rpc"),
@@ -382,7 +380,8 @@ fn raw_broadcast_rejects_wrong_network_expiry_signature_and_encoding() {
     let mut other_network = body.clone();
     other_network.chain_id[0] ^= 1;
     let mut expired = body.clone();
-    expired.expiry_height = 1;
+    expired.anchor = codec::block_hash(&codec::genesis_block(&Config::devnet()).unwrap());
+    expired.expiry_blocks = 1;
     let mut altered = signed.clone();
     altered.signature[0] ^= 1;
     let mut appended = wallet::signed_hex(&signed);

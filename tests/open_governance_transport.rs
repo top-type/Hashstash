@@ -34,7 +34,10 @@ fn signed(chain: &Chain, secret: &[u8; 32], operation: Operation) -> Transaction
             sender,
             nonce: state.account(&sender, None).unwrap().nonce,
             fee: 0u32.into(),
-            expiry_height: 10_000,
+            anchor: hashstash::codec::block_hash(
+                &hashstash::codec::genesis_block(&chain.config).unwrap(),
+            ),
+            expiry_blocks: 10_000,
             operation,
             data: vec![],
         },
@@ -131,7 +134,10 @@ async fn large_governed_block_relays_compactly_and_survives_reopen() {
                     sender: miner,
                     nonce: nonce_before + nonce,
                     fee: 12u32.into(),
-                    expiry_height: 10_000,
+                    anchor: hashstash::codec::block_hash(
+                        &hashstash::codec::genesis_block(&chain.config).unwrap(),
+                    ),
+                    expiry_blocks: 10_000,
                     operation: Operation::TransferExact {
                         recipient: miner,
                         amount: 1u32.into(),

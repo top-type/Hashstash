@@ -100,7 +100,7 @@ pub fn decode_signed(raw: &str) -> Result<Transaction> {
 fn validate_body(body: &TransactionBody) -> Result<()> {
     ensure!(crypto::valid_key(&body.sender), "invalid sender public key");
     ensure!(body.nonce != u64::MAX, "nonce exhausted");
-    ensure!(body.expiry_height > 0, "expiry height must be positive");
+    ensure!(body.expiry_blocks > 0, "expiry blocks must be positive");
     ensure!(body.fee.bits() <= 512, "fee exceeds supported HASH range");
     let amount = |v: &Amount| -> Result<()> {
         ensure!(v.bits() <= 512, "amount exceeds supported range");
@@ -238,7 +238,8 @@ pub fn review(body: &TransactionBody) -> Vec<ReviewField> {
     add("Chain ID", hex::encode(body.chain_id));
     add("Sender", account(&body.sender));
     add("Nonce", body.nonce.to_string());
-    add("Expiry block", body.expiry_height.to_string());
+    add("Anchor block", hex::encode(body.anchor));
+    add("Valid for · blocks", body.expiry_blocks.to_string());
     add("Fee · HASH", body.fee.to_str_radix(10));
     let operation = &body.operation;
     match &operation {
@@ -255,7 +256,10 @@ pub fn review(body: &TransactionBody) -> Vec<ReviewField> {
         } => {
             add("Action", "Deposit".into());
             add("Amount · HASH", amount.to_str_radix(10));
-            add("Execution", "Batch trade; full or partial fill".into());
+            add(
+                "Execution",
+                "Batch trade; full, partial or zero fill".into(),
+            );
             add(
                 "Unfilled input",
                 "Returned automatically; transaction fee remains payable".into(),
@@ -272,7 +276,10 @@ pub fn review(body: &TransactionBody) -> Vec<ReviewField> {
         } => {
             add("Action", "Redeem".into());
             add("Shares", shares.to_str_radix(10));
-            add("Execution", "Batch trade; full or partial fill".into());
+            add(
+                "Execution",
+                "Batch trade; full, partial or zero fill".into(),
+            );
             add(
                 "Unfilled input",
                 "Returned automatically; transaction fee remains payable".into(),
@@ -398,16 +405,9 @@ pub fn review(body: &TransactionBody) -> Vec<ReviewField> {
     }
     fields
 }
-/// Market trade estimates are short-lived; other operations retain a longer default.
-pub fn default_expiry_blocks(operation: &Operation) -> u64 {
-    if matches!(
-        operation,
-        Operation::Deposit { .. } | Operation::Redeem { .. }
-    ) {
-        2
-    } else {
-        100
-    }
+/// Every newly prepared transaction has a short lifetime from its signed anchor.
+pub fn default_expiry_blocks(_operation: &Operation) -> u64 {
+    2
 }
 
 fn outcome_name(outcome: Outcome) -> &'static str {
@@ -451,6 +451,10 @@ mod governance_review_tests {
 
     #[test]
     fn cold_review_uses_blocks_and_discloses_partial_trade_execution() {
+        assert_eq!(
+            default_expiry_blocks(&body(Parameter::DecisionBlocks, 60, 120).operation),
+            2
+        );
         let fields = review(&body(Parameter::DecisionBlocks, 60, 120));
         assert!(
             fields
@@ -490,8 +494,10 @@ mod governance_review_tests {
             assert!(
                 fields
                     .iter()
-                    .any(|field| field.label == "Expiry block" && field.value == "100")
+                    .any(|field| field.label == "Valid for · blocks" && field.value == "100")
             );
+            assert!(fields.iter().any(|field| field.label == "Anchor block"
+                && field.value == hex::encode(transaction.anchor)));
             assert_eq!(default_expiry_blocks(&transaction.operation), 2);
             assert_eq!(
                 decode_unsigned(&unsigned(&transaction)).unwrap(),
@@ -507,7 +513,8 @@ mod governance_review_tests {
             sender: crypto::public_key(&[41; 32]).unwrap(),
             nonce: 0,
             fee: 10u32.into(),
-            expiry_height: 100,
+            anchor: [38; 32],
+            expiry_blocks: 100,
             operation: Operation::Propose {
                 round: 0,
                 description: [0; 32],

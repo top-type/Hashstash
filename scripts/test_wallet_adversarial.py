@@ -103,7 +103,7 @@ def main():
             assert rpc(base, 'mempool') == []
             return reply['error']
 
-        def prepare(amount='1', expiry=100):
+        def prepare(amount='1', expiry=2):
             envelope = rpc(base, 'preparetransaction', {'sender': primary['public_key'], **{'extra_fee': '0'}, 'expiry_blocks': expiry, 'operation': transfer_operation(primary['public_key'], amount)})
             envelope.pop('fee_quote', None)
             return envelope
@@ -117,10 +117,22 @@ def main():
         body = bytes.fromhex(original['body'])
         _, fee_length_offset = read_uint(body, 64)
         fee_size, fee_offset = read_uint(body, fee_length_offset)
-        expiry_offset = fee_offset + fee_size
+        anchor_offset = fee_offset + fee_size
+        expiry_offset = anchor_offset + 32
         expiry, operation_offset = read_uint(body, expiry_offset)
         assert body[:32].hex() == rpc(base, 'status')['chain_id']
         assert body[32:64].hex() == primary['public_key']
+        assert body[anchor_offset:expiry_offset].hex() == rpc(base, 'status')['tip']
+        assert expiry == 2
+        for method, extra in [('preparetransaction', {'anchor': '42' * 32}),
+                              ('fee_quote', {'anchor': '42' * 32}),
+                              ('preparetransaction', {'expiry_height': rpc(base, 'status')['height'] + 2}),
+                              ('preparetransaction', {'expiry_blocks': 0})]:
+            code, reply = request(base, '/rpc', {'jsonrpc': '2.0', 'id': 1, 'method': method,
+                'params': {'sender': primary['public_key'], 'operation': transfer_operation(primary['public_key']), **extra}})
+            assert code in (200, 400) and 'error' in reply
+        assert rpc(base, 'mempool') == []
+        check('Preparation and fee quotes reject a foreign anchor; absolute expiry input and zero lifetime also reject')
 
         def changed(offset, value, length=None):
             return {**original, 'body': (body[:offset] + value + body[offset + (len(value) if length is None else length):]).hex()}
@@ -133,7 +145,7 @@ def main():
             'nonhex body': {**original, 'body': 'zz'},
             'truncated body': {**original, 'body': original['body'][:-2]},
             'trailing byte': {**original, 'body': original['body'] + '00'},
-            'oversized body': {**original, 'body': '00' * 16385},
+            'large malformed body': {**original, 'body': '00' * 16385},
             'invalid sender': changed(32, b'\xff' * 32),
             'different sender': changed(32, bytes.fromhex(other['public_key'])),
             'exhausted nonce': changed(64, compact_uint((1 << 64) - 1), fee_length_offset - 64),
@@ -145,8 +157,8 @@ def main():
             'unknown operation': changed(operation_offset, b'\x08'),
             'other chain': changed(0, b'B' * 32),
             'noncanonical fee length': changed(fee_length_offset, b'\xfb' + fee_size.to_bytes(2, 'little'), fee_offset - fee_length_offset),
-            'noncanonical fee': changed(fee_length_offset, compact_uint(fee_size + 1) + body[fee_offset:expiry_offset] + b'\x00', expiry_offset - fee_length_offset),
-            'fee above 512 bits': changed(fee_length_offset, compact_uint(65) + b'\xff' * 65, expiry_offset - fee_length_offset),
+            'noncanonical fee': changed(fee_length_offset, compact_uint(fee_size + 1) + body[fee_offset:anchor_offset] + b'\x00', anchor_offset - fee_length_offset),
+            'fee above 512 bits': changed(fee_length_offset, compact_uint(65) + b'\xff' * 65, anchor_offset - fee_length_offset),
         }
         tag, recipient_offset = read_uint(body, operation_offset)
         assert tag == 0
@@ -178,9 +190,11 @@ def main():
         assert raw_cold('unlock', ' ' * (128 * 1024 + 1))[0] == 413
         assert raw_cold('review', ' ' * (128 * 1024 + 1))[0] == 400
         review_limit = 2 * 32 * 1024 * 1024 + 128 * 1024
-        assert raw_cold('review', ' ' * (review_limit + 1))[0] == 413
+        assert raw_cold('review', ' ' * (review_limit + 1))[0] == 400
+        assert raw_cold('review', ' ' * (review_limit + 1) + json.dumps(original))[0] == 200
+        check('Valid review envelopes are not rejected by the removed fixed transaction body limit')
         assert request(cold_base, '/api/session')[1]['unlocked'] is True
-        check('Cross-origin, wrong token/host, and oversized HTTP inputs leave the signer available and wallet unchanged')
+        check('Cross-origin, wrong token/host, and oversized control inputs leave the signer available and wallet unchanged')
         signed = sign(original)
         raw = bytes.fromhex(signed['raw'])
         assert raw[:len(body)] == body and len(raw) == len(body) + 64
@@ -190,6 +204,7 @@ def main():
             'above block capacity': '00' * (status['settings']['block_bytes'] + 1),
             'wrong signature': (raw[:-1] + bytes([raw[-1] ^ 1])).hex(),
             'changed signed nonce': (raw[:64] + compact_uint(1) + raw[fee_length_offset:]).hex(),
+            'changed signed anchor': (raw[:anchor_offset] + b'\x42' * 32 + raw[expiry_offset:]).hex(),
             'signature length prefix': (body + compact_uint(64) + raw[len(body):]).hex(),
         }
         status_before = rpc(base, 'status')
@@ -204,6 +219,10 @@ def main():
         reject_raw(foreign['raw'])
         assert rpc(base, 'status') == status_before
         check('A valid signature over another chain identity cannot enter the local mempool')
+        foreign_anchor = sign(changed(anchor_offset, b'\x42' * 32))
+        reject_raw(foreign_anchor['raw'])
+        assert rpc(base, 'status') == status_before
+        check('A valid signature anchored to an unknown block cannot enter the local mempool')
         competing = sign(prepare('2'))
         accepted = rpc(base, 'broadcasttransaction', {'raw': signed['raw']})
         assert accepted['transaction_id'] == signed['txid']
@@ -226,6 +245,37 @@ def main():
         rpc(base, 'mine', {'count': 1})
         assert rpc(base, 'account', {'key': primary['public_key']})['account']['nonce'] == 2
         check('Failed private-key import clears prior approval; restoring the wallet remains functional')
+        for kind, field, removed, tag in [('Deposit', 'amount', 'min_shares', 1),
+                                           ('Redeem', 'shares', 'min_received', 2)]:
+            account = rpc(base, 'account', {'key': primary['public_key']})['account']
+            value = 4 if kind == 'Deposit' else int(account['shares']) // 2
+            assert value > 0
+            operation = {kind: {field: str(value), 'decision': None, 'outcome': None}}
+            params = {'sender': primary['public_key'], 'operation': operation}
+            envelope = rpc(base, 'preparetransaction', params)
+            envelope.pop('fee_quote', None)
+            encoded = bytes.fromhex(envelope['body'])
+            _, offset = read_uint(encoded, 64)
+            fee_size, offset = read_uint(encoded, offset)
+            anchor_offset = offset + fee_size
+            assert encoded[anchor_offset:anchor_offset + 32].hex() == rpc(base, 'status')['tip']
+            expiry, offset = read_uint(encoded, anchor_offset + 32)
+            assert expiry == 2
+            magnitude = value.to_bytes((value.bit_length() + 7) // 8, 'little')
+            assert encoded[offset:] == compact_uint(tag) + compact_uint(len(magnitude)) + magnitude + b'\x00\x00\x00'
+            review = cold('review', envelope)
+            assert not any('minimum' in item['label'].lower() for item in review['fields'])
+            signed_trade = cold('sign', {'review_token': review['review_token']})
+            rpc(base, 'broadcasttransaction', {'raw': signed_trade['raw']})
+            rpc(base, 'mine', {'count': 1})
+            current = rpc(base, 'account', {'key': primary['public_key']})['account']
+            assert current['nonce'] == account['nonce'] + 1
+            assert (int(current['shares']) > int(account['shares'])) == (kind == 'Deposit')
+            invalid_operation = {kind: {**operation[kind], removed: '0'}}
+            code, response = request(base, '/rpc', {'jsonrpc': '2.0', 'id': 1,
+                'method': 'preparetransaction', 'params': {**params, 'operation': invalid_operation}})
+            assert code in (200, 400) and 'error' in response
+            check(kind + ' amount-only bytes use a two-block expiry, cold-sign and execute; removed minimum fields reject')
         report.update(passed=True, final_status=rpc(base, 'status'), invalid_unsigned=len(invalid) + 1, invalid_signed=len(invalid_signed))
     finally:
         for process in processes:

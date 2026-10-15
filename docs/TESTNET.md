@@ -29,7 +29,7 @@ Create/import a wallet or add a watch-only account on the Wallet page. Back up k
 
 During a decision, holdings are alternatives. Trade Stash on PASS or FAIL directly. Shared payments and fees must fit both cash balances. The wallet shows the smaller available payment balance and separate outcome holdings; never add the alternatives. Each block counts for PASS only when its parent closing quote beats FAIL by the frozen margin. A strict majority of the full decision block count is required. PASS sets aside the full grant at decision opening, using waiting revenue first and then reserve. It pays every listed recipient once if PASS wins. Parameter changes activate after rest.
 
-Stash orders in each block clear together at one execution price per world. The price-change bound can cause partial or zero fills; unused input stays in the account. Fees require existing cash. Trade orders default to a two-block expiry; signing provides no minimum-output guarantee.
+Stash orders in each block clear together at one execution price per world. The price-change bound can cause partial or zero fills; unused input stays in the account. Fees require existing cash. Every transaction signs a recent block hash and defaults to a two-block lifetime after that block. The anchor must remain on the chain used for inclusion. Signing provides no minimum-output guarantee.
 
 Chat is a feed of public transaction data. Mail encrypts a message in any transaction's attached data; its standalone composer uses a self-payment. Explorer and Network are read-only views available without a wallet.
 
@@ -41,3 +41,5 @@ python .\scripts\test_network.py <manifest-path> --report <report-path>
 ```
 
 The network check deliberately transacts and mines on that selected local fixture. It tests supply, fees, Stash, revenue, grants, auctions, partial fills, block-majority decisions, external Stratum headers, relay and reorganization. Its temporary fork process stops afterward; stop the three fixture nodes using their saved manifest when done. The [validation guide](VALIDATION.md) describes the other checks. Use these scripts only with the disposable fixture created for them.
+
+The load check defaults to 64 transactions per wave, which fits the standard 16 KiB preset. Its setup funds all fees and every input in a complete wave before submitting them. Even a self-payment cannot reuse its returned input within the same block. Larger waves require enough configured capacity; `--transactions-per-wave` selects the test workload.

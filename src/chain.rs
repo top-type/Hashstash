@@ -141,22 +141,7 @@ impl Chain {
         }
         let state = State::genesis(&config);
         state.validate(&config)?;
-        let mut genesis = Block {
-            header: Header {
-                version: codec::HEADER_VERSION,
-                previous: ZERO_HASH,
-                merkle_root: ZERO_HASH,
-                timestamp: config.genesis_time,
-                bits: config.initial_bits,
-                nonce: 0,
-            },
-            height: 0,
-            miner: ZERO_HASH,
-            state_root: state.root(),
-            extranonce: [0; 8],
-            transactions: vec![],
-        };
-        genesis.header.merkle_root = codec::merkle_root(&genesis)?;
+        let genesis = codec::genesis_block(&config)?;
         let genesis_hash = codec::block_hash(&genesis);
         let genesis_entry = Arc::new(Entry {
             header: genesis.header.clone(),
@@ -266,6 +251,113 @@ impl Chain {
     }
     pub fn block(&self, hash: &Hash) -> Option<Block> {
         self.load_block(hash).ok().flatten()
+    }
+    /// Height of a locally validated block, including genesis and side branches.
+    pub fn block_height(&self, hash: &Hash) -> Result<Option<u64>> {
+        Ok(self.load_entry(hash)?.map(|entry| entry.height))
+    }
+
+    /// Check the signed preparation reference against the next block on this
+    /// tip, returning its fixed, derived expiry height.
+    pub fn validate_transaction_anchor(&self, transaction: &Transaction) -> Result<u64> {
+        self.transaction_anchor_results(&self.tip, &[transaction])?
+            .pop()
+            .unwrap()
+            .map_err(anyhow::Error::msg)
+    }
+
+    fn transaction_anchor_results(
+        &self,
+        parent: &Hash,
+        transactions: &[&Transaction],
+    ) -> Result<Vec<std::result::Result<u64, String>>> {
+        let parent_entry = self
+            .load_entry(parent)?
+            .ok_or_else(|| LocalIndexError(anyhow::anyhow!("candidate parent absent")))?;
+        let height = parent_entry
+            .height
+            .checked_add(1)
+            .context("candidate height overflow")?;
+        let genesis = codec::block_hash(&self.genesis);
+        let mut required = BTreeMap::<u64, BTreeSet<Hash>>::new();
+        let mut ancestors = BTreeSet::new();
+        let mut results = Vec::with_capacity(transactions.len());
+        for tx in transactions {
+            let body = &tx.body;
+            let result = if body.expiry_blocks == 0 {
+                Err("transaction lifetime must be positive".into())
+            } else if let Some(anchor) = self.load_entry(&body.anchor)? {
+                if anchor.height >= height {
+                    Err("transaction anchor must precede its including block".into())
+                } else if let Some(expiry) = anchor.height.checked_add(body.expiry_blocks) {
+                    if height > expiry {
+                        Err("transaction expired relative to its signed anchor".into())
+                    } else {
+                        if body.anchor == genesis {
+                            ancestors.insert(genesis);
+                        } else {
+                            required
+                                .entry(anchor.height)
+                                .or_default()
+                                .insert(body.anchor);
+                        }
+                        Ok(expiry)
+                    }
+                } else {
+                    Err("transaction lifetime overflows its anchor height".into())
+                }
+            } else {
+                Err("unknown transaction anchor".into())
+            };
+            results.push(result);
+        }
+        // Canonical references use indexed height lookups. A side branch is
+        // walked only to its common canonical ancestor, once for all references.
+        // Memory depends on this block's references, never on chain age.
+        let mut cursor = *parent;
+        let mut entry = parent_entry;
+        while !required.is_empty() {
+            if self.canonical_hash(entry.height)? == Some(cursor) {
+                for (height, requested) in &required {
+                    if let Some(hash) = self.canonical_hash(*height)?
+                        && requested.contains(&hash)
+                    {
+                        ancestors.insert(hash);
+                    }
+                }
+                break;
+            }
+            if let Some(requested) = required.remove(&entry.height)
+                && requested.contains(&cursor)
+            {
+                ancestors.insert(cursor);
+            }
+            if required.is_empty() || entry.height == 0 {
+                break;
+            }
+            cursor = entry.header.previous;
+            entry = self
+                .load_entry(&cursor)?
+                .ok_or_else(|| LocalIndexError(anyhow::anyhow!("candidate ancestor absent")))?;
+        }
+        for (tx, result) in transactions.iter().zip(&mut results) {
+            if result.is_ok() && !ancestors.contains(&tx.body.anchor) {
+                *result = Err("transaction anchor is not on the candidate parent branch".into());
+            }
+        }
+        Ok(results)
+    }
+
+    fn validate_transaction_anchors(
+        &self,
+        parent: &Hash,
+        transactions: &[Transaction],
+    ) -> Result<()> {
+        let refs: Vec<_> = transactions.iter().collect();
+        for result in self.transaction_anchor_results(parent, &refs)? {
+            result.map_err(anyhow::Error::msg)?;
+        }
+        Ok(())
     }
     pub fn state_at(&self, hash: &Hash) -> Option<Arc<State>> {
         self.load_state(hash).ok()
@@ -437,6 +529,7 @@ impl Chain {
                 .load_block(&next)?
                 .context("stored ancestor block absent")?;
             let subsidy = math::work(&math::target_from_bits(block.header.bits)?);
+            self.validate_transaction_anchors(&block.header.previous, &block.transactions)?;
             let replayed = consensus::execute(
                 &self.config,
                 &state,
@@ -470,17 +563,31 @@ impl Chain {
     pub fn expected_elapsed_seconds(&self) -> u64 {
         self.tip_entry.clock
     }
+    fn canonical_hash(&self, height: u64) -> Result<Option<Hash>> {
+        (|| -> Result<_> {
+            let raw: Option<Vec<u8>> = self
+                .db
+                .query_row(
+                    "SELECT hash FROM canonical_index WHERE height=?1",
+                    [height],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(raw) = raw {
+                Ok(Some(
+                    raw.as_slice()
+                        .try_into()
+                        .context("malformed canonical hash")?,
+                ))
+            } else {
+                ensure!(height > self.tip_height(), "canonical height absent");
+                Ok(None)
+            }
+        })()
+        .map_err(|error| LocalIndexError(error).into())
+    }
     pub fn hash_at_height(&self, height: u64) -> Option<Hash> {
-        self.db
-            .query_row(
-                "SELECT hash FROM canonical_index WHERE height=?1",
-                [height],
-                |r| r.get::<_, Vec<u8>>(0),
-            )
-            .optional()
-            .ok()
-            .flatten()
-            .and_then(|bytes| bytes.as_slice().try_into().ok())
+        self.canonical_hash(height).ok().flatten()
     }
     fn median(&self, parent: Hash) -> Result<u32> {
         let mut times = Vec::new();
@@ -546,6 +653,7 @@ impl Chain {
                 block.header.merkle_root == codec::merkle_root(block)?,
                 "incorrect transaction Merkle root"
             );
+            self.validate_transaction_anchors(&block.header.previous, &block.transactions)?;
             Ok(target)
         })()
         .map_err(permanent)?;
@@ -660,6 +768,7 @@ impl Chain {
         timestamp: u32,
     ) -> Result<Block> {
         let parent = &self.tip_entry;
+        self.validate_transaction_anchors(&self.tip, &transactions)?;
         let target = self.target(parent)?;
         let state = consensus::execute(
             &self.config,
@@ -774,7 +883,7 @@ impl Chain {
                 continue;
             }
             if transaction.body.chain_id != execution.state.chain_id
-                || transaction.body.expiry_height < execution.state.height
+                || transaction.body.expiry_blocks == 0
                 || transaction.body.nonce == u64::MAX
             {
                 continue;
@@ -801,6 +910,13 @@ impl Chain {
             ));
         }
         type RankedCandidate<'a> = (&'a Transaction, usize, Amount, u64, Hash, Option<PublicKey>);
+        let refs: Vec<_> = pending.iter().map(|candidate| candidate.0).collect();
+        let anchor_validity = self.transaction_anchor_results(&self.tip, &refs)?;
+        pending = pending
+            .into_iter()
+            .zip(anchor_validity)
+            .filter_map(|(candidate, validity)| validity.is_ok().then_some(candidate))
+            .collect();
         let rank = |pending: &mut Vec<RankedCandidate<'_>>| {
             pending.sort_by(|a, b| {
                 let earnings = (&b.2 * Amount::from(a.3)).cmp(&(&a.2 * Amount::from(b.3)));
@@ -1119,5 +1235,55 @@ mod cache_tests {
         assert_eq!(chain.tip_hash(), hash);
         assert_eq!(chain.tip_state().root(), root);
         chain.tip_state().audit(&chain.config).unwrap();
+    }
+    #[test]
+    fn anchor_index_failure_does_not_poison_invalid_block_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut chain =
+            Chain::open(&directory.path().join("anchor-index.db"), Config::devnet()).unwrap();
+        let first = candidate(&chain, 1);
+        chain
+            .submit(first.clone(), u64::from(first.header.timestamp))
+            .unwrap();
+        let owner = crypto::public_key(&[91; 32]).unwrap();
+        let tx = crypto::sign(
+            &TransactionBody {
+                chain_id: chain.chain_id(),
+                sender: owner,
+                nonce: 0,
+                fee: 1u32.into(),
+                anchor: chain.tip_hash(),
+                expiry_blocks: 2,
+                operation: Operation::TransferExact {
+                    recipient: owner,
+                    amount: 1u32.into(),
+                },
+                data: vec![],
+            },
+            &[91; 32],
+        )
+        .unwrap();
+        let block = Chain::mine(chain.template(owner, vec![tx], 0).unwrap(), 100_000).unwrap();
+        chain
+            .db
+            .execute("DELETE FROM canonical_index WHERE height=1", [])
+            .unwrap();
+        let error = chain
+            .submit(block.clone(), u64::from(block.header.timestamp))
+            .unwrap_err();
+        assert!(error.is::<LocalIndexError>(), "{error:#}");
+        assert_eq!(chain.cached_invalid_count(), 0);
+        chain
+            .db
+            .execute(
+                "INSERT INTO canonical_index(height,hash) VALUES(1,?1)",
+                [codec::block_hash(&first).as_slice()],
+            )
+            .unwrap();
+        assert!(
+            chain
+                .submit(block.clone(), u64::from(block.header.timestamp))
+                .unwrap()
+        );
     }
 }

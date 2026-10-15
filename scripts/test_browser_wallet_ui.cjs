@@ -18,11 +18,11 @@ function prepare(chain, p) {
   const inner=Buffer.concat([compact(0),bytes(tx.recipient),amount(tx.amount)]);
   const data=Buffer.from(p.data_hex||'','hex');
   const envelope=Buffer.concat([inner,vector(data)]);
-  return {format:'hashstash-unsigned-v1',body:Buffer.concat([bytes(chain),bytes(p.sender),compact(p.nonce),amount(p.fee),compact(p.expiry_height),envelope]).toString('hex')};
+  return {format:'hashstash-unsigned-v1',body:Buffer.concat([bytes(chain),bytes(p.sender),compact(p.nonce),amount(p.fee),bytes(p.anchor),compact(p.expiry_blocks),envelope]).toString('hex')};
 }
 function fee(h,p) {
   const {chain_id,tip,state_root,height}=h.currentSnapshot.status, priority=p.extra_fee||'0';
-  const paid=1n+BigInt(priority),miner=paid/2n;return {miner_fee_percent:50,miner_fee:String(miner),revenue_fee:String(paid-miner),chain_id,tip,state_root,height,sender:addr(p.sender),sender_public_key:p.sender,fee:String(1n+BigInt(priority)),minimum_fee:'1',account_creation_fee:'0',grant_recipient_fee:'0',extra_fee:priority,weight:'512',minimum_fee_rate:'1',pending:false,nonce:0,expiry_height:height+100,operation:p.operation,data_hex:p.data_hex||'',data_bytes:(p.data_hex||'').length/2};
+  const paid=1n+BigInt(priority),miner=paid/2n;return {miner_fee_percent:50,miner_fee:String(miner),revenue_fee:String(paid-miner),chain_id,tip,state_root,height,sender:addr(p.sender),sender_public_key:p.sender,fee:String(1n+BigInt(priority)),minimum_fee:'1',account_creation_fee:'0',grant_recipient_fee:'0',extra_fee:priority,weight:'512',minimum_fee_rate:'1',pending:false,nonce:0,anchor:tip,anchor_height:height,expiry_blocks:p.expiry_blocks??2,expiry_height:String(BigInt(height)+BigInt(p.expiry_blocks??2)),operation:p.operation,data_hex:p.data_hex||'',data_bytes:(p.data_hex||'').length/2};
 }
 async function setup(options={}) {
   const h=await harness({realWallet:true,publicWeb:true,...options});
@@ -85,7 +85,7 @@ async function run() {
   assert.equal(broadcasts(a).length,1,a.get('send-form').querySelector().textContent);checks++;
   const raw=Buffer.from(broadcasts(a)[0].body.params.raw,'hex'),body=raw.subarray(0,-64),signature=raw.subarray(-64);
   assert.equal(raw.length,body.length+64);checks++;
-  const tag=sha(Buffer.from('Hashstash/Transaction')),message=sha(Buffer.concat([tag,tag,body]));
+  const tag=sha(Buffer.from('Hashstash/anchored-transaction')),message=sha(Buffer.concat([tag,tag,body]));
   assert.equal(a.noble.schnorr.verify(Uint8Array.from(signature),Uint8Array.from(message),Uint8Array.from(Buffer.from(alice,'hex'))),true);checks++;
   const decoded=a.browserApi.decodeUnsigned({format:'hashstash-unsigned-v1',body:body.toString('hex')});
   assert.equal(decoded.sender,alice);checks++;
@@ -95,11 +95,18 @@ async function run() {
   assert.equal(Object.hasOwn(decoded,'extra_fee'),false);checks++;
   assert.equal(decoded.data_hex,'00ff80');checks++;
   assert.equal(decoded.nonce,'0');checks++;
-  assert.equal(decoded.expiry_height,'120');checks++;
+  assert.equal(decoded.anchor,a.currentSnapshot.status.tip);checks++;
+  assert.equal(decoded.expiry_blocks,'2');checks++;
   a.handlers.preparetransaction=p=>response({result:prepare(a.currentSnapshot.status.chain_id,{...p,fee:'500'})});
   await (await fill(a,bob)).requestSubmit();
   assert.equal(broadcasts(a).length,1,'malicious prepared fee cannot be signed or broadcast');checks++;
   assert.match(a.get('send-form').querySelector().textContent,/does not match/);checks++;
+  for(const change of [{anchor:'35'.repeat(32)},{expiry_blocks:3}]) {
+    a.handlers.preparetransaction=p=>response({result:prepare(a.currentSnapshot.status.chain_id,{...p,...change})});
+    await (await fill(a,bob)).requestSubmit();
+    assert.equal(broadcasts(a).length,1,'changed signed lifetime or block reference cannot be broadcast');checks++;
+    assert.match(a.get('send-form').querySelector().textContent,/does not match/);checks++;
+  }
   const pending=deferred();a.handlers.preparetransaction=()=>pending.promise;
   const form=await fill(a,bob),sending=form.requestSubmit();await settle();
   const req=a.calls.filter(c=>c.body.method==='preparetransaction').at(-1).body.params;
@@ -112,7 +119,7 @@ async function run() {
   assert.equal(reloaded.browserStore.snapshot().wallets.length,2);checks++;
   assert.equal(reloaded.browserStore.snapshot().wallet_enabled,false);checks++;
   // A watch export can be signed in the other independent browser holding its key.
-  const local=b.browserStore.snapshot(),signed=b.browserStore.signUnsigned(watchEnvelope,{chain_id:b.currentSnapshot.status.chain_id,sender:bob,nonce:'0',expiry_height:'120',operation:{TransferExact:{recipient:alice,amount:'100'}},fee:'4',data_hex:'00ff80',wallet_id:local.wallet_id,wallet_revision:local.wallet_revision});
+  const local=b.browserStore.snapshot(),signed=b.browserStore.signUnsigned(watchEnvelope,{chain_id:b.currentSnapshot.status.chain_id,sender:bob,nonce:'0',anchor:b.currentSnapshot.status.tip,expiry_blocks:'2',operation:{TransferExact:{recipient:alice,amount:'100'}},fee:'4',data_hex:'00ff80',wallet_id:local.wallet_id,wallet_revision:local.wallet_revision});
   reloaded.get('broadcast-raw').value=signed.raw;await reloaded.get('broadcast-form').requestSubmit();
   assert.equal(broadcasts(reloaded).length,1);checks++;
   for(const h of [a,b,reloaded]) {
@@ -141,9 +148,9 @@ async function run() {
     assert.equal(decoded.operation.TransferExact.amount,'1','public text has no special payment threshold');checks++;
     assert.equal(decoded.fee,'1');checks++;
     assert.equal(Buffer.from(decoded.data_hex,'hex').toString(),'Public test message 🌱');checks++;
-    const tag=sha(Buffer.from('Hashstash/Transaction')),message=sha(Buffer.concat([tag,tag,body]));
+    const tag=sha(Buffer.from('Hashstash/anchored-transaction')),message=sha(Buffer.concat([tag,tag,body]));
     assert.equal(c.noble.schnorr.verify(Uint8Array.from(raw.subarray(-64)),Uint8Array.from(message),Uint8Array.from(Buffer.from(bob,'hex'))),true);checks++;
-    const intent={chain_id:c.currentSnapshot.status.chain_id,sender:bob,nonce:'0',expiry_height:'120',operation:{Donate:{amount:'1',decision:null,outcome:null}},fee:'1',data_hex:''};
+    const intent={chain_id:c.currentSnapshot.status.chain_id,sender:bob,nonce:'0',anchor:c.currentSnapshot.status.tip,expiry_blocks:'2',operation:{Donate:{amount:'1',decision:null,outcome:null}},fee:'1',data_hex:''};
     assert.throws(()=>c.browserApi.verifyUnsigned(envelope,intent),/unsupported fields/i);checks++;
     assert.throws(()=>c.browserApi.verifyUnsigned(envelope,{...decoded,chain_id:'not-a-chain'}),/Invalid|hex/i);checks++;
     c.handlers.preparetransaction=p=>response({result:prepare(c.currentSnapshot.status.chain_id,{...p,operation:{TransferExact:{...p.operation.TransferExact,recipient:bob}}})});

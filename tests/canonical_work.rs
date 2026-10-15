@@ -158,7 +158,8 @@ fn whole_actual_fee_obeys_the_governed_split() {
                 sender: owner,
                 nonce: s.account(&owner, None).unwrap().nonce,
                 fee: 100_000u32.into(),
-                expiry_height: s.height + 10,
+                anchor: [0; 32],
+                expiry_blocks: s.height + 10,
                 operation: Operation::TransferExact {
                     recipient,
                     amount: 1u32.into(),

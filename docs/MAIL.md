@@ -34,7 +34,7 @@ Common authenticated data concatenates UTF-8 `Hashstash/Mail/v2\0`, chain ID, se
 
 Each role (recipient or sender) derives ECDH with its public key and the ephemeral scalar. HKDF uses the chain ID as salt and `Hashstash/Mail/v2/<role>\0`, common authenticated data and the role's candidate public key as info. A decrypting client derives its candidate from its own key without a lookup. The resulting AES key wraps the content key using authenticated data equal to common data followed by `/<role>`. The sender wrap enables sent-mail recovery, including the encrypted recipient.
 
-Decryption authenticates both wrap and content before validating canonical JSON, length, zero padding and the encrypted recipient. Readable UTF-8 never establishes delivery. The outer transaction signature authenticates the publisher and binds operation, fees, nonce, expiry and ciphertext. Different chain/sender/nonce invalidates decryption; ordinary account nonces prevent transaction replay.
+Decryption authenticates both wrap and content before validating canonical JSON, length, zero padding and the encrypted recipient. Readable UTF-8 never establishes delivery. The outer transaction signature authenticates the publisher and binds operation, fees, nonce, anchor block, lifetime and ciphertext. Different chain/sender/nonce invalidates decryption; ordinary account nonces prevent transaction replay.
 
 ## Discovery API
 

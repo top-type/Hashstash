@@ -468,7 +468,10 @@ async fn bounded_seeded_peer_mutations_and_invalid_transactions_preserve_state()
             sender: crypto::public_key(&secret).unwrap(),
             nonce: 0,
             fee: 100u32.into(),
-            expiry_height: 100,
+            anchor: hashstash::codec::block_hash(
+                &hashstash::codec::genesis_block(&configuration()).unwrap(),
+            ),
+            expiry_blocks: 100,
             operation: Operation::TransferExact {
                 recipient: crypto::public_key(&[103; 32]).unwrap(),
                 amount: 1u32.into(),
@@ -688,7 +691,10 @@ async fn concurrent_invalid_signature_batches_leave_coherent_rpc_snapshots_respo
             sender: crypto::public_key(&secret).unwrap(),
             nonce: 0,
             fee: 100u32.into(),
-            expiry_height: 100,
+            anchor: hashstash::codec::block_hash(
+                &hashstash::codec::genesis_block(&configuration()).unwrap(),
+            ),
+            expiry_blocks: 100,
             operation: Operation::TransferExact {
                 recipient: crypto::public_key(&[107; 32]).unwrap(),
                 amount: 1u32.into(),
@@ -917,7 +923,10 @@ async fn stratum_admits_and_mines_a_complete_256_transaction_job() {
                     sender: public,
                     nonce,
                     fee: 1u32.into(),
-                    expiry_height: 100,
+                    anchor: hashstash::codec::block_hash(
+                        &hashstash::codec::genesis_block(&configuration()).unwrap(),
+                    ),
+                    expiry_blocks: 100,
                     operation: Operation::TransferExact {
                         recipient: public,
                         amount: 1u32.into(),

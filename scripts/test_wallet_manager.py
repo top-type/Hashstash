@@ -21,9 +21,10 @@ def main():
     parser.add_argument('--node', type=Path, default=REPO / 'target/release' / ('hashstash.exe' if os.name == 'nt' else 'hashstash'))
     parser.add_argument('--cold', type=Path, default=REPO / 'target/release' / ('hashstash-cold.exe' if os.name == 'nt' else 'hashstash-cold'))
     parser.add_argument('--report', type=Path, default=REPO / 'work/wallet-manager-report.json')
+    parser.add_argument('--directory', type=Path, default=REPO / 'work')
     args = parser.parse_args()
     args.node, args.cold = (args.node.resolve(), args.cold.resolve())
-    scratch = REPO / 'work'
+    scratch = args.directory.resolve()
     scratch.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix='wallet-manager-', dir=scratch)).resolve()
     assert directory.is_relative_to(scratch.resolve())
@@ -162,7 +163,7 @@ def main():
 
         def send(operation, expected=200, identity=None):
             identity = identity or session
-            code, result = request(base, '/api/wallet', {'operation': operation, **fee_fields, 'expiry_blocks': 100, 'expected_sender': identity['public_key'], 'wallet_revision': identity['wallet_revision']}, session['token'])
+            code, result = request(base, '/api/wallet', {'operation': operation, **fee_fields, 'expiry_blocks': 2, 'expected_sender': identity['public_key'], 'wallet_revision': identity['wallet_revision']}, session['token'])
             assert code == expected, (code, result)
             return result
         send(payment, expected=400, identity=old_hot)
@@ -179,7 +180,7 @@ def main():
         assert rpc(base, 'account', {'key': offline['public_key']})['account']['ordinary'] == '6'
         manage('select', id=watch_id)
         send(payment, expected=403)
-        unsigned = rpc(base, 'preparetransaction', {'sender': offline['public_key'], 'operation': payment, **fee_fields, 'expiry_blocks': 100})
+        unsigned = rpc(base, 'preparetransaction', {'sender': offline['public_key'], 'operation': payment, **fee_fields, 'expiry_blocks': 2})
         unsigned.pop('fee_quote', None)
         _, cold_base = start(args.cold, ['--port', '0'], 'cold', 'cold signer: (http://127\\.0\\.0\\.1:\\d+)/')
         _, cold_session = request(cold_base, '/api/session')

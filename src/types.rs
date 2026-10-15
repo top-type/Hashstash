@@ -303,7 +303,10 @@ pub struct TransactionBody {
     pub nonce: u64,
     #[serde(with = "amount")]
     pub fee: Amount,
-    pub expiry_height: u64,
+    /// Block whose state was used to prepare this transaction.
+    pub anchor: Hash,
+    /// Valid for this many blocks after the signed anchor; retries never extend it.
+    pub expiry_blocks: u64,
     pub operation: Operation,
     /// Signed, uninterpreted bytes; applications define their own formats.
     pub data: Vec<u8>,

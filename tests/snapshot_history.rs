@@ -24,7 +24,10 @@ fn governance_snapshot_keeps_current_proposal_after_more_than_one_page_of_histor
                 sender: public,
                 nonce,
                 fee: 1u32.into(),
-                expiry_height: 10_000,
+                anchor: hashstash::codec::block_hash(
+                    &hashstash::codec::genesis_block(&config).unwrap(),
+                ),
+                expiry_blocks: 10_000,
                 operation,
             },
             &secret,

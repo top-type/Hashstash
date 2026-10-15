@@ -192,7 +192,6 @@
         [tx.status === 'orphaned' ? 'Recorded fee' : tx.status === 'pending' ? 'Signed fee' : 'Fee paid', tx.fee !== null && tx.fee !== undefined ? cell => amount(cell, tx.fee) : undefined],
         [tx.fee_estimated ? 'Current minimum fee' : 'Minimum fee', tx.minimum_fee !== null && tx.minimum_fee !== undefined ? cell => amount(cell, tx.minimum_fee) : undefined],
         ['Above minimum', tx.extra_fee !== null && tx.extra_fee !== undefined ? cell => amount(cell, tx.extra_fee) : undefined],
-        ['Expiry block', grouped(tx.expiry_height)],
         ['Transaction number', grouped(tx.nonce)],
         ['Outcome', operation.outcome ? String(operation.outcome).toUpperCase() : undefined],
         ['Settlement', effects[tx.settlement?.effect]],
@@ -202,7 +201,7 @@
       if (validHash(operation.proposal)) record(parent, [['Proposal', cell => link(cell, 'governance', operation.proposal)]]);
       dataField(parent, tx.data_hex);
       const technical = details(parent, 'Transaction details');
-      record(technical, [['Size', `${grouped(tx.size_bytes)} bytes`]]);
+      record(technical, [['Size', `${grouped(tx.size_bytes)} bytes`], ['Anchor block', validHash(tx.anchor) ? cell => link(cell, 'block', tx.anchor, tx.anchor, 'explorer-link explorer-full') : undefined], ['Valid for · blocks', grouped(tx.expiry_blocks)]]);
       add(technical, 'pre', 'explorer-raw', JSON.stringify(tx.operation, null, 2));
     }
     function account(data, query) {
@@ -221,14 +220,17 @@
         if (data.pass_account) {
           for (const [label, account, marked, withdrawal] of [['PASS', data.pass_account, data.pass_stash_value_hash, data.pass_stash_withdrawal_hash], ['FAIL', data.account, data.stash_value_hash, data.stash_withdrawal_hash]]) {
             const outcome = add(parent, 'section', 'explorer-account-outcome'); add(outcome, 'h3', '', label);
-            record(outcome, [['hashes', cell => amount(cell, account.ordinary)], ['stash', cell => amount(cell, account.shares, 'stash')], ['Estimated stash value', marked ? cell => amount(cell, marked.numerator, 'hash', marked.denominator) : undefined], ['Withdrawal before fees', withdrawal !== undefined ? cell => amount(cell, withdrawal) : undefined]]);
+            record(outcome, [['hashes', cell => amount(cell, account.ordinary)], ['stash', cell => amount(cell, account.shares, 'stash')], ['Estimated stash value', marked ? cell => amount(cell, marked.numerator, 'hash', marked.denominator) : undefined], ['Uncapped redemption value', withdrawal !== undefined ? cell => amount(cell, withdrawal) : undefined]]);
           }
         }
         record(parent, [
           ['Estimated stash value', !data.pass_account && data.stash_value_hash ? cell => amount(cell, data.stash_value_hash.numerator, 'hash', data.stash_value_hash.denominator) : undefined],
-          ['Stash withdrawal before fees', !data.pass_account && data.stash_withdrawal_hash !== undefined ? cell => amount(cell, data.stash_withdrawal_hash) : undefined],
+          ['Uncapped redemption value', !data.pass_account && data.stash_withdrawal_hash !== undefined ? cell => amount(cell, data.stash_withdrawal_hash) : undefined],
           ['Transaction counter', grouped(data.account.nonce)],
         ]);
+        if (data.stash_withdrawal_hash !== undefined || data.pass_stash_withdrawal_hash !== undefined) {
+          add(parent, 'p', 'explorer-secondary', 'Uncapped redemption value follows the curve for all held stash, before fees and the block price limit. It is not an executable withdrawal quote.');
+        }
       }
       if (data.pending?.length) transactions(panel('Pending transactions'), data.pending);
       const history = panel('History');

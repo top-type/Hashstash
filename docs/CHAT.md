@@ -6,7 +6,7 @@ Open **Chat** to read without a wallet. Each entry links to its signed transacti
 
 ## Public text
 
-The Message input encodes text as UTF-8 bytes in the signed transaction `data` vector. Leaving it empty attaches no data. Advanced hexadecimal input remains available for exact binary bytes; the CLI and RPC continue to use `--data-hex` and `data_hex` respectively. The complete signature covers those bytes together with the operation, amounts, fees, nonce and expiry.
+The Message input encodes text as UTF-8 bytes in the signed transaction `data` vector. Leaving it empty attaches no data. Advanced hexadecimal input remains available for exact binary bytes; the CLI and RPC continue to use `--data-hex` and `data_hex` respectively. The complete signature covers those bytes together with the operation, amounts, fees, nonce, anchor block and lifetime.
 
 The feed accepts nonblank valid UTF-8 without control characters other than line breaks, carriage returns and tabs. The complete signed transaction, including its operation and signature, must fit the current block’s byte and weight capacity. Data contributes to the normal transaction weight and fee. Arbitrary binary data remains valid transaction data but is not displayed as a public text message.
 

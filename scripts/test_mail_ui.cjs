@@ -16,7 +16,7 @@ async function setup(options={}){
    return {ready:true,chain_id:s.status.chain_id,tip:s.status.tip,anchor:s.status.tip,indexed_height:s.status.height,height:s.status.height,messages,next_cursor,scan_cursor:next_cursor||`${s.status.height}:9223372036854775807`};};
  h.handlers.explorer_mail=params=>h.invalidAnchor&&params.anchor?response({error:{message:'Mail scan anchor is no longer canonical'}}):response({result:h.feed(params)});
  h.handlers.fee_quote=params=>{const {chain_id,tip,state_root,height}=s.status,priority=params.extra_fee||'0',data=params.data_hex||'',paid=1n+BigInt(priority),miner=paid/2n;
- return response({result:{miner_fee_percent:50,miner_fee:String(miner),revenue_fee:String(paid-miner),chain_id,tip,state_root,height,sender:addr(params.sender),sender_public_key:params.sender,fee:String(paid),minimum_fee:'1',account_creation_fee:'0',grant_recipient_fee:'0',extra_fee:priority,weight:'512',minimum_fee_rate:'1',data_hex:data,data_bytes:data.length/2}});};
+ return response({result:{miner_fee_percent:50,miner_fee:String(miner),revenue_fee:String(paid-miner),chain_id,tip,state_root,height,anchor:tip,anchor_height:height,expiry_blocks:params.expiry_blocks??2,expiry_height:String(BigInt(height)+BigInt(params.expiry_blocks??2)),sender:addr(params.sender),sender_public_key:params.sender,fee:String(paid),minimum_fee:'1',account_creation_fee:'0',grant_recipient_fee:'0',extra_fee:priority,weight:'512',minimum_fee_rate:'1',data_hex:data,data_bytes:data.length/2}});};
  h.decryptMail=(data,identity)=>h.mailCrypto.decrypt(data,identity,a);
  h.drain=()=>wait(()=>!h.get('mail-scan-status').textContent.startsWith('Scanning'),h);
  await h.refresh();await h.navigate('#mail');await h.drain();

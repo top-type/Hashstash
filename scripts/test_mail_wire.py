@@ -121,7 +121,7 @@ def run(args):
                 # The administrative CLI uses submittransaction; the browser's
                 # public surface intentionally exposes only signed-hex broadcast.
                 sent = json.loads(cli("send", "--url", f"http://127.0.0.1:{private_port}/rpc", "--key", key,
-                    "--operation-file", operation, "--data-hex", data, "--nonce", identity["nonce"], "--expiry-blocks", "20"))
+                    "--operation-file", operation, "--data-hex", data, "--nonce", identity["nonce"], "--expiry-blocks", "2"))
                 txid = sent.get("transaction_id") or sent.get("txid")
                 check(isinstance(txid, str) and len(txid) == 64, "Actual CLI signs and broadcasts the ordinary data transfer")
                 report["txid"] = txid

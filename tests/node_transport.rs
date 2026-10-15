@@ -37,7 +37,8 @@ fn signed(
             sender: crypto::public_key(secret).unwrap(),
             nonce,
             fee: 2u32.into(),
-            expiry_height: 1000,
+            anchor: hashstash::codec::block_hash(&hashstash::codec::genesis_block(c).unwrap()),
+            expiry_blocks: 1000,
             operation: Operation::TransferExact {
                 recipient,
                 amount: amount.into(),
@@ -442,7 +443,10 @@ async fn large_legal_loose_transaction_relays_alongside_blocks_without_stalling_
                 sender: miner,
                 nonce,
                 fee: 2000u32.into(),
-                expiry_height: 100,
+                anchor: hashstash::codec::block_hash(
+                    &hashstash::codec::genesis_block(&config).unwrap(),
+                ),
+                expiry_blocks: 100,
                 operation: Operation::TransferExact {
                     recipient: miner,
                     amount: 1u32.into(),

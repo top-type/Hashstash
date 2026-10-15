@@ -17,7 +17,8 @@ fn body(operation: Operation) -> TransactionBody {
         sender: crypto::public_key(&[19; 32]).unwrap(),
         nonce: 7,
         fee: 100u32.into(),
-        expiry_height: 50,
+        anchor: [38; 32],
+        expiry_blocks: 50,
         operation,
     }
 }
@@ -198,7 +199,8 @@ fn offline_exports_reject_invalid_values_and_removed_operation_tags() {
     assert!(wallet::decode_unsigned(&wallet::unsigned(&tx)).is_err());
     tx = body(transfer());
     let canonical = codec::encode(&tx);
-    let operation_offset = 32 + 32 + 1 + 2 + 1;
+    let operation_offset =
+        canonical.len() - codec::encode(&tx.operation).len() - codec::encode(&tx.data).len();
     assert_eq!(canonical[operation_offset], 0);
     for tag in [6, 7, 255] {
         let mut bytes = canonical.clone();
@@ -259,6 +261,132 @@ fn successful(output: std::process::Output) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn cli_zero_rate_prepares_creates_recipients_and_executes_amount_only_trades() {
+    let directory = tempfile::tempdir().unwrap();
+    let secret = [19; 32];
+    let sender = crypto::public_key(&secret).unwrap();
+    let recipient = crypto::public_key(&[20; 32]).unwrap();
+    let mut config = Config::devnet();
+    config.initial.minimum_fee_rate = 0;
+    config.genesis_time = node::now().saturating_sub(3600) as u32;
+    let share_scale = config.share_scale.clone();
+    let node = Node::open(&directory.path().join("zero-fee.sqlite"), config, sender).unwrap();
+    for _ in 0..8 {
+        node.mine(100_000).unwrap();
+    }
+    let server = node::serve(
+        node.clone(),
+        ServerOptions {
+            rpc: "127.0.0.1:0".parse().unwrap(),
+            p2p: "127.0.0.1:0".parse().unwrap(),
+            stratum: "127.0.0.1:0".parse().unwrap(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let url = format!("http://{}/rpc", server.rpc);
+    let key = directory.path().join("published-test-key.json");
+    std::fs::write(
+        &key,
+        serde_json::to_vec(&json!({"secret":hex::encode(secret),"public":hex::encode(sender)}))
+            .unwrap(),
+    )
+    .unwrap();
+    let payment = Operation::TransferExact {
+        recipient,
+        amount: 1u32.into(),
+    };
+    let unsigned_path = directory.path().join("unsigned.json");
+    successful(
+        cli(vec![
+            "prepare".into(),
+            "--url".into(),
+            url.clone(),
+            "--sender".into(),
+            hex::encode(sender),
+            "--operation".into(),
+            serde_json::to_string(&payment).unwrap(),
+            "--out".into(),
+            unsigned_path.to_str().unwrap().into(),
+        ])
+        .await,
+    );
+    let envelope = serde_json::from_slice(&std::fs::read(&unsigned_path).unwrap()).unwrap();
+    let prepared = wallet::decode_unsigned(&envelope).unwrap();
+    assert_eq!(prepared.fee, 0u32.into());
+    assert_eq!(prepared.operation, payment);
+    for (operation, extra) in [
+        (payment.clone(), 0u32),
+        (payment, 1),
+        (
+            Operation::Deposit {
+                amount: 4u32.into(),
+                decision: None,
+                outcome: None,
+            },
+            0,
+        ),
+        (
+            Operation::Redeem {
+                shares: share_scale.clone(),
+                decision: None,
+                outcome: None,
+            },
+            0,
+        ),
+    ] {
+        let anchor = node::parse_hash(node.status().unwrap()["tip"].as_str().unwrap()).unwrap();
+        successful(
+            cli(vec![
+                "send".into(),
+                "--url".into(),
+                url.clone(),
+                "--key".into(),
+                key.to_str().unwrap().into(),
+                "--operation".into(),
+                serde_json::to_string(&operation).unwrap(),
+                "--extra-fee".into(),
+                extra.to_string(),
+            ])
+            .await,
+        );
+        let pending = node.rpc("mempool", json!({})).unwrap();
+        assert_eq!(pending.as_array().unwrap().len(), 1);
+        assert_eq!(pending[0]["body"]["fee"], extra.to_string());
+        assert_eq!(
+            pending[0]["body"]["operation"],
+            serde_json::to_value(&operation).unwrap()
+        );
+        assert_eq!(
+            pending[0]["body"]["expiry_blocks"],
+            wallet::default_expiry_blocks(&operation)
+        );
+        assert_eq!(pending[0]["body"]["anchor"], json!(anchor));
+        assert!(pending[0]["body"].get("expiry_height").is_none());
+        node.mine(100_000).unwrap();
+        assert!(
+            node.rpc("mempool", json!({}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert_eq!(
+        node.rpc("account", json!({"key":hex::encode(recipient)}))
+            .unwrap()["account"]["ordinary"],
+        "2"
+    );
+    assert_eq!(
+        node.rpc("account", json!({"key":hex::encode(sender)}))
+            .unwrap()["account"]["shares"],
+        (share_scale * 3u32).to_string()
+    );
+    server.stop().await;
 }
 
 #[tokio::test]
@@ -472,7 +600,8 @@ async fn cli_finds_pending_nonce_beyond_legacy_mempool_size() {
             sender,
             nonce,
             fee: 4u32.into(),
-            expiry_height: 100,
+            anchor: node::parse_hash(node.status().unwrap()["tip"].as_str().unwrap()).unwrap(),
+            expiry_blocks: 100,
             operation: operation.clone(),
         };
         node.submit_transaction(crypto::sign(&body, &secret).unwrap())

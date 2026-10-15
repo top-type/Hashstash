@@ -270,12 +270,17 @@ impl Config {
             "opening price rounds to zero at configured quote precision"
         );
         ensure!(
+            (((Amount::one() << self.money_bits as usize) - 1u32) * &self.quote_scale).bits()
+                <= self.max_integer_bits,
+            "display quote range too small"
+        );
+        ensure!(
             (((Amount::one() << self.money_bits as usize) - 1u32)
-                * &self.quote_scale
+                * ((Amount::one() << self.share_bits as usize) - 1u32)
                 * (Amount::from(u64::MAX) + Amount::from(10_000u32)))
             .bits()
                 <= self.max_integer_bits,
-            "price comparison range too small"
+            "marginal price comparison range too small"
         );
         Ok(())
     }

@@ -319,8 +319,11 @@ fn world_mut(s: &mut State, o: Option<Outcome>) -> &mut World {
     }
 }
 
-/// Apply an atomic, conserving transaction. Charges are staged in Revenue;
-/// BlockExecution tracks and settles the miner share of the whole fee.
+/// Simulate one atomic transaction as its own batch. Repeated calls are not a
+/// block: use execute/BlockExecution to share opening funds and clear once.
+/// Charges are staged in Revenue; block execution settles the miner fee share.
+/// This economic simulation has no header history: Chain additionally validates
+/// the signed anchor's ancestry and lifetime before admitting a transaction.
 pub fn apply_transaction(c: &Config, s: &mut State, t: &Transaction) -> Result<()> {
     let prepared = fees::PreparedTransaction::with_limit(t, c.transaction_bytes(&s.settings))?;
     crypto::verify(t)?;
@@ -370,7 +373,7 @@ fn transaction_inner(
         b.chain_id == s.chain_id,
         "transaction belongs to another network"
     );
-    ensure!(b.expiry_height >= s.height, "expired transaction");
+    ensure!(b.expiry_blocks > 0, "transaction lifetime must be positive");
     c.check_amount(&b.fee)?;
     let sender = s
         .account(&b.sender, None)
@@ -755,28 +758,87 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
     }
     Ok(())
 }
-/// Exact strict quote comparison for one block observation.
-/// Equality at the threshold does not award a leading block.
-pub fn pass_beats_fail(pass: &Amount, fail: &Amount, margin_bps: u64) -> bool {
-    pass * Amount::from(10_000u32) > fail * (Amount::from(10_000u32) + Amount::from(margin_bps))
+/// Compare actual marginal prices M/S, independently of display precision.
+/// An empty world's price is zero; equality never awards a leading block.
+pub fn pass_beats_fail(pass: &World, fail: &World, margin_bps: u64) -> bool {
+    if pass.shares.is_zero() {
+        return false;
+    }
+    if fail.shares.is_zero() {
+        return !pass.curve_mass.is_zero();
+    }
+    &pass.curve_mass * &fail.shares * 10_000u32
+        > &fail.curve_mass * &pass.shares * (Amount::from(10_000u32) + Amount::from(margin_bps))
 }
 
 #[cfg(test)]
 mod margin_tests {
     use super::*;
 
+    fn world(mass: Amount, shares: Amount) -> World {
+        World {
+            reserve: mass.clone(),
+            curve_mass: mass,
+            shares,
+            ..World::default()
+        }
+    }
+
     #[test]
     fn pass_margin_uses_exact_strict_comparison_and_all_u64_values() {
-        assert!(!pass_beats_fail(&100u32.into(), &100u32.into(), 0));
-        assert!(pass_beats_fail(&101u32.into(), &100u32.into(), 0));
-        assert!(!pass_beats_fail(&105u32.into(), &100u32.into(), 500));
-        assert!(pass_beats_fail(&106u32.into(), &100u32.into(), 500));
-        assert!(!pass_beats_fail(&0u32.into(), &0u32.into(), u64::MAX));
-        assert!(pass_beats_fail(&1u32.into(), &0u32.into(), u64::MAX));
-        let fail = Amount::from(10_000u32) << 400usize;
+        let fail = world(100u32.into(), 1u32.into());
+        assert!(!pass_beats_fail(&fail, &fail, 0));
+        assert!(pass_beats_fail(
+            &world(101u32.into(), 1u32.into()),
+            &fail,
+            0
+        ));
+        assert!(!pass_beats_fail(
+            &world(105u32.into(), 1u32.into()),
+            &fail,
+            500
+        ));
+        assert!(pass_beats_fail(
+            &world(106u32.into(), 1u32.into()),
+            &fail,
+            500
+        ));
+        assert!(!pass_beats_fail(
+            &World::default(),
+            &World::default(),
+            u64::MAX
+        ));
+        assert!(pass_beats_fail(&fail, &World::default(), u64::MAX));
+        assert!(!pass_beats_fail(&World::default(), &fail, 0));
+        let fail = world(
+            Amount::from(10_000u32) << 400usize,
+            Amount::from(1u32) << 511usize,
+        );
         let threshold = (Amount::from(u64::MAX) + 10_000u32) << 400usize;
-        assert!(!pass_beats_fail(&threshold, &fail, u64::MAX));
-        assert!(pass_beats_fail(&(threshold + 1u32), &fail, u64::MAX));
+        let at_threshold = world(threshold.clone(), fail.shares.clone());
+        assert!(!pass_beats_fail(&at_threshold, &fail, u64::MAX));
+        assert!(pass_beats_fail(
+            &world(threshold + 1u32, fail.shares.clone()),
+            &fail,
+            u64::MAX
+        ));
+    }
+
+    #[test]
+    fn displayed_zero_prices_do_not_hide_strict_leads_or_margin_ties() {
+        let c = Config::devnet();
+        let supply = Amount::from(1u32) << 500usize;
+        let fail = world(100u32.into(), supply.clone());
+        let equal = world(200u32.into(), &supply * 2u32);
+        let threshold = world(210u32.into(), &supply * 2u32);
+        let lead = world(211u32.into(), &supply * 2u32);
+        for w in [&fail, &equal, &threshold, &lead] {
+            assert!(w.quote(&c).is_zero());
+        }
+        assert!(!pass_beats_fail(&equal, &fail, 0));
+        assert!(pass_beats_fail(&threshold, &fail, 0));
+        assert!(!pass_beats_fail(&threshold, &fail, 500));
+        assert!(pass_beats_fail(&lead, &fail, 500));
     }
 }
 
@@ -820,7 +882,9 @@ fn resolve(c: &Config, s: &mut State) -> Result<bool> {
     Ok(won)
 }
 
-/// Executes the state transition independently of nonce/extranonce/timestamp mining fields.
+/// Execute economic state transitions without a header-history context.
+/// Chain admission, templates and replay additionally validate every signed
+/// anchor's ancestry and lifetime; this helper alone is not block validation.
 pub fn execute(
     c: &Config,
     parent: &State,
@@ -832,7 +896,9 @@ pub fn execute(
     Ok(execute_with_fills(c, parent, parent_hash, miner, subsidy, transactions)?.0)
 }
 
-/// Replay once and return the actual batch fills for explorers and wallets.
+/// Replay economic transitions once and return actual batch fills.
+/// Like execute, this has no header-history context; Chain validates signed
+/// anchor ancestry and lifetime before block admission or historical replay.
 pub fn execute_with_fills(
     c: &Config,
     parent: &State,
@@ -930,8 +996,8 @@ pub(crate) fn prepare_block(
     if let Phase::Governance(d) = &mut s.phase {
         let pass = parent.alternative.as_ref().context("missing PASS world")?;
         if pass_beats_fail(
-            &pass.quote(c),
-            &parent.world.quote(c),
+            pass,
+            &parent.world,
             parent.frozen.pass_margin_bps.unwrap_or(0),
         ) {
             d.leading_blocks = d
@@ -1133,7 +1199,8 @@ mod transaction_batch_tests {
                 sender: sender(),
                 nonce: s.account(&sender(), None).unwrap().nonce,
                 fee: 20u32.into(),
-                expiry_height: 100,
+                anchor: [0; 32],
+                expiry_blocks: 100,
                 operation: op,
             },
             &SECRET,
@@ -1304,7 +1371,8 @@ mod reserve_model_tests {
                 sender: owner(),
                 nonce: s.account(&owner(), None).unwrap().nonce + offset,
                 fee: fee.into(),
-                expiry_height: s.height + 100,
+                anchor: [0; 32],
+                expiry_blocks: s.height + 100,
                 operation,
             },
             &SECRET,

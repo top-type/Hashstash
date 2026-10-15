@@ -161,6 +161,34 @@ fn genesis_settings_use_defined_domains_without_policy_limits() {
 }
 
 #[test]
+fn intermediate_width_covers_exact_prices_and_display_precision_separately() {
+    let mut c = Config::devnet();
+    // (2^512-1)^2 * (2^64-1+10000) is just above 2^1088.
+    c.max_integer_bits = 1089;
+    c.validate().unwrap();
+    c.max_integer_bits = 1088;
+    assert!(
+        c.validate()
+            .unwrap_err()
+            .to_string()
+            .contains("marginal price comparison")
+    );
+
+    // A deliberately wider display scale has its own arithmetic requirement:
+    // World::quote multiplies only Q*M: (2^512-1) * 2^600 needs 1112 bits.
+    c.quote_scale = hashstash::types::Amount::from(1u32) << 600usize;
+    c.max_integer_bits = 1112;
+    c.validate().unwrap();
+    c.max_integer_bits = 1111;
+    assert!(
+        c.validate()
+            .unwrap_err()
+            .to_string()
+            .contains("display quote range")
+    );
+}
+
+#[test]
 fn obsolete_grant_cap_config_and_state_fields_are_rejected() {
     let config = Config::devnet();
     for (field, value) in [

@@ -329,7 +329,8 @@ fn body(sender: PublicKey, operation: Operation) -> TransactionBody {
         chain_id: [9; 32],
         sender,
         nonce: 9_007_199_254_740_993,
-        expiry_height: 9_007_199_254_740_999,
+        anchor: [0; 32],
+        expiry_blocks: 9_007_199_254_740_999,
         fee: (Amount::from(1u32) << 128usize) + 17u32,
         operation,
     }

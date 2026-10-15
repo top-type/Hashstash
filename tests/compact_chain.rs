@@ -56,7 +56,10 @@ fn selection_accounts_for_real_body_bytes_and_new_account_weight() {
                             sender: miner(1),
                             nonce,
                             fee: 100u32.into(),
-                            expiry_height: 100,
+                            anchor: hashstash::codec::block_hash(
+                                &hashstash::codec::genesis_block(&c).unwrap(),
+                            ),
+                            expiry_blocks: 100,
                             operation: Operation::TransferExact {
                                 recipient: if new_accounts {
                                     miner(nonce as u8 + 10)

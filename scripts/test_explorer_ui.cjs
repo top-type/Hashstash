@@ -26,7 +26,7 @@ const walk = element => [element, ...element.children.flatMap(walk)];
 const links = h => walk(h.content).filter(n => n.tagName === 'a');
 const ctx = { chain_id: chain, tip: blockHash, height: 12, state_root: 'c'.repeat(64) };
 const block = { height: 12, hash: blockHash, previous: 'c'.repeat(64), state_root: 'f'.repeat(64), miner: address, expected_hashes: '1000000000000', subsidy: '1000000000000', difficulty: 232.83, body_bytes: 500, transaction_count: 1, phase: 'auction', status: 'confirmed', header: { nonce: 42 }, rewards: { subsidy: '1000000000000', extra_fees: '6', minimum_fees: '3', miner_total: '1000000000006' } };
-const tx = { txid, kind: 'transfer', status: 'confirmed', height: 12, block_hash: blockHash, confirmations: 1, sender: address, recipient: address, amount: '1000', asset: 'hash', nonce: 0, fee: '9', minimum_fee: '3', extra_fee: '6', expiry_height: 30, operation: { TransferExact: { recipient: Array(32).fill(18), amount: '1000' } }, data_hex: '', data_bytes: 0, size_bytes: 200 };
+const tx = { txid, kind: 'transfer', status: 'confirmed', height: 12, block_hash: blockHash, confirmations: 1, sender: address, recipient: address, amount: '1000', asset: 'hash', nonce: 0, fee: '9', minimum_fee: '3', extra_fee: '6', anchor: blockHash, expiry_blocks: 2, operation: { TransferExact: { recipient: Array(32).fill(18), amount: '1000' } }, data_hex: '', data_bytes: 0, size_bytes: 200 };
 function harness() {
   const elements = new Map(), get = id => { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); };
   const tabs = ['blocks', 'transactions', 'governance'].map(value => { const node = new Element('a'); node.dataset.explorerTab = value; return node; });

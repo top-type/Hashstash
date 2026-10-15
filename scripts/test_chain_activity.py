@@ -95,7 +95,7 @@ class FakeCli:
             op = json.loads(Path(flag('--operation-file')).read_text())
             sender = flag('--sender')
             body, raw = ca.make_body(CHAIN, sender, self.node.account_values[sender]['nonce'],
-                flag('--fee'), self.node.height + int(flag('--expiry-blocks')), op,
+                flag('--fee'), self.node.snapshot()['status']['tip'], int(flag('--expiry-blocks')), op,
                 flag('--data-hex') if '--data-hex' in args else '')
             ca.save_new(flag('--out'), {'format': 'hashstash-unsigned-v1', 'body': raw.hex()})
             if self.change_after_prepare:
@@ -131,7 +131,7 @@ class ActivityTests(unittest.TestCase):
 
     def action(self):
         return {'kind': 'transfer', 'sender_index': 0, 'operation': operation(),
-                'guard': {'nonce': 0, 'phase': 'rest'}, 'amount_raw': '1000', 'quoted_fee_raw': '1', 'expiry_blocks': 20}
+                'guard': {'nonce': 0, 'phase': 'rest'}, 'amount_raw': '1000', 'quoted_fee_raw': '1', 'expiry_blocks': 2}
 
     def test_chat_rotation_uses_full_confirmed_ledger_after_512_actions_and_restart(self):
         import activity_personas as personas
@@ -285,6 +285,9 @@ class ActivityTests(unittest.TestCase):
 
     def test_restart_retry_identical_no_new_signature_or_nonce(self):
         row = self.send()
+        original_body = json.loads(row['body'])
+        self.assertEqual(original_body['anchor'], list(bytes.fromhex(self.snapshot['status']['tip'])))
+        self.assertEqual(original_body['expiry_blocks'], 2)
         self.activity.ledger.db.close()
         self.activity = ca.Activity(self.cfg, Planner, self.cli, self.node, clock=lambda: self.now)
         self.activity.observe()
@@ -294,12 +297,35 @@ class ActivityTests(unittest.TestCase):
         self.activity.reconcile(snapshot, accounts)
         self.assertEqual(self.cli.broadcasts, [row['raw'], row['raw']])
         self.assertEqual(len(self.activity.ledger.rows(('pending',))), 1)
+        retried = self.activity.ledger.rows(('pending',))[0]
+        self.assertEqual(json.loads(retried['body']), original_body)
+        self.assertEqual(retried['expiry'], row['prepared_height'] + 2)
+
+    def test_same_height_reorg_after_preparation_is_not_signed(self):
+        original = self.cli.run
+        snapshot = self.node.snapshot
+        def run(args):
+            result = original(args)
+            if args[0] == 'prepare':
+                def reorganized():
+                    value = snapshot()
+                    value['status']['tip'] = 'ef' * 32
+                    return value
+                self.node.snapshot = reorganized
+            return result
+        self.cli.run = run
+        with self.assertRaisesRegex(ca.Pause, 'anchor moved before signing'):
+            self.send()
+        rows = self.activity.ledger.rows(('abandoned',))
+        self.assertEqual(len(rows), 1)
+        self.assertFalse((self.activity.work / rows[0]['id'] / 'signed.json').exists())
+        self.assertFalse(self.cli.broadcasts)
 
     def test_receipt_depth_required_and_anchor_reorg_fault(self):
         row = self.send()
         self.node.account_values[KEYS[0]]['nonce'] = 1
         self.node.receipt = dict(txid=row['txid'], sender_public_key=KEYS[0], nonce=0,
-            status='confirmed', confirmations=1, height=12, block_hash=self.node.anchor)
+            status='confirmed', confirmations=1, height=row['prepared_height'] + 1, block_hash=self.node.anchor)
         snapshot, accounts = self.activity.observe()
         self.activity.reconcile(snapshot, accounts)
         self.assertEqual(len(self.activity.ledger.rows(('pending',))), 1)
@@ -311,12 +337,13 @@ class ActivityTests(unittest.TestCase):
         with self.assertRaises(ca.Fault):
             self.activity.check_anchors()
 
-    def test_canonical_receipt_below_preparation_height_is_found(self):
+    def test_receipt_before_signed_anchor_cannot_be_accepted(self):
         row = self.send()
         self.node.receipt = dict(txid=row['txid'], sender_public_key=KEYS[0], nonce=0,
             status='confirmed', confirmations=3, height=9, block_hash=self.node.anchor)
-        self.activity.reconcile(self.snapshot, self.accounts)
-        self.assertEqual(self.activity.ledger.rows(('confirmed',))[0]['receipt_height'], 9)
+        with self.assertRaisesRegex(ca.Fault, 'outside the signed anchor lifetime'):
+            self.activity.reconcile(self.snapshot, self.accounts)
+        self.assertFalse(self.activity.ledger.rows(('confirmed',)))
 
     def test_unknown_nonce_consumption_does_not_pay_again(self):
         self.send()
@@ -328,7 +355,9 @@ class ActivityTests(unittest.TestCase):
 
     def test_expiration_does_not_reuse_original_transaction(self):
         row = self.send()
-        self.node.height = row['expiry'] + 1
+        # At the last eligible height, an absent transaction cannot enter any
+        # future block. Check its canonical receipt before declaring expiry.
+        self.node.height = row['expiry']
         snapshot, accounts = self.activity.observe()
         self.activity.reconcile(snapshot, accounts)
         self.assertEqual(len(self.activity.ledger.rows(('expired',))), 1)
@@ -500,14 +529,33 @@ class ActivityTests(unittest.TestCase):
         with self.assertRaises(ca.Fault):
             ca.Ledger(self.cfg['database'], other)
 
-    def test_registry_and_expiry_cannot_widen_scope(self):
+    def test_registry_identity_and_expiry_arithmetic_are_checked(self):
         other = copy.deepcopy(self.cfg)
         other['registry']['sgp'][0] = KEYS[0]
         with self.assertRaises(ValueError):
             ca.config_checked(other)
-        other = dict(self.cfg, expiry_blocks=21)
-        with self.assertRaises(ValueError):
-            ca.config_checked(other)
+        for lifetime in (21, (1 << 64) - 1):
+            self.assertEqual(ca.config_checked(dict(self.cfg, expiry_blocks=lifetime))['expiry_blocks'], lifetime)
+        for invalid in (0, -1, 1 << 64, True, 2.5):
+            with self.subTest(lifetime=invalid), self.assertRaises(ValueError):
+                ca.config_checked(dict(self.cfg, expiry_blocks=invalid))
+
+    def test_explicit_long_lifetime_is_signed_but_height_overflow_is_not(self):
+        action = self.action()
+        action['expiry_blocks'] = 21
+        self.activity.submit(action, self.snapshot, self.accounts)
+        row = self.activity.ledger.rows(('pending',))[0]
+        self.assertEqual(json.loads(row['body'])['expiry_blocks'], 21)
+        self.assertEqual(row['expiry'], row['prepared_height'] + 21)
+        action = self.action()
+        action['sender_index'] = 1
+        action['expiry_blocks'] = (1 << 64) - 1
+        with self.assertRaisesRegex(ca.Pause, 'valid height range'):
+            self.activity.submit(action, self.snapshot, self.accounts)
+        action['expiry_blocks'] = 1 << 63
+        with self.assertRaisesRegex(ca.Pause, 'SQLite ledger'):
+            self.activity.submit(action, self.snapshot, self.accounts)
+        self.assertEqual(len(self.activity.ledger.rows(('pending',))), 1)
 
     def test_funding_address_is_verified_by_public_cli_only(self):
         class IdentityCli:
@@ -551,15 +599,15 @@ class WireTests(unittest.TestCase):
             self.assertEqual(total, count)
             op = {'Propose': dict(round=2, description=[3] * 32,
                                  proposal={'Grant': grant}, support='1')}
-            body, wire = ca.make_body(CHAIN, KEYS[0], 0, 1, 120, op)
+            body, wire = ca.make_body(CHAIN, KEYS[0], 0, 1, 'ab' * 32, 2, op)
             prepared = {'format': 'hashstash-unsigned-v1', 'body': wire.hex()}
             self.assertEqual(ca.verified_prepared(
-                prepared, CHAIN, KEYS[0], 0, 1, op, '', 100, 20), (body, wire))
+                prepared, CHAIN, KEYS[0], 0, 1, op, '', 'ab' * 32, 2), (body, wire))
             self.assertLessEqual(len(wire) + 64, 16384)
         self.assertGreater(len(wire) + 64, 4096)
         with self.assertRaisesRegex(ca.Fault, 'unsigned length'):
             ca.verified_prepared({'format': 'hashstash-unsigned-v1', 'body': wire.hex()},
-                                 CHAIN, KEYS[0], 0, 1, op, '', 100, 20, max_bytes=4096)
+                                 CHAIN, KEYS[0], 0, 1, op, '', 'ab' * 32, 2, max_bytes=4096)
 
     def test_compact_integer_boundaries_and_noncanonical_encodings(self):
         fixtures = ((0, '00'), (250, 'fa'), (251, 'fbfb00'),
@@ -585,7 +633,7 @@ class WireTests(unittest.TestCase):
     def test_zero_amount_and_fixed_signature_have_no_redundant_payload(self):
         self.assertEqual(ca.amount(0), b'\x00')
         self.assertEqual(ca.amount(256), b'\x02\x00\x01')
-        body, raw = ca.make_body(CHAIN, KEYS[0], 0, 0, 1, operation())
+        body, raw = ca.make_body(CHAIN, KEYS[0], 0, 0, 'ab' * 32, 2, operation())
         signed = ca.signed_wire({'body': body, 'signature': [7] * 64}, body, raw)
         self.assertEqual(signed, raw + b'\x07' * 64)
         self.assertEqual(len(signed) - len(raw), 64)
@@ -599,19 +647,19 @@ class WireTests(unittest.TestCase):
                 ca.encode_operation(op)
 
     def test_every_intent_field_is_compared(self):
-        body, raw = ca.make_body(CHAIN, KEYS[0], 9, 1000, 120, operation())
+        body, raw = ca.make_body(CHAIN, KEYS[0], 9, 1000, 'ab' * 32, 2, operation())
         envelope = {'format': 'hashstash-unsigned-v1', 'body': raw.hex()}
-        parsed, encoded = ca.verified_prepared(envelope, CHAIN, KEYS[0], 9, 1000, operation(), '', 100, 20)
+        parsed, encoded = ca.verified_prepared(envelope, CHAIN, KEYS[0], 9, 1000, operation(), '', 'ab' * 32, 2)
         self.assertEqual(parsed, body)
         self.assertEqual(encoded, raw)
         for offset in (0, 32, 64, 65, 68, 69, len(raw) - 1):
             bad = bytearray(raw)
             bad[offset] ^= 1
             with self.assertRaises((ca.Fault, ca.Pause, ValueError)):
-                ca.verified_prepared(dict(envelope, body=bad.hex()), CHAIN, KEYS[0], 9, 1000, operation(), '', 100, 20)
+                ca.verified_prepared(dict(envelope, body=bad.hex()), CHAIN, KEYS[0], 9, 1000, operation(), '', 'ab' * 32, 2)
 
     def test_changed_signed_body_or_signature_length_rejected(self):
-        body, raw = ca.make_body(CHAIN, KEYS[0], 0, 1, 20, operation())
+        body, raw = ca.make_body(CHAIN, KEYS[0], 0, 1, 'ab' * 32, 2, operation())
         with self.assertRaises(ca.Fault):
             ca.signed_wire({'body': dict(body, nonce=1), 'signature': [0] * 64}, body, raw)
         with self.assertRaises(ca.Fault):
@@ -659,7 +707,7 @@ class WireTests(unittest.TestCase):
                 for i, inner in enumerate(ops):
                     # Positive/zero amounts and both empty and nonempty signed data
                     # are validated by the actual Rust wallet decoder and signer.
-                    body, raw = ca.make_body(CHAIN, public, i, 1000000, 100, inner,
+                    body, raw = ca.make_body(CHAIN, public, i, 1000000, 'ab' * 32, 2, inner,
                         b'Automated test'.hex() if i == 0 else '')
                     ca.save_new(root / f'body{i}.json', body)
                     cli.run(['sign', '--key', root / 'test.key', '--body', root / f'body{i}.json', '--out', root / f'signed{i}.json'])

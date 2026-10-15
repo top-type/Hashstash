@@ -34,7 +34,7 @@ pub const METHODS: &[&str] = &[
     "explorer_chat",
     "explorer_mail",
 ];
-const SCHEMA: &str = "batch-fills-leading-blocks";
+const SCHEMA: &str = "anchored-batch-fills-leading-blocks";
 pub const MAX_PAGE: u64 = 50;
 
 pub struct Explorer {
@@ -967,7 +967,8 @@ mod page_capacity_tests {
             sender: owner,
             nonce: 0,
             fee: 100_000u32.into(),
-            expiry_height: 100,
+            anchor: [38; 32],
+            expiry_blocks: 100,
             operation: Operation::Propose {
                 round: 1,
                 description: [43; 32],
@@ -1111,7 +1112,7 @@ fn tx_value(
         );
     }
     let quote = fees::quote(c, s, t).ok();
-    let mut v = json!({"txid":hex::encode(codec::transaction_id(t)),"status":if height.is_some(){"confirmed"}else{"pending"},"height":height,"block_hash":block.map(hex::encode),"confirmations":0,"sender":address::encode(&t.body.sender,&s.chain_id)?,"sender_public_key":hex::encode(t.body.sender),"nonce":t.body.nonce,"fee":t.body.fee.to_str_radix(10),"minimum_fee":quote.as_ref().map(|q|q.minimum_fee.to_str_radix(10)),"extra_fee":quote.as_ref().map(|q|q.extra_fee.to_str_radix(10)),"expiry_height":t.body.expiry_height,"kind":kind(&operation),"operation":operation,"data_hex":hex::encode(&data[..data.len().min(256)]),"data_bytes":data.len(),"data_truncated":data.len()>256,"size_bytes":codec::encode(t).len()});
+    let mut v = json!({"txid":hex::encode(codec::transaction_id(t)),"status":if height.is_some(){"confirmed"}else{"pending"},"height":height,"block_hash":block.map(hex::encode),"confirmations":0,"sender":address::encode(&t.body.sender,&s.chain_id)?,"sender_public_key":hex::encode(t.body.sender),"nonce":t.body.nonce,"fee":t.body.fee.to_str_radix(10),"minimum_fee":quote.as_ref().map(|q|q.minimum_fee.to_str_radix(10)),"extra_fee":quote.as_ref().map(|q|q.extra_fee.to_str_radix(10)),"anchor":hex::encode(t.body.anchor),"expiry_blocks":t.body.expiry_blocks,"kind":kind(&operation),"operation":operation,"data_hex":hex::encode(&data[..data.len().min(256)]),"data_bytes":data.len(),"data_truncated":data.len()>256,"size_bytes":codec::encode(t).len()});
     if let Some(recipient) = recipient(&operation) {
         v["recipient"] = json!(address::encode(&recipient, &s.chain_id)?);
     }
@@ -1433,7 +1434,7 @@ fn decision_record(c: &Config, s: &State, ended_height: Option<u64>) -> Result<V
     // quotes. Include that final observation in the historical result.
     if ended_height.is_some_and(|height| height > s.height) && observed < d.blocks {
         observed += 1;
-        if consensus::pass_beats_fail(&pass.quote(c), &s.world.quote(c), margin) {
+        if consensus::pass_beats_fail(pass, &s.world, margin) {
             leading += 1;
         }
     }
@@ -1505,7 +1506,8 @@ mod indexing_tests {
                 sender: owner,
                 nonce: 0,
                 fee: 1u32.into(),
-                expiry_height: 3,
+                anchor: [38; 32],
+                expiry_blocks: 3,
                 operation: Operation::Redeem {
                     shares: &c.share_scale * 100u32,
                     decision: None,
@@ -1619,6 +1621,16 @@ mod indexing_tests {
         assert_eq!(ended["leading_blocks"], 2);
         assert_eq!(ended["observed_blocks"], 3);
         assert_eq!(ended["outcome"], "pass");
+        // Presentation precision must not discard a real price lead when both
+        // display quotes round to zero.
+        let tiny_price_supply = &c.quote_scale * 1000u32;
+        state.world.shares = tiny_price_supply.clone();
+        state.alternative.as_mut().unwrap().shares = tiny_price_supply;
+        assert!(state.world.quote(&c).is_zero());
+        assert!(state.alternative.as_ref().unwrap().quote(&c).is_zero());
+        let tiny = decision_record(&c, &state, Some(8)).unwrap();
+        assert_eq!(tiny["leading_blocks"], 2);
+        assert_eq!(tiny["outcome"], "pass");
         state.height = 8;
         if let Phase::Governance(decision) = &mut state.phase {
             decision.blocks = 4;
@@ -1874,7 +1886,8 @@ mod indexing_tests {
                     sender: owner,
                     nonce,
                     fee: Amount::from(1_000_000u32 + extra),
-                    expiry_height: 100,
+                    anchor: [38; 32],
+                    expiry_blocks: 100,
                     operation: Operation::TransferExact {
                         recipient,
                         amount: 100u32.into(),
@@ -2020,7 +2033,8 @@ mod chat_tests {
                     sender: key,
                     nonce: 0,
                     fee: 10u32.into(),
-                    expiry_height: 100,
+                    anchor: [38; 32],
+                    expiry_blocks: 100,
                     operation,
                     data: b"An ordinary signed note".to_vec(),
                 },
@@ -2077,7 +2091,8 @@ mod chat_tests {
                     sender: owner,
                     nonce,
                     fee: 1_000_000u64.into(),
-                    expiry_height: 100,
+                    anchor: [38; 32],
+                    expiry_blocks: 100,
                     operation: Operation::TransferExact {
                         recipient: if nonce == 0 { other } else { owner },
                         amount: 100u32.into(),
@@ -2278,7 +2293,8 @@ mod chat_tests {
                     sender: owner,
                     nonce,
                     fee: 1_000_000u64.into(),
-                    expiry_height: 100,
+                    anchor: [38; 32],
+                    expiry_blocks: 100,
                     operation: Operation::TransferExact {
                         recipient: crypto::public_key(&[6; 32]).unwrap(),
                         amount: Amount::from(amount),

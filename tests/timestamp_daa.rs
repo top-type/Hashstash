@@ -31,7 +31,7 @@ fn append(chain: &mut Chain, seconds: u32, txs: Vec<Transaction>) -> Block {
     chain.tip_state().audit(&chain.config).unwrap();
     block
 }
-fn sign(s: &State, operation: Operation) -> Transaction {
+fn sign(c: &Config, s: &State, operation: Operation) -> Transaction {
     support::sign_minimum(
         s,
         TransactionBody {
@@ -39,7 +39,8 @@ fn sign(s: &State, operation: Operation) -> Transaction {
             sender: miner(),
             nonce: s.account(&miner(), None).unwrap().nonce,
             fee: 100_000u32.into(),
-            expiry_height: s.height + 10_000,
+            anchor: hashstash::codec::block_hash(&hashstash::codec::genesis_block(c).unwrap()),
+            expiry_blocks: s.height + 10_000,
             operation,
             data: vec![],
         },
@@ -268,6 +269,7 @@ fn interval_governance_changes_future_schedule_without_accelerating_economics() 
     assert!(matches!(chain.tip_state().phase, Phase::Auction(_)));
     let amount = chain.tip_state().account(&miner(), None).unwrap().ordinary / 2u32;
     let deposit = sign(
+        &c,
         chain.tip_state(),
         Operation::Deposit {
             amount,
@@ -284,6 +286,7 @@ fn interval_governance_changes_future_schedule_without_accelerating_economics() 
     // slope through a real, passing grant on the mined chain first.
     let grant = &chain.tip_state().world.reserve / 20u32;
     let proposal = sign(
+        &c,
         chain.tip_state(),
         Operation::Propose {
             round: chain.tip_state().auction_round().unwrap(),
@@ -307,6 +310,7 @@ fn interval_governance_changes_future_schedule_without_accelerating_economics() 
     let state = chain.tip_state();
     assert_eq!(state.alternative.as_ref().unwrap().grant_escrow, grant);
     let trade = sign(
+        &c,
         state,
         Operation::Deposit {
             amount: 1000u32.into(),
@@ -333,6 +337,7 @@ fn interval_governance_changes_future_schedule_without_accelerating_economics() 
     }
     let s = chain.tip_state();
     let tx = sign(
+        &c,
         s,
         Operation::Propose {
             round: s.auction_round().unwrap(),
@@ -355,6 +360,7 @@ fn interval_governance_changes_future_schedule_without_accelerating_economics() 
     let s = chain.tip_state();
     assert!(s.decision_id().is_some());
     let tx = sign(
+        &c,
         s,
         Operation::Deposit {
             amount: 1000u32.into(),
@@ -423,6 +429,7 @@ fn immediate_revenue_replenishment_is_independent_of_block_interval() {
         s = consensus::execute(&c, &s, &s.root(), &miner(), &1000u32.into(), &[]).unwrap();
     }
     let deposit = sign(
+        &c,
         &s,
         Operation::Deposit {
             amount: 10_000u32.into(),
@@ -479,7 +486,7 @@ fn time_policies_preserve_nominal_duration_at_different_intervals() {
 }
 
 #[test]
-fn decision_duration_is_independent_of_removed_funding_steps() {
+fn decision_block_counts_do_not_require_interval_divisibility() {
     let c = config();
     let mut settings = c.initial.clone();
     settings.interval = 60;
@@ -515,6 +522,7 @@ fn grant_decision_counts_blocks_and_reserves_upfront() {
     }
     assert!(matches!(s.phase, Phase::Auction(_)));
     let reserve_deposit = sign(
+        &c,
         &s,
         Operation::Deposit {
             amount: 10_000_000u32.into(),
@@ -534,6 +542,7 @@ fn grant_decision_counts_blocks_and_reserves_upfront() {
     .unwrap();
     let grant: Amount = 100_001u32.into();
     let proposal = sign(
+        &c,
         &s,
         Operation::Propose {
             round: s.auction_round().unwrap(),
@@ -570,6 +579,7 @@ fn grant_decision_counts_blocks_and_reserves_upfront() {
     assert!(consensus::grant_capacity(&s.world) >= grant);
     s.audit(&c).unwrap();
     let deposit = sign(
+        &c,
         &s,
         Operation::Deposit {
             amount: 2_000_000u32.into(),
@@ -599,12 +609,7 @@ fn grant_decision_counts_blocks_and_reserves_upfront() {
         .account(&miner(), Some(decision.epoch))
         .unwrap()
         .ordinary;
-    let pass_quote = pass.quote(&c);
-    assert!(consensus::pass_beats_fail(
-        &pass_quote,
-        &s.world.quote(&c),
-        0
-    ));
+    assert!(consensus::pass_beats_fail(pass, &s.world, 0));
     assert!(matches!(&s.phase, Phase::Governance(d) if d.leading_blocks == 1));
     s = consensus::execute(&c, &s, &s.root(), &miner(), &1_000_000u32.into(), &[]).unwrap();
     assert_eq!(s.clock - decision.started, 45);
@@ -618,7 +623,7 @@ fn grant_decision_counts_blocks_and_reserves_upfront() {
 }
 
 #[test]
-fn shortest_decision_allows_an_outcome_trade_and_successful_governance() {
+fn three_block_decision_allows_an_outcome_trade_and_successful_governance() {
     let mut c = config();
     c.initial.decision_blocks = 3;
     c.validate().unwrap();
@@ -627,6 +632,7 @@ fn shortest_decision_allows_an_outcome_trade_and_successful_governance() {
         s = consensus::execute(&c, &s, &s.root(), &miner(), &1_000_000u32.into(), &[]).unwrap();
     }
     let reserve_deposit = sign(
+        &c,
         &s,
         Operation::Deposit {
             amount: 10_000_000u32.into(),
@@ -655,6 +661,7 @@ fn shortest_decision_allows_an_outcome_trade_and_successful_governance() {
     s.audit(&c).unwrap();
     let new_capacity = c.initial.block_bytes * 2;
     let proposal = sign(
+        &c,
         &s,
         Operation::Propose {
             round: s.auction_round().unwrap(),
@@ -688,6 +695,7 @@ fn shortest_decision_allows_an_outcome_trade_and_successful_governance() {
     assert_eq!(decision.blocks, 3);
     s.audit(&c).unwrap();
     let deposit = sign(
+        &c,
         &s,
         Operation::Deposit {
             amount: 2_000_000u32.into(),

@@ -54,7 +54,10 @@ fn transfer(chain: &Chain, recipient: PublicKey, amount: u32, nonce: u64) -> Tra
             sender: key(&SECRET),
             nonce,
             fee: 2u32.into(),
-            expiry_height: chain.tip_height() + 100,
+            anchor: hashstash::codec::block_hash(
+                &hashstash::codec::genesis_block(&chain.config).unwrap(),
+            ),
+            expiry_blocks: chain.tip_height() + 100,
             operation: Operation::TransferExact {
                 recipient,
                 amount: amount.into(),

@@ -32,7 +32,14 @@ fn transfer(recipient: PublicKey, amount: u64) -> Operation {
         amount: amount.into(),
     }
 }
-fn sign(s: &State, op: Operation, priority: u64, data: &[u8], offset: u64) -> Transaction {
+fn sign(
+    c: &Config,
+    s: &State,
+    op: Operation,
+    priority: u64,
+    data: &[u8],
+    offset: u64,
+) -> Transaction {
     support::sign_minimum(
         s,
         TransactionBody {
@@ -40,7 +47,8 @@ fn sign(s: &State, op: Operation, priority: u64, data: &[u8], offset: u64) -> Tr
             sender: owner(),
             nonce: s.account(&owner(), None).unwrap().nonce + offset,
             fee: 1_000_000u64.into(),
-            expiry_height: s.height + 100,
+            anchor: codec::block_hash(&codec::genesis_block(c).unwrap()),
+            expiry_blocks: s.height + 100,
             operation: op,
             data: data.to_vec(),
         },
@@ -54,6 +62,7 @@ fn funded(c: &Config) -> State {
 fn funded_curve(c: &Config) -> State {
     let mut s = funded(c);
     let tx = sign(
+        c,
         &s,
         Operation::Deposit {
             amount: 800_000u32.into(),
@@ -80,7 +89,7 @@ fn fee_revenue_waits_at_flat_without_creating_an_account() {
     let s = funded_curve(&c);
     let recipient = crypto::public_key(&[82; 32]).unwrap();
     assert!(s.account(&recipient, None).is_none());
-    let tx = sign(&s, transfer(recipient, 100), 7, b"hello", 0);
+    let tx = sign(&c, &s, transfer(recipient, 100), 7, b"hello", 0);
     let quote = fees::quote(&c, &s, &tx).unwrap();
     assert_eq!(
         quote.weight,
@@ -103,11 +112,12 @@ fn fee_revenue_waits_at_flat_without_creating_an_account() {
 fn explicit_deposits_keep_accumulated_fees_outside_private_reserve_and_shares() {
     let c = config();
     let mut s = funded(&c);
-    let tx = sign(&s, transfer(owner(), 1), 7, &[], 0);
+    let tx = sign(&c, &s, transfer(owner(), 1), 7, &[], 0);
     let fee = fees::quote(&c, &s, &tx).unwrap().revenue_fee;
     s = step(&c, &s, owner(), 1, &[tx]);
     assert!(s.world.reserve.is_zero() && s.world.shares.is_zero());
     let tx = sign(
+        &c,
         &s,
         Operation::Deposit {
             amount: 1000u32.into(),
@@ -137,6 +147,7 @@ fn empty_reserve_keeps_revenue_and_reopens_flat_only_with_a_real_deposit() {
     c.initial.max_price_change_bps = 10_000;
     let mut s = funded_curve(&c);
     let tx = sign(
+        &c,
         &s,
         Operation::Redeem {
             shares: s.world.shares.clone(),
@@ -156,6 +167,7 @@ fn empty_reserve_keeps_revenue_and_reopens_flat_only_with_a_real_deposit() {
     assert!(s.world.reserve.is_zero());
     assert_eq!(s.world.revenue, waiting);
     let tx = sign(
+        &c,
         &s,
         Operation::Deposit {
             amount: 100u64.into(),
@@ -202,6 +214,7 @@ fn fee_buffer_reorg_and_reopen_restore_the_selected_committed_balance() {
         );
     }
     let tx = sign(
+        &c,
         chain.tip_state(),
         transfer(owner(), 1),
         0,

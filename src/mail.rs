@@ -139,7 +139,8 @@ pub(crate) mod tests {
                 sender,
                 nonce: 0,
                 fee: 100u32.into(),
-                expiry_height: 100,
+                anchor: [0; 32],
+                expiry_blocks: 100,
                 operation: Operation::TransferExact {
                     recipient: sender,
                     amount: 1u32.into(),

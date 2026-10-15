@@ -84,8 +84,10 @@ class Audit:
         quote = rpc(port or self.port, 'fee_quote', {'sender': sender or self.key, 'operation': operation, 'extra_fee': str(fee)})
         return {'required': int(quote['fee']), 'miner': quoted_miner_fee(quote)}
 
-    def send(self, operation, fee='0', mine=True):
+    def send(self, operation, fee='0', mine=True, expiry_blocks=None):
         fields = {'extra_fee': str(fee)}
+        if expiry_blocks is not None:
+            fields['expiry_blocks'] = expiry_blocks
         result = http(self.port, '/api/wallet', {'operation': operation, **fields, 'expected_sender': self.session['public_key'], 'wallet_revision': self.session['wallet_revision']}, {'X-Hashstash-Token': self.session['token']})
         if 'error' in result:
             raise RuntimeError(result['error'])
@@ -235,7 +237,10 @@ class Audit:
                 initial_balance = int(self.account(recipient)['ordinary'])
                 payment = self.transfer_operation(recipient, 1)
                 terms = self.payment_terms(payment, 3)
-                self.send(payment, '3')
+                # This replay test intentionally advances a competing branch
+                # by three blocks. Keep its common-ancestor anchor valid long
+                # enough to isolate fee rollback/replay from ordinary expiry.
+                self.send(payment, '3', expiry_blocks=10)
                 self.mine()
                 assert int(self.account(recipient)['ordinary']) == initial_balance + 1
                 rpc(ports[0], 'mine', {'count': 3, 'attempts': 1000000})

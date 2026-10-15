@@ -60,7 +60,7 @@ The result envelope always contains `chain_id`, `tip`, `height`, and `state_root
 
 Block records contain their header, miner address and public key, expected hashes, Bitcoin-relative difficulty, body size, transaction count, subsidy, actual fee allocation and resulting state root. Genesis has no miner. Rewards report transaction_fees, minimum_fees and extra_fees separately from miner_fees and revenue_fees (allocation). The entire exact fee follows the governed split; extra_fees is the paid amount above the inclusion-time minimum, not a separate signed field. Detached blocks retain recorded accounting rather than claiming a current payment.
 
-Transaction records include `txid`, `status`, `height`, `block_hash`, `confirmations`, sender/recipient addresses, `nonce`, `expiry_height`, `kind`, decoded `operation`, `amount` and `asset` where applicable, the exact signed `fee`, optional `minimum_fee` and `extra_fee` quote breakdown, and data fields. List data is limited to a 256-byte preview; transaction detail returns all bounded transaction bytes as `data_hex`, with `data_bytes` and `data_truncated` describing the preview. Arbitrary data remains uninterpreted.
+Transaction records include `txid`, `status`, `height`, `block_hash`, `confirmations`, sender/recipient addresses, `nonce`, `anchor`, `expiry_blocks`, `kind`, decoded `operation`, `amount` and `asset` where applicable, the exact signed `fee`, optional `minimum_fee` and `extra_fee` quote breakdown, and data fields. List data is limited to a 256-byte preview; transaction detail returns all bounded transaction bytes as `data_hex`, with `data_bytes` and `data_truncated` describing the preview. Arbitrary data remains uninterpreted.
 
 Confirmed trade records and account events report actual filled input in `amount`. They also expose `input_requested`, `input_filled`, `input_unfilled`, `output`, `output_asset` and `fill_status` (`full`, `partial` or `unfilled`). The signed operation retains the requested input. Pending trades have no fill result. A trade can pay its fee while receiving no fill, and an unresolved outcome fill can later be discarded.
 
@@ -91,3 +91,5 @@ cargo run --example explorer_fixture -- <new-output-directory>
 ```
 
 It mines only its own local test chain and creates a transfer with uninterpreted data, a completed governance decision, and a prepared pending transaction. It does not contact public peers.
+
+`stash_withdrawal_hash` and `pass_stash_withdrawal_hash` are uncapped curve valuations for all held Stash, before fees. They exclude the per-block price bound and other included orders; they are not executable withdrawal quotes. Actual trade results are recorded only after block clearing.

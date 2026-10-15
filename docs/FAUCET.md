@@ -29,7 +29,7 @@ An example configuration for a local development website is:
   "lifetime_claims": 1000,
   "recent_block_seconds": 180,
   "confirmations": 2,
-  "expiry_blocks": 20
+  "expiry_blocks": 2
 }
 ```
 
@@ -138,11 +138,17 @@ ledger, all address cooldowns, and hourly, daily, and lifetime budget usage.
 ## Payment and recovery rules
 
 The service first checks eligibility, prepares a fixed exact transfer, and
-independently verifies the chain, sender, recipient, amount, nonce, expiry,
+independently verifies the chain, sender, recipient, amount, nonce, anchor and lifetime,
 exact fee within its configured local spending allowance, and absence of arbitrary data. It commits the
 signed bytes, transaction ID, and quota reservation in SQLite before broadcast.
 Only one payment is outstanding per faucet instance. Network errors keep it pending;
 subsequent polls and restarts retry identical signed bytes.
+
+The default lifetime is two blocks after the signed anchor. An anchor at height
+100 with `expiry_blocks: 2` permits inclusion at heights 101 or 102. Set a longer
+positive lifetime explicitly when needed; retries keep the original anchor and
+lifetime. The derived deadline must fit the faucet ledger's signed 64-bit SQLite
+integer before the service signs a payment.
 
 Confirmation requires locating that transaction in canonical block history and
 the configured confirmation depth. A higher account nonce alone is insufficient.

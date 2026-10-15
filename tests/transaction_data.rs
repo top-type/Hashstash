@@ -29,14 +29,15 @@ fn transfer(recipient: PublicKey) -> Operation {
     }
 }
 
-fn signed(s: &State, operation: Operation, data: Vec<u8>, offset: u64) -> Transaction {
+fn signed(c: &Config, s: &State, operation: Operation, data: Vec<u8>, offset: u64) -> Transaction {
     crypto::sign(
         &TransactionBody {
             chain_id: s.chain_id,
             sender: key(&ALICE),
             nonce: s.account(&key(&ALICE), None).map_or(0, |a| a.nonce) + offset,
             fee: 100u32.into(),
-            expiry_height: s.height + 1_000,
+            anchor: hashstash::codec::block_hash(&hashstash::codec::genesis_block(c).unwrap()),
+            expiry_blocks: s.height + 1_000,
             operation,
             data,
         },
@@ -77,7 +78,7 @@ fn rejected(c: &Config, s: &State, tx: &Transaction) -> String {
 fn empty_data_has_one_canonical_encoding_and_arbitrary_bytes_round_trip() {
     let c = config();
     let s = funded(&c);
-    let empty = signed(&s, transfer(key(&BOB)), vec![], 0);
+    let empty = signed(&c, &s, transfer(key(&BOB)), vec![], 0);
     assert!(empty.body.data.is_empty());
     assert_eq!(codec::encode(&empty.body.operation)[0], 0);
     for data in [
@@ -86,7 +87,7 @@ fn empty_data_has_one_canonical_encoding_and_arbitrary_bytes_round_trip() {
         (0..=255).collect(),
         vec![255; 3_500],
     ] {
-        let tx = signed(&s, transfer(key(&BOB)), data.clone(), 0);
+        let tx = signed(&c, &s, transfer(key(&BOB)), data.clone(), 0);
         assert_eq!(codec::encode(&tx.body.operation)[0], 0);
         let encoded = codec::encode(&tx);
         let decoded: Transaction =
@@ -111,8 +112,8 @@ fn data_does_not_execute_even_when_it_encodes_a_valid_operation() {
         amount: 800_000u32.into(),
     });
     let other = vec![255; encoded_operation.len()];
-    let a = signed(&s, transfer(key(&BOB)), encoded_operation, 0);
-    let b = signed(&s, transfer(key(&BOB)), other, 0);
+    let a = signed(&c, &s, transfer(key(&BOB)), encoded_operation, 0);
+    let b = signed(&c, &s, transfer(key(&BOB)), other, 0);
     assert_ne!(codec::transaction_id(&a), codec::transaction_id(&b));
     let first = step(&c, &s, &MINER, 0, &[a]);
     let second = step(&c, &s, &MINER, 0, &[b]);
@@ -125,8 +126,8 @@ fn data_does_not_execute_even_when_it_encodes_a_valid_operation() {
 fn data_bytes_are_fully_charged_and_fee_distribution_is_unchanged() {
     let c = config();
     let s = funded(&c);
-    let plain = signed(&s, transfer(key(&BOB)), vec![], 0);
-    let tx = signed(&s, transfer(key(&BOB)), vec![0; 2_048], 0);
+    let plain = signed(&c, &s, transfer(key(&BOB)), vec![], 0);
+    let tx = signed(&c, &s, transfer(key(&BOB)), vec![0; 2_048], 0);
     let old_quote = fees::quote(&c, &s, &plain).unwrap();
     let quote = fees::quote(&c, &s, &tx).unwrap();
     assert_eq!(
@@ -162,7 +163,7 @@ fn data_bytes_are_fully_charged_and_fee_distribution_is_unchanged() {
 fn mutation_removal_and_reordering_invalidate_signature_and_do_not_charge() {
     let c = config();
     let s = funded(&c);
-    let original = signed(&s, transfer(key(&BOB)), vec![0, 1, 2, 255], 0);
+    let original = signed(&c, &s, transfer(key(&BOB)), vec![0, 1, 2, 255], 0);
     for data in [
         vec![0, 1, 3, 255],
         vec![0, 1, 2],
@@ -188,14 +189,14 @@ fn mutation_removal_and_reordering_invalidate_signature_and_do_not_charge() {
 fn transaction_size_boundary_includes_data_without_a_separate_data_limit() {
     let c = config();
     let s = funded(&c);
-    let first = signed(&s, transfer(key(&ALICE)), vec![0; 1024], 0);
+    let first = signed(&c, &s, transfer(key(&ALICE)), vec![0; 1024], 0);
     let overhead = codec::encode(&first).len() - 1024;
     let max_data = c.transaction_bytes(&s.settings) - overhead;
     assert!(max_data > 3_000);
-    let full = signed(&s, transfer(key(&ALICE)), vec![0; max_data], 0);
+    let full = signed(&c, &s, transfer(key(&ALICE)), vec![0; max_data], 0);
     assert_eq!(codec::encode(&full).len(), c.transaction_bytes(&s.settings));
     step(&c, &s, &MINER, 0, &[full]);
-    let oversized = signed(&s, transfer(key(&ALICE)), vec![0; max_data + 1], 0);
+    let oversized = signed(&c, &s, transfer(key(&ALICE)), vec![0; max_data + 1], 0);
     assert_eq!(
         codec::encode(&oversized).len(),
         c.transaction_bytes(&s.settings) + 1
@@ -241,9 +242,10 @@ fn data_consumes_block_capacity_and_invalid_candidates_do_not_block_selection() 
     }
     let s = chain.tip_state();
     let valid: Vec<_> = (0..10)
-        .map(|n| signed(s, transfer(key(&ALICE)), vec![n as u8; 3_000], n))
+        .map(|n| signed(&c, s, transfer(key(&ALICE)), vec![n as u8; 3_000], n))
         .collect();
     let oversized = signed(
+        &c,
         s,
         transfer(key(&ALICE)),
         vec![0; c.transaction_bytes(&s.settings)],
@@ -294,6 +296,7 @@ fn data_is_committed_in_blocks_and_preserved_across_reorg_and_database_replay() 
     let transactions: Vec<_> = (0..3)
         .map(|n| {
             signed(
+                &c,
                 main.tip_state(),
                 transfer(key(&ALICE)),
                 vec![n as u8; 3_000],

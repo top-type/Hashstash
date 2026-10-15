@@ -81,7 +81,7 @@ def transaction_bytes(tx):
     transfer = body["operation"]["TransferExact"]
     return (bytes(body["chain_id"]) + bytes(body["sender"])
             + compact_uint(body["nonce"]) + amount(body["fee"])
-            + compact_uint(body["expiry_height"]) + compact_uint(0)
+            + bytes(body["anchor"]) + compact_uint(body["expiry_blocks"]) + compact_uint(0)
             + bytes(transfer["recipient"]) + amount(transfer["amount"])
             + vector(bytes(body["data"])) + bytes(tx["signature"]))
 

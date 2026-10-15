@@ -37,7 +37,8 @@ mod tests {
             chain_id: Config::testnet().chain_id(),
             sender: crypto::public_key(&secret).unwrap(),
             nonce: 0,
-            expiry_height: 100,
+            anchor: [0; 32],
+            expiry_blocks: 100,
             fee: 1u32.into(),
             operation: Operation::Propose {
                 round: 1,
@@ -74,7 +75,8 @@ mod tests {
                     chain_id: config.chain_id(),
                     sender: crypto::public_key(&secret).unwrap(),
                     nonce: 0,
-                    expiry_height: 100,
+                    anchor: [0; 32],
+                    expiry_blocks: 100,
                     fee: 1u32.into(),
                     operation: Operation::Propose {
                         round: 1,

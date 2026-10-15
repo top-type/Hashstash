@@ -141,34 +141,37 @@ def encode_operation(operation):
     return u64(code) + payload
 
 
-def make_body(chain, sender, nonce, fee, expiry, operation, data_hex=''):
+def make_body(chain, sender, nonce, fee, anchor, expiry_blocks, operation, data_hex=''):
     inner = encode_operation(operation)
     data = bytes.fromhex(data_hex)
     if len(data) > 1024:
         raise ValueError('activity data too large')
     body = dict(chain_id=list(key_bytes(chain)), sender=list(key_bytes(sender)),
-                nonce=int(nonce), fee=str(fee), expiry_height=int(expiry),
+                nonce=int(nonce), fee=str(fee), anchor=list(key_bytes(anchor)), expiry_blocks=int(expiry_blocks),
                 operation=operation, data=list(data))
-    wire = key_bytes(chain) + key_bytes(sender) + u64(nonce) + amount(fee) + u64(expiry) + inner + vector(data)
+    wire = key_bytes(chain) + key_bytes(sender) + u64(nonce) + amount(fee) + key_bytes(anchor) + u64(expiry_blocks) + inner + vector(data)
     return body, wire
 
 
-def verified_prepared(envelope, chain, sender, nonce, fee, operation, data_hex, height, expiry_blocks,
+def verified_prepared(envelope, chain, sender, nonce, fee, operation, data_hex, anchor, expiry_blocks,
                       max_bytes=None):
     if envelope.get('format') != 'hashstash-unsigned-v1':
         raise Fault('unexpected unsigned format')
     raw = bytes.fromhex(envelope.get('body', ''))
-    if len(raw) < 70 or (max_bytes is not None and
+    if len(raw) < 102 or (max_bytes is not None and
                        (type(max_bytes) is not int or max_bytes <= 0 or len(raw) + 64 > max_bytes)):
         raise Fault('invalid unsigned length')
     _, offset = read_u64(raw, 64)
     fee_length, offset = read_u64(raw, offset)
-    if fee_length > 64 or offset + fee_length >= len(raw):
+    if fee_length > 64 or offset + fee_length + 32 >= len(raw):
         raise Fault('invalid unsigned amount')
-    expiry, _ = read_u64(raw, offset + fee_length)
-    if not height < expiry <= height + expiry_blocks:
-        raise Pause('prepared expiry moved; obtain a fresh snapshot')
-    body, expected = make_body(chain, sender, nonce, fee, expiry, operation, data_hex)
+    prepared_anchor = raw[offset + fee_length:offset + fee_length + 32]
+    ttl, _ = read_u64(raw, offset + fee_length + 32)
+    if prepared_anchor != key_bytes(anchor):
+        raise Pause('prepared anchor moved; obtain a fresh snapshot')
+    if ttl != expiry_blocks or ttl == 0:
+        raise Fault('prepared lifetime differs from fixed intent')
+    body, expected = make_body(chain, sender, nonce, fee, anchor, ttl, operation, data_hex)
     if raw != expected:
         raise Fault('prepared transaction differs from fixed intent')
     return body, raw
@@ -331,7 +334,7 @@ def config_checked(config):
             raise ValueError('absolute paths required')
     defaults = {'action_seconds': 20, 'chat_seconds': 90 if substantive else 300, 'mining_fresh_seconds': 180,
                 'max_fee_raw': '1' if native else '1000000', 'fee_reserve_raw': '2' if native else '1000000000',
-                'confirmations': 2, 'expiry_blocks': 20, 'max_actions_daily': 4320,
+                'confirmations': 2, 'expiry_blocks': 2, 'max_actions_daily': 4320,
                 'max_consumptive_daily_raw': '1000000000000000' if substantive else '200000000000000',
                 'funding_seconds': 86400}
     for key, value in defaults.items():
@@ -344,8 +347,10 @@ def config_checked(config):
         raise ValueError('substantive profile exceeds its authorized ceiling')
     if not native and (int(c['max_fee_raw']) > 1000000 or c['max_actions_daily'] > 4320):
         raise ValueError('activity limit exceeds fixed ceiling')
-    if c['expiry_blocks'] > 20 or not 2 <= c['confirmations'] <= 100:
-        raise ValueError('bounded expiry and confirmation depth required')
+    if type(c['expiry_blocks']) is not int or not 0 < c['expiry_blocks'] < 1 << 64:
+        raise ValueError('expiry blocks must be a positive u64')
+    if not 2 <= c['confirmations'] <= 100:
+        raise ValueError('confirmation depth is outside the activity policy')
     if native:
         # Null records that these inherited budget knobs are inactive. Cadence,
         # identity, journaling and actual backing/fee checks remain mandatory.
@@ -544,7 +549,7 @@ class Activity:
         txid = sha256d(raw)
         save_new(directory / 'raw.hex', raw.hex() + '\n', text=True)
         self.ledger.update(row['id'], state='pending', raw=raw.hex(), txid=txid,
-                           nonce=body['nonce'], expiry=body['expiry_height'])
+                           nonce=body['nonce'], expiry=row['prepared_height'] + body['expiry_blocks'])
 
     def check_anchors(self):
         # Latest receipt per sender catches a reorg through any earlier receipt.
@@ -576,6 +581,8 @@ class Activity:
                 if tx.get('txid') != row['txid'] or tx.get('sender_public_key') != row['sender'] or tx.get('nonce') != row['nonce']:
                     raise Fault('transaction receipt differs from journal')
                 if tx.get('status') == 'confirmed':
+                    if not row['prepared_height'] < tx['height'] <= row['expiry']:
+                        raise Fault('receipt lies outside the signed anchor lifetime')
                     if tx.get('confirmations', 0) >= self.c['confirmations']:
                         self.ledger.update(row['id'], state='confirmed', receipt_height=tx['height'],
                                            receipt_hash=tx['block_hash'], confirmed=self.clock(), receipt=compact(tx))
@@ -589,7 +596,7 @@ class Activity:
                 if latest.get('tip') != snapshot['status'].get('tip') or latest['height'] != height:
                     raise Pause('receipt snapshot moved')
                 raise Fault('account nonce advanced without its recorded receipt')
-            if height > row['expiry']:
+            if height >= row['expiry']:
                 self.ledger.update(row['id'], state='expired')
             elif self.mining():
                 try:
@@ -771,6 +778,12 @@ class Activity:
         if fee < 0 or (self.c['profile'] not in NATIVE_PROFILES and fee > int(self.c['max_fee_raw'])):
             raise Pause('quoted fee exceeds activity budget')
         height = int(snapshot['status']['height'])
+        anchor = snapshot['status']['tip']
+        expiry_blocks = action.get('expiry_blocks', self.c['expiry_blocks'])
+        if type(expiry_blocks) is not int or not 0 < expiry_blocks < 1 << 64 or height + expiry_blocks >= 1 << 64:
+            raise Pause('activity lifetime is outside the valid height range')
+        if height + expiry_blocks >= 1 << 63:
+            raise Pause('activity deadline cannot be represented in the SQLite ledger')
         nonce = int(account['account']['nonce'])
         ident = uuid.uuid4().hex
         directory = self.work / ident
@@ -781,16 +794,18 @@ class Activity:
         save_new(directory / 'operation.json', action['operation'])
         args = ['prepare', '--url', self.c['rpc_url'], '--sender', account['public_key'],
                 '--operation-file', directory / 'operation.json', '--fee', str(fee),
-                '--expiry-blocks', self.c['expiry_blocks'], '--out', directory / 'unsigned.json']
+                '--expiry-blocks', expiry_blocks, '--out', directory / 'unsigned.json']
         if action.get('data_hex'):
             args += ['--data-hex', action['data_hex']]
         try:
             self.cli.run(args)
             envelope = json.loads((directory / 'unsigned.json').read_text(encoding='utf-8'))
             body, _ = verified_prepared(envelope, self.c['chain_id'], account['public_key'], nonce,
-                fee, action['operation'], action.get('data_hex', ''), height, self.c['expiry_blocks'],
+                fee, action['operation'], action.get('data_hex', ''), anchor, expiry_blocks,
                 max_bytes=int(snapshot['status']['settings']['block_bytes']))
             fresh, current = self.observe()
+            if fresh['status']['height'] != height or fresh['status']['tip'] != anchor:
+                raise Pause('prepared anchor moved before signing')
             if not self.mining() or not self.planner.still_valid(action, fresh, current[index]) or current[index]['account']['nonce'] != nonce:
                 raise Pause('snapshot changed before signing')
             self.check_cash(action, fresh, current[index])
@@ -800,7 +815,7 @@ class Activity:
                     allowed.update(x if isinstance(x, str) else x['public_key'] for x in group)
                 self.grant_check(action['operation'], allowed, fresh, fee)
             save_new(directory / 'body.json', body)
-            self.ledger.update(ident, body=compact(body), nonce=nonce, expiry=body['expiry_height'])
+            self.ledger.update(ident, body=compact(body), nonce=nonce, expiry=height + expiry_blocks)
             self.cli.run(['sign', '--key', self.c['accounts'][index]['key_file'], '--body', directory / 'body.json', '--out', directory / 'signed.json'])
             row = self.ledger.db.execute('SELECT * FROM intents WHERE id=?', (ident,)).fetchone()
             self.finish_signature(row)

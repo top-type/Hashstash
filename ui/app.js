@@ -583,7 +583,7 @@
         document.querySelectorAll(".wallet-action").forEach(button => {
             button.disabled = !enabled || button.classList.contains("auction-action") && phaseName() !== "Auction";
             button.dataset.hotLabel ||= button.textContent;
-            const label = button.id === "trade-submit" ? state.trade === "deposit" ? "Deposit" : "Withdraw" : button.dataset.hotLabel;
+            const label = button.id === "trade-submit" ? state.trade === "deposit" ? "Buy stash" : "Sell stash" : button.dataset.hotLabel;
             button.textContent = state.session?.wallet_enabled ? label : "Prepare transaction";
         });
         $("broadcast-submit").disabled = !state.ready || !state.session || state.broadcasting;
@@ -759,7 +759,11 @@
     }
     $("faucet-claim").addEventListener("click", claimFaucet);
     function transactionExpiry(form) {
-        return safeInteger($(form.id === "trade-form" ? "trade-expiry" : "wallet-expiry").value, "Transaction expiry");
+        const raw = $(form.id === "trade-form" ? "trade-expiry" : "wallet-expiry").value.trim();
+        if (!/^[0-9]+$/.test(raw) || raw.length > 20) throw new Error("Transaction expiry must be a positive whole number of blocks.");
+        const lifetime = BigInt(raw);
+        if (!lifetime || lifetime > 18446744073709551615n) throw new Error("Transaction expiry must fit a positive 64-bit block count.");
+        return lifetime;
     }
     async function submit(form, operation) {
         if (!state.ready) throw new Error("Wait for the node connection to refresh.");
@@ -783,20 +787,21 @@
         const identity = submissionIdentity(form), hot = state.session.wallet_enabled, dataFields = transactionData(form);
         const nonce = nextNonce();
         const expiryHeight = BigInt(state.status.height) + BigInt(expiry);
-        if (expiryHeight > BigInt(state.config.max_height ?? 4294967295)) throw new Error("Transaction expiry exceeds this network’s height limit.");
+        if (expiryHeight > 18446744073709551615n) throw new Error("Transaction lifetime overflows the block height.");
         const request = {
             sender: key(),
             operation: operation,
             ...feeFields,
             ...dataFields,
-            expiry_blocks: expiry,
+            expiry_blocks: jsonInteger(expiry),
             nonce: jsonInteger(nonce),
-            expiry_height: jsonInteger(expiryHeight)
+            anchor: state.status.tip
         };
         const expected = {
             ...request,
             nonce: nonce.toString(),
-            expiry_height: expiryHeight.toString(),
+            anchor_height: String(state.status.height),
+            current_height: String(state.status.height),
             chain_id: state.status.chain_id,
             data_hex: dataFields.data_hex || "",
             wallet_id: state.session.wallet_id,
@@ -854,7 +859,7 @@
         form.id === "send-form" && (values.quoteIdentity = sendIdentity());
         values.nonce = nextNonce().toString();
         form.id === "propose-form" && values.type === "parameter" && (values.currentSetting = [ state.status?.settings?.[settings[values.parameter]?.[0]] ]);
-        return JSON.stringify([ walletIdentity(), state.session?.wallet_enabled, $(form.id === "trade-form" ? "trade-expiry" : "wallet-expiry").value, state.status?.chain_id, phaseName(), activeDecision()?.id, state.gov?.phase?.Auction?.round, form.id === "trade-form" ? state.trade : null, values ]);
+        return JSON.stringify([ walletIdentity(), state.session?.wallet_enabled, $(form.id === "trade-form" ? "trade-expiry" : "wallet-expiry").value, state.status?.chain_id, state.status?.tip, state.status?.height, state.status?.state_root, phaseName(), activeDecision()?.id, state.gov?.phase?.Auction?.round, form.id === "trade-form" ? state.trade : null, values ]);
     }
     function bindForm(id, operationBuilder) {
         const form = $(id);
@@ -890,6 +895,7 @@
         for (const field of [ "fee", "minimum_fee", "account_creation_fee", "grant_recipient_fee", "extra_fee", "weight", "minimum_fee_rate" ]) if (typeof result[field] !== "string" || !/^(0|[1-9]\d{0,159})$/.test(result[field])) throw new Error("Invalid fee quote.");
         if (result.chain_id !== state.status.chain_id) throw new Error("Fee quote belongs to a different network.");
         checkQuoteSnapshot(result);
+        if (result.anchor !== state.status.tip || String(result.anchor_height) !== String(state.status.height) || String(result.expiry_blocks) !== String(transactionExpiry(form)) || BigInt(result.expiry_height) !== BigInt(state.status.height) + BigInt(transactionExpiry(form))) throw new Error("Fee quote does not match the transaction lifetime.");
         if (result.sender_public_key !== key() || result.sender !== address() || result.extra_fee !== extra) throw new Error("Fee quote does not match this account.");
         {
             const data = transactionData(form).data_hex || "";
@@ -972,7 +978,8 @@
                 operation: operation,
                 ...transactionData(form),
                 extra_fee: extra,
-                expiry_blocks: transactionExpiry(form)
+                anchor: state.status.tip,
+                expiry_blocks: jsonInteger(transactionExpiry(form))
             });
             if (!current()) return;
             checkFeeQuote(result, extra, form, operation);
@@ -1097,8 +1104,6 @@
         const selected = outcome === "Pass" ? state.pass : outcome === "Fail" ? state.fail : state.account;
         stashNumber("stash-total", selected?.account?.shares || "0");
         rational("stash-marked", selected?.stash_value_hash);
-        text("overview-nonce", a ? `Transaction counter ${commas(a.nonce)}` : "");
-        $("overview-nonce").title = "The account's next transaction number. It prevents a signed transaction from being used twice.";
         $("governance-wallet-help").hidden = selectedWallet;
         $("governance-common").hidden = !selectedWallet;
         $("governance-actions").hidden = !selectedWallet;
@@ -1117,7 +1122,6 @@
         }
         if (!selectedWallet) {
             for (const id of [ "overview-cash", "overview-total", "overview-stash", "send-available", "stash-total", "stash-marked" ]) text(id, "—");
-            text("overview-nonce", "");
         }
         if (!state.ready) {
             for (const id of [ "overview-cash", "overview-total", "overview-total-pass", "overview-total-fail", "overview-stash", "send-available", "stash-total", "stash-marked", "governance-common-cash", "pass-cash", "pass-stash", "pass-stash-marked", "fail-cash", "fail-stash", "fail-stash-marked" ]) {
@@ -1132,7 +1136,7 @@
         const conditional = state.ready && !!activeDecision();
         $("overview-conversion-ordinary").hidden = conditional;
         $("overview-conversion-pass").hidden = $("overview-conversion-fail").hidden = !conditional;
-        const note = "Estimated value uses the current price. Withdrawal proceeds depend on trade size and fees.";
+        const note = "Estimated value uses the current price. Selling can receive a different amount, depending on the fill and fees.";
         $("overview-conversion").title = note;
         for (const [id, world] of [ [ "overview-price", state.gov?.world ], [ "overview-price-pass", state.gov?.pass ], [ "overview-price-fail", state.gov?.world ] ]) {
             const available = state.ready && world;
@@ -1538,7 +1542,7 @@
             const leading = BigInt(decision.leading_blocks), other = observed - leading;
             if (leading < 0n || other < 0n) throw new Error("Invalid decision block counts.");
             const margin = BigInt(gov.frozen.pass_margin_bps || 0);
-            const criterion = `PASS must lead in more than half of ${blockCount(total)}.${margin ? ` A block counts only when its price is more than ${fraction(margin, 100, 2)}% above FAIL.` : " Equal prices count for FAIL."}`;
+            const criterion = `PASS must lead in more than half of ${blockCount(total)}.${margin ? ` A block counts only when its price is more than ${fraction(margin, 100, 2)}% above FAIL.` : " Equal prices add no PASS lead."}`;
             text("gov-subtitle", criterion);
             text("overview-governance-title", "Decision active");
             text("overview-governance-text", proposalTitle(decision.proposal));
@@ -1778,7 +1782,7 @@
         document.querySelectorAll(".outcome-cash-label").forEach(node => {
             node.textContent = "Hashes";
         });
-        text("guide-decision", "Each block compares the previous block’s closing stash prices. PASS gets one leading block when its price beats FAIL by more than the required margin. PASS wins only with more than half of all decision blocks; a tie means FAIL. The margin and decision length are fixed when the decision begins.");
+        text("guide-decision", "Each block compares the previous block’s exact closing stash prices before display rounding. PASS gets one leading block when its price beats FAIL by more than the required margin. PASS wins only with more than half of all decision blocks; a tie means FAIL. The margin and decision length are fixed when the decision begins.");
         text("guide-clock", "A decision lasts its configured number of blocks. Each block counts once toward PASS or FAIL. Auction lead and rest use a scheduled clock that advances by the target interval; mining determines the actual wait. Transaction expiry and confirmations also use block counts.");
         text("guide-difficulty", "ASERT, the difficulty-adjustment algorithm, uses block timestamps to aim for the governed average block interval. Only blocks on the accepted chain create new hashes; losing blocks receive no reward.");
         for (const field of [ "reserve", "revenue", "grant_capacity" ]) {
@@ -2131,10 +2135,11 @@
             state.tradeAll && kind === "redeem" && ($("trade-amount").value = HashstashShares.exactInput(result.input_requested));
             amountText("trade-quote", kind === "deposit" ? `${HashstashShares.formatAmount(result.shares)} stash` : formatExactHash(result.output_hash));
             $("trade-quote").title = kind === "deposit" ? `${HashstashShares.exactInput(result.shares)} stash` : formatExactHash(result.output_hash);
-            amountText("quote-remaining", `${kind === "deposit" ? "Stash balance" : "Stash remaining"}: ${HashstashShares.formatAmount(result.share_after)} stash`);
-            $("quote-remaining").title = `${HashstashShares.exactInput(result.share_after)} stash`;
+            const unused = kind === "deposit" ? formatExactHash(result.input_unfilled) : `${HashstashShares.formatAmount(result.input_unfilled)} stash`;
+            amountText("quote-remaining", unfilled > 0n ? `Estimated unused: ${unused}` : `Stash balance: ${HashstashShares.formatAmount(result.share_after)} stash`);
+            $("quote-remaining").title = unfilled > 0n ? "This amount would stay in your balance. The final fill depends on the other orders included." : `${HashstashShares.exactInput(result.share_after)} stash`;
             $("quote-remaining").hidden = false;
-            text("quote-height", "Estimate · partial fills possible · fees excluded");
+            text("quote-height", filled === 0n ? "No fill estimated. A fee still applies if included." : "Final amount may differ or fill partly. Fee shown below.");
             $("quote-height").title = `Estimated at block ${commas(result.height)}. Orders in the same block share an execution price. Unfilled input stays in your balance.`;
             state.quoteOutput = {
                 ...result,
@@ -2189,7 +2194,8 @@
                     amount: amount,
                     ...transactionData(form),
                     extra_fee: extra,
-                    expiry_blocks: safeInteger($("wallet-expiry").value, "Transaction expiry")
+                    anchor: state.status.tip,
+                    expiry_blocks: jsonInteger(transactionExpiry($("send-form")))
                 });
                 if (version !== sendVersion || identity !== sendIdentity() || !state.ready) return;
                 checkFeeQuote(result, extra, form);
@@ -2286,12 +2292,12 @@
         $("trade-amount").value = "";
         $("trade-max").setAttribute("aria-pressed", "false");
         document.querySelectorAll("[data-trade-tab]").forEach(button => button.classList.toggle("selected", button.dataset.tradeTab === kind));
-        text("trade-amount-label", kind === "deposit" ? "Deposit · hash" : "Withdraw · stash");
+        text("trade-amount-label", kind === "deposit" ? "Spend · hash" : "Sell · stash");
         text("trade-unit", kind === "deposit" ? "hash" : "stash");
         $("trade-amount").inputMode = "decimal";
         $("trade-amount").title = kind === "deposit" ? "Amount in hashes; up to 18 decimal places." : "Amount in stash; up to 36 decimal places.";
         text("quote-label", "Estimated receive");
-        text("trade-submit", kind === "deposit" ? "Deposit" : "Withdraw");
+        text("trade-submit", kind === "deposit" ? "Buy stash" : "Sell stash");
         text("trade-quote", "—");
         text("quote-height", "");
         $("quote-height").title = "";
@@ -2820,10 +2826,10 @@
         if (!state.ready || !selected?.account) return;
         state.tradeAll = state.trade === "redeem";
         let value = BigInt(state.tradeAll ? selected.account.shares : outcome ? outcomeCash(selected) : selected.account.ordinary);
-        if (state.trade === "deposit" && (!outcome || true)) {
+        if (state.trade === "deposit") {
             const identity = tradeIdentity(), snapshot = state.status.state_root, balance = value;
             try {
-                const extra = integer($("trade-form").elements.extra_fee.value, $("trade-expiry").value, "Optional extra", true);
+                const extra = integer($("trade-form").elements.extra_fee.value, "Optional extra", true);
                 for (let attempt = 0; attempt < 8; attempt++) {
                     if (value <= 0n) break;
                     const quote = await rpc("stash_quote", {
@@ -2846,7 +2852,8 @@
                         operation: operation,
                         ...transactionData($("trade-form")),
                         extra_fee: extra,
-                        expiry_blocks: transactionExpiry($("trade-form"))
+                        anchor: state.status.tip,
+                        expiry_blocks: jsonInteger(transactionExpiry($("trade-form")))
                     });
                     if (identity !== tradeIdentity() || snapshot !== state.status?.state_root || !state.ready) return;
                     checkFeeQuote(fee, extra, $("trade-form"));

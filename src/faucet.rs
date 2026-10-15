@@ -47,7 +47,12 @@ pub struct FaucetConfig {
     pub lifetime_claims: u64,
     pub recent_block_seconds: u64,
     pub confirmations: u64,
+    #[serde(default = "default_expiry_blocks")]
     pub expiry_blocks: u64,
+}
+
+fn default_expiry_blocks() -> u64 {
+    2
 }
 
 fn default_subnet_cooldown() -> u64 {
@@ -113,7 +118,7 @@ impl FaucetConfig {
             "invalid mining freshness window"
         );
         ensure!(
-            (1..=100).contains(&self.confirmations) && (1..=100).contains(&self.expiry_blocks),
+            (1..=100).contains(&self.confirmations) && self.expiry_blocks > 0,
             "invalid confirmation or expiry policy"
         );
         ensure!(
@@ -496,6 +501,8 @@ struct Engine {
     ledger: Ledger,
     client: reqwest::Client,
     height: Option<u64>,
+    tip: Option<Hash>,
+    state_root: Option<Hash>,
     nonce: u64,
     funds: Amount,
     last_advance: Option<Instant>,
@@ -548,6 +555,8 @@ impl Engine {
             ledger,
             client,
             height: None,
+            tip: None,
+            state_root: None,
             nonce: 0,
             funds: Amount::zero(),
             last_advance: None,
@@ -662,11 +671,19 @@ impl Engine {
             "node changed network"
         );
         let height = status["height"].as_u64().context("missing height")?;
+        let tip = parse_hash(status["tip"].as_str().context("missing tip")?)?;
+        let state_root = parse_hash(
+            status["state_root"]
+                .as_str()
+                .context("missing state root")?,
+        )?;
         ensure!(height <= i64::MAX as u64, "unsupported chain height");
         if self.height.is_some_and(|v| height > v) {
             self.last_advance = Some(Instant::now());
         }
         self.height = Some(height);
+        self.tip = Some(tip);
+        self.state_root = Some(state_root);
         let anchor: Option<(u64,String)> = self.ledger.db.query_row("SELECT receipt_height,receipt_hash FROM claims WHERE status='confirmed' ORDER BY receipt_height DESC LIMIT 1", [], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
         if let Some((h, hash)) = anchor {
             if height < h {
@@ -702,6 +719,17 @@ impl Engine {
             anyhow::bail!("pending faucet payment crossed a deep reorganization");
         }
         let tx = wallet::decode_signed(&claim.raw)?;
+        ensure!(
+            claim.height.checked_add(tx.body.expiry_blocks) == Some(claim.expiry),
+            "stored faucet lifetime differs from its signed transaction"
+        );
+        let anchor_block: Block =
+            serde_json::from_value(self.rpc("getblock", json!({"height":claim.height})).await?)?;
+        if anchor_block.height != claim.height || codec::block_hash(&anchor_block) != tx.body.anchor
+        {
+            self.fault = true;
+            anyhow::bail!("pending faucet payment anchor was reorganized");
+        }
         let operation = Operation::TransferExact {
             recipient: address::decode(&claim.address, &self.chain)?,
             amount: amount(&claim.amount_hashes)?,
@@ -711,7 +739,8 @@ impl Engine {
             self.chain,
             self.sender,
             claim.nonce,
-            claim.expiry,
+            tx.body.anchor,
+            tx.body.expiry_blocks,
             &operation,
             &tx.body.fee,
         )?;
@@ -719,8 +748,7 @@ impl Engine {
             hex::encode(codec::transaction_id(&tx)) == claim.txid
                 && tx.body.sender == self.sender
                 && tx.body.chain_id == self.chain
-                && tx.body.nonce == claim.nonce
-                && tx.body.expiry_height == claim.expiry,
+                && tx.body.nonce == claim.nonce,
             "invalid stored faucet transaction"
         );
         if self.nonce > claim.nonce {
@@ -747,7 +775,7 @@ impl Engine {
             if height.saturating_sub(h).saturating_add(1) >= self.config.confirmations {
                 self.ledger.db.execute("UPDATE claims SET status='confirmed',receipt_height=?1,receipt_hash=?2 WHERE txid=?3 AND status='pending'",params![h,hash,claim.txid])?;
             }
-        } else if height > claim.expiry {
+        } else if height >= claim.expiry {
             self.ledger.db.execute(
                 "UPDATE claims SET status='expired' WHERE txid=?1 AND status='pending'",
                 [&claim.txid],
@@ -800,14 +828,34 @@ impl Engine {
         self.ledger
             .eligible(&self.config, &canonical, client_subnet, now())?;
         let height = self.height.context("missing chain height")?;
+        let anchor = self.tip.context("missing quoted tip")?;
+        let state_root = self.state_root.context("missing quoted state root")?;
         let expiry = height
             .checked_add(self.config.expiry_blocks)
             .context("expiry overflow")?;
+        // Durable claim heights use SQLite signed INTEGERs. Reject before signing
+        // instead of truncating a valid u64 lifetime or corrupting the receipt.
+        ensure!(
+            expiry <= i64::MAX as u64,
+            "expiry exceeds faucet ledger integer storage"
+        );
         let operation = Operation::TransferExact {
             recipient: key,
             amount: self.payout.clone(),
         };
-        let result = self.rpc("preparetransaction",json!({"sender":hex::encode(self.sender),"operation":operation,"nonce":self.nonce,"expiry_height":expiry,"extra_fee":"0"})).await?;
+        let result = self.rpc("preparetransaction",json!({"sender":hex::encode(self.sender),"operation":operation,"nonce":self.nonce,"anchor":hex::encode(anchor),"expiry_blocks":self.config.expiry_blocks,"extra_fee":"0"})).await?;
+        let quote = &result["fee_quote"];
+        ensure!(
+            quote["chain_id"] == self.config.chain_id
+                && quote["tip"] == hex::encode(anchor)
+                && quote["state_root"] == hex::encode(state_root)
+                && quote["height"] == height
+                && quote["anchor"] == hex::encode(anchor)
+                && quote["anchor_height"] == height
+                && quote["expiry_blocks"] == self.config.expiry_blocks
+                && quote["expiry_height"] == expiry,
+            "prepared faucet snapshot changed"
+        );
         let envelope = wallet::UnsignedEnvelope {
             format: result["format"]
                 .as_str()
@@ -824,7 +872,8 @@ impl Engine {
             self.chain,
             self.sender,
             self.nonce,
-            expiry,
+            anchor,
+            self.config.expiry_blocks,
             &operation,
             &self.maximum_fee,
         )?;
@@ -849,12 +898,14 @@ impl Engine {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_intent(
     body: &TransactionBody,
     chain: Hash,
     sender: PublicKey,
     nonce: u64,
-    expiry: u64,
+    anchor: Hash,
+    expiry_blocks: u64,
     operation: &Operation,
     maximum: &Amount,
 ) -> Result<()> {
@@ -862,8 +913,9 @@ fn verify_intent(
         body.chain_id == chain
             && body.sender == sender
             && body.nonce == nonce
-            && body.expiry_height == expiry
-            && !body.fee.is_zero()
+            && body.anchor == anchor
+            && body.expiry_blocks == expiry_blocks
+            && expiry_blocks > 0
             && body.fee <= *maximum,
         "prepared faucet envelope changed"
     );
@@ -1204,11 +1256,27 @@ mod tests {
             lifetime_claims: 1000,
             recent_block_seconds: 180,
             confirmations: 2,
-            expiry_blocks: 20,
+            expiry_blocks: 2,
         }
     }
     fn recipient(n: u8) -> String {
         address::encode(&crypto::public_key(&[n; 32]).unwrap(), &[7; 32]).unwrap()
+    }
+
+    #[test]
+    fn transaction_lifetime_defaults_to_two_without_an_arbitrary_upper_cap() {
+        let dir = TempDir::new().unwrap();
+        let config = config(&dir);
+        let mut value = serde_json::to_value(&config).unwrap();
+        value.as_object_mut().unwrap().remove("expiry_blocks");
+        let mut parsed: FaucetConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.expiry_blocks, 2);
+        for lifetime in [2, 101, 10_000, u64::MAX] {
+            parsed.expiry_blocks = lifetime;
+            parsed.validate().unwrap();
+        }
+        parsed.expiry_blocks = 0;
+        assert!(parsed.validate().is_err());
     }
 
     #[tokio::test]
@@ -1715,23 +1783,36 @@ mod tests {
             chain_id: [7; 32],
             sender,
             nonce: 9,
-            expiry_height: 22,
+            anchor: [38; 32],
+            expiry_blocks: 2,
             fee: 10u32.into(),
             operation: operation.clone(),
         };
         let verify = |body: &TransactionBody| {
-            verify_intent(body, [7; 32], sender, 9, 22, &operation, &10u32.into())
+            verify_intent(
+                body,
+                [7; 32],
+                sender,
+                9,
+                [38; 32],
+                2,
+                &operation,
+                &10u32.into(),
+            )
         };
         verify(&good).unwrap();
+        let mut free = good.clone();
+        free.fee = Amount::zero();
+        verify(&free).unwrap();
         for n in 0..9 {
             let mut changed = good.clone();
             match n {
                 0 => changed.chain_id = [8; 32],
                 1 => changed.sender = crypto::public_key(&[4; 32]).unwrap(),
                 2 => changed.nonce = 10,
-                3 => changed.expiry_height = 23,
+                3 => changed.expiry_blocks = 3,
                 4 => changed.fee = 11u32.into(),
-                5 => changed.fee = Amount::zero(),
+                5 => changed.anchor[0] ^= 1,
                 6 => {
                     changed.operation = {
                         changed.data = vec![1];
@@ -1772,7 +1853,7 @@ mod tests {
         let p = &request["params"];
         let result = match request["method"].as_str().unwrap() {
             "snapshot" => {
-                json!({"status":{"chain_id":hex::encode([7;32]),"height":node.height},"payment_available_hash":"1000000000000000000","account":{"account":{"ordinary":"1000000000000000000","nonce":node.nonce}}})
+                json!({"status":{"chain_id":hex::encode([7;32]),"height":node.height,"tip":hex::encode(codec::block_hash(node.blocks.get(&node.height).unwrap_or(&block(node.height,vec![])))),"state_root":hex::encode([0;32])},"payment_available_hash":"1000000000000000000","account":{"account":{"ordinary":"1000000000000000000","nonce":node.nonce}}})
             }
             "preparetransaction" => {
                 let mut operation: Operation =
@@ -1791,11 +1872,16 @@ mod tests {
                         .try_into()
                         .unwrap(),
                     nonce: p["nonce"].as_u64().unwrap(),
-                    expiry_height: p["expiry_height"].as_u64().unwrap(),
+                    anchor: parse_hash(p["anchor"].as_str().unwrap()).unwrap(),
+                    expiry_blocks: p["expiry_blocks"].as_u64().unwrap(),
                     fee: 2u32.into(),
                     operation,
                 };
-                serde_json::to_value(wallet::unsigned(&body)).unwrap()
+                {
+                    let mut result = serde_json::to_value(wallet::unsigned(&body)).unwrap();
+                    result["fee_quote"] = json!({"chain_id":hex::encode(body.chain_id),"tip":hex::encode(body.anchor),"anchor":hex::encode(body.anchor),"state_root":hex::encode([0;32]),"height":node.height,"anchor_height":node.height,"expiry_blocks":body.expiry_blocks,"expiry_height":node.height.checked_add(body.expiry_blocks).unwrap()});
+                    result
+                }
             }
             "broadcasttransaction" => {
                 let transaction = wallet::decode_signed(p["raw"].as_str().unwrap()).unwrap();
@@ -1812,10 +1898,12 @@ mod tests {
                 }
                 json!({"transaction_id":hex::encode(txid)})
             }
-            "getblock" => {
-                serde_json::to_value(node.blocks.get(&p["height"].as_u64().unwrap()).unwrap())
-                    .unwrap()
-            }
+            "getblock" => serde_json::to_value(
+                node.blocks
+                    .get(&p["height"].as_u64().unwrap())
+                    .unwrap_or(&block(p["height"].as_u64().unwrap(), vec![])),
+            )
+            .unwrap(),
             other => panic!("unexpected RPC {other}"),
         };
         Json(json!({"jsonrpc":"2.0","id":1,"result":result})).into_response()
@@ -1944,6 +2032,7 @@ mod tests {
         let before = legacy_rows(&db);
         drop(db);
         c.payout = "1000000000000000".into();
+        c.expiry_blocks = 7;
         let mut engine = Engine::open(c.clone()).unwrap();
         assert_eq!(legacy_rows(&engine.ledger.db), before);
         engine.refresh().await.unwrap();
@@ -2022,7 +2111,7 @@ mod tests {
         node.lock().await.height = 2;
         engine.refresh().await.unwrap();
         let result = engine.claim(&recipient(3), "a").await.unwrap();
-        node.lock().await.height = 23;
+        node.lock().await.height = 4; // The next block is outside the signed two-block window.
         engine.refresh().await.unwrap();
         assert_eq!(
             engine.status(Some(&recipient(3)), "a").unwrap()["claim"]["status"],
@@ -2035,12 +2124,86 @@ mod tests {
         assert!(engine.claim(&recipient(4), "a").await.is_err()); // subnet quota survived expiry
         engine.claim(&recipient(4), "b").await.unwrap();
         assert_eq!(node.lock().await.transactions.len(), 2);
-        node.lock().await.height = 22;
+        node.lock().await.height = 3;
         assert!(engine.refresh().await.is_err());
         assert!(engine.fault);
         assert_eq!(engine.state().unwrap(), "unavailable");
         assert!(engine.claim(&recipient(5), "c").await.is_err());
         assert_eq!(node.lock().await.transactions.len(), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn changed_quote_or_unrepresentable_ledger_expiry_never_signs_or_reserves() {
+        let dir = TempDir::new().unwrap();
+        let mut c = config(&dir);
+        let (node, rpc, task) = mock().await;
+        c.rpc_url = format!("http://{rpc}/rpc");
+        let mut engine = Engine::open(c).unwrap();
+        engine.refresh().await.unwrap();
+        node.lock().await.height = 2;
+        engine.refresh().await.unwrap();
+        node.lock().await.height = 3;
+        assert!(
+            engine
+                .claim(&recipient(3), "a")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("snapshot changed")
+        );
+        assert!(engine.ledger.pending().unwrap().is_none());
+        assert!(node.lock().await.transactions.is_empty());
+        engine.refresh().await.unwrap();
+        engine.config.expiry_blocks = i64::MAX as u64;
+        assert!(
+            engine
+                .claim(&recipient(3), "a")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("ledger integer storage")
+        );
+        engine.config.expiry_blocks = u64::MAX;
+        assert!(
+            engine
+                .claim(&recipient(3), "a")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("overflow")
+        );
+        assert!(engine.ledger.pending().unwrap().is_none());
+        assert!(node.lock().await.transactions.is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn orphaned_pending_anchor_pauses_without_replacement_signing() {
+        let dir = TempDir::new().unwrap();
+        let mut c = config(&dir);
+        let (node, rpc, task) = mock().await;
+        c.rpc_url = format!("http://{rpc}/rpc");
+        let mut engine = Engine::open(c).unwrap();
+        engine.refresh().await.unwrap();
+        node.lock().await.height = 2;
+        engine.refresh().await.unwrap();
+        engine.claim(&recipient(3), "a").await.unwrap();
+        let raw = engine.ledger.pending().unwrap().unwrap().raw;
+        let mut replaced = block(2, vec![]);
+        replaced.header.nonce = 99;
+        node.lock().await.blocks.insert(2, replaced);
+        assert!(
+            engine
+                .refresh()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("anchor was reorganized")
+        );
+        assert!(engine.fault);
+        assert_eq!(engine.ledger.pending().unwrap().unwrap().raw, raw);
+        assert_eq!(node.lock().await.transactions.len(), 1);
         task.abort();
     }
 

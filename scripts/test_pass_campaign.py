@@ -336,7 +336,7 @@ class CampaignCustodyTests(unittest.TestCase):
                                for group in self.cfg['registry'].values() for key in group}
         desc = hashlib.sha256(p.proposal_description('sgp', 0, p.PASS_PROFILE).encode()).digest()
         recipient = self.cfg['registry']['fra'][0]
-        action = dict(kind='propose_grant', sender_index=0, quoted_fee_raw='1', amount_raw='1000', expiry_blocks=20,
+        action = dict(kind='propose_grant', sender_index=0, quoted_fee_raw='1', amount_raw='1000', expiry_blocks=2,
             guard=dict(nonce=0, phase='auction', chain_id=self.cfg['chain_id'], decision=None, auction_round=0,
                        height=snapshot['status']['height'], sender_public_key=self.cfg['accounts'][0]['public_key']),
             operation={'Propose': dict(round=0, description=list(desc), support='1000',

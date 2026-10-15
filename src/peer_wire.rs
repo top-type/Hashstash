@@ -271,9 +271,10 @@ impl<'a> Cursor<'a> {
     fn transaction(&mut self, maximum: usize) -> Result<()> {
         let start = self.at;
         self.take(64)?; // chain ID and sender
-        self.integer()?;
-        self.amount()?;
-        self.integer()?;
+        self.integer()?; // nonce
+        self.amount()?; // fee
+        self.take(32)?; // signed preparation block
+        self.integer()?; // lifetime in blocks
         match self.integer()? {
             0 => {
                 self.take(32)?;
@@ -537,7 +538,8 @@ mod tests {
                 sender: crypto::public_key(&[1; 32]).unwrap(),
                 nonce,
                 fee: 300u32.into(),
-                expiry_height: 1000,
+                anchor: [37; 32],
+                expiry_blocks: 1000,
                 operation,
                 data: vec![0, 255, 10, 0],
             },
@@ -794,6 +796,7 @@ mod tests {
         cursor.take(64).unwrap();
         cursor.integer().unwrap();
         cursor.amount().unwrap();
+        cursor.take(32).unwrap();
         cursor.integer().unwrap();
         assert_eq!(cursor.integer().unwrap(), 3);
         cursor.integer().unwrap();
@@ -876,6 +879,7 @@ mod tests {
             cursor.take(64).unwrap();
             cursor.integer().unwrap();
             cursor.amount().unwrap();
+            cursor.take(32).unwrap();
             cursor.integer().unwrap();
             assert_eq!(cursor.integer().unwrap(), 3);
             cursor.integer().unwrap();
@@ -896,7 +900,7 @@ mod tests {
     fn nested_preflight_matches_integer_option_and_amount_boundaries() {
         let (limits, mut sync) = fixture();
         sync.transactions[0].body.nonce = u64::MAX;
-        sync.transactions[0].body.expiry_height = u64::MAX;
+        sync.transactions[0].body.expiry_blocks = u64::MAX;
         sync.transactions[0] = crypto::sign(&sync.transactions[0].body, &[1; 32]).unwrap();
         sync.blocks[0].height = u64::MAX;
         let wire = encode(&Message::Sync(sync.clone()), limits).unwrap();
@@ -916,6 +920,7 @@ mod tests {
             );
         }
         cursor.amount().unwrap();
+        cursor.take(32).unwrap();
         cursor.integer().unwrap();
         assert_eq!(cursor.integer().unwrap(), 1);
         cursor.amount().unwrap();

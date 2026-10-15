@@ -7,7 +7,7 @@ use anyhow::{Result, ensure};
 use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey, schnorr::Signature};
 use sha2::{Digest, Sha256};
 
-pub const TRANSACTION_TAG: &str = "Hashstash/Transaction";
+pub const TRANSACTION_TAG: &str = "Hashstash/anchored-transaction";
 
 pub fn sha256d(bytes: &[u8]) -> Hash {
     Sha256::digest(Sha256::digest(bytes)).into()
@@ -109,7 +109,8 @@ mod tests {
             sender: public_key(&key).unwrap(),
             nonce: 4,
             fee: 1u32.into(),
-            expiry_height: 100,
+            anchor: [0; 32],
+            expiry_blocks: 100,
             operation: Operation::TransferExact {
                 recipient: public_key(&[2; 32]).unwrap(),
                 amount: 2u32.into(),
@@ -127,11 +128,41 @@ mod tests {
         changed.body.fee += 1u32;
         assert!(verify(&changed).is_err());
         changed = signed.clone();
-        changed.body.expiry_height += 1;
+        changed.body.expiry_blocks += 1;
+        assert!(verify(&changed).is_err());
+        changed = signed.clone();
+        changed.body.anchor[0] ^= 1;
         assert!(verify(&changed).is_err());
         changed = signed.clone();
         changed.signature[63] ^= 1;
         assert!(verify(&changed).is_err());
         assert!(sign(&body, &[2; 32]).is_err());
+    }
+    #[test]
+    fn anchored_transactions_use_a_distinct_signing_domain() {
+        let secret = [1; 32];
+        let body = TransactionBody {
+            chain_id: [1; 32],
+            sender: public_key(&secret).unwrap(),
+            nonce: 0,
+            fee: 1u32.into(),
+            anchor: [3; 32],
+            expiry_blocks: 2,
+            operation: Operation::TransferExact {
+                recipient: public_key(&secret).unwrap(),
+                amount: 1u32.into(),
+            },
+            data: vec![],
+        };
+        let secp = Secp256k1::new();
+        let pair = Keypair::from_secret_key(&secp, &SecretKey::from_byte_array(secret).unwrap());
+        let former_digest = tagged_hash("Hashstash/Transaction", &codec::encode(&body));
+        let signature = secp.sign_schnorr_with_aux_rand(&former_digest, &pair, &[0; 32]);
+        let former_domain = Transaction {
+            body: body.clone(),
+            signature: *signature.as_ref(),
+        };
+        assert!(verify(&former_domain).is_err());
+        verify(&sign(&body, &secret).unwrap()).unwrap();
     }
 }

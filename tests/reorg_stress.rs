@@ -49,7 +49,10 @@ fn sign(
             sender,
             nonce: chain.tip_state().account(&sender, None).unwrap().nonce + offset,
             fee: 100u32.into(),
-            expiry_height: chain.tip_height() + 10_000,
+            anchor: hashstash::codec::block_hash(
+                &hashstash::codec::genesis_block(&chain.config).unwrap(),
+            ),
+            expiry_blocks: chain.tip_height() + 10_000,
             operation,
         },
         secret,

@@ -6,12 +6,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from test_network import http, rpc, quoted_miner_fee
-TRANSACTIONS_PER_WAVE = 256
+TRANSACTIONS_PER_WAVE = 64
 PAID_FEE = 3
 FEE_INTERVAL = 16
 
 def prepare_load(port, key, rounds, block_limit, transactions=TRANSACTIONS_PER_WAVE):
-    """Fund the complete fee budget using actual balances."""
+    """Fund all fees plus one wave of inputs from block-opening balances."""
     initial = rpc(port, 'status')
     mined = 0
 
@@ -32,7 +32,8 @@ def prepare_load(port, key, rounds, block_limit, transactions=TRANSACTIONS_PER_W
     # Round per-transaction charges, matching consensus; the mandatory price is
     # per 1024 weight units rather than per transaction.
     transaction_fee = (int(quote['weight']) * minimum_rate + 1023) // 1024
-    required = rounds * (transactions * transaction_fee + priorities) + 1
+    # Self-payment credits arrive too late to finance another input in the block.
+    required = rounds * (transactions * transaction_fee + priorities) + transactions
     while True:
         account = rpc(port, 'account', {'key': key})['account']
         ordinary = int(account['ordinary']) if account else 0
@@ -88,12 +89,12 @@ def main():
                     'Increase transactions per wave to exercise high occupancy',
                     wave_weight, before['settings']['block_bytes'] // 2,
                 )
-            assert int(account_before['ordinary']) >= fees_paid + 1, 'Insufficient ordinary HASH for this wave.'
+            assert int(account_before['ordinary']) >= fees_paid + transactions, 'Insufficient opening HASH for this wave inputs and fees.'
             ids = set()
             for index in range(transactions):
                 tip = str(PAID_FEE) if index % FEE_INTERVAL == 0 else '0'
                 fees = {'extra_fee': tip}
-                result = http(port, '/api/wallet', {'operation': transfer, **fees, 'expiry_blocks': 100, 'expected_sender': session['public_key'], 'wallet_revision': session['wallet_revision']}, {'X-Hashstash-Token': session['token']})
+                result = http(port, '/api/wallet', {'operation': transfer, **fees, 'expiry_blocks': 2, 'expected_sender': session['public_key'], 'wallet_revision': session['wallet_revision']}, {'X-Hashstash-Token': session['token']})
                 assert 'transaction_id' in result, result
                 ids.add(result['transaction_id'])
             assert len(ids) == transactions
@@ -145,6 +146,6 @@ def main():
         empty_rates.append(rate)
     print('PASS loaded and empty blocks preserve the governed fee rate', flush=True)
     report = {'passed': True, 'node_sha256': hashlib.sha256(Path(manifest['executable']).read_bytes()).hexdigest(), 'transactions': transactions * args.rounds, 'setup': setup, 'empty_block_minimum_rates': empty_rates, 'rounds': batches, 'elapsed_seconds': round(time.monotonic() - started, 2), 'final_status': rpc(port, 'status')}
-    args.report.write_text(json.dumps(report, indent=2) + '\n')
+    args.report.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
 if __name__ == '__main__':
     main()

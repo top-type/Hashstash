@@ -14,7 +14,8 @@ fn body(operation: Operation) -> TransactionBody {
         sender: crypto::public_key(&[19; 32]).unwrap(),
         nonce: u64::MAX - 1,
         fee: maximum_amount(),
-        expiry_height: u64::MAX,
+        anchor: [38; 32],
+        expiry_blocks: u64::MAX,
         operation,
     }
 }
@@ -43,7 +44,8 @@ fn expected(action: &str, entries: &[(&str, String)]) -> BTreeMap<String, String
             address::encode(&crypto::public_key(&[19; 32]).unwrap(), &[39; 32]).unwrap(),
         ),
         ("Nonce".into(), (u64::MAX - 1).to_string()),
-        ("Expiry block".into(), u64::MAX.to_string()),
+        ("Anchor block".into(), hex::encode([38; 32])),
+        ("Valid for · blocks".into(), u64::MAX.to_string()),
         ("Fee · HASH".into(), maximum_amount().to_string()),
         ("Action".into(), action.into()),
     ]);
@@ -184,7 +186,10 @@ fn every_operation_roundtrips_and_reviews_every_signed_field_exactly() {
                 (value_label, amount.to_string()),
                 ("Outcome", outcome_name.into()),
             ];
-            entries.push(("Execution", "Batch trade; full or partial fill".into()));
+            entries.push((
+                "Execution",
+                "Batch trade; full, partial or zero fill".into(),
+            ));
             entries.push((
                 "Unfilled input",
                 "Returned automatically; transaction fee remains payable".into(),
@@ -423,7 +428,10 @@ fn signed_exports_reject_modified_fields_and_signatures() {
     tx.body.nonce -= 1;
     changed.push(tx);
     let mut tx = original.clone();
-    tx.body.expiry_height -= 1;
+    tx.body.expiry_blocks -= 1;
+    changed.push(tx);
+    let mut tx = original.clone();
+    tx.body.anchor[0] ^= 1;
     changed.push(tx);
     let mut tx = original.clone();
     tx.body.fee -= 1u32;
@@ -549,7 +557,7 @@ fn invalid_sender_recipient_limits_and_conditional_contexts_are_rejected() {
     b.nonce = u64::MAX;
     cases.push(b);
     let mut b = ordinary();
-    b.expiry_height = 0;
+    b.expiry_blocks = 0;
     cases.push(b);
     let mut b = ordinary();
     b.fee = Amount::from(1u32) << 512usize;

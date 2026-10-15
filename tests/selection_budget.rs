@@ -45,7 +45,10 @@ fn signed(
             sender: crypto::public_key(secret).unwrap(),
             nonce,
             fee: 100u32.into(),
-            expiry_height: chain.tip_height() + 10_000 + expiry_offset,
+            anchor: hashstash::codec::block_hash(
+                &hashstash::codec::genesis_block(&chain.config).unwrap(),
+            ),
+            expiry_blocks: chain.tip_height() + 10_000 + expiry_offset,
             operation,
         },
         secret,

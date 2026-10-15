@@ -286,7 +286,7 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
             return None
         fee_quote = _read(rpc, "fee_quote", {"sender": sender["public_key"],
             "operation": {"TransferExact": {"recipient": _bytes(registry_keys[region][1]), "amount": "1"}},
-            "extra_fee": "0", "expiry_blocks": 20})
+            "extra_fee": "0", "anchor": status["tip"], "expiry_blocks": 2})
         if not isinstance(fee_quote, dict) or _number(fee_quote.get("fee")) < 1:
             return None
         max_fee = _number(fee_quote["fee"])
@@ -346,9 +346,9 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
         if not usable(index):
             return None
         data = metadata.pop("data_hex", None)
-        expiry_blocks = 2 if next(iter(operation)) in {"Deposit", "Redeem"} else 20
+        expiry_blocks = 2
         request = {"sender": accounts[index]["public_key"], "operation": operation,
-                   "extra_fee": "0", "expiry_blocks": expiry_blocks}
+                   "extra_fee": "0", "anchor": status["tip"], "expiry_blocks": expiry_blocks}
         if data:
             request["data_hex"] = data
         quote = _read(rpc, "fee_quote", request)

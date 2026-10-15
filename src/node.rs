@@ -143,7 +143,8 @@ struct PendingBody<'a> {
     sender: PublicKey,
     nonce: u64,
     fee: String,
-    expiry_height: u64,
+    anchor: Hash,
+    expiry_blocks: u64,
     operation: &'a Operation,
 }
 
@@ -163,7 +164,8 @@ fn mempool_page(pool: &[Transaction], offset: usize, limit: usize, summary: bool
                     sender: body.sender,
                     nonce: body.nonce,
                     fee: body.fee.to_str_radix(10),
-                    expiry_height: body.expiry_height,
+                    anchor: body.anchor,
+                    expiry_blocks: body.expiry_blocks,
                     operation: &body.operation,
                 },
             })?
@@ -841,7 +843,7 @@ impl Node {
                 extra_fee: request.extra_fee,
                 data_hex: request.data_hex,
                 expiry_blocks: request.expiry_blocks,
-                expiry_height: request.expiry_height,
+                anchor: request.anchor,
                 nonce: request.nonce,
             },
         )?;
@@ -879,7 +881,14 @@ impl Node {
             request.nonce.is_none_or(|requested| requested == nonce),
             "requested nonce differs from pending nonce"
         );
-        let body = wallet_body(&i.chain.config, state, sender, nonce, request)?;
+        let body = wallet_body(
+            &i.chain.config,
+            state,
+            i.chain.tip_hash(),
+            sender,
+            nonce,
+            request,
+        )?;
         let unsigned_size = codec::encode(&body).len();
         // A signed transaction adds exactly 64 signature bytes.
         ensure!(
@@ -1201,7 +1210,7 @@ impl Node {
                 let nonce = request
                     .nonce
                     .unwrap_or_else(|| s.account(&sender, None).map_or(0, |a| a.nonce));
-                let body = wallet_body(c, s, sender, nonce, request)?;
+                let body = wallet_body(c, s, i.chain.tip_hash(), sender, nonce, request)?;
                 fee_quote_json(c, s, i.chain.tip_hash(), &body)
             }
             "transfer_quote" => {
@@ -1249,7 +1258,7 @@ impl Node {
                 let nonce = request
                     .nonce
                     .unwrap_or_else(|| s.account(&sender, None).map_or(0, |a| a.nonce));
-                let body = wallet_body(c, s, sender, nonce, request)?;
+                let body = wallet_body(c, s, i.chain.tip_hash(), sender, nonce, request)?;
                 let mut quote = fee_quote_json(c, s, i.chain.tip_hash(), &body)?;
                 let fee = parse_amount(required_str(&quote, "fee")?)?;
                 let total = &amount + &fee;
@@ -1267,12 +1276,12 @@ impl Node {
                 let world = |w: &crate::state::World| json!({"reserve":w.reserve.to_str_radix(10),"shares":w.shares.to_str_radix(10),"curve_mass":w.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(w).to_str_radix(10),"account_shares":w.account_shares.to_str_radix(10),"revenue":w.revenue.to_str_radix(10),"grant_escrow":w.grant_escrow.to_str_radix(10)});
                 let progress = if let crate::state::Phase::Governance(d) = &s.phase {
                     let observed = s.height.saturating_sub(d.started_height).min(d.blocks);
-                    json!({"leading_blocks":d.leading_blocks,"observed_blocks":observed,"blocks":d.blocks,"blocks_remaining":d.blocks.saturating_sub(observed)})
+                    json!({"time_unit":"blocks","leading_blocks":d.leading_blocks,"observed_blocks":observed,"blocks":d.blocks,"blocks_remaining":d.blocks.saturating_sub(observed)})
                 } else {
                     Value::Null
                 };
                 Ok(
-                    json!({"phase":s.phase,"height":s.height,"state_root":hex::encode(s.root()),"clock":s.clock,"time_unit":"blocks","clock_basis":"target_interval","settings":s.settings,"frozen":s.frozen,"pass_margin_bps":s.frozen.pass_margin_bps.unwrap_or(0).to_string(),"world":world(&s.world),"pass":s.alternative.as_ref().map(world),"auction_escrow":s.auction_escrow.to_str_radix(10),"progress":progress}),
+                    json!({"phase":s.phase,"height":s.height,"state_root":hex::encode(s.root()),"clock":s.clock,"time_unit":"seconds","clock_basis":"target_interval","settings":s.settings,"frozen":s.frozen,"pass_margin_bps":s.frozen.pass_margin_bps.unwrap_or(0).to_string(),"world":world(&s.world),"pass":s.alternative.as_ref().map(world),"auction_escrow":s.auction_escrow.to_str_radix(10),"progress":progress}),
                 )
             }
             "proposals" => {
@@ -1492,8 +1501,18 @@ impl Node {
             }
             "quote" => {
                 let amount = parse_amount(required_str(&params, "amount")?)?;
+                ensure!(
+                    params
+                        .get("outcome")
+                        .is_none_or(|value| value.is_null() || value.is_string()),
+                    "outcome must be pass or fail"
+                );
                 let outcome = parse_outcome(&params)?;
                 let s = i.chain.tip_state();
+                ensure!(
+                    s.decision_id().is_some() == outcome.is_some(),
+                    "select PASS or FAIL during governance; omit outcome otherwise"
+                );
                 let w = match outcome {
                     Some(Outcome::Pass) => {
                         s.alternative.as_ref().context("no active PASS state")?
@@ -1693,7 +1712,7 @@ impl Node {
                         extra_fee: request.extra_fee,
                         data_hex: request.data_hex,
                         expiry_blocks: request.expiry_blocks,
-                        expiry_height: request.expiry_height,
+                        anchor: request.anchor,
                         nonce: request.nonce,
                     },
                 )?;
@@ -1821,7 +1840,6 @@ impl Node {
         Ok(result)
     }
 }
-/// Value of this holding if fully redeemed now, before transaction fees.
 /// A one-order estimate. Actual fills depend on the full set of included orders.
 fn preview_trade(
     c: &Config,
@@ -1854,6 +1872,8 @@ fn preview_trade(
     Ok((filled, output, after))
 }
 
+/// Full-holding curve valuation before fees, without the per-block price limit.
+/// This is not an executable single-block withdrawal estimate; use preview_trade.
 fn stash_withdrawal(w: &crate::state::World, shares: &Amount) -> Result<Amount> {
     Ok(if shares.is_zero() || w.shares.is_zero() {
         Amount::zero()
@@ -2812,7 +2832,7 @@ struct WalletRequest {
     extra_fee: Option<String>,
     data_hex: Option<String>,
     expiry_blocks: Option<u64>,
-    expiry_height: Option<u64>,
+    anchor: Option<String>,
     nonce: Option<u64>,
 }
 #[derive(Deserialize)]
@@ -2823,7 +2843,7 @@ struct HotWalletRequest {
     extra_fee: Option<String>,
     data_hex: Option<String>,
     expiry_blocks: Option<u64>,
-    expiry_height: Option<u64>,
+    anchor: Option<String>,
     nonce: Option<u64>,
     expected_sender: String,
     wallet_revision: u64,
@@ -2837,7 +2857,7 @@ struct PrepareRequest {
     extra_fee: Option<String>,
     data_hex: Option<String>,
     expiry_blocks: Option<u64>,
-    expiry_height: Option<u64>,
+    anchor: Option<String>,
     nonce: Option<u64>,
 }
 #[derive(Deserialize)]
@@ -2850,6 +2870,7 @@ struct BroadcastRequest {
 fn wallet_body(
     c: &Config,
     s: &State,
+    tip: Hash,
     sender: PublicKey,
     nonce: u64,
     request: WalletRequest,
@@ -2859,20 +2880,26 @@ fn wallet_body(
         request.expiry_blocks.is_none_or(|blocks| blocks > 0),
         "expiry_blocks must be positive"
     );
-    let expiry_height = match request.expiry_height {
-        Some(height) => height,
-        None => s
-            .height
-            .checked_add(
-                request
-                    .expiry_blocks
-                    .unwrap_or_else(|| wallet::default_expiry_blocks(&request.operation)),
-            )
-            .context("expiry height overflow")?,
-    };
+    let anchor = request
+        .anchor
+        .as_deref()
+        .map(parse_hash)
+        .transpose()?
+        .unwrap_or(tip);
     ensure!(
-        expiry_height > s.height && expiry_height <= c.max_height,
-        "expiry height must allow inclusion and fit protocol maximum"
+        anchor == tip,
+        "anchor differs from the quoted tip; refresh before preparing"
+    );
+    let expiry_blocks = request
+        .expiry_blocks
+        .unwrap_or_else(|| wallet::default_expiry_blocks(&request.operation));
+    let expiry_height = s
+        .height
+        .checked_add(expiry_blocks)
+        .context("expiry height overflow")?;
+    ensure!(
+        expiry_height > s.height,
+        "expiry height must allow inclusion"
     );
     check_operation_bounds(c, &request.operation)?;
     let data = transaction_data(
@@ -2884,7 +2911,8 @@ fn wallet_body(
         sender,
         nonce,
         fee: Amount::zero(),
-        expiry_height,
+        anchor,
+        expiry_blocks,
         operation: request.operation,
         data,
     };
@@ -2937,6 +2965,14 @@ fn wallet_body(
 }
 
 fn fee_quote_json(c: &Config, s: &State, tip: Hash, body: &TransactionBody) -> Result<Value> {
+    ensure!(
+        body.anchor == tip,
+        "fee quote anchor differs from its snapshot"
+    );
+    let expiry_height = s
+        .height
+        .checked_add(body.expiry_blocks)
+        .context("expiry height overflow")?;
     let quote = crate::fees::quote(
         c,
         s,
@@ -2956,7 +2992,8 @@ fn fee_quote_json(c: &Config, s: &State, tip: Hash, body: &TransactionBody) -> R
        "chain_id":hex::encode(s.chain_id), "height":s.height, "tip":hex::encode(tip), "state_root":hex::encode(s.root()),
        "sender":address::encode(&body.sender,&s.chain_id)?, "sender_public_key":hex::encode(body.sender),
        "payment_available_hash":s.common_spendable(&body.sender).unwrap_or_default().to_str_radix(10),
-       "nonce":body.nonce, "expiry_height":body.expiry_height, "pending":false,
+       "nonce":body.nonce, "anchor":hex::encode(body.anchor), "anchor_height":s.height,
+       "expiry_blocks":body.expiry_blocks, "expiry_height":expiry_height, "pending":false,
        "operation":body.operation,
        "data_hex":hex::encode(&body.data), "data_bytes":body.data.len()
     });
@@ -3735,7 +3772,8 @@ mod capacity_work_tests {
                 sender,
                 nonce: 17,
                 fee: 123u32.into(),
-                expiry_height: 100,
+                anchor: [38; 32],
+                expiry_blocks: 100,
                 operation: Operation::TransferExact {
                     recipient: sender,
                     amount: 1u32.into(),
@@ -4371,7 +4409,7 @@ mod tests {
         assert!(quote.get("maximum_total_debit").is_none());
         assert_eq!(quote["sender_public_key"], hex::encode(sender));
         let before = node.read_view().unwrap().chain.tip_state().clone();
-        let request = json!({"sender":hex::encode(sender),"operation":operation,"extra_fee":"3","expiry_height":before.height+2,"nonce":0});
+        let request = json!({"sender":hex::encode(sender),"operation":operation,"extra_fee":"3","anchor":quote["tip"],"expiry_blocks":2,"nonce":0});
         let prepared = node.rpc("preparetransaction", request.clone()).unwrap();
         assert_eq!(
             prepared["fee_quote"],
@@ -4437,6 +4475,71 @@ mod tests {
         quote
     }
     #[test]
+    fn wallet_preparation_binds_quoted_tip_and_two_block_lifetime() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = crypto::public_key(&[73; 32]).unwrap();
+        let node = Node::open(
+            &directory.path().join("anchored.sqlite"),
+            Config::devnet(),
+            key,
+        )
+        .unwrap();
+        let operation = Operation::TransferExact {
+            recipient: key,
+            amount: 1u32.into(),
+        };
+        let request = json!({"sender":hex::encode(key),"operation":operation});
+        let genesis_quote = node.rpc("fee_quote", request.clone()).unwrap();
+        assert_eq!(genesis_quote["anchor"], node.status().unwrap()["tip"]);
+        assert_eq!(genesis_quote["anchor_height"], 0);
+        assert_eq!(genesis_quote["expiry_blocks"], 2);
+        assert_eq!(genesis_quote["expiry_height"], 2);
+        let mut maximum_lifetime = request.clone();
+        maximum_lifetime["expiry_blocks"] = json!(u64::MAX);
+        assert_eq!(
+            node.rpc("fee_quote", maximum_lifetime.clone()).unwrap()["expiry_height"],
+            u64::MAX
+        );
+        node.mine(100_000).unwrap();
+        assert!(
+            node.rpc("fee_quote", maximum_lifetime)
+                .unwrap_err()
+                .to_string()
+                .contains("overflow")
+        );
+        let mut exact = request.clone();
+        exact["anchor"] = node.status().unwrap()["tip"].clone();
+        let prepared = node.rpc("preparetransaction", exact.clone()).unwrap();
+        let mut envelope = prepared.clone();
+        envelope.as_object_mut().unwrap().remove("fee_quote");
+        let signed_body =
+            wallet::decode_unsigned(&serde_json::from_value(envelope).unwrap()).unwrap();
+        assert_eq!(hex::encode(signed_body.anchor), exact["anchor"]);
+        assert_eq!(signed_body.expiry_blocks, 2);
+        assert_eq!(prepared["fee_quote"]["anchor_height"], 1);
+        assert_eq!(prepared["fee_quote"]["expiry_height"], 3);
+        assert!(
+            serde_json::to_value(&signed_body)
+                .unwrap()
+                .get("expiry_height")
+                .is_none()
+        );
+        node.mine(100_000).unwrap();
+        for method in ["preparetransaction", "fee_quote"] {
+            assert!(
+                node.rpc(method, exact.clone())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("quoted tip")
+            );
+        }
+        let mut longer = request;
+        longer["expiry_blocks"] = json!(10_000);
+        let quote = node.rpc("fee_quote", longer).unwrap();
+        assert_eq!(quote["expiry_blocks"], 10_000);
+        assert_eq!(quote["expiry_height"], 10_002);
+    }
+    #[test]
     fn exact_quotes_reject_ambiguous_and_unbounded_authorizations() {
         let directory = tempfile::tempdir().unwrap();
         let key = crypto::public_key(&[73; 32]).unwrap();
@@ -4458,6 +4561,9 @@ mod tests {
             ("max_fee", json!("1".repeat(20_001))),
             ("nonce", json!(u64::MAX)),
             ("expiry_height", json!(0)),
+            ("expiry_blocks", json!(0)),
+            ("anchor", json!("not-a-block-hash")),
+            ("anchor", json!("00".repeat(32))),
             ("unknown", json!(true)),
         ] {
             let mut invalid = request.clone();
@@ -4803,7 +4909,8 @@ mod tests {
                 sender,
                 nonce: s.account(&sender, None).unwrap().nonce,
                 fee: 1u32.into(),
-                expiry_height: s.height + 1,
+                anchor: [38; 32],
+                expiry_blocks: s.height + 1,
                 operation,
             },
             &[1; 32],
@@ -4977,7 +5084,8 @@ mod tests {
                 sender: key,
                 nonce: 0,
                 fee: 100u32.into(),
-                expiry_height: state.height + 1,
+                anchor: [38; 32],
+                expiry_blocks: state.height + 1,
                 operation,
             },
             &[1; 32],
@@ -5167,6 +5275,19 @@ mod tests {
                 "{request}"
             );
         }
+        for outcome in [json!("Pass"), json!("Fail"), json!(1), json!({})] {
+            assert!(
+                Node::read_rpc(
+                    &view,
+                    "quote",
+                    json!({"kind":"deposit","amount":"1","outcome":outcome})
+                )
+                .is_err()
+            );
+        }
+        let governance = Node::read_rpc(&view, "governance", json!({})).unwrap();
+        assert_eq!(governance["time_unit"], "seconds");
+        assert!(governance["progress"].is_null());
     }
     #[test]
     fn stash_quotes_redeem_exact_share_atoms_and_report_remaining_holdings() {
@@ -5276,6 +5397,23 @@ mod tests {
             )
             .is_err()
         );
+        for outcome in [Value::Null, json!(1), json!({})] {
+            assert!(
+                Node::read_rpc(
+                    &view,
+                    "quote",
+                    json!({"kind":"deposit","amount":"10","outcome":outcome})
+                )
+                .is_err()
+            );
+        }
+        assert!(Node::read_rpc(&view, "quote", json!({"kind":"deposit","amount":"10"})).is_err());
+        let governance = Node::read_rpc(&view, "governance", json!({})).unwrap();
+        assert_eq!(governance["time_unit"], "seconds");
+        assert_eq!(governance["clock"], view.chain.tip_state().clock);
+        assert_eq!(governance["progress"]["time_unit"], "blocks");
+        assert_eq!(governance["progress"]["observed_blocks"], 7);
+        assert_eq!(governance["progress"]["blocks_remaining"], 57);
         let mut before_values = vec![];
         for outcome in [Outcome::Pass, Outcome::Fail] {
             for kind in ["withdraw", "deposit", "redeem"] {
@@ -5290,6 +5428,23 @@ mod tests {
                     json!({"key":hex::encode(key),"kind":kind,"amount":amount,"outcome":outcome}),
                 )
                 .unwrap();
+                if kind != "withdraw" {
+                    let generic = Node::read_rpc(
+                        &view,
+                        "quote",
+                        json!({"kind":kind,"amount":amount,"outcome":outcome}),
+                    )
+                    .unwrap();
+                    for field in [
+                        "input_requested",
+                        "input_filled",
+                        "input_unfilled",
+                        "output",
+                        "decision",
+                    ] {
+                        assert_eq!(generic[field], quote[field], "{kind} {field}");
+                    }
+                }
                 assert_eq!(quote["decision"], hex::encode([3; 32]));
                 assert_eq!(quote["outcome"], json!(outcome));
                 if kind == "withdraw" {
@@ -5578,7 +5733,8 @@ mod tests {
                 sender: crypto::public_key(&[1; 32]).unwrap(),
                 nonce: 0,
                 fee: 0u32.into(),
-                expiry_height: 1000,
+                anchor: [38; 32],
+                expiry_blocks: 1000,
                 operation: Operation::TransferExact {
                     recipient: [2; 32],
                     amount: 1u32.into(),

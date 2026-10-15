@@ -19,7 +19,8 @@ fn signed(c: &Config, s: &State, operation: Operation) -> Transaction {
         sender: owner(),
         nonce: s.account(&owner(), None).unwrap().nonce,
         fee: 0u32.into(),
-        expiry_height: s.height + 1000,
+        anchor: hashstash::codec::block_hash(&hashstash::codec::genesis_block(c).unwrap()),
+        expiry_blocks: s.height + 1000,
         operation,
         data: Vec::new(),
     };

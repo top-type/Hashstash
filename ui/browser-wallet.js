@@ -175,8 +175,8 @@
   }
   function decodeBody(bytes) {
     const r = new Reader(bytes);
-    const decoded = {chain_id:r.hash(),sender:r.hash(true),nonce:String(r.uint()),fee:r.amount(),expiry_height:String(r.uint()),operation:readOperation(r),data_hex:hex(r.vector())};
-    r.done(); if (BigInt(decoded.nonce) === MAX_U64) fail('Nonce exhausted.'); if (decoded.expiry_height === '0') fail('Expiry height must be positive.');
+    const decoded = {chain_id:r.hash(),sender:r.hash(true),nonce:String(r.uint()),fee:r.amount(),anchor:r.hash(),expiry_blocks:String(r.uint()),operation:readOperation(r),data_hex:hex(r.vector())};
+    r.done(); if (BigInt(decoded.nonce) === MAX_U64) fail('Nonce exhausted.'); if (decoded.expiry_blocks === '0') fail('Transaction lifetime must be positive.');
     return decoded;
   }
   function decodeUnsigned(envelope) {
@@ -185,16 +185,25 @@
   }
   function expectedBytes(expected) {
     if (!expected || typeof expected !== 'object') fail('Transaction intent is required.');
-    const nonce = u64(expected.nonce, 'Nonce'), expiry = u64(expected.expiry_height, 'Expiry height');
-    if (nonce === MAX_U64 || !expiry) fail('Invalid nonce or expiry height.');
-    if (expected.current_height !== undefined && expiry <= u64(expected.current_height)) fail('Transaction has expired.');
+    const nonce = u64(expected.nonce, 'Nonce'), lifetime = u64(expected.expiry_blocks, 'Transaction lifetime');
+    if (nonce === MAX_U64 || !lifetime) fail('Invalid nonce or transaction lifetime.');
+    if (expected.expiry_height !== undefined) fail('Use a block reference and lifetime, not an absolute expiry.');
+    if (expected.anchor_height !== undefined) {
+      const height = u64(expected.anchor_height, 'Anchor height'), expiry = height + lifetime;
+      if (expiry > MAX_U64) fail('Transaction expiry exceeds the height limit.');
+      if (expected.current_height !== undefined) {
+        const current = u64(expected.current_height, 'Current height');
+        if (current < height) fail('Anchor is ahead of the current block.');
+        if (current >= expiry) fail('Transaction has expired.');
+      }
+    } else if (expected.current_height !== undefined) fail('Anchor height is required to check expiry.');
     const parameter = expected.operation?.Propose?.proposal?.Parameter;
     if (parameter?.parameter === 'MinerFeePercent' && (u64(parameter.old) > 100n || u64(parameter.new) > 100n)) fail('Miner fee share must be from 0 to 100 percent.');
     if (parameter && ['Interval','DecisionBlocks','BlockBytes'].includes(parameter.parameter) && (!u64(parameter.old) || !u64(parameter.new))) fail('This setting must be positive.');
     if (parameter?.parameter === 'BlockBytes' && (u64(parameter.old) < 1024n || u64(parameter.new) < 1024n)) fail('Block capacity must cover the miner account’s 1,024 weight.');
     const op = encodeOperation(expected.operation), data = fromHex(expected.data_hex ?? '', undefined, 'Transaction data');
     const fee = amount(expected.fee);
-    const w = new Writer(); w.hash(expected.chain_id); w.hash(expected.sender,true); w.uint(nonce); w.amount(fee); w.uint(expiry); w.raw(op); w.vector(data);
+    const w = new Writer(); w.hash(expected.chain_id); w.hash(expected.sender,true); w.uint(nonce); w.amount(fee); w.hash(expected.anchor); w.uint(lifetime); w.raw(op); w.vector(data);
     return w.finish();
   }
   function verifyUnsigned(envelope, expected) {
@@ -208,12 +217,13 @@
     const bytes = fromHex(raw, undefined, 'Signed transaction');
     if (bytes.length <= 64) fail('Invalid signed transaction.');
     const body = bytes.subarray(0, -64), decoded = decodeBody(body);
-    if (!noble.schnorr.verify(bytes.subarray(-64), tagged('Hashstash/Transaction', body), bytes32(decoded.sender))) fail('Invalid transaction signature.');
+    if (!noble.schnorr.verify(bytes.subarray(-64), tagged('Hashstash/anchored-transaction', body), bytes32(decoded.sender))) fail('Invalid transaction signature.');
     const txid = hex(noble.sha256(noble.sha256(bytes)));
-    for (const field of ['chain_id','sender','data_hex']) {
+    for (const field of ['chain_id','sender','anchor','data_hex']) {
       if (expected[field] !== undefined && expected[field] !== decoded[field]) fail('Signed transaction does not match the message.');
     }
     if (expected.nonce !== undefined && String(u64(expected.nonce, 'Nonce')) !== decoded.nonce) fail('Signed transaction does not match the message.');
+    if (expected.expiry_blocks !== undefined && String(u64(expected.expiry_blocks, 'Transaction lifetime')) !== decoded.expiry_blocks) fail('Signed transaction does not match the message.');
     if (expected.txid !== undefined && expected.txid !== txid) fail('Signed transaction ID does not match the message.');
     if (expected.operation !== undefined && hex(encodeOperation(expected.operation)) !== hex(encodeOperation(decoded.operation))) fail('Signed transaction operation does not match the message.');
     // Authentication of these bytes does not establish canonical-chain inclusion.
@@ -334,7 +344,7 @@
         verifyUnsigned(envelope,expected);
         const secret=secretBytes(w.private_key), aux=random(32);
         try {
-          const body=fromHex(envelope.body), signature=noble.schnorr.sign(tagged('Hashstash/Transaction',body),secret,aux);
+          const body=fromHex(envelope.body), signature=noble.schnorr.sign(tagged('Hashstash/anchored-transaction',body),secret,aux);
           const raw=concat(body,signature);
           guard(read(),expected);
           return {raw:hex(raw),transaction_id:hex(noble.sha256(noble.sha256(raw)))};

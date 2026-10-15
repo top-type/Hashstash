@@ -19,7 +19,7 @@ fn step(c: &Config, s: &State, txs: &[Transaction]) -> State {
     next.audit(c).unwrap();
     next
 }
-fn signed(s: &State, secret: &[u8; 32], operation: Operation) -> Transaction {
+fn signed(c: &Config, s: &State, secret: &[u8; 32], operation: Operation) -> Transaction {
     support::sign_minimum(
         s,
         TransactionBody {
@@ -27,7 +27,8 @@ fn signed(s: &State, secret: &[u8; 32], operation: Operation) -> Transaction {
             sender: key(secret),
             nonce: s.account(&key(secret), None).unwrap().nonce,
             fee: 0u32.into(),
-            expiry_height: s.height + 1000,
+            anchor: hashstash::codec::block_hash(&hashstash::codec::genesis_block(c).unwrap()),
+            expiry_blocks: s.height + 1000,
             operation,
             data: vec![],
         },
@@ -52,6 +53,7 @@ fn genesis_opens_payments_and_flat_stash_before_first_auction() {
     assert!(s.world.reserve.is_zero() && s.world.shares.is_zero());
     s = step(&c, &s, &[]);
     let tx = signed(
+        &c,
         &s,
         &ALICE,
         Operation::TransferExact {
@@ -60,7 +62,7 @@ fn genesis_opens_payments_and_flat_stash_before_first_auction() {
         },
     );
     s = step(&c, &s, &[tx]);
-    let tx = signed(&s, &BOB, deposit(100));
+    let tx = signed(&c, &s, &BOB, deposit(100));
     s = step(&c, &s, &[tx]);
     assert!(s.clock < c.initial.rest);
     assert!(matches!(s.phase, Phase::Rest(_)));
@@ -73,6 +75,7 @@ fn genesis_opens_payments_and_flat_stash_before_first_auction() {
     assert!(s.account(&key(&ALICE), None).unwrap().shares.is_zero());
     let before = s.account(&key(&BOB), None).unwrap();
     let tx = signed(
+        &c,
         &s,
         &BOB,
         Operation::Redeem {
@@ -138,7 +141,7 @@ fn early_explicit_deposit_reorg_and_restart_restore_exact_ownership() {
     let first = append(&mut main, key(&ALICE), vec![]);
     fork.submit(first.clone(), u64::from(first.header.timestamp))
         .unwrap();
-    let tx = signed(main.tip_state(), &ALICE, deposit(100));
+    let tx = signed(&c, main.tip_state(), &ALICE, deposit(100));
     append(&mut main, key(&ALICE), vec![tx]);
     assert!(!main.tip_state().world.shares.is_zero());
     for _ in 0..2 {

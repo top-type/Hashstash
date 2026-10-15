@@ -56,6 +56,27 @@ pub fn header_bytes(header: &Header) -> [u8; 80] {
 pub fn block_hash(block: &Block) -> Hash {
     sha256d(&header_bytes(&block.header))
 }
+/// Canonical empty genesis record shared by chain initialization and tooling.
+pub fn genesis_block(config: &crate::config::Config) -> Result<Block> {
+    let state = crate::state::State::genesis(config);
+    let mut block = Block {
+        header: Header {
+            version: HEADER_VERSION,
+            previous: crate::types::ZERO_HASH,
+            merkle_root: crate::types::ZERO_HASH,
+            timestamp: config.genesis_time,
+            bits: config.initial_bits,
+            nonce: 0,
+        },
+        height: 0,
+        miner: crate::types::ZERO_HASH,
+        state_root: state.root(),
+        extranonce: [0; 8],
+        transactions: Vec::new(),
+    };
+    block.header.merkle_root = merkle_root(&block)?;
+    Ok(block)
+}
 pub fn transaction_id(tx: &Transaction) -> Hash {
     sha256d(&encode(tx))
 }
@@ -210,7 +231,8 @@ mod tests {
                 sender: [2; 32],
                 nonce,
                 fee: 0u32.into(),
-                expiry_height: 100,
+                anchor: [0; 32],
+                expiry_blocks: 100,
                 operation: Operation::TransferExact {
                     recipient: [9; 32],
                     amount: 3u32.into(),
@@ -318,7 +340,9 @@ mod tests {
             amount: 65_537u32.into(),
         };
         let bytes = encode(&transaction);
-        assert_eq!(bytes.len(), 171);
+        // Two identity hashes, nonce, fee magnitude, preparation hash,
+        // lifetime, operation, opaque-data length, and raw signature.
+        assert_eq!(bytes.len(), 32 + 32 + 1 + 3 + 32 + 1 + 1 + 32 + 4 + 1 + 64);
         assert_eq!(bytes.len(), encode(&transaction.body).len() + 64);
         assert_eq!(&bytes[bytes.len() - 64..], &[4; 64]);
         assert_eq!(encode(&Account::default()), [0, 0, 0, 0]);

@@ -20,10 +20,11 @@ fn signed(
         .as_u64()
         .context("nonce missing")?
         + offset;
-    let height = node.status()?["height"]
-        .as_u64()
-        .context("height missing")?;
-    let quote = node.rpc("fee_quote", json!({"sender":hex::encode(public), "operation":operation, "data_hex":hex::encode(&data), "extra_fee":"1", "nonce":nonce, "expiry_height":height+100}))?;
+    let status = node.status()?;
+    let anchor: Hash = hex::decode(status["tip"].as_str().context("tip missing")?)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid tip hash length"))?;
+    let quote = node.rpc("fee_quote", json!({"sender":hex::encode(public), "operation":operation, "data_hex":hex::encode(&data), "extra_fee":"1", "nonce":nonce, "anchor":hex::encode(anchor), "expiry_blocks":2}))?;
     let fee: Amount = quote["fee"].as_str().context("fee missing")?.parse()?;
     crypto::sign(
         &TransactionBody {
@@ -31,7 +32,8 @@ fn signed(
             sender: public,
             nonce,
             fee,
-            expiry_height: height + 100,
+            anchor,
+            expiry_blocks: 2,
             operation,
             data,
         },

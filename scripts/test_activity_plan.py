@@ -21,7 +21,7 @@ class PlannerTest(unittest.TestCase):
                        "last_action_height": 1, "last_chat_at": 900,
                        "history": [], "cursor": 0}
         self.snapshot = {
-            "status": {"chain_id": CHAIN, "height": 100, "clock": 1500,
+            "status": {"chain_id": CHAIN, "height": 100, "clock": 1500, "tip": "bc" * 32,
                        "phase": "rest", "decision": None, "auction_round": None,
                        "settings": {"interval": 15}},
             "governance": {"world": {"reserve": str(10**18), "grant_capacity": str(10**17)}},

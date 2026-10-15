@@ -12,7 +12,8 @@ fn canonical_transaction_matches_independent_fixed_bytes() {
             sender: [2; 32],
             nonce: 42,
             fee: 258u32.into(),
-            expiry_height: 100,
+            anchor: [3; 32],
+            expiry_blocks: 100,
             operation: Operation::TransferExact {
                 recipient: [5; 32],
                 amount: 65_537u32.into(),

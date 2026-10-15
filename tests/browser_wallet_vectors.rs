@@ -94,7 +94,8 @@ fn browser_signatures_verify_in_rust_for_every_current_operation() {
             sender,
             nonce: u64::MAX - 1,
             fee: maximum.clone(),
-            expiry_height: u64::MAX,
+            anchor: [38; 32],
+            expiry_blocks: u64::MAX,
             operation,
             data: data.clone(),
         };
@@ -102,7 +103,7 @@ fn browser_signatures_verify_in_rust_for_every_current_operation() {
         assert_eq!(wallet::decode_unsigned(&unsigned).unwrap(), body);
         let mut expected = json!({
             "chain_id":hex::encode(body.chain_id), "sender":hex::encode(sender),
-            "nonce":body.nonce.to_string(), "expiry_height":body.expiry_height.to_string(),
+            "nonce":body.nonce.to_string(), "anchor":hex::encode(body.anchor), "expiry_blocks":body.expiry_blocks.to_string(),
             "operation":operation_json, "data_hex":hex::encode(data)
         });
         expected["fee"] = json!(body.fee.to_str_radix(10));

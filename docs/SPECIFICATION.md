@@ -6,7 +6,7 @@ This document describes the current rules. The [consensus format](CONSENSUS.md) 
 
 ## 1 Accounts, payments and issuance
 
-An account is identified by a 32-byte BIP340 public key and holds spendable hashes and stash shares. Its nonce counts outgoing transactions and prevents a signed transaction from being spent twice. A transaction requires the sender's signature, exact next nonce, full chain identity and an unexpired inclusive block height. Payments credit the exact signed recipient amount; the signed fee is charged separately. Stash cannot be transferred between accounts.
+An account is identified by a 32-byte BIP340 public key and holds spendable hashes and stash shares. Its nonce counts outgoing transactions and prevents a signed transaction from being spent twice. A transaction requires the sender's signature, exact next nonce, full chain identity, an ancestor block reference and a positive lifetime measured from that block. If the reference is block 100 and the lifetime is 2, inclusion is valid in blocks 101–102. A reference removed by a reorganization is invalid on that branch. The reference and lifetime are signed and cannot slide forward during retries. Payments credit the exact signed recipient amount; the signed fee is charged separately. Stash cannot be transferred between accounts.
 
 Each canonical non-genesis block creates `floor(2^256 / (target + 1))` raw hash atoms. This is the expected number of hashing attempts represented by its required target, rounded down. Actual attempts are not measurable from the resulting proof. Losing blocks receive no reward. Nodes select the valid branch with greatest accumulated expected work and retain their current tip on equality.
 
@@ -149,13 +149,15 @@ At settlement, account balances continue directly from the chosen root. The losi
 
 ## 7 Price comparison and resolution
 
-A decision freezes a positive block count N and PASS margin m when it opens. Each subsequent block observes the completed parent’s quotes `q = floor(Q*M/S)`, with zero for an empty curve. Q is the fixed quote precision. It adds one PASS leading block exactly when:
+A decision freezes a positive block count N and PASS margin m when it opens. Each subsequent block observes the completed parent’s exact marginal prices. For two nonempty curves, it adds one PASS leading block exactly when:
 
 ```text
-q_PASS * 10000 > q_FAIL * (10000 + m)
+M_PASS * S_FAIL * 10000 > M_FAIL * S_PASS * (10000 + m)
 ```
 
 The size of the lead and the block timestamp add no extra weight. Equality contributes no PASS lead. After exactly N observations, PASS wins only if `leading_blocks > N/2` and the proposal is still fully funded. This is a strict majority of all observed blocks, including ties. A change to the PASS margin is judged under the old frozen margin.
+
+Prices are compared as exact mass/supply ratios using integer cross-products. Display rounding and quote scale do not affect whether a block leads. An empty curve has zero price.
 
 A trade affects the closing quote of its inclusion block and is first counted by the following block. Resolution happens before the final block’s user transactions, so a last-moment trade cannot alter an observation that has already settled. The opening quotes are equal when the decision merely reserves a grant, so its first observation is a tie unless another prior state difference exists. There is no price integral or magnitude-weighted average.
 
@@ -221,7 +223,7 @@ Balances, shares, curve state, intermediate arithmetic, clocks, deadlines and co
 
 ## 12 Records, storage and networking
 
-Transactions contain chain ID, sender, nonce, exact fee, expiry, one of six direct operations, arbitrary data bytes and a fixed 64-byte BIP340 signature. Binary amounts use a compact length followed by their minimal unsigned little-endian magnitude; zero has no magnitude bytes. Other integers and lengths use canonical variable-width encoding. Unknown fields, invalid tags, nonminimal encodings, excess lengths and trailing bytes are rejected.
+Transactions contain chain ID, sender, nonce, exact fee, anchor block hash, lifetime in blocks, one of six direct operations, arbitrary data bytes and a fixed 64-byte BIP340 signature. Binary amounts use a compact length followed by their minimal unsigned little-endian magnitude; zero has no magnitude bytes. Other integers and lengths use canonical variable-width encoding. Unknown fields, invalid tags, nonminimal encodings, excess lengths and trailing bytes are rejected.
 
 A block contains the header, height, miner key, state root, eight-byte mining extranonce and ordered transactions. Its Bitcoin-shaped system coinbase commits to the miner, transaction list and state root. It is the sole Merkle leaf, allowing SHA256 ASIC Stratum jobs with an empty Merkle branch. Validation of the transaction commitment needs the whole ordered list rather than a short per-transaction proof.
 

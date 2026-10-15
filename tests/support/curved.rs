@@ -18,7 +18,8 @@ fn signed(c: &Config, s: &State, secret: &[u8; 32], operation: Operation) -> Tra
         sender,
         nonce: s.account(&sender, None).unwrap().nonce,
         fee: 0u32.into(),
-        expiry_height: s.height + 10_000,
+        anchor: hashstash::codec::block_hash(&hashstash::codec::genesis_block(c).unwrap()),
+        expiry_blocks: s.height + 10_000,
         operation,
         data: vec![],
     };

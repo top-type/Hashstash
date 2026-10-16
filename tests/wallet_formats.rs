@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 fn body(operation: Operation) -> TransactionBody {
     TransactionBody {
         data: Vec::new(),
-        chain_id: [39; 32],
         sender: crypto::public_key(&[19; 32]).unwrap(),
         nonce: u64::MAX - 1,
         fee: maximum_amount(),
@@ -25,7 +24,7 @@ fn maximum_amount() -> Amount {
 }
 
 fn fields(body: &TransactionBody) -> BTreeMap<String, String> {
-    let result = wallet::review(body);
+    let result = wallet::review(body, Some(&[39; 32]));
     let count = result.len();
     let map: BTreeMap<_, _> = result.into_iter().map(|f| (f.label, f.value)).collect();
     assert_eq!(
@@ -38,7 +37,11 @@ fn fields(body: &TransactionBody) -> BTreeMap<String, String> {
 
 fn expected(action: &str, entries: &[(&str, String)]) -> BTreeMap<String, String> {
     let mut result = BTreeMap::from([
-        ("Chain ID".into(), hex::encode([39; 32])),
+        ("Network context · unsigned".into(), hex::encode([39; 32])),
+        (
+            "Anchor validation".into(),
+            "Ancestry and expiry are checked by the receiving node".into(),
+        ),
         (
             "Sender".into(),
             address::encode(&crypto::public_key(&[19; 32]).unwrap(), &[39; 32]).unwrap(),
@@ -61,7 +64,7 @@ fn exact_transfer_review_and_signature_preserve_recipient_amount_and_fee() {
         amount: 100u32.into(),
     });
     b.fee = 6u32.into();
-    let original = wallet::unsigned(&b);
+    let original = wallet::unsigned(&b, &[39; 32]);
     assert_eq!(wallet::decode_unsigned(&original).unwrap(), b);
     let review = fields(&b);
     assert_eq!(review["Recipient receives · HASH"], "100");
@@ -349,12 +352,12 @@ fn every_operation_roundtrips_and_reviews_every_signed_field_exactly() {
     assert_eq!(cases.len(), 19);
     for (operation, expected) in cases {
         let body = body(operation);
-        let envelope = wallet::unsigned(&body);
+        let envelope = wallet::unsigned(&body, &[39; 32]);
         let serialized = serde_json::to_string(&envelope).unwrap();
         let recovered: UnsignedEnvelope = serde_json::from_str(&serialized).unwrap();
         assert_eq!(wallet::decode_unsigned(&recovered).unwrap(), body);
         assert_eq!(fields(&body), expected);
-        let review_json = serde_json::to_value(wallet::review(&body)).unwrap();
+        let review_json = serde_json::to_value(wallet::review(&body, Some(&[39; 32]))).unwrap();
         assert!(
             review_json
                 .as_array()
@@ -399,7 +402,7 @@ fn fee_share_exports_reject_invalid_or_unchanged_percentages() {
             },
             support: 1u32.into(),
         });
-        assert!(wallet::decode_unsigned(&wallet::unsigned(&invalid)).is_err());
+        assert!(wallet::decode_unsigned(&wallet::unsigned(&invalid, &[39; 32])).is_err());
         let transaction = crypto::sign(&invalid, &[19; 32]).unwrap();
         assert!(wallet::decode_signed(&wallet::signed_hex(&transaction)).is_err());
     }
@@ -418,9 +421,6 @@ fn ordinary() -> TransactionBody {
 fn signed_exports_reject_modified_fields_and_signatures() {
     let original = crypto::sign(&ordinary(), &[19; 32]).unwrap();
     let mut changed = Vec::new();
-    let mut tx = original.clone();
-    tx.body.chain_id[0] ^= 1;
-    changed.push(tx);
     let mut tx = original.clone();
     tx.body.sender = crypto::public_key(&[20; 32]).unwrap();
     changed.push(tx);
@@ -480,7 +480,7 @@ fn signed_exports_reject_modified_fields_and_signatures() {
 
 #[test]
 fn malformed_envelopes_and_noncanonical_bytes_are_rejected() {
-    let envelope = wallet::unsigned(&ordinary());
+    let envelope = wallet::unsigned(&ordinary(), &[39; 32]);
     let mut value = serde_json::to_value(&envelope).unwrap();
     value["summary"] = json!("Trust this unrelated summary");
     assert!(serde_json::from_value::<UnsignedEnvelope>(value).is_err());
@@ -491,7 +491,7 @@ fn malformed_envelopes_and_noncanonical_bytes_are_rejected() {
     }
     assert!(
         serde_json::from_str::<UnsignedEnvelope>(
-            r#"{"format":"hashstash-unsigned-v1","format":"hashstash-unsigned-v1","body":"00"}"#
+            r#"{"format":"hashstash-unsigned-anchor","format":"hashstash-unsigned-anchor","chain_id":"2727272727272727272727272727272727272727272727272727272727272727","body":"00"}"#
         )
         .is_err()
     );
@@ -502,14 +502,16 @@ fn malformed_envelopes_and_noncanonical_bytes_are_rejected() {
     let mut body = ordinary();
     body.fee = 1u32.into();
     let original = codec::encode(&body);
+    let fee_offset = body.sender.len() + codec::encode(&body.nonce).len();
+    assert_eq!(original[fee_offset], 1);
     let mut malicious_length = original.clone();
     malicious_length.splice(
-        73..74,
+        fee_offset..fee_offset + 1,
         [vec![253], u64::MAX.to_le_bytes().to_vec()].concat(),
     );
     let mut nonminimal_amount = original.clone();
-    nonminimal_amount[73] = 2;
-    nonminimal_amount.insert(75, 0);
+    nonminimal_amount[fee_offset] = 2;
+    nonminimal_amount.insert(fee_offset + 2, 0);
     let mut trailing = original.clone();
     trailing.push(0);
     let mut truncated = original;
@@ -517,6 +519,7 @@ fn malformed_envelopes_and_noncanonical_bytes_are_rejected() {
     for bytes in [malicious_length, nonminimal_amount, trailing, truncated] {
         let changed = UnsignedEnvelope {
             format: wallet::UNSIGNED_FORMAT.into(),
+            chain_id: hex::encode([39; 32]),
             body: hex::encode(bytes),
         };
         assert!(wallet::decode_unsigned(&changed).is_err());
@@ -524,6 +527,7 @@ fn malformed_envelopes_and_noncanonical_bytes_are_rejected() {
     for invalid in ["".to_string(), "0".into(), "zz".into(), "0x01".into()] {
         let changed = UnsignedEnvelope {
             format: wallet::UNSIGNED_FORMAT.into(),
+            chain_id: hex::encode([39; 32]),
             body: invalid.clone(),
         };
         assert!(wallet::decode_unsigned(&changed).is_err());
@@ -609,7 +613,7 @@ fn invalid_sender_recipient_limits_and_conditional_contexts_are_rejected() {
     }
     for body in cases {
         assert!(
-            wallet::decode_unsigned(&wallet::unsigned(&body)).is_err(),
+            wallet::decode_unsigned(&wallet::unsigned(&body, &[39; 32])).is_err(),
             "accepted invalid body: {body:?}"
         );
     }
@@ -624,7 +628,7 @@ fn current_wallet_formats_reject_removed_operation_tags() {
     for tag in [6, 7, 8, 255] {
         let mut invalid = raw.clone();
         invalid[offset] = tag;
-        let mut envelope = wallet::unsigned(&current);
+        let mut envelope = wallet::unsigned(&current, &[39; 32]);
         envelope.body = hex::encode(invalid);
         assert!(wallet::decode_unsigned(&envelope).is_err());
     }
@@ -642,7 +646,7 @@ fn offline_wallet_round_trips_transactions_larger_than_the_initial_block() {
     let largest = with_payload(payload);
     assert!(codec::encode(&largest).len() > 16_384);
     assert_eq!(
-        wallet::decode_unsigned(&wallet::unsigned(&largest)).unwrap(),
+        wallet::decode_unsigned(&wallet::unsigned(&largest, &[39; 32])).unwrap(),
         largest
     );
     let signed = crypto::sign(&largest, &[19; 32]).unwrap();

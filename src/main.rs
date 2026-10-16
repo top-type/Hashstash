@@ -114,7 +114,7 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Sign and submit any protocol operation, filling the chain ID and account nonce.
+    /// Sign and submit any protocol operation, filling the block anchor and account nonce.
     Send {
         #[arg(long, default_value = "http://127.0.0.1:18480/rpc")]
         url: String,
@@ -664,7 +664,6 @@ fn verify_automatic_fee(
 #[allow(clippy::too_many_arguments)]
 fn verify_prepared_body(
     body: &TransactionBody,
-    chain_id: Hash,
     sender: PublicKey,
     operation: &Operation,
     nonce: u64,
@@ -673,10 +672,6 @@ fn verify_prepared_body(
     request: &Value,
 ) -> Result<()> {
     verify_prepared_data(body, request)?;
-    ensure!(
-        body.chain_id == chain_id,
-        "prepared transaction has another chain ID"
-    );
     ensure!(
         body.sender == sender,
         "prepared transaction has another sender"
@@ -792,9 +787,12 @@ async fn send_operation(
         let quote = response.get("fee_quote").cloned().unwrap_or(Value::Null);
         let envelope = prepared_envelope(response)?;
         let body = hashstash::wallet::decode_unsigned(&envelope)?;
+        ensure!(
+            hashstash::wallet::unsigned_chain(&envelope)? == chain_id,
+            "prepared export has another network context"
+        );
         verify_prepared_body(
             &body,
-            chain_id,
             sender,
             &operation,
             nonce,
@@ -929,7 +927,7 @@ async fn main() -> Result<()> {
         Command::Sign { key, body, out } => {
             let (secret, public) = key_file(&key)?;
             let body: TransactionBody = serde_json::from_value(read_json(&body)?)?;
-            hashstash::wallet::decode_unsigned(&hashstash::wallet::unsigned(&body))?;
+            hashstash::wallet::validate_body(&body)?;
             ensure!(
                 body.sender == public,
                 "transaction sender differs from signing key"
@@ -1010,8 +1008,8 @@ async fn main() -> Result<()> {
             let body = hashstash::wallet::decode_unsigned(&envelope)?;
             verify_prepared_data(&body, &request)?;
             ensure!(
-                body.chain_id == chain_id,
-                "prepared transaction has another chain ID"
+                hashstash::wallet::unsigned_chain(&envelope)? == chain_id,
+                "prepared export has another network context"
             );
             ensure!(
                 body.sender
@@ -1326,7 +1324,6 @@ mod tests {
             amount: 5u32.into(),
         };
         let body = TransactionBody {
-            chain_id: [9; 32],
             sender,
             nonce: 4,
             anchor: [38; 32],
@@ -1337,10 +1334,10 @@ mod tests {
         };
         let request = json!({"fee":"20"});
         let check = |body: &TransactionBody| {
-            verify_prepared_body(body, [9; 32], sender, &operation, 4, [38; 32], 25, &request)
+            verify_prepared_body(body, sender, &operation, 4, [38; 32], 25, &request)
         };
         assert!(check(&body).is_ok());
-        let status = json!({"chain_id":hex::encode(body.chain_id),"tip":hex::encode(body.anchor),"height":20,"state_root":hex::encode([44;32])});
+        let status = json!({"chain_id":hex::encode([9; 32]),"tip":hex::encode(body.anchor),"height":20,"state_root":hex::encode([44;32])});
         let mut snapshot_quote = status.clone();
         snapshot_quote["anchor"] = json!(hex::encode(body.anchor));
         snapshot_quote["anchor_height"] = json!(20);
@@ -1366,10 +1363,9 @@ mod tests {
                 "accepted altered {field}"
             );
         }
-        for field in 0..8 {
+        for field in 1..8 {
             let mut changed = body.clone();
             match field {
-                0 => changed.chain_id = [8; 32],
                 1 => changed.sender = crypto::public_key(&[8; 32]).unwrap(),
                 2 => changed.nonce += 1,
                 3 => changed.expiry_blocks += 1,
@@ -1386,7 +1382,8 @@ mod tests {
             }
             assert!(check(&changed).is_err());
         }
-        let mut response = serde_json::to_value(hashstash::wallet::unsigned(&body)).unwrap();
+        let mut response =
+            serde_json::to_value(hashstash::wallet::unsigned(&body, &[9; 32])).unwrap();
         response["fee_quote"] = json!({"fee":"20","minimum_fee":"10"});
         assert_eq!(
             hashstash::wallet::decode_unsigned(&prepared_envelope(response.clone()).unwrap())
@@ -1453,7 +1450,6 @@ mod tests {
             amount: 5u32.into(),
         };
         let make_body = |data| TransactionBody {
-            chain_id: [9; 32],
             sender,
             nonce: 4,
             anchor: [38; 32],
@@ -1466,10 +1462,7 @@ mod tests {
         for spelling in ["00AAFF", "00aAfF", "00aaff"] {
             let request = json!({"fee":"20","data_hex":spelling});
             verify_prepared_data(&body, &request).unwrap();
-            verify_prepared_body(
-                &body, [9; 32], sender, &operation, 4, [38; 32], 25, &request,
-            )
-            .unwrap();
+            verify_prepared_body(&body, sender, &operation, 4, [38; 32], 25, &request).unwrap();
             for changed in [
                 vec![0, 171, 255],
                 vec![0, 170],
@@ -1480,10 +1473,8 @@ mod tests {
                 let changed = make_body(changed);
                 assert!(verify_prepared_data(&changed, &request).is_err());
                 assert!(
-                    verify_prepared_body(
-                        &changed, [9; 32], sender, &operation, 4, [38; 32], 25, &request
-                    )
-                    .is_err()
+                    verify_prepared_body(&changed, sender, &operation, 4, [38; 32], 25, &request)
+                        .is_err()
                 );
             }
         }
@@ -1516,7 +1507,6 @@ mod tests {
             (sender, 0u64),
         ] {
             let mut body = TransactionBody {
-                chain_id: [9; 32],
                 sender,
                 nonce: 0,
                 anchor: [38; 32],
@@ -1584,7 +1574,6 @@ mod tests {
         for (recipient, creation_weight) in [(sender, 0), (other, 0), (other, 1024)] {
             for extra in [0u32, 7] {
                 let body = TransactionBody {
-                    chain_id: [9; 32],
                     sender,
                     nonce: 0,
                     anchor: [38; 32],
@@ -1673,7 +1662,6 @@ mod tests {
             .collect();
         payments.sort_by_key(|p| p.recipient);
         let mut body = TransactionBody {
-            chain_id: [9; 32],
             sender: crypto::public_key(&[6; 32]).unwrap(),
             nonce: 0,
             fee: 0u32.into(),

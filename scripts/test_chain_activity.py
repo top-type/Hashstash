@@ -94,10 +94,10 @@ class FakeCli:
         if args[0] == 'prepare':
             op = json.loads(Path(flag('--operation-file')).read_text())
             sender = flag('--sender')
-            body, raw = ca.make_body(CHAIN, sender, self.node.account_values[sender]['nonce'],
+            body, raw = ca.make_body(sender, self.node.account_values[sender]['nonce'],
                 flag('--fee'), self.node.snapshot()['status']['tip'], int(flag('--expiry-blocks')), op,
                 flag('--data-hex') if '--data-hex' in args else '')
-            ca.save_new(flag('--out'), {'format': 'hashstash-unsigned-v1', 'body': raw.hex()})
+            ca.save_new(flag('--out'), {'format': 'hashstash-unsigned-anchor', 'chain_id': CHAIN, 'body': raw.hex()})
             if self.change_after_prepare:
                 self.node.phase = 'governance'
         elif args[0] == 'sign':
@@ -599,14 +599,14 @@ class WireTests(unittest.TestCase):
             self.assertEqual(total, count)
             op = {'Propose': dict(round=2, description=[3] * 32,
                                  proposal={'Grant': grant}, support='1')}
-            body, wire = ca.make_body(CHAIN, KEYS[0], 0, 1, 'ab' * 32, 2, op)
-            prepared = {'format': 'hashstash-unsigned-v1', 'body': wire.hex()}
+            body, wire = ca.make_body(KEYS[0], 0, 1, 'ab' * 32, 2, op)
+            prepared = {'format': 'hashstash-unsigned-anchor', 'chain_id': CHAIN, 'body': wire.hex()}
             self.assertEqual(ca.verified_prepared(
                 prepared, CHAIN, KEYS[0], 0, 1, op, '', 'ab' * 32, 2), (body, wire))
             self.assertLessEqual(len(wire) + 64, 16384)
         self.assertGreater(len(wire) + 64, 4096)
         with self.assertRaisesRegex(ca.Fault, 'unsigned length'):
-            ca.verified_prepared({'format': 'hashstash-unsigned-v1', 'body': wire.hex()},
+            ca.verified_prepared({'format': 'hashstash-unsigned-anchor', 'chain_id': CHAIN, 'body': wire.hex()},
                                  CHAIN, KEYS[0], 0, 1, op, '', 'ab' * 32, 2, max_bytes=4096)
 
     def test_compact_integer_boundaries_and_noncanonical_encodings(self):
@@ -633,10 +633,38 @@ class WireTests(unittest.TestCase):
     def test_zero_amount_and_fixed_signature_have_no_redundant_payload(self):
         self.assertEqual(ca.amount(0), b'\x00')
         self.assertEqual(ca.amount(256), b'\x02\x00\x01')
-        body, raw = ca.make_body(CHAIN, KEYS[0], 0, 0, 'ab' * 32, 2, operation())
+        body, raw = ca.make_body(KEYS[0], 0, 0, 'ab' * 32, 2, operation())
         signed = ca.signed_wire({'body': body, 'signature': [7] * 64}, body, raw)
         self.assertEqual(signed, raw + b'\x07' * 64)
         self.assertEqual(len(signed) - len(raw), 64)
+
+    def test_anchor_only_body_keeps_network_context_out_of_signed_bytes(self):
+        body, raw = ca.make_body(KEYS[0], 0, 1, 'ab' * 32, 2, operation())
+        self.assertNotIn('chain_id', body)
+        self.assertEqual(raw[:32], bytes.fromhex(KEYS[0]))
+        self.assertEqual(len(raw) + 64, 169)
+        envelope = {'format': 'hashstash-unsigned-anchor', 'chain_id': CHAIN, 'body': raw.hex()}
+        args = (CHAIN, KEYS[0], 0, 1, operation(), '', 'ab' * 32, 2)
+        self.assertEqual(ca.verified_prepared(envelope, *args), (body, raw))
+        for bad in (
+            dict(envelope, chain_id='12' * 32),
+            {key: value for key, value in envelope.items() if key != 'chain_id'},
+            dict(envelope, format='hashstash-unsigned-v1'),
+            dict(envelope, unreviewed='metadata'),
+        ):
+            with self.subTest(envelope=bad), self.assertRaises(ca.Fault):
+                ca.verified_prepared(bad, *args)
+        # Matching export metadata alone never replaces the signed anchor check.
+        changed = dict(envelope, body=(raw[:35] + bytes.fromhex('ac' * 32) + raw[67:]).hex())
+        with self.assertRaises(ca.Pause):
+            ca.verified_prepared(changed, *args)
+
+    def test_old_body_layout_is_rejected_even_with_current_export_metadata(self):
+        _, raw = ca.make_body(KEYS[0], 0, 1, 'ab' * 32, 2, operation())
+        old = {'format': 'hashstash-unsigned-anchor', 'chain_id': CHAIN,
+               'body': (bytes.fromhex(CHAIN) + raw).hex()}
+        with self.assertRaises((ca.Fault, ca.Pause)):
+            ca.verified_prepared(old, CHAIN, KEYS[0], 0, 1, operation(), '', 'ab' * 32, 2)
 
     def test_amount_only_trade_encoding_rejects_removed_output_fields(self):
         for kind, field, removed, tag in [('Deposit','amount','min_shares',1), ('Redeem','shares','min_received',2)]:
@@ -647,19 +675,19 @@ class WireTests(unittest.TestCase):
                 ca.encode_operation(op)
 
     def test_every_intent_field_is_compared(self):
-        body, raw = ca.make_body(CHAIN, KEYS[0], 9, 1000, 'ab' * 32, 2, operation())
-        envelope = {'format': 'hashstash-unsigned-v1', 'body': raw.hex()}
+        body, raw = ca.make_body(KEYS[0], 9, 1000, 'ab' * 32, 2, operation())
+        envelope = {'format': 'hashstash-unsigned-anchor', 'chain_id': CHAIN, 'body': raw.hex()}
         parsed, encoded = ca.verified_prepared(envelope, CHAIN, KEYS[0], 9, 1000, operation(), '', 'ab' * 32, 2)
         self.assertEqual(parsed, body)
         self.assertEqual(encoded, raw)
-        for offset in (0, 32, 64, 65, 68, 69, len(raw) - 1):
+        for offset in (0, 32, 33, 36, 37, 68, 69, len(raw) - 1):
             bad = bytearray(raw)
             bad[offset] ^= 1
             with self.assertRaises((ca.Fault, ca.Pause, ValueError)):
                 ca.verified_prepared(dict(envelope, body=bad.hex()), CHAIN, KEYS[0], 9, 1000, operation(), '', 'ab' * 32, 2)
 
     def test_changed_signed_body_or_signature_length_rejected(self):
-        body, raw = ca.make_body(CHAIN, KEYS[0], 0, 1, 'ab' * 32, 2, operation())
+        body, raw = ca.make_body(KEYS[0], 0, 1, 'ab' * 32, 2, operation())
         with self.assertRaises(ca.Fault):
             ca.signed_wire({'body': dict(body, nonce=1), 'signature': [0] * 64}, body, raw)
         with self.assertRaises(ca.Fault):
@@ -707,7 +735,7 @@ class WireTests(unittest.TestCase):
                 for i, inner in enumerate(ops):
                     # Positive/zero amounts and both empty and nonempty signed data
                     # are validated by the actual Rust wallet decoder and signer.
-                    body, raw = ca.make_body(CHAIN, public, i, 1000000, 'ab' * 32, 2, inner,
+                    body, raw = ca.make_body(public, i, 1000000, 'ab' * 32, 2, inner,
                         b'Automated test'.hex() if i == 0 else '')
                     ca.save_new(root / f'body{i}.json', body)
                     cli.run(['sign', '--key', root / 'test.key', '--body', root / f'body{i}.json', '--out', root / f'signed{i}.json'])

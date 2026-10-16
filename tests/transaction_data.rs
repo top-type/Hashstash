@@ -32,7 +32,6 @@ fn transfer(recipient: PublicKey) -> Operation {
 fn signed(c: &Config, s: &State, operation: Operation, data: Vec<u8>, offset: u64) -> Transaction {
     crypto::sign(
         &TransactionBody {
-            chain_id: s.chain_id,
             sender: key(&ALICE),
             nonce: s.account(&key(&ALICE), None).map_or(0, |a| a.nonce) + offset,
             fee: 100u32.into(),

@@ -812,7 +812,9 @@
         feedback(form, hot ? "Signing and submitting…" : "Preparing transaction…");
         try {
             if (identity !== submissionIdentity(form)) throw new Error("Details or connection changed. Review again.");
-            const envelope = await rpc("preparetransaction", request);
+            const prepared = await rpc("preparetransaction", request);
+            // RPC adds a fee quote; only these three fields form the offline export.
+            const envelope = {format: prepared?.format, chain_id: prepared?.chain_id, body: prepared?.body};
             if (identity !== submissionIdentity(form)) throw new Error("Details or connection changed. Prepare the transaction again.");
             if (typeof envelope?.body !== "string" || envelope.body.length / 2 + 64 > transactionByteLimit()) throw new Error("Transaction exceeds the block capacity.");
             HashstashBrowserWallet.verifyUnsigned(envelope, expected);
@@ -820,6 +822,7 @@
             if (!hot) {
                 $("unsigned-output").value = JSON.stringify({
                     format: envelope.format,
+                    chain_id: envelope.chain_id,
                     body: envelope.body
                 }, null, 2);
                 $("unsigned-dialog").showModal();

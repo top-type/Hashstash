@@ -34,7 +34,7 @@ pub const METHODS: &[&str] = &[
     "explorer_chat",
     "explorer_mail",
 ];
-const SCHEMA: &str = "petahash-atoms-anchored-batch";
+const SCHEMA: &str = "petahash-atoms-anchor-only-batch";
 pub const MAX_PAGE: u64 = 50;
 
 pub struct Explorer {
@@ -410,7 +410,7 @@ impl Explorer {
                     mempool
                         .iter()
                         .rev()
-                        .filter_map(|t| chat_value(c, s, t, None, None, None))
+                        .filter_map(|t| chat_value(s, t, None, None, None))
                         .take(limit as usize)
                         .collect::<Vec<_>>()
                 );
@@ -963,7 +963,6 @@ mod page_capacity_tests {
             .collect();
         payments.sort_by_key(|p| p.recipient);
         let body = TransactionBody {
-            chain_id: s.chain_id,
             sender: owner,
             nonce: 0,
             fee: 100_000u32.into(),
@@ -991,16 +990,9 @@ mod page_capacity_tests {
             let mut body = body.clone();
             body.nonce = nonce;
             let transaction = crate::crypto::sign(&body, &secret).unwrap();
-            let record = mail_value(
-                &c,
-                &s,
-                &transaction,
-                Some(nonce + 1),
-                Some([7; 32]),
-                Some(0),
-            )
-            .unwrap()
-            .to_string();
+            let record = mail_value(&s, &transaction, Some(nonce + 1), Some([7; 32]), Some(0))
+                .unwrap()
+                .to_string();
             largest = largest.max(record.len());
             assert!(record.len() < PAGE_BYTES);
             db.execute(
@@ -1065,14 +1057,13 @@ fn operation_amount(operation: &Operation) -> Option<(&Amount, &'static str)> {
     }
 }
 fn chat_value(
-    c: &Config,
     s: &State,
     t: &Transaction,
     height: Option<u64>,
     block: Option<Hash>,
     position: Option<u64>,
 ) -> Option<Value> {
-    let message = crate::chat::from_transaction(c, t)?;
+    let message = crate::chat::from_transaction(t)?;
     let operation = t.body.operation.clone();
     let amount = operation_amount(&operation);
     Some(
@@ -1081,14 +1072,13 @@ fn chat_value(
 }
 
 fn mail_value(
-    c: &Config,
     s: &State,
     t: &Transaction,
     height: Option<u64>,
     block: Option<Hash>,
     position: Option<u64>,
 ) -> Option<Value> {
-    crate::mail::from_transaction(c, t)?;
+    crate::mail::from_transaction(t)?;
     let operation = t.body.operation.clone();
     Some(
         json!({"txid":hex::encode(codec::transaction_id(t)),"raw":crate::wallet::signed_hex(t),"sender":address::encode(&t.body.sender,&s.chain_id).ok()?,"sender_public_key":hex::encode(t.body.sender),"nonce":t.body.nonce.to_string(),"kind":kind(&operation),"operation":operation,"data_hex":hex::encode(&t.body.data),"height":height,"block_hash":block.map(hex::encode),"position":position,"status":"confirmed","confirmations":0}),
@@ -1255,7 +1245,6 @@ fn index_block(
         let operation = t.body.operation.clone();
         db.execute("INSERT OR REPLACE INTO explorer_transactions(txid,block_hash,height,position,record,data) VALUES(?1,?2,?3,?4,?5,?6)",params![id,hash_text,b.height,position as u64,serde_json::to_string(&value)?,hex::encode(&t.body.data)])?;
         if let Some(message) = chat_value(
-            c,
             opening,
             t,
             Some(b.height),
@@ -1265,7 +1254,6 @@ fn index_block(
             db.execute("INSERT OR REPLACE INTO explorer_chat(txid,block_hash,height,position,record) VALUES(?1,?2,?3,?4,?5)", params![id,hash_text,b.height,position as u64,serde_json::to_string(&message)?])?;
         }
         if let Some(message) = mail_value(
-            c,
             opening,
             t,
             Some(b.height),
@@ -1556,7 +1544,6 @@ mod indexing_tests {
         parent.height = 1;
         let tx = crypto::sign(
             &TransactionBody {
-                chain_id: c.chain_id(),
                 sender: owner,
                 nonce: 0,
                 fee: 1u32.into(),
@@ -1940,7 +1927,6 @@ mod indexing_tests {
         let make = |nonce, extra: u32| {
             crypto::sign(
                 &TransactionBody {
-                    chain_id: c.chain_id(),
                     sender: owner,
                     nonce,
                     fee: Amount::from(1_000_000u32 + extra),
@@ -2088,7 +2074,6 @@ mod chat_tests {
         ] {
             let tx = Transaction {
                 body: TransactionBody {
-                    chain_id: c.chain_id(),
                     sender: key,
                     nonce: 0,
                     fee: 10u32.into(),
@@ -2100,7 +2085,7 @@ mod chat_tests {
                 signature: [0; 64],
             };
             // Classification receives already validated transactions from its caller.
-            let value = chat_value(&c, &s, &tx, Some(1), Some([2; 32]), Some(3)).unwrap();
+            let value = chat_value(&s, &tx, Some(1), Some([2; 32]), Some(3)).unwrap();
             assert_eq!(value["kind"], expected_kind);
             assert_eq!(value["amount"], expected_amount);
             assert_eq!(value["asset"], expected_asset);
@@ -2150,7 +2135,6 @@ mod chat_tests {
         let make = |nonce, data| {
             crypto::sign(
                 &TransactionBody {
-                    chain_id: c.chain_id(),
                     sender: owner,
                     nonce,
                     fee: 1_000_000u64.into(),
@@ -2356,7 +2340,6 @@ mod chat_tests {
         let make = |nonce, text: &str, amount| {
             crypto::sign(
                 &TransactionBody {
-                    chain_id: c.chain_id(),
                     sender: owner,
                     nonce,
                     fee: 1_000_000u64.into(),

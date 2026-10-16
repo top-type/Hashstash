@@ -23,7 +23,6 @@ fn signed(c: &Config, s: &State, secret: &[u8; 32], operation: Operation) -> Tra
     support::sign_minimum(
         s,
         TransactionBody {
-            chain_id: s.chain_id,
             sender: key(secret),
             nonce: s.account(&key(secret), None).unwrap().nonce,
             fee: 0u32.into(),

@@ -43,7 +43,6 @@ fn sign(
     support::sign_minimum(
         s,
         TransactionBody {
-            chain_id: s.chain_id,
             sender: owner(),
             nonce: s.account(&owner(), None).unwrap().nonce + offset,
             fee: 1_000_000u64.into(),

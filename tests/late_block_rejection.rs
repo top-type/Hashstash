@@ -50,7 +50,6 @@ fn transfer(chain: &Chain, recipient: PublicKey, amount: u32, nonce: u64) -> Tra
     crypto::sign(
         &TransactionBody {
             data: Vec::new(),
-            chain_id: chain.chain_id(),
             sender: key(&SECRET),
             nonce,
             fee: 2u32.into(),

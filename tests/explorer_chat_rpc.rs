@@ -49,7 +49,6 @@ fn tx(node: &Node, c: &Config, amount: u64) -> Transaction {
         .unwrap();
     crypto::sign(
         &TransactionBody {
-            chain_id: c.chain_id(),
             sender: owner(),
             nonce,
             fee: 2u64.into(),
@@ -258,7 +257,6 @@ async fn public_chat_and_governance_read_do_not_expose_private_node_authority() 
     let forged = Transaction {
         body: TransactionBody {
             data: Vec::new(),
-            chain_id: c.chain_id(),
             sender: crypto::public_key(&[110; 32]).unwrap(),
             nonce: 0,
             fee: 10u64.into(),

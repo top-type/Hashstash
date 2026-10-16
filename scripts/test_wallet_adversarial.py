@@ -116,13 +116,13 @@ def main():
         cold('unlock', {'passphrase': primary['passphrase']})
         original = prepare()
         body = bytes.fromhex(original['body'])
-        _, fee_length_offset = read_uint(body, 64)
+        _, fee_length_offset = read_uint(body, 32)
         fee_size, fee_offset = read_uint(body, fee_length_offset)
         anchor_offset = fee_offset + fee_size
         expiry_offset = anchor_offset + 32
         expiry, operation_offset = read_uint(body, expiry_offset)
-        assert body[:32].hex() == rpc(base, 'status')['chain_id']
-        assert body[32:64].hex() == primary['public_key']
+        assert original['chain_id'] == rpc(base, 'status')['chain_id']
+        assert body[:32].hex() == primary['public_key']
         assert body[anchor_offset:expiry_offset].hex() == rpc(base, 'status')['tip']
         assert expiry == 2
         for method, extra in [('preparetransaction', {'anchor': '42' * 32}),
@@ -147,16 +147,19 @@ def main():
             'truncated body': {**original, 'body': original['body'][:-2]},
             'trailing byte': {**original, 'body': original['body'] + '00'},
             'large malformed body': {**original, 'body': '00' * 16385},
-            'invalid sender': changed(32, b'\xff' * 32),
-            'different sender': changed(32, bytes.fromhex(other['public_key'])),
-            'exhausted nonce': changed(64, compact_uint((1 << 64) - 1), fee_length_offset - 64),
-            'noncanonical nonce': changed(64, b'\xfb\x00\x00', fee_length_offset - 64),
-            'forbidden integer tag': changed(64, b'\xff', fee_length_offset - 64),
-            'u128 nonce': changed(64, b'\xfe' + bytes(16), fee_length_offset - 64),
+            'invalid sender': changed(0, b'\xff' * 32),
+            'different sender': changed(0, bytes.fromhex(other['public_key'])),
+            'exhausted nonce': changed(32, compact_uint((1 << 64) - 1), fee_length_offset - 32),
+            'noncanonical nonce': changed(32, b'\xfb\x00\x00', fee_length_offset - 32),
+            'forbidden integer tag': changed(32, b'\xff', fee_length_offset - 32),
+            'u128 nonce': changed(32, b'\xfe' + bytes(16), fee_length_offset - 32),
             'zero expiry': changed(expiry_offset, b'\x00', operation_offset - expiry_offset),
             'noncanonical expiry': changed(expiry_offset, b'\xfd' + expiry.to_bytes(8, 'little'), operation_offset - expiry_offset),
             'unknown operation': changed(operation_offset, b'\x08'),
-            'other chain': changed(0, b'B' * 32),
+            'other network context': {**original, 'chain_id': '42' * 32},
+            'missing network context': {key: value for key, value in original.items() if key != 'chain_id'},
+            'old unsigned format': {**original, 'format': 'hashstash-unsigned-v1'},
+            'old chain-prefixed body': {**original, 'body': original['chain_id'] + original['body']},
             'noncanonical fee length': changed(fee_length_offset, b'\xfb' + fee_size.to_bytes(2, 'little'), fee_offset - fee_length_offset),
             'noncanonical fee': changed(fee_length_offset, compact_uint(fee_size + 1) + body[fee_offset:anchor_offset] + b'\x00', anchor_offset - fee_length_offset),
             'fee above 512 bits': changed(fee_length_offset, compact_uint(65) + b'\xff' * 65, anchor_offset - fee_length_offset),
@@ -180,7 +183,7 @@ def main():
             cold('review', envelope, expected=400)
             cold('sign', {'review_token': review['review_token']}, expected=400)
             check('Malformed unsigned export rejected and prior approval invalidated: ' + name)
-        duplicate = '{"format":"hashstash-unsigned-v1","body":"' + original['body'] + '","body":"00"}'
+        duplicate = json.dumps(original)[:-1] + ',"body":"00"}'
         prior = cold('review', original)
         assert raw_cold('review', duplicate)[0] == 400
         cold('sign', {'review_token': prior['review_token']}, expected=400)
@@ -204,7 +207,7 @@ def main():
             'odd hex': signed['raw'] + '0', 'nonhex': 'gg', 'empty': '',
             'above block capacity': '00' * (status['settings']['block_bytes'] + 1),
             'wrong signature': (raw[:-1] + bytes([raw[-1] ^ 1])).hex(),
-            'changed signed nonce': (raw[:64] + compact_uint(1) + raw[fee_length_offset:]).hex(),
+            'changed signed nonce': (raw[:32] + compact_uint(1) + raw[fee_length_offset:]).hex(),
             'changed signed anchor': (raw[:anchor_offset] + b'\x42' * 32 + raw[expiry_offset:]).hex(),
             'signature length prefix': (body + compact_uint(64) + raw[len(body):]).hex(),
         }
@@ -215,11 +218,10 @@ def main():
             check('Malformed signed export rejected without state changes: ' + name)
         foreign_chain = '42' * 32
         cold('network', {'chain_id': foreign_chain})
-        foreign = sign(changed(0, bytes.fromhex(foreign_chain)))
-        cold('network', {'chain_id': body[:32].hex()})
-        reject_raw(foreign['raw'])
+        cold('review', original, expected=400)
+        cold('network', {'chain_id': original['chain_id']})
         assert rpc(base, 'status') == status_before
-        check('A valid signature over another chain identity cannot enter the local mempool')
+        check('Unsigned network context catches an accidental signer network mismatch without entering the signed body')
         foreign_anchor = sign(changed(anchor_offset, b'\x42' * 32))
         reject_raw(foreign_anchor['raw'])
         assert rpc(base, 'status') == status_before
@@ -256,7 +258,7 @@ def main():
             envelope = rpc(base, 'preparetransaction', params)
             envelope.pop('fee_quote', None)
             encoded = bytes.fromhex(envelope['body'])
-            _, offset = read_uint(encoded, 64)
+            _, offset = read_uint(encoded, 32)
             fee_size, offset = read_uint(encoded, offset)
             anchor_offset = offset + fee_size
             assert encoded[anchor_offset:anchor_offset + 32].hex() == rpc(base, 'status')['tip']

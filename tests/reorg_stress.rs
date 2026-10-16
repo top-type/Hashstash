@@ -45,7 +45,6 @@ fn sign(
         chain.tip_state(),
         TransactionBody {
             data: Vec::new(),
-            chain_id: chain.chain_id(),
             sender,
             nonce: chain.tip_state().account(&sender, None).unwrap().nonce + offset,
             fee: 100u32.into(),

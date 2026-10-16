@@ -141,27 +141,33 @@ def encode_operation(operation):
     return u64(code) + payload
 
 
-def make_body(chain, sender, nonce, fee, anchor, expiry_blocks, operation, data_hex=''):
+def make_body(sender, nonce, fee, anchor, expiry_blocks, operation, data_hex=''):
     inner = encode_operation(operation)
     data = bytes.fromhex(data_hex)
     if len(data) > 1024:
         raise ValueError('activity data too large')
-    body = dict(chain_id=list(key_bytes(chain)), sender=list(key_bytes(sender)),
+    body = dict(sender=list(key_bytes(sender)),
                 nonce=int(nonce), fee=str(fee), anchor=list(key_bytes(anchor)), expiry_blocks=int(expiry_blocks),
                 operation=operation, data=list(data))
-    wire = key_bytes(chain) + key_bytes(sender) + u64(nonce) + amount(fee) + key_bytes(anchor) + u64(expiry_blocks) + inner + vector(data)
+    wire = key_bytes(sender) + u64(nonce) + amount(fee) + key_bytes(anchor) + u64(expiry_blocks) + inner + vector(data)
     return body, wire
 
 
 def verified_prepared(envelope, chain, sender, nonce, fee, operation, data_hex, anchor, expiry_blocks,
                       max_bytes=None):
-    if envelope.get('format') != 'hashstash-unsigned-v1':
+    if envelope.get('format') != 'hashstash-unsigned-anchor':
         raise Fault('unexpected unsigned format')
+    if set(envelope) != {'format', 'chain_id', 'body'}:
+        raise Fault('unexpected unsigned export fields')
+    # This is wallet/network context, not part of the signed body. The expected
+    # anchor below is independently fixed by the controller's coherent snapshot.
+    if envelope.get('chain_id') != chain or chain != key_bytes(chain).hex():
+        raise Fault('prepared network context differs from selected network')
     raw = bytes.fromhex(envelope.get('body', ''))
-    if len(raw) < 102 or (max_bytes is not None and
+    if len(raw) < 70 or (max_bytes is not None and
                        (type(max_bytes) is not int or max_bytes <= 0 or len(raw) + 64 > max_bytes)):
         raise Fault('invalid unsigned length')
-    _, offset = read_u64(raw, 64)
+    _, offset = read_u64(raw, 32)
     fee_length, offset = read_u64(raw, offset)
     if fee_length > 64 or offset + fee_length + 32 >= len(raw):
         raise Fault('invalid unsigned amount')
@@ -171,7 +177,7 @@ def verified_prepared(envelope, chain, sender, nonce, fee, operation, data_hex, 
         raise Pause('prepared anchor moved; obtain a fresh snapshot')
     if ttl != expiry_blocks or ttl == 0:
         raise Fault('prepared lifetime differs from fixed intent')
-    body, expected = make_body(chain, sender, nonce, fee, anchor, ttl, operation, data_hex)
+    body, expected = make_body(sender, nonce, fee, anchor, ttl, operation, data_hex)
     if raw != expected:
         raise Fault('prepared transaction differs from fixed intent')
     return body, raw

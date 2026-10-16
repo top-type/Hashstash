@@ -227,7 +227,6 @@ mod tests {
         Transaction {
             body: TransactionBody {
                 data: Vec::new(),
-                chain_id: [1; 32],
                 sender: [2; 32],
                 nonce,
                 fee: 0u32.into(),
@@ -340,9 +339,9 @@ mod tests {
             amount: 65_537u32.into(),
         };
         let bytes = encode(&transaction);
-        // Two identity hashes, nonce, fee magnitude, preparation hash,
-        // lifetime, operation, opaque-data length, and raw signature.
-        assert_eq!(bytes.len(), 32 + 32 + 1 + 3 + 32 + 1 + 1 + 32 + 4 + 1 + 64);
+        // Sender, nonce, fee magnitude, preparation hash, lifetime, operation,
+        // recipient, payment magnitude, opaque-data length, and raw signature.
+        assert_eq!(bytes.len(), 32 + 1 + 3 + 32 + 1 + 1 + 32 + 4 + 1 + 64);
         assert_eq!(bytes.len(), encode(&transaction.body).len() + 64);
         assert_eq!(&bytes[bytes.len() - 64..], &[4; 64]);
         assert_eq!(encode(&Account::default()), [0, 0, 0, 0]);

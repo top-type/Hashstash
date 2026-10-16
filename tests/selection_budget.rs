@@ -41,7 +41,6 @@ fn signed(
         chain.tip_state(),
         TransactionBody {
             data: Vec::new(),
-            chain_id: chain.chain_id(),
             sender: crypto::public_key(secret).unwrap(),
             nonce,
             fee: 100u32.into(),

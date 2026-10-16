@@ -2,7 +2,7 @@
 
 Hashstash is a proof-of-work blockchain with two kinds of holdings: **hashes**, which you can spend, and **stash**, which you obtain by depositing hashes into a shared reserve. Its governance system uses trading in two possible outcomes—PASS and FAIL—to decide grants and changes to network settings.
 
-This repository contains the node, browser wallet, explorer, messaging tools and an optional faucet service. The current version is **0.41.0**. It is experimental software; its security and economic design have not received a complete independent audit.
+This repository contains the node, browser wallet, explorer, messaging tools and an optional faucet service. The current version is **0.42.0**. It is experimental software; its security and economic design have not received a complete independent audit.
 
 ## How it works
 
@@ -43,7 +43,7 @@ Decision length is a number of blocks. Auction and rest timing use a clock advan
 
 ## Using Hashstash
 
-Transactions reference the block used to prepare them and expire two blocks later by default. A transaction prepared from block 100 can be included in 101 or 102. Longer lifetimes are explicit, and a reorganization that removes the reference block invalidates the transaction.
+Transactions sign the block reference used to prepare them and expire two blocks later by default. That reference binds the transaction to its chain history, so transactions do not repeat the network ID. A transaction prepared from block 100 can be included in 101 or 102. Longer lifetimes are explicit, and a reorganization that removes the reference block invalidates the transaction.
 
 The browser **Wallet** creates or imports keys, displays balances and signs transactions locally. Back up its keys: browser storage is unencrypted and clearing site data can erase them. A separate cold signer can review and sign exported transactions offline.
 

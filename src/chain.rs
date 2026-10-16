@@ -258,7 +258,8 @@ impl Chain {
     }
 
     /// Check the signed preparation reference against the next block on this
-    /// tip, returning its fixed, derived expiry height.
+    /// tip, returning its fixed, derived expiry height. Membership in this
+    /// genesis-descended branch also establishes the transaction's network.
     pub fn validate_transaction_anchor(&self, transaction: &Transaction) -> Result<u64> {
         self.transaction_anchor_results(&self.tip, &[transaction])?
             .pop()
@@ -885,10 +886,7 @@ impl Chain {
             {
                 continue;
             }
-            if transaction.body.chain_id != execution.state.chain_id
-                || transaction.body.expiry_blocks == 0
-                || transaction.body.nonce == u64::MAX
-            {
+            if transaction.body.expiry_blocks == 0 || transaction.body.nonce == u64::MAX {
                 continue;
             }
             result.signatures_checked += 1;
@@ -1254,7 +1252,6 @@ mod cache_tests {
         let owner = crypto::public_key(&[91; 32]).unwrap();
         let tx = crypto::sign(
             &TransactionBody {
-                chain_id: chain.chain_id(),
                 sender: owner,
                 nonce: 0,
                 fee: 1u32.into(),

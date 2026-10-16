@@ -90,7 +90,6 @@ fn browser_signatures_verify_in_rust_for_every_current_operation() {
         let mut operation_json = serde_json::to_value(&operation).unwrap();
         string_u64_fields(&mut operation_json);
         let body = TransactionBody {
-            chain_id: [39; 32],
             sender,
             nonce: u64::MAX - 1,
             fee: maximum.clone(),
@@ -99,10 +98,10 @@ fn browser_signatures_verify_in_rust_for_every_current_operation() {
             operation,
             data: data.clone(),
         };
-        let unsigned = wallet::unsigned(&body);
+        let unsigned = wallet::unsigned(&body, &[39; 32]);
         assert_eq!(wallet::decode_unsigned(&unsigned).unwrap(), body);
         let mut expected = json!({
-            "chain_id":hex::encode(body.chain_id), "sender":hex::encode(sender),
+            "chain_id":hex::encode([39; 32]), "sender":hex::encode(sender),
             "nonce":body.nonce.to_string(), "anchor":hex::encode(body.anchor), "expiry_blocks":body.expiry_blocks.to_string(),
             "operation":operation_json, "data_hex":hex::encode(data)
         });

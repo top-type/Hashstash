@@ -32,7 +32,6 @@ fn step(c: &Config, s: &State, subsidy: u64, txs: &[Transaction]) -> State {
 fn sign(s: &State, op: Operation, offset: u64) -> Transaction {
     crypto::sign(
         &TransactionBody {
-            chain_id: s.chain_id,
             sender: owner(),
             nonce: s.account(&owner(), None).unwrap().nonce + offset,
             fee: 100u64.into(),

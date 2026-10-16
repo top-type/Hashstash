@@ -1,6 +1,6 @@
 //! Bounded encrypted-mail discovery over signed transaction data.
 //! The node validates envelope structure only; it never decrypts message content.
-use crate::{config::Config, crypto, types::*};
+use crate::{crypto, types::*};
 use serde::{Deserialize, Serialize};
 
 pub const PREFIX: &[u8] = b"hashstash.mail/2\n";
@@ -48,10 +48,8 @@ pub fn decode(data: &[u8]) -> Option<Envelope> {
     crypto::valid_key(&key).then_some(e)
 }
 
-pub fn from_transaction(c: &Config, tx: &Transaction) -> Option<Envelope> {
-    if tx.body.chain_id != c.chain_id() {
-        return None;
-    }
+/// Interpret data only after the caller validates the transaction and its anchor.
+pub fn from_transaction(tx: &Transaction) -> Option<Envelope> {
     // Canonical execution has already authenticated the transaction and its
     // action. Mail is an interpretation of its data, independent of that action.
     decode(&tx.body.data)
@@ -131,11 +129,9 @@ pub(crate) mod tests {
     }
     #[test]
     fn discovery_accepts_transaction_data_independently_of_its_action() {
-        let c = Config::testnet();
         let sender = crypto::public_key(&[91; 32]).unwrap();
         let mut tx = Transaction {
             body: TransactionBody {
-                chain_id: c.chain_id(),
                 sender,
                 nonce: 0,
                 fee: 100u32.into(),
@@ -150,10 +146,7 @@ pub(crate) mod tests {
             // Discovery is derived metadata; canonical execution authenticates.
             signature: [0; 64],
         };
-        assert!(from_transaction(&c, &tx).is_some());
-        tx.body.chain_id[0] ^= 1;
-        assert!(from_transaction(&c, &tx).is_none());
-        tx.body.chain_id = c.chain_id();
+        assert!(from_transaction(&tx).is_some());
         for operation in [
             Operation::TransferExact {
                 recipient: crypto::public_key(&[92; 32]).unwrap(),
@@ -194,9 +187,9 @@ pub(crate) mod tests {
                 tx.body.data = fixture();
                 operation
             };
-            assert!(from_transaction(&c, &tx).is_some());
+            assert!(from_transaction(&tx).is_some());
         }
         tx.body.data.truncate(4);
-        assert!(from_transaction(&c, &tx).is_none());
+        assert!(from_transaction(&tx).is_none());
     }
 }

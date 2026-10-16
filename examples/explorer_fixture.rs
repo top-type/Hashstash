@@ -7,13 +7,7 @@ use std::path::PathBuf;
 const OWNER: [u8; 32] = [91; 32];
 const RECIPIENT: [u8; 32] = [92; 32];
 
-fn signed(
-    node: &Node,
-    config: &Config,
-    operation: Operation,
-    data: Vec<u8>,
-    offset: u64,
-) -> Result<Transaction> {
+fn signed(node: &Node, operation: Operation, data: Vec<u8>, offset: u64) -> Result<Transaction> {
     let public = crypto::public_key(&OWNER)?;
     let account = node.rpc("account", json!({"key":hex::encode(public)}))?;
     let nonce = account["account"]["nonce"]
@@ -28,7 +22,6 @@ fn signed(
     let fee: Amount = quote["fee"].as_str().context("fee missing")?.parse()?;
     crypto::sign(
         &TransactionBody {
-            chain_id: config.chain_id(),
             sender: public,
             nonce,
             fee,
@@ -79,7 +72,6 @@ fn main() -> Result<()> {
     }
     let transfer = signed(
         &node,
-        &config,
         Operation::TransferExact {
             recipient,
             amount: 100u32.into(),
@@ -106,7 +98,6 @@ fn main() -> Result<()> {
     let proposal = state::proposal_id(&config.chain_id(), round, &description, &action);
     node.submit_transaction(signed(
         &node,
-        &config,
         Operation::Propose {
             round,
             description,
@@ -119,7 +110,6 @@ fn main() -> Result<()> {
     node.mine(1_000_000)?;
     node.submit_transaction(signed(
         &node,
-        &config,
         Operation::Support {
             round,
             proposal,
@@ -143,7 +133,6 @@ fn main() -> Result<()> {
     let decision: Hash = serde_json::from_value(gov["phase"]["Governance"]["id"].clone())?;
     node.submit_transaction(signed(
         &node,
-        &config,
         Operation::Deposit {
             amount: 80u32.into(),
             decision: Some(decision),
@@ -165,7 +154,6 @@ fn main() -> Result<()> {
     );
     let pending = signed(
         &node,
-        &config,
         Operation::TransferExact {
             recipient,
             amount: 5u32.into(),

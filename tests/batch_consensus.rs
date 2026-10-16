@@ -54,7 +54,6 @@ fn fixture() -> (Config, State) {
 fn sign(s: &State, secret: &[u8; 32], nonce_offset: u64, operation: Operation) -> Transaction {
     crypto::sign(
         &TransactionBody {
-            chain_id: s.chain_id,
             sender: key(secret),
             nonce: s.account(&key(secret), None).unwrap().nonce + nonce_offset,
             fee: 20u32.into(),

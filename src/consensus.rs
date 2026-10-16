@@ -369,10 +369,6 @@ fn transaction_inner(
     let charged_fee = &b.fee;
     let operation = prepared.operation();
     let mut accounts = AccountChanges::default();
-    ensure!(
-        b.chain_id == s.chain_id,
-        "transaction belongs to another network"
-    );
     ensure!(b.expiry_blocks > 0, "transaction lifetime must be positive");
     c.check_amount(&b.fee)?;
     let sender = s
@@ -1200,7 +1196,6 @@ mod transaction_batch_tests {
         crypto::sign(
             &TransactionBody {
                 data: Vec::new(),
-                chain_id: s.chain_id,
                 sender: sender(),
                 nonce: s.account(&sender(), None).unwrap().nonce,
                 fee: 20u32.into(),
@@ -1372,7 +1367,6 @@ mod reserve_model_tests {
         crypto::sign(
             &TransactionBody {
                 data: Vec::new(),
-                chain_id: s.chain_id,
                 sender: owner(),
                 nonce: s.account(&owner(), None).unwrap().nonce + offset,
                 fee: fee.into(),

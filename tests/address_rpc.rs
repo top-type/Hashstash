@@ -131,7 +131,13 @@ fn rpc_addresses_keep_same_accounts_and_signed_transaction_bytes() {
     addressed.as_object_mut().unwrap().remove("fee_quote");
     let body = wallet::decode_unsigned(&serde_json::from_value(addressed).unwrap()).unwrap();
     assert_eq!(body.sender, public);
-    assert_eq!(body.chain_id, chain);
+    assert!(
+        !serde_json::to_value(&body)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("chain_id")
+    );
     let transaction = crypto::sign(&body, &secret).unwrap();
     node.rpc(
         "broadcasttransaction",

@@ -15,7 +15,6 @@ fn owner() -> PublicKey {
 }
 fn signed(c: &Config, s: &State, operation: Operation) -> Transaction {
     let mut body = TransactionBody {
-        chain_id: s.chain_id,
         sender: owner(),
         nonce: s.account(&owner(), None).unwrap().nonce,
         fee: 0u32.into(),

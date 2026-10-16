@@ -46,12 +46,18 @@ async function run(){
   ['changed ciphertext',m=>({...m,data_hex:m.data_hex.slice(0,-2)+(m.data_hex.endsWith('00')?'01':'00')})],
   ['wrong txid',m=>({...m,txid:key(555)})],
   ['changed operation',(m,h)=>({...m,operation:{TransferExact:{recipient:h.other,amount:'1'}}})],
-  ['different signed chain',(m,h)=>signMailRow(h.noble,'fe'.repeat(32),b,m)],
  ]){
   const h=await setup(),m=await h.message({},h.sender,h.recipient),before=[...h.savedMail.values()][0];let attempts=0;const real=h.decryptMail;h.decryptMail=(...args)=>{attempts++;return real(...args);};
   await h.publish([change(m,h)]);
   eq(attempts,0,`${label}: reject before decryption`);eq(h.get('mail-list').children.length,0,`${label}: never display`);ok(h.get('mail-error').textContent.includes('could not be verified'),`${label}: report verification failure`);eq([...h.savedMail.values()][0],before,`${label}: never advance persisted checkpoint`);
   h.history=[m];await h.publish([]);eq(h.get('mail-list').children.length,1,`${label}: the valid signed message remains discoverable`);
+ }
+ {
+  const h=await setup(),foreign={chain_id:'fe'.repeat(32),sender:h.recipient,recipient:h.sender,nonce:'0'};
+  const data=await h.mailCrypto.encrypt({subject:'Foreign network',body:'Cannot authenticate in this network'},foreign);
+  const row=await h.message({data_hex:data},h.sender,h.recipient);
+  let attempts=0;const decrypt=h.decryptMail;h.decryptMail=(...args)=>{attempts++;return decrypt(...args);};
+  await h.publish([row]);eq(attempts,1,'transaction signature does not authenticate network metadata');eq(h.get('mail-list').children.length,0,'mail encryption still binds the selected network');eq(h.get('mail-error').textContent,'','unrelated encrypted context stays private');
  }
  {
   const h=await setup();let attempts=0;h.decryptMail=async()=>{attempts++;throw Error('not mine');};

@@ -10,7 +10,7 @@ async fn large_transaction_review_uses_record_capacity_while_control_requests_st
     let sender = signer.unlock(PHRASE).await;
     let mut expected = body(sender, payment());
     expected.data = vec![1; 96 * 1024];
-    let envelope = serde_json::to_value(wallet::unsigned(&expected)).unwrap();
+    let envelope = serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap();
     assert!(serde_json::to_vec(&envelope).unwrap().len() > cold::MAX_CONTROL_REQUEST);
     let reviewed = signer.ok("review", envelope).await;
     let signed = signer
@@ -45,7 +45,7 @@ async fn data_review_exposes_full_bytes_and_changed_data_invalidates_prior_appro
     let old = signer
         .ok(
             "review",
-            serde_json::to_value(wallet::unsigned(&expected)).unwrap(),
+            serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap(),
         )
         .await;
     let fields = old["fields"].as_array().unwrap();
@@ -65,7 +65,7 @@ async fn data_review_exposes_full_bytes_and_changed_data_invalidates_prior_appro
     let updated = signer
         .ok(
             "review",
-            serde_json::to_value(wallet::unsigned(&expected)).unwrap(),
+            serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap(),
         )
         .await;
     assert_ne!(updated["review_token"], old["review_token"]);
@@ -173,7 +173,7 @@ impl Signer {
 }
 
 #[tokio::test]
-async fn configured_network_formats_addresses_and_rejects_another_full_chain() {
+async fn configured_network_formats_addresses_and_rejects_mismatched_export_context() {
     let chain = [9; 32];
     let signer = Signer::with_chain(Some(chain)).await;
     let sender = signer.unlock(PHRASE).await;
@@ -188,7 +188,7 @@ async fn configured_network_formats_addresses_and_rejects_another_full_chain() {
     let review = signer
         .ok(
             "review",
-            serde_json::to_value(wallet::unsigned(&expected)).unwrap(),
+            serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap(),
         )
         .await;
     assert_eq!(review["address"], address::encode(&sender, &chain).unwrap());
@@ -212,16 +212,14 @@ async fn configured_network_formats_addresses_and_rejects_another_full_chain() {
         address::decode(review["address"].as_str().unwrap(), &chain).unwrap(),
         sender
     );
-    // Full transaction chain checking remains stronger than the display fingerprint.
-    let mut alien = expected.clone();
-    alien.chain_id[31] ^= 1;
-    assert_eq!(address::hrp(&alien.chain_id), address::hrp(&chain));
+    // Unsigned display context is checked in full, but does not prove anchor ancestry.
+    let mut alien_chain = chain;
+    alien_chain[31] ^= 1;
+    assert_eq!(address::hrp(&alien_chain), address::hrp(&chain));
+    let alien = wallet::unsigned(&expected, &alien_chain);
     assert_eq!(
         signer
-            .post(
-                "review",
-                serde_json::to_value(wallet::unsigned(&alien)).unwrap()
-            )
+            .post("review", serde_json::to_value(alien).unwrap())
             .await
             .status(),
         StatusCode::BAD_REQUEST
@@ -246,7 +244,7 @@ async fn configured_network_formats_addresses_and_rejects_another_full_chain() {
         signer
             .post(
                 "review",
-                serde_json::to_value(wallet::unsigned(&expected)).unwrap()
+                serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap()
             )
             .await
             .status(),
@@ -263,19 +261,18 @@ async fn network_changes_invalidate_review_and_persist_across_key_changes() {
     let review = signer
         .ok(
             "review",
-            serde_json::to_value(wallet::unsigned(&expected)).unwrap(),
+            serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap(),
         )
         .await;
-    assert_eq!(review["chain_id"], hex::encode(expected.chain_id));
+    assert_eq!(review["chain_id"], hex::encode([9; 32]));
     assert_eq!(review["watch"]["format"], "hashstash-watch-v2");
-    let mut other = expected.clone();
-    other.chain_id = [10; 32];
+    let other_chain = [10; 32];
     let configured = signer
-        .ok("network", json!({"chain_id":hex::encode(other.chain_id)}))
+        .ok("network", json!({"chain_id":hex::encode(other_chain)}))
         .await;
     assert_eq!(
         configured["address"],
-        address::encode(&sender, &other.chain_id).unwrap()
+        address::encode(&sender, &other_chain).unwrap()
     );
     assert_eq!(
         signer
@@ -287,7 +284,7 @@ async fn network_changes_invalidate_review_and_persist_across_key_changes() {
     let review = signer
         .ok(
             "review",
-            serde_json::to_value(wallet::unsigned(&other)).unwrap(),
+            serde_json::to_value(wallet::unsigned(&expected, &other_chain)).unwrap(),
         )
         .await;
     for invalid in [
@@ -308,17 +305,17 @@ async fn network_changes_invalidate_review_and_persist_across_key_changes() {
         StatusCode::BAD_REQUEST
     );
     let locked = signer.ok("lock", json!({})).await;
-    assert_eq!(locked["chain_id"], hex::encode(other.chain_id));
+    assert_eq!(locked["chain_id"], hex::encode(other_chain));
     assert!(locked["address"].is_null());
     assert_eq!(signer.unlock(PHRASE).await, sender);
     let imported = signer
         .ok("import", json!({"private_key":hex::encode([41;32])}))
         .await;
     let imported_public = crypto::public_key(&[41; 32]).unwrap();
-    assert_eq!(imported["chain_id"], hex::encode(other.chain_id));
+    assert_eq!(imported["chain_id"], hex::encode(other_chain));
     assert_eq!(
         imported["address"],
-        address::encode(&imported_public, &other.chain_id).unwrap()
+        address::encode(&imported_public, &other_chain).unwrap()
     );
     signer.server.stop().await;
 }
@@ -326,7 +323,6 @@ async fn network_changes_invalidate_review_and_persist_across_key_changes() {
 fn body(sender: PublicKey, operation: Operation) -> TransactionBody {
     TransactionBody {
         data: Vec::new(),
-        chain_id: [9; 32],
         sender,
         nonce: 9_007_199_254_740_993,
         anchor: [0; 32],
@@ -356,7 +352,7 @@ async fn exact_fee_review_signs_total_and_rejects_ambiguous_envelopes() {
     let review = signer
         .ok(
             "review",
-            serde_json::to_value(wallet::unsigned(&expected)).unwrap(),
+            serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap(),
         )
         .await;
     let fields = review["fields"].as_array().unwrap();
@@ -389,10 +385,10 @@ async fn exact_fee_review_signs_total_and_rejects_ambiguous_envelopes() {
     let reviewed = signer
         .ok(
             "review",
-            serde_json::to_value(wallet::unsigned(&expected)).unwrap(),
+            serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap(),
         )
         .await;
-    let mut ambiguous = serde_json::to_value(wallet::unsigned(&expected)).unwrap();
+    let mut ambiguous = serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap();
     ambiguous["max_fee"] = json!("20");
     assert_eq!(
         signer.post("review", ambiguous).await.status(),
@@ -589,12 +585,12 @@ async fn all_operations_sign_the_exact_reviewed_bytes_with_exact_large_fields() 
         let reviewed = signer
             .ok(
                 "review",
-                serde_json::to_value(wallet::unsigned(&expected)).unwrap(),
+                serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap(),
             )
             .await;
         assert_eq!(
             reviewed["fields"],
-            serde_json::to_value(wallet::review(&expected)).unwrap()
+            serde_json::to_value(wallet::review(&expected, Some(&[9; 32]))).unwrap()
         );
         assert!(
             reviewed["fields"]
@@ -646,7 +642,7 @@ async fn invalid_fee_share_proposals_cannot_be_reviewed_or_signed() {
             signer
                 .post(
                     "review",
-                    serde_json::to_value(wallet::unsigned(&invalid)).unwrap()
+                    serde_json::to_value(wallet::unsigned(&invalid, &[9; 32])).unwrap()
                 )
                 .await
                 .status(),
@@ -667,7 +663,8 @@ async fn invalid_fee_share_proposals_cannot_be_reviewed_or_signed() {
 async fn edits_failed_reviews_lock_and_import_invalidate_old_signatures() {
     let signer = Signer::start().await;
     let sender = signer.unlock(PHRASE).await;
-    let envelope = serde_json::to_value(wallet::unsigned(&body(sender, payment()))).unwrap();
+    let envelope =
+        serde_json::to_value(wallet::unsigned(&body(sender, payment()), &[9; 32])).unwrap();
     let first = signer.ok("review", envelope.clone()).await;
     let second = signer.ok("review", envelope.clone()).await;
     assert_ne!(first["review_token"], second["review_token"]);
@@ -683,7 +680,7 @@ async fn edits_failed_reviews_lock_and_import_invalidate_old_signatures() {
         signer
             .post(
                 "review",
-                serde_json::to_value(wallet::unsigned(&alien)).unwrap()
+                serde_json::to_value(wallet::unsigned(&alien, &[9; 32])).unwrap()
             )
             .await
             .status(),
@@ -809,7 +806,7 @@ async fn importing_private_keys_signs_and_invalidates_previous_reviews() {
     let old = signer
         .ok(
             "review",
-            serde_json::to_value(wallet::unsigned(&body(old_sender, payment()))).unwrap(),
+            serde_json::to_value(wallet::unsigned(&body(old_sender, payment()), &[9; 32])).unwrap(),
         )
         .await;
     let private = [41u8; 32];
@@ -833,7 +830,7 @@ async fn importing_private_keys_signs_and_invalidates_previous_reviews() {
     let reviewed = signer
         .ok(
             "review",
-            serde_json::to_value(wallet::unsigned(&expected)).unwrap(),
+            serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap(),
         )
         .await;
     let signed = signer
@@ -849,7 +846,7 @@ async fn importing_private_keys_signs_and_invalidates_previous_reviews() {
         let reviewed = signer
             .ok(
                 "review",
-                serde_json::to_value(wallet::unsigned(&expected)).unwrap(),
+                serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap(),
             )
             .await;
         assert_eq!(
@@ -895,14 +892,14 @@ async fn malformed_operations_cannot_be_approved_offline() {
         let previous = signer
             .ok(
                 "review",
-                serde_json::to_value(wallet::unsigned(&current)).unwrap(),
+                serde_json::to_value(wallet::unsigned(&current, &[9; 32])).unwrap(),
             )
             .await;
         assert_eq!(
             signer
                 .post(
                     "review",
-                    serde_json::to_value(wallet::unsigned(&transaction)).unwrap()
+                    serde_json::to_value(wallet::unsigned(&transaction, &[9; 32])).unwrap()
                 )
                 .await
                 .status(),

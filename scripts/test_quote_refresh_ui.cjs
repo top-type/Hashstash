@@ -142,7 +142,7 @@ async function chainMovementIsPendingRatherThanInvalidInput() {
 }
 
 async function malformedQuotesStillShowErrors() {
-  for (const mutation of [{ sender_public_key: 'ab'.repeat(32) }, { data_hex: 'ff', data_bytes: 1 }, { miner_fee: '999' }, { fee: 'invalid' }, { chain_id: 'ab'.repeat(32) }, { tip: 'invalid' }, { height: -1 }]) {
+  for (const mutation of [{ sender_public_key: 'ab'.repeat(32) }, { data_hex: 'ff', data_bytes: 1 }, { miner_fee: '999' }, { fee: 'invalid' }, { chain_id: 'ab'.repeat(32) }, { tip: 'invalid' }, { height: -1 }, { anchor: 'ab'.repeat(32) }, { anchor_height: '21' }, { expiry_blocks: '3' }, { expiry_height: '23' }]) {
     const h = await setup(); h.handlers.transfer_quote = p => transferReply(h, p, mutation); await h.send('10');
     equal(visible(h, 'send-net'), 'Check payment details', `${Object.keys(mutation)[0]} mismatch remains a real validation error`);
     ok(visible(h, 'send-cost').length > 0);
@@ -255,7 +255,7 @@ async function delayedPreparationRechecksTheAnchorSnapshot() {
     const h=await setup();await h.trade('10');const held=deferred();let request;
     h.handlers.preparetransaction=p=>{request=p;return held.promise;};const sending=h.get('trade-form').requestSubmit();await settle();ok(request,'trade preparation reached the held request');
     h.currentSnapshot.status.height+=advance;h.currentSnapshot.status.tip='74'.repeat(32);h.currentSnapshot.status.state_root='75'.repeat(32);await h.refresh();
-    held.resolve(response({result:{format:'hashstash-unsigned-v1',body:'abab'}}));await sending;
+    held.resolve(response({result:{format:'hashstash-unsigned-anchor',chain_id:h.currentSnapshot.status.chain_id,body:'abab'}}));await sending;
     equal(h.wallet.length,0,'the signer is never called after the preparation snapshot changes');equal(h.calls.filter(c=>c.body.method==='broadcasttransaction').length,0);
   }
 }

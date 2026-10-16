@@ -24,7 +24,6 @@ fn config() -> Config {
 fn sign(s: &State, operation: Operation, offset: u64, data: Vec<u8>) -> Transaction {
     crypto::sign(
         &TransactionBody {
-            chain_id: s.chain_id,
             sender: key(181),
             nonce: s.account(&key(181), None).unwrap().nonce + offset,
             fee: 100u32.into(),

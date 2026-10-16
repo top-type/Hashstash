@@ -270,7 +270,7 @@ impl<'a> Cursor<'a> {
     }
     fn transaction(&mut self, maximum: usize) -> Result<()> {
         let start = self.at;
-        self.take(64)?; // chain ID and sender
+        self.take(32)?; // sender; network membership is established by the anchor
         self.integer()?; // nonce
         self.amount()?; // fee
         self.take(32)?; // signed preparation block
@@ -534,7 +534,6 @@ mod tests {
     fn transaction(operation: Operation, nonce: u64) -> Transaction {
         crypto::sign(
             &TransactionBody {
-                chain_id: Config::devnet().chain_id(),
                 sender: crypto::public_key(&[1; 32]).unwrap(),
                 nonce,
                 fee: 300u32.into(),
@@ -759,7 +758,7 @@ mod tests {
         assert!(decode(&wire, tiny).is_err());
         tx.body.fee = 0u32.into();
         let bytes = codec::encode(&tx);
-        let amount_at = 64 + codec::encode(&tx.body.nonce).len();
+        let amount_at = tx.body.sender.len() + codec::encode(&tx.body.nonce).len();
         let mut bad = bytes.clone();
         bad.splice(amount_at..amount_at + 1, [1, 0]);
         let mut r = Cursor::new(&bad);
@@ -793,7 +792,7 @@ mod tests {
         }
         let raw = codec::encode(&template);
         let mut cursor = Cursor::new(&raw);
-        cursor.take(64).unwrap();
+        cursor.take(template.body.sender.len()).unwrap();
         cursor.integer().unwrap();
         cursor.amount().unwrap();
         cursor.take(32).unwrap();
@@ -876,7 +875,7 @@ mod tests {
             assert_eq!(decode(&wire, limits).unwrap(), Message::Sync(current));
             let raw = codec::encode(&tx);
             let mut cursor = Cursor::new(&raw);
-            cursor.take(64).unwrap();
+            cursor.take(tx.body.sender.len()).unwrap();
             cursor.integer().unwrap();
             cursor.amount().unwrap();
             cursor.take(32).unwrap();
@@ -907,7 +906,7 @@ mod tests {
         assert_eq!(decode(&wire, limits).unwrap(), Message::Sync(sync.clone()));
         let raw = codec::encode(&sync.transactions[1]);
         let mut cursor = Cursor::new(&raw);
-        cursor.take(64).unwrap();
+        cursor.take(sync.transactions[1].body.sender.len()).unwrap();
         cursor.integer().unwrap();
         let amount_at = cursor.at;
         for length in [8193u64, u64::MAX] {

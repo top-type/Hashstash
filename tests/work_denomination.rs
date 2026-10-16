@@ -141,7 +141,6 @@ fn zero_subsidy_charges_miner_creation_only_when_fees_pay_it() {
     let payment = |fee: u32| {
         crypto::sign(
             &TransactionBody {
-                chain_id: funded.chain_id,
                 sender: key(1),
                 nonce: 0,
                 fee: fee.into(),
@@ -174,9 +173,7 @@ fn zero_subsidy_charges_miner_creation_only_when_fees_pay_it() {
     );
     c.initial.block_bytes = 16_384;
     let funded = step(&c, &State::genesis(&c), 1, &q * 100u32, &[]);
-    let mut paid = payment(1);
-    paid.body.chain_id = funded.chain_id;
-    paid = crypto::sign(&paid.body, &[1; 32]).unwrap();
+    let paid = payment(1);
     let next = step(&c, &funded, 2, 2u32.into(), &[paid]);
     assert_eq!(next.issued, funded.issued);
     assert_eq!(next.account(&key(2), None).unwrap().ordinary, Amount::one());

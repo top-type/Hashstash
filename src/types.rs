@@ -298,12 +298,12 @@ pub enum Operation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransactionBody {
-    pub chain_id: Hash,
     pub sender: PublicKey,
     pub nonce: u64,
     #[serde(with = "amount")]
     pub fee: Amount,
-    /// Block whose state was used to prepare this transaction.
+    /// Block whose state was used to prepare this transaction. Its validated
+    /// ancestry binds the transaction to the network and branch.
     pub anchor: Hash,
     /// Valid for this many blocks after the signed anchor; retries never extend it.
     pub expiry_blocks: u64,

@@ -461,10 +461,6 @@ async fn bounded_seeded_peer_mutations_and_invalid_transactions_preserve_state()
     let invalid = crypto::sign(
         &TransactionBody {
             data: Vec::new(),
-            chain_id: hex::decode(node.status().unwrap()["chain_id"].as_str().unwrap())
-                .unwrap()
-                .try_into()
-                .unwrap(),
             sender: crypto::public_key(&secret).unwrap(),
             nonce: 0,
             fee: 100u32.into(),
@@ -684,10 +680,6 @@ async fn concurrent_invalid_signature_batches_leave_coherent_rpc_snapshots_respo
     let original = crypto::sign(
         &TransactionBody {
             data: Vec::new(),
-            chain_id: hex::decode(node.status().unwrap()["chain_id"].as_str().unwrap())
-                .unwrap()
-                .try_into()
-                .unwrap(),
             sender: crypto::public_key(&secret).unwrap(),
             nonce: 0,
             fee: 100u32.into(),
@@ -916,10 +908,6 @@ async fn stratum_admits_and_mines_a_complete_256_transaction_job() {
             crypto::sign(
                 &TransactionBody {
                     data: Vec::new(),
-                    chain_id: hex::decode(node.status().unwrap()["chain_id"].as_str().unwrap())
-                        .unwrap()
-                        .try_into()
-                        .unwrap(),
                     sender: public,
                     nonce,
                     fee: 1u32.into(),

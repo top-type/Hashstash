@@ -139,7 +139,6 @@ struct RawMempoolRow<'a> {
 
 #[derive(Serialize)]
 struct PendingBody<'a> {
-    chain_id: Hash,
     sender: PublicKey,
     nonce: u64,
     fee: String,
@@ -160,7 +159,6 @@ fn mempool_page(pool: &[Transaction], offset: usize, limit: usize, summary: bool
             let body = &transaction.body;
             page.push(&PendingRow {
                 body: PendingBody {
-                    chain_id: body.chain_id,
                     sender: body.sender,
                     nonce: body.nonce,
                     fee: body.fee.to_str_radix(10),
@@ -1716,7 +1714,8 @@ impl Node {
                         nonce: request.nonce,
                     },
                 )?;
-                let mut result = serde_json::to_value(wallet::unsigned(&body))?;
+                let mut result =
+                    serde_json::to_value(wallet::unsigned(&body, &i.chain.chain_id()))?;
 
                 result["fee_quote"] = fee_quote_json(
                     &i.chain.config,
@@ -2907,7 +2906,6 @@ fn wallet_body(
         request.data_hex.as_deref(),
     )?;
     let mut body = TransactionBody {
-        chain_id: s.chain_id,
         sender,
         nonce,
         fee: Amount::zero(),
@@ -3768,7 +3766,6 @@ mod capacity_work_tests {
         .unwrap();
         let transaction = crypto::sign(
             &TransactionBody {
-                chain_id: config.chain_id(),
                 sender,
                 nonce: 17,
                 fee: 123u32.into(),
@@ -4913,7 +4910,6 @@ mod tests {
         let transaction = crypto::sign(
             &TransactionBody {
                 data: Vec::new(),
-                chain_id: s.chain_id,
                 sender,
                 nonce: s.account(&sender, None).unwrap().nonce,
                 fee: 1u32.into(),
@@ -5088,7 +5084,6 @@ mod tests {
         let tx = crypto::sign(
             &TransactionBody {
                 data: Vec::new(),
-                chain_id: state.chain_id,
                 sender: key,
                 nonce: 0,
                 fee: 100u32.into(),
@@ -5741,7 +5736,6 @@ mod tests {
         let transaction = Transaction {
             body: TransactionBody {
                 data: Vec::new(),
-                chain_id: [1; 32],
                 sender: crypto::public_key(&[1; 32]).unwrap(),
                 nonce: 0,
                 fee: 0u32.into(),

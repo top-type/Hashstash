@@ -30,7 +30,8 @@ fn prepare(node: &Node, sender: PublicKey, operation: Operation) -> TransactionB
         )
         .unwrap();
     assert!(value.as_object_mut().unwrap().remove("fee_quote").is_some());
-    assert_eq!(value.as_object().unwrap().len(), 2);
+    assert_eq!(value.as_object().unwrap().len(), 3);
+    assert_eq!(value["chain_id"], node.status().unwrap()["chain_id"]);
     wallet::decode_unsigned(&serde_json::from_value::<wallet::UnsignedEnvelope>(value).unwrap())
         .unwrap()
 }
@@ -378,7 +379,9 @@ fn raw_broadcast_rejects_wrong_network_expiry_signature_and_encoding() {
     let body = prepare(&node, sender, donation());
     let signed = crypto::sign(&body, &secret).unwrap();
     let mut other_network = body.clone();
-    other_network.chain_id[0] ^= 1;
+    let mut foreign_config = Config::devnet();
+    foreign_config.network.push_str("-foreign");
+    other_network.anchor = codec::block_hash(&codec::genesis_block(&foreign_config).unwrap());
     let mut expired = body.clone();
     expired.anchor = codec::block_hash(&codec::genesis_block(&Config::devnet()).unwrap());
     expired.expiry_blocks = 1;

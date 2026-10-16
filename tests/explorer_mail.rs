@@ -33,7 +33,6 @@ fn envelope() -> Vec<u8> {
 }
 fn authenticate_record(record: &Value, chain_id: Hash) -> Transaction {
     let transaction = wallet::decode_signed(record["raw"].as_str().unwrap()).unwrap();
-    assert_eq!(transaction.body.chain_id, chain_id);
     assert_eq!(record["raw"], wallet::signed_hex(&transaction));
     assert_eq!(
         record["txid"],
@@ -58,7 +57,6 @@ fn authenticate_record(record: &Value, chain_id: Hash) -> Transaction {
 fn signed(c: &Config, nonce: u64, operation: Operation, data: Vec<u8>) -> Transaction {
     crypto::sign(
         &TransactionBody {
-            chain_id: c.chain_id(),
             sender: key(91),
             nonce,
             fee: 4u32.into(),
@@ -181,7 +179,7 @@ fn canonical_mail_carries_payments_stash_actions_and_proposals_without_recipient
     );
     let forged = signed(&c, 4, actions[0].clone(), envelope());
     let mut forged_body = forged.clone();
-    forged_body.body.chain_id[0] ^= 1;
+    forged_body.body.anchor[0] ^= 1;
     assert!(n.submit_transaction(forged_body).is_err());
     let mut forged_signature = forged;
     forged_signature.signature[0] ^= 1;

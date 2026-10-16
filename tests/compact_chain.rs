@@ -52,7 +52,6 @@ fn selection_accounts_for_real_body_bytes_and_new_account_weight() {
                 .map(|nonce| {
                     crypto::sign(
                         &TransactionBody {
-                            chain_id: c.chain_id(),
                             sender: miner(1),
                             nonce,
                             fee: 100u32.into(),

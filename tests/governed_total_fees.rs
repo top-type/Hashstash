@@ -37,7 +37,6 @@ fn sign(
 ) -> Transaction {
     let (c, s) = context;
     let mut body = TransactionBody {
-        chain_id: s.chain_id,
         sender: key(secret),
         nonce: s.account(&key(secret), None).map_or(0, |a| a.nonce) + offset,
         fee: 0u32.into(),

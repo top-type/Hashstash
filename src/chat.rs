@@ -1,5 +1,5 @@
 //! A read-only conversation view of ordinary UTF-8 transaction data, not consensus.
-use crate::{config::Config, types::*};
+use crate::types::*;
 
 pub fn decode(data: &[u8], max_bytes: usize) -> Option<&str> {
     if data.len() > max_bytes {
@@ -21,10 +21,8 @@ pub fn decode(data: &[u8], max_bytes: usize) -> Option<&str> {
     Some(text)
 }
 
-pub fn from_transaction<'a>(c: &Config, tx: &'a Transaction) -> Option<&'a str> {
-    if tx.body.chain_id != c.chain_id() {
-        return None;
-    }
+/// Interpret data only after the caller validates the transaction and its anchor.
+pub fn from_transaction(tx: &Transaction) -> Option<&str> {
     decode(&tx.body.data, tx.body.data.len())
 }
 
@@ -60,7 +58,6 @@ mod tests {
 
     #[test]
     fn every_data_operation_can_carry_text_without_payment_rules() {
-        let c = Config::devnet();
         let key = crate::crypto::public_key(&[22; 32]).unwrap();
         let operations = [
             Operation::TransferExact {
@@ -91,7 +88,6 @@ mod tests {
         for operation in operations {
             let mut tx = Transaction {
                 body: TransactionBody {
-                    chain_id: c.chain_id(),
                     sender: key,
                     nonce: 0,
                     fee: 1u32.into(),
@@ -103,16 +99,13 @@ mod tests {
                 signature: [0; 64],
             };
             // Discovery does not authenticate; callers admit only validated transactions.
-            assert_eq!(from_transaction(&c, &tx).unwrap(), "ordinary note");
-            tx.body.chain_id[0] ^= 1;
-            assert!(from_transaction(&c, &tx).is_none());
-            tx.body.chain_id = c.chain_id();
+            assert_eq!(from_transaction(&tx).unwrap(), "ordinary note");
             tx.body.operation = {
                 tx.body.data = vec![b'a'; 32 * 1024];
                 tx.body.operation.clone()
             };
             assert!(
-                from_transaction(&c, &tx).is_some(),
+                from_transaction(&tx).is_some(),
                 "historical messages survive a later capacity reduction"
             );
         }

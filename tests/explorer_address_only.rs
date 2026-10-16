@@ -31,7 +31,6 @@ fn read(node: &Node, method: &str, params: Value) -> Value {
 fn transaction(c: &Config, nonce: u64, data: &[u8]) -> Transaction {
     crypto::sign(
         &TransactionBody {
-            chain_id: c.chain_id(),
             sender: owner(),
             nonce,
             fee: 1u32.into(),
@@ -151,7 +150,7 @@ fn old_derived_schema_is_rebuilt_without_retired_tables_or_consensus_changes() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(schema, "petahash-atoms-anchored-batch");
+    assert_eq!(schema, "petahash-atoms-anchor-only-batch");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

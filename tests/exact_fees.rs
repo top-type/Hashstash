@@ -33,7 +33,6 @@ fn sign(
     crypto::sign(
         &TransactionBody {
             data: Vec::new(),
-            chain_id: s.chain_id,
             sender: key(secret),
             nonce: s.account(&key(secret), None).map_or(0, |a| a.nonce) + offset,
             fee: (fee + extra).into(),

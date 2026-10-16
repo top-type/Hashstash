@@ -18,7 +18,7 @@ function prepare(chain, p) {
   const inner=Buffer.concat([compact(0),bytes(tx.recipient),amount(tx.amount)]);
   const data=Buffer.from(p.data_hex||'','hex');
   const envelope=Buffer.concat([inner,vector(data)]);
-  return {format:'hashstash-unsigned-v1',body:Buffer.concat([bytes(chain),bytes(p.sender),compact(p.nonce),amount(p.fee),bytes(p.anchor),compact(p.expiry_blocks),envelope]).toString('hex')};
+  return {format:'hashstash-unsigned-anchor',chain_id:chain,body:Buffer.concat([bytes(p.sender),compact(p.nonce),amount(p.fee),bytes(p.anchor),compact(p.expiry_blocks),envelope]).toString('hex')};
 }
 function fee(h,p) {
   const {chain_id,tip,state_root,height}=h.currentSnapshot.status, priority=p.extra_fee||'0';
@@ -34,7 +34,7 @@ async function setup(options={}) {
 
   h.handlers.fee_quote=p=>response({result:fee(h,p)});
   h.handlers.transfer_quote=p=>{const f=fee(h,p);return response({result:{...f,recipient:addr(p.recipient),public_key:p.recipient,amount:p.amount,recipient_receives:p.amount,total_debit:String(BigInt(p.amount)+BigInt(f.fee))}});};
-  h.handlers.preparetransaction=p=>response({result:prepare(h.currentSnapshot.status.chain_id,p)});
+  h.handlers.preparetransaction=p=>response({result:{...prepare(h.currentSnapshot.status.chain_id,p),fee_quote:fee(h,p)}});
   h.handlers.broadcasttransaction=p=>response({result:{transaction_id:sha(sha(Buffer.from(p.raw,'hex'))).toString('hex')}});
   await h.refresh(); return h;
 }
@@ -85,10 +85,13 @@ async function run() {
   assert.equal(broadcasts(a).length,1,a.get('send-form').querySelector().textContent);checks++;
   const raw=Buffer.from(broadcasts(a)[0].body.params.raw,'hex'),body=raw.subarray(0,-64),signature=raw.subarray(-64);
   assert.equal(raw.length,body.length+64);checks++;
-  const tag=sha(Buffer.from('Hashstash/anchored-transaction')),message=sha(Buffer.concat([tag,tag,body]));
+  const tag=sha(Buffer.from('Hashstash/anchor-only-transaction')),message=sha(Buffer.concat([tag,tag,body]));
   assert.equal(a.noble.schnorr.verify(Uint8Array.from(signature),Uint8Array.from(message),Uint8Array.from(Buffer.from(alice,'hex'))),true);checks++;
-  const decoded=a.browserApi.decodeUnsigned({format:'hashstash-unsigned-v1',body:body.toString('hex')});
+  const decoded=a.browserApi.decodeUnsigned({format:'hashstash-unsigned-anchor',chain_id:a.currentSnapshot.status.chain_id,body:body.toString('hex')});
   assert.equal(decoded.sender,alice);checks++;
+  assert.equal(Object.hasOwn(decoded,'chain_id'),false);checks++;
+  assert.equal(watchEnvelope.chain_id,a.currentSnapshot.status.chain_id,'offline export retains unsigned network context');checks++;
+  assert.deepEqual(Object.keys(watchEnvelope).sort(),['body','chain_id','format'],'RPC-only fee quote is excluded from the strict offline export');checks++;
   assert.equal(decoded.operation.TransferExact.recipient,bob);checks++;
   assert.equal(decoded.operation.TransferExact.amount,'100');checks++;
   assert.equal(decoded.fee,'4');checks++;
@@ -107,6 +110,9 @@ async function run() {
     assert.equal(broadcasts(a).length,1,'changed signed lifetime or block reference cannot be broadcast');checks++;
     assert.match(a.get('send-form').querySelector().textContent,/does not match/);checks++;
   }
+  a.handlers.preparetransaction=p=>response({result:prepare('ff'.repeat(32),p)});
+  await (await fill(a,bob)).requestSubmit();assert.equal(broadcasts(a).length,1,'unsigned network metadata mismatch cannot be signed');checks++;
+  assert.match(a.get('send-form').querySelector().textContent,/network context/);checks++;
   const pending=deferred();a.handlers.preparetransaction=()=>pending.promise;
   const form=await fill(a,bob),sending=form.requestSubmit();await settle();
   const req=a.calls.filter(c=>c.body.method==='preparetransaction').at(-1).body.params;
@@ -143,12 +149,12 @@ async function run() {
     assert.equal(c.hasElement('chat-form'),false,'feed has no separate transaction composer');checks++;
     assert.equal(broadcasts(c).length,0);checks++;
     await f.requestSubmit();assert.equal(broadcasts(c).length,1,f.querySelector().textContent);checks++;
-    const raw=Buffer.from(broadcasts(c)[0].body.params.raw,'hex'),body=raw.subarray(0,-64),envelope={format:'hashstash-unsigned-v1',body:body.toString('hex')},decoded=c.browserApi.decodeUnsigned(envelope);
+    const raw=Buffer.from(broadcasts(c)[0].body.params.raw,'hex'),body=raw.subarray(0,-64),envelope={format:'hashstash-unsigned-anchor',chain_id:c.currentSnapshot.status.chain_id,body:body.toString('hex')},decoded=c.browserApi.decodeUnsigned(envelope);
     assert.equal(decoded.operation.TransferExact.recipient,alice);checks++;
     assert.equal(decoded.operation.TransferExact.amount,'1','public text has no special payment threshold');checks++;
     assert.equal(decoded.fee,'1');checks++;
     assert.equal(Buffer.from(decoded.data_hex,'hex').toString(),'Public test message 🌱');checks++;
-    const tag=sha(Buffer.from('Hashstash/anchored-transaction')),message=sha(Buffer.concat([tag,tag,body]));
+    const tag=sha(Buffer.from('Hashstash/anchor-only-transaction')),message=sha(Buffer.concat([tag,tag,body]));
     assert.equal(c.noble.schnorr.verify(Uint8Array.from(raw.subarray(-64)),Uint8Array.from(message),Uint8Array.from(Buffer.from(bob,'hex'))),true);checks++;
     const intent={chain_id:c.currentSnapshot.status.chain_id,sender:bob,nonce:'0',anchor:c.currentSnapshot.status.tip,expiry_blocks:'2',operation:{Donate:{amount:'1',decision:null,outcome:null}},fee:'1',data_hex:''};
     assert.throws(()=>c.browserApi.verifyUnsigned(envelope,intent),/unsupported fields/i);checks++;

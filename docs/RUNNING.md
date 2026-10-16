@@ -24,7 +24,7 @@ Read methods include status, config, snapshot, account, governance, proposals, s
 
 `proposals` and `mempool` accept `offset` and `limit` (up to 128); response byte and JSON-value budgets may end a page sooner. Advance the offset by the number of rows returned until an empty page. Snapshots include pending transaction metadata and operations, without arbitrary data or signatures. For complete large pending transactions, request `mempool` with `format: "hex"`; each row contains `txid` and the full signed `raw` record. Default JSON mode preserves the ordinary transaction fields when they fit the bounded JSON page.
 
-Private development methods can mine or submit candidate blocks. Use those only on explicitly selected disposable fixtures. Public signed transactions carry their sender, nonce, chain ID, exact fee, anchor block hash, lifetime and operation/data; the node verifies them before mempool admission. Wallet mutation endpoints require their local session token and exact wallet revision.
+Private development methods can mine or submit candidate blocks. Use those only on explicitly selected disposable fixtures. Public signed transactions carry their sender, nonce, exact fee, anchor block hash, lifetime and operation/data; the node verifies them before mempool admission. Wallet mutation endpoints require their local session token and exact wallet revision.
 
 ## Peers
 

@@ -92,7 +92,7 @@
             if(!current())return;
             let signed;
             try{
-              const expected={chain_id:context.chain_id,txid:source.txid};
+              const expected={txid:source.txid};
               if(!restoring){
                 const sender=source.sender_public_key||source.sender;
                 if(!validId(sender)||!/^\d{1,20}$/.test(String(source.nonce))||typeof source.data_hex!=='string')throw Error();

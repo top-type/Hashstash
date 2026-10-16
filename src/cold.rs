@@ -371,17 +371,18 @@ async fn review(State(app): State<App>, bytes: Bytes) -> Response {
         let envelope = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow!("Invalid unsigned transaction envelope"))?;
         let body = wallet::decode_unsigned(&envelope)?;
+        let chain_id = wallet::unsigned_chain(&envelope)?;
         ensure!(
             body.sender == crypto::public_key(secret)?,
             "Transaction sender does not match this wallet"
         );
         ensure!(
-            state.chain_id.is_none_or(|chain| chain == body.chain_id),
-            "Transaction belongs to another network; change the selected network to review it"
+            state.chain_id.is_none_or(|chain| chain == chain_id),
+            "Export network context differs from the selected network"
         );
-        state.chain_id = Some(body.chain_id);
+        state.chain_id = Some(chain_id);
         let review_token = token()?;
-        let fields: Vec<_> = wallet::review(&body)
+        let fields: Vec<_> = wallet::review(&body, Some(&chain_id))
             .into_iter()
             .map(|field| json!({"label":field.label,"value":field.value}))
             .collect();

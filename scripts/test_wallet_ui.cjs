@@ -451,8 +451,9 @@ async function harness(options = {}) {
     console, HashstashAmounts: amounts, HashstashShares:shares, HashstashAddress:addresses, TextEncoder, TextDecoder, Uint8Array, crypto: webcrypto,
     HashstashBrowserWallet: {
       publicKey() { return '9a'.repeat(32); },
-      verifyUnsigned(envelope) {
-        if (envelope?.format !== 'hashstash-unsigned-v1' || !/^[a-f0-9]+$/i.test(envelope.body || '') || envelope.body.length % 2) throw new Error('The node returned an invalid unsigned transaction.');
+      verifyUnsigned(envelope,expected) {
+        if (expected?.chain_id !== envelope?.chain_id) throw new Error('Prepared transaction network context does not match the selected network.');
+        if (envelope?.format !== 'hashstash-unsigned-anchor' || !/^[a-f0-9]+$/i.test(envelope.body || '') || envelope.body.length % 2) throw new Error('The node returned an invalid unsigned transaction.');
       },
       createStore() {
         const manage = async (action, values, guard) => {
@@ -566,7 +567,7 @@ async function harness(options = {}) {
 
       if (method === 'mine') return response({ result: {} });
 
-      if (method === 'preparetransaction') return response({result:{format:'hashstash-unsigned-v1',body:'abcdef'}});
+      if (method === 'preparetransaction') return response({result:{format:'hashstash-unsigned-anchor',chain_id:h.currentSnapshot.status.chain_id,body:'abcdef'}});
       if (method === 'broadcasttransaction') return response({result:{transaction_id:'d'.repeat(64)}});
 
       throw new Error(`Unexpected RPC ${method}`);

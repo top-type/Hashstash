@@ -8,7 +8,6 @@ fn canonical_transaction_matches_independent_fixed_bytes() {
     let tx = Transaction {
         body: TransactionBody {
             data: Vec::new(),
-            chain_id: [1; 32],
             sender: [2; 32],
             nonce: 42,
             fee: 258u32.into(),
@@ -45,6 +44,41 @@ fn canonical_transaction_matches_independent_fixed_bytes() {
         new: 2,
     };
     assert_eq!(hex::encode(codec::encode(&minimum)), "01070102");
+}
+
+#[test]
+fn anchor_only_transfer_saves_exactly_one_hash_and_rejects_legacy_records() {
+    let tx = Transaction {
+        body: TransactionBody {
+            sender: [2; 32],
+            nonce: 0,
+            fee: 1u32.into(),
+            anchor: [3; 32],
+            expiry_blocks: 2,
+            operation: Operation::TransferExact {
+                recipient: [5; 32],
+                amount: 1000u32.into(),
+            },
+            data: vec![],
+        },
+        signature: [4; 64],
+    };
+    let compact = codec::encode(&tx);
+    assert_eq!(compact.len(), 169);
+    assert_eq!(codec::encode(&tx.body).len(), 105);
+    // The previous record's leading chain hash occupied exactly 32 bytes.
+    let legacy = [vec![1; 32], compact.clone()].concat();
+    assert_eq!(legacy.len(), 201);
+    assert!(codec::decode::<Transaction>(&legacy, legacy.len()).is_err());
+    assert_eq!(
+        codec::decode::<Transaction>(&compact, compact.len()).unwrap(),
+        tx
+    );
+
+    // JSON schemas reject the removed field rather than silently ignoring it.
+    let mut legacy_json = serde_json::to_value(&tx).unwrap();
+    legacy_json["body"]["chain_id"] = serde_json::to_value([1u8; 32]).unwrap();
+    assert!(serde_json::from_value::<Transaction>(legacy_json).is_err());
 }
 
 #[test]

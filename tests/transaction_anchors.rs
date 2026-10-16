@@ -18,7 +18,6 @@ fn append(chain: &mut Chain, txs: Vec<Transaction>, salt: u64) -> Block {
 fn payment(chain: &Chain, anchor: Hash, expiry_blocks: u64) -> Transaction {
     crypto::sign(
         &TransactionBody {
-            chain_id: chain.chain_id(),
             sender: owner(),
             nonce: chain.tip_state().account(&owner(), None).unwrap().nonce,
             fee: 1u32.into(),
@@ -53,6 +52,77 @@ fn unchecked_candidate(chain: &Chain, tx: Transaction, salt: u64) -> Block {
     block.extranonce = salt.to_le_bytes();
     block.header.merkle_root = codec::merkle_root(&block).unwrap();
     Chain::mine(block, 100_000).unwrap()
+}
+#[test]
+fn distinct_networks_cannot_replay_a_signed_anchor_without_a_chain_id_field() {
+    let d = tempfile::tempdir().unwrap();
+    let config = Config::devnet();
+    let mut other_config = config.clone();
+    other_config.network.push_str("-other");
+    let mut local = Chain::open(&d.path().join("local.db"), config.clone()).unwrap();
+    let mut other = Chain::open(&d.path().join("other.db"), other_config).unwrap();
+    let local_genesis = local.tip_hash();
+    let other_genesis = other.tip_hash();
+    assert_ne!(local.chain_id(), other.chain_id());
+    assert_ne!(local.tip_state().root(), other.tip_state().root());
+    assert_ne!(local_genesis, other_genesis);
+    append(&mut local, vec![], 1);
+    append(&mut other, vec![], 1);
+    assert_ne!(local.tip_hash(), other.tip_hash());
+    let local_root = local.tip_state().root();
+    for anchor in [other_genesis, other.tip_hash()] {
+        let tx = payment(&other, anchor, 2);
+        other.validate_transaction(&tx).unwrap();
+        crypto::verify(&tx).unwrap();
+        for result in [
+            local.validate_transaction_anchor(&tx).map(|_| ()),
+            local.validate_transaction(&tx),
+            local.template(owner(), vec![tx.clone()], 0).map(|_| ()),
+        ] {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown transaction anchor")
+            );
+        }
+        assert!(
+            local
+                .select_transactions(owner(), std::slice::from_ref(&tx), 10)
+                .unwrap()
+                .transactions
+                .is_empty()
+        );
+        // Economic simulation alone intentionally has no chain history. Even a
+        // PoW-valid block with its resulting state must fail the admission gate.
+        let forged = unchecked_candidate(&local, tx, 2);
+        assert!(
+            local
+                .submit(forged.clone(), u64::from(forged.header.timestamp))
+                .unwrap_err()
+                .to_string()
+                .contains("unknown transaction anchor")
+        );
+        assert_eq!(local.tip_state().root(), local_root);
+    }
+    // The public mempool path uses the same anchor gate before retaining bytes.
+    let node = hashstash::node::Node::open(&d.path().join("node.db"), config, owner()).unwrap();
+    node.mine(100_000).unwrap();
+    let status = node.status().unwrap();
+    let tx = payment(&other, other.tip_hash(), 2);
+    assert!(
+        node.submit_transaction(tx.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("not valid in next block")
+    );
+    assert_eq!(node.status().unwrap()["mempool"], 0);
+    assert_eq!(node.status().unwrap()["state_root"], status["state_root"]);
+    let mut local_body = tx.body;
+    local_body.anchor = hashstash::node::parse_hash(status["tip"].as_str().unwrap()).unwrap();
+    node.submit_transaction(crypto::sign(&local_body, &SECRET).unwrap())
+        .unwrap();
+    assert_eq!(node.status().unwrap()["mempool"], 1);
 }
 #[test]
 fn two_block_lifetime_is_fixed_to_the_signed_anchor_and_retry_bytes_do_not_change() {

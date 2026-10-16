@@ -94,7 +94,7 @@ async function run() {
     await quote(h,form);const gate=deferred();let preparing=false;
     h.handlers.preparetransaction=()=>{preparing=true;return gate.promise;};
     const submitting=form.requestSubmit();await until(()=>preparing,'preparation is in flight');
-    form.elements.mail_body.value='Changed while preparing';gate.resolve(response({result:{format:'hashstash-unsigned-v1',body:'abcdef'}}));await submitting;
+    form.elements.mail_body.value='Changed while preparing';gate.resolve(response({result:{format:'hashstash-unsigned-anchor',body:'abcdef'}}));await submitting;
     eq(h.wallet.length,0,'changed message never signs the old ciphertext');ok(/changed/i.test(form.feedback.textContent));
   }
   for(const mode of ['text','hex']) {

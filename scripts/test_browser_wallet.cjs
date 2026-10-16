@@ -37,6 +37,7 @@ function browser(p=profile(),hostname='wallet.example',protocol='https:') {
 const LE=(n,size)=>{n=BigInt(n);const b=Buffer.alloc(size);for(let i=0;i<size;i++){b[i]=Number(n&255n);n>>=8n;}return b;};
 const compact=n=>{n=BigInt(n);return n<251n?LE(n,1):n<=0xffffn?Buffer.concat([LE(251,1),LE(n,2)]):n<=0xffffffffn?Buffer.concat([LE(252,1),LE(n,4)]):Buffer.concat([LE(253,1),LE(n,8)]);};
 const vector=b=>Buffer.concat([compact(b.length),b]);
+const signedFields=({chain_id,...fields})=>fields;
 const amt=n=>{n=BigInt(n);if(n===0n)return vector(Buffer.alloc(0));let h=n.toString(16);if(h.length%2)h='0'+h;return vector(Buffer.from(h,'hex').reverse());};
 function transferFixture(api,changes={}) {
   const secret='13'.repeat(32),sender=api.publicKey(secret),recipient=api.publicKey('14'.repeat(32));
@@ -45,8 +46,8 @@ function transferFixture(api,changes={}) {
   const inner=Buffer.concat([compact(0),Buffer.from(t.recipient,'hex'),amt(t.amount)]);
   const data=Buffer.from(expected.data_hex,'hex');
   const op=Buffer.concat([inner,vector(data)]);
-  const body=Buffer.concat([Buffer.from(expected.chain_id,'hex'),Buffer.from(expected.sender,'hex'),compact(expected.nonce),amt(expected.fee),Buffer.from(expected.anchor,'hex'),compact(expected.expiry_blocks),op]).toString('hex');
-  return {secret,expected,envelope:{format:'hashstash-unsigned-v1',body}};
+  const body=Buffer.concat([Buffer.from(expected.sender,'hex'),compact(expected.nonce),amt(expected.fee),Buffer.from(expected.anchor,'hex'),compact(expected.expiry_blocks),op]).toString('hex');
+  return {secret,expected,envelope:{format:'hashstash-unsigned-anchor',chain_id:expected.chain_id,body}};
 }
 async function runRustVectors() {
   const rows=JSON.parse(fs.readFileSync(0,'utf8')),b=browser(),results=[];
@@ -55,7 +56,7 @@ async function runRustVectors() {
     const expected={...row.expected,wallet_id:snapshot.wallet_id,wallet_revision:snapshot.wallet_revision};
     b.api.verifyUnsigned(row.envelope,expected);
     const signed=store.signUnsigned(row.envelope,expected);
-    b.api.verifySigned(signed.raw,{...row.expected,txid:signed.transaction_id});
+    b.api.verifySigned(signed.raw,{...signedFields(row.expected),txid:signed.transaction_id});
     results.push(signed);
     store.destroy();
   }
@@ -111,6 +112,11 @@ async function run() {
   let snap=await store.importPrivate(f.secret),expected={...f.expected,wallet_id:snap.wallet_id,wallet_revision:snap.wallet_revision};
   equal(b.api.decodeUnsigned(f.envelope).operation.TransferExact.amount,'100');
   b.api.verifyUnsigned(f.envelope,expected);checks++;
+  equal(Object.hasOwn(b.api.decodeUnsigned(f.envelope),'chain_id'),false);
+  for(const chain_id of [undefined,null,'', 'AA'.repeat(32),Array(32).fill(39)])throws(()=>b.api.decodeUnsigned({...f.envelope,chain_id}),/network context/);
+  throws(()=>b.api.decodeUnsigned({...f.envelope,format:'hashstash-unsigned-v1'}),/unsigned transaction/);
+  equal(JSON.stringify(b.api.decodeUnsigned({...f.envelope,chain_id:'28'.repeat(32)})),JSON.stringify(b.api.decodeUnsigned(f.envelope)),'network context is outside signed bytes');
+  equal(Buffer.from(f.envelope.body,'hex').subarray(0,32).toString('hex'),expected.sender,'sender is the first body field');
   for (const chain of ['ff'.repeat(32),'not-a-chain','']) throws(()=>b.api.verifyUnsigned(f.envelope,{...expected,chain_id:chain}));
   for(const parameter of ['AccountCharge','StaleTargetBps','UncleFinderPercent','UncleIncluderPercent','DifficultyFloor']) {
     const intent={...expected,operation:{Propose:{round:'0',description:'44'.repeat(32),proposal:{Parameter:{parameter,old:'25',new:'30'}},support:'1'}}};
@@ -120,12 +126,12 @@ async function run() {
     const intent={...expected,data_hex:'',operation:{Propose:{round:'0',description:'44'.repeat(32),proposal:{Parameter:{parameter:'MinerFeePercent',old:'50',new:String(percent)}},support:'1'}}};
     const inner=Buffer.concat([compact(3),compact(0),Buffer.from('44'.repeat(32),'hex'),compact(1),compact(5),compact(50),compact(percent),amt(1)]);
     const outer=Buffer.concat([inner,vector(Buffer.alloc(0))]);
-    const body=Buffer.concat([Buffer.from(intent.chain_id,'hex'),Buffer.from(intent.sender,'hex'),compact(intent.nonce),amt(intent.fee),Buffer.from(intent.anchor,'hex'),compact(intent.expiry_blocks),outer]);
-    const envelope={format:'hashstash-unsigned-v1',body:body.toString('hex')};
+    const body=Buffer.concat([Buffer.from(intent.sender,'hex'),compact(intent.nonce),amt(intent.fee),Buffer.from(intent.anchor,'hex'),compact(intent.expiry_blocks),outer]);
+    const envelope={format:'hashstash-unsigned-anchor',chain_id:intent.chain_id,body:body.toString('hex')};
     b.api.verifyUnsigned(envelope,intent);checks++;
     equal(b.api.decodeUnsigned(envelope).operation.Propose.proposal.Parameter.new,String(percent));
     const signed=store.signUnsigned(envelope,intent);ok(signed.raw.length>0);
-    equal(b.api.verifySigned(signed.raw,{...intent,txid:signed.transaction_id}).operation.Propose.proposal.Parameter.new,String(percent));
+    equal(b.api.verifySigned(signed.raw,{...signedFields(intent),txid:signed.transaction_id}).operation.Propose.proposal.Parameter.new,String(percent));
     const bad=JSON.parse(JSON.stringify(intent));bad.operation.Propose.proposal.Parameter.new='101';throws(()=>b.api.verifyUnsigned(envelope,bad),/0 to 100/);
   }
   const parameterCases={BlockBytes:[[1024n,1537n],[33554432n,33554433n],[1024n,(1n<<64n)-1n]],Interval:[[15n,61n],[61n,(1n<<64n)-1n]],Lead:[[0n,17n],[17n,0n],[0n,(1n<<64n)-1n]],Rest:[[0n,19n],[19n,0n],[0n,(1n<<64n)-1n]],DecisionBlocks:[[60n,1n],[1n,(1n<<64n)-1n]],MaxPriceChangeBps:[[1000n,0n],[0n,10000n],[10000n,(1n<<64n)-1n]],PassMarginBps:[[0n,15001n],[15001n,0n],[0n,(1n<<64n)-1n]],MinimumFeeRate:[[0n,1n],[1n,0n],[3n,1n],[2n,3n],[(1n<<64n)-1n,0n],[0n,(1n<<64n)-1n]]};
@@ -133,9 +139,9 @@ async function run() {
   for(const [parameter,pairs] of Object.entries(parameterCases)) for(const [oldValue,newValue] of pairs) {
     const intent={...expected,data_hex:'',operation:{Propose:{round:'0',description:'44'.repeat(32),proposal:{Parameter:{parameter,old:String(oldValue),new:String(newValue)}},support:'1'}}};
     const inner=Buffer.concat([compact(3),compact(0),Buffer.from('44'.repeat(32),'hex'),compact(1),compact(parameterNames.indexOf(parameter)),compact(oldValue),compact(newValue),amt(1)]);
-    const envelope={format:'hashstash-unsigned-v1',body:Buffer.concat([Buffer.from(intent.chain_id,'hex'),Buffer.from(intent.sender,'hex'),compact(intent.nonce),amt(intent.fee),Buffer.from(intent.anchor,'hex'),compact(intent.expiry_blocks),inner,vector(Buffer.alloc(0))]).toString('hex')};
+    const envelope={format:'hashstash-unsigned-anchor',chain_id:intent.chain_id,body:Buffer.concat([Buffer.from(intent.sender,'hex'),compact(intent.nonce),amt(intent.fee),Buffer.from(intent.anchor,'hex'),compact(intent.expiry_blocks),inner,vector(Buffer.alloc(0))]).toString('hex')};
     b.api.verifyUnsigned(envelope,intent);checks++;equal(JSON.stringify(b.api.decodeUnsigned(envelope).operation.Propose.proposal.Parameter),JSON.stringify({parameter,old:String(oldValue),new:String(newValue)}));
-    const signed=store.signUnsigned(envelope,intent);equal(b.api.verifySigned(signed.raw,{...intent,txid:signed.transaction_id}).operation.Propose.proposal.Parameter.new,String(newValue));
+    const signed=store.signUnsigned(envelope,intent);equal(b.api.verifySigned(signed.raw,{...signedFields(intent),txid:signed.transaction_id}).operation.Propose.proposal.Parameter.new,String(newValue));
     for(const invalid of ['18446744073709551616','-1','1.5',9007199254740992]) {
       const bad={...intent,operation:{Propose:{...intent.operation.Propose,proposal:{Parameter:{parameter,old:String(oldValue),new:invalid}}}}};throws(()=>b.api.verifyUnsigned(envelope,bad),/integer|too large/i);
     }
@@ -160,14 +166,14 @@ async function run() {
   ];
   function oracleEnvelope(inner,data=Buffer.alloc(0)) {
     const outer=Buffer.concat([inner,vector(data)]);
-    return {format:'hashstash-unsigned-v1',body:Buffer.concat([hash(expected.chain_id),hash(expected.sender),compact(expected.nonce),amt(expected.fee),Buffer.from(expected.anchor,'hex'),compact(expected.expiry_blocks),outer]).toString('hex')};
+    return {format:'hashstash-unsigned-anchor',chain_id:expected.chain_id,body:Buffer.concat([hash(expected.sender),compact(expected.nonce),amt(expected.fee),Buffer.from(expected.anchor,'hex'),compact(expected.expiry_blocks),outer]).toString('hex')};
   }
   for(const [operation,inner] of operationVectors)for(const length of [0,1,250,251]) {
     const data=Buffer.alloc(length,0xa5),intent={...expected,operation,data_hex:data.toString('hex')},envelope=oracleEnvelope(inner,data);
     b.api.verifyUnsigned(envelope,intent);checks++;
     equal(JSON.stringify(b.api.decodeUnsigned(envelope).operation),JSON.stringify(operation));
     const signed=store.signUnsigned(envelope,intent);equal(signed.raw.length/2,envelope.body.length/2+64);
-    const verified=b.api.verifySigned(signed.raw,{...intent,txid:signed.transaction_id});
+    const verified=b.api.verifySigned(signed.raw,{...signedFields(intent),txid:signed.transaction_id});
     equal(JSON.stringify(verified.operation),JSON.stringify(operation));equal(verified.data_hex,intent.data_hex);
   }
   for (const [operation,inner] of operationVectors.slice(0,3)) {
@@ -179,17 +185,17 @@ async function run() {
     const [operation,inner]=operationVectors[0],data=Buffer.alloc(256*1024,0xa5),envelope=oracleEnvelope(inner,data),intent={...expected,operation,data_hex:data.toString('hex')};
     b.api.verifyUnsigned(envelope,intent);checks++;
     equal(b.api.decodeUnsigned(envelope).data_hex,intent.data_hex,'larger blocks can carry data beyond the former wallet ceiling');
-    const signed=store.signUnsigned(envelope,intent),raw=Buffer.from(signed.raw,'hex'),body=raw.subarray(0,-64),tag=createHash('sha256').update('Hashstash/anchored-transaction').digest();
+    const signed=store.signUnsigned(envelope,intent),raw=Buffer.from(signed.raw,'hex'),body=raw.subarray(0,-64),tag=createHash('sha256').update('Hashstash/anchor-only-transaction').digest();
     ok(b.noble.schnorr.verify(raw.subarray(-64),createHash('sha256').update(Buffer.concat([tag,tag,body])).digest(),Buffer.from(expected.sender,'hex')),'large payload has a valid signature over every byte');
     equal(raw.length,envelope.body.length/2+64);
-    equal(b.api.verifySigned(signed.raw,{...intent,txid:signed.transaction_id}).data_hex,intent.data_hex);
+    equal(b.api.verifySigned(signed.raw,{...signedFields(intent),txid:signed.transaction_id}).data_hex,intent.data_hex);
   }
   for(const removed of [6,7,8,9,10,11])throws(()=>b.api.decodeUnsigned(oracleEnvelope(compact(removed))),/Unsupported operation/);
   {
     const keys=Array.from({length:100},(_,i)=>b.api.publicKey(BigInt(i+1).toString(16).padStart(64,'0'))).sort(),payments=keys.map((recipient,i)=>({recipient,amount:String(i+1)}));
     const inner=values=>Buffer.concat([compact(3),compact(0),hash(proposal),compact(0),compact(values.length),...values.flatMap(p=>[hash(p.recipient),amt(p.amount)]),amt(1)]);
     const intent=values=>({...expected,data_hex:'',operation:{Propose:{round:'0',description:proposal,proposal:{Grant:{payments:values}},support:'1'}}});
-    for(const count of [1,2,16,17,32,100]){const list=payments.slice(0,count),envelope=oracleEnvelope(inner(list));b.api.verifyUnsigned(envelope,intent(list));checks++;equal(JSON.stringify(b.api.decodeUnsigned(envelope).operation.Propose.proposal.Grant.payments),JSON.stringify(list));const signed=store.signUnsigned(envelope,intent(list));equal(signed.raw.length/2,envelope.body.length/2+64);equal(JSON.stringify(b.api.verifySigned(signed.raw,{...intent(list),txid:signed.transaction_id}).operation.Propose.proposal.Grant.payments),JSON.stringify(list));}
+    for(const count of [1,2,16,17,32,100]){const list=payments.slice(0,count),envelope=oracleEnvelope(inner(list));b.api.verifyUnsigned(envelope,intent(list));checks++;equal(JSON.stringify(b.api.decodeUnsigned(envelope).operation.Propose.proposal.Grant.payments),JSON.stringify(list));const signed=store.signUnsigned(envelope,intent(list));equal(signed.raw.length/2,envelope.body.length/2+64);equal(JSON.stringify(b.api.verifySigned(signed.raw,{...signedFields(intent(list)),txid:signed.transaction_id}).operation.Propose.proposal.Grant.payments),JSON.stringify(list));}
     const max=((1n<<512n)-1n).toString();
     for(const list of [[],[payments[0],payments[0]],[payments[1],payments[0]],[{...payments[0],amount:'0'}],[{...payments[0],amount:max},{...payments[1],amount:'1'}]]){throws(()=>b.api.verifyUnsigned(oracleEnvelope(inner(list)),intent(list)));throws(()=>b.api.decodeUnsigned(oracleEnvelope(inner(list))));}
     for(const count of [101n,1n<<32n,(1n<<64n)-1n]){
@@ -208,30 +214,36 @@ async function run() {
   throws(()=>b.api.decodeUnsigned(oracleEnvelope(Buffer.concat([compact(1n<<32n)]))),/too large/);
   const signed=store.signUnsigned(f.envelope,expected),raw=Buffer.from(signed.raw,'hex'),body=Buffer.from(f.envelope.body,'hex');
   equal(raw.length,body.length+64);equal(raw.subarray(0,body.length).toString('hex'),f.envelope.body);equal(raw.subarray(body.length).length,64);
-  const tag=createHash('sha256').update('Hashstash/anchored-transaction').digest(),message=createHash('sha256').update(Buffer.concat([tag,tag,body])).digest();
+  const tag=createHash('sha256').update('Hashstash/anchor-only-transaction').digest(),message=createHash('sha256').update(Buffer.concat([tag,tag,body])).digest();
   ok(b.noble.schnorr.verify(raw.subarray(-64),message,Buffer.from(expected.sender,'hex')));
   equal(signed.transaction_id,createHash('sha256').update(createHash('sha256').update(raw).digest()).digest('hex'));
   // Mail authenticates the complete signed transaction locally. Encryption
   // alone cannot establish that the claimed sender authorized a message.
-  const verified=b.api.verifySigned(signed.raw,{...expected,txid:signed.transaction_id});
+  const verified=b.api.verifySigned(signed.raw,{...signedFields(expected),txid:signed.transaction_id});
   equal(verified.txid,signed.transaction_id);equal(verified.sender,expected.sender);equal(verified.nonce,expected.nonce);equal(verified.data_hex,expected.data_hex);ok(Object.isFrozen(verified));
   equal(b.api.verifySigned(signed.raw).txid,signed.transaction_id);
+  equal(Object.hasOwn(verified,'chain_id'),false);
+  throws(()=>b.api.verifySigned(signed.raw,{chain_id:expected.chain_id}),/not a signed field/);
   equal(b.api.verifySigned(signed.raw.toUpperCase()).txid,signed.transaction_id);
-  for(const [field,value] of Object.entries({chain_id:'28'.repeat(32),sender:b.api.publicKey('15'.repeat(32)),nonce:'1',anchor:'32'.repeat(32),expiry_blocks:'1',data_hex:'00',txid:'00'.repeat(32),operation:{TransferExact:{...expected.operation.TransferExact,amount:'101'}}}))throws(()=>b.api.verifySigned(signed.raw,{[field]:value}),/does not match/);
+  for(const [field,value] of Object.entries({sender:b.api.publicKey('15'.repeat(32)),nonce:'1',anchor:'32'.repeat(32),expiry_blocks:'1',data_hex:'00',txid:'00'.repeat(32),operation:{TransferExact:{...expected.operation.TransferExact,amount:'101'}}}))throws(()=>b.api.verifySigned(signed.raw,{[field]:value}),/does not match/);
   for(const invalid of [null,[],false])throws(()=>b.api.verifySigned(signed.raw,invalid),/expectations/);
   throws(()=>b.api.verifySigned(signed.raw,{nonce:9007199254740992}),/exact/);
   for(const invalid of [null,{},'', 'a','zz','00'.repeat(64)])throws(()=>b.api.verifySigned(invalid),/invalid/i);
   for(const length of [1,32,64,65,raw.length-1])throws(()=>b.api.verifySigned(raw.subarray(0,length).toString('hex')));
   throws(()=>b.api.verifySigned(signed.raw+'00'));
-  const signBody=(bytes,secret=f.secret,domain='Hashstash/anchored-transaction')=>{
+  const signBody=(bytes,secret=f.secret,domain='Hashstash/anchor-only-transaction')=>{
     const tag=createHash('sha256').update(domain).digest(),message=createHash('sha256').update(Buffer.concat([tag,tag,bytes])).digest();
     const signature=b.noble.schnorr.sign(message,Buffer.from(secret,'hex'),Buffer.alloc(32));
     return Buffer.concat([bytes,signature]).toString('hex');
   };
-  const forgedSender=Buffer.from(body);Buffer.from(b.api.publicKey('15'.repeat(32)),'hex').copy(forgedSender,32);
+  const forgedSender=Buffer.from(body);Buffer.from(b.api.publicKey('15'.repeat(32)),'hex').copy(forgedSender,0);
   throws(()=>b.api.verifySigned(signBody(forgedSender)),/signature/);
   throws(()=>b.api.verifySigned(signBody(body,f.secret,'Hashstash/UnrelatedSignature')),/signature/);
   throws(()=>b.api.verifySigned(signBody(body,f.secret,'Hashstash/Transaction')),/signature/);
+  throws(()=>b.api.verifySigned(signBody(body,f.secret,'Hashstash/anchored-transaction')),/signature/);
+  const legacyBody=Buffer.concat([Buffer.from(expected.chain_id,'hex'),body]);
+  throws(()=>b.api.verifySigned(signBody(legacyBody,f.secret,'Hashstash/anchored-transaction')));
+  throws(()=>b.api.decodeUnsigned({...f.envelope,body:legacyBody.toString('hex')}));
   throws(()=>b.api.verifySigned(signBody(Buffer.concat([body,Buffer.from([0])]))),/bytes/);
   for(let i=0;i<raw.length;i++){const changed=Buffer.from(raw);changed[i]^=1;throws(()=>b.api.verifySigned(changed.toString('hex')));}
   // Tamper each byte: no field, opaque suffix or discriminator can escape review.
@@ -258,7 +270,7 @@ async function run() {
     throws(()=>b.api.verifyUnsigned(anchored.envelope,{...anchored.expected,expiry_height:102}),/absolute expiry/);
     const zero=transferFixture(b.api,{expiry_blocks:'0'});throws(()=>b.api.decodeUnsigned(zero.envelope),/positive/);
     const missing={...anchored.expected};delete missing.anchor;throws(()=>b.api.verifyUnsigned(anchored.envelope,missing));
-    const encoded=Buffer.from(anchored.envelope.body,'hex'),anchorOffset=64+compact(0).length+amt(anchored.expected.fee).length;
+    const encoded=Buffer.from(anchored.envelope.body,'hex'),anchorOffset=32+compact(0).length+amt(anchored.expected.fee).length;
     const legacy=Buffer.concat([encoded.subarray(0,anchorOffset),encoded.subarray(anchorOffset+32)]);
     throws(()=>b.api.decodeUnsigned({...anchored.envelope,body:legacy.toString('hex')}));
   }
@@ -274,7 +286,7 @@ async function run() {
     b.api.verifyUnsigned(sample.envelope,sample.expected);checks++;
     equal(b.api.decodeUnsigned(sample.envelope).fee,String(value));
   }
-  const feeOffset=64+compact(expected.nonce).length, afterFee=feeOffset+amt(expected.fee).length;
+  const feeOffset=32+compact(expected.nonce).length, afterFee=feeOffset+amt(expected.fee).length;
   const extraLimb=Buffer.concat([body.subarray(0,feeOffset),compact(3),LE(expected.fee,2),Buffer.from([0]),body.subarray(afterFee)]);
   throws(()=>b.api.decodeUnsigned({...f.envelope,body:extraLimb.toString('hex')}),/Noncanonical amount/);
   throws(()=>b.api.verifySigned(signBody(extraLimb)),/Noncanonical amount/);
@@ -283,12 +295,12 @@ async function run() {
   throws(()=>b.api.decodeUnsigned({...zero.envelope,body:paddedZero.toString('hex')}),/Noncanonical amount/);
   throws(()=>b.api.verifySigned(signBody(paddedZero)),/Noncanonical amount/);
   for(const malformed of [Buffer.concat([LE(251,1),LE(250,2)]),Buffer.concat([LE(252,1),LE(65535,4)]),Buffer.concat([LE(253,1),LE(0xffffffffn,8)]),Buffer.concat([LE(254,1),LE(1,16)]),LE(255,1)]) {
-    const changed=Buffer.concat([body.subarray(0,64),malformed,body.subarray(feeOffset)]);
+    const changed=Buffer.concat([body.subarray(0,32),malformed,body.subarray(feeOffset)]);
     throws(()=>b.api.decodeUnsigned({...f.envelope,body:changed.toString('hex')}),/Noncanonical integer|Invalid integer/);
     throws(()=>b.api.verifySigned(signBody(changed)),/Noncanonical integer|Invalid integer/);
   }
   for(const malformed of [LE(251,1),Buffer.from([252,1,2]),Buffer.from([253,1,2,3])]) {
-    throws(()=>b.api.decodeUnsigned({...f.envelope,body:Buffer.concat([body.subarray(0,64),malformed]).toString('hex')}),/Truncated/);
+    throws(()=>b.api.decodeUnsigned({...f.envelope,body:Buffer.concat([body.subarray(0,32),malformed]).toString('hex')}),/Truncated/);
   }
   const plain=transferFixture(b.api,{data_hex:''}),plainBody=Buffer.from(plain.envelope.body,'hex'),outerOffset=afterFee+32+compact(expected.expiry_blocks).length;
   throws(()=>b.api.decodeUnsigned({...plain.envelope,body:plainBody.subarray(0,-1).toString('hex')}),/Truncated/);

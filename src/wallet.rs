@@ -5,7 +5,7 @@ use num_traits::Zero;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-pub const UNSIGNED_FORMAT: &str = "hashstash-unsigned-v1";
+pub const UNSIGNED_FORMAT: &str = "hashstash-unsigned-anchor";
 pub const PASSPHRASE_SCHEME: &str = "hashstash-passphrase-v1";
 pub const MAX_PASSPHRASE_BYTES: usize = 4096;
 
@@ -33,14 +33,32 @@ pub fn derive_secret(passphrase: &str) -> Result<Zeroizing<[u8; 32]>> {
 #[serde(deny_unknown_fields)]
 pub struct UnsignedEnvelope {
     pub format: String,
+    /// Unsigned network context for address display; ancestry requires a node.
+    pub chain_id: String,
     pub body: String,
 }
 
-pub fn unsigned(body: &TransactionBody) -> UnsignedEnvelope {
+pub fn unsigned(body: &TransactionBody, chain_id: &Hash) -> UnsignedEnvelope {
     UnsignedEnvelope {
         format: UNSIGNED_FORMAT.into(),
+        chain_id: hex::encode(chain_id),
         body: hex::encode(codec::encode(body)),
     }
+}
+
+/// Decode display context, without claiming it is authenticated by the signature.
+pub fn unsigned_chain(envelope: &UnsignedEnvelope) -> Result<Hash> {
+    ensure!(
+        envelope.chain_id.len() == 64
+            && envelope
+                .chain_id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "invalid unsigned network context"
+    );
+    Ok(hex::decode(&envelope.chain_id)?
+        .try_into()
+        .expect("checked hash length"))
 }
 
 fn validate_raw_length(hex_bytes: usize) -> Result<()> {
@@ -76,6 +94,7 @@ pub fn decode_unsigned(envelope: &UnsignedEnvelope) -> Result<TransactionBody> {
         envelope.format == UNSIGNED_FORMAT,
         "unsupported unsigned transaction format"
     );
+    unsigned_chain(envelope)?;
     let bytes = raw_bytes(&envelope.body)?;
     // A canonical BIP340 signature adds exactly 64 bytes. Check the actual
     // allocation boundary; block capacity is evaluated against chain state.
@@ -97,7 +116,8 @@ pub fn decode_signed(raw: &str) -> Result<Transaction> {
     Ok(transaction)
 }
 
-fn validate_body(body: &TransactionBody) -> Result<()> {
+/// Validate a transaction's local shape. Chain ancestry and expiry require a node.
+pub fn validate_body(body: &TransactionBody) -> Result<()> {
     ensure!(crypto::valid_key(&body.sender), "invalid sender public key");
     ensure!(body.nonce != u64::MAX, "nonce exhausted");
     ensure!(body.expiry_blocks > 0, "expiry blocks must be positive");
@@ -217,7 +237,7 @@ pub struct ReviewField {
 }
 
 /// Values are strings so even u64 fields remain exact in a browser.
-pub fn review(body: &TransactionBody) -> Vec<ReviewField> {
+pub fn review(body: &TransactionBody, chain_id: Option<&Hash>) -> Vec<ReviewField> {
     if let Err(error) = validate_body(body) {
         return vec![ReviewField {
             label: "Invalid transaction".into(),
@@ -225,8 +245,13 @@ pub fn review(body: &TransactionBody) -> Vec<ReviewField> {
         }];
     }
     let account = |key: &PublicKey| {
-        crate::address::encode(key, &body.chain_id)
-            .unwrap_or_else(|_| format!("Invalid public key: {}", hex::encode(key)))
+        chain_id.map_or_else(
+            || hex::encode(key),
+            |chain| {
+                crate::address::encode(key, chain)
+                    .unwrap_or_else(|_| format!("Invalid public key: {}", hex::encode(key)))
+            },
+        )
     };
     let mut fields = Vec::new();
     let mut add = |label: &str, value: String| {
@@ -235,7 +260,13 @@ pub fn review(body: &TransactionBody) -> Vec<ReviewField> {
             value,
         })
     };
-    add("Chain ID", hex::encode(body.chain_id));
+    if let Some(chain) = chain_id {
+        add("Network context · unsigned", hex::encode(chain));
+    }
+    add(
+        "Anchor validation",
+        "Ancestry and expiry are checked by the receiving node".into(),
+    );
     add("Sender", account(&body.sender));
     add("Nonce", body.nonce.to_string());
     add("Anchor block", hex::encode(body.anchor));
@@ -422,6 +453,55 @@ mod governance_review_tests {
     use super::*;
 
     #[test]
+    fn unsigned_network_context_is_canonical_metadata_outside_signed_body() {
+        let transaction = body(Parameter::DecisionBlocks, 60, 120);
+        let first = unsigned(&transaction, &[42; 32]);
+        let second = unsigned(&transaction, &[43; 32]);
+        assert_ne!(first.chain_id, second.chain_id);
+        assert_eq!(first.body, second.body);
+        assert_eq!(
+            decode_unsigned(&first).unwrap(),
+            decode_unsigned(&second).unwrap()
+        );
+        assert!(
+            !serde_json::to_value(&transaction)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("chain_id")
+        );
+        let fields = review(&transaction, Some(&[42; 32]));
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.label == "Network context · unsigned")
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.label == "Anchor validation")
+        );
+        let without_context = review(&transaction, None);
+        assert!(
+            without_context
+                .iter()
+                .any(|field| field.label == "Sender"
+                    && field.value == hex::encode(transaction.sender))
+        );
+        for malformed in [String::new(), "00".into(), "g".repeat(64), "AA".repeat(32)] {
+            let mut changed = first.clone();
+            changed.chain_id = malformed;
+            assert!(decode_unsigned(&changed).is_err());
+        }
+        let mut legacy = first.clone();
+        legacy.format = "hashstash-unsigned-v1".into();
+        assert!(decode_unsigned(&legacy).is_err());
+        let mut missing = serde_json::to_value(first).unwrap();
+        missing.as_object_mut().unwrap().remove("chain_id");
+        assert!(serde_json::from_value::<UnsignedEnvelope>(missing).is_err());
+    }
+
+    #[test]
     fn raw_record_bounds_reserve_signatures_and_reject_overflow_without_allocation() {
         assert!(validate_raw_length(128 * 1024 * 1024).is_ok());
         assert!(validate_raw_length(usize::MAX).is_err());
@@ -435,7 +515,7 @@ mod governance_review_tests {
     #[test]
     fn cold_review_labels_governed_timing_in_seconds() {
         for parameter in [Parameter::Interval, Parameter::Lead, Parameter::Rest] {
-            let fields = review(&body(parameter, 30, 60));
+            let fields = review(&body(parameter, 30, 60), Some(&[42; 32]));
             assert!(
                 fields
                     .iter()
@@ -455,13 +535,16 @@ mod governance_review_tests {
             default_expiry_blocks(&body(Parameter::DecisionBlocks, 60, 120).operation),
             2
         );
-        let fields = review(&body(Parameter::DecisionBlocks, 60, 120));
+        let fields = review(&body(Parameter::DecisionBlocks, 60, 120), Some(&[42; 32]));
         assert!(
             fields
                 .iter()
                 .any(|field| field.label == "Proposed value" && field.value == "120 blocks")
         );
-        let fields = review(&body(Parameter::MaxPriceChangeBps, 1000, 2500));
+        let fields = review(
+            &body(Parameter::MaxPriceChangeBps, 1000, 2500),
+            Some(&[42; 32]),
+        );
         assert!(
             fields
                 .iter()
@@ -483,7 +566,7 @@ mod governance_review_tests {
         ] {
             let mut transaction = body(Parameter::DecisionBlocks, 60, 120);
             transaction.operation = operation;
-            let fields = review(&transaction);
+            let fields = review(&transaction, Some(&[42; 32]));
             assert!(
                 fields
                     .iter()
@@ -500,7 +583,7 @@ mod governance_review_tests {
                 && field.value == hex::encode(transaction.anchor)));
             assert_eq!(default_expiry_blocks(&transaction.operation), 2);
             assert_eq!(
-                decode_unsigned(&unsigned(&transaction)).unwrap(),
+                decode_unsigned(&unsigned(&transaction, &[42; 32])).unwrap(),
                 transaction
             );
         }
@@ -509,7 +592,6 @@ mod governance_review_tests {
     fn body(parameter: Parameter, old: u64, new: u64) -> TransactionBody {
         TransactionBody {
             data: Vec::new(),
-            chain_id: [42; 32],
             sender: crypto::public_key(&[41; 32]).unwrap(),
             nonce: 0,
             fee: 10u32.into(),
@@ -532,13 +614,15 @@ mod governance_review_tests {
     fn cold_review_preserves_full_margin_and_accepts_probability_endpoints() {
         let transaction = body(Parameter::PassMarginBps, 0, u64::MAX);
         assert_eq!(
-            decode_unsigned(&unsigned(&transaction)).unwrap(),
+            decode_unsigned(&unsigned(&transaction, &[42; 32])).unwrap(),
             transaction
         );
-        assert!(review(&transaction).iter().any(|field| {
+        assert!(review(&transaction, Some(&[42; 32])).iter().any(|field| {
             field.label == "Proposed margin" && field.value == "184467440737095516.15%"
         }));
-        assert!(decode_unsigned(&unsigned(&body(Parameter::PassMarginBps, 0, 0))).is_err());
+        assert!(
+            decode_unsigned(&unsigned(&body(Parameter::PassMarginBps, 0, 0), &[42; 32])).is_err()
+        );
     }
 
     #[test]
@@ -546,10 +630,16 @@ mod governance_review_tests {
         for new in [0, 100] {
             let transaction = body(Parameter::MinerFeePercent, 50, new);
             assert_eq!(
-                decode_unsigned(&unsigned(&transaction)).unwrap(),
+                decode_unsigned(&unsigned(&transaction, &[42; 32])).unwrap(),
                 transaction
             );
         }
-        assert!(decode_unsigned(&unsigned(&body(Parameter::MinerFeePercent, 50, 101))).is_err());
+        assert!(
+            decode_unsigned(&unsigned(
+                &body(Parameter::MinerFeePercent, 50, 101),
+                &[42; 32]
+            ))
+            .is_err()
+        );
     }
 }

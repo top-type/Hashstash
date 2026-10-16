@@ -736,7 +736,6 @@ impl Engine {
         };
         verify_intent(
             &tx.body,
-            self.chain,
             self.sender,
             claim.nonce,
             tx.body.anchor,
@@ -747,7 +746,6 @@ impl Engine {
         ensure!(
             hex::encode(codec::transaction_id(&tx)) == claim.txid
                 && tx.body.sender == self.sender
-                && tx.body.chain_id == self.chain
                 && tx.body.nonce == claim.nonce,
             "invalid stored faucet transaction"
         );
@@ -857,6 +855,10 @@ impl Engine {
             "prepared faucet snapshot changed"
         );
         let envelope = wallet::UnsignedEnvelope {
+            chain_id: result["chain_id"]
+                .as_str()
+                .context("missing unsigned network context")?
+                .into(),
             format: result["format"]
                 .as_str()
                 .context("missing unsigned format")?
@@ -867,9 +869,12 @@ impl Engine {
                 .into(),
         };
         let body = wallet::decode_unsigned(&envelope)?;
+        ensure!(
+            wallet::unsigned_chain(&envelope)? == self.chain,
+            "prepared faucet network context changed"
+        );
         verify_intent(
             &body,
-            self.chain,
             self.sender,
             self.nonce,
             anchor,
@@ -901,7 +906,6 @@ impl Engine {
 #[allow(clippy::too_many_arguments)]
 fn verify_intent(
     body: &TransactionBody,
-    chain: Hash,
     sender: PublicKey,
     nonce: u64,
     anchor: Hash,
@@ -910,8 +914,7 @@ fn verify_intent(
     maximum: &Amount,
 ) -> Result<()> {
     ensure!(
-        body.chain_id == chain
-            && body.sender == sender
+        body.sender == sender
             && body.nonce == nonce
             && body.anchor == anchor
             && body.expiry_blocks == expiry_blocks
@@ -1780,7 +1783,6 @@ mod tests {
         };
         let good = TransactionBody {
             data: Vec::new(),
-            chain_id: [7; 32],
             sender,
             nonce: 9,
             anchor: [38; 32],
@@ -1789,25 +1791,15 @@ mod tests {
             operation: operation.clone(),
         };
         let verify = |body: &TransactionBody| {
-            verify_intent(
-                body,
-                [7; 32],
-                sender,
-                9,
-                [38; 32],
-                2,
-                &operation,
-                &10u32.into(),
-            )
+            verify_intent(body, sender, 9, [38; 32], 2, &operation, &10u32.into())
         };
         verify(&good).unwrap();
         let mut free = good.clone();
         free.fee = Amount::zero();
         verify(&free).unwrap();
-        for n in 0..9 {
+        for n in 1..9 {
             let mut changed = good.clone();
             match n {
-                0 => changed.chain_id = [8; 32],
                 1 => changed.sender = crypto::public_key(&[4; 32]).unwrap(),
                 2 => changed.nonce = 10,
                 3 => changed.expiry_blocks = 3,
@@ -1866,7 +1858,6 @@ mod tests {
                 }
                 let body = TransactionBody {
                     data: Vec::new(),
-                    chain_id: [7; 32],
                     sender: hex::decode(p["sender"].as_str().unwrap())
                         .unwrap()
                         .try_into()
@@ -1878,8 +1869,9 @@ mod tests {
                     operation,
                 };
                 {
-                    let mut result = serde_json::to_value(wallet::unsigned(&body)).unwrap();
-                    result["fee_quote"] = json!({"chain_id":hex::encode(body.chain_id),"tip":hex::encode(body.anchor),"anchor":hex::encode(body.anchor),"state_root":hex::encode([0;32]),"height":node.height,"anchor_height":node.height,"expiry_blocks":body.expiry_blocks,"expiry_height":node.height.checked_add(body.expiry_blocks).unwrap()});
+                    let mut result =
+                        serde_json::to_value(wallet::unsigned(&body, &[7; 32])).unwrap();
+                    result["fee_quote"] = json!({"chain_id":hex::encode([7; 32]),"tip":hex::encode(body.anchor),"anchor":hex::encode(body.anchor),"state_root":hex::encode([0;32]),"height":node.height,"anchor_height":node.height,"expiry_blocks":body.expiry_blocks,"expiry_height":node.height.checked_add(body.expiry_blocks).unwrap()});
                     result
                 }
             }

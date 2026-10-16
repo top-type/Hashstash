@@ -45,7 +45,10 @@ async function harness(initialChain = null) {
       if(url==='/api/unlock'||url==='/api/import') serverPublic=publicKey;
       if(url==='/api/lock') serverPublic=null;
       if(url==='/api/network') serverChain=body.chain_id;
-      if(url==='/api/review'&&!serverChain) serverChain=chainA;
+      if(url==='/api/review') {
+        if (body?.format!=='hashstash-unsigned-anchor'||!/^[0-9a-f]{64}$/.test(body.chain_id||'')||(serverChain&&serverChain!==body.chain_id))return {ok:false,json:async()=>({error:'Unsigned network context does not match the selected network'})};
+        if (!serverChain) serverChain=body.chain_id;
+      }
       const data = url === '/api/session' ? {token:'token',...status()} :
         ['/api/unlock','/api/import','/api/network','/api/lock'].includes(url) ? status() :
         url === '/api/review' ? {...status(),review_token:'review-token',body:review.body,fields:review.fields || [{label:'Sender',value:addressFor(serverChain)}]} :
@@ -68,7 +71,7 @@ async function run() {
     assert.equal(h.get('passphrase').value,'');checks++;
     assert.equal(h.get('public-key').textContent,publicKey);checks++;
     assert.equal(h.get('export-public').disabled,true);checks++;
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     await h.get('review-form').fire('submit');
     assert.equal(h.get('review-panel').hidden,false);checks++;
     assert.equal(h.get('network-current').textContent,chainA);checks++;
@@ -90,7 +93,7 @@ async function run() {
     await h.get('export-public').fire('click');
     const watch=JSON.parse(await h.downloads[0].blob.text());
     assert.deepEqual(watch,{format:'hashstash-watch-v2',address:addressFor(chainA),public_key:publicKey,chain_id:chainA});checks++;
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     await h.get('review-form').fire('submit');
     await h.get('network-change').fire('click');
     assert.equal(h.get('review-panel').hidden,true);checks++;
@@ -103,6 +106,14 @@ async function run() {
     await h.get('lock').fire('click');
     assert.equal(h.get('network-current').textContent,chainB);checks++;
     assert.equal(h.get('copy-address').disabled,true);checks++;
+  }
+  for(const networkContext of [chainB,null,undefined]) {
+    const h=await harness(chainA);h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:networkContext,body:'abcdef'});
+    await h.get('review-form').fire('submit');
+    assert.equal(h.get('network-current').textContent,chainA,'unsigned metadata cannot silently switch a selected network');checks++;
+    assert.equal(h.get('review-panel').hidden,true);checks++;
+    await h.get('sign').fire('click');assert.equal(h.calls.filter(call=>call.url==='/api/sign').length,0,'bad or mismatched network context never yields a signing token');checks++;
   }
   {
     const h=await harness();
@@ -158,7 +169,7 @@ async function run() {
       {label:'Fee · HASH',value:'1234567890000000000'},
       {label:'Outcome',value:'PASS'},
     ];
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     await h.get('review-form').fire('submit');
     const fields=h.get('review-fields').children[0].children, technical=h.get('review-technical-fields').children[0].children;
     assert.equal(fields[1].textContent,'Withdraw','withdraw terminology does not alter signed Redeem operation');checks++;
@@ -183,7 +194,7 @@ async function run() {
   {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     await h.get('review-form').fire('submit');
     assert.equal(h.get('review-panel').hidden,false);checks++;
     h.review.fields=[{label:'Shares',value:'95E'}];
@@ -198,7 +209,7 @@ async function run() {
   for(const edit of ['input','file','network-input','network-change','lock','rejected','bad-json','bad-hash']) {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     h.review.fields=[{label:'Action',value:'Deposit'},{label:'Amount · HASH',value:'1234000'},{label:'Data bytes',value:'2'},{label:'Data hex',value:'00ff'}];
     await h.get('review-form').fire('submit');
     const fields=h.get('review-fields').children[0].children;
@@ -234,7 +245,7 @@ async function run() {
   {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     h.review.fields=[{label:'Shares',value:'95000'}];
     await h.get('review-form').fire('submit');h.get('review-details').open=true;
     h.review.fields=[{label:'Action',value:'Transfer'},{label:'Amount · HASH',value:'20'}];
@@ -258,7 +269,7 @@ async function run() {
       {label:'Expected Revenue share',value:'50%'},
       {label:'Proposed Revenue share',value:`${100-percent}%`},
     ];
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     await h.get('review-form').fire('submit');
     const fields=h.get('review-fields').children[0].children;
     assert.equal(fields[5].textContent,'Miner fee share');checks++;
@@ -278,7 +289,7 @@ async function run() {
       {label:'Fee · HASH',value:exactFee},
       {label:'Total debit · HASH',value:String(100n+BigInt(exactFee))},
     ];
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     await h.get('review-form').fire('submit');
     const fields=h.get('review-fields').children[0].children;
     assert.equal(fields[2].textContent,'Recipient receives'); checks++;
@@ -298,7 +309,7 @@ async function run() {
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
     h.review.fields=[{label:'Action',value:'Transfer'},{label:'Recipient receives · HASH',value:'100'},{label:'Data bytes',value:String(bytes.length)},{label:'Data hex',value:bytes.toString('hex')}];
     h.review.body='aabb00ff'+bytes.toString('hex');
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:h.review.body});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:h.review.body});
     await h.get('review-form').fire('submit');
     assert.equal(h.get('review-panel').hidden,false);checks++;
     assert.equal(h.get('review-data').hidden,false);checks++;
@@ -320,7 +331,7 @@ async function run() {
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
     const message='<script>alert("literal")</script>\r\n\t雪 🌞', bytes=Buffer.from(message);
     h.review.fields=[{label:'Data bytes',value:String(bytes.length)},{label:'Data hex',value:bytes.toString('hex')}];
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     await h.get('review-form').fire('submit');
     assert.equal(h.get('review-message').hidden,false);checks++;
     assert.equal(h.get('review-message-text').textContent,message,'public UTF-8 is displayed exactly as literal text');checks++;
@@ -340,7 +351,7 @@ async function run() {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
     h.review.fields=[{label:'Data bytes',value:String(bytes.length)},{label:'Data hex',value:bytes.toString('hex')}];
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     await h.get('review-form').fire('submit');
     assert.equal(h.get('review-message').hidden,true,'invalid UTF-8, blank data and control characters remain hex-only');checks++;
     assert.equal(h.get('review-data-hex').textContent,bytes.toString('hex'));checks++;
@@ -353,7 +364,7 @@ async function run() {
   ]) {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     await h.get('review-form').fire('submit');
     h.review.fields=[{label:'Data bytes',value:malformed.count},{label:'Data hex',value:malformed.hex}];
     h.review.body=malformed.body||'abcdef';
@@ -365,7 +376,7 @@ async function run() {
   {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     h.review.fields=[{label:'Data bytes',value:'1'},{label:'Data hex',value:'ff'}];
     await h.get('review-form').fire('submit');
     h.review.fields=[{label:'Action',value:'Transfer'},{label:'Recipient',value:'<img src=x onerror=alert(1)>'}];
@@ -377,7 +388,7 @@ async function run() {
   {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     h.review.fields=[{label:'Parameter',value:'Minimum difficulty'},{label:'Change',value:'Double'},
       {label:'Expected minimum work · hashes',value:'4295032833'},
       {label:'Expected compact target',value:'1d00ffff'},
@@ -397,7 +408,7 @@ async function run() {
   {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     h.review.fields=[{label:'Amount · HASH',value:'1000000'},{label:'Shares',value:'1000'}];
     await h.get('review-form').fire('submit');
     const fields=h.get('review-fields').children[0].children;
@@ -408,7 +419,7 @@ async function run() {
     assert.equal(shares.parseAmount(fields[3].textContent),h.review.fields[1].value);checks++;
   }
   {
-    const h=await harness(chainA);h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    const h=await harness(chainA);h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     h.review.fields=[{label:'Recipient 1',value:'first-full-address'},{label:'Payment 1 · HASH',value:'1000000000000000001'},{label:'Recipient 2',value:'second-full-address'},{label:'Payment 2 · HASH',value:'2'},{label:'Total grant · HASH',value:'1000000000000000003'},{label:'Fee · HASH',value:'7'}];
     await h.get('review-form').fire('submit');const fields=h.get('review-fields').children[0].children;
     for(const [index,value] of [[1,'first-full-address'],[3,'1000000000000000.001 hash'],[5,'second-full-address'],[7,'0.002 hash'],[9,'1000000000000000.003 hash'],[11,'0.007 hash']]){assert.equal(fields[index].textContent,value);checks++;}
@@ -416,7 +427,7 @@ async function run() {
   for (const raw of ['0', '1', '1000000000000000001', '123456789123456789123456789', ((1n << 512n) - 1n).toString()]) {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     h.review.fields=['Amount', 'Recipient receives', 'Fee', 'Total debit', 'Payment', 'Support', 'Grant'].map(label => ({label:label+' · HASH',value:raw}));
     await h.get('review-form').fire('submit');
     assert.equal(h.get('review-panel').hidden,false);checks++;
@@ -434,7 +445,7 @@ async function run() {
   for (const raw of ['-1', '1000000000000000 hash', '1.1', '1e18']) {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     h.review.fields=[{label:'Amount · HASH',value:raw}];
     await h.get('review-form').fire('submit');
     assert.equal(h.get('review-panel').hidden,true,'review API still requires nonnegative integer hash atoms');checks++;
@@ -443,7 +454,7 @@ async function run() {
   }
   {
     const h=await harness(chainA);h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     h.review.fields=[{label:'Parameter',value:'Rest period'},{label:'Expected value',value:'18446744073709551615'},{label:'Proposed value',value:'9007199254740993'}];
     await h.get('review-form').fire('submit');
     assert.ok(h.get('review-fields').textContent.includes('18446744073709551615'));checks++;
@@ -452,7 +463,7 @@ async function run() {
   for(const margin of ['0.00%','150.01%','184467440737095516.15%']) {
     const h=await harness(chainA);
     h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     h.review.fields=[{label:'Parameter',value:'PASS margin'},{label:'Expected margin',value:'2.50%'},{label:'Proposed margin',value:margin}];
     await h.get('review-form').fire('submit');
     assert.equal(h.get('review-fields').children[0].children[5].textContent,margin);checks++;
@@ -460,7 +471,7 @@ async function run() {
   }
   {
     const h=await harness(chainA);h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
-    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-v1',body:'abcdef'});
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     const data=Buffer.from('hashstash.mail/2\n{}').toString('hex');
     h.review.fields=[{label:'Action',value:'Transfer'},{label:'Recipient',value:addressFor(chainA)},{label:'Amount · HASH',value:'1000000000000'},{label:'Data bytes',value:String(data.length/2)},{label:'Data hex',value:data}];
     await h.get('review-form').fire('submit');
@@ -470,7 +481,7 @@ async function run() {
     assert.equal(h.get('review-message').hidden,true,'encrypted mail envelope never becomes a public-message preview');checks++;
   }
   {
-    const h=await harness(chainA),source=JSON.stringify({format:'hashstash-unsigned-v1',body:'ab'.repeat(256*1024)});
+    const h=await harness(chainA),source=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'ab'.repeat(256*1024)});
     h.get('unsigned-file').files=[{size:source.length,text:async()=>source}];
     await h.get('unsigned-file').fire('change');
     assert.equal(h.get('unsigned').value,source,'unsigned imports may exceed the former128KiB file ceiling');checks++;
@@ -479,6 +490,8 @@ async function run() {
     assert.equal(read,true,'unsigned imports have no fixed32MiB policy ceiling');checks++;
     assert.equal(h.get('unsigned').value,source);checks++;
   }
+  assert.ok(html.includes('Anchor ancestry and expiry are checked by the receiving node.'));checks++;
+  assert.ok(html.includes('Network context is not signed.'));checks++;
   assert.match(html, /id="import-method"><option value="private">Private key/);checks++;
   assert.ok(html.includes('entering it here derives a different account'));checks++;
   console.log(`Cold UI: ${checks} behavior assertions passed.`);

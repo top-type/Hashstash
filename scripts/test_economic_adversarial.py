@@ -72,7 +72,7 @@ def main():
     account = before[0]['account']['account']
     assert int(account['ordinary']) > 20
     recipient = nodes[1]['public_key']
-    body = {'chain_id': list(bytes.fromhex(status['chain_id'])), 'sender': list(bytes.fromhex(nodes[0]['public_key'])), 'nonce': account['nonce'], 'fee': '100', 'anchor': list(bytes.fromhex(status['tip'])), 'expiry_blocks': 2, 'operation': {'TransferExact': {'recipient': list(bytes.fromhex(recipient)), 'amount': '7'}}}
+    body = {'sender': list(bytes.fromhex(nodes[0]['public_key'])), 'nonce': account['nonce'], 'fee': '100', 'anchor': list(bytes.fromhex(status['tip'])), 'expiry_blocks': 2, 'operation': {'TransferExact': {'recipient': list(bytes.fromhex(recipient)), 'amount': '7'}}}
     # Quote before constructing the exact signed fee; later recipient creation
     # may lower the minimum, but it never reduces that signed fee.
     terms = audit.payment_terms(body['operation'], 3)
@@ -91,9 +91,9 @@ def main():
     unknown_anchor = copy.deepcopy(body)
     unknown_anchor['anchor'] = [42] * 32
     bad_cases.append(('unknown-anchor', sign(unknown_anchor, 'unknown-anchor')))
-    wrong_chain = copy.deepcopy(body)
-    wrong_chain['chain_id'][0] ^= 1
-    bad_cases.append(('wrong-chain', sign(wrong_chain, 'wrong-chain')))
+    altered_anchor = copy.deepcopy(body)
+    altered_anchor['anchor'][0] ^= 1
+    bad_cases.append(('altered-anchor', sign(altered_anchor, 'altered-anchor')))
     vectors = json.loads((Path(__file__).resolve().parents[1] / 'tests/data/passphrase-v1.json').read_text(encoding='utf-8'))['vectors']
     new_recipient = next((v['public_key'] for v in vectors if v['public_key'] not in {n['public_key'] for n in nodes}))
     underpayment = copy.deepcopy(body)

@@ -33,7 +33,6 @@ fn signed(
     crypto::sign(
         &TransactionBody {
             data: Vec::new(),
-            chain_id: c.chain_id(),
             sender: crypto::public_key(secret).unwrap(),
             nonce,
             fee: 2u32.into(),
@@ -439,7 +438,6 @@ async fn large_legal_loose_transaction_relays_alongside_blocks_without_stalling_
     let make = |nonce, data| {
         crypto::sign(
             &TransactionBody {
-                chain_id: config.chain_id(),
                 sender: miner,
                 nonce,
                 fee: 2000u32.into(),

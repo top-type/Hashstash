@@ -13,7 +13,6 @@ use std::collections::BTreeMap;
 fn body(operation: Operation) -> TransactionBody {
     TransactionBody {
         data: Vec::new(),
-        chain_id: [39; 32],
         sender: crypto::public_key(&[19; 32]).unwrap(),
         nonce: 7,
         fee: 100u32.into(),
@@ -31,7 +30,7 @@ fn transfer() -> Operation {
 }
 
 fn fields(body: &TransactionBody) -> BTreeMap<String, String> {
-    let fields = wallet::review(body);
+    let fields = wallet::review(body, Some(&[39; 32]));
     let count = fields.len();
     let map: BTreeMap<_, _> = fields.into_iter().map(|f| (f.label, f.value)).collect();
     assert_eq!(
@@ -119,7 +118,10 @@ fn offline_review_discloses_exact_fee_for_every_operation() {
     ];
     for (operation, action) in operations {
         let tx = body(operation.clone());
-        assert_eq!(wallet::decode_unsigned(&wallet::unsigned(&tx)).unwrap(), tx);
+        assert_eq!(
+            wallet::decode_unsigned(&wallet::unsigned(&tx, &[39; 32])).unwrap(),
+            tx
+        );
         assert_eq!(tx.operation.clone(), operation);
         let review = fields(&tx);
         assert_eq!(review["Action"], action);
@@ -143,7 +145,7 @@ fn offline_review_discloses_exact_fee_for_every_operation() {
         amount: maximum.clone(),
     });
     tx.fee = maximum.clone();
-    assert!(wallet::decode_unsigned(&wallet::unsigned(&tx)).is_ok());
+    assert!(wallet::decode_unsigned(&wallet::unsigned(&tx, &[39; 32])).is_ok());
     assert_eq!(
         fields(&tx)["Total debit · HASH"],
         (maximum * 2u32).to_string()
@@ -156,16 +158,19 @@ fn offline_exports_reject_invalid_values_and_removed_operation_tags() {
     // The signer validates parameter values; network consensus checks them
     // against the current chain state.
     assert!(
-        wallet::decode_unsigned(&wallet::unsigned(&body(Operation::Propose {
-            round: 2,
-            description: [4; 32],
-            support: 1u32.into(),
-            proposal: Proposal::Parameter {
-                parameter: Parameter::MinerFeePercent,
-                old: 50,
-                new: 37
-            },
-        })))
+        wallet::decode_unsigned(&wallet::unsigned(
+            &body(Operation::Propose {
+                round: 2,
+                description: [4; 32],
+                support: 1u32.into(),
+                proposal: Proposal::Parameter {
+                    parameter: Parameter::MinerFeePercent,
+                    old: 50,
+                    new: 37
+                },
+            }),
+            &[39; 32]
+        ))
         .is_ok()
     );
     for operation in [
@@ -190,13 +195,13 @@ fn offline_exports_reject_invalid_values_and_removed_operation_tags() {
             outcome: None,
         },
     ] {
-        assert!(wallet::decode_unsigned(&wallet::unsigned(&body(operation))).is_err());
+        assert!(wallet::decode_unsigned(&wallet::unsigned(&body(operation), &[39; 32])).is_err());
     }
     let mut tx = body(transfer());
     tx.fee = 6u32.into();
-    assert!(wallet::decode_unsigned(&wallet::unsigned(&tx)).is_ok());
+    assert!(wallet::decode_unsigned(&wallet::unsigned(&tx, &[39; 32])).is_ok());
     tx.fee = Amount::from(1u32) << 512usize;
-    assert!(wallet::decode_unsigned(&wallet::unsigned(&tx)).is_err());
+    assert!(wallet::decode_unsigned(&wallet::unsigned(&tx, &[39; 32])).is_err());
     tx = body(transfer());
     let canonical = codec::encode(&tx);
     let operation_offset =
@@ -206,7 +211,7 @@ fn offline_exports_reject_invalid_values_and_removed_operation_tags() {
         let mut bytes = canonical.clone();
         bytes[operation_offset] = tag;
         let export = serde_json::from_value(
-            json!({"format":"hashstash-unsigned-v1","body":hex::encode(bytes)}),
+            json!({"format":wallet::UNSIGNED_FORMAT,"chain_id":hex::encode([39;32]),"body":hex::encode(bytes)}),
         )
         .unwrap();
         assert!(wallet::decode_unsigned(&export).is_err());
@@ -216,7 +221,7 @@ fn offline_exports_reject_invalid_values_and_removed_operation_tags() {
     assert!(
         wallet::decode_unsigned(
             &serde_json::from_value(
-                json!({"format":"hashstash-unsigned-v1","body":hex::encode(trailing)})
+                json!({"format":wallet::UNSIGNED_FORMAT,"chain_id":hex::encode([39;32]),"body":hex::encode(trailing)})
             )
             .unwrap()
         )
@@ -583,7 +588,6 @@ async fn cli_finds_pending_nonce_beyond_legacy_mempool_size() {
     config.genesis_time = node::now().saturating_sub(3600) as u32;
     config.initial_bits = 0x1f7fffff;
     config.limit_bits = config.initial_bits;
-    let chain_id = config.chain_id();
     let node = Node::open(&directory.path().join("chain.sqlite"), config, sender).unwrap();
     for _ in 0..3 {
         node.mine(1_000_000).unwrap();
@@ -596,7 +600,6 @@ async fn cli_finds_pending_nonce_beyond_legacy_mempool_size() {
     for nonce in 0..260 {
         let body = TransactionBody {
             data: Vec::new(),
-            chain_id,
             sender,
             nonce,
             fee: 4u32.into(),

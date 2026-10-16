@@ -79,7 +79,7 @@ def transaction_bytes(tx):
     """Current protocol direct transfer and raw data, independently reconstructed."""
     body = tx["body"]
     transfer = body["operation"]["TransferExact"]
-    return (bytes(body["chain_id"]) + bytes(body["sender"])
+    return (bytes(body["sender"])
             + compact_uint(body["nonce"]) + amount(body["fee"])
             + bytes(body["anchor"]) + compact_uint(body["expiry_blocks"]) + compact_uint(0)
             + bytes(transfer["recipient"]) + amount(transfer["amount"])

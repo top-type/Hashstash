@@ -7,7 +7,7 @@ use anyhow::{Result, ensure};
 use secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey, schnorr::Signature};
 use sha2::{Digest, Sha256};
 
-pub const TRANSACTION_TAG: &str = "Hashstash/anchored-transaction";
+pub const TRANSACTION_TAG: &str = "Hashstash/anchor-only-transaction";
 
 pub fn sha256d(bytes: &[u8]) -> Hash {
     Sha256::digest(Sha256::digest(bytes)).into()
@@ -105,7 +105,6 @@ mod tests {
         let key = [1u8; 32];
         let body = TransactionBody {
             data: Vec::new(),
-            chain_id: [7; 32],
             sender: public_key(&key).unwrap(),
             nonce: 4,
             fee: 1u32.into(),
@@ -119,7 +118,7 @@ mod tests {
         let signed = sign(&body, &key).unwrap();
         verify(&signed).unwrap();
         let mut changed = signed.clone();
-        changed.body.chain_id[0] ^= 1;
+        changed.body.sender[0] ^= 1;
         assert!(verify(&changed).is_err());
         changed = signed.clone();
         changed.body.nonce += 1;
@@ -142,7 +141,6 @@ mod tests {
     fn anchored_transactions_use_a_distinct_signing_domain() {
         let secret = [1; 32];
         let body = TransactionBody {
-            chain_id: [1; 32],
             sender: public_key(&secret).unwrap(),
             nonce: 0,
             fee: 1u32.into(),
@@ -156,13 +154,18 @@ mod tests {
         };
         let secp = Secp256k1::new();
         let pair = Keypair::from_secret_key(&secp, &SecretKey::from_byte_array(secret).unwrap());
-        let former_digest = tagged_hash("Hashstash/Transaction", &codec::encode(&body));
-        let signature = secp.sign_schnorr_with_aux_rand(&former_digest, &pair, &[0; 32]);
-        let former_domain = Transaction {
-            body: body.clone(),
-            signature: *signature.as_ref(),
-        };
-        assert!(verify(&former_domain).is_err());
+        for tag in ["Hashstash/Transaction", "Hashstash/anchored-transaction"] {
+            let former_digest = tagged_hash(tag, &codec::encode(&body));
+            let signature = secp.sign_schnorr_with_aux_rand(&former_digest, &pair, &[0; 32]);
+            let former_domain = Transaction {
+                body: body.clone(),
+                signature: *signature.as_ref(),
+            };
+            assert!(
+                verify(&former_domain).is_err(),
+                "accepted former domain {tag}"
+            );
+        }
         verify(&sign(&body, &secret).unwrap()).unwrap();
     }
 }

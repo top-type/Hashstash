@@ -28,13 +28,12 @@ pub fn from_transaction(tx: &Transaction) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::Config, crypto};
+    use crate::crypto;
     #[test]
     fn rationale_requires_exact_signed_commitment_and_plain_text() {
         let secret = [22; 32];
         let text = "A shared explanation 🌱";
         let mut body = TransactionBody {
-            chain_id: Config::testnet().chain_id(),
             sender: crypto::public_key(&secret).unwrap(),
             nonce: 0,
             anchor: [0; 32],
@@ -68,11 +67,9 @@ mod tests {
     #[test]
     fn plain_rationale_retains_exact_bounds_and_does_not_unwrap_json() {
         let secret = [22; 32];
-        let config = Config::devnet();
         let parse = |text: &str, data: &[u8]| {
             let transaction = crypto::sign(
                 &TransactionBody {
-                    chain_id: config.chain_id(),
                     sender: crypto::public_key(&secret).unwrap(),
                     nonce: 0,
                     anchor: [0; 32],

@@ -138,12 +138,15 @@ def main():
             return (path, command)
         unsigned, command = prepare('unsigned.json')
         envelope = json.loads(unsigned.read_text(encoding='utf-8'))
+        assert envelope['format'] == 'hashstash-unsigned-anchor'
+        assert envelope['chain_id'] == rpc(base, 'status')['chain_id']
+        assert bytes.fromhex(envelope['body'])[:32].hex() == vector['public_key']
         original = unsigned.read_bytes()
         cli(*command, success=False)
         assert unsigned.read_bytes() == original
         assert rpc(base, 'mempool') == []
         assert rpc(base, 'account', {'key': vector['public_key']})['account']['nonce'] == before
-        check('CLI prepares a versioned unsigned file without reserving a nonce or overwriting a file')
+        check('CLI prepares anchor-only bytes with separate network context without reserving a nonce or overwriting a file')
         _, cold_session = request(cold_base, '/api/session')
         token = cold_session['token']
         assert cold_session['unlocked'] is False
@@ -177,6 +180,7 @@ def main():
         cli('mine', '--url', base + '/rpc', '--count', '1')
         block = rpc(base, 'getblock')
         assert len(block['transactions']) == 1 and block['transactions'][0]['body']['nonce'] == before
+        assert 'chain_id' not in block['transactions'][0]['body']
         assert rpc(base, 'account', {'key': vector['public_key']})['account']['nonce'] == before + 1
         check('Cold review signs once; exported raw file broadcasts and is included in a mined block')
         cli('broadcast', '--url', base + '/rpc', '--raw-file', raw_file, success=False)

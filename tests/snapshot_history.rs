@@ -20,7 +20,6 @@ fn governance_snapshot_keeps_current_proposal_after_more_than_one_page_of_histor
         let transaction = crypto::sign(
             &TransactionBody {
                 data: Vec::new(),
-                chain_id: config.chain_id(),
                 sender: public,
                 nonce,
                 fee: 1u32.into(),

@@ -207,7 +207,6 @@ async fn compact_transaction_worker_roundtrip(mut c: Config, data: Vec<u8>) {
     n.mine(1_000_000).unwrap();
     let tx = crypto::sign(
         &TransactionBody {
-            chain_id: c.chain_id(),
             sender: miner,
             nonce: 0,
             fee: 100u32.into(),

@@ -138,7 +138,8 @@ ledger, all address cooldowns, and hourly, daily, and lifetime budget usage.
 ## Payment and recovery rules
 
 The service first checks eligibility, prepares a fixed exact transfer, and
-independently verifies the chain, sender, recipient, amount, nonce, anchor and lifetime,
+checks the node and export network context, then independently verifies the signed
+sender, recipient, amount, nonce, anchor and lifetime against its coherent node snapshot,
 exact fee within its configured local spending allowance, and absence of arbitrary data. It commits the
 signed bytes, transaction ID, and quota reservation in SQLite before broadcast.
 Only one payment is outstanding per faucet instance. Network errors keep it pending;

@@ -11,7 +11,6 @@ fn operation() -> Operation {
 
 fn body(data: Vec<u8>) -> TransactionBody {
     TransactionBody {
-        chain_id: [39; 32],
         sender: crypto::public_key(&[19; 32]).unwrap(),
         nonce: 7,
         fee: 100u32.into(),
@@ -31,7 +30,7 @@ fn unsigned_and_signed_exports_preserve_every_data_byte_and_show_complete_hex() 
         b"<script>alert('data')</script>\0\r\n".to_vec(),
     ] {
         let body = body(data.clone());
-        let envelope = wallet::unsigned(&body);
+        let envelope = wallet::unsigned(&body, &[39; 32]);
         let exported = serde_json::to_string(&envelope).unwrap();
         let decoded = wallet::decode_unsigned(&serde_json::from_str(&exported).unwrap()).unwrap();
         assert_eq!(decoded, body);
@@ -41,7 +40,7 @@ fn unsigned_and_signed_exports_preserve_every_data_byte_and_show_complete_hex() 
             wallet::decode_signed(&wallet::signed_hex(&signed)).unwrap(),
             signed
         );
-        let fields: BTreeMap<_, _> = wallet::review(&body)
+        let fields: BTreeMap<_, _> = wallet::review(&body, Some(&[39; 32]))
             .into_iter()
             .map(|field| (field.label, field.value))
             .collect();
@@ -67,7 +66,11 @@ fn signatures_bind_data_and_every_transaction_header_field() {
     for mutation in 0..8 {
         let mut changed = original.clone();
         match mutation {
-            0 => changed.body.chain_id[31] ^= 1,
+            0 => {
+                if let Operation::TransferExact { recipient, .. } = &mut changed.body.operation {
+                    *recipient = crypto::public_key(&[22; 32]).unwrap();
+                }
+            }
             1 => changed.body.sender = crypto::public_key(&[21; 32]).unwrap(),
             2 => changed.body.nonce += 1,
             3 => changed.body.expiry_blocks += 1,
@@ -104,13 +107,13 @@ fn wallet_rejects_removed_operation_tags_and_oversized_fields() {
     for tag in [6, 7, 8, 255] {
         let mut malformed = encoded.clone();
         malformed[operation_offset] = tag;
-        let mut exported = wallet::unsigned(&candidate);
+        let mut exported = wallet::unsigned(&candidate, &[39; 32]);
         exported.body = hex::encode(malformed);
         assert!(wallet::decode_unsigned(&exported).is_err());
     }
     let mut candidate = body(vec![0, 255]);
     candidate.fee = Amount::from(1u32) << 512usize;
-    assert!(wallet::decode_unsigned(&wallet::unsigned(&candidate)).is_err());
+    assert!(wallet::decode_unsigned(&wallet::unsigned(&candidate, &[39; 32])).is_err());
     candidate = body(vec![0; 32 * 1024 * 1024 + 1]);
-    assert!(wallet::decode_unsigned(&wallet::unsigned(&candidate)).is_ok());
+    assert!(wallet::decode_unsigned(&wallet::unsigned(&candidate, &[39; 32])).is_ok());
 }

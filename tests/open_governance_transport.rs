@@ -30,7 +30,6 @@ fn signed(chain: &Chain, secret: &[u8; 32], operation: Operation) -> Transaction
     support::sign_minimum(
         state,
         TransactionBody {
-            chain_id: chain.chain_id(),
             sender,
             nonce: state.account(&sender, None).unwrap().nonce,
             fee: 0u32.into(),
@@ -130,7 +129,6 @@ async fn large_governed_block_relays_compactly_and_survives_reopen() {
         .map(|nonce| {
             let transaction = crypto::sign(
                 &TransactionBody {
-                    chain_id: config.chain_id(),
                     sender: miner,
                     nonce: nonce_before + nonce,
                     fee: 12u32.into(),

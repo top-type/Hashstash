@@ -410,6 +410,123 @@ async fn public_connections_and_malformed_cooldowns_do_not_exhaust_private_rpc()
     server.stop().await;
 }
 
+/// Visitor-chosen cost: every list element under a grant-payments path is one
+/// work unit, before the method checks its parameters.
+fn priced_status(units: usize) -> Value {
+    json!({"jsonrpc":"2.0","id":1,"method":"status","params":{
+        "operation":{"Propose":{"proposal":{"Grant":{"payments":vec![0; units]}}}}
+    }})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_named_visitors_cannot_spend_the_shared_public_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = crypto::public_key(&[110; 32]).unwrap();
+    let node = Node::open(&directory.path().join("chain.sqlite"), config(), key).unwrap();
+    let server = node::serve(node, options()).await.unwrap();
+    let public = format!("http://{}", server.public_web.unwrap());
+    let rpc = format!("{public}/rpc");
+    let client = reqwest::Client::new();
+    let send = |visitor: &'static str, body: Value| {
+        client
+            .post(&rpc)
+            .header("X-Real-IP", visitor)
+            .json(&body)
+            .send()
+    };
+    // Each request costs about half of one visitor's eighth of the shared
+    // 1,048,576-unit work burst, so the third is refused for that visitor.
+    let expensive = priced_status(65_000);
+    for _ in 0..2 {
+        let response = send("192.0.2.10", expensive.clone()).await.unwrap();
+        assert_eq!(response.status(), 200);
+    }
+    assert!(send("192.0.2.10", expensive.clone()).await.is_err());
+    // Another visitor, and unnamed local tools, keep the shared budget.
+    let response = send("192.0.2.11", expensive).await.unwrap();
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["result"]["height"],
+        0
+    );
+    let response = request(&client, &public, "status", json!({})).await;
+    assert_eq!(response.status(), 200);
+    let invalid = send("not-an-address", json!({})).await.unwrap();
+    assert_eq!(invalid.status(), 400);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_named_visitors_are_cooled_down_for_their_own_framing_errors() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = crypto::public_key(&[111; 32]).unwrap();
+    let node = Node::open(&directory.path().join("chain.sqlite"), config(), key).unwrap();
+    let server = node::serve(node, options()).await.unwrap();
+    let public = format!("http://{}/rpc", server.public_web.unwrap());
+    let client = reqwest::Client::new();
+    let status = |visitor: Option<&'static str>| {
+        let mut post = client
+            .post(&public)
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"status","params":{}}));
+        if let Some(visitor) = visitor {
+            post = post.header("X-Real-IP", visitor);
+        }
+        post.send()
+    };
+    // Three spaced violations raise the visitor's cooldown to one second.
+    for wait in [300, 600, 0] {
+        let response = client
+            .post(&public)
+            .header("X-Real-IP", "198.51.100.20")
+            .header("Content-Type", "text/plain")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+    }
+    let cooled = status(Some("198.51.100.20")).await.unwrap();
+    assert_eq!(cooled.status(), 400);
+    assert_eq!(
+        cooled.json::<Value>().await.unwrap()["error"]["message"],
+        "temporary network cooldown"
+    );
+    for visitor in [Some("198.51.100.21"), None] {
+        assert_eq!(status(visitor).await.unwrap().status(), 200);
+    }
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_request_heads_have_a_short_deadline() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = crypto::public_key(&[112; 32]).unwrap();
+    let node = Node::open(&directory.path().join("chain.sqlite"), config(), key).unwrap();
+    let server = node::serve(node, options()).await.unwrap();
+    let mut stream = TcpStream::connect(server.public_web.unwrap())
+        .await
+        .unwrap();
+    stream
+        .write_all(b"GET /api/session HTTP/1.1\r\n")
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(12),
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response),
+    )
+    .await
+    .expect("an incomplete head is closed before the full request deadline")
+    .unwrap();
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_secs(4) && elapsed < Duration::from_secs(10));
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 400 "), "{response}");
+    assert!(response.contains("HTTP request timed out"), "{response}");
+    server.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn public_mining_status_and_storage_errors_hide_operator_details() {
     let directory = tempfile::tempdir().unwrap();

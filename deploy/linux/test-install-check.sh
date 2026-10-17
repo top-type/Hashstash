@@ -30,9 +30,9 @@ PEER_KEY_FILE=/etc/hashstash/peer-identity.json
 PEER_PINS=192.0.2.2:18481=$other
 EOF
 }
-stage_tmpdir=
+stage_tmpdir= candidate= candidate_hash=
 check() {
-  TMPDIR=${stage_tmpdir:-${TMPDIR:-/tmp}} bash "$repo/deploy/linux/install.sh" --binary "$binary" --sha256 "$binary_hash" \
+  TMPDIR=${stage_tmpdir:-${TMPDIR:-/tmp}} bash "$repo/deploy/linux/install.sh" --binary "${candidate:-$binary}" --sha256 "${candidate_hash:-$binary_hash}" \
     --genesis "$fixture/network.json" --genesis-sha256 "$genesis_hash" \
     --node-env "$fixture/node.env" "$@" --check > "$fixture/out" 2> "$fixture/err"
 }
@@ -45,6 +45,16 @@ stage_tmpdir=$fixture/shared; reject --peer-key-file "$fixture/peer.json"
 grep -Fq 'staging directory is modifiable by another account' "$fixture/err"; checks=$((checks+1))
 chmod 1777 -- "$fixture/shared"; pass --peer-key-file "$fixture/peer.json"; stage_tmpdir=
 [[ -z $(ls -A -- "$fixture/shared") ]]; checks=$((checks+1))
+# A staged binary that cannot run at all is reported as such, not as another release.
+candidate=$fixture/unrunnable; { printf '\177ELF'; head -c 60 /dev/zero; } > "$candidate"; chmod 755 -- "$candidate"
+candidate_hash=$(sha256sum -- "$candidate"); candidate_hash=${candidate_hash%% *}
+reject --peer-key-file "$fixture/peer.json"; candidate= candidate_hash=
+grep -Fq 'staged binary cannot be executed' "$fixture/err"; checks=$((checks+1))
+# Debian and Ubuntu mount the sticky /run/lock noexec; staging there names the cause.
+if [[ ,$(findmnt -no OPTIONS --target /run/lock 2>/dev/null), == *,noexec,* && -d /run/lock && -k /run/lock && -w /run/lock ]]; then
+  stage_tmpdir=/run/lock; reject --peer-key-file "$fixture/peer.json"; stage_tmpdir=
+  grep -Fq 'staging directory does not allow execution' "$fixture/err"; checks=$((checks+1))
+fi
 chmod 644 "$fixture/peer.json"; reject --peer-key-file "$fixture/peer.json"; chmod 600 "$fixture/peer.json"
 ln -s "$fixture/peer.json" "$fixture/peer-link.json"; reject --peer-key-file "$fixture/peer-link.json"
 "$binary" keygen --out "$fixture/wallet.json" > "$fixture/keygen.out"

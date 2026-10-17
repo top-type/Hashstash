@@ -62,10 +62,15 @@ fi
 # Hash, validate, execute and install only private copies. A source replaced
 # after this point cannot reach root execution or the hash-named binary pin.
 stage_parent=$(realpath -e -- "${TMPDIR:-/tmp}")
-private_directory "$stage_parent" || fail "staging directory is modifiable by another account: $stage_parent (set TMPDIR)"
+private_directory "$stage_parent" || fail "staging directory is modifiable by another account: $stage_parent; set TMPDIR (with sudo: sudo env TMPDIR=DIR bash install.sh ...)"
 stage=$(mktemp -d "$stage_parent/hashstash-install.XXXXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
 [[ $(stat -c '%u:%a' -- "$stage") == "$EUID:700" ]] || fail 'staging directory is not private'
+# The staged binary runs from here. Name a noexec mount plainly, before it can
+# surface as a misleading permission or version failure. sudo does not pass on
+# an exported TMPDIR, so the hints give it to the installer directly.
+printf '#!/bin/sh\n' > "$stage/probe"; chmod 700 -- "$stage/probe"
+"$stage/probe" 2>/dev/null || fail "staging directory does not allow execution: $stage_parent; set TMPDIR to an executable directory (with sudo: sudo env TMPDIR=DIR bash install.sh ...)"
 stage_input() {
     [[ -f "$1" ]] || fail "input is not a regular file: $1"
     # Mode is preserved for the executable and owner-only identity checks.
@@ -93,7 +98,11 @@ actual=$(sha256sum -- "$binary"); actual=${actual%% *}
 [[ $(od -An -tx1 -N4 -- "$binary" | tr -d ' \n') == 7f454c46 ]] || fail 'binary must be a Linux ELF executable'
 actual=$(sha256sum -- "$genesis"); actual=${actual%% *}
 [[ "$actual" == "$genesis_sha256" ]] || fail 'shared genesis SHA256 does not match'
-[[ $("$binary" --version) == "hashstash $version" ]] || fail "expected Hashstash $version Linux binary"
+# Exit status 126: the staged copy could not be executed at all, which a
+# version mismatch message would hide.
+reported=$("$binary" --version) && status=0 || status=$?
+(( status != 126 )) || fail 'staged binary cannot be executed on this host; check its architecture'
+(( status == 0 )) && [[ "$reported" == "hashstash $version" ]] || fail "expected Hashstash $version Linux binary"
 bash "$script_dir/run-node.sh" check "$node_env" "$binary" "$genesis" "$password_file" "$peer_key_file"
 printf 'Shared genesis SHA256: %s\n' "$(sha256sum -- "$genesis" | awk '{print $1}')"
 "$binary" network --config "$genesis"

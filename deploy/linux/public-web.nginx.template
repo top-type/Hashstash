@@ -1,18 +1,26 @@
 # Replace PUBLIC_HOST with this server's DNS name (preferred) or IPv4 address.
-# Browsers never apply Strict-Transport-Security to IP-address hosts (RFC 6797
-# section 8.1), so an IP-literal site cannot stop an on-path attacker from
-# stripping a visit that starts at http://. This proxy deliberately has no
-# route to the private wallet/admin RPC port.
+# Requires nginx 1.15.7 or later for the `delay=` limit below. Browsers never
+# apply Strict-Transport-Security to IP-address hosts (RFC 6797 section 8.1),
+# so an IP-literal site cannot stop an on-path attacker from stripping a visit
+# that starts at http://. This proxy deliberately has no route to the private
+# wallet/admin RPC port.
 #
-# Every visitor reaches the restricted listener from 127.0.0.1, so all of them
-# share one node admission record: 8 sessions and 131,072 work units/s. One
-# transaction preparation, broadcast or explorer account read costs about
-# 4,200-6,700 units, roughly 20-30 such calls per second for everyone. The
-# per-client JSON-RPC rate below keeps each address far under that shared
-# budget; raising it lets a few clients deny those calls to all visitors.
+# Every visitor reaches the restricted listener from 127.0.0.1. The node tells
+# them apart only by the X-Real-IP header set below, which must overwrite any
+# client-supplied value. All visitors together share one admission record of
+# 32 sessions and 131,072 work units/s (burst 1,048,576); each visitor's own
+# record allows 6 sessions and an eighth of that work (16,384/s, burst
+# 131,072). The client chooses a request's cost: an ordinary preparation,
+# broadcast or explorer account read costs about 4,200-6,700 units, but a
+# maximum-size request can cost about 85,000 because list parameters are priced
+# before they are validated. So one address can spend at most its eighth, and
+# keeping the shared budget empty takes eight or more addresses. The per-client
+# rates below only pace ordinary use; enough addresses can always exhaust a
+# shared quota.
 limit_req_zone $binary_remote_addr zone=hashstash_web:10m rate=15r/s;
 limit_req_zone $binary_remote_addr zone=hashstash_rpc:10m rate=2r/s;
 limit_conn_zone $binary_remote_addr zone=hashstash_connections:10m;
+limit_conn_zone $server_name zone=hashstash_upstream:1m;
 
 server {
     listen 80 default_server;
@@ -41,8 +49,11 @@ server {
     client_header_timeout 10s;
     keepalive_timeout 15s;
     send_timeout 15s;
-    # The node serves at most 8 public sessions in total.
-    limit_conn hashstash_connections 8;
+    # One client gets a browser's six parallel connections, below the node's
+    # per-visitor cap; all clients together get the node's 32 sessions, so
+    # excess requests receive 429 here instead of a reset upstream connection.
+    limit_conn hashstash_connections 6;
+    limit_conn hashstash_upstream 32;
     limit_req zone=hashstash_web burst=60 nodelay;
     limit_req_status 429;
     limit_conn_status 429;
@@ -51,8 +62,11 @@ server {
     add_header X-Content-Type-Options nosniff always;
     add_header Referrer-Policy no-referrer always;
     add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+    # Locations below must not set their own proxy_set_header: nginx would
+    # then drop these, including the X-Real-IP overwrite.
     proxy_set_header Host $host;
     proxy_set_header Connection "";
+    proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For "";
     proxy_set_header X-Forwarded-Proto "";
     proxy_http_version 1.1;
@@ -64,9 +78,11 @@ server {
         # (160 KiB at the default 16 KiB). Raise this only after governance
         # enlarges blocks beyond 448 KiB.
         client_max_body_size 1m;
-        # Location limits replace the server-level ones. Sequential callers
-        # are paced rather than refused; floods beyond the burst receive 429.
+        # Location limits replace the server-level ones, so both connection
+        # limits are repeated. Sequential callers are paced rather than
+        # refused; floods beyond the burst receive 429.
         limit_conn hashstash_connections 4;
+        limit_conn hashstash_upstream 32;
         limit_req zone=hashstash_rpc burst=20 delay=10;
         proxy_pass http://127.0.0.1:18483;
     }

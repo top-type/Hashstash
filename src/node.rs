@@ -371,6 +371,8 @@ const PEER_BATCH_WORK: usize = network_guard::PEER_WORK_PER_SECOND as usize
     - MAX_BACKLOG;
 const MAX_SNAPSHOT_KEYS: usize = 256;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
+/// Deadline for the request line and headers on the public-web listener.
+const PUBLIC_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const VERSION_MASK: u32 = 0x1fffe000;
 const HASHRATE_WINDOW_SECONDS: u64 = 300;
 const MAX_SUBMITTED_HEADERS: usize = 4096;
@@ -3963,10 +3965,11 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
     });
     // The proxy may originate every public connection from loopback. Separate
     // admission records and worker slots prevent it exhausting private RPC.
+    // Each visitor it names, like each direct client, holds only a share.
     let public_http = Arc::new(HttpContext {
         public: true,
         session_token: None,
-        sessions: Arc::new(Semaphore::new(8)),
+        sessions: Arc::new(Semaphore::new(network_guard::PUBLIC_WEB_SESSIONS)),
         parsers: Arc::new(Semaphore::new(2)),
         workers: Arc::new(Semaphore::new(4)),
         mutations: Arc::new(Semaphore::new(2)),
@@ -4917,7 +4920,15 @@ async fn read_http<R: AsyncBufRead + Unpin>(
     transaction_bytes: usize,
     session_token: Option<&str>,
 ) -> Result<HttpRequest> {
-    let first = bounded_line(read, 4096).await?;
+    // A proxy sends the whole head at once; an idle remote socket must not
+    // hold a public session for the full request deadline.
+    let head_timeout = if public {
+        PUBLIC_HEADER_TIMEOUT
+    } else {
+        IO_TIMEOUT
+    };
+    let head = tokio::time::Instant::now() + head_timeout;
+    let first = tokio::time::timeout_at(head, bounded_line(read, 4096)).await??;
     ensure!(first.ends_with(b"\r\n"), "invalid HTTP request line");
     let first = std::str::from_utf8(&first)?;
     // Exactly one space separates the three request-line tokens.
@@ -4939,7 +4950,7 @@ async fn read_http<R: AsyncBufRead + Unpin>(
     let mut headers = HashMap::new();
     let mut size = first.len();
     loop {
-        let line = bounded_line(read, 4096).await?;
+        let line = tokio::time::timeout_at(head, bounded_line(read, 4096)).await??;
         size += line.len();
         ensure!(size <= 16384, "HTTP headers too large");
         if line == b"\r\n" {
@@ -4957,6 +4968,16 @@ async fn read_http<R: AsyncBufRead + Unpin>(
             headers.insert(name, value.trim().to_owned()).is_none(),
             "duplicate HTTP header"
         );
+    }
+    // The shipped proxy overwrites X-Real-IP with the connecting address. Only
+    // its loopback sessions are attributed; its own record still caps them all.
+    if admission.proxied()
+        && let Some(client) = headers.get("x-real-ip")
+    {
+        let client = client
+            .parse::<IpAddr>()
+            .map_err(|_| anyhow!("invalid X-Real-IP header"))?;
+        admission.forwarded_for(client)?;
     }
     ensure!(
         !headers.contains_key("transfer-encoding"),
@@ -5151,7 +5172,7 @@ async fn http_session(
         Ok(Ok(request)) => request,
         failed => {
             let (message, drain) = match failed {
-                Ok(Err(e)) => (e.to_string(), true),
+                Ok(Err(e)) if !e.is::<tokio::time::error::Elapsed>() => (e.to_string(), true),
                 _ => ("HTTP request timed out".into(), false),
             };
             let status = if message.starts_with("forbidden:") {
@@ -5159,6 +5180,9 @@ async fn http_session(
             } else if message == "resource not found" {
                 404
             } else {
+                // Framing errors and expired deadlines. Refused origins and
+                // unknown paths stay unpenalized: ordinary browsers cause them.
+                admission.framing_error();
                 400
             };
             let sent = http_response(

@@ -97,7 +97,7 @@ Choose **Export watch-only account** to save the watch-only descriptor. Copy onl
 
 The signer checks the transaction format and matching sender. It cannot check live balances, governance state, or whether its block reference, nonce or lifetime is still usable; the online node validates those when broadcasting and including the transaction. Editing or replacing the unsigned input clears its previous review. Signing consumes that review.
 
-Both hot and watch-only wallets offer this broadcast control. Every transaction defaults to a two-block lifetime. Trades expose this under **More options → Order expiry**; other transactions use **Payments → Advanced → Transaction expiry**. Preparation signs the current block hash. For example, an anchor at block 100 with a lifetime of 2 permits inclusion in blocks 101 or 102. An expired transaction must be prepared and signed again. If a reorganization removes its anchor, the transaction is invalid on that branch. Expiry governs how long an order can wait for inclusion; the price limit applies separately to each block, so it can compound while an order waits.
+Both hot and watch-only wallets offer this broadcast control. Every transaction defaults to a two-block lifetime. Trades expose this under **More options → Order expiry**; other transactions use **Payments → Advanced → Transaction expiry**. Preparation signs the current block hash. For example, an anchor at block 100 with a lifetime of 2 permits inclusion in blocks 101 or 102. An expired transaction must be prepared and signed again. If a reorganization removes its anchor, the transaction is invalid on that branch. The node drops such a transaction without a record. The form that submitted it follows it by sender nonce: once the pending list is complete and has twice lacked it while its nonce is unused, the form reports **No longer pending** and asks for a new preparation. A used nonce reports **Mined or replaced**. Expiry governs how long an order can wait for inclusion; the price limit applies separately to each block, so it can compound while an order waits.
 
 ## Advanced startup options
 
@@ -130,7 +130,7 @@ The browser manager does not call server-wallet endpoints. It serializes local s
 
 ## Optional node-wallet tools
 
-Opt-in node wallets store keys and selection beside the chain database: `chain.sqlite` uses `chain.wallets.sqlite`. These keys are separate from browser wallets. Import a key file or an explicitly exported private-key backup through Wallet to use that account in the browser.
+Opt-in node wallets store keys and selection beside the chain database: `chain.sqlite` uses `chain.wallets.sqlite`. These keys are separate from browser wallets. The file cannot be rebuilt from the chain, so a damaged or foreign one stops startup; the node checks it before replaying history, and the error appears at once. Move it aside only if it holds no keys you need. Import a key file or an explicitly exported private-key backup through Wallet to use that account in the browser.
 
 The private loopback listener exposes session-authorized wallet tools: `GET /api/session` lists wallet IDs and the current revision; `POST /api/wallet/manage` with `action:"export"`, its `id`, and that `revision` returns a backup when authorized with the local session token in `X-Hashstash-Token`. Export only the intended key and keep the private listener private. These routes and the `/api/wallet` signer are unavailable on the public-web listener. Normal browser use never calls them.
 

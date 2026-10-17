@@ -408,11 +408,13 @@ fn node_self_payment(c: &Config, secret: &[u8; 32], nonce: u64) -> Transaction {
     .unwrap()
 }
 
-/// Related prior finding: one bad-signature transaction forces a full-mempool
-/// signature re-verification on the public `submit_transaction` path (the same
-/// path `receive_peer` uses), under the node lock.
+/// Related prior finding: one bad-signature transaction used to force a
+/// full-mempool signature re-verification on the public `submit_transaction`
+/// path (the same path `receive_peer` uses), under the node lock. Submission
+/// and relay now authenticate a transaction before taking the node lock, so a
+/// forged record is refused without any selection; this asserts the fix.
 #[test]
-fn h9_bad_signature_forces_full_reverification() {
+fn h9_bad_signature_is_refused_before_selection() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = configuration();
     config.initial.block_bytes = 1024 * 1024; // hold a full mempool
@@ -439,27 +441,29 @@ fn h9_bad_signature_forces_full_reverification() {
     let _ = node.submit_transaction(dup);
     let dup_elapsed = t0.elapsed();
 
-    // One transaction with a bad signature cannot short-circuit (its id differs),
-    // so submit_locked re-runs selection over the whole mempool, re-verifying
-    // every signature (chain.rs:892-895) before rejecting it.
+    // One transaction with a bad signature cannot short-circuit (its id differs).
+    // Before the fix submit_locked re-ran selection over the whole mempool,
+    // re-verifying every signature (chain.rs:892-895) before rejecting it.
     let mut bad = node_self_payment(&config, &SECRET, 0);
     bad.signature[0] ^= 1;
+    let before = node.rpc("mempool", serde_json::json!({"format":"hex"})).unwrap();
     let t1 = Instant::now();
     let rejected = node.submit_transaction(bad);
     let bad_elapsed = t1.elapsed();
 
-    println!("=== H9 related: full-mempool signature re-verification ===");
+    println!("=== H9 related: forged transaction refused before selection ===");
     println!("mempool size:                         {filled}");
     println!("duplicate resubmit (short-circuit):   {dup_elapsed:?}");
-    println!("bad-signature resubmit (full verify): {bad_elapsed:?}");
+    println!("bad-signature resubmit (one verify):  {bad_elapsed:?}");
     println!("bad transaction rejected:             {}", rejected.is_err());
 
-    // The bad signature never enters the mempool...
-    assert!(rejected.is_err(), "bad signature must be rejected");
     assert!(filled >= 1, "mempool should have been filled");
-    // ...but rejecting it still costs a full re-verification the duplicate skips.
-    assert!(
-        bad_elapsed >= dup_elapsed,
-        "bad-signature path re-verifies the whole mempool: {bad_elapsed:?} vs {dup_elapsed:?}"
+    // The forged record is refused by its own authentication, never by a
+    // selection over the pool, and the pool is untouched.
+    let error = rejected.expect_err("bad signature must be rejected").to_string();
+    assert!(error.contains("invalid transaction signature"), "{error}");
+    assert_eq!(
+        node.rpc("mempool", serde_json::json!({"format":"hex"})).unwrap(),
+        before
     );
 }

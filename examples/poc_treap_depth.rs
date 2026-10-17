@@ -1,5 +1,12 @@
 //! Proof of concept for finding H7: unbounded recursion in `hashstash::tree::Map`.
 //!
+//! Status: fixed (audit F007). Insert, remove, merge, split, drop and snapshot
+//! restoration now walk paths with heap worklists, so this program is expected
+//! to print "survived depth N" for any N; tests/treap_depth.rs keeps a smaller
+//! spine on a 128 KiB stack as a regression test. The description below is the
+//! original analysis. Ground depth still costs one node copy per level on each
+//! update of that path; it no longer aborts the process.
+//!
 //! `Map` (src/tree.rs) is a treap whose node priority is
 //! `tagged_hash("Hashstash/TreePriority", key)` (tree.rs:52). The binary-search
 //! shape is therefore the unique Cartesian tree of `(priority, key)` pairs, and

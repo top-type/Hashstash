@@ -3,18 +3,24 @@
 //! The binary-search shape is the unique Cartesian tree of `(SHA256-tagged(key),
 //! key)` priorities. Thus insertion order and snapshot restoration cannot change
 //! the root. Nodes are immutable, reference counted, and cache their commitment.
-//! Cloning is constant time; updates copy an expected logarithmic search path.
+//! Values are shared between versions, so cloning is constant time and an update
+//! copies only the nodes of its search path, not the values stored on it.
+//!
+//! Priorities are public functions of keys, and many keys (account public keys,
+//! proposal identifiers) are chosen by users. Depth is therefore logarithmic only
+//! in expectation: ground keys can lengthen one path by a level per key. Every
+//! operation, including dropping and restoring a map, walks paths with explicit
+//! heap worklists, so no depth exhausts a thread stack.
 
 use crate::{codec, crypto, types::Hash};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeSeq};
-use std::{fmt, sync::Arc};
+use std::{cmp::Ordering, fmt, sync::Arc};
 
 type Link<V> = Option<Arc<Node<V>>>;
 
-#[derive(Clone, Debug)]
 struct Node<V> {
     key: Vec<u8>,
-    value: V,
+    value: Arc<V>,
     value_hash: Hash,
     priority: Hash,
     left: Link<V>,
@@ -23,9 +29,32 @@ struct Node<V> {
     root: Hash,
 }
 
-#[derive(Clone, Debug)]
+impl<V> Drop for Node<V> {
+    /// The derived drop would recurse once per level. Detach uniquely owned
+    /// descendants first and free them from a worklist; shared subtrees only
+    /// lose a reference.
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        for link in [self.left.take(), self.right.take()] {
+            pending.extend(link.and_then(Arc::into_inner));
+        }
+        while let Some(mut node) = pending.pop() {
+            for link in [node.left.take(), node.right.take()] {
+                pending.extend(link.and_then(Arc::into_inner));
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Map<V> {
     node: Link<V>,
+}
+
+impl<V: fmt::Debug> fmt::Debug for Map<V> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
 }
 
 fn empty_root() -> Hash {
@@ -47,15 +76,14 @@ fn node_hash(key: &[u8], value: &Hash, left: &Hash, right: &Hash) -> Hash {
     )
 }
 
-impl<V: Clone> Node<V> {
-    fn make(key: Vec<u8>, value: V, value_hash: Hash, left: Link<V>, right: Link<V>) -> Arc<Self> {
-        let priority = crypto::tagged_hash("Hashstash/TreePriority", &key);
-        Self::with_priority(key, value, value_hash, priority, left, right)
-    }
+fn key_priority(key: &[u8]) -> Hash {
+    crypto::tagged_hash("Hashstash/TreePriority", key)
+}
 
+impl<V> Node<V> {
     fn with_priority(
         key: Vec<u8>,
-        value: V,
+        value: Arc<V>,
         value_hash: Hash,
         priority: Hash,
         left: Link<V>,
@@ -89,83 +117,119 @@ impl<V: Clone> Node<V> {
     fn precedes(&self, other: &Self) -> bool {
         (self.priority, &self.key) < (other.priority, &other.key)
     }
+
+    fn child(&self, direction: Direction) -> Option<&Arc<Self>> {
+        match direction {
+            Direction::Left => self.left.as_ref(),
+            Direction::Right => self.right.as_ref(),
+        }
+    }
 }
 
-fn insert<V: Clone + Serialize>(node: &Link<V>, key: Vec<u8>, value: V) -> Arc<Node<V>> {
-    let Some(n) = node else {
-        let digest = value_hash(&value);
-        return Node::make(key, value, digest, None, None);
+/// Copies a recorded search path bottom-up. Each ancestor takes the new
+/// subtree on the side the search followed and keeps its other child.
+fn rebuild_path<V>(path: Vec<(&Node<V>, Direction)>, mut child: Link<V>) -> Link<V> {
+    for (n, direction) in path.into_iter().rev() {
+        child = Some(match direction {
+            Direction::Left => n.rebuild(child, n.right.clone()),
+            Direction::Right => n.rebuild(n.left.clone(), child),
+        });
+    }
+    child
+}
+
+/// Splits a subtree that does not contain `key` into the parts ordered before
+/// and after it. Only the nodes on the key's search path are copied.
+fn split<V>(mut next: Option<&Arc<Node<V>>>, key: &[u8]) -> (Link<V>, Link<V>) {
+    let (mut before, mut after) = (Vec::new(), Vec::new());
+    while let Some(n) = next {
+        if n.key.as_slice() < key {
+            before.push(n);
+            next = n.right.as_ref();
+        } else {
+            after.push(n);
+            next = n.left.as_ref();
+        }
+    }
+    let mut left = None;
+    for n in before.into_iter().rev() {
+        left = Some(n.rebuild(n.left.clone(), left));
+    }
+    let mut right = None;
+    for n in after.into_iter().rev() {
+        right = Some(n.rebuild(right, n.right.clone()));
+    }
+    (left, right)
+}
+
+fn insert<V: Serialize>(node: &Link<V>, key: Vec<u8>, value: V) -> Link<V> {
+    let priority = key_priority(&key);
+    let digest = value_hash(&value);
+    let mut path = Vec::new();
+    let mut next = node.as_ref();
+    while let Some(n) = next {
+        let direction = match key.cmp(&n.key) {
+            // An existing key keeps its priority, position and subtrees.
+            Ordering::Equal => {
+                let updated = Node::with_priority(
+                    key,
+                    Arc::new(value),
+                    digest,
+                    n.priority,
+                    n.left.clone(),
+                    n.right.clone(),
+                );
+                return rebuild_path(path, Some(updated));
+            }
+            // A new key that precedes this node roots its subtree.
+            _ if (priority, key.as_slice()) < (n.priority, n.key.as_slice()) => break,
+            Ordering::Less => Direction::Left,
+            Ordering::Greater => Direction::Right,
+        };
+        path.push((n.as_ref(), direction));
+        next = n.child(direction);
+    }
+    let (left, right) = split(next, &key);
+    let node = Node::with_priority(key, Arc::new(value), digest, priority, left, right);
+    rebuild_path(path, Some(node))
+}
+
+/// Joins two subtrees whose keys are all ordered before and after each other.
+fn merge<V>(left: &Link<V>, right: &Link<V>) -> Link<V> {
+    let mut path = Vec::new();
+    let (mut l, mut r) = (left.as_ref(), right.as_ref());
+    let rest = loop {
+        match (l, r) {
+            (Some(a), Some(b)) if a.precedes(b) => {
+                path.push((a.as_ref(), Direction::Right));
+                l = a.right.as_ref();
+            }
+            (Some(_), Some(b)) => {
+                path.push((b.as_ref(), Direction::Left));
+                r = b.left.as_ref();
+            }
+            (rest, None) | (None, rest) => break rest.cloned(),
+        }
     };
-    match key.cmp(&n.key) {
-        std::cmp::Ordering::Equal => {
-            let digest = value_hash(&value);
-            Node::with_priority(
-                key,
-                value,
-                digest,
-                n.priority,
-                n.left.clone(),
-                n.right.clone(),
-            )
-        }
-        std::cmp::Ordering::Less => {
-            let left = insert(&n.left, key, value);
-            if left.precedes(n) {
-                let right = n.rebuild(left.right.clone(), n.right.clone());
-                left.rebuild(left.left.clone(), Some(right))
-            } else {
-                n.rebuild(Some(left), n.right.clone())
-            }
-        }
-        std::cmp::Ordering::Greater => {
-            let right = insert(&n.right, key, value);
-            if right.precedes(n) {
-                let left = n.rebuild(n.left.clone(), right.left.clone());
-                right.rebuild(Some(left), right.right.clone())
-            } else {
-                n.rebuild(n.left.clone(), Some(right))
-            }
-        }
-    }
-}
-
-fn merge<V: Clone>(left: &Link<V>, right: &Link<V>) -> Link<V> {
-    match (left, right) {
-        (None, _) => right.clone(),
-        (_, None) => left.clone(),
-        (Some(l), Some(r)) => {
-            if l.precedes(r) {
-                Some(l.rebuild(l.left.clone(), merge(&l.right, right)))
-            } else {
-                Some(r.rebuild(merge(left, &r.left), r.right.clone()))
-            }
-        }
-    }
+    rebuild_path(path, rest)
 }
 
 fn remove<V: Clone>(node: &Link<V>, key: &[u8]) -> (Link<V>, Option<V>) {
-    let Some(n) = node else {
-        return (None, None);
-    };
-    match key.cmp(n.key.as_slice()) {
-        std::cmp::Ordering::Equal => (merge(&n.left, &n.right), Some(n.value.clone())),
-        std::cmp::Ordering::Less => {
-            let (left, old) = remove(&n.left, key);
-            if old.is_some() {
-                (Some(n.rebuild(left, n.right.clone())), old)
-            } else {
-                (node.clone(), None)
+    let mut path = Vec::new();
+    let mut next = node.as_ref();
+    while let Some(n) = next {
+        let direction = match key.cmp(n.key.as_slice()) {
+            Ordering::Equal => {
+                let merged = merge(&n.left, &n.right);
+                return (rebuild_path(path, merged), Some((*n.value).clone()));
             }
-        }
-        std::cmp::Ordering::Greater => {
-            let (right, old) = remove(&n.right, key);
-            if old.is_some() {
-                (Some(n.rebuild(n.left.clone(), right)), old)
-            } else {
-                (node.clone(), None)
-            }
-        }
+            Ordering::Less => Direction::Left,
+            Ordering::Greater => Direction::Right,
+        };
+        path.push((n.as_ref(), direction));
+        next = n.child(direction);
     }
+    (node.clone(), None)
 }
 
 impl<V> Default for Map<V> {
@@ -192,7 +256,7 @@ impl<V> Map<V> {
         let mut next = self.node.as_deref();
         while let Some(n) = next {
             match key.cmp(n.key.as_slice()) {
-                std::cmp::Ordering::Equal => return Some(&n.value),
+                std::cmp::Ordering::Equal => return Some(&*n.value),
                 std::cmp::Ordering::Less => next = n.left.as_deref(),
                 std::cmp::Ordering::Greater => next = n.right.as_deref(),
             }
@@ -205,7 +269,7 @@ impl<V> Map<V> {
         while let Some(right) = n.right.as_deref() {
             n = right;
         }
-        Some((&n.key, &n.value))
+        Some((&n.key, &*n.value))
     }
 
     pub fn iter(&self) -> Iter<'_, V> {
@@ -252,7 +316,7 @@ impl<V> Map<V> {
 
 impl<V: Clone + Serialize> Map<V> {
     pub fn insert(&mut self, key: Vec<u8>, value: V) {
-        self.node = Some(insert(&self.node, key, value));
+        self.node = insert(&self.node, key, value);
     }
 
     pub fn remove(&mut self, key: &[u8]) -> Option<V> {
@@ -280,7 +344,7 @@ impl<'a, V> Iterator for Iter<'a, V> {
     fn next(&mut self) -> Option<Self::Item> {
         let n = self.stack.pop()?;
         self.push_left(n.right.as_deref());
-        Some((&n.key, &n.value))
+        Some((&n.key, &*n.value))
     }
 }
 
@@ -309,20 +373,62 @@ impl<'de, V: Clone + Serialize + Deserialize<'de>> Deserialize<'de> for Map<V> {
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("strictly key-ordered map entries")
             }
+            /// Sorted entries determine the unique Cartesian tree in one pass:
+            /// `spine` holds the right spine, whose right subtrees are still
+            /// open, and each node is hashed once, when its subtree closes.
             fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Map<V>, A::Error> {
-                let mut map = Map::new();
-                let mut previous: Option<Vec<u8>> = None;
+                let mut spine: Vec<Open<V>> = Vec::new();
                 while let Some((key, value)) = seq.next_element::<(Vec<u8>, V)>()? {
-                    if previous.as_ref().is_some_and(|last| last >= &key) {
+                    if spine.last().is_some_and(|last| last.key >= key) {
                         return Err(de::Error::custom("map keys must be strictly increasing"));
                     }
-                    previous = Some(key.clone());
-                    map.insert(key, value);
+                    let entry = Open {
+                        priority: key_priority(&key),
+                        value_hash: value_hash(&value),
+                        value: Arc::new(value),
+                        key,
+                        left: None,
+                    };
+                    let mut left = None;
+                    while let Some(top) = spine.pop_if(|top| entry.precedes(top)) {
+                        left = Some(top.close(left));
+                    }
+                    spine.push(Open { left, ..entry });
                 }
-                Ok(map)
+                let mut node = None;
+                while let Some(top) = spine.pop() {
+                    node = Some(top.close(node));
+                }
+                Ok(Map { node })
             }
         }
         deserializer.deserialize_seq(Visitor(std::marker::PhantomData))
+    }
+}
+
+/// A restored node whose right subtree is not yet known.
+struct Open<V> {
+    key: Vec<u8>,
+    value: Arc<V>,
+    value_hash: Hash,
+    priority: Hash,
+    left: Link<V>,
+}
+
+impl<V> Open<V> {
+    fn precedes(&self, other: &Self) -> bool {
+        (self.priority, &self.key) < (other.priority, &other.key)
+    }
+
+    fn close(self, right: Link<V>) -> Arc<Node<V>> {
+        Node::with_priority(
+            self.key,
+            self.value,
+            self.value_hash,
+            self.priority,
+            self.left,
+            right,
+        )
     }
 }
 
@@ -400,7 +506,7 @@ mod tests {
             n.root,
             node_hash(
                 &n.key,
-                &value_hash(&n.value),
+                &value_hash(&*n.value),
                 &root(&n.left),
                 &root(&n.right)
             )
@@ -444,9 +550,42 @@ mod tests {
         let restored: Map<u64> = codec::decode(&codec::encode(&a), 1_000_000).unwrap();
         assert_eq!(a.root(), restored.root());
         assert_eq!(a, restored);
+        check_node(&restored.node, None, None);
         let json_restored: Map<u64> =
             serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
         assert_eq!(a.root(), json_restored.root());
+        for n in [0, 1, 2, 3, 17] {
+            let small = populated(0..n);
+            let restored: Map<u64> = codec::decode(&codec::encode(&small), 1000).unwrap();
+            assert_eq!(small.root(), restored.root());
+            check_node(&restored.node, None, None);
+        }
+    }
+
+    #[test]
+    fn path_copies_share_stored_values() {
+        let original = populated(0..200);
+        let root_key = original.node.as_ref().unwrap().key.clone();
+        let mut next = original.clone();
+        // Key 87 is not the root, so this update copies the root node.
+        assert_ne!(root_key, key(87));
+        next.insert(key(87), 999);
+        let (old_root, new_root) = (original.node.as_ref(), next.node.as_ref());
+        assert!(!Arc::ptr_eq(old_root.unwrap(), new_root.unwrap()));
+        assert!(Arc::ptr_eq(
+            &old_root.unwrap().value,
+            &new_root.unwrap().value
+        ));
+        assert!(std::ptr::eq(
+            original.get(&root_key).unwrap(),
+            next.get(&root_key).unwrap()
+        ));
+        assert_eq!(next.remove(&key(87)), Some(999));
+        assert!(std::ptr::eq(
+            original.get(&root_key).unwrap(),
+            next.get(&root_key).unwrap()
+        ));
+        assert_eq!(format!("{:?}", populated(1..3)), "{[0, 0, 0, 1]: 3, [0, 0, 0, 2]: 6}");
     }
 
     #[test]

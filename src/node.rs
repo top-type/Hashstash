@@ -105,6 +105,16 @@ const CURVE_EVALUATION_WORK: usize = 512;
 /// Grant payments kept by a display summary of a record too large for a page.
 const SUMMARY_GRANT_PAYMENTS: usize = 256;
 
+/// Admission work for a request that reselects the pending pool with one
+/// newcomer, or scans it: one unit per pending entry (the published
+/// selection and its backlog) plus the newcomer, and at least MAX_MEMPOOL,
+/// as each mined block is charged and as peers pay for the pool their loose
+/// transactions are selected against. A small pool's change is not charged as
+/// a full 4,096-entry selection, so a sustained local workload is not refused
+/// for work that did not run; a full pool still pays for all of it.
+fn pool_change_work(pending: usize) -> usize {
+    pending.saturating_add(1).max(MAX_MEMPOOL)
+}
 /// Charge read work once its actual size is known. In-process calls are unmetered.
 fn charge(meter: Option<&Session>, work: usize) -> Result<()> {
     match meter {
@@ -3234,12 +3244,18 @@ impl Node {
                 let mut hashes = Vec::new();
                 for _ in 0..count {
                     if let Some(admission) = admission {
-                        let view = self.read_view()?;
-
                         // Recheck each block's current queue. Charging an entire
                         // batch as 4096-transaction blocks rejects even empty
                         // batches beyond the admission bucket's capacity.
-                        admission.work((view.mempool.len() + 1).max(MAX_MEMPOOL))?;
+                        let work = pool_change_work(self.read_view()?.mempool.len());
+                        if let Err(error) = admission.work(work) {
+                            // Only a batch refused before its first block is a
+                            // refusal a client may simply resend.
+                            if hashes.is_empty() {
+                                return Err(error);
+                            }
+                            bail!("mined {} of {count} blocks, then {error}", hashes.len());
+                        }
                     }
                     hashes.push(hex::encode(codec::block_hash(
                         &self.mine_to(attempts, recipient)?,
@@ -3581,7 +3597,10 @@ async fn parse_value_with_slots(
     body_kind: JsonBody,
     slots: Arc<Semaphore>,
 ) -> Result<Value> {
-    let permit = timeout(IO_TIMEOUT, slots.acquire_owned()).await??;
+    // Waiting for a local parser is never the client's fault.
+    let permit = timeout(IO_TIMEOUT, slots.acquire_owned())
+        .await
+        .map_err(|_| network_guard::Busy("JSON parser workers busy"))??;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         match body_kind {
@@ -3993,6 +4012,8 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
         let share_difficulty = options.stratum_share_difficulty;
         let mut shutdown = rx.clone();
         let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let refusals = Arc::new(Semaphore::new(HTTP_REFUSAL_REPLIES));
+        let web = kind == 0 || kind == 3;
         let http = if kind == 3 {
             public_http.clone()
         } else {
@@ -4021,7 +4042,13 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
                     // holds only until authorization; authorized workers are bounded by the
                     // worker registry, so unauthenticated sockets cannot occupy their capacity.
                     let permit = if kind == 2 { None } else {
-                        let Ok(permit) = limit.clone().try_acquire_owned() else { drop(stream); continue };
+                        let Ok(permit) = limit.clone().try_acquire_owned() else {
+                            if web {
+                                let refusal = HttpRefusal::busy("connection limit reached");
+                                refuse_connection(&mut clients, &refusals, stream, refusal);
+                            }
+                            continue
+                        };
                         Some(permit)
                     };
                     let surface=match kind {0|3=>Surface::Rpc,1=>Surface::Peer,_=>Surface::Stratum};
@@ -4044,8 +4071,22 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
                         let Some(id) = SessionIds::allocate(&n.mining_session_ids) else { drop(stream); continue };
                         (admission, SessionCapacity::Mining(id), Some(slot))
                     } else {
-                        let Ok(permit) = http.sessions.clone().try_acquire_owned() else { drop(stream); continue };
-                        let Ok(admission)=guard.admit(address.ip(),surface) else {drop(stream);continue};
+                        // An HTTP connection refused here is answered, not dropped: a
+                        // cooldown or connection quota with 429, busy sessions with 503.
+                        let Ok(permit) = http.sessions.clone().try_acquire_owned() else {
+                            let refusal = HttpRefusal::busy("HTTP sessions busy");
+                            refuse_connection(&mut clients, &refusals, stream, refusal);
+                            continue
+                        };
+                        let admission = match guard.admit(address.ip(), surface) {
+                            Ok(admission) => admission,
+                            Err(error) => {
+                                let refusal = HttpRefusal::of(&error)
+                                    .unwrap_or_else(|| HttpRefusal::busy("connection refused"));
+                                refuse_connection(&mut clients, &refusals, stream, refusal);
+                                continue
+                            }
+                        };
                         (admission, SessionCapacity::Http(permit), None)
                     };
                     let extranonce = match &capacity { SessionCapacity::Mining(id) => id.1, _ => 0 };
@@ -5094,6 +5135,16 @@ async fn http_response_limited<W: AsyncWrite + Unpin>(
     body: &[u8],
     limit: usize,
 ) -> Result<()> {
+    write_http_response(write, status, content_type, body, limit, None).await
+}
+async fn write_http_response<W: AsyncWrite + Unpin>(
+    write: &mut W,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    limit: usize,
+    retry_after: Option<u64>,
+) -> Result<()> {
     ensure!(body.len() <= limit, "HTTP response too large");
     let reason = match status {
         200 => "OK",
@@ -5101,10 +5152,13 @@ async fn http_response_limited<W: AsyncWrite + Unpin>(
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        429 => "Too Many Requests",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
+    let retry_after = retry_after.map_or_else(String::new, |s| format!("Retry-After: {s}\r\n"));
     let header = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Resource-Policy: same-origin\r\nContent-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{retry_after}Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Resource-Policy: same-origin\r\nContent-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'\r\n\r\n",
         body.len()
     );
     timeout(IO_TIMEOUT, async {
@@ -5116,6 +5170,129 @@ async fn http_response_limited<W: AsyncWrite + Unpin>(
 }
 fn http_error(message: &str) -> Value {
     json!({"error":{"message":message}})
+}
+/// A request refused on admission grounds rather than for its content. Its
+/// work never ran, so it is answered, never dropped, and the answer says
+/// when to resend it: 429 for the client's own quota (a cooldown or an
+/// exhausted request, byte or work budget), 503 for local capacity that all
+/// clients share. A charge beyond the quota's whole burst can never be
+/// admitted and is answered 400. Each answer is a short fixed-shape error,
+/// so refusing costs less than the request it refuses.
+struct HttpRefusal {
+    status: u16,
+    retry_after: Option<u64>,
+    message: String,
+}
+impl HttpRefusal {
+    fn busy(message: &str) -> Self {
+        Self {
+            status: 503,
+            retry_after: Some(1),
+            message: message.into(),
+        }
+    }
+    fn of(error: &anyhow::Error) -> Option<Self> {
+        if let Some(limited) = error.downcast_ref::<network_guard::Limited>() {
+            Some(match limited.retry_after {
+                Some(wait) => Self {
+                    status: 429,
+                    // Whole seconds, rounded up, so a client that waits them
+                    // finds both the cooldown over and the charge refilled.
+                    retry_after: Some((wait.as_secs() + u64::from(wait.subsec_nanos() > 0)).max(1)),
+                    message: limited.reason.into(),
+                },
+                None => Self {
+                    status: 400,
+                    retry_after: None,
+                    message: format!("{}: the request exceeds the whole budget", limited.reason),
+                },
+            })
+        } else if let Some(busy) = error.downcast_ref::<network_guard::Busy>() {
+            Some(Self::busy(busy.0))
+        } else {
+            None
+        }
+    }
+    async fn send<W: AsyncWrite + Unpin>(&self, write: &mut W, body: &Value) -> Result<()> {
+        write_http_response(
+            write,
+            self.status,
+            "application/json",
+            &serde_json::to_vec(body)?,
+            MAX_RESPONSE_FRAME,
+            self.retry_after,
+        )
+        .await
+    }
+    async fn send_error<W: AsyncWrite + Unpin>(&self, write: &mut W) -> Result<()> {
+        self.send(write, &http_error(&self.message)).await
+    }
+}
+/// Answer an admission refusal with the endpoint's error body; any other
+/// error still ends the session.
+async fn refuse_request<W: AsyncWrite + Unpin>(
+    write: &mut W,
+    error: anyhow::Error,
+    body: impl FnOnce(&str) -> Value,
+) -> Result<()> {
+    match HttpRefusal::of(&error) {
+        Some(refusal) => refusal.send(write, &body(&refusal.message)).await,
+        None => Err(error),
+    }
+}
+/// Answers to HTTP connections refused before their session starts, in
+/// flight at once per listener. Past this a refused connection is closed
+/// unanswered, so refusals cannot hold more than this bounded capacity.
+const HTTP_REFUSAL_REPLIES: usize = 16;
+/// A refused connection's request head is awaited for at most this long,
+/// within the usual 16 KiB head limit, because HTTP clients expect the answer
+/// after their request; one that sends no complete head closes unanswered.
+const HTTP_REFUSAL_HEAD: Duration = Duration::from_secs(2);
+/// One refusal answer's write deadline. Discarding the client's unread body
+/// afterwards, so the answer is not lost to a reset, has its own bounded
+/// time and size in `finish_http`.
+const HTTP_REFUSAL_WRITE: Duration = Duration::from_secs(1);
+/// Answer a refused HTTP connection while a refusal reply slot is free;
+/// otherwise close it unanswered. Admitted sessions never wait for these.
+fn refuse_connection(
+    clients: &mut tokio::task::JoinSet<()>,
+    replies: &Arc<Semaphore>,
+    stream: TcpStream,
+    refusal: HttpRefusal,
+) {
+    if let Ok(permit) = replies.clone().try_acquire_owned() {
+        clients.spawn(async move {
+            let _permit = permit;
+            refuse_http(stream, refusal).await;
+        });
+    }
+}
+/// Answer a connection refused before its session started, such as one
+/// arriving during its address's cooldown or while every session is busy.
+/// Only the head's framing is read; nothing in it is parsed or charged.
+async fn refuse_http(stream: TcpStream, refusal: HttpRefusal) {
+    let (read, mut write) = stream.into_split();
+    let mut read = BufReader::new(read);
+    let head = async {
+        let mut size = 0;
+        loop {
+            let line = bounded_line(&mut read, 4096).await?;
+            size += line.len();
+            ensure!(size <= 16384, "HTTP headers too large");
+            if line == b"\r\n" {
+                return anyhow::Ok(());
+            }
+        }
+    };
+    if !matches!(timeout(HTTP_REFUSAL_HEAD, head).await, Ok(Ok(()))) {
+        return;
+    }
+    if matches!(
+        timeout(HTTP_REFUSAL_WRITE, refusal.send_error(&mut write)).await,
+        Ok(Ok(()))
+    ) {
+        finish_http(&mut read, &mut write).await;
+    }
 }
 /// Like peer replies, public-web replies spend the byte budget without
 /// penalty: the node chose their size, so an exhausted budget only asks the
@@ -5171,6 +5348,17 @@ async fn http_session(
     {
         Ok(Ok(request)) => request,
         failed => {
+            // A quota refused the head or body before it was read: answer it
+            // and discard the unread body, without a further framing penalty.
+            if let Ok(Err(e)) = &failed
+                && let Some(refusal) = HttpRefusal::of(e)
+            {
+                let sent = refusal.send_error(&mut write).await;
+                if sent.is_ok() {
+                    finish_http(&mut read, &mut write).await;
+                }
+                return sent;
+            }
             let (message, drain) = match failed {
                 Ok(Err(e)) if !e.is::<tokio::time::error::Elapsed>() => (e.to_string(), true),
                 _ => ("HTTP request timed out".into(), false),
@@ -5358,6 +5546,9 @@ async fn http_session(
     let value = match value {
         Ok(value) => value,
         Err(e) => {
+            if let Some(refusal) = HttpRefusal::of(&e) {
+                return refusal.send_error(&mut write).await;
+            }
             admission.malformed();
             return http_response(
                 &mut write,
@@ -5369,8 +5560,16 @@ async fn http_session(
         }
     };
     if request.path == "/api/wallet/manage" {
-        admission.work(1)?;
-        let permit = timeout(IO_TIMEOUT, node.rpc_mutations.clone().acquire_owned()).await??;
+        if let Err(e) = admission.work(1) {
+            return refuse_request(&mut write, e, http_error).await;
+        }
+        let Ok(permit) = timeout(IO_TIMEOUT, node.rpc_mutations.clone().acquire_owned()).await
+        else {
+            return HttpRefusal::busy("wallet workers busy")
+                .send_error(&mut write)
+                .await;
+        };
+        let permit = permit?;
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let request: ManageRequest = serde_json::from_value(value)?;
@@ -5391,8 +5590,17 @@ async fn http_session(
         .await;
     }
     if request.path == "/api/wallet" {
-        admission.work(mempool_limit(&node.read_view()?.chain.config) + 1)?;
-        let permit = timeout(IO_TIMEOUT, node.rpc_mutations.clone().acquire_owned()).await??;
+        // Signing and submitting reselects the pending pool with the newcomer.
+        if let Err(e) = admission.work(pool_change_work(node.read_view()?.mempool.len())) {
+            return refuse_request(&mut write, e, http_error).await;
+        }
+        let Ok(permit) = timeout(IO_TIMEOUT, node.rpc_mutations.clone().acquire_owned()).await
+        else {
+            return HttpRefusal::busy("wallet workers busy")
+                .send_error(&mut write)
+                .await;
+        };
+        let permit = permit?;
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             node.wallet_submit(serde_json::from_value::<HotWalletRequest>(value)?)
@@ -5463,13 +5671,17 @@ async fn http_session(
         method.as_str(),
         "submittransaction" | "template" | "preparetransaction" | "broadcasttransaction"
     ) {
-        cost = cost.saturating_add(MAX_ADAPTIVE_MEMPOOL + 1);
+        cost = cost.saturating_add(pool_change_work(node.read_view()?.mempool.len()));
     } else if method == "mine" {
         // Reserve individual blocks when their actual queue is known.
         cost = 1;
     }
 
-    admission.work(cost)?;
+    let rpc_error =
+        |message: &str| json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":message}});
+    if let Err(e) = admission.work(cost) {
+        return refuse_request(&mut write, e, rpc_error).await;
+    }
     let public = http.public;
     let (result, admission) = if value.get("jsonrpc") != Some(&Value::String("2.0".into())) {
         (Err(anyhow!("jsonrpc must be 2.0")), admission)
@@ -5479,7 +5691,11 @@ async fn http_session(
         } else {
             http.workers.clone()
         };
-        let permit = timeout(IO_TIMEOUT, slots.acquire_owned()).await??;
+        let Ok(permit) = timeout(IO_TIMEOUT, slots.acquire_owned()).await else {
+            let busy = HttpRefusal::busy("RPC workers busy");
+            return busy.send(&mut write, &rpc_error(&busy.message)).await;
+        };
+        let permit = permit?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let result = if public {
@@ -5492,10 +5708,17 @@ async fn http_session(
         .await
         .context("RPC worker failed")?
     };
+    // A metered read, or a mined batch before its first block, refused by
+    // the client's budget did not run: its error carries the refusal status.
+    let mut refusal = None;
     let response = match result {
         Ok(v) => json!({"jsonrpc":"2.0","id":id.clone(),"result":v}),
         Err(e) => {
-            json!({"jsonrpc":"2.0","id":id.clone(),"error":{"code":-32000,"message":e.to_string()}})
+            refusal = HttpRefusal::of(&e);
+            let message = refusal
+                .as_ref()
+                .map_or_else(|| e.to_string(), |r| r.message.clone());
+            rpc_error(&message)
         }
     };
     let mut body = serde_json::to_vec(&response)?;
@@ -5505,17 +5728,29 @@ async fn http_session(
     let limit = response_frame;
     let refused = if body.len() > limit {
         Some("RPC response exceeds the local response limit")
-    } else if public && charge_public_reply(&http.guard, &admission, body.len(), limit).is_err() {
+    } else if public
+        && let Err(e) = charge_public_reply(&http.guard, &admission, body.len(), limit)
+    {
+        // Never a cooldown: the node chose the reply's size. The client
+        // retries once its byte budget has refilled.
+        refusal = HttpRefusal::of(&e);
         Some("public response byte budget exhausted; try again")
     } else {
         None
     };
     if let Some(message) = refused {
-        body = serde_json::to_vec(
-            &json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":message}}),
-        )?;
+        body = serde_json::to_vec(&rpc_error(message))?;
     }
-    http_response_limited(&mut write, 200, "application/json", &body, limit).await
+    let (status, retry_after) = refusal.map_or((200, None), |r| (r.status, r.retry_after));
+    write_http_response(
+        &mut write,
+        status,
+        "application/json",
+        &body,
+        limit,
+        retry_after,
+    )
+    .await
 }
 
 fn rpc_cost(method: &str, params: &Value) -> usize {
@@ -5594,6 +5829,69 @@ mod capacity_work_tests {
             admission_frame_bytes(&Config::devnet(), capacity as u64).unwrap()
                 >= transaction_request_bytes(capacity).unwrap() + 16 * 1024
         );
+    }
+
+    #[test]
+    fn pool_changes_pay_for_the_pool_they_reselect() {
+        // The load check's 64-entry pool pays the per-block floor, not a
+        // full 4,096-entry selection: a 1,048,576-unit burst admits 4,096
+        // such submissions instead of 255.
+        assert_eq!(pool_change_work(0), MAX_MEMPOOL);
+        assert_eq!(pool_change_work(64), MAX_MEMPOOL);
+        assert_eq!(
+            pool_change_work(MAX_ADAPTIVE_MEMPOOL + MAX_BACKLOG),
+            MAX_ADAPTIVE_MEMPOOL + MAX_BACKLOG + 1
+        );
+        assert_eq!(pool_change_work(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn admission_refusals_map_to_retryable_http_answers() {
+        let limited = |retry_after| {
+            anyhow::Error::from(network_guard::Limited {
+                reason: "network rate budget exhausted",
+                retry_after,
+            })
+        };
+        let quota = HttpRefusal::of(&limited(Some(Duration::from_millis(1)))).unwrap();
+        assert_eq!((quota.status, quota.retry_after), (429, Some(1)));
+        assert_eq!(quota.message, "network rate budget exhausted");
+        let quota = HttpRefusal::of(&limited(Some(Duration::from_millis(16_001)))).unwrap();
+        assert_eq!(quota.retry_after, Some(17));
+        // Context added on the way out keeps the refusal recognizable.
+        let wrapped = limited(Some(Duration::ZERO)).context("while charging");
+        assert_eq!(HttpRefusal::of(&wrapped).unwrap().retry_after, Some(1));
+        let never = HttpRefusal::of(&limited(None)).unwrap();
+        assert_eq!((never.status, never.retry_after), (400, None));
+        let busy = network_guard::Busy("JSON parser workers busy").into();
+        let busy = HttpRefusal::of(&busy).unwrap();
+        assert_eq!((busy.status, busy.retry_after), (503, Some(1)));
+        assert!(HttpRefusal::of(&anyhow!("transaction not valid in next block")).is_none());
+    }
+
+    #[tokio::test]
+    async fn refusal_answers_are_short_and_carry_retry_after() {
+        let refusal = HttpRefusal::of(&anyhow::Error::from(network_guard::Limited {
+            reason: "temporary network cooldown",
+            retry_after: Some(Duration::from_millis(250)),
+        }))
+        .unwrap();
+        let mut wire = Vec::new();
+        refusal.send_error(&mut wire).await.unwrap();
+        let text = String::from_utf8(wire).unwrap();
+        assert!(
+            text.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+            "{text}"
+        );
+        assert!(text.contains("\r\nRetry-After: 1\r\n"), "{text}");
+        assert!(text.contains("\r\nConnection: close\r\n"), "{text}");
+        let (_, body) = text.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(body).unwrap(),
+            json!({"error":{"message":"temporary network cooldown"}})
+        );
+        // Bounded, fixed-shape answer: no amplification of a tiny request.
+        assert!(text.len() < 1024, "{}", text.len());
     }
 
     #[test]
@@ -6241,7 +6539,9 @@ mod read_admission_tests {
         // The next one exceeds the remaining budget: a retryable refusal,
         // never a cooldown for a size the node chose.
         let refused = charge_public_reply(&guard, &session, reply, frame).unwrap_err();
-        assert!(refused.is::<network_guard::Busy>(), "{refused}");
+        let answer = HttpRefusal::of(&refused).expect("a quota refusal");
+        assert_eq!(answer.status, 429, "{refused}");
+        assert!(answer.retry_after.is_some_and(|s| (1..=4).contains(&s)));
         session.request().unwrap();
         drop(guard.admit(remote, Surface::Rpc).unwrap());
     }

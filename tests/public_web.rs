@@ -441,7 +441,18 @@ async fn proxy_named_visitors_cannot_spend_the_shared_public_budget() {
         let response = send("192.0.2.10", expensive.clone()).await.unwrap();
         assert_eq!(response.status(), 200);
     }
-    assert!(send("192.0.2.10", expensive.clone()).await.is_err());
+    // Refused, not dropped: the visitor learns when its share has refilled.
+    let refused = send("192.0.2.10", expensive.clone()).await.unwrap();
+    assert_eq!(refused.status(), 429);
+    let wait: u64 = refused.headers()["Retry-After"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((1..=8).contains(&wait), "{wait}");
+    let refused: Value = refused.json().await.unwrap();
+    assert_eq!(refused["id"], 1);
+    assert_eq!(refused["error"]["message"], "network rate budget exhausted");
     // Another visitor, and unnamed local tools, keep the shared budget.
     let response = send("192.0.2.11", expensive).await.unwrap();
     assert_eq!(
@@ -486,7 +497,8 @@ async fn proxy_named_visitors_are_cooled_down_for_their_own_framing_errors() {
         tokio::time::sleep(Duration::from_millis(wait)).await;
     }
     let cooled = status(Some("198.51.100.20")).await.unwrap();
-    assert_eq!(cooled.status(), 400);
+    assert_eq!(cooled.status(), 429);
+    assert!(cooled.headers().contains_key("Retry-After"));
     assert_eq!(
         cooled.json::<Value>().await.unwrap()["error"]["message"],
         "temporary network cooldown"

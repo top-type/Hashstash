@@ -5,7 +5,9 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from test_network import http, rpc, quoted_miner_fee
+# http() waits out and resends a request the node refused with 429 or 503
+# (Retry-After); the report counts them, and the documented load needs none.
+from test_network import admission_refusals, http, rpc, quoted_miner_fee
 TRANSACTIONS_PER_WAVE = 64
 PAID_FEE = 3
 FEE_INTERVAL = 16
@@ -151,7 +153,8 @@ def main():
         assert 'fee_market' not in status
         empty_rates.append(rate)
     print('PASS loaded and empty blocks preserve the governed fee rate', flush=True)
-    report = {**fixture_mode, 'passed': True, 'node_sha256': hashlib.sha256(Path(manifest['executable']).read_bytes()).hexdigest(), 'transactions': transactions * args.rounds, 'setup': setup, 'empty_block_minimum_rates': empty_rates, 'rounds': batches, 'elapsed_seconds': round(time.monotonic() - started, 2), 'final_status': rpc(port, 'status')}
+    print(f'PASS admission: {admission_refusals()} refused requests waited out and resent', flush=True)
+    report = {**fixture_mode, 'passed': True, 'node_sha256': hashlib.sha256(Path(manifest['executable']).read_bytes()).hexdigest(), 'transactions': transactions * args.rounds, 'setup': setup, 'empty_block_minimum_rates': empty_rates, 'admission_refusals': admission_refusals(), 'rounds': batches, 'elapsed_seconds': round(time.monotonic() - started, 2), 'final_status': rpc(port, 'status')}
     args.report.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
 if __name__ == '__main__':
     main()

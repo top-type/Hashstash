@@ -11,18 +11,50 @@ from pathlib import Path
 import socket
 import struct
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
 
-def http(port, path, value=None, headers=None):
-    data = None if value is None else json.dumps(value).encode()
-    request = urllib.request.Request(f'http://127.0.0.1:{port}{path}', data=data, headers={'Content-Type': 'application/json', **(headers or {})})
+# The node answers a request it refused on admission grounds, before running
+# it, with 429 (this client's budget or cooldown) or 503 (busy local capacity)
+# and Retry-After. Resending after that wait is safe; any other failure,
+# including a dropped connection, is still an error.
+RETRY_STATUSES = (429, 503)
+ADMISSION_RETRY_SECONDS = 120
+_refusals = 0
+_refusals_lock = threading.Lock()
+
+def admission_refusals():
+    """How many refused requests this process waited for and resent."""
+    return _refusals
+
+def retry_delay(value):
+    """Seconds to wait for a Retry-After value, bounded for a test run."""
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as error:
-        raise RuntimeError(f'HTTP {error.code}: {error.read().decode()}') from error
+        return min(max(float(value), 0.1), 30.0)
+    except (TypeError, ValueError):
+        return 1.0
+
+def http(port, path, value=None, headers=None):
+    global _refusals
+    data = None if value is None else json.dumps(value).encode()
+    give_up = time.monotonic() + ADMISSION_RETRY_SECONDS
+    while True:
+        request = urllib.request.Request(f'http://127.0.0.1:{port}{path}', data=data, headers={'Content-Type': 'application/json', **(headers or {})})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as error:
+            body = error.read().decode()
+            if error.code in RETRY_STATUSES:
+                wait = retry_delay(error.headers.get('Retry-After'))
+                if time.monotonic() + wait < give_up:
+                    with _refusals_lock:
+                        _refusals += 1
+                    time.sleep(wait)
+                    continue
+            raise RuntimeError(f'HTTP {error.code}: {body}') from error
 
 def rpc(port, method, params=None):
     response = http(port, '/rpc', {'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': {} if params is None else params})

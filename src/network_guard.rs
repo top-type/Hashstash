@@ -94,6 +94,32 @@ impl std::fmt::Display for Busy {
 }
 impl std::error::Error for Busy {}
 
+/// One client's own admission quota refused it: a temporary cooldown, or a
+/// connection, request, byte or work budget that refills over time.
+/// `retry_after` is when the same charge would be admitted again, counting
+/// any cooldown it started; `None` means the charge exceeds the quota's whole
+/// burst, so waiting cannot help. A refused charge never ran its work, so an
+/// HTTP client is told to wait (429 with Retry-After) instead of losing the
+/// connection.
+#[derive(Debug)]
+pub struct Limited {
+    pub reason: &'static str,
+    pub retry_after: Option<Duration>,
+}
+impl std::fmt::Display for Limited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.reason.fmt(f)
+    }
+}
+impl std::error::Error for Limited {}
+fn limited(reason: &'static str, retry_after: Option<Duration>) -> anyhow::Error {
+    Limited {
+        reason,
+        retry_after,
+    }
+    .into()
+}
+
 /// Loopback, link-local, unique-local, private and shared (CGNAT) sources
 /// belong to networks the operator controls.
 fn local_source(ip: IpAddr) -> bool {
@@ -263,6 +289,17 @@ impl Bucket {
             self.remainder = 0;
         }
     }
+    /// After a `take` at some instant refused `amount`, how long from that
+    /// instant until the bucket holds it. `None` when it never can.
+    fn wait(&self, amount: u64, rate: u64, capacity: u64) -> Option<Duration> {
+        if amount > capacity || rate == 0 {
+            return None;
+        }
+        let missing = u128::from(amount.saturating_sub(self.tokens));
+        let units = (missing * 1_000_000_000).saturating_sub(self.remainder);
+        let nanos = units.div_ceil(u128::from(rate));
+        Some(Duration::from_nanos(nanos.min(u64::MAX as u128) as u64))
+    }
     /// Tokens available at `now`, without changing the bucket.
     fn level(&self, rate: u64, capacity: u64, now: Instant) -> u64 {
         let units = now
@@ -303,6 +340,11 @@ impl Record {
         self.strikes = self.strikes.saturating_add(1).min(7);
         self.last = now;
         self.cooldown = now + Duration::from_millis((250u64 << (self.strikes - 1)).min(16_000));
+    }
+    /// A refusal that a bucket's `wait` describes, after any cooldown it set.
+    fn refusal(&self, reason: &'static str, wait: Option<Duration>, now: Instant) -> anyhow::Error {
+        let cooling = self.cooldown.saturating_duration_since(now);
+        limited(reason, wait.map(|wait| wait.max(cooling)))
     }
 }
 /// Incoming frame bytes buffered by inbound sessions.
@@ -486,19 +528,29 @@ impl NetworkGuard {
                     .min_by_key(|(_, r)| (r.cooldown > now, r.last))
                     .map(|(k, _)| *k);
                 let Some(oldest) = oldest else {
-                    return Err(anyhow!("network accounting capacity reached"));
+                    return Err(Busy("network accounting capacity reached").into());
                 };
                 records.remove(&oldest);
             }
             records.insert(key, Record::new(self.key_policy(key), now));
         }
         let record = records.get_mut(&key).unwrap();
-        ensure!(now >= record.cooldown, "temporary network cooldown");
+        if now < record.cooldown {
+            let refusal = "temporary network cooldown";
+            return Err(record.refusal(refusal, Some(Duration::ZERO), now));
+        }
         let p = self.key_policy(key);
-        ensure!(record.active < p.connections, "per-address connection limit");
+        if record.active >= p.connections {
+            // A slot frees when one of this address's sessions ends.
+            return Err(limited(
+                "per-address connection limit",
+                Some(Duration::from_secs(1)),
+            ));
+        }
         if !record.requests.take(1, p.requests, p.request_burst, now) {
             self.penalize(key, record, now);
-            return Err(anyhow!("connection rate limit"));
+            let wait = record.requests.wait(1, p.requests, p.request_burst);
+            return Err(record.refusal("connection rate limit", wait, now));
         }
         record.active += 1;
         record.last = now;
@@ -656,21 +708,30 @@ impl Session {
                 .expect("active sessions retain their accounting entry");
             if !self.worker.load(Ordering::Relaxed) && now < record.cooldown {
                 self.refused.store(true, Ordering::Relaxed);
-                return Err(anyhow!("temporary network cooldown"));
+                let refusal = "temporary network cooldown";
+                return Err(record.refusal(refusal, Some(Duration::ZERO), now));
             }
             let p = self.guard.key_policy(key);
-            if !record
+            // The first bucket that refuses says when this charge fits again.
+            let wait = if !record
                 .requests
                 .take(requests, p.requests, p.request_burst, now)
-                || !record.bytes.take(bytes, p.bytes, p.byte_burst, now)
-                || !record.work.take(work, p.work, p.work_burst, now)
             {
+                Some(record.requests.wait(requests, p.requests, p.request_burst))
+            } else if !record.bytes.take(bytes, p.bytes, p.byte_burst, now) {
+                Some(record.bytes.wait(bytes, p.bytes, p.byte_burst))
+            } else if !record.work.take(work, p.work, p.work_burst, now) {
+                Some(record.work.wait(work, p.work, p.work_burst))
+            } else {
+                None
+            };
+            if let Some(wait) = wait {
                 self.refused.store(true, Ordering::Relaxed);
                 if !penalize {
-                    return Err(Busy("outgoing network budget exhausted").into());
+                    return Err(record.refusal("outgoing network budget exhausted", wait, now));
                 }
                 self.guard.penalize(key, record, now);
-                return Err(anyhow!("network rate budget exhausted"));
+                return Err(record.refusal("network rate budget exhausted", wait, now));
             }
             record.last = now;
         }
@@ -1403,6 +1464,61 @@ mod tests {
         assert!(bucket.take(2, 2, 10, now + Duration::from_secs(1)));
     }
     #[test]
+    fn refusals_say_when_the_same_charge_fits_again() {
+        let wait = |error: anyhow::Error| {
+            let limited = error.downcast::<Limited>().expect("a quota refusal");
+            (limited.reason, limited.retry_after)
+        };
+        let now = Instant::now();
+        let mut bucket = Bucket::new(10, now);
+        assert!(bucket.take(10, 4, 10, now));
+        assert!(!bucket.take(3, 4, 10, now));
+        assert_eq!(bucket.wait(3, 4, 10), Some(Duration::from_millis(750)));
+        assert_eq!(bucket.wait(11, 4, 10), None);
+        assert!(!bucket.take(3, 4, 10, now + Duration::from_millis(749)));
+        assert!(bucket.take(3, 4, 10, now + Duration::from_millis(750)));
+
+        let guard = Arc::new(NetworkGuard::default());
+        let ip: IpAddr = "192.0.2.9".parse().unwrap();
+        let session = guard.admit(ip, Surface::Rpc).unwrap();
+        session.work(1_048_576).unwrap();
+        // One second of refill is missing. The 250 ms cooldown the refusal
+        // starts ends sooner, so the answer is when the charge fits again.
+        let refused = Instant::now();
+        let (reason, retry) = wait(session.work(131_072).unwrap_err());
+        assert_eq!(reason, "network rate budget exhausted");
+        let retry = retry.unwrap();
+        assert!(
+            retry > Duration::from_millis(900) && retry <= Duration::from_secs(1),
+            "{retry:?}"
+        );
+        // A new connection during the cooldown is told when it ends.
+        let (reason, retry) = wait(
+            guard
+                .admit_at(ip, Surface::Rpc, Direction::Inbound, refused)
+                .err()
+                .unwrap(),
+        );
+        assert_eq!(reason, "temporary network cooldown");
+        let retry = retry.unwrap();
+        assert!(
+            retry > Duration::from_millis(200)
+                && retry <= Duration::from_millis(250) + refused.elapsed(),
+            "{retry:?}"
+        );
+        // A charge above the whole burst can never be admitted.
+        let other = guard.admit("192.0.2.10".parse().unwrap(), Surface::Rpc);
+        let (_, retry) = wait(other.unwrap().work(1_048_577).unwrap_err());
+        assert_eq!(retry, None);
+        // An exhausted reply budget says when to retry and starts no cooldown.
+        let outbound = guard.admit_outbound(ip, Surface::Peer).unwrap();
+        outbound.outgoing(0, 65_536).unwrap();
+        let (reason, retry) = wait(outbound.outgoing(0, 16_384).unwrap_err());
+        assert_eq!(reason, "outgoing network budget exhausted");
+        assert!(retry.unwrap() <= Duration::from_secs(1));
+        assert!(guard.admit_outbound(ip, Surface::Peer).is_ok());
+    }
+    #[test]
     fn public_proxy_cannot_be_banned_by_one_visitor_but_quotas_still_apply() {
         let guard = Arc::new(NetworkGuard::for_public_web());
         for ip in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
@@ -1638,8 +1754,15 @@ mod tests {
         // Inbound cooldown and connection use from a shared address cannot
         // block this node's own outbound synchronization to it.
         let outbound = guard.admit_outbound(ip, Surface::Peer).unwrap();
+        // Past the whole burst: refused without penalty, and no wait helps.
         let error = outbound.outgoing(0, 65_537).unwrap_err();
-        assert!(error.is::<Busy>());
+        assert!(matches!(
+            error.downcast_ref::<Limited>(),
+            Some(Limited {
+                retry_after: None,
+                ..
+            })
+        ));
         assert!(outbound.outgoing(0, 65_536).is_ok());
         drop(outbound);
         assert!(guard.admit_outbound(ip, Surface::Peer).is_ok());

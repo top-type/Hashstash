@@ -1037,6 +1037,7 @@ struct Prepared {
     anchor_height: u64,
     nonce: NonceSource,
     fee: Option<(FeeBreakdown, Amount)>,
+    scheduled_change: Option<String>,
 }
 impl Prepared {
     /// Context the signed body alone does not show, including what the endpoint chose.
@@ -1071,6 +1072,7 @@ impl Prepared {
             ),
             None => "Fee source: exact --fee".to_owned(),
         });
+        notes.extend(self.scheduled_change.clone());
         if !client.is_loopback()
             && self.body.expiry_blocks > wallet::default_expiry_blocks(&self.body.operation)
         {
@@ -1168,6 +1170,28 @@ async fn prepare_verified(
         anchor_height,
         nonce,
         fee,
+        scheduled_change: scheduled_change_note(&quote),
+    })
+}
+
+/// A warning for a fee-rate increase or capacity decrease that the endpoint
+/// reports within this lifetime. Advisory only: the signed body is unchanged.
+fn scheduled_change_note(quote: &Value) -> Option<String> {
+    let change = quote.get("scheduled_change")?;
+    if change["valid_after"] != false {
+        return None;
+    }
+    let height = change["effective_height"].as_u64()?;
+    Some(match change["parameter"].as_str()? {
+        "MinimumFeeRate" => format!(
+            "warning: the minimum fee rises to {} atoms from block {height}; this transaction is valid only before that block unless --fee or --extra-fee covers it",
+            change["minimum_fee"].as_str()?
+        ),
+        "BlockBytes" => format!(
+            "warning: block capacity falls to {} from block {height}; this transaction is valid only before that block",
+            change["value"].as_str()?
+        ),
+        _ => return None,
     })
 }
 
@@ -2218,6 +2242,22 @@ mod tests {
         // Audit F046: a Propose always pays for its proposal record.
         quote["weight"] = json!((weight - fees::RECORD_WEIGHT).to_string());
         assert!(verify_automatic_fee(&body, &quote, &status, &0u32.into()).is_err());
+    }
+
+    #[test]
+    fn prepared_notes_warn_about_a_change_due_within_the_lifetime() {
+        // Audit F157: the endpoint reports a pending fee-rate increase or
+        // capacity decrease; the CLI warns instead of silently signing.
+        let change = |parameter: &str, valid: bool| {
+            json!({"scheduled_change":{"parameter":parameter,"value":"2","activation_height":11,
+                "effective_height":12,"minimum_fee":"3","valid_after":valid}})
+        };
+        let note = scheduled_change_note(&change("MinimumFeeRate", false)).unwrap();
+        assert!(note.contains("3 atoms from block 12"), "{note}");
+        let note = scheduled_change_note(&change("BlockBytes", false)).unwrap();
+        assert!(note.contains("capacity falls to 2 from block 12"), "{note}");
+        assert!(scheduled_change_note(&change("MinimumFeeRate", true)).is_none());
+        assert!(scheduled_change_note(&json!({})).is_none());
     }
 
     #[test]

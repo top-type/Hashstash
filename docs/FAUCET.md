@@ -62,7 +62,11 @@ claim-count caps allow up to 100 hashes per hour, 250 hashes per day, and 1,000
 hashes over the ledger's lifetime. The service additionally limits each exact
 quoted fee to 0.01 hash.
 This is a local spending allowance, not an encoded transaction cap. Pending
-and expired claims consume the allowance too. Changing the payout does not
+and expired claims consume the allowance too. When a passed MinimumFeeRate
+increase or BlockBytes decrease takes effect within a claim's lifetime, the
+node's quote reports it and the faucet refuses the claim before signing, so the
+visitor can retry once the change is active instead of spending an allowance on
+a payment with only one usable block. Changing the payout does not
 reset these counts; historical payments retain the amounts paid at the time. This
 limits the dispenser's exposure; IP limits are not proof of unique people. To
 extend an exhausted lifetime allowance, raise `lifetime_claims` (up to

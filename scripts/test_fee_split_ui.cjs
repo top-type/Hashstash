@@ -47,6 +47,15 @@ async function run(){
   h.get('send-form').elements.amount.value=amounts.exactInput('11');await h.get('send-form').fire('input');await h.timersDue();s.status.settings.minimum_fee_rate=4;s.status.fee_policy.minimum_fee_rate='4';await h.refresh();pending.resolve(response({result:old}));await settle();eq(h.get('send-submit').disabled,true,'fee rate change invalidates an in-flight payment quote');
   delete h.handlers.transfer_quote;await h.send('11');eq(h.get('send-submit').disabled,false);eq(h.get('send-fee-quote').textContent,amounts.formatExactHash('2'),'fresh quote uses governed rate with ceiling division');
  }
+ {
+  // Audit F157: a fee-rate increase due within the lifetime is shown without
+  // blocking a fee that is valid now.
+  const h=await setup(),original=h.fee,f=h.get('send-form');
+  h.fee=p=>({...original(p),scheduled_change:{parameter:'MinimumFeeRate',value:'2',activation_height:21,effective_height:22,minimum_fee:'9',valid_after:false}});
+  await h.send('10');ok(h.get('send-fee-error').textContent.includes('from block 22'),h.get('send-fee-error').textContent);eq(h.get('send-fee-error').hidden,false);eq(h.get('send-submit').disabled,false,'the warning does not block a fee that is valid now');
+  h.fee=p=>({...original(p),scheduled_change:{parameter:'MinimumFeeRate',value:'2',activation_height:21,effective_height:22,minimum_fee:'1',valid_after:true}});
+  f.elements.amount.value=amounts.exactInput('11');await f.fire('input');await h.timersDue();await settle();eq(h.get('send-fee-error').hidden,true,'a fee that stays valid needs no warning');
+ }
  console.log(`Whole fee split UI: ${checks} checks passed`);
 }
 run().catch(e=>{console.error(e);process.exitCode=1;});

@@ -1065,8 +1065,17 @@
             allocation.title = "The entire fee, including the optional extra, follows the miner/revenue split in effect when the transaction is included.";
             allocation.hidden = false;
         }
-        feeError(form, "");
+        feeError(form, scheduledChangeNote(result));
         modeButtons();
+    }
+    // A pending fee-rate increase or capacity decrease that takes effect within
+    // the transaction's lifetime leaves it valid only for the blocks before.
+    function scheduledChangeNote(result) {
+        const change = result.scheduled_change;
+        if (!change || change.valid_after !== false || !Number.isSafeInteger(change.effective_height) || !/^(0|[1-9]\d{0,159})$/.test(String(change.minimum_fee))) return "";
+        if (change.parameter === "MinimumFeeRate") return `The minimum fee rises to ${formatExactHash(change.minimum_fee)} from block ${commas(change.effective_height)}, so this transaction is valid only before that block. Add the difference as an optional extra to keep its whole lifetime.`;
+        if (change.parameter === "BlockBytes") return `Block capacity falls from block ${commas(change.effective_height)}, and this transaction will no longer fit after that block.`;
+        return "";
     }
     function feeError(form, message) {
         const node = $(form.id.replace("-form", "-fee-error"));

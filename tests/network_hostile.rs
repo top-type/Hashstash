@@ -445,6 +445,17 @@ async fn malformed_http_and_json_fail_closed_without_changing_state_or_listener_
         }
         healthy(&server, &before).await;
     }
+    // Web clients cannot push peer synchronization errors out of the
+    // operator's peer diagnostics.
+    let events = node.rpc("peers", json!({})).unwrap();
+    assert!(
+        events
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| !e["peer"].as_str().unwrap().starts_with("inbound/0/")),
+        "{events}"
+    );
     eprintln!(
         "HTTP malformed corpus: {} isolated requests; state and RPC health preserved",
         cases.len()
@@ -600,7 +611,18 @@ async fn invalid_peer_blocks_cannot_change_committed_state_then_valid_sync_succe
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p2p_admission_saturation_does_not_starve_rpc_or_a_different_peer() {
-    let (_dir, node, server) = isolated().await;
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::open(
+        &dir.path().join("node.sqlite"),
+        configuration(),
+        crypto::public_key(&[101; 32]).unwrap(),
+    )
+    .unwrap();
+    // A configured peer address keeps reserved inbound capacity. Its own
+    // outbound target is closed, so that retry loop only backs off.
+    let mut config = options();
+    config.peers = vec!["127.0.6.9:9".parse().unwrap()];
+    let server = node::serve(node.clone(), config).await.unwrap();
     let before = node.status().unwrap();
     let mut held = Vec::new();
     for _ in 0..4 {
@@ -615,14 +637,18 @@ async fn p2p_admission_saturation_does_not_starve_rpc_or_a_different_peer() {
         "over-limit peer should be closed before parsing"
     );
     valid_peer(server.p2p, &hello(&node), 6, 2).await;
-    // A second address can use the remaining four slots, filling the complete
-    // P2P listener budget while leaving the independent RPC budget available.
-    for _ in 0..4 {
-        let mut stream = connect(server.p2p, 6, 2).await;
-        stream.write_all(b"{").await.unwrap();
-        held.push(stream);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Loopback addresses keep per-address limits only, so four of them fill
+    // every general inbound slot, while the RPC budget stays independent.
+    // Public sources are additionally limited per network group.
+    for host in 2..=4 {
+        for _ in 0..4 {
+            let mut stream = connect(server.p2p, 6, host).await;
+            stream.write_all(b"{").await.unwrap();
+            held.push(stream);
+        }
     }
-    let mut global_excess = connect(server.p2p, 6, 3).await;
+    let mut global_excess = connect(server.p2p, 6, 5).await;
     assert!(
         read_closed(&mut global_excess, Instant::now() + FAST_DEADLINE)
             .await
@@ -631,12 +657,54 @@ async fn p2p_admission_saturation_does_not_starve_rpc_or_a_different_peer() {
     for _ in 0..8 {
         healthy(&server, &before).await;
     }
+    // A configured peer still synchronizes through reserved capacity.
+    valid_peer(server.p2p, &hello(&node), 6, 9).await;
     drop(held);
     // Admission alone should not permanently ban an address. Allow tasks to
     // observe the closed sockets, then retry a well-formed local handshake.
     tokio::time::sleep(Duration::from_millis(100)).await;
     healthy(&server, &before).await;
-    valid_peer(server.p2p, &hello(&node), 6, 3).await;
+    valid_peer(server.p2p, &hello(&node), 6, 5).await;
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn first_peer_message_is_bounded_before_its_body_is_read() {
+    let (_dir, node, server) = isolated().await;
+    let before = node.status().unwrap();
+    let limits = Limits::from_config(&configuration());
+    // A first message is a locator request: a declared length beyond that
+    // allowance closes at once instead of buffering a full block frame.
+    let mut stream = connect(server.p2p, 16, 1).await;
+    stream
+        .write_all(&((limits.locator_request_bytes() + 1) as u32).to_be_bytes())
+        .await
+        .unwrap();
+    assert!(
+        read_closed(&mut stream, Instant::now() + FAST_DEADLINE)
+            .await
+            .is_empty()
+    );
+    // Blocks are never accepted in a first message.
+    let d = tempfile::tempdir().unwrap();
+    let chain = Chain::open(&d.path().join("source.sqlite"), configuration()).unwrap();
+    let block = Chain::mine(
+        chain
+            .template(
+                crypto::public_key(&[104; 32]).unwrap(),
+                vec![],
+                chain.config.genesis_time + 2,
+            )
+            .unwrap(),
+        100_000,
+    )
+    .unwrap();
+    let mut request = hello(&node);
+    request.blocks.push(block);
+    assert!(exchange(server.p2p, 16, 2, &peer_bytes(&request)).await.is_empty());
+    assert_eq!(node.status().unwrap()["tip"], before["tip"]);
+    valid_peer(server.p2p, &hello(&node), 16, 3).await;
+    healthy(&server, &before).await;
     server.stop().await;
 }
 

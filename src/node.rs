@@ -7,7 +7,7 @@ use crate::{
     crypto,
     explorer::Explorer,
     fees, math,
-    network_guard::{self, NetworkGuard, Session, Surface},
+    network_guard::{self, NetworkGuard, PeerSlots, Session, Surface},
     peer_auth::{Channel as PeerChannel, Policy as PeerPolicy},
     peer_discovery::{self, AddressBook, Options as DiscoveryOptions},
     peer_wire::{self, Message as PeerPacket, Sync as PeerMessage},
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock, Weak,
@@ -202,6 +202,11 @@ fn mempool_hex_page(pool: &[Transaction], offset: usize, limit: usize) -> Result
 }
 
 const MAX_BATCH: usize = peer_wire::MAX_BLOCKS;
+// One reply's block work plus the recipient's loose-transaction and mempool
+// reselection terms stays within one second of peer work refill.
+const PEER_BATCH_WORK: usize = network_guard::PEER_WORK_PER_SECOND as usize
+    - peer_wire::MAX_TRANSACTIONS
+    - MAX_ADAPTIVE_MEMPOOL;
 const MAX_SNAPSHOT_KEYS: usize = 256;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 const VERSION_MASK: u32 = 0x1fffe000;
@@ -493,7 +498,7 @@ pub struct Node {
     wallets: Arc<Mutex<WalletStore>>,
     startup_wallet_mode: Option<&'static str>,
     rpc_sessions: Arc<Semaphore>,
-    peer_sessions: Arc<Semaphore>,
+    peer_sessions: Arc<PeerSlots>,
     rpc_parsers: Arc<Semaphore>,
     peer_parsers: Arc<Semaphore>,
     stratum_parsers: Arc<Semaphore>,
@@ -507,7 +512,8 @@ pub struct Node {
     outbound_sessions: Arc<Semaphore>,
     mining: Arc<Mutex<MiningRuntime>>,
     work_updates: watch::Sender<u64>,
-    mining_session_ids: Arc<AtomicU64>,
+    mining_session_ids: Arc<Mutex<SessionIds>>,
+    listener_health: Arc<Mutex<HashMap<&'static str, ListenerHealth>>>,
     peer_auth: Option<Arc<PeerPolicy>>,
     peer_health: Arc<Mutex<HashMap<SocketAddr, PeerHealth>>>,
     discovery_options: DiscoveryOptions,
@@ -523,6 +529,41 @@ struct PeerHealth {
     last_attempt: u64,
     last_success: u64,
     failures: u32,
+}
+/// Accept failures never stop a listener; they are counted for `peerstatus`.
+#[derive(Default, Serialize)]
+struct ListenerHealth {
+    accept_errors: u64,
+    last_error: Option<String>,
+    last_error_at: u64,
+}
+/// Live Stratum extranonces. A wrapped counter skips every value still held
+/// by a connected session, so admission never depends on a lifetime count.
+#[derive(Default)]
+struct SessionIds {
+    next: u32,
+    live: HashSet<u32>,
+}
+struct SessionId(Arc<Mutex<SessionIds>>, u32);
+impl SessionIds {
+    fn allocate(ids: &Arc<Mutex<Self>>) -> Option<SessionId> {
+        let mut state = ids.lock().ok()?;
+        // Live IDs are bounded by the listener's connection limit.
+        loop {
+            let id = state.next;
+            state.next = state.next.wrapping_add(1);
+            if state.live.insert(id) {
+                return Some(SessionId(ids.clone(), id));
+            }
+        }
+    }
+}
+impl Drop for SessionId {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.lock() {
+            state.live.remove(&self.1);
+        }
+    }
 }
 impl Node {
     pub fn open(path: &Path, config: Config, miner: PublicKey) -> Result<Self> {
@@ -545,6 +586,15 @@ impl Node {
             &inner.chain.config,
             inner.chain.max_known_block_bytes(),
         )?));
+        // One block at the genesis signature limit, with a full loose batch and
+        // mempool reselection, must always fit a single peer work burst.
+        guard.allow_work(
+            inner
+                .chain
+                .config
+                .max_signatures
+                .saturating_add(1 + peer_wire::MAX_TRANSACTIONS + MAX_ADAPTIVE_MEMPOOL),
+        )?;
         let explorer_config = inner.chain.config.clone();
         let discovery_path = peer_discovery::path_for(path, inner.chain.chain_id());
         let mut discovery_id = [0; 32];
@@ -564,7 +614,7 @@ impl Node {
             wallets: Arc::new(Mutex::new(wallets)),
             startup_wallet_mode: None,
             rpc_sessions: Arc::new(Semaphore::new(8)),
-            peer_sessions: Arc::new(Semaphore::new(8)),
+            peer_sessions: Arc::new(PeerSlots::default()),
             rpc_parsers: Arc::new(Semaphore::new(2)),
             peer_parsers: Arc::new(Semaphore::new(2)),
             stratum_parsers: Arc::new(Semaphore::new(2)),
@@ -578,7 +628,8 @@ impl Node {
             outbound_sessions: Arc::new(Semaphore::new(2)),
             mining: Arc::new(Mutex::new(MiningRuntime::default())),
             work_updates: watch::channel(0).0,
-            mining_session_ids: Arc::new(AtomicU64::new(0)),
+            mining_session_ids: Arc::new(Mutex::new(SessionIds::default())),
+            listener_health: Arc::new(Mutex::new(HashMap::new())),
             peer_auth: None,
             peer_health: Arc::new(Mutex::new(HashMap::new())),
             discovery_options: DiscoveryOptions::default(),
@@ -627,14 +678,21 @@ impl Node {
             .map_err(|_| anyhow!("peer discovery lock poisoned"))?;
         let discovery_status = match discovery.as_ref() {
             Some(book) => {
-                json!({"enabled":true,"known":book.entries().count(),"verified":book.entries().filter(|e|e.last_success>0).count(),"advertise":book.options.advertise,"seeds":book.options.seeds,"last_error":book.last_error,"peers":book.entries().collect::<Vec<_>>()})
+                json!({"enabled":true,"known":book.entries().count(),"verified":book.entries().filter(|e|e.last_success>0).count(),"advertise":book.options.advertise,"seeds":book.options.seeds,"last_error":book.last_error,"load_error":book.load_error,"peers":book.entries().collect::<Vec<_>>()})
             }
             None => json!({"enabled":false}),
         };
+        drop(discovery);
+        let listeners = json!(
+            *self
+                .listener_health
+                .lock()
+                .map_err(|_| anyhow!("listener health lock poisoned"))?
+        );
         Ok(
             json!({"transport":if self.peer_auth.as_ref().is_some_and(|p|p.is_discovery()){"authenticated-discovery"}else if self.peer_auth.is_some(){"pinned-signed"}else{"compact-binary"}, "wire_format":"compact-binary",
             "public_key":self.peer_auth.as_ref().map(|p|hex::encode(p.public_key())), "peers":peers,
-            "discovery":discovery_status,
+            "discovery":discovery_status, "listeners":listeners,
             "observed_at":at, "encrypted":false,
             "chain_height":self.read_view()?.chain.tip_height(),
             "seconds_without_new_tip":at.saturating_sub(self.last_tip_change.load(Ordering::Relaxed)),
@@ -723,6 +781,34 @@ impl Node {
         self.inner
             .lock()
             .map_err(|_| anyhow!("node state lock poisoned"))
+    }
+    fn listener_error(&self, kind: i32, error: &std::io::Error, delay: Duration) {
+        let name = match kind {
+            0 => "rpc",
+            1 => "p2p",
+            2 => "stratum",
+            _ => "public_web",
+        };
+        if let Ok(mut health) = self.listener_health.lock() {
+            let entry = health.entry(name).or_default();
+            entry.accept_errors = entry.accept_errors.saturating_add(1);
+            entry.last_error = Some(error.to_string().chars().take(256).collect());
+            entry.last_error_at = now();
+        }
+        // Per-connection resets are only counted; resource errors are logged
+        // at most once per backoff interval.
+        if !delay.is_zero() {
+            eprintln!("{name} listener accept failed: {error}; retrying in {delay:?}");
+        }
+    }
+    /// Configured or pinned peers, and discovery peers this node verified in
+    /// the last hour, may use reserved inbound capacity.
+    fn protected_peer(&self, configured: &HashSet<IpAddr>, ip: IpAddr) -> bool {
+        configured.contains(&network_guard::admission_address(ip))
+            || self.discovery.lock().is_ok_and(|book| {
+                book.as_ref()
+                    .is_some_and(|book| book.verified_ip(ip, now()))
+            })
     }
     fn peer_event(&self, peer: String, result: &Result<()>) {
         if let Ok(mut events) = self.peer_events.lock() {
@@ -1002,76 +1088,95 @@ impl Node {
         }
         out
     }
-    fn blocks_after(chain: &Chain, locator: &[Hash]) -> Result<(Vec<Block>, peer_wire::Limits)> {
+    /// Blocks after the best canonical locator match, the recipient's minimum
+    /// admission limits, and the framed block bytes.
+    fn blocks_after(
+        chain: &Chain,
+        locator: &[Hash],
+    ) -> Result<(Vec<Block>, peer_wire::Limits, usize)> {
         ensure!(
             !locator.is_empty() && locator.len() <= 128,
             "invalid locator length"
         );
-        let height = locator
-            .iter()
-            .filter_map(|h| chain.block(h).map(|b| (*h, b.height)))
-            .filter(|(h, height)| chain.hash_at_height(*height) == Some(*h))
-            .max_by_key(|(_, height)| *height)
-            .map(|(_, h)| h)
-            .context("no common ancestor")?;
+        // An untrusted locator is matched through the header index only: no
+        // block body is decoded and no historical state is rebuilt for it.
+        let mut seen = HashSet::new();
+        let mut height = None;
+        for hash in locator.iter().filter(|h| seen.insert(**h)) {
+            if let Some(h) = chain.block_height(hash)?
+                && chain.hash_at_height(h) == Some(*hash)
+            {
+                height = height.max(Some(h));
+            }
+        }
+        let height = height.context("no common ancestor")?;
+        // The recipient validated this common ancestor, so its admission
+        // allowance covers the genesis capacity and the ancestor's post-state
+        // capacity. The next active body proves a lower bound for the latter;
+        // at the tip the current state gives it exactly. Stop before a larger
+        // newly governed block so the recipient can first validate the
+        // transition and increase its allowance on the next synchronization.
+        let tip = chain.tip_height();
+        let mut capacity = chain.config.initial.block_bytes;
+        if height == tip {
+            capacity = capacity.max(chain.tip_state().settings.block_bytes);
+        }
+        let mut limits = peer_wire::Limits::for_capacity(&chain.config, capacity);
         let mut out = Vec::new();
         let mut size = 0usize;
-        // The recipient has validated this common ancestor. Stop before a
-        // larger newly governed block so it can first validate the transition
-        // and increase its admission allowance on the next synchronization.
-        let ancestor = chain
-            .hash_at_height(height)
-            .context("common ancestor missing")?;
-        let parent = chain
-            .state_at(&ancestor)
-            .context("common ancestor state missing")?;
-        let limits = peer_wire::Limits::for_capacity(&chain.config, parent.settings.block_bytes);
-        let block_budget = limits
-            .block_bytes
-            .checked_add(MAX_BATCH * 9)
-            .context("peer block batch budget overflow")?
-            .min(
-                limits
-                    .frame_bytes()
-                    .saturating_sub(peer_wire::SYNC_OVERHEAD_BYTES),
-            );
-        for h in height + 1..=chain.tip_height() {
+        let mut work = 0usize;
+        for h in height + 1..=tip {
             if out.len() >= MAX_BATCH {
                 break;
             }
             let b = chain
                 .block(&chain.hash_at_height(h).context("active height missing")?)
                 .context("active block missing")?;
-            let bytes = peer_wire::record_size(codec::encode(&b).len())?;
-            if bytes > block_budget && out.is_empty() {
-                bail!(
-                    "valid block exceeds local peer wire capacity; import requires a larger transport representation"
-                );
+            if out.is_empty() {
+                capacity = capacity.max(u64::try_from(codec::body_size(&b)?)?);
+                limits = peer_wire::Limits::for_capacity(&chain.config, capacity);
             }
+            let block_budget = limits.block_batch_bytes().min(
+                limits
+                    .frame_bytes()
+                    .saturating_sub(peer_wire::SYNC_OVERHEAD_BYTES),
+            );
+            let record = codec::encode(&b).len();
+            let bytes = peer_wire::record_size(record)?;
             let next_size = size
                 .checked_add(bytes)
                 .context("peer block batch length overflow")?;
-            if next_size > block_budget {
+            // Work is bounded per reply as well as bytes; the first block is
+            // always sent, and its work fits the scaled peer burst.
+            let next_work = work.saturating_add(b.transactions.len() + 1);
+            if out.is_empty() {
+                if record > limits.block_bytes || bytes > block_budget {
+                    bail!(
+                        "valid block exceeds local peer wire capacity; import requires a larger transport representation"
+                    );
+                }
+            } else if record > limits.block_bytes
+                || next_size > block_budget
+                || next_work > PEER_BATCH_WORK
+            {
                 break;
             }
             size = next_size;
+            work = next_work;
             out.push(b);
         }
-        Ok((out, limits))
+        Ok((out, limits, size))
     }
     fn peer_snapshot(&self, locator: Option<&[Hash]>) -> Result<PeerMessage> {
         let mut i = self.locked()?;
-        let (blocks, peer_limits) = match locator {
+        let (blocks, peer_limits, blocks_bytes) = match locator {
             Some(l) => Self::blocks_after(&i.chain, l)?,
-            None => (Vec::new(), peer_wire::Limits::from_config(&i.chain.config)),
+            None => (
+                Vec::new(),
+                peer_wire::Limits::from_config(&i.chain.config),
+                0,
+            ),
         };
-        let blocks_bytes = blocks
-            .iter()
-            .try_fold(0usize, |total, block| -> Result<usize> {
-                total
-                    .checked_add(peer_wire::record_size(codec::encode(block).len())?)
-                    .context("peer block framing length overflow")
-            })?;
         let transaction_budget = peer_limits.transaction_batch_bytes().min(
             peer_limits
                 .frame_bytes()
@@ -1145,10 +1250,32 @@ impl Node {
                 && msg.locator.len() <= 128,
             "peer batch limit exceeded"
         );
+        let config = self.read_view()?.chain.config.clone();
         for b in &msg.blocks {
-            self.submit_block(b.clone())?;
-            let mut i = self.locked()?;
             let hash = codec::block_hash(b);
+            let known = {
+                let i = self.locked()?;
+                match i.chain.block_height(&hash)? {
+                    // A stored active block is never download progress: any
+                    // peer could resend one without proof of work to push
+                    // competing-branch cursors out.
+                    Some(height) if i.chain.hash_at_height(height) == Some(hash) => continue,
+                    known => known.is_some(),
+                }
+            };
+            if !known {
+                // Every valid block meets its own compact target within the
+                // genesis limit. Check that before copying or hashing a large
+                // record under the node lock.
+                let target = math::target_from_bits(b.header.bits)?;
+                ensure!(
+                    target <= math::target_from_bits(config.limit_bits)?,
+                    "block target exceeds the network limit"
+                );
+                math::check_pow(&b.header, &target)?;
+                self.submit_block(b.clone())?;
+            }
+            let mut i = self.locked()?;
             // Replace the preceding cursor for this branch, so normal downloads
             // consume one entry each rather than one per batch.
             // Retain accepted progress even if a later message entry is invalid.
@@ -1982,12 +2109,32 @@ async fn write_json<W: AsyncWrite + Unpin>(w: &mut W, value: &impl Serialize) ->
     timeout(IO_TIMEOUT, w.write_all(&bytes)).await??;
     Ok(())
 }
+/// One per peer connection. A signed session can never revert to unsigned
+/// frames: if its channel is lost, every later read or write fails closed.
+enum PeerTransport {
+    Plain,
+    Signed(PeerChannel),
+    Failed,
+}
+/// The expected message and read allowance for one peer frame.
+#[derive(Clone, Copy, PartialEq)]
+enum PeerRead {
+    /// A connection's first message: a locator request or address request.
+    Request,
+    Sync,
+    Ack,
+    Addresses,
+}
+/// A write allows the ordinary deadline plus one second per whole MiB sent.
+fn peer_write_timeout(bytes: usize) -> Duration {
+    IO_TIMEOUT + Duration::from_secs(bytes as u64 / (1024 * 1024))
+}
 async fn write_peer<W: AsyncWrite + Unpin>(
     node: &Node,
     write: &mut W,
     message: PeerPacket,
     admission: &Session,
-    auth: &mut Option<PeerChannel>,
+    transport: &mut PeerTransport,
 ) -> Result<()> {
     let work = match &message {
         PeerPacket::Sync(message) => {
@@ -2002,25 +2149,28 @@ async fn write_peer<W: AsyncWrite + Unpin>(
         PeerPacket::GetAddresses { .. } => 1,
         PeerPacket::Addresses { addresses, .. } => addresses.len().max(1),
     };
-    admission.work(work.max(1))?;
+    // This node chose the reply. Its budget bounds amplification, but an
+    // exhausted budget never penalizes the recipient's address.
+    admission.outgoing(0, work.max(1))?;
     let limits = node.peer_limits()?;
     let permit = timeout(IO_TIMEOUT, node.peer_workers.clone().acquire_owned()).await??;
-    let mut channel = auth.take();
-    let (bytes, channel) = tokio::task::spawn_blocking(move || -> Result<_> {
+    let mut mode = std::mem::replace(transport, PeerTransport::Failed);
+    let (bytes, mode) = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let payload = peer_wire::encode(&message, limits)?;
-        let bytes = if let Some(auth) = &mut channel {
-            auth.seal(payload)?
-        } else {
-            peer_wire::frame(&payload, limits.frame_bytes())?
-        };
-        Ok((bytes, channel))
+        let bytes = peer_wire::encode(&message, limits).and_then(|payload| match &mut mode {
+            PeerTransport::Signed(channel) => channel.seal(payload),
+            PeerTransport::Plain => peer_wire::frame(&payload, limits.frame_bytes()),
+            PeerTransport::Failed => Err(anyhow!("peer transport failed closed")),
+        });
+        // The channel returns on every path, including encoding errors.
+        (bytes, mode)
     })
     .await
-    .context("peer serialization worker failed")??;
-    *auth = channel;
-    admission.bytes(bytes.len())?;
-    timeout(IO_TIMEOUT, write.write_all(&bytes)).await??;
+    .context("peer serialization worker failed")?;
+    *transport = mode;
+    let bytes = bytes?;
+    admission.outgoing(bytes.len(), 0)?;
+    timeout(peer_write_timeout(bytes.len()), write.write_all(&bytes)).await??;
     Ok(())
 }
 enum JsonBody {
@@ -2063,49 +2213,44 @@ async fn read_peer_packet<R: AsyncBufRead + Unpin>(
     r: &mut R,
     node: &Node,
     admission: &Session,
-    auth: &mut Option<PeerChannel>,
-    acknowledgment: bool,
-) -> Result<PeerPacket> {
-    read_peer_packet_bounded(r, node, admission, auth, acknowledgment, None).await
-}
-async fn read_peer_packet_bounded<R: AsyncBufRead + Unpin>(
-    r: &mut R,
-    node: &Node,
-    admission: &Session,
-    auth: &mut Option<PeerChannel>,
-    acknowledgment: bool,
-    bound: Option<usize>,
+    transport: &mut PeerTransport,
+    kind: PeerRead,
 ) -> Result<PeerPacket> {
     admission.request()?;
     let limits = node.peer_limits()?;
-    let maximum = if acknowledgment {
-        peer_wire::ACK_BYTES
-    } else {
-        bound.unwrap_or_else(|| limits.frame_bytes())
+    // A first message carries no blocks, so it never needs a block allowance.
+    let maximum = match kind {
+        PeerRead::Request => limits.locator_request_bytes(),
+        PeerRead::Sync => limits.frame_bytes(),
+        PeerRead::Ack => peer_wire::ACK_BYTES,
+        PeerRead::Addresses => peer_wire::DISCOVERY_BYTES,
     };
-    let exchange_timeout = if bound.is_some() {
+    let exchange_timeout = if kind == PeerRead::Addresses {
         IO_TIMEOUT
     } else {
         node.peer_exchange_timeout()?
     };
-    let result = if let Some(auth) = auth {
-        timeout(
+    let result = match transport {
+        PeerTransport::Signed(channel) => timeout(
             exchange_timeout,
-            auth.read(r, maximum, admission, node.peer_parsers.clone()),
+            channel.read(r, maximum, admission, node.peer_parsers.clone()),
         )
         .await
         .map_err(anyhow::Error::from)
-        .and_then(|v| v)
-    } else {
-        timeout(exchange_timeout, read_peer_frame(r, maximum, admission))
+        .and_then(|v| v),
+        PeerTransport::Plain => timeout(exchange_timeout, read_peer_frame(r, maximum, admission))
             .await
             .map_err(anyhow::Error::from)
-            .and_then(|v| v)
+            .and_then(|v| v),
+        PeerTransport::Failed => Err(anyhow!("peer transport failed closed")),
     };
     let bytes = match result {
         Ok(bytes) => bytes,
         Err(error) => {
-            admission.malformed();
+            // Local memory pressure from other sessions is not this peer's fault.
+            if !error.is::<network_guard::Busy>() {
+                admission.malformed();
+            }
             return Err(error);
         }
     };
@@ -2118,10 +2263,22 @@ async fn read_peer_packet_bounded<R: AsyncBufRead + Unpin>(
     .context("peer decoding worker failed")?;
     match result {
         Ok(packet) => {
-            ensure!(
-                matches!(&packet, PeerPacket::Ack) == acknowledgment,
-                "unexpected peer message type"
+            let expected = matches!(
+                (kind, &packet),
+                (
+                    PeerRead::Request,
+                    PeerPacket::Sync(_) | PeerPacket::GetAddresses { .. }
+                ) | (PeerRead::Sync, PeerPacket::Sync(_))
+                    | (PeerRead::Ack, PeerPacket::Ack)
+                    | (PeerRead::Addresses, PeerPacket::Addresses { .. })
             );
+            ensure!(expected, "unexpected peer message type");
+            if kind == PeerRead::Request
+                && matches!(&packet, PeerPacket::Sync(hello) if !hello.blocks.is_empty())
+            {
+                admission.malformed();
+                bail!("first peer message must be a locator request");
+            }
             let work = match &packet {
                 PeerPacket::Sync(message) => {
                     let incoming = message.transactions.len()
@@ -2154,12 +2311,11 @@ async fn read_peer<R: AsyncBufRead + Unpin>(
     r: &mut R,
     node: &Node,
     admission: &Session,
-    auth: &mut Option<PeerChannel>,
+    transport: &mut PeerTransport,
 ) -> Result<PeerMessage> {
-    match read_peer_packet(r, node, admission, auth, false).await? {
+    match read_peer_packet(r, node, admission, transport, PeerRead::Sync).await? {
         PeerPacket::Sync(message) => Ok(message),
-        PeerPacket::Ack => bail!("unexpected peer acknowledgment"),
-        _ => bail!("unexpected discovery message during synchronization"),
+        _ => bail!("unexpected message during synchronization"),
     }
 }
 async fn read_peer_frame<R: AsyncBufRead + Unpin>(
@@ -2175,6 +2331,7 @@ async fn read_peer_frame<R: AsyncBufRead + Unpin>(
         length >= peer_wire::ACK_BYTES && length <= maximum,
         "peer frame too large or truncated"
     );
+    admission.reserve_frame(length)?;
     let mut out = Vec::with_capacity(length.min(8192));
     let mut chunk = [0u8; 8192];
     while out.len() < length {
@@ -2296,6 +2453,16 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
             });
         }
     }
+    // Configured and pinned peer addresses keep reserved inbound capacity.
+    let protected: Arc<HashSet<IpAddr>> = Arc::new(
+        options
+            .peers
+            .iter()
+            .map(SocketAddr::ip)
+            .chain(node.peer_auth.iter().flat_map(|p| p.pinned_ips()))
+            .map(network_guard::admission_address)
+            .collect(),
+    );
     let rpc = TcpListener::bind(options.rpc).await?;
     let p2p = TcpListener::bind(options.p2p).await?;
     let stratum = if options.stratum_enabled {
@@ -2397,45 +2564,61 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
         let share_difficulty = options.stratum_share_difficulty;
         let mut shutdown = rx.clone();
         let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-        let extranonces = if kind == 2 {
-            node.mining_session_ids.clone()
-        } else {
-            Arc::new(AtomicU64::new(0))
-        };
         let http = if kind == 3 {
             public_http.clone()
         } else {
             private_http.clone()
         };
-        let sessions = if kind == 0 || kind == 3 {
-            http.sessions.clone()
-        } else {
-            node.peer_sessions.clone()
-        };
+        let protected = protected.clone();
         tasks.push(tokio::spawn(async move {
             let mut clients = tokio::task::JoinSet::new();
+            let mut accept_failures = 0u32;
             loop { tokio::select! {
                 _ = shutdown.changed() => break,
                 Some(_) = clients.join_next(), if !clients.is_empty() => {},
                 accepted = listener.accept() => {
-                    let Ok((stream, address)) = accepted else { break };
+                    let (stream, address) = match accepted {
+                        Ok(accepted) => { accept_failures = 0; accepted }
+                        Err(error) => {
+                            // An accept failure never stops the listener or its live sessions.
+                            let delay = accept_retry_delay(&error, accept_failures);
+                            accept_failures = accept_failures.saturating_add(1);
+                            n.listener_error(kind, &error, delay);
+                            tokio::select! { _ = shutdown.changed() => break, _ = tokio::time::sleep(delay) => {} }
+                            continue;
+                        }
+                    };
                     if kind == 1 && n.peer_auth.as_ref().is_some_and(|p| !p.allows_ip(address.ip())) { drop(stream); continue; }
                     let Ok(permit) = limit.clone().try_acquire_owned() else { drop(stream); continue };
-                    let large = if kind != 2 {
-                        let Ok(permit) = sessions.clone().try_acquire_owned() else { drop(stream); continue };
-                        Some(permit)
-                    } else { None };
                     let surface=match kind {0|3=>Surface::Rpc,1=>Surface::Peer,_=>Surface::Stratum};
                     let guard = if kind == 0 || kind == 3 { &http.guard } else { &n.guard };
-                    let Ok(admission)=guard.admit(address.ip(),surface) else {drop(stream);continue};
+                    let (admission, capacity) = if kind == 1 {
+                        // Rate limits and cooldowns apply before slot selection, so a
+                        // connection flood spends its own request budget.
+                        let Ok(admission)=guard.admit(address.ip(),surface) else {drop(stream);continue};
+                        let Some(slot) = n.peer_sessions.try_acquire(address.ip(), n.protected_peer(&protected, address.ip())) else { drop(stream); continue };
+                        (admission, SessionCapacity::Peer(slot))
+                    } else {
+                        let capacity = if kind == 2 {
+                            // Only mining sessions use an extranonce.
+                            let Some(id) = SessionIds::allocate(&n.mining_session_ids) else { drop(stream); continue };
+                            SessionCapacity::Mining(id)
+                        } else {
+                            let Ok(permit) = http.sessions.clone().try_acquire_owned() else { drop(stream); continue };
+                            SessionCapacity::Http(permit)
+                        };
+                        let Ok(admission)=guard.admit(address.ip(),surface) else {drop(stream);continue};
+                        (admission, capacity)
+                    };
+                    let extranonce = match &capacity { SessionCapacity::Mining(id) => id.1, _ => 0 };
                     let node = n.clone(); let password = password.clone(); let http=http.clone();
-                    let next = extranonces.fetch_add(1, Ordering::Relaxed);
-                    let Ok(extranonce) = u32::try_from(next) else { drop(stream); continue };
-                    clients.spawn(async move { let _permit = permit; let _large = large; let _ = stream.set_nodelay(true);
+                    clients.spawn(async move { let _permit = permit; let _capacity = capacity; let _ = stream.set_nodelay(true);
                         let reporter = node.clone();
                         let result = match kind { 0|3 => http_session(node, stream, http, admission).await, 1 => peer_session(node, stream, admission).await, _ => stratum_session(node, stream, password, share_difficulty, extranonce.to_le_bytes(), admission).await };
                         // Peer data is untrusted; individual failures close only that connection.
-                        if result.is_err() { reporter.peer_event(format!("inbound/{kind}/{address}"), &result); }
+                        // Only P2P failures enter the peer diagnostics ring, so web and
+                        // mining clients cannot push synchronization errors out of it.
+                        if kind == 1 && result.is_err() { reporter.peer_event(format!("inbound/{kind}/{address}"), &result); }
                     });
                 }
             }}
@@ -2457,7 +2640,7 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
             let mut failures=0u32;
             loop {
                 let result=tokio::select! { _ = shutdown.changed() => break, result=sync_peer(&n, peer) => result };
-                failures=if result.is_ok()||result.as_ref().is_err_and(|e|e.is::<crate::chain::ValidationDeferred>()){0}else{failures.saturating_add(1)};
+                failures=if sync_completed(&result){0}else{failures.saturating_add(1)};
                 let mut random=[0u8;8];let _=getrandom::fill(&mut random);
                 let delay=network_guard::retry_delay(failures,u64::from_le_bytes(random));
                 tokio::select! { _ = shutdown.changed() => break, _ = tokio::time::sleep(delay) => {} }
@@ -2480,6 +2663,38 @@ fn random_u64() -> u64 {
     let mut bytes = [0; 8];
     let _ = getrandom::fill(&mut bytes);
     u64::from_le_bytes(bytes)
+}
+/// Capacity held for the whole life of one accepted connection; each value
+/// is released by its drop.
+#[allow(dead_code)]
+enum SessionCapacity {
+    Http(tokio::sync::OwnedSemaphorePermit),
+    Peer(network_guard::PeerSlot),
+    Mining(SessionId),
+}
+/// Accept errors never end a listener. A reset or aborted connection is that
+/// client's failure and is skipped at once; other errors, such as descriptor
+/// or memory exhaustion, back off from 10 ms to one second while existing
+/// sessions continue.
+fn accept_retry_delay(error: &std::io::Error, consecutive: u32) -> Duration {
+    use std::io::ErrorKind::*;
+    if consecutive < 64
+        && matches!(
+            error.kind(),
+            ConnectionAborted | ConnectionReset | ConnectionRefused | Interrupted | WouldBlock
+        )
+    {
+        Duration::ZERO
+    } else {
+        Duration::from_millis((10u64 << consecutive.min(7)).min(1000))
+    }
+}
+/// A deferred replay is local validation progress, not a peer failure.
+fn sync_completed(result: &Result<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => error.is::<crate::chain::ValidationDeferred>(),
+    }
 }
 async fn discovery_seed_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
     loop {
@@ -2531,8 +2746,10 @@ async fn discovery_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
                     return (peer, false);
                 };
                 let result = timeout(exchange_timeout.saturating_mul(5), sync_peer(&n, peer)).await;
-                let success = matches!(result, Ok(Ok(())));
-                if success {
+                // A peer serving a deep reorganization while local replay
+                // defers is healthy, exactly as in configured-peer loops.
+                let success = result.as_ref().is_ok_and(sync_completed);
+                if matches!(result, Ok(Ok(()))) {
                     let query = n
                         .discovery
                         .lock()
@@ -2563,26 +2780,46 @@ async fn discovery_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
             _=tokio::time::sleep(Duration::from_millis(200))=>{},
         }
         if now().saturating_sub(saved_at) >= 5 {
-            if let Ok(mut guard) = node.discovery.lock()
-                && let Some(book) = guard.as_mut()
-            {
-                book.last_error = book
-                    .save()
-                    .err()
-                    .map(|e| format!("address book save failed: {e}"));
-            }
+            persist_address_book(&node).await;
             saved_at = now();
         }
     }
     workers.abort_all();
     while workers.join_next().await.is_some() {}
+    persist_address_book(&node).await;
+}
+/// Serialize under the discovery lock only when the persisted form changed;
+/// the file write and its fsync run on a blocking worker without the lock.
+async fn persist_address_book(node: &Node) {
+    let pending = node.discovery.lock().ok().and_then(|mut guard| {
+        let book = guard.as_mut()?;
+        match book.pending_save() {
+            Ok(pending) => pending.map(|bytes| (book.path().to_path_buf(), bytes)),
+            Err(error) => {
+                book.last_error = Some(format!("address book save failed: {error}"));
+                None
+            }
+        }
+    });
+    let Some((path, bytes)) = pending else {
+        return;
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        AddressBook::persist(&path, &bytes).map(|()| bytes)
+    })
+    .await
+    .map_err(|error| anyhow!("address book worker failed: {error}"))
+    .and_then(|result| result);
     if let Ok(mut guard) = node.discovery.lock()
         && let Some(book) = guard.as_mut()
     {
-        book.last_error = book
-            .save()
-            .err()
-            .map(|e| format!("address book save failed: {e}"));
+        match result {
+            Ok(bytes) => {
+                book.mark_saved(bytes);
+                book.last_error = None;
+            }
+            Err(error) => book.last_error = Some(format!("address book save failed: {error}")),
+        }
     }
 }
 async fn discover_peer(node: &Node, peer: SocketAddr) -> Result<()> {
@@ -2595,10 +2832,10 @@ async fn discover_peer(node: &Node, peer: SocketAddr) -> Result<()> {
         policy.is_discovery(),
         "discovery disabled in pinned transport"
     );
-    let admission = node.guard.admit(peer.ip(), Surface::Peer)?;
+    let admission = node.guard.admit_outbound(peer.ip(), Surface::Peer)?;
     let mut stream = timeout(IO_TIMEOUT, TcpStream::connect(peer)).await??;
     let chain = node.read_view()?.chain.chain_id();
-    let mut auth = Some(
+    let mut transport = PeerTransport::Signed(
         timeout(
             IO_TIMEOUT,
             PeerChannel::connect(&mut stream, policy, peer, chain, &admission),
@@ -2616,16 +2853,15 @@ async fn discover_peer(node: &Node, peer: SocketAddr) -> Result<()> {
             advertise: node.discovery_options.advertise,
         },
         &admission,
-        &mut auth,
+        &mut transport,
     )
     .await?;
-    match read_peer_packet_bounded(
+    match read_peer_packet(
         &mut read,
         node,
         &admission,
-        &mut auth,
-        false,
-        Some(peer_wire::DISCOVERY_BYTES),
+        &mut transport,
+        PeerRead::Addresses,
     )
     .await?
     {
@@ -2649,38 +2885,54 @@ async fn discover_peer(node: &Node, peer: SocketAddr) -> Result<()> {
         _ => bail!("unexpected peer discovery response"),
     }
 }
-async fn peer_session(node: Node, mut stream: TcpStream, admission: Session) -> Result<()> {
-    let remote = stream.peer_addr()?;
-    let mut auth = if let Some(policy) = &node.peer_auth {
-        let ip = stream.peer_addr()?.ip();
-        match timeout(
-            IO_TIMEOUT,
-            PeerChannel::accept(
-                &mut stream,
-                policy,
-                ip,
-                node.read_view()?.chain.chain_id(),
-                &admission,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(channel)) => Some(channel),
-            result => {
-                admission.malformed();
-                return Err(match result {
-                    Ok(Err(e)) => e,
-                    Err(e) => e.into(),
-                    _ => unreachable!(),
-                });
-            }
+async fn peer_session(node: Node, stream: TcpStream, admission: Session) -> Result<()> {
+    // An absolute deadline bounds how long one connection holds an inbound
+    // slot, however each individual step is paced.
+    let deadline = node.peer_exchange_timeout()?.saturating_mul(2);
+    match timeout(deadline, peer_session_steps(&node, stream, &admission)).await {
+        Ok(result) => result,
+        Err(_) => {
+            admission.malformed();
+            bail!("peer session exceeded its overall deadline")
         }
+    }
+}
+async fn peer_session_steps(node: &Node, mut stream: TcpStream, admission: &Session) -> Result<()> {
+    let remote = stream.peer_addr()?;
+    // The handshake and first message share one deadline.
+    let first = tokio::time::Instant::now() + node.peer_exchange_timeout()?;
+    let mut transport = if let Some(policy) = &node.peer_auth {
+        // Nothing has been proved before the handshake completes. A failure
+        // here closes the connection without a cooldown that would also hit
+        // honest hosts sharing this source address; rate limits still apply.
+        PeerTransport::Signed(
+            tokio::time::timeout_at(
+                first,
+                PeerChannel::accept(
+                    &mut stream,
+                    policy,
+                    remote.ip(),
+                    node.read_view()?.chain.chain_id(),
+                    admission,
+                ),
+            )
+            .await??,
+        )
     } else {
-        None
+        PeerTransport::Plain
     };
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
-    let hello = match read_peer_packet(&mut read, &node, &admission, &mut auth, false).await? {
+    let request = tokio::time::timeout_at(
+        first,
+        read_peer_packet(&mut read, node, admission, &mut transport, PeerRead::Request),
+    )
+    .await
+    .map_err(|_| {
+        admission.malformed();
+        anyhow!("peer request deadline exceeded")
+    })??;
+    let hello = match request {
         PeerPacket::Sync(hello) => hello,
         PeerPacket::GetAddresses {
             chain,
@@ -2707,28 +2959,24 @@ async fn peer_session(node: Node, mut stream: TcpStream, admission: Session) -> 
                     addresses: book.advertised(now(), random_u64()),
                 }
             };
-            write_peer(&node, &mut write, reply, &admission, &mut auth).await?;
+            write_peer(node, &mut write, reply, admission, &mut transport).await?;
             return Ok(());
         }
         _ => bail!("unexpected first peer message"),
     };
-    ensure!(
-        hello.blocks.is_empty(),
-        "first peer message must be a locator request"
-    );
-    let hello = receive_peer_async(&node, hello).await?;
-    let reply = peer_snapshot_async(&node, Some(hello.locator)).await?;
+    let hello = receive_peer_async(node, hello).await?;
+    let reply = peer_snapshot_async(node, Some(hello.locator)).await?;
     write_peer(
-        &node,
+        node,
         &mut write,
         PeerPacket::Sync(reply),
-        &admission,
-        &mut auth,
+        admission,
+        &mut transport,
     )
     .await?;
-    let push = read_peer(&mut read, &node, &admission, &mut auth).await?;
-    receive_peer_async(&node, push).await?;
-    write_peer(&node, &mut write, PeerPacket::Ack, &admission, &mut auth).await?;
+    let push = read_peer(&mut read, node, admission, &mut transport).await?;
+    receive_peer_async(node, push).await?;
+    write_peer(node, &mut write, PeerPacket::Ack, admission, &mut transport).await?;
     Ok(())
 }
 pub async fn sync_peer(node: &Node, peer: SocketAddr) -> Result<()> {
@@ -2742,11 +2990,7 @@ pub async fn sync_peer(node: &Node, peer: SocketAddr) -> Result<()> {
     if let Ok(mut health) = node.peer_health.lock()
         && let Some(h) = health.get_mut(&peer)
     {
-        if result.is_ok()
-            || result
-                .as_ref()
-                .is_err_and(|e| e.is::<crate::chain::ValidationDeferred>())
-        {
+        if sync_completed(&result) {
             h.last_success = now();
             h.failures = 0;
         } else {
@@ -2778,13 +3022,25 @@ async fn peer_snapshot_async(node: &Node, locator: Option<Vec<Hash>>) -> Result<
     .context("peer snapshot worker failed")?
 }
 async fn sync_peer_inner(node: &Node, peer: SocketAddr) -> Result<()> {
+    // Keep the former five-stage overall budget, growing with the same
+    // validated capacity as individual exchanges. A slow peer can hold one of
+    // the two outbound slots only for this long, and waiting for a slot fails
+    // instead of hanging behind such peers.
+    let deadline = node.peer_exchange_timeout()?.saturating_mul(5);
     // Reserve separate inbound capacity so simultaneous outgoing synchronizations
     // cannot consume every receiving slot on all peers.
-    let _frame_permit = node.outbound_sessions.clone().acquire_owned().await?;
-    let admission = node.guard.admit(peer.ip(), Surface::Peer)?;
+    let _frame_permit = timeout(deadline, node.outbound_sessions.clone().acquire_owned())
+        .await
+        .map_err(|_| anyhow!("outbound peer slots remained busy"))??;
+    timeout(deadline, sync_peer_steps(node, peer))
+        .await
+        .map_err(|_| anyhow!("peer synchronization exceeded its overall deadline"))?
+}
+async fn sync_peer_steps(node: &Node, peer: SocketAddr) -> Result<()> {
+    let admission = node.guard.admit_outbound(peer.ip(), Surface::Peer)?;
     let mut stream = timeout(IO_TIMEOUT, TcpStream::connect(peer)).await??;
-    let mut auth = if let Some(policy) = &node.peer_auth {
-        Some(
+    let mut transport = if let Some(policy) = &node.peer_auth {
+        PeerTransport::Signed(
             timeout(
                 IO_TIMEOUT,
                 PeerChannel::connect(
@@ -2798,7 +3054,7 @@ async fn sync_peer_inner(node: &Node, peer: SocketAddr) -> Result<()> {
             .await??,
         )
     } else {
-        None
+        PeerTransport::Plain
     };
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
@@ -2807,20 +3063,20 @@ async fn sync_peer_inner(node: &Node, peer: SocketAddr) -> Result<()> {
         &mut write,
         PeerPacket::Sync(peer_snapshot_async(node, None).await?),
         &admission,
-        &mut auth,
+        &mut transport,
     )
     .await?;
-    let reply = read_peer(&mut read, node, &admission, &mut auth).await?;
+    let reply = read_peer(&mut read, node, &admission, &mut transport).await?;
     let reply = receive_peer_async(node, reply).await?;
     write_peer(
         node,
         &mut write,
         PeerPacket::Sync(peer_snapshot_async(node, Some(reply.locator)).await?),
         &admission,
-        &mut auth,
+        &mut transport,
     )
     .await?;
-    read_peer_packet(&mut read, node, &admission, &mut auth, true).await?;
+    read_peer_packet(&mut read, node, &admission, &mut transport, PeerRead::Ack).await?;
     Ok(())
 }
 #[derive(Deserialize)]
@@ -5778,11 +6034,314 @@ mod tests {
         };
         let mut config = Config::devnet();
         config.max_signatures = count;
-        let limits = peer_wire::Limits::from_config(&config);
+        // Record admission follows the validated capacity, here 4 MiB.
+        let limits = peer_wire::Limits::for_capacity(&config, 4 * 1024 * 1024);
+        let preset = peer_wire::Limits::from_config(&config);
+        assert!(peer_wire::encode(&PeerPacket::Sync(message.clone()), preset).is_err());
         let wire = peer_wire::encode(&PeerPacket::Sync(message.clone()), limits).unwrap();
         assert_eq!(
             peer_wire::decode(&wire, limits).unwrap(),
             PeerPacket::Sync(message)
+        );
+    }
+}
+
+#[cfg(test)]
+mod peer_tests {
+    use super::*;
+    use crate::peer_auth::Policy;
+
+    fn advance(chain: &mut Chain, miner: PublicKey) -> Block {
+        let timestamp =
+            chain.tip_block().header.timestamp + chain.tip_state().settings.interval as u32;
+        let block =
+            Chain::mine(chain.template(miner, vec![], timestamp).unwrap(), 100_000).unwrap();
+        chain.submit(block.clone(), timestamp as u64).unwrap();
+        block
+    }
+
+    #[test]
+    fn locator_matching_uses_the_index_and_answers_without_historical_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        let miner = crypto::public_key(&[61; 32]).unwrap();
+        let mut chain = Chain::open(&dir.path().join("chain.db"), config.clone()).unwrap();
+        for _ in 0..300 {
+            advance(&mut chain, miner);
+        }
+        let mut side = Chain::open(&dir.path().join("side.db"), config.clone()).unwrap();
+        let fork = advance(&mut side, crypto::public_key(&[62; 32]).unwrap());
+        chain
+            .submit(fork.clone(), fork.header.timestamp as u64)
+            .unwrap();
+        let old = chain.hash_at_height(10).unwrap();
+        // Unknown, repeated and losing-branch hashes are ignored; the best
+        // canonical match wins even far below every cached historical state.
+        let mut locator = vec![[9; 32], codec::block_hash(&fork)];
+        locator.extend(std::iter::repeat_n(old, 120));
+        locator.push(chain.hash_at_height(3).unwrap());
+        let (blocks, limits, size) = Node::blocks_after(&chain, &locator).unwrap();
+        assert_eq!(blocks.len(), MAX_BATCH);
+        assert_eq!(blocks[0].height, 11);
+        assert_eq!(blocks.last().unwrap().height, 10 + MAX_BATCH as u64);
+        assert_eq!(
+            limits.block_bytes,
+            peer_wire::Limits::from_config(&config).block_bytes
+        );
+        let framed = blocks
+            .iter()
+            .map(|b| peer_wire::record_size(codec::encode(b).len()).unwrap())
+            .sum::<usize>();
+        assert_eq!(size, framed);
+        // At the tip the current state supplies the recipient's capacity.
+        let (blocks, limits, size) = Node::blocks_after(&chain, &[chain.tip_hash()]).unwrap();
+        assert!(blocks.is_empty() && size == 0);
+        assert_eq!(
+            limits.block_bytes,
+            peer_wire::Limits::for_capacity(&config, chain.tip_state().settings.block_bytes)
+                .block_bytes
+        );
+        assert!(Node::blocks_after(&chain, &[[9; 32], codec::block_hash(&fork)]).is_err());
+        assert!(Node::blocks_after(&chain, &[]).is_err());
+    }
+
+    #[test]
+    fn catch_up_replies_are_bounded_by_recipient_work_as_well_as_bytes() {
+        use secp256k1::{Keypair, Secp256k1, SecretKey};
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::devnet();
+        // Two of these blocks fit one reply's byte allowance, but not its work.
+        config.max_signatures = PEER_BATCH_WORK / 2;
+        config.initial.block_bytes = 4 * 1024 * 1024;
+        config.initial_bits = 0x1f1fffff;
+        config.limit_bits = config.initial_bits;
+        config.validate().unwrap();
+        let secret = [68; 32];
+        let miner = crypto::public_key(&secret).unwrap();
+        let mut chain = Chain::open(&dir.path().join("work.db"), config.clone()).unwrap();
+        let append = |chain: &mut Chain, transactions: Vec<Transaction>| {
+            let timestamp =
+                chain.tip_block().header.timestamp + chain.tip_state().settings.interval as u32;
+            let block = Chain::mine(
+                chain.template(miner, transactions, timestamp).unwrap(),
+                1_000_000,
+            )
+            .unwrap();
+            chain.submit(block, timestamp as u64).unwrap();
+        };
+        for _ in 0..8 {
+            append(&mut chain, vec![]);
+        }
+        let funded = chain.tip_hash();
+        // One signing context keeps fixture construction fast.
+        let secp = Secp256k1::new();
+        let pair = Keypair::from_secret_key(&secp, &SecretKey::from_byte_array(secret).unwrap());
+        let anchor = codec::block_hash(&codec::genesis_block(&config).unwrap());
+        let mut nonce = 0;
+        for _ in 0..2 {
+            let transactions = (0..config.max_signatures)
+                .map(|_| {
+                    let body = TransactionBody {
+                        sender: miner,
+                        nonce,
+                        fee: 1u32.into(),
+                        anchor,
+                        expiry_blocks: 1000,
+                        operation: Operation::TransferExact {
+                            recipient: miner,
+                            amount: 1u32.into(),
+                        },
+                        data: vec![],
+                    };
+                    nonce += 1;
+                    let message =
+                        crypto::tagged_hash(crypto::TRANSACTION_TAG, &codec::encode(&body));
+                    Transaction {
+                        signature: *secp.sign_schnorr_no_aux_rand(&message, &pair).as_ref(),
+                        body,
+                    }
+                })
+                .collect();
+            append(&mut chain, transactions);
+        }
+        let (blocks, limits, size) = Node::blocks_after(&chain, &[funded]).unwrap();
+        assert!(2 * size < limits.block_batch_bytes());
+        assert_eq!(blocks.len(), 1, "work, not bytes, ends this reply");
+        assert!(blocks[0].transactions.len() + 1 <= PEER_BATCH_WORK);
+        let (blocks, _, _) = Node::blocks_after(&chain, &[codec::block_hash(&blocks[0])]).unwrap();
+        assert_eq!(blocks.len(), 1);
+        // A genesis signature limit above the baseline burst still admits
+        // one complete block message.
+        let mut large = Config::devnet();
+        large.max_signatures = 100_000;
+        let node = Node::open(&dir.path().join("large.db"), large, miner).unwrap();
+        let session = node
+            .guard
+            .admit("127.0.0.1".parse().unwrap(), Surface::Peer)
+            .unwrap();
+        assert!(
+            session
+                .work(100_001 + peer_wire::MAX_TRANSACTIONS + MAX_ADAPTIVE_MEMPOOL)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn known_active_blocks_cannot_push_out_download_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        let node = Node::open(
+            &dir.path().join("node.db"),
+            config.clone(),
+            crypto::public_key(&[63; 32]).unwrap(),
+        )
+        .unwrap();
+        let mut known = Vec::new();
+        for _ in 0..64 {
+            known.push(node.mine(100_000).unwrap());
+        }
+        let cursor = [7; 32];
+        node.locked().unwrap().downloads.push_back(cursor);
+        // Non-adjacent known canonical blocks need no proof of work to resend.
+        let resent = known.iter().step_by(2).take(MAX_BATCH).cloned().collect();
+        let message = PeerMessage {
+            chain: config.chain_id(),
+            locator: vec![],
+            blocks: resent,
+            transactions: vec![],
+        };
+        node.receive_peer(&message).unwrap();
+        node.receive_peer(&message).unwrap();
+        assert_eq!(
+            node.locked()
+                .unwrap()
+                .downloads
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [cursor]
+        );
+        // A stored competing-branch block still restores its branch cursor.
+        let mut side = Chain::open(&dir.path().join("side.db"), config.clone()).unwrap();
+        let fork = advance(&mut side, crypto::public_key(&[64; 32]).unwrap());
+        node.submit_block(fork.clone()).unwrap();
+        node.receive_peer(&PeerMessage {
+            blocks: vec![fork.clone()],
+            ..message.clone()
+        })
+        .unwrap();
+        assert_eq!(
+            node.locked().unwrap().downloads.front(),
+            Some(&codec::block_hash(&fork))
+        );
+        // A block missing its own proof of work is rejected before validation.
+        let mut invalid = side.tip_block().clone();
+        let target = math::target_from_bits(invalid.header.bits).unwrap();
+        while math::check_pow(&invalid.header, &target).is_ok() {
+            invalid.header.nonce = invalid.header.nonce.wrapping_add(1);
+        }
+        let error = node
+            .receive_peer(&PeerMessage {
+                blocks: vec![invalid],
+                ..message
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("proof of work"), "{error}");
+    }
+
+    #[test]
+    fn listener_ids_and_retry_policy_never_end_admission() {
+        let ids = Arc::new(Mutex::new(SessionIds {
+            next: u32::MAX,
+            live: HashSet::from([0]),
+        }));
+        let last = SessionIds::allocate(&ids).unwrap();
+        assert_eq!(last.1, u32::MAX);
+        // The wrapped counter skips an extranonce still held by a session.
+        let wrapped = SessionIds::allocate(&ids).unwrap();
+        assert_eq!(wrapped.1, 1);
+        drop(last);
+        assert!(!ids.lock().unwrap().live.contains(&u32::MAX));
+        use std::io::{Error, ErrorKind};
+        let reset = Error::from(ErrorKind::ConnectionReset);
+        assert_eq!(accept_retry_delay(&reset, 0), Duration::ZERO);
+        assert_eq!(accept_retry_delay(&reset, 64), Duration::from_millis(1000));
+        let exhausted = Error::other("too many open files");
+        assert_eq!(accept_retry_delay(&exhausted, 0), Duration::from_millis(10));
+        assert_eq!(accept_retry_delay(&exhausted, 3), Duration::from_millis(80));
+        assert_eq!(
+            accept_retry_delay(&exhausted, 30),
+            Duration::from_millis(1000)
+        );
+        assert!(sync_completed(&Ok(())));
+        assert!(sync_completed(&Err(
+            crate::chain::ValidationDeferred.into()
+        )));
+        assert!(!sync_completed(&Err(anyhow!("peer closed"))));
+    }
+
+    #[tokio::test]
+    async fn a_failed_signed_write_keeps_its_channel_and_never_downgrades() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        let node = Node::open(
+            &dir.path().join("node.db"),
+            config.clone(),
+            crypto::public_key(&[65; 32]).unwrap(),
+        )
+        .unwrap();
+        let client = Policy::discovery([66; 32], vec![]).unwrap();
+        let server = Policy::discovery([67; 32], vec![]).unwrap();
+        let guard = Arc::new(NetworkGuard::default());
+        let local: IpAddr = "127.0.0.1".parse().unwrap();
+        let (a, b) = (
+            guard.admit_outbound(local, Surface::Peer).unwrap(),
+            guard.admit(local, Surface::Peer).unwrap(),
+        );
+        let (mut left, mut right) = tokio::io::duplex(4096);
+        let chain = config.chain_id();
+        let (channel, _) = tokio::join!(
+            PeerChannel::connect(
+                &mut left,
+                &client,
+                "127.0.0.1:1".parse().unwrap(),
+                chain,
+                &a
+            ),
+            PeerChannel::accept(&mut right, &server, local, chain, &b)
+        );
+        let mut transport = PeerTransport::Signed(channel.unwrap());
+        let genesis = codec::genesis_block(&config).unwrap();
+        // Encoding fails: more blocks than one message may carry.
+        let oversized = PeerPacket::Sync(PeerMessage {
+            chain,
+            locator: vec![],
+            blocks: vec![genesis; MAX_BATCH + 1],
+            transactions: vec![],
+        });
+        let mut sink = Vec::new();
+        assert!(
+            write_peer(&node, &mut sink, oversized, &a, &mut transport)
+                .await
+                .is_err()
+        );
+        assert!(matches!(transport, PeerTransport::Signed(_)));
+        write_peer(&node, &mut sink, PeerPacket::Ack, &a, &mut transport)
+            .await
+            .unwrap();
+        // A signed frame header precedes the payload, never a bare length.
+        assert_eq!(sink.len(), 4 + 8 + 64 + peer_wire::ACK_BYTES);
+        let mut failed = PeerTransport::Failed;
+        assert!(
+            write_peer(&node, &mut sink, PeerPacket::Ack, &a, &mut failed)
+                .await
+                .is_err()
+        );
+        let mut empty: &[u8] = &[];
+        assert!(
+            read_peer_packet(&mut empty, &node, &b, &mut failed, PeerRead::Ack)
+                .await
+                .is_err()
         );
     }
 }

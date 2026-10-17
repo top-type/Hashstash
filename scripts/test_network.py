@@ -59,6 +59,8 @@ class Audit:
         self.port = self.nodes[0]['rpc_port']
         self.key = self.nodes[0]['public_key']
         self.session = http(self.port, '/api/session')
+        # The wallet token is only in the node's owner-only file, never served.
+        self.session['token'] = Path(self.nodes[0]['data_file']).with_suffix('.session-token').read_text()
         assert self.session['wallet_enabled'] and self.session['public_key'] == self.key, 'This audit needs a fresh network started with -SeedWallets.'
         self.checks = []
         self.config = rpc(self.port, 'config')

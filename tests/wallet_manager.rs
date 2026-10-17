@@ -57,7 +57,8 @@ async fn wallets_persist_and_failed_imports_preserve_selection_and_chain() {
     let server = node::serve(node.clone(), options()).await.unwrap();
     let base = format!("http://{}", server.rpc);
     let initial = session(&base).await;
-    let token = initial["token"].as_str().unwrap();
+    let initial_token = std::fs::read_to_string(&server.session_token_file).unwrap();
+    let token = initial_token.as_str();
     assert_eq!(initial["wallets"].as_array().unwrap().len(), 0);
     assert_eq!(initial["wallet_mode"], "none");
     assert!(initial["wallet_id"].is_null());
@@ -134,7 +135,11 @@ async fn wallets_persist_and_failed_imports_preserve_selection_and_chain() {
     ] {
         assert_eq!(restored[field], watched[field]);
     }
-    assert_ne!(restored["token"], initial["token"]);
+    assert!(restored.get("token").is_none());
+    assert_ne!(
+        std::fs::read_to_string(&server.session_token_file).unwrap(),
+        initial_token
+    );
     assert!(path.with_extension("wallets.sqlite").exists());
     server.stop().await;
 }
@@ -155,7 +160,7 @@ async fn stale_revision_wrong_sender_and_watch_selection_never_sign() {
     let server = node::serve(node.clone(), options()).await.unwrap();
     let base = format!("http://{}", server.rpc);
     let hot = session(&base).await;
-    let token = hot["token"].as_str().unwrap();
+    let token = &std::fs::read_to_string(&server.session_token_file).unwrap();
     assert_eq!(
         hot["wallets"].as_array().unwrap().len(),
         1,
@@ -264,7 +269,10 @@ async fn manager_rejects_missing_token_and_foreign_origin_without_mutation() {
     let response = reqwest::Client::new()
         .post(format!("{base}/api/wallet/manage"))
         .header("Origin", "https://foreign.invalid")
-        .header("X-Hashstash-Token", before["token"].as_str().unwrap())
+        .header(
+            "X-Hashstash-Token",
+            std::fs::read_to_string(&server.session_token_file).unwrap(),
+        )
         .json(&request)
         .send()
         .await
@@ -313,7 +321,8 @@ async fn empty_store_stays_empty_across_restart_and_each_first_action_adds_one_w
         if action == "watch" {
             request["public_key"] = json!(imported_public);
         }
-        let (code, first) = manage(&base, empty["token"].as_str().unwrap(), request).await;
+        let token = std::fs::read_to_string(&server.session_token_file).unwrap();
+        let (code, first) = manage(&base, &token, request).await;
         assert_eq!(code, 200, "{first}");
         assert_eq!(first["wallets"].as_array().unwrap().len(), 1);
         assert_eq!(first["wallet_revision"], 1);

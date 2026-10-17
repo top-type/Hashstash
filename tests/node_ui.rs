@@ -116,6 +116,10 @@ async fn session(url: &str) -> Value {
         .await
         .unwrap()
 }
+/// Wallet clients read the token from the node's owner-only file.
+fn session_token(server: &node::Server) -> String {
+    std::fs::read_to_string(&server.session_token_file).unwrap()
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn embedded_assets_session_and_atomic_pending_wallet_nonces() {
@@ -161,8 +165,9 @@ async fn embedded_assets_session_and_atomic_pending_wallet_nonces() {
     assert_eq!(s["wallet_enabled"], true);
     assert_eq!(s["public_key"], hex::encode(public));
     assert_eq!(s["miner"], hex::encode(public));
-    let token = s["token"].as_str().unwrap();
+    let token = &session_token(&server);
     assert_eq!(token.len(), 64);
+    assert!(s.get("token").is_none());
     assert!(!s.to_string().contains(&hex::encode(secret)));
     let send = |amount: &str| {
         client.post(format!("{url}/api/wallet")).header("Origin",&url).header("X-Hashstash-Token",token).json(&json!({"operation":{"TransferExact":{"recipient":recipient,"amount":amount}},"extra_fee":"0","expiry_blocks":100,"expected_sender":hex::encode(public),"wallet_revision":s["wallet_revision"]})).send()
@@ -183,6 +188,12 @@ async fn embedded_assets_session_and_atomic_pending_wallet_nonces() {
         .map(|v| v["body"]["nonce"].as_u64().unwrap())
         .collect();
     assert_eq!(nonces, vec![0, 1]);
+    // Clients learn the next nonce without downloading raw pending records.
+    let pending = n
+        .rpc("account", json!({"key":hex::encode(public)}))
+        .unwrap();
+    assert_eq!(pending["account"]["nonce"], 0);
+    assert_eq!(pending["pending_nonce"], 2);
     n.mine(100_000).unwrap();
     assert_eq!(
         n.rpc("account", json!({"key":hex::encode(recipient)}))
@@ -219,7 +230,7 @@ async fn wallet_rejects_foreign_origins_hosts_and_missing_or_wrong_tokens() {
     let url = format!("http://{}", server.rpc);
     let client = reqwest::Client::new();
     let s = session(&url).await;
-    let token = s["token"].as_str().unwrap();
+    let token = &session_token(&server);
     let body = json!({"operation":{"TransferExact":{"recipient":public,"amount":"1"}},"extra_fee":"0","expected_sender":hex::encode(public),"wallet_revision":s["wallet_revision"]});
     for header in [None, Some("incorrect-session-token")] {
         let mut request = client.post(format!("{url}/api/wallet")).json(&body);
@@ -315,7 +326,7 @@ async fn no_key_starts_without_a_wallet_and_rpc_never_binds_publicly() {
     assert!(s["wallet_id"].is_null());
     assert_eq!(s["wallet_mode"], "none");
     assert_eq!(s["wallets"], json!([]));
-    let result=reqwest::Client::new().post(format!("{url}/api/wallet")).header("X-Hashstash-Token",s["token"].as_str().unwrap()).json(&json!({"operation":{"TransferExact":{"recipient":public,"amount":"1"}},"extra_fee":"0"})).send().await.unwrap();
+    let result=reqwest::Client::new().post(format!("{url}/api/wallet")).header("X-Hashstash-Token",session_token(&server)).json(&json!({"operation":{"TransferExact":{"recipient":public,"amount":"1"}},"extra_fee":"0"})).send().await.unwrap();
     assert_eq!(result.status(), 403);
     server.stop().await;
     let n = n.with_wallet(secret).unwrap();
@@ -338,11 +349,12 @@ async fn restarting_server_rotates_token_and_unfunded_wallet_fails_cleanly() {
     let first = node::serve(n.clone(), options()).await.unwrap();
     let first_url = format!("http://{}", first.rpc);
     let old_session = session(&first_url).await;
+    let old_token = session_token(&first);
     let body = json!({"operation":{"TransferExact":{"recipient":public,"amount":"1"}},"extra_fee":"0","expected_sender":hex::encode(public),"wallet_revision":old_session["wallet_revision"]});
     let client = reqwest::Client::new();
     let response = client
         .post(format!("{first_url}/api/wallet"))
-        .header("X-Hashstash-Token", old_session["token"].as_str().unwrap())
+        .header("X-Hashstash-Token", &old_token)
         .json(&body)
         .send()
         .await
@@ -361,10 +373,12 @@ async fn restarting_server_rotates_token_and_unfunded_wallet_fails_cleanly() {
     let second = node::serve(n.clone(), options()).await.unwrap();
     let url = format!("http://{}", second.rpc);
     let new_session = session(&url).await;
-    assert_ne!(old_session["token"], new_session["token"]);
+    assert_eq!(old_session["wallet_revision"], new_session["wallet_revision"]);
+    let new_token = session_token(&second);
+    assert_ne!(old_token, new_token);
     let response = client
         .post(format!("{url}/api/wallet"))
-        .header("X-Hashstash-Token", old_session["token"].as_str().unwrap())
+        .header("X-Hashstash-Token", &old_token)
         .json(&body)
         .send()
         .await
@@ -373,7 +387,7 @@ async fn restarting_server_rotates_token_and_unfunded_wallet_fails_cleanly() {
     assert_eq!(n.status().unwrap()["mempool"], 0);
     let response = client
         .post(format!("{url}/api/wallet"))
-        .header("X-Hashstash-Token", new_session["token"].as_str().unwrap())
+        .header("X-Hashstash-Token", &new_token)
         .json(&body)
         .send()
         .await
@@ -381,4 +395,68 @@ async fn restarting_server_rotates_token_and_unfunded_wallet_fails_cleanly() {
     assert_eq!(response.status(), 200);
     assert_eq!(n.status().unwrap()["mempool"], 1);
     second.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loopback_clients_cannot_obtain_the_wallet_token_over_http() {
+    let d = tempfile::tempdir().unwrap();
+    let secret = [16; 32];
+    let public = crypto::public_key(&secret).unwrap();
+    let path = d.path().join("cookie.db");
+    let n = Node::open(&path, Config::devnet(), public)
+        .unwrap()
+        .with_wallet(secret)
+        .unwrap();
+    let server = node::serve(n.clone(), options()).await.unwrap();
+    assert_eq!(server.session_token_file, node::session_token_path(&path));
+    let url = format!("http://{}", server.rpc);
+    let token = session_token(&server);
+    assert_eq!(token.len(), 64);
+    let client = reqwest::Client::new();
+    // Any process reaching loopback still gets the page and session context,
+    // but nothing it can fetch over HTTP carries the wallet token.
+    for path in ["/api/session", "/", "/app.js"] {
+        let text = client
+            .get(format!("{url}{path}"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(!text.contains(&token), "{path}");
+    }
+    let s = session(&url).await;
+    let export = json!({"action":"export","id":s["wallet_id"],"revision":s["wallet_revision"]});
+    let refused = client
+        .post(format!("{url}/api/wallet/manage"))
+        .json(&export)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+    assert!(!refused.text().await.unwrap().contains(&hex::encode(secret)));
+    let exported: Value = client
+        .post(format!("{url}/api/wallet/manage"))
+        .header("X-Hashstash-Token", &token)
+        .json(&export)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(exported["private_key"], hex::encode(secret));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&server.session_token_file)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
+    }
+    server.stop().await;
 }

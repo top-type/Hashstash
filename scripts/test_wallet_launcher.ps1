@@ -67,7 +67,7 @@ try {
     [IO.File]::WriteAllText($invalidFile, (@{format='hashstash-watch-v1';public_key=$publicKey} | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
     $legacy = & (Join-Path $fixture 'Start-WatchOnly.ps1') -WatchFile $invalidFile -Config $Config -Executable $Executable -DataDirectory $directory -BasePort $BasePort -NoBrowser -PassThru
     Check ([int]$legacy.pid -eq [int]$first.pid) 'Legacy v1 watch descriptor remains compatible with the same account'
-    $created = Invoke-RestMethod -Uri ($first.url + 'api/wallet/manage') -Method Post -ContentType 'application/json' -Headers @{'Origin'=$first.url.TrimEnd('/');'X-Hashstash-Token'=$session.token} -Body (@{action='create';name='Launcher persistence test';revision=$session.wallet_revision} | ConvertTo-Json) -TimeoutSec 5
+    $created = Invoke-RestMethod -Uri ($first.url + 'api/wallet/manage') -Method Post -ContentType 'application/json' -Headers @{'Origin'=$first.url.TrimEnd('/');'X-Hashstash-Token'=(Get-Content -LiteralPath (Join-Path $directory 'chain.session-token') -Raw)} -Body (@{action='create';name='Launcher persistence test';revision=$session.wallet_revision} | ConvertTo-Json) -TimeoutSec 5
     Check ($created.wallet_mode -eq 'hot' -and $created.public_key -ne $publicKey) 'Runtime creation selects a different hot wallet on the same node'
     $selected = [string]$created.public_key
     $selectedId = [string]$created.wallet_id

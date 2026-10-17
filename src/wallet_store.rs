@@ -89,6 +89,8 @@ pub(crate) struct WalletStore {
     revision: u64,
     fresh: bool,
     chain_id: Hash,
+    /// The node's peer transport identity, which no wallet account may share.
+    reserved: Option<PublicKey>,
 }
 /// Hot secrets are stored unencrypted, so the database is owner-only on Unix.
 /// SQLite gives its rollback journal the database file's mode. Windows files
@@ -211,6 +213,7 @@ impl WalletStore {
             revision,
             fresh,
             chain_id,
+            reserved: None,
         })
     }
     /// Keys are independent of chain state, but sidecar names derive from the
@@ -237,6 +240,16 @@ impl WalletStore {
                 params![chain_id],
             )?;
         }
+        Ok(())
+    }
+    /// Peer identities are public network identities. Refuse one that a saved
+    /// account uses, and every later account that would use it.
+    pub fn reserve_peer_identity(&mut self, public: PublicKey) -> Result<()> {
+        ensure!(
+            self.entries.values().all(|entry| entry.public != public),
+            "peer identity must differ from every server wallet account"
+        );
+        self.reserved = Some(public);
         Ok(())
     }
     pub fn seed_hot(&mut self, secret: [u8; 32]) -> Result<()> {
@@ -408,6 +421,10 @@ impl WalletStore {
         Ok(self.status())
     }
     fn add_select(&mut self, entry: Entry) -> Result<()> {
+        ensure!(
+            self.reserved != Some(entry.public),
+            "peer identity must differ from every server wallet account"
+        );
         let id = entry.id();
         if self.entries.contains_key(&id) {
             return self.select(&id);
@@ -582,6 +599,34 @@ mod tests {
         assert!(empty.unapplied_seed("--wallet-key", "hot", &public).is_none());
         let watch = empty.unapplied_seed("--watch-key", "watch", &public).unwrap();
         assert!(watch.contains("hot wallet hsh"), "{watch}");
+    }
+
+    #[test]
+    fn peer_identity_is_never_a_saved_seeded_or_imported_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = crypto::public_key(&[6; 32]).unwrap();
+        let peer = crypto::public_key(&[7; 32]).unwrap();
+        let mut store = WalletStore::open(&dir.path().join("chain.sqlite"), [1; 32]).unwrap();
+        manage(&mut store, json!({"action":"watch","public_key":hex::encode(saved)}));
+        let error = store.reserve_peer_identity(saved).unwrap_err();
+        assert!(error.to_string().contains("peer identity"), "{error}");
+        store.reserve_peer_identity(peer).unwrap();
+        for mut request in [
+            json!({"action":"import","private_key":hex::encode([7; 32])}),
+            json!({"action":"watch","public_key":hex::encode(peer)}),
+        ] {
+            request["revision"] = json!(store.revision);
+            let error = store
+                .manage(serde_json::from_value(request).unwrap())
+                .unwrap_err();
+            assert!(error.to_string().contains("peer identity"), "{error}");
+        }
+        assert_eq!(store.entries.len(), 1);
+        let mut fresh = WalletStore::open(&dir.path().join("fresh.sqlite"), [1; 32]).unwrap();
+        fresh.reserve_peer_identity(peer).unwrap();
+        assert!(fresh.seed_hot([7; 32]).is_err());
+        assert!(fresh.seed_watch(peer).is_err());
+        assert!(fresh.entries.is_empty());
     }
 
     #[test]

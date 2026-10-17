@@ -119,8 +119,8 @@ def run(args):
                 check(data != vector["data_hex"], "Browser encrypts using this fresh chain identity")
                 operation = fixture / "operation.json"
                 save(operation, {"TransferExact": {"recipient": sender_address, "amount": "1"}})
-                # The administrative CLI uses submittransaction; the browser's
-                # public surface intentionally exposes only signed-hex broadcast.
+                # The CLI signs locally and broadcasts the signed hex through
+                # broadcasttransaction, the same method the browser's public surface uses.
                 sent = json.loads(cli("send", "--url", f"http://127.0.0.1:{private_port}/rpc", "--key", key,
                     "--operation-file", operation, "--data-hex", data, "--nonce", identity["nonce"], "--expiry-blocks", "2"))
                 txid = sent.get("transaction_id") or sent.get("txid")

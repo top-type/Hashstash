@@ -287,7 +287,7 @@ enum Command {
 struct Endpoint {
     #[arg(long, default_value = "http://127.0.0.1:18480/rpc")]
     url: String,
-    /// Permit plain HTTP to a non-loopback endpoint, whose replies anyone on the path can forge.
+    /// Permit plain HTTP to non-loopback endpoints, whose replies anyone on the path can forge.
     #[arg(long)]
     insecure_http: bool,
 }
@@ -306,6 +306,10 @@ struct NetworkPin {
     /// Chain ID of the intended network, instead of --config.
     #[arg(long)]
     chain_id: Option<String>,
+    /// A second endpoint, ideally run by someone else, that must hold the anchor
+    /// block on its canonical chain of the same network before signing or saving.
+    #[arg(long)]
+    anchor_url: Option<String>,
 }
 impl NetworkPin {
     fn chain(&self) -> Result<Option<Hash>> {
@@ -313,6 +317,13 @@ impl NetworkPin {
             return Ok(None);
         }
         address_chain(self.network_config.as_deref(), self.chain_id.as_deref()).map(Some)
+    }
+    /// The --anchor-url client, under the same transport rules as --url.
+    fn anchor_client(&self, endpoint: &Endpoint) -> Result<Option<RpcClient>> {
+        self.anchor_url
+            .as_deref()
+            .map(|url| RpcClient::new(url, endpoint.insecure_http).context("invalid --anchor-url"))
+            .transpose()
     }
 }
 
@@ -540,14 +551,11 @@ fn ensure_peer_key_file(path: &Path) -> Result<()> {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
-    let published = match fs::hard_link(&temporary, path) {
-        // A concurrent start published its identity first; keep that one.
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        result => result,
-    };
-    let removed = fs::remove_file(&temporary);
+    let published = publish_new(&temporary, path, |from, to| fs::hard_link(from, to));
+    if published.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
     published.with_context(|| format!("publish peer identity {}", path.display()))?;
-    removed.with_context(|| format!("remove temporary {}", temporary.display()))?;
     #[cfg(unix)]
     {
         // Make the new directory entry durable as well as the file contents.
@@ -557,8 +565,33 @@ fn ensure_peer_key_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Move a complete temporary file to `path` unless a file is already there.
+/// `link` adds the name without replacing; where hard links are unsupported
+/// (FAT volumes, some network mounts) the file is renamed while `path` is
+/// still absent, which only two simultaneous first starts could race.
+fn publish_new(
+    temporary: &Path,
+    path: &Path,
+    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match link(temporary, path) {
+        Ok(()) => {}
+        // A concurrent start published its identity first; keep that one.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return fs::rename(temporary, path);
+            }
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        },
+    }
+    fs::remove_file(temporary)
+}
+
 /// Peer transport keys are public network identities; never link one to a
-/// server wallet account the operator also configured.
+/// server wallet account the operator also configured. Saved and later wallet
+/// accounts are refused by the node's wallet store once peer auth is set.
 fn check_peer_identity(
     peer: PublicKey,
     wallet: Option<PublicKey>,
@@ -1024,6 +1057,55 @@ fn pinned_network(pin: Option<Hash>, reported: Hash, loopback: bool) -> Result<H
     }
 }
 
+/// Lookups, one second apart, while a second endpoint receives or indexes a fresh anchor.
+const ANCHOR_ATTEMPTS: u32 = 10;
+
+/// Confirm through a second endpoint that the anchor is a canonical block of
+/// the selected network. Signatures do not name a network, so this keeps one
+/// endpoint from anchoring them on another network where the key holds value.
+/// The second endpoint is trusted for this fact alone.
+async fn confirm_anchor(
+    client: &RpcClient,
+    chain_id: &Hash,
+    anchor: &Hash,
+    height: u64,
+) -> Result<()> {
+    let status = client.call("status", json!({}), RpcLimits::SMALL).await?;
+    ensure!(
+        status["chain_id"].as_str() == Some(hex::encode(chain_id).as_str()),
+        "--anchor-url is on another network"
+    );
+    let anchor = hex::encode(anchor);
+    let mut attempt = 1;
+    let reply = loop {
+        match client
+            .call(
+                "explorer_block",
+                json!({"hash":anchor,"limit":1}),
+                RpcLimits::SMALL,
+            )
+            .await
+        {
+            Ok(reply) => break reply,
+            Err(error) if attempt == ANCHOR_ATTEMPTS => {
+                return Err(error.context("--anchor-url does not report the anchor block"));
+            }
+            Err(_) => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    };
+    let block = &reply["block"];
+    ensure!(
+        block["hash"].as_str() == Some(anchor.as_str())
+            && block["height"].as_u64() == Some(height)
+            && block["status"] == "confirmed",
+        "--anchor-url does not hold anchor {anchor} at height {height} on its canonical chain"
+    );
+    Ok(())
+}
+
 enum NonceSource {
     Requested(u64),
     Discovered(node::PendingNonce),
@@ -1043,6 +1125,7 @@ struct Prepared {
     body: TransactionBody,
     chain_id: Hash,
     anchor_height: u64,
+    anchor_confirmed: bool,
     nonce: NonceSource,
     fee: Option<(FeeBreakdown, Amount)>,
     scheduled_change: Option<String>,
@@ -1055,6 +1138,15 @@ impl Prepared {
             self.anchor_height,
             self.anchor_height.saturating_add(self.body.expiry_blocks)
         )];
+        if self.anchor_confirmed {
+            notes.push(
+                "Anchor check: a canonical block of this network at --anchor-url".to_owned(),
+            );
+        } else if !client.is_loopback() {
+            notes.push(
+                "Anchor check: only this endpoint reports the anchor block; --anchor-url confirms it with a second endpoint".to_owned(),
+            );
+        }
         notes.push(match &self.nonce {
             NonceSource::Requested(_) => "Nonce source: --nonce".to_owned(),
             NonceSource::Discovered(found) => match found.pending {
@@ -1063,7 +1155,7 @@ impl Prepared {
                     found.account_nonce, pending
                 ),
                 None => format!(
-                    "Nonce source: account nonce {} reported by the endpoint, pending nonce {} after its pending transactions from this sender",
+                    "Nonce source: account nonce {} reported by the endpoint, pending nonce {} as the endpoint reports it, unverified",
                     found.account_nonce, found.nonce
                 ),
             },
@@ -1084,9 +1176,10 @@ impl Prepared {
         if !client.is_loopback()
             && self.body.expiry_blocks > wallet::default_expiry_blocks(&self.body.operation)
         {
+            let nonce = self.body.nonce;
             notes.push(format!(
-                "warning: a remote endpoint can withhold this transaction for its {}-block lifetime. If it never confirms, cancel it by confirming another transaction with nonce {} first, such as a 1-atom transfer to yourself with --nonce {}",
-                self.body.expiry_blocks, self.body.nonce, self.body.nonce
+                "warning: a remote endpoint can withhold this transaction for its {}-block lifetime. If it never confirms, cancel it through a node you trust with another nonce-{nonce} transaction paying a higher fee for its weight, such as a 1-atom transfer to yourself with --nonce {nonce}. If the account's next nonce there is lower, submit those lower-nonce transactions with the cancellation, or wait out the lifetime",
+                self.body.expiry_blocks
             ));
         }
         notes
@@ -1097,6 +1190,7 @@ impl Prepared {
 /// lifetime, operation, data and fee before anything is signed or exported.
 async fn prepare_verified(
     client: &RpcClient,
+    anchor_client: Option<&RpcClient>,
     network: &NetworkPin,
     sender: &str,
     operation: Value,
@@ -1114,6 +1208,15 @@ async fn prepare_verified(
     let operation: Operation = serde_json::from_value(operation)?;
     let expiry_blocks = expiry_blocks.unwrap_or_else(|| wallet::default_expiry_blocks(&operation));
     ensure!(expiry_blocks > 0, "expiry blocks must be positive");
+    // A remote endpoint could pick a nonce above the account's next one and
+    // withhold the signed result until a lower-nonce payment makes it valid.
+    // Beyond the default lifetime that window is the user's, and so is the nonce.
+    ensure!(
+        client.is_loopback()
+            || options.nonce.is_some()
+            || expiry_blocks <= wallet::default_expiry_blocks(&operation),
+        "a remote endpoint cannot choose the nonce of a {expiry_blocks}-block transaction; check the account's next nonce on a node you trust and pass --nonce"
+    );
     let anchor = node::parse_hash(status["tip"].as_str().context("missing status tip")?)?;
     let anchor_height = status["height"].as_u64().context("invalid status height")?;
     let nonce = match options.nonce {
@@ -1171,11 +1274,15 @@ async fn prepare_verified(
         }
         None => None,
     };
+    if let Some(anchor_client) = anchor_client {
+        confirm_anchor(anchor_client, &chain_id, &anchor, anchor_height).await?;
+    }
     Ok(Prepared {
         envelope,
         body,
         chain_id,
         anchor_height,
+        anchor_confirmed: anchor_client.is_some(),
         nonce,
         fee,
         scheduled_change: scheduled_change_note(&quote),
@@ -1255,16 +1362,18 @@ async fn broadcast_signed(
 /// The key file is read for its public key, then again only to sign, so the
 /// secret is not held in memory across RPC round trips.
 async fn send_operation(
-    client: &RpcClient,
+    endpoint: &Endpoint,
     key: &Path,
     network: &NetworkPin,
     operation: Value,
     options: TransactionArgs,
     expiry_blocks: Option<u64>,
 ) -> Result<Value> {
+    let (client, anchor_client) = (endpoint.client()?, network.anchor_client(endpoint)?);
     let sender = key_file(key)?.1;
     let prepared = prepare_verified(
-        client,
+        &client,
+        anchor_client.as_ref(),
         network,
         &hex::encode(sender),
         operation,
@@ -1276,7 +1385,7 @@ async fn send_operation(
         "Signing transaction:",
         &prepared.body,
         Some(&prepared.chain_id),
-        &prepared.notes(client),
+        &prepared.notes(&client),
     );
     let signed = {
         let (secret, public) = key_file(key)?;
@@ -1286,7 +1395,7 @@ async fn send_operation(
         );
         crypto::sign(&prepared.body, &secret)?
     };
-    let result = broadcast_signed(client, &signed, &wallet::signed_hex(&signed)).await?;
+    let result = broadcast_signed(&client, &signed, &wallet::signed_hex(&signed)).await?;
     Ok(json!({"txid":result["transaction_id"]}))
 }
 
@@ -1454,11 +1563,10 @@ async fn main() -> Result<()> {
             } else {
                 serde_json::from_str(operation.as_deref().context("operation missing")?)?
             };
-            let client = endpoint.client()?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &send_operation(&client, &key, &network, operation, options, expiry_blocks)
+                    &send_operation(&endpoint, &key, &network, operation, options, expiry_blocks)
                         .await?
                 )?
             );
@@ -1478,10 +1586,17 @@ async fn main() -> Result<()> {
             } else {
                 serde_json::from_str(operation.as_deref().context("operation missing")?)?
             };
-            let client = endpoint.client()?;
-            let prepared =
-                prepare_verified(&client, &network, &sender, operation, options, expiry_blocks)
-                    .await?;
+            let (client, anchor_client) = (endpoint.client()?, network.anchor_client(&endpoint)?);
+            let prepared = prepare_verified(
+                &client,
+                anchor_client.as_ref(),
+                &network,
+                &sender,
+                operation,
+                options,
+                expiry_blocks,
+            )
+            .await?;
             print_review(
                 "Prepared transaction:",
                 &prepared.body,
@@ -1675,11 +1790,10 @@ async fn main() -> Result<()> {
             options,
         } => {
             let operation = json!({"TransferExact":{"recipient":recipient,"amount":amount}});
-            let client = endpoint.client()?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &send_operation(&client, &key, &network, operation, options, None).await?
+                    &send_operation(&endpoint, &key, &network, operation, options, None).await?
                 )?
             );
         }
@@ -2456,6 +2570,26 @@ mod tests {
         ensure_peer_key_file(&path).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"{");
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn identity_publication_falls_back_where_hard_links_are_unsupported() {
+        let directory = tempfile::tempdir().unwrap();
+        let (temporary, path) = (directory.path().join("new.tmp"), directory.path().join("key"));
+        type Link = fn(&Path, &Path) -> std::io::Result<()>;
+        let unsupported: Link = |_, _| Err(std::io::ErrorKind::Unsupported.into());
+        let existing: Link = |_, _| Err(std::io::ErrorKind::AlreadyExists.into());
+        fs::write(&temporary, b"whole").unwrap();
+        publish_new(&temporary, &path, unsupported).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"whole");
+        assert!(!temporary.exists());
+        // A file already published is kept, whichever way publication failed.
+        for link in [unsupported, existing] {
+            fs::write(&temporary, b"other").unwrap();
+            publish_new(&temporary, &path, link).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), b"whole");
+            assert!(!temporary.exists());
+        }
     }
 
     #[test]

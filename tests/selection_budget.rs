@@ -186,7 +186,7 @@ fn rejected_candidate_and_duplicate_cannot_corrupt_selection_state() {
 }
 
 #[test]
-fn repeated_state_failures_have_a_linear_operation_budget() {
+fn repeated_state_failures_have_a_linear_per_sender_operation_budget() {
     let directory = tempfile::tempdir().unwrap();
     let mut chain = Chain::open(&directory.path().join("chain.db"), configuration()).unwrap();
     for _ in 0..3 {
@@ -206,6 +206,11 @@ fn repeated_state_failures_have_a_linear_operation_budget() {
     );
     append(&mut chain, vec![create]);
     let missing = crypto::public_key(&[64; 32]).unwrap();
+    let valid: Vec<_> = (0..128)
+        .map(|nonce| self_payment(&chain, &other_secret, nonce))
+        .collect();
+    // The opening balance cannot cover these payments. They can never apply,
+    // so they are dropped before ranking and never charged an attempt.
     let mut candidates: Vec<_> = (0..128)
         .map(|index| {
             signed(
@@ -220,23 +225,42 @@ fn repeated_state_failures_have_a_linear_operation_budget() {
             )
         })
         .collect();
-    let valid: Vec<_> = (0..128)
-        .map(|nonce| self_payment(&chain, &other_secret, nonce))
+    candidates.extend(valid.iter().rev().cloned());
+    let result = chain.select_transactions(key(), &candidates, 256).unwrap();
+    assert!(!result.budget_exhausted);
+    assert_eq!(result.execution_attempts, valid.len());
+    assert_eq!(result.signatures_checked, candidates.len());
+    assert_eq!(result.transactions, valid);
+    // Affordable, higher-priority candidates that always fail are retried
+    // after each acceptance, but only within their own sender's budget. They
+    // previously consumed the shared budget and truncated the valid selection.
+    let mut candidates: Vec<_> = (0..128)
+        .map(|index| {
+            let mut body = signed(
+                &chain,
+                &SECRET,
+                1,
+                Operation::TransferExact {
+                    recipient: missing,
+                    amount: 0u32.into(),
+                },
+                index,
+            )
+            .body;
+            body.fee = 100u32.into();
+            crypto::sign(&body, &SECRET).unwrap()
+        })
         .collect();
+    let failing = candidates.len();
     candidates.extend(valid.iter().rev().cloned());
     let result = chain.select_transactions(key(), &candidates, 256).unwrap();
     assert!(result.budget_exhausted);
     assert_eq!(
         result.execution_attempts,
-        candidates.len() * SELECTION_ATTEMPTS_PER_CANDIDATE
+        valid.len() + failing * SELECTION_ATTEMPTS_PER_CANDIDATE
     );
     assert_eq!(result.signatures_checked, candidates.len());
-    assert!(!result.transactions.is_empty());
-    assert!(result.transactions.len() < valid.len());
-    // The policy budget does not make the full valid block invalid.
-    chain
-        .template(key(), valid, chain.tip_block().header.timestamp + 2)
-        .unwrap();
+    assert_eq!(result.transactions, valid);
     append(&mut chain, result.transactions);
     assert!(chain.tip_state().account(&missing, None).is_none());
 }

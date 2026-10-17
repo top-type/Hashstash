@@ -933,6 +933,13 @@ pub(crate) struct BlockExecution {
     subsidy_expected: bool,
 }
 impl BlockExecution {
+    /// Whether opening funds still cover this transaction after the inputs
+    /// committed by accepted transactions. Commitments only grow, so a
+    /// transaction that fails this check cannot apply later in the same block.
+    pub(crate) fn opening_funds_cover(&self, t: &Transaction) -> bool {
+        reserve_inputs(&self.opening, &self.spent, t).is_ok()
+    }
+
     /// Charge accounting is updated only after an atomic transaction succeeds.
     pub(crate) fn apply_verified_transaction(&mut self, c: &Config, t: &Transaction) -> Result<()> {
         self.apply_prepared_transaction(

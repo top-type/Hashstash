@@ -4,16 +4,36 @@ use num_traits::Zero;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
     cell::{Cell, RefCell},
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 
+/// Recently validated or reconstructed states outside the active-chain checkpoints.
 pub const MAX_CACHED_STATES: usize = 128;
 pub const MAX_CACHED_INVALID_BLOCKS: usize = 128;
 /// Local metadata cache only. Eviction never discards accepted history or limits reorg depth.
 pub const MAX_CACHED_ENTRIES: usize = 256;
+/// Active-chain states this close to the tip are all retained. Deeper ones are
+/// thinned to two per doubling of depth, so reconstructing an ancestor replays
+/// about its depth below the tip at most, never the whole chain height.
+pub const DENSE_STATE_CHECKPOINTS: u64 = 32;
+/// Ancestor-walk steps charged as one replayed block against a replay budget.
+const WALK_STEPS_PER_REPLAY_STEP: u64 = 16;
+/// Local side-branch admission policy, not a consensus rule. A block that would
+/// not become the tip must carry at least 1/SIDE_BRANCH_WORK_RATIO of the next
+/// active-chain block's work, and its branch must be able to overtake the tip
+/// within SIDE_BRANCH_CATCH_UP_BLOCKS further blocks of the same work.
+pub const SIDE_BRANCH_WORK_RATIO: u32 = 64;
+pub const SIDE_BRANCH_CATCH_UP_BLOCKS: u32 = 4096;
+/// A losing branch raises the peer capacity allowance only while it stays within
+/// this many next-block works of the tip, with at least 1/CAPACITY_BRANCH_WORK_RATIO
+/// of that work in its leaf block.
+pub const CAPACITY_BRANCH_MARGIN_BLOCKS: u32 = 6;
+pub const CAPACITY_BRANCH_WORK_RATIO: u32 = 4;
+const MAX_CAPACITY_BRANCHES: usize = 256;
 const INVALID_BLOCK_TTL: Duration = Duration::from_secs(60);
 #[derive(Debug)]
 struct PermanentBlockError(String);
@@ -41,6 +61,26 @@ impl std::fmt::Display for ValidationDeferred {
     }
 }
 impl std::error::Error for ValidationDeferred {}
+/// Local admission policy declined a block that would not become the tip.
+/// The block is not invalid and is never cached as such; it can be offered
+/// again once its branch is competitive.
+#[derive(Debug)]
+pub struct SideBranchRefused(&'static str);
+impl std::fmt::Display for SideBranchRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "side branch not retained: {}", self.0)
+    }
+}
+impl std::error::Error for SideBranchRefused {}
+/// Retained reconstruction progress no longer links to the active chain.
+#[derive(Debug)]
+struct StaleReplay;
+impl std::fmt::Display for StaleReplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "retained state replay no longer matches the active chain")
+    }
+}
+impl std::error::Error for StaleReplay {}
 
 fn permanent(error: anyhow::Error) -> anyhow::Error {
     // Metadata now comes from SQLite too; a local I/O/index problem must never
@@ -54,6 +94,7 @@ fn permanent(error: anyhow::Error) -> anyhow::Error {
 
 /// Local transaction-selection policy; these are not consensus block limits.
 pub const MAX_SELECTION_CANDIDATES: usize = 8192;
+/// Operation attempts granted to each sender per candidate it submits.
 pub const SELECTION_ATTEMPTS_PER_CANDIDATE: usize = 4;
 #[derive(Debug)]
 pub struct SelectionResult {
@@ -70,6 +111,35 @@ fn compact_size_len(n: usize) -> usize {
         _ => 9,
     }
 }
+/// Height of the skip-link target, as in Bitcoin's block index.
+fn skip_height(height: u64) -> u64 {
+    fn invert_lowest_one(n: u64) -> u64 {
+        n & n.wrapping_sub(1)
+    }
+    if height < 2 {
+        0
+    } else if height & 1 == 1 {
+        invert_lowest_one(invert_lowest_one(height - 1)) + 1
+    } else {
+        invert_lowest_one(height)
+    }
+}
+/// Whether an active-chain state at `height` stays retained below a tip at `tip`.
+/// Retention only shrinks as the tip advances, so dropped states are not needed again.
+fn checkpoint_retained(height: u64, tip: u64) -> bool {
+    if height == 0 {
+        return true;
+    }
+    if height >= tip {
+        return false;
+    }
+    let depth = tip - height;
+    if depth < DENSE_STATE_CHECKPOINTS {
+        return true;
+    }
+    let step = 1u64 << (62 - depth.leading_zeros());
+    height % step == 0
+}
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Entry {
@@ -77,11 +147,15 @@ struct Entry {
     height: u64,
     // Expected elapsed seconds for timestamp ASERT, independent of economic progress.
     clock: u64,
-    // The first mined block anchors its own branch. These derived fields are
+    // The first mined blocks anchor their own branch. These derived fields are
     // rebuilt from validated headers, so pre-mining idle time is not DAA debt.
     anchor_timestamp: u32,
     anchor_clock: u64,
     work: Amount,
+    // Ancestor at skip_height(height), giving logarithmic ancestry lookups.
+    skip: Hash,
+    // Greatest governed block capacity on this branch through this post-state.
+    capacity: u64,
 }
 #[derive(Default)]
 struct StateCache {
@@ -93,6 +167,37 @@ struct EntryCache {
     entries: BTreeMap<Hash, Arc<Entry>>,
     order: VecDeque<Hash>,
 }
+/// Resumable reconstruction of one historical state. Progress is kept outside
+/// the recent-state cache, so unrelated insertions cannot discard it.
+struct Replay {
+    target: Hash,
+    /// Next entry to inspect while the base state is still unknown.
+    walk: Option<Hash>,
+    /// Side-branch blocks recorded for this target in the temporary path
+    /// table; position zero is the target itself.
+    side: u64,
+    /// Active-chain heights still to apply before the side-branch path.
+    canonical: (u64, u64),
+    /// Latest reconstructed ancestor.
+    base: Option<(Hash, Arc<State>)>,
+}
+/// A stored losing-branch leaf that may still raise the peer capacity allowance.
+struct BranchLeaf {
+    work: Amount,
+    block_work: Amount,
+    capacity: u64,
+}
+impl BranchLeaf {
+    fn of(entry: &Entry) -> Self {
+        Self {
+            work: entry.work.clone(),
+            block_work: math::target_from_bits(entry.header.bits)
+                .map(|target| math::work(&target))
+                .unwrap_or_default(),
+            capacity: entry.capacity,
+        }
+    }
+}
 pub struct Chain {
     pub config: Config,
     db: Connection,
@@ -102,11 +207,15 @@ pub struct Chain {
     genesis: Block,
     tip_block: Block,
     tip_state: Arc<State>,
+    // Active-chain states by height. Side-branch traffic never evicts them.
+    checkpoints: RefCell<BTreeMap<u64, (Hash, Arc<State>)>>,
     cache: RefCell<StateCache>,
+    replay: RefCell<Option<Replay>>,
     invalid_blocks: BTreeMap<Hash, String>,
     invalid_order: VecDeque<(Hash, Instant)>,
     replay_budget: Cell<Option<usize>>,
-    known_block_bytes: Cell<u64>,
+    branches: BTreeMap<Hash, BranchLeaf>,
+    known_block_bytes: u64,
 }
 impl Chain {
     pub fn open(path: &Path, config: Config) -> Result<Self> {
@@ -118,10 +227,11 @@ impl Chain {
         }
         let db = Connection::open(path)?;
         db.busy_timeout(Duration::from_secs(2))?;
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA locking_mode=EXCLUSIVE; CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value BLOB NOT NULL); CREATE TABLE IF NOT EXISTS blocks(seq INTEGER PRIMARY KEY AUTOINCREMENT, hash BLOB NOT NULL UNIQUE, bytes BLOB NOT NULL, accepted_at INTEGER NOT NULL);")?;
+        // The journal limit returns WAL space after the startup index rebuild.
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_size_limit=67108864; CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value BLOB NOT NULL); CREATE TABLE IF NOT EXISTS blocks(seq INTEGER PRIMARY KEY AUTOINCREMENT, hash BLOB NOT NULL UNIQUE, bytes BLOB NOT NULL, accepted_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS rejected_blocks(hash BLOB PRIMARY KEY, bytes BLOB NOT NULL, accepted_at INTEGER NOT NULL, reason TEXT NOT NULL);")?;
         // Derived indexes are rebuilt from independently validated block bodies on every open.
         // SQLite bounds its page cache; canonical and losing-branch metadata stay on disk.
-        db.execute_batch("PRAGMA cache_size=-8192; PRAGMA temp_store=FILE; CREATE TABLE IF NOT EXISTS entry_index(hash BLOB PRIMARY KEY, bytes BLOB NOT NULL); CREATE TABLE IF NOT EXISTS canonical_index(height INTEGER PRIMARY KEY, hash BLOB NOT NULL); CREATE TEMP TABLE IF NOT EXISTS state_replay_path(position INTEGER PRIMARY KEY, hash BLOB NOT NULL);")?;
+        db.execute_batch("PRAGMA cache_size=-8192; PRAGMA temp_store=FILE; CREATE TABLE IF NOT EXISTS entry_index(hash BLOB PRIMARY KEY, bytes BLOB NOT NULL); CREATE TABLE IF NOT EXISTS canonical_index(height INTEGER PRIMARY KEY, hash BLOB NOT NULL); CREATE TEMP TABLE IF NOT EXISTS state_replay_path(target BLOB NOT NULL, position INTEGER NOT NULL, hash BLOB NOT NULL, PRIMARY KEY(target,position));")?;
         let saved: Option<Vec<u8>> = db
             .query_row("SELECT value FROM metadata WHERE key='config'", [], |r| {
                 r.get(0)
@@ -150,6 +260,8 @@ impl Chain {
             anchor_timestamp: config.genesis_time,
             anchor_clock: 0,
             work: Amount::zero(),
+            skip: ZERO_HASH,
+            capacity: state.settings.block_bytes,
         });
         db.execute_batch("BEGIN IMMEDIATE; DELETE FROM entry_index; DELETE FROM canonical_index;")?;
         db.execute(
@@ -173,14 +285,23 @@ impl Chain {
             genesis: genesis.clone(),
             tip_block: genesis,
             tip_state: state.clone(),
+            checkpoints: RefCell::new(BTreeMap::from([(0, (genesis_hash, state))])),
             cache: RefCell::new(StateCache::default()),
+            replay: RefCell::new(None),
             invalid_blocks: BTreeMap::new(),
             invalid_order: VecDeque::new(),
             replay_budget: Cell::new(None),
-            known_block_bytes: Cell::new(state.settings.block_bytes),
+            branches: BTreeMap::new(),
+            known_block_bytes: genesis_entry.capacity,
         };
         chain.cache_entry(genesis_hash, genesis_entry);
-        chain.cache_state(genesis_hash, state);
+        // Stored blocks that fail current validation are set aside when they
+        // belong to losing branches. Storage and index errors still stop startup.
+        let mut rejected = BTreeMap::<Hash, (Option<Amount>, String)>::new();
+        let claimed_work = |parent: Option<&Amount>, block: &Block| {
+            let target = math::target_from_bits(block.header.bits).ok()?;
+            Some(parent? + math::work(&target))
+        };
         // Replay one bounded record at a time instead of buffering the entire database.
         let mut sequence = 0i64;
         loop {
@@ -195,21 +316,30 @@ impl Chain {
             let block: Block = codec::decode_block(&bytes, bytes.len())?;
             let hash = codec::block_hash(&block);
             ensure!(raw_hash == hash, "stored block hash mismatch");
-            let (entry, state) = chain
-                .validate_block(&block, accepted_at)
-                .context("invalid stored history")?;
+            if let Some((parent, _)) = rejected.get(&block.header.previous) {
+                let claimed = claimed_work(parent.as_ref(), &block);
+                rejected.insert(hash, (claimed, "parent block fails validation".into()));
+                continue;
+            }
+            let (entry, state) = match chain.validate_block(&block, accepted_at, false) {
+                Ok(valid) => valid,
+                Err(error) if error.is::<PermanentBlockError>() => {
+                    let parent = chain.load_entry(&block.header.previous)?;
+                    let claimed = claimed_work(parent.as_ref().map(|entry| &entry.work), &block);
+                    rejected.insert(hash, (claimed, error.to_string()));
+                    continue;
+                }
+                Err(error) => return Err(error.context("invalid stored history")),
+            };
             let best = entry.work > chain.tip_entry.work;
             chain.db.execute(
                 "INSERT INTO entry_index(hash,bytes) VALUES(?1,?2)",
                 params![hash.as_slice(), codec::encode(&entry)],
             )?;
-            let entry = Arc::new(entry);
-            chain.cache_entry(hash, entry.clone());
-            chain.cache_state(hash, state.clone());
             if best {
                 Self::write_canonical(&chain.db, hash, entry.height)?;
-                chain.select_tip(hash, block, state, entry);
             }
+            chain.record(hash, block, Arc::new(entry), state, best);
         }
         let saved_tip: Option<Vec<u8>> = chain
             .db
@@ -217,21 +347,73 @@ impl Chain {
                 r.get(0)
             })
             .optional()?;
-        if let Some(raw) = saved_tip {
-            let hash: Hash = raw.as_slice().try_into().context("invalid persisted tip")?;
-            let entry = chain.load_entry(&hash)?.context("persisted tip absent")?;
-            ensure!(
-                entry.work == chain.tip_entry.work,
-                "persisted tip has less work"
-            );
+        let persisted = saved_tip
+            .as_deref()
+            .and_then(|raw| Hash::try_from(raw).ok());
+        // Tips only gain work and every accepted block is committed with the tip
+        // it produces, so a stored losing branch never claims more work than the
+        // persisted tip. Anything else means the persisted tip itself, or the
+        // database, disagrees with current validation: fail closed.
+        let persisted_work = match persisted {
+            Some(hash) => chain.load_entry(&hash)?.map(|entry| entry.work.clone()),
+            None => None,
+        };
+        for (hash, (claimed, reason)) in &rejected {
+            if claimed
+                .as_ref()
+                .zip(persisted_work.as_ref())
+                .is_none_or(|(claimed, persisted)| claimed > persisted)
+            {
+                anyhow::bail!(
+                    "invalid stored history: block {} fails validation: {reason}",
+                    hex::encode(hash)
+                );
+            }
+        }
+        let hinted = match persisted {
+            Some(hash) if hash != chain.tip => chain
+                .load_entry(&hash)?
+                .filter(|entry| entry.work == chain.tip_entry.work)
+                .map(|entry| (hash, entry)),
+            _ => None,
+        };
+        if let Some((hash, entry)) = hinted {
+            // An equal-work hint only breaks the first-seen tie between
+            // already revalidated branches.
             let block = chain
                 .load_block(&hash)?
                 .context("persisted tip block absent")?;
             let state = chain.load_state(&hash)?;
             Self::write_canonical(&chain.db, hash, entry.height)?;
-            chain.select_tip(hash, block, state, entry);
+            let previous = (chain.tip, chain.tip_entry.clone());
+            chain.select_tip(hash, block, state, entry.clone());
+            chain.note_branch(hash, &entry, true, previous);
+            chain.refresh_capacity();
+        } else if persisted != Some(chain.tip) && (saved_tip.is_some() || chain.tip != genesis_hash)
+        {
+            // A missing, malformed or lower-work hint cannot override validated
+            // history; record the replayed best tip instead.
+            eprintln!("Ignoring a stale persisted chain tip; using the replayed best tip");
+            chain.db.execute("INSERT INTO metadata(key,value) VALUES('tip',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [chain.tip.as_slice()])?;
+        }
+        for (hash, (_, reason)) in &rejected {
+            chain.db.execute(
+                "INSERT OR IGNORE INTO rejected_blocks(hash,bytes,accepted_at,reason) SELECT hash,bytes,accepted_at,?2 FROM blocks WHERE hash=?1",
+                params![hash.as_slice(), reason],
+            )?;
+            chain
+                .db
+                .execute("DELETE FROM blocks WHERE hash=?1", [hash.as_slice()])?;
+        }
+        if !rejected.is_empty() {
+            eprintln!(
+                "Moved {} stored side-branch block(s) that fail validation into rejected_blocks",
+                rejected.len()
+            );
         }
         chain.db.execute_batch("COMMIT")?;
+        // Housekeeping only: a failed checkpoint leaves committed history intact.
+        let _ = chain.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         Ok(chain)
     }
     pub fn chain_id(&self) -> Hash {
@@ -265,6 +447,44 @@ impl Chain {
             .pop()
             .unwrap()
             .map_err(anyhow::Error::msg)
+    }
+
+    /// Hash of the ancestor at `height` of the branch at `cursor`. Skip links keep
+    /// the walk logarithmic in distance, and once it meets the active chain the
+    /// canonical height index answers directly (the cursor becomes `None`).
+    fn branch_ancestor(
+        &self,
+        cursor: &mut Option<(Hash, Arc<Entry>)>,
+        height: u64,
+    ) -> Result<Hash> {
+        loop {
+            let Some((hash, entry)) = cursor.as_ref() else {
+                return self.canonical_hash(height)?.ok_or_else(|| {
+                    LocalIndexError(anyhow::anyhow!("canonical ancestor absent")).into()
+                });
+            };
+            if entry.height <= height {
+                ensure!(entry.height == height, "ancestor above its descendant");
+                return Ok(*hash);
+            }
+            if self.canonical_hash(entry.height)? == Some(*hash) {
+                *cursor = None;
+                continue;
+            }
+            let skip = skip_height(entry.height);
+            let skip_previous = skip_height(entry.height - 1);
+            let next = if skip == height
+                || (skip > height && !(skip_previous + 2 < skip && skip_previous >= height))
+            {
+                entry.skip
+            } else {
+                entry.header.previous
+            };
+            let next_entry = self
+                .load_entry(&next)?
+                .ok_or_else(|| LocalIndexError(anyhow::anyhow!("candidate ancestor absent")))?;
+            *cursor = Some((next, next_entry));
+        }
     }
 
     fn transaction_anchor_results(
@@ -312,34 +532,15 @@ impl Chain {
             };
             results.push(result);
         }
-        // Canonical references use indexed height lookups. A side branch is
-        // walked only to its common canonical ancestor, once for all references.
+        // Canonical references use indexed height lookups. On a side branch,
+        // skip links reach each referenced height without walking every block.
         // Memory depends on this block's references, never on chain age.
-        let mut cursor = *parent;
-        let mut entry = parent_entry;
-        while !required.is_empty() {
-            if self.canonical_hash(entry.height)? == Some(cursor) {
-                for (height, requested) in &required {
-                    if let Some(hash) = self.canonical_hash(*height)?
-                        && requested.contains(&hash)
-                    {
-                        ancestors.insert(hash);
-                    }
-                }
-                break;
+        let mut cursor = Some((*parent, parent_entry));
+        for (height, requested) in required.iter().rev() {
+            let hash = self.branch_ancestor(&mut cursor, *height)?;
+            if requested.contains(&hash) {
+                ancestors.insert(hash);
             }
-            if let Some(requested) = required.remove(&entry.height)
-                && requested.contains(&cursor)
-            {
-                ancestors.insert(cursor);
-            }
-            if required.is_empty() || entry.height == 0 {
-                break;
-            }
-            cursor = entry.header.previous;
-            entry = self
-                .load_entry(&cursor)?
-                .ok_or_else(|| LocalIndexError(anyhow::anyhow!("candidate ancestor absent")))?;
         }
         for (tx, result) in transactions.iter().zip(&mut results) {
             if result.is_ok() && !ancestors.contains(&tx.body.anchor) {
@@ -363,8 +564,13 @@ impl Chain {
     pub fn state_at(&self, hash: &Hash) -> Option<Arc<State>> {
         self.load_state(hash).ok()
     }
+    /// Recently validated or reconstructed states outside the active-chain checkpoints.
     pub fn cached_state_count(&self) -> usize {
         self.cache.borrow().states.len()
+    }
+    /// Retained active-chain states; logarithmic in the chain height.
+    pub fn checkpoint_state_count(&self) -> usize {
+        self.checkpoints.borrow().len()
     }
     pub fn cached_entry_count(&self) -> usize {
         self.entries.borrow().entries.len()
@@ -385,11 +591,8 @@ impl Chain {
     fn read_entry(db: &Connection, hash: &Hash) -> Result<Option<Arc<Entry>>> {
         (|| -> Result<_> {
             let bytes: Option<Vec<u8>> = db
-                .query_row(
-                    "SELECT bytes FROM entry_index WHERE hash=?1",
-                    [hash.as_slice()],
-                    |r| r.get(0),
-                )
+                .prepare_cached("SELECT bytes FROM entry_index WHERE hash=?1")?
+                .query_row([hash.as_slice()], |r| r.get(0))
                 .optional()?;
             bytes
                 .map(|bytes| codec::decode::<Entry>(&bytes, 4096).map(Arc::new))
@@ -411,22 +614,22 @@ impl Chain {
         Ok(entry)
     }
     /// Walk a branch using disk metadata. No in-memory vector grows with reorg depth.
+    /// Cached statements avoid re-preparing SQL for each block of a deep switch.
     fn write_canonical(db: &Connection, hash: Hash, height: u64) -> Result<()> {
-        db.execute("DELETE FROM canonical_index WHERE height>?1", [height])?;
+        db.prepare_cached("DELETE FROM canonical_index WHERE height>?1")?
+            .execute([height])?;
         let mut cursor = hash;
         loop {
             let entry = Self::read_entry(db, &cursor)?.context("canonical entry absent")?;
             let active: Option<Vec<u8>> = db
-                .query_row(
-                    "SELECT hash FROM canonical_index WHERE height=?1",
-                    [entry.height],
-                    |r| r.get(0),
-                )
+                .prepare_cached("SELECT hash FROM canonical_index WHERE height=?1")?
+                .query_row([entry.height], |r| r.get(0))
                 .optional()?;
             if active.as_deref() == Some(cursor.as_slice()) {
                 break;
             }
-            db.execute("INSERT INTO canonical_index(height,hash) VALUES(?1,?2) ON CONFLICT(height) DO UPDATE SET hash=excluded.hash", params![entry.height, cursor.as_slice()])?;
+            db.prepare_cached("INSERT INTO canonical_index(height,hash) VALUES(?1,?2) ON CONFLICT(height) DO UPDATE SET hash=excluded.hash")?
+                .execute(params![entry.height, cursor.as_slice()])?;
             ensure!(entry.height > 0, "canonical genesis mismatch");
             cursor = entry.header.previous;
         }
@@ -469,90 +672,346 @@ impl Chain {
             .optional()?;
         bytes.map(|b| codec::decode_block(&b, b.len())).transpose()
     }
+    /// Greatest block capacity on the active chain's history or on a losing
+    /// branch that is still competitive with the tip. Recomputed after every
+    /// accepted block, so it falls again when such a branch is left behind.
     pub fn max_known_block_bytes(&self) -> u64 {
-        self.known_block_bytes.get()
-    }
-    fn cache_state(&self, hash: Hash, state: Arc<State>) {
         self.known_block_bytes
-            .set(self.known_block_bytes.get().max(state.settings.block_bytes));
-        let mut cache = self.cache.borrow_mut();
-        if cache.states.contains_key(&hash) {
-            return;
-        }
-        while cache.states.len() >= MAX_CACHED_STATES {
-            if let Some(old) = cache.order.pop_front() {
-                cache.states.remove(&old);
-            }
-        }
-        cache.states.insert(hash, state);
-        cache.order.push_back(hash);
     }
+    /// Least recently used states are evicted first; a hit refreshes the state.
+    fn cache_state(&self, hash: Hash, state: Arc<State>) {
+        let mut cache = self.cache.borrow_mut();
+        if cache.states.insert(hash, state).is_some()
+            && let Some(position) = cache.order.iter().position(|cached| *cached == hash)
+        {
+            cache.order.remove(position);
+        }
+        cache.order.push_back(hash);
+        while cache.states.len() > MAX_CACHED_STATES {
+            let Some(old) = cache.order.pop_front() else {
+                break;
+            };
+            cache.states.remove(&old);
+        }
+    }
+    fn cached_state(&self, hash: &Hash) -> Option<Arc<State>> {
+        let mut cache = self.cache.borrow_mut();
+        let state = cache.states.get(hash)?.clone();
+        if let Some(position) = cache.order.iter().position(|cached| cached == hash) {
+            cache.order.remove(position);
+            cache.order.push_back(*hash);
+        }
+        Some(state)
+    }
+    fn uncache_state(&self, hash: &Hash) -> Option<Arc<State>> {
+        let mut cache = self.cache.borrow_mut();
+        let state = cache.states.remove(hash)?;
+        cache.order.retain(|cached| cached != hash);
+        Some(state)
+    }
+    fn checkpoint_state(&self, height: u64, hash: &Hash) -> Option<Arc<State>> {
+        self.checkpoints
+            .borrow()
+            .get(&height)
+            .filter(|(retained, _)| retained == hash)
+            .map(|(_, state)| state.clone())
+    }
+    fn charge_replay(&self) -> Result<()> {
+        if let Some(remaining) = self.replay_budget.get() {
+            if remaining == 0 {
+                return Err(ValidationDeferred.into());
+            }
+            self.replay_budget.set(Some(remaining - 1));
+        }
+        Ok(())
+    }
+    fn clear_replay_path(&self, target: &Hash) -> Result<()> {
+        self.db
+            .prepare_cached("DELETE FROM state_replay_path WHERE target=?1")?
+            .execute([target.as_slice()])?;
+        Ok(())
+    }
+    /// Reconstruct a validated state from the nearest retained ancestor: the tip,
+    /// a recent state, or an active-chain checkpoint. A replay budget also
+    /// covers the ancestor walk; deferred work resumes from retained progress.
     fn load_state(&self, hash: &Hash) -> Result<Arc<State>> {
         if *hash == self.tip {
             return Ok(self.tip_state.clone());
         }
-        let mut cursor = *hash;
-        self.db.execute("DELETE FROM state_replay_path", [])?;
-        let mut path_length = 0u64;
-        let mut state = loop {
-            if cursor == self.tip {
-                break self.tip_state.clone();
+        if let Some(state) = self.cached_state(hash) {
+            return Ok(state);
+        }
+        if let Some(entry) = self.load_entry(hash)?
+            && let Some(state) = self.checkpoint_state(entry.height, hash)
+        {
+            return Ok(state);
+        }
+        let resumed = self
+            .replay
+            .borrow_mut()
+            .take_if(|replay| replay.target == *hash);
+        let mut replay = match resumed {
+            Some(replay) => replay,
+            None => self.start_replay(hash)?,
+        };
+        let result = match self.run_replay(&mut replay) {
+            Err(error) if error.is::<StaleReplay>() => {
+                // The active chain changed below retained progress; start over.
+                replay = self.start_replay(hash)?;
+                self.run_replay(&mut replay)
             }
-            if let Some(state) = self.cache.borrow().states.get(&cursor) {
-                break state.clone();
+            result => result,
+        };
+        match result {
+            Err(error) if error.is::<ValidationDeferred>() => {
+                // The latest progress also enters the recent cache, so another
+                // deferred target taking the record does not discard it.
+                if let Some((base, state)) = &replay.base {
+                    self.cache_state(*base, state.clone());
+                }
+                let previous = self.replay.borrow_mut().replace(replay);
+                if let Some(previous) = previous {
+                    self.clear_replay_path(&previous.target)?;
+                }
+                Err(error)
+            }
+            result => {
+                self.clear_replay_path(hash)?;
+                result
+            }
+        }
+    }
+    fn start_replay(&self, hash: &Hash) -> Result<Replay> {
+        self.clear_replay_path(hash)?;
+        Ok(Replay {
+            target: *hash,
+            walk: Some(*hash),
+            side: 0,
+            canonical: (1, 0),
+            base: None,
+        })
+    }
+    fn run_replay(&self, replay: &mut Replay) -> Result<Arc<State>> {
+        let mut steps = 0u64;
+        while let Some(cursor) = replay.walk {
+            let retained = if cursor == self.tip {
+                Some(self.tip_state.clone())
+            } else {
+                self.cached_state(&cursor)
+            };
+            if let Some(state) = retained {
+                replay.base = Some((cursor, state));
+                replay.walk = None;
+                break;
             }
             let entry = self.load_entry(&cursor)?.context("unknown state")?;
-            if entry.height == 0 {
-                break Arc::new(State::genesis(&self.config));
+            if let Some(state) = self.checkpoint_state(entry.height, &cursor) {
+                replay.base = Some((cursor, state));
+                replay.walk = None;
+                break;
             }
-            self.db.execute(
-                "INSERT INTO state_replay_path(position,hash) VALUES(?1,?2)",
-                params![path_length, cursor.as_slice()],
-            )?;
-            path_length += 1;
-            cursor = entry.header.previous;
-        };
-        while path_length > 0 {
-            if let Some(remaining) = self.replay_budget.get() {
-                if remaining == 0 {
-                    return Err(ValidationDeferred.into());
-                }
-                self.replay_budget.set(Some(remaining - 1));
+            if self.canonical_hash(entry.height)? == Some(cursor) {
+                // The branch meets the active chain: continue by height from the
+                // nearest checkpoint, at most about this depth below the tip.
+                let (height, base) = self
+                    .checkpoints
+                    .borrow()
+                    .range(..=entry.height)
+                    .next_back()
+                    .map(|(height, (hash, state))| (*height, (*hash, state.clone())))
+                    .context("genesis checkpoint absent")?;
+                replay.base = Some(base);
+                replay.canonical = (height + 1, entry.height);
+                replay.walk = None;
+                break;
             }
-            path_length -= 1;
-            let next: Vec<u8> = self.db.query_row(
-                "SELECT hash FROM state_replay_path WHERE position=?1",
-                [path_length],
-                |r| r.get(0),
-            )?;
-            let next: Hash = next.as_slice().try_into().context("invalid replay index")?;
+            if steps % WALK_STEPS_PER_REPLAY_STEP == 0 {
+                self.charge_replay()?;
+            }
+            steps += 1;
+            self.db
+                .prepare_cached(
+                    "INSERT INTO state_replay_path(target,position,hash) VALUES(?1,?2,?3)",
+                )?
+                .execute(params![
+                    replay.target.as_slice(),
+                    replay.side,
+                    cursor.as_slice()
+                ])?;
+            replay.side += 1;
+            replay.walk = Some(entry.header.previous);
+        }
+        let (mut hash, mut state) = replay.base.clone().context("replay base absent")?;
+        while replay.canonical.0 <= replay.canonical.1 {
+            let height = replay.canonical.0;
+            let Some(next) = self.canonical_hash(height)? else {
+                return Err(StaleReplay.into());
+            };
+            self.charge_replay()?;
             let block = self
                 .load_block(&next)?
                 .context("stored ancestor block absent")?;
-            let subsidy = math::work(&math::target_from_bits(block.header.bits)?);
-            self.validate_transaction_anchors(&block.header.previous, &block.transactions)?;
-            let replayed = consensus::execute(
-                &self.config,
-                &state,
-                &block.header.previous,
-                &block.miner,
-                &subsidy,
-                &block.transactions,
-            )?;
-            ensure!(
-                replayed.root() == block.state_root,
-                "replayed state commitment mismatch"
-            );
-            state = Arc::new(replayed);
-            self.cache_state(next, state.clone());
+            if block.header.previous != hash {
+                return Err(StaleReplay.into());
+            }
+            state = self.replay_block(&block, &state)?;
+            hash = next;
+            replay.base = Some((hash, state.clone()));
+            replay.canonical.0 = height + 1;
+            if checkpoint_retained(height, self.tip_height()) {
+                self.checkpoints
+                    .borrow_mut()
+                    .insert(height, (hash, state.clone()));
+            }
+        }
+        while replay.side > 0 {
+            let position = replay.side - 1;
+            let next: Vec<u8> = self
+                .db
+                .prepare_cached(
+                    "SELECT hash FROM state_replay_path WHERE target=?1 AND position=?2",
+                )?
+                .query_row(params![replay.target.as_slice(), position], |r| r.get(0))?;
+            let next: Hash = next.as_slice().try_into().context("invalid replay index")?;
+            self.charge_replay()?;
+            let block = self
+                .load_block(&next)?
+                .context("stored ancestor block absent")?;
+            if block.header.previous != hash {
+                return Err(StaleReplay.into());
+            }
+            state = self.replay_block(&block, &state)?;
+            hash = next;
+            replay.base = Some((hash, state.clone()));
+            replay.side = position;
+        }
+        ensure!(hash == replay.target, "state replay ended at another block");
+        let height = self.load_entry(&hash)?.map(|entry| entry.height);
+        if height.is_none_or(|height| self.checkpoint_state(height, &hash).is_none()) {
+            self.cache_state(hash, state.clone());
         }
         Ok(state)
     }
+    fn replay_block(&self, block: &Block, parent: &State) -> Result<Arc<State>> {
+        let subsidy = math::work(&math::target_from_bits(block.header.bits)?);
+        self.validate_transaction_anchors(&block.header.previous, &block.transactions)?;
+        let replayed = consensus::execute(
+            &self.config,
+            parent,
+            &block.header.previous,
+            &block.miner,
+            &subsidy,
+            &block.transactions,
+        )?;
+        ensure!(
+            replayed.root() == block.state_root,
+            "replayed state commitment mismatch"
+        );
+        Ok(Arc::new(replayed))
+    }
+    /// Install a validated block's in-memory metadata after its rows are written.
+    fn record(
+        &mut self,
+        hash: Hash,
+        block: Block,
+        entry: Arc<Entry>,
+        state: Arc<State>,
+        best: bool,
+    ) {
+        self.cache_entry(hash, entry.clone());
+        let previous = (self.tip, self.tip_entry.clone());
+        if best {
+            self.select_tip(hash, block, state, entry.clone());
+        } else {
+            self.cache_state(hash, state);
+        }
+        self.note_branch(hash, &entry, best, previous);
+        self.refresh_capacity();
+    }
+    /// Callers have already written the canonical index for the new tip.
     fn select_tip(&mut self, hash: Hash, block: Block, state: Arc<State>, entry: Arc<Entry>) {
+        let extends = block.header.previous == self.tip;
+        let previous = (
+            self.tip,
+            self.tip_entry.height,
+            std::mem::replace(&mut self.tip_state, state),
+        );
         self.tip = hash;
         self.tip_block = block;
-        self.tip_state = state;
         self.tip_entry = entry;
+        let height = self.tip_entry.height;
+        if extends {
+            self.checkpoints
+                .get_mut()
+                .insert(previous.1, (previous.0, previous.2));
+        } else {
+            // The previous tip leaves the active chain; keep it as a recent state.
+            self.cache_state(previous.0, previous.2);
+            let stale: Vec<u64> = self
+                .checkpoints
+                .borrow()
+                .iter()
+                .filter(|(height, (hash, _))| {
+                    self.canonical_hash(**height).ok().flatten() != Some(*hash)
+                })
+                .map(|(height, _)| *height)
+                .collect();
+            for height in stale {
+                self.checkpoints.get_mut().remove(&height);
+            }
+            // Recently validated states of the new active chain become checkpoints.
+            for height in height.saturating_sub(DENSE_STATE_CHECKPOINTS)..height {
+                if self.checkpoints.get_mut().contains_key(&height) {
+                    continue;
+                }
+                if let Some(hash) = self.canonical_hash(height).ok().flatten()
+                    && let Some(state) = self.uncache_state(&hash)
+                {
+                    self.checkpoints.get_mut().insert(height, (hash, state));
+                }
+            }
+        }
+        self.checkpoints
+            .get_mut()
+            .retain(|retained, _| checkpoint_retained(*retained, height));
+    }
+    /// Track stored losing-branch leaves that could still raise peer capacity.
+    fn note_branch(&mut self, hash: Hash, entry: &Entry, best: bool, previous: (Hash, Arc<Entry>)) {
+        self.branches.remove(&entry.header.previous);
+        self.branches.remove(&hash);
+        if !best {
+            self.branches.insert(hash, BranchLeaf::of(entry));
+        } else if entry.header.previous != previous.0 && previous.0 != hash {
+            // A tip has no stored children, so the previous tip is now a leaf.
+            self.branches.insert(previous.0, BranchLeaf::of(&previous.1));
+        }
+    }
+    fn refresh_capacity(&mut self) {
+        let next = self
+            .target(&self.tip_entry)
+            .map(|target| math::work(&target))
+            .unwrap_or_default();
+        let margin = &next * CAPACITY_BRANCH_MARGIN_BLOCKS;
+        let tip_work = &self.tip_entry.work;
+        // Tip work only grows, so a leaf left behind does not return.
+        self.branches
+            .retain(|_, leaf| &leaf.work + &margin >= *tip_work);
+        while self.branches.len() > MAX_CAPACITY_BRANCHES {
+            let lowest = self
+                .branches
+                .iter()
+                .min_by(|a, b| a.1.work.cmp(&b.1.work).then_with(|| a.0.cmp(b.0)))
+                .map(|(hash, _)| *hash);
+            if let Some(hash) = lowest {
+                self.branches.remove(&hash);
+            }
+        }
+        self.known_block_bytes = self
+            .branches
+            .values()
+            .filter(|leaf| &leaf.block_work * CAPACITY_BRANCH_WORK_RATIO >= next)
+            .map(|leaf| leaf.capacity)
+            .fold(self.tip_entry.capacity, u64::max);
     }
     pub fn chain_work(&self) -> &Amount {
         &self.tip_entry.work
@@ -568,11 +1027,8 @@ impl Chain {
         (|| -> Result<_> {
             let raw: Option<Vec<u8>> = self
                 .db
-                .query_row(
-                    "SELECT hash FROM canonical_index WHERE height=?1",
-                    [height],
-                    |row| row.get(0),
-                )
+                .prepare_cached("SELECT hash FROM canonical_index WHERE height=?1")?
+                .query_row([height], |row| row.get(0))
                 .optional()?;
             if let Some(raw) = raw {
                 Ok(Some(
@@ -619,7 +1075,30 @@ impl Chain {
             &math::target_from_bits(self.config.limit_bits)?,
         ))
     }
-    fn validate_block(&self, block: &Block, now: u64) -> Result<(Entry, Arc<State>)> {
+    /// Local anti-DoS admission for a block that would not become the tip. Its
+    /// claimed work is backed by the proof of work checked before this runs.
+    fn admit_branch(&self, parent: &Entry, work: &Amount) -> Result<()> {
+        let branch = &parent.work + work;
+        if branch > self.tip_entry.work {
+            return Ok(());
+        }
+        let next = math::work(&self.target(&self.tip_entry)?);
+        if work * SIDE_BRANCH_WORK_RATIO < next {
+            return Err(SideBranchRefused("block work is far below the active chain's").into());
+        }
+        if branch + work * SIDE_BRANCH_CATCH_UP_BLOCKS < self.tip_entry.work {
+            return Err(
+                SideBranchRefused("branch cannot plausibly overtake the active chain").into(),
+            );
+        }
+        Ok(())
+    }
+    fn validate_block(
+        &self,
+        block: &Block,
+        now: u64,
+        admission: bool,
+    ) -> Result<(Entry, Arc<State>)> {
         let parent = self
             .load_entry(&block.header.previous)?
             .context("unknown parent")?;
@@ -654,10 +1133,17 @@ impl Chain {
                 block.header.merkle_root == codec::merkle_root(block)?,
                 "incorrect transaction Merkle root"
             );
-            self.validate_transaction_anchors(&block.header.previous, &block.transactions)?;
             Ok(target)
         })()
         .map_err(permanent)?;
+        let work = math::work(&target);
+        // Admission policy runs after the cheap header checks and before any
+        // ancestry walk or state reconstruction for the block.
+        if admission {
+            self.admit_branch(&parent, &work)?;
+        }
+        self.validate_transaction_anchors(&block.header.previous, &block.transactions)
+            .map_err(permanent)?;
         let parent_state = self.load_state(&block.header.previous)?;
         // Disk/reconstruction failures above are transient local failures and are
         // never entered into the cache of permanently invalid block messages.
@@ -666,7 +1152,6 @@ impl Chain {
                 codec::body_size(block)? as u64 <= parent_state.settings.block_bytes,
                 "block body exceeds byte limit"
             );
-            let work = math::work(&target);
             let state = consensus::execute(
                 &self.config,
                 &parent_state,
@@ -683,11 +1168,22 @@ impl Chain {
                 .clock
                 .checked_add(parent_state.settings.interval)
                 .context("expected timestamp schedule overflow")?;
-            let (anchor_timestamp, anchor_clock) = if parent.height == 0 {
-                (block.header.timestamp, clock)
-            } else {
-                (parent.anchor_timestamp, parent.anchor_clock)
+            let (anchor_timestamp, anchor_clock) = match parent.height {
+                0 => (block.header.timestamp, clock),
+                // The first block cannot backdate its branch's schedule: the
+                // anchor is at least the second timestamp less one interval.
+                1 => {
+                    let floor = u64::from(block.header.timestamp)
+                        .saturating_sub(parent_state.settings.interval);
+                    (
+                        parent.anchor_timestamp.max(u32::try_from(floor)?),
+                        parent.anchor_clock,
+                    )
+                }
+                _ => (parent.anchor_timestamp, parent.anchor_clock),
             };
+            let mut ancestry = Some((block.header.previous, parent.clone()));
+            let skip = self.branch_ancestor(&mut ancestry, skip_height(block.height))?;
             Ok((
                 Entry {
                     header: block.header.clone(),
@@ -696,6 +1192,8 @@ impl Chain {
                     anchor_timestamp,
                     anchor_clock,
                     work: &parent.work + work,
+                    skip,
+                    capacity: parent.capacity.max(state.settings.block_bytes),
                 },
                 Arc::new(state),
             ))
@@ -730,7 +1228,7 @@ impl Chain {
         if let Some(error) = self.invalid_blocks.get(&identity) {
             anyhow::bail!("cached invalid block: {error}");
         }
-        let (entry, state) = match self.validate_block(&block, now) {
+        let (entry, state) = match self.validate_block(&block, now, true) {
             Ok(valid) => valid,
             Err(error) => {
                 if error.downcast_ref::<PermanentBlockError>().is_some() {
@@ -754,12 +1252,7 @@ impl Chain {
             transaction.execute("INSERT INTO metadata(key,value) VALUES('tip',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[hash.as_slice()])?;
         }
         transaction.commit()?;
-        let entry = Arc::new(entry);
-        self.cache_entry(hash, entry.clone());
-        self.cache_state(hash, state.clone());
-        if best {
-            self.select_tip(hash, block, state, entry);
-        }
+        self.record(hash, block, Arc::new(entry), state, best);
         Ok(best)
     }
     pub fn template(
@@ -789,6 +1282,8 @@ impl Chain {
         state_root: Hash,
     ) -> Result<Block> {
         let target = self.target(&self.tip_entry)?;
+        // Header timestamps are u32: the chain cannot extend once median
+        // past time reaches u32::MAX (2106-02-07 UTC), a protocol lifetime limit.
         let timestamp = timestamp.max(
             self.median(self.tip)?
                 .checked_add(1)
@@ -870,7 +1365,6 @@ impl Chain {
             budget_exhausted: false,
         };
         let limit = limit.min(self.config.max_signatures);
-        let budget = candidates.len() * SELECTION_ATTEMPTS_PER_CANDIDATE;
         let (prefix, suffix) = codec::coinbase_parts(execution.state.height, &miner, &ZERO_HASH);
         let system_bytes = prefix.len() + 8 + suffix.len();
         // The combined coinbase commitment has a separately transmitted state-root opening.
@@ -896,122 +1390,206 @@ impl Chain {
             let Ok(quote) = fees::quote(&self.config, &execution.state, transaction) else {
                 continue;
             };
-            let (priority, weight) = (quote.miner_fee, quote.weight);
-            let recipient = match transaction.body.operation.clone() {
-                Operation::TransferExact { recipient, .. } => Some(recipient),
+            // Only opening funds can be committed and commitments only grow, so
+            // a candidate the opening balance cannot cover never executes. It
+            // is dropped before ranking, whatever fee it declares.
+            if !execution.opening_funds_cover(transaction) {
+                continue;
+            }
+            let recipient = match &transaction.body.operation {
+                Operation::TransferExact { recipient, .. } => Some(*recipient),
                 _ => None,
             };
-            pending.push((
+            pending.push(Candidate {
                 transaction,
-                compact_size_len(bytes.len()) + bytes.len(),
-                priority,
-                weight,
-                id,
+                bytes: compact_size_len(bytes.len()) + bytes.len(),
+                priority: Priority {
+                    fee: quote.miner_fee,
+                    weight: quote.weight,
+                    id,
+                },
                 recipient,
-            ));
+                slot: Slot::Waiting,
+            });
         }
-        type RankedCandidate<'a> = (&'a Transaction, usize, Amount, u64, Hash, Option<PublicKey>);
-        let refs: Vec<_> = pending.iter().map(|candidate| candidate.0).collect();
+        let refs: Vec<_> = pending.iter().map(|candidate| candidate.transaction).collect();
         let anchor_validity = self.transaction_anchor_results(&self.tip, &refs)?;
-        pending = pending
+        let mut pending: Vec<_> = pending
             .into_iter()
             .zip(anchor_validity)
             .filter_map(|(candidate, validity)| validity.is_ok().then_some(candidate))
             .collect();
-        let rank = |pending: &mut Vec<RankedCandidate<'_>>| {
-            pending.sort_by(|a, b| {
-                let earnings = (&b.2 * Amount::from(a.3)).cmp(&(&a.2 * Amount::from(b.3)));
-                earnings.then_with(|| a.4.cmp(&b.4))
-            });
-        };
-        // Rank actual miner earnings per weight; txid breaks equal bids.
-        rank(&mut pending);
-        while !pending.is_empty() && result.transactions.len() < limit {
-            let previous_count = result.transactions.len();
-            let mut index = 0;
-            while index < pending.len() {
-                let (transaction, bytes) = (pending[index].0, pending[index].1);
-                let nonce = execution
+        // Index candidates by sender nonce and payment recipient. Each sender
+        // has its own operation budget, so one sender's failing candidates
+        // cannot use up the attempts available to others.
+        let mut senders = BTreeMap::<PublicKey, SenderQueue>::new();
+        let mut payments = BTreeMap::<PublicKey, Vec<usize>>::new();
+        for (index, candidate) in pending.iter().enumerate() {
+            let body = &candidate.transaction.body;
+            let queue = senders.entry(body.sender).or_insert_with(|| SenderQueue {
+                nonce: execution
                     .state
-                    .account(&transaction.body.sender, None)
-                    .map(|a| a.nonce);
-                if nonce.is_some_and(|n| transaction.body.nonce < n) {
-                    pending.remove(index);
-                    continue;
-                }
-                if nonce != Some(transaction.body.nonce) {
-                    index += 1;
-                    continue;
-                }
-                // Include the mandatory system record and CompactSize count growth.
-                let record_count = result.transactions.len() + 2;
-                let body_size = compact_size_len(record_count) + records_bytes + bytes;
-                if body_size > byte_limit {
-                    pending.remove(index);
-                    continue;
-                }
-                if result.execution_attempts == budget {
-                    result.budget_exhausted = true;
-                    break;
-                }
-                result.execution_attempts += 1;
-                let created_recipient = pending[index]
-                    .5
-                    .filter(|recipient| execution.state.account(recipient, None).is_none());
-                if execution
-                    .apply_verified_transaction(&self.config, transaction)
-                    .is_ok()
-                {
-                    records_bytes += bytes;
-                    result.transactions.push(transaction.clone());
-                    pending.remove(index);
-                    if let Some(recipient) = created_recipient {
-                        // Creating an account lowers the weight of later payments
-                        // to that account while their exact fees stay fixed. Reprice affected
-                        // candidates, then rank again before filling more slots.
-                        let mut repriced = false;
-                        pending.retain_mut(|candidate| {
-                            if candidate.5 != Some(recipient) {
-                                return true;
-                            }
-                            let Ok(quote) =
-                                fees::quote(&self.config, &execution.state, candidate.0)
-                            else {
-                                return false;
-                            };
-                            candidate.2 = quote.miner_fee;
-                            candidate.3 = quote.weight;
-                            repriced = true;
-                            true
-                        });
-                        if repriced {
-                            rank(&mut pending);
-                        }
-                    }
-                    // An accepted prerequisite may make an earlier, higher-priority
-                    // candidate executable. Revisit it before filling the last slots
-                    // with lower-priority transactions. Authentication stays cached
-                    // and the same linear budget bounds actual operation attempts.
-                    break;
-                } else {
-                    index += 1;
-                }
-            }
-            if result.budget_exhausted || result.transactions.len() == previous_count {
-                break;
+                    .account(&body.sender, None)
+                    .map_or(u64::MAX, |account| account.nonce),
+                budget: 0,
+                waiting: BTreeMap::new(),
+            });
+            queue.budget += SELECTION_ATTEMPTS_PER_CANDIDATE;
+            queue.waiting.entry(body.nonce).or_default().push(index);
+            if let Some(recipient) = candidate.recipient {
+                payments.entry(recipient).or_default().push(index);
             }
         }
-        let state = consensus::finish_block(
+        // Rank actual miner earnings per weight; txid breaks equal bids. Only
+        // candidates at their sender's current nonce are ready to execute.
+        let mut ready = BTreeSet::new();
+        for queue in senders.values_mut() {
+            // Lower nonces are already used and never become executable.
+            queue.waiting = queue.waiting.split_off(&queue.nonce);
+            for index in queue.waiting.remove(&queue.nonce).unwrap_or_default() {
+                pending[index].slot = Slot::Ready;
+                ready.insert((pending[index].priority.clone(), index));
+            }
+        }
+        let mut parked = Vec::new();
+        while result.transactions.len() < limit {
+            let Some((_, index)) = ready.pop_first() else {
+                break;
+            };
+            let (transaction, bytes, recipient) = {
+                let candidate = &mut pending[index];
+                candidate.slot = Slot::Done;
+                (candidate.transaction, candidate.bytes, candidate.recipient)
+            };
+            let queue = senders
+                .get_mut(&transaction.body.sender)
+                .context("selection sender absent")?;
+            // Another candidate already used this nonce.
+            if transaction.body.nonce != queue.nonce {
+                continue;
+            }
+            // Include the mandatory system record and CompactSize count growth.
+            // Used bytes only grow, so a candidate that does not fit never will.
+            let record_count = result.transactions.len() + 2;
+            let body_size = compact_size_len(record_count) + records_bytes + bytes;
+            if body_size > byte_limit || !execution.opening_funds_cover(transaction) {
+                continue;
+            }
+            if queue.budget == 0 {
+                result.budget_exhausted = true;
+                continue;
+            }
+            queue.budget -= 1;
+            result.execution_attempts += 1;
+            let created_recipient =
+                recipient.filter(|recipient| execution.state.account(recipient, None).is_none());
+            if execution
+                .apply_verified_transaction(&self.config, transaction)
+                .is_err()
+            {
+                pending[index].slot = Slot::Parked;
+                parked.push(index);
+                continue;
+            }
+            records_bytes += bytes;
+            result.transactions.push(transaction.clone());
+            queue.nonce = transaction.body.nonce + 1;
+            let mut revisit = queue.waiting.remove(&queue.nonce).unwrap_or_default();
+            // An accepted prerequisite may make an earlier, higher-priority
+            // failure executable. Revisit failures before lower-priority
+            // entries; each sender's budget bounds the repeated attempts.
+            revisit.append(&mut parked);
+            for next in revisit {
+                if matches!(pending[next].slot, Slot::Waiting | Slot::Parked) {
+                    pending[next].slot = Slot::Ready;
+                    ready.insert((pending[next].priority.clone(), next));
+                }
+            }
+            if let Some(recipient) = created_recipient {
+                // Creating an account lowers the weight of later payments to that
+                // account while their exact fees stay fixed. Reprice only those.
+                for payment in payments.remove(&recipient).unwrap_or_default() {
+                    let slot = pending[payment].slot;
+                    if slot == Slot::Done {
+                        continue;
+                    }
+                    if slot == Slot::Ready {
+                        ready.remove(&(pending[payment].priority.clone(), payment));
+                    }
+                    let Ok(quote) =
+                        fees::quote(&self.config, &execution.state, pending[payment].transaction)
+                    else {
+                        pending[payment].slot = Slot::Done;
+                        continue;
+                    };
+                    pending[payment].priority.fee = quote.miner_fee;
+                    pending[payment].priority.weight = quote.weight;
+                    if slot == Slot::Ready {
+                        ready.insert((pending[payment].priority.clone(), payment));
+                    }
+                }
+            }
+        }
+        let state = match consensus::finish_block(
             &self.config,
             &self.tip_state,
             &self.tip,
             &miner,
             &block_work,
             execution,
-        )?;
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                let (length, state) = self
+                    .finish_prefix(&miner, &block_work, &result.transactions)
+                    .ok_or(error)?;
+                result.transactions.truncate(length);
+                state
+            }
+        };
         Ok((result, state))
     }
+    /// Selection is local policy: if the accepted set cannot finish as a block,
+    /// keep the longest prefix found by bisection, down to an empty block.
+    /// A chain-level failure that also rejects the empty block is returned.
+    fn finish_prefix(
+        &self,
+        miner: &PublicKey,
+        block_work: &Amount,
+        accepted: &[Transaction],
+    ) -> Option<(usize, State)> {
+        let finish = |length: usize| -> Result<State> {
+            let mut execution =
+                consensus::prepare_block(&self.config, &self.tip_state, miner, block_work)?;
+            for transaction in &accepted[..length] {
+                execution.apply_verified_transaction(&self.config, transaction)?;
+            }
+            consensus::finish_block(
+                &self.config,
+                &self.tip_state,
+                &self.tip,
+                miner,
+                block_work,
+                execution,
+            )
+        };
+        let mut best = (0, finish(0).ok()?);
+        let mut failed = accepted.len();
+        while failed - best.0 > 1 {
+            let middle = best.0 + (failed - best.0) / 2;
+            match finish(middle) {
+                Ok(state) => best = (middle, state),
+                Err(_) => failed = middle,
+            }
+        }
+        Some(best)
+    }
 
+    /// Test and diagnostic helper: a one-transaction template paid to the
+    /// transaction's own sender. That sender already has an account, so unlike
+    /// mempool admission (`select_transactions` with the node's payout key) this
+    /// never reserves miner account-creation weight. Do not use it for admission.
+    #[doc(hidden)]
     pub fn validate_transaction(&self, transaction: &Transaction) -> Result<()> {
         self.template(
             transaction.body.sender,
@@ -1036,6 +1614,51 @@ impl Chain {
         }
         anyhow::bail!("no valid nonce in mining attempt limit")
     }
+}
+
+/// Selection order: higher actual miner earnings per weight, then txid.
+#[derive(Clone)]
+struct Priority {
+    fee: Amount,
+    weight: u64,
+    id: Hash,
+}
+impl Ord for Priority {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (&other.fee * Amount::from(self.weight))
+            .cmp(&(&self.fee * Amount::from(other.weight)))
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+impl PartialOrd for Priority {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for Priority {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for Priority {}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Waiting,
+    Ready,
+    Parked,
+    Done,
+}
+struct Candidate<'a> {
+    transaction: &'a Transaction,
+    bytes: usize,
+    priority: Priority,
+    recipient: Option<PublicKey>,
+    slot: Slot,
+}
+struct SenderQueue {
+    nonce: u64,
+    budget: usize,
+    waiting: BTreeMap<u64, Vec<usize>>,
 }
 
 #[cfg(test)]
@@ -1288,5 +1911,176 @@ mod cache_tests {
                 .submit(block.clone(), u64::from(block.header.timestamp))
                 .unwrap()
         );
+    }
+    #[test]
+    fn skip_links_find_every_ancestor_of_a_side_branch() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        let mut main = Chain::open(&directory.path().join("main.db"), config.clone()).unwrap();
+        let mut side = Chain::open(&directory.path().join("side.db"), config).unwrap();
+        for n in 0..160 {
+            let block = candidate(&main, n);
+            if n < 5 {
+                side.submit(block.clone(), block.header.timestamp as u64)
+                    .unwrap();
+            }
+            main.submit(block.clone(), block.header.timestamp as u64)
+                .unwrap();
+        }
+        // A side branch that stays behind the main chain's work.
+        let mut tip = side.tip_hash();
+        for n in 0..150 {
+            let block = candidate(&side, 1_000 + n);
+            side.submit(block.clone(), block.header.timestamp as u64)
+                .unwrap();
+            assert!(
+                !main
+                    .submit(block.clone(), block.header.timestamp as u64)
+                    .unwrap()
+            );
+            tip = codec::block_hash(&block);
+        }
+        let mut expected = BTreeMap::new();
+        let mut cursor = tip;
+        loop {
+            let entry = main.load_entry(&cursor).unwrap().unwrap();
+            expected.insert(entry.height, cursor);
+            if entry.height == 0 {
+                break;
+            }
+            cursor = entry.header.previous;
+        }
+        assert_eq!(expected.len(), 156);
+        for (height, hash) in expected {
+            let mut ancestry = Some((tip, main.load_entry(&tip).unwrap().unwrap()));
+            assert_eq!(main.branch_ancestor(&mut ancestry, height).unwrap(), hash);
+        }
+        for height in 1..4096u64 {
+            assert!(skip_height(height) < height);
+        }
+    }
+    #[test]
+    fn active_chain_checkpoints_stay_logarithmic_and_monotone() {
+        for tip in [1u64, 31, 32, 33, 1_000, 1 << 20, (1 << 40) + 7] {
+            let low = tip.saturating_sub(4096);
+            let retained = (low..tip)
+                .chain((0..64).map(|shift| tip >> shift))
+                .filter(|height| checkpoint_retained(*height, tip))
+                .collect::<BTreeSet<_>>();
+            assert!(retained.contains(&0));
+            for height in tip.saturating_sub(DENSE_STATE_CHECKPOINTS - 1)..tip {
+                assert!(retained.contains(&height));
+            }
+            // A state dropped once is never retained by a later tip.
+            for height in &retained {
+                for later in [tip + 1, tip + 31, tip * 2 + 3] {
+                    if checkpoint_retained(*height, later) {
+                        assert!(checkpoint_retained(*height, tip));
+                    }
+                }
+            }
+        }
+        let tip = 1u64 << 20;
+        let count = (0..tip)
+            .filter(|height| checkpoint_retained(*height, tip))
+            .count();
+        assert!(count <= DENSE_STATE_CHECKPOINTS as usize + 2 * 20 + 1, "{count}");
+    }
+    #[test]
+    fn stale_tip_hints_are_replaced_by_the_replayed_best_tip() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hint.db");
+        let config = Config::devnet();
+        let mut chain = Chain::open(&path, config.clone()).unwrap();
+        let mut first = None;
+        for n in 0..3 {
+            let block = candidate(&chain, n);
+            first.get_or_insert(codec::block_hash(&block));
+            chain
+                .submit(block.clone(), block.header.timestamp as u64)
+                .unwrap();
+        }
+        let tip = chain.tip_hash();
+        drop(chain);
+        // An absent block, a lower-work ancestor and a malformed value.
+        for hint in [vec![7; 32], first.unwrap().to_vec(), vec![1, 2, 3]] {
+            let db = Connection::open(&path).unwrap();
+            db.execute("UPDATE metadata SET value=?1 WHERE key='tip'", [&hint])
+                .unwrap();
+            drop(db);
+            let chain = Chain::open(&path, config.clone()).unwrap();
+            assert_eq!(chain.tip_hash(), tip);
+            let saved: Vec<u8> = chain
+                .db
+                .query_row("SELECT value FROM metadata WHERE key='tip'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(saved, tip.to_vec());
+        }
+    }
+    #[test]
+    fn losing_blocks_failing_replay_move_aside_and_startup_truncates_the_wal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rejected.db");
+        let config = Config::devnet();
+        let mut chain = Chain::open(&path, config.clone()).unwrap();
+        let mut branch = Chain::open(&directory.path().join("branch.db"), config.clone()).unwrap();
+        for n in 0..3 {
+            let block = candidate(&chain, n);
+            if n == 0 {
+                branch
+                    .submit(block.clone(), block.header.timestamp as u64)
+                    .unwrap();
+            }
+            chain
+                .submit(block.clone(), block.header.timestamp as u64)
+                .unwrap();
+        }
+        let tip = chain.tip_hash();
+        let root = chain.tip_state().root();
+        drop(chain);
+        // A losing sibling that does not validate, and its child.
+        let mut invalid = candidate(&branch, 77);
+        invalid.state_root = [9; 32];
+        invalid.header.merkle_root = codec::merkle_root(&invalid).unwrap();
+        let invalid = Chain::mine(invalid, 100_000).unwrap();
+        let mut child = invalid.clone();
+        child.header.previous = codec::block_hash(&invalid);
+        child.height += 1;
+        child.header.timestamp += 15;
+        let child = Chain::mine(child, 100_000).unwrap();
+        let db = Connection::open(&path).unwrap();
+        for block in [&invalid, &child] {
+            db.execute(
+                "INSERT INTO blocks(hash,bytes,accepted_at) VALUES(?1,?2,?3)",
+                params![
+                    codec::block_hash(block).as_slice(),
+                    codec::encode(block),
+                    u64::from(block.header.timestamp)
+                ],
+            )
+            .unwrap();
+        }
+        drop(db);
+        let chain = Chain::open(&path, config.clone()).unwrap();
+        assert_eq!(chain.tip_hash(), tip);
+        assert_eq!(chain.tip_state().root(), root);
+        for block in [&invalid, &child] {
+            assert!(chain.block(&codec::block_hash(block)).is_none());
+        }
+        let moved: i64 = chain
+            .db
+            .query_row("SELECT COUNT(*) FROM rejected_blocks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(moved, 2);
+        // The rebuilt indexes were checkpointed and the log truncated.
+        let wal = std::fs::metadata(format!("{}-wal", path.display()))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        assert_eq!(wal, 0);
+        drop(chain);
+        let chain = Chain::open(&path, config).unwrap();
+        assert_eq!(chain.tip_hash(), tip);
     }
 }

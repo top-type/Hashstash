@@ -131,6 +131,12 @@ async function run() {
   const local=b.browserStore.snapshot(),signed=b.browserStore.signUnsigned(watchEnvelope,{chain_id:b.currentSnapshot.status.chain_id,sender:bob,nonce:'0',anchor:b.currentSnapshot.status.tip,expiry_blocks:'2',operation:{TransferExact:{recipient:alice,amount:'100'}},fee:'4',data_hex:'00ff80',wallet_id:local.wallet_id,wallet_revision:local.wallet_revision});
   reloaded.get('broadcast-raw').value=signed.raw;await reloaded.get('broadcast-form').requestSubmit();
   assert.equal(broadcasts(reloaded).length,1);checks++;
+  // The watch-only broadcast is followed by sender nonce like the other forms,
+  // so a transaction the node drops does not stay pending.
+  const broadcastFeedback=()=>reloaded.get('broadcast-form').querySelector().textContent;
+  assert.match(broadcastFeedback(),/^Pending · /);checks++;
+  reloaded.currentSnapshot.mempool=[];reloaded.currentSnapshot.status.mempool=0;await reloaded.refresh();await reloaded.refresh();
+  assert.match(broadcastFeedback(),/^No longer pending · .*Prepare it again\.$/);checks++;
   for(const h of [a,b,reloaded]) {
     const requests=JSON.stringify(h.calls);
     assert.equal(requests.includes(aliceSecret),false,'generated private key never leaves browser');checks++;

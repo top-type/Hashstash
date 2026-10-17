@@ -2858,7 +2858,20 @@
                 raw: raw
             });
             if (!result?.transaction_id) throw new Error("The node did not return a transaction ID.");
-            feedback(form, `Pending · ${short(result.transaction_id)}`);
+            // Follow the selected account's own broadcasts by sender nonce, as
+            // the transaction forms do. Another account's is not refreshed here.
+            let signed = null;
+            try {
+                signed = HashstashBrowserWallet.verifySigned(raw);
+            } catch {
+                // The node accepted bytes this page cannot decode; it reports only the ID.
+            }
+            if (signed?.txid === result.transaction_id && signed.sender === key()) {
+                feedback(form, `Pending · ${short(result.transaction_id)}`);
+                trackSubmission(form, result.transaction_id, signed.sender, signed.nonce);
+            } else {
+                feedback(form, `Broadcast · ${short(result.transaction_id)}. This form follows only the selected account's transactions.`);
+            }
             toast("Transaction broadcast.");
             await refresh();
         } catch (error) {

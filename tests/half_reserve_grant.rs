@@ -87,7 +87,9 @@ fn signed_outcome_trades_pass_half_reserve_grant_and_keep_a_bent_curve() {
     // Proposal fees also create revenue. Construct the exact grant after fee
     // convergence so all waiting revenue and half the ordinary reserve leave
     // the PASS world; no manual state edits or forced resolution are used.
-    let mut grant = &chain.tip_state().world.revenue + &support + &reserve_before / 2u32;
+    // The winning bid becomes revenue only after the grant is reserved, so it
+    // does not fund this grant.
+    let mut grant = &chain.tip_state().world.revenue + &reserve_before / 2u32;
     let proposal = loop {
         let tx = signed(
             &c,
@@ -105,10 +107,8 @@ fn signed_outcome_trades_pass_half_reserve_grant_and_keep_a_bent_curve() {
             },
         );
         let quote = fees::quote(&c, chain.tip_state(), &tx).unwrap();
-        let required = &chain.tip_state().world.revenue
-            + &support
-            + &reserve_before / 2u32
-            + quote.revenue_fee;
+        let required =
+            &chain.tip_state().world.revenue + &reserve_before / 2u32 + quote.revenue_fee;
         if required == grant {
             break tx;
         }
@@ -125,7 +125,9 @@ fn signed_outcome_trades_pass_half_reserve_grant_and_keep_a_bent_curve() {
     assert!(matches!(s.phase, Phase::Governance(_)));
     let pass = s.alternative.as_ref().unwrap();
     assert_eq!(pass.grant_escrow, grant);
-    assert_eq!(&pass.reserve * 2u32, s.world.reserve);
+    assert_eq!(&pass.reserve * 2u32, reserve_before);
+    // FAIL opens on the same bent curve and keeps the shortfall as revenue.
+    assert_eq!(pass.reserve, s.world.reserve);
     assert_eq!(pass.curve_mass, s.world.curve_mass);
     assert_eq!(pass.quote(&c), s.world.quote(&c));
     assert_eq!(

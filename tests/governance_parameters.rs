@@ -1,6 +1,9 @@
-//! Governance has arithmetic/construction bounds, not policy grids.
+//! Genesis has arithmetic/construction bounds, not policy grids. Governed
+//! changes add only the bounds that keep a passed change reversible.
 use hashstash::{
-    config::{Config, MIN_GOVERNED_BLOCK_BYTES},
+    config::{
+        Config, MAX_GOVERNED_DURATION, MIN_GOVERNED_BLOCK_BYTES, MIN_GOVERNED_DECISION_BLOCKS,
+    },
     consensus, crypto, math,
     state::{Phase, State},
     types::Parameter,
@@ -61,17 +64,27 @@ fn block_capacity_has_only_account_work_and_representation_bounds() {
 #[test]
 fn parameters_accept_direct_values_and_zero_where_defined() {
     let c = Config::testnet();
+    // A leader from the first half of a round must still be able to mature.
+    let longest_lead = (c.auction_timeout - c.initial.interval) / 2;
     for (parameter, next) in [
         (Parameter::Lead, 3),
         (Parameter::Lead, 0),
+        (Parameter::Lead, longest_lead),
         (Parameter::Rest, 7),
         (Parameter::Rest, 0),
+        (Parameter::Rest, MAX_GOVERNED_DURATION),
         (Parameter::DecisionBlocks, 17),
-        (Parameter::DecisionBlocks, 1),
+        (Parameter::DecisionBlocks, MIN_GOVERNED_DECISION_BLOCKS),
+        (
+            Parameter::DecisionBlocks,
+            MAX_GOVERNED_DURATION / c.initial.interval,
+        ),
         (Parameter::Interval, 61),
-        (Parameter::Interval, 1 << 40),
+        (Parameter::Interval, c.daa_half_life),
         (Parameter::MinimumFeeRate, 0),
-        (Parameter::MinimumFeeRate, 7),
+        (Parameter::MinimumFeeRate, 2),
+        (Parameter::MaxPriceChangeBps, 1),
+        (Parameter::MaxPriceChangeBps, u64::MAX),
     ] {
         c.parameter_change(&c.initial, parameter, c.initial.get(parameter), next)
             .unwrap();
@@ -85,6 +98,48 @@ fn parameters_accept_direct_values_and_zero_where_defined() {
                 .is_err()
         );
     }
+    // Governance cannot select a value that no later decision could undo,
+    // although genesis may still start with any representable value.
+    for (parameter, next) in [
+        // The first observation ties, so PASS could never reach a majority.
+        (Parameter::DecisionBlocks, 1),
+        (Parameter::DecisionBlocks, 2),
+        // Phases that outlast any practical revision.
+        (
+            Parameter::DecisionBlocks,
+            MAX_GOVERNED_DURATION / c.initial.interval + 1,
+        ),
+        (Parameter::Lead, longest_lead + 1),
+        (Parameter::Lead, c.auction_timeout * 8),
+        (Parameter::Rest, MAX_GOVERNED_DURATION + 1),
+        (Parameter::Rest, u64::MAX - 1),
+        // A step beyond the ASERT half life starves the next target.
+        (Parameter::Interval, c.daa_half_life + 1),
+        (Parameter::Interval, 86_400),
+        (Parameter::Interval, 1 << 40),
+        // Pinned prices can never produce a PASS lead.
+        (Parameter::MaxPriceChangeBps, 0),
+        // One decision cannot price every account out of transacting.
+        (Parameter::MinimumFeeRate, 3),
+        (Parameter::MinimumFeeRate, u64::MAX),
+    ] {
+        assert!(
+            c.parameter_change(&c.initial, parameter, c.initial.get(parameter), next)
+                .is_err(),
+            "{parameter:?} = {next} must be rejected"
+        );
+        let mut changed = c.clone();
+        changed.initial.set(parameter, next);
+        changed.validate().unwrap();
+    }
+    let mut free = c.initial.clone();
+    free.minimum_fee_rate = 0;
+    c.parameter_change(&free, Parameter::MinimumFeeRate, 0, 1)
+        .unwrap();
+    assert!(
+        c.parameter_change(&free, Parameter::MinimumFeeRate, 0, 2)
+            .is_err()
+    );
     let mut lead = c.initial.clone();
     lead.lead = c.auction_timeout * 8;
     assert_eq!(
@@ -96,46 +151,74 @@ fn parameters_accept_direct_values_and_zero_where_defined() {
 }
 
 #[test]
-fn deadlines_are_checked_at_the_actual_activation_clock() {
+fn deadlines_are_checked_through_the_whole_height_range() {
     let c = Config::testnet();
-    let clock = 1_000;
-    let duration = (u64::MAX - clock) / c.initial.interval;
-    c.parameter_change_at(
-        &c.initial,
-        Parameter::DecisionBlocks,
-        c.initial.decision_blocks,
-        duration,
-        clock,
-    )
-    .unwrap();
-    assert!(
+    let settings = &c.initial;
+    let decision = 100;
+    let mut changed = settings.clone();
+    changed.decision_blocks = decision;
+    // Every later block can add one interval before a deadline is computed,
+    // so the activation clock must leave room for the whole height range.
+    let span = settings.interval * c.max_height
+        + c.auction_timeout_for(&changed).unwrap()
+        + decision * settings.interval
+        + settings.rest
+        + 2 * settings.interval;
+    let latest = u64::MAX - span;
+    let change = |clock| {
         c.parameter_change_at(
-            &c.initial,
+            settings,
             Parameter::DecisionBlocks,
-            c.initial.decision_blocks,
-            duration + 1,
-            clock
+            settings.decision_blocks,
+            decision,
+            clock,
         )
-        .is_err()
-    );
-    // The same value can be arithmetically valid earlier, then become stale.
+    };
+    change(latest).unwrap();
+    assert!(change(latest + 1).is_err());
+    // The same value is valid without a clock, then stale late in the range.
     c.parameter_change(
-        &c.initial,
+        settings,
         Parameter::DecisionBlocks,
-        c.initial.decision_blocks,
-        duration + 1,
+        settings.decision_blocks,
+        decision,
     )
     .unwrap();
-    assert!(
-        c.parameter_change_at(
-            &c.initial,
-            Parameter::DecisionBlocks,
-            c.initial.decision_blocks,
-            duration,
-            clock + c.initial.interval
-        )
-        .is_err()
-    );
+    assert!(change(latest + settings.interval).is_err());
+}
+
+#[test]
+fn rest_cannot_reach_the_deadline_overflow_window_after_activation() {
+    // Audit F012: a Rest checked only at its activation clock A could lie in
+    // (u64::MAX - A - timeout, u64::MAX - A]. The next auction then timed out
+    // into an unrepresentable rest and every candidate block was invalid.
+    let c = Config::testnet();
+    let settings = &c.initial;
+    let activation = 1_000_000;
+    let timeout = c.auction_timeout_for(settings).unwrap();
+    for rest in [
+        u64::MAX - activation,
+        u64::MAX - activation - timeout,
+        MAX_GOVERNED_DURATION + 1,
+    ] {
+        let mut changed = settings.clone();
+        changed.rest = rest;
+        // The former single-clock check accepted every one of these.
+        c.validate_governance_settings_at(&changed, activation)
+            .unwrap();
+        assert!(
+            c.parameter_change_at(settings, Parameter::Rest, settings.rest, rest, activation)
+                .is_err()
+        );
+    }
+    c.parameter_change_at(
+        settings,
+        Parameter::Rest,
+        settings.rest,
+        MAX_GOVERNED_DURATION,
+        activation,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -156,11 +239,37 @@ fn decision_block_count_can_be_one() {
 }
 
 #[test]
-fn pass_margin_supports_every_u64_value_and_is_committed_in_genesis_and_frozen_state() {
+fn pass_margin_genesis_supports_every_u64_value_and_governed_margins_stay_reachable() {
     let c = Config::testnet();
-    for margin in [1, 123, 10_000, 100_000, u64::MAX] {
+    // PASS must lead from observation ceil(N/2), after ceil(N/2)-1 traded
+    // blocks that can each move the price by at most MaxPriceChangeBps.
+    let reachable = (c.initial.decision_blocks.div_ceil(2) - 1) * c.initial.max_price_change_bps;
+    for margin in [1, 123, reachable - 1] {
         c.parameter_change(&c.initial, Parameter::PassMarginBps, 0, margin)
             .unwrap();
+    }
+    for margin in [reachable, 10_000, 100_000, u64::MAX] {
+        assert!(
+            c.parameter_change(&c.initial, Parameter::PassMarginBps, 0, margin)
+                .is_err()
+        );
+    }
+    // Shortening the decision or tightening the bound cannot strand a margin.
+    let mut wide = c.initial.clone();
+    wide.pass_margin_bps = Some(reachable - 1);
+    for (parameter, next) in [
+        (Parameter::DecisionBlocks, c.initial.decision_blocks - 2),
+        (
+            Parameter::MaxPriceChangeBps,
+            c.initial.max_price_change_bps - 1,
+        ),
+    ] {
+        assert!(
+            c.parameter_change(&wide, parameter, wide.get(parameter), next)
+                .is_err()
+        );
+    }
+    for margin in [1, 123, 10_000, 100_000, u64::MAX] {
         let mut changed = c.clone();
         changed.initial.pass_margin_bps = Some(margin);
         changed.validate().unwrap();

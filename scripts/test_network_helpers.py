@@ -17,11 +17,12 @@ class PriceComparisonTests(unittest.TestCase):
         self.assertFalse(pass_leads(world(11, 100), world(1, 10), 1000))
         self.assertTrue(pass_leads(world(1100001, 10000000), world(1, 10), 1000))
 
-    def test_empty_curves_have_zero_price(self):
+    def test_an_empty_curve_is_no_observation(self):
         empty = world(0, 0)
         self.assertFalse(pass_leads(empty, empty, 0))
-        self.assertFalse(pass_leads(empty, world(1, 10**60), 0))
-        self.assertTrue(pass_leads(world(1, 10**60), empty, (1 << 64) - 1))
+        for margin in (0, (1 << 64) - 1):
+            self.assertFalse(pass_leads(empty, world(1, 10**60), margin))
+            self.assertFalse(pass_leads(world(1, 10**60), empty, margin))
 
 
 if __name__ == '__main__':

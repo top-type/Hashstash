@@ -109,7 +109,12 @@ fn whole_grant_is_reserved_at_opening_and_tied_prices_fail() {
             unreachable!()
         };
         let pass = s.alternative.as_ref().unwrap();
-        assert_eq!(s.world.revenue, before.world.revenue + 10u64);
+        // FAIL sets the same reserve shortfall aside as waiting revenue, and
+        // the winning bid joins revenue only after the grant is reserved.
+        let shortfall = &before.world.reserve - &s.world.reserve;
+        assert!(!shortfall.is_zero());
+        assert_eq!(pass.reserve, s.world.reserve);
+        assert_eq!(s.world.revenue, &before.world.revenue + 10u64 + &shortfall);
         assert_eq!(pass.grant_escrow, amount.into());
         assert_eq!(pass.curve_mass, s.world.curve_mass);
         assert_eq!(pass.shares, s.world.shares);
@@ -198,10 +203,14 @@ fn pass_trade_can_win_and_release_escrow_exactly_once() {
 }
 
 #[test]
-fn fee_revenue_replenishes_each_world_after_miner_split() {
+fn fee_revenue_waits_in_each_world_until_the_decision_resolves() {
+    // Audit F010: replenishing PASS during a decision flattened its curve
+    // right after a small PASS buy and locked that lead in for every
+    // remaining observation. Revenue now waits until the outcome is chosen.
     let c = config(12);
     let (_, mut s) = grant(&c, 1207);
-    let before = s.alternative.as_ref().unwrap().clone();
+    let before_pass = s.alternative.as_ref().unwrap().clone();
+    let before_fail = s.world.clone();
     let tx = sign(
         &s,
         Operation::TransferExact {
@@ -212,14 +221,27 @@ fn fee_revenue_replenishes_each_world_after_miner_split() {
     );
     let quote = hashstash::fees::quote(&c, &s, &tx).unwrap();
     s = step(&c, &s, 1, &[tx]);
-    let pass = s.alternative.as_ref().unwrap();
-    assert_eq!(pass.reserve, &before.reserve + &quote.revenue_fee);
-    assert_eq!(pass.curve_mass, before.curve_mass);
-    assert_eq!(pass.shares, before.shares);
-    assert_eq!(pass.quote(&c), before.quote(&c));
-    assert!(pass.revenue.is_zero());
+    for (world, before) in [
+        (s.alternative.as_ref().unwrap(), &before_pass),
+        (&s.world, &before_fail),
+    ] {
+        assert_eq!(world.reserve, before.reserve);
+        assert_eq!(world.curve_mass, before.curve_mass);
+        assert_eq!(world.shares, before.shares);
+        assert_eq!(world.quote(&c), before.quote(&c));
+        assert_eq!(world.revenue, &before.revenue + &quote.revenue_fee);
+        assert!(world.reserve < world.curve_mass);
+    }
+    while s.decision_id().is_some() {
+        s = step(&c, &s, 1, &[]);
+    }
+    // The selected FAIL world refills from its resolution block.
+    let deficit = &before_fail.curve_mass - &before_fail.reserve;
     assert_eq!(s.world.reserve, s.world.curve_mass);
-    assert!(s.world.revenue >= quote.revenue_fee);
+    assert_eq!(
+        s.world.revenue,
+        &before_fail.revenue + &quote.revenue_fee - &deficit
+    );
 }
 
 #[test]

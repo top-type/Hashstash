@@ -90,7 +90,7 @@ fn zero_rest_and_lead_open_and_resolve_without_stuck_transient_phases() {
     for (parameter, value) in [
         (Parameter::DecisionBlocks, 155),
         (Parameter::Interval, 77),
-        (Parameter::MinimumFeeRate, 3),
+        (Parameter::MinimumFeeRate, 1),
     ] {
         let tx = propose(
             &s,
@@ -150,12 +150,16 @@ fn block_count_decisions_fail_ties_and_restore_grant_escrow() {
             opened.alternative.as_ref().unwrap().grant_escrow,
             100u32.into()
         );
+        // FAIL opens on the same bent curve, holding the shortfall as revenue.
+        let pass = opened.alternative.as_ref().unwrap();
+        assert_eq!(opened.world.reserve, pass.reserve);
+        assert!(opened.world.reserve < s.world.reserve);
         let mut closed = opened.clone();
         for _ in 0..duration {
             closed = step(&c, &closed, 0, &[]);
         }
         assert!(matches!(closed.phase, Phase::Auction(_)));
-        assert_eq!(closed.world.reserve, opened.world.reserve);
+        assert_eq!(closed.world.reserve, s.world.reserve);
         assert!(closed.alternative.is_none());
         assert_eq!(closed.world.grant_escrow, 0u32.into());
         assert_eq!(closed.height - opened.height, duration);
@@ -193,8 +197,13 @@ fn long_intervals_resolve_escrow_without_losing_funds() {
     );
     assert!(closed.decision_id().is_none());
     assert!(closed.alternative.is_none());
-    assert_eq!(closed.world.reserve, opened.world.reserve);
-    assert_eq!(closed.world.revenue, opened.world.revenue);
+    // FAIL's set-aside shortfall returns to its reserve at resolution.
+    assert_eq!(closed.world.reserve, s.world.reserve);
+    assert_eq!(closed.world.reserve, closed.world.curve_mass);
+    assert_eq!(
+        &closed.world.reserve + &closed.world.revenue,
+        &opened.world.reserve + &opened.world.revenue
+    );
     assert_eq!(closed.world.account_cash, opened.world.account_cash);
     assert_eq!(closed.world.grant_escrow, 0u32.into());
     assert_eq!(closed.issued, opened.issued);
@@ -202,15 +211,30 @@ fn long_intervals_resolve_escrow_without_losing_funds() {
 
 #[test]
 fn proposals_that_no_longer_fit_at_activation_are_refunded_without_halting_blocks() {
-    let c = config();
+    // A short height range keeps the governed lifetime bound near the end
+    // of the clock range, where a value can fit at submission but not at
+    // its projected activation one decision later.
+    let mut c = config();
+    c.max_height = 1_000;
+    c.validate().unwrap();
     let mut s = funded(&c);
-    s.clock = u64::MAX - 10_000;
+    let new = 1_000;
+    let mut changed = s.settings.clone();
+    changed.decision_blocks = new;
+    let interval = s.settings.interval;
+    let span = interval * c.max_height
+        + c.auction_timeout_for(&changed).unwrap()
+        + new * interval
+        + changed.rest
+        + 2 * interval;
+    // The including block's clock leaves 20 seconds of slack at submission;
+    // activation comes decision_blocks * interval later.
+    s.clock = u64::MAX - span - 20 - interval;
     if let Phase::Auction(a) = &mut s.phase {
         a.opened = s.clock;
         a.lead_since = s.clock;
     }
     s.audit(&c).unwrap();
-    let new = (u64::MAX - (s.clock + s.settings.interval)) / s.settings.interval;
     let tx = propose(
         &s,
         Proposal::Parameter {

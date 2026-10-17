@@ -35,6 +35,6 @@ The offline signer obtains its network from a local configuration, a pasted chai
 .\bin\hashstash.exe mine --recipient '<address>' --count 1
 ```
 
-`address` also accepts `--public-key HEX` instead of `--key`. Both conversion commands accept `--chain-id HEX` instead of `--config`. The convenience transfer command and `send`/`prepare` recipient strings validate against the connected node's chain. Raw hexadecimal keys and byte-array operation fields remain available for existing scripts. `run --miner` and `run --watch-key` accept either a network-matching address or a raw public key.
+`address` also accepts `--public-key HEX` instead of `--key`. Both conversion commands accept `--chain-id HEX` instead of `--config`. The convenience transfer command and `send`/`prepare` recipient strings validate against the connected node's chain, which must match `--config` or `--chain-id` when given; a non-loopback `--url` requires one. Raw hexadecimal keys and byte-array operation fields remain available for existing scripts. `run --miner` and `run --watch-key` accept either a network-matching address or a raw public key.
 
 Read-only RPC `address` takes `{public_key}` and returns its current-network address. `validateaddress` takes `{address}` and strictly validates it against the connected chain. Both return `{address, public_key, address_hrp}`. Session metadata exposes these addresses without revealing private keys.

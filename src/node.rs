@@ -2512,6 +2512,8 @@ impl Node {
                         .max();
                     snapshot["pending_nonce"] =
                         nonce.map_or(Value::Null, |n| json!(n.to_string()));
+                    // Charged like the global page above, before it is built.
+                    charge(meter, mempool_work(&own, 0, 128, "summary"))?;
                     snapshot["sender_mempool"] = mempool_page(&own, 0, 128, true)?;
                 }
                 if let Some(keys) = keys {
@@ -5467,6 +5469,51 @@ mod read_admission_tests {
             response_frame_bytes(usize::MAX).unwrap(),
             isize::MAX as usize
         );
+    }
+
+    #[test]
+    fn sender_pending_rows_are_charged_before_the_snapshot_builds_them() {
+        let other = crypto::public_key(&[2; 32]).unwrap();
+        let pending = |sender, nonce, proposal: Option<Proposal>| Transaction {
+            body: TransactionBody {
+                sender,
+                nonce,
+                fee: 1u32.into(),
+                anchor: [9; 32],
+                expiry_blocks: 10,
+                operation: match proposal {
+                    Some(proposal) => Operation::Propose {
+                        round: 0,
+                        description: [0; 32],
+                        proposal,
+                        support: 1u32.into(),
+                    },
+                    None => Operation::Refund {
+                        round: 0,
+                        proposal: [0; 32],
+                    },
+                },
+                data: Vec::new(),
+            },
+            signature: [0; 64],
+        };
+        // The global page holds only the other sender's rows; the selected
+        // sender's grant rows appear only in its own page.
+        let mut pool: Vec<_> = (0..128).map(|n| pending(other, n, None)).collect();
+        pool.extend((0..128).map(|n| pending(key(), n, Some(grant(512)))));
+        let view = view(curved(), pool);
+        let budget = || {
+            let session = Arc::new(NetworkGuard::for_public_web())
+                .admit("127.0.0.1".parse().unwrap(), Surface::Rpc)
+                .unwrap();
+            session.work(1_048_576 - 8192).unwrap();
+            session
+        };
+        let anonymous = Node::read_rpc_metered(&view, "snapshot", json!({}), Some(&budget()));
+        assert!(anonymous.is_ok(), "{:?}", anonymous.err());
+        let keyed = json!({"key":hex::encode(key())});
+        let error = Node::read_rpc_metered(&view, "snapshot", keyed, Some(&budget())).unwrap_err();
+        assert!(error.to_string().contains("budget"), "{error}");
     }
 
     async fn parse(raw: &[u8], token: Option<&str>) -> Result<HttpRequest> {

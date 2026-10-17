@@ -75,6 +75,39 @@ async function run() {
   assert.match(h.get('gov-grant-progress').title, /Set aside on PASS/); checks++;
   assert.equal(h.get('pass-ratio').textContent, '20%'); checks++;
   assert.equal(h.get('fail-ratio').textContent, '20%'); checks++;
+
+  // At the last tip the next block adds one observation from these closing
+  // prices and resolves before its transactions: the result is already fixed.
+  const status = () => h.get('gov-result-status').textContent;
+  decision.started_height = s.status.height - 15; decision.leading_blocks = 8; await h.refresh();
+  assert.equal(status(), 'PASS decided', 'PASS leads at the closing prices, so it reaches 9 of 16'); checks++;
+  assert.match(h.get('gov-result-detail').textContent, /9 of 16 blocks count for PASS.*resolves at the start of the next block/); checks++;
+  assert.match(h.get('gov-result').title, /result is fixed/); checks++;
+  s.governance.pass.curve_mass = '5000'; await h.refresh();
+  assert.equal(status(), 'FAIL decided', 'equal closing prices add no PASS block, so 8 of 16 already means FAIL even though 8 of 15 leads'); checks++;
+  decision.blocks = 15; decision.started_height = s.status.height - 14; decision.leading_blocks = 7; s.governance.pass.curve_mass = '10000'; await h.refresh();
+  assert.equal(status(), 'PASS decided', 'the mirror case: 7 of 14 trails, but the closing block makes 8 of 15'); checks++;
+  s.governance.pass.grant_escrow = '9'; await h.refresh();
+  assert.equal(status(), 'FAIL decided', 'an underfunded grant cannot be decided for PASS'); checks++;
+  s.governance.pass.grant_escrow = '10';
+  {
+    // No conditional trade can be included once the next block resolves the decision.
+    const { settle } = require('./test_wallet_ui.cjs');
+    await h.refresh(); await h.navigate('#stash');
+    assert.equal(h.get('stash-context-notice').textContent, 'Trading is closed: the decision resolves at the start of the next block, before its transactions.'); checks++;
+    const quotes = () => h.calls.filter(call => call.body.method === 'stash_quote').length, before = quotes();
+    h.get('trade-amount').value = '1'; await h.get('trade-amount').fire('input'); await h.timersDue(); await settle();
+    assert.equal(quotes(), before, 'no quote is requested for a trade that cannot be included'); checks++;
+    assert.equal(h.get('trade-quote').textContent, 'Quote unavailable'); checks++;
+    assert.match(h.get('quote-height').textContent, /Trading is closed/); checks++;
+    assert.equal(h.get('trade-submit').disabled, true); checks++;
+    decision.started_height = s.status.height - 13; await h.refresh(); await h.timersDue(); await settle();
+    assert.equal(h.get('stash-context-notice').textContent, 'Fees require hashes in both outcomes.', 'one block earlier, trading is open'); checks++;
+    assert.ok(quotes() > before, 'and quotes are requested again'); checks++;
+    assert.equal(status(), 'PASS leads', 'before the last tip the running count is shown'); checks++;
+    h.get('trade-amount').value = ''; await h.get('trade-amount').fire('input'); await h.timersDue(); await h.navigate('#governance');
+  }
+  decision.blocks = 16;
   decision.started_height = s.status.height; decision.leading_blocks = 0; await h.refresh();
   assert.equal(h.get('gov-result-status').textContent, 'Pending'); checks++;
   assert.equal(h.get('pass-leading-blocks').textContent, '0'); checks++;

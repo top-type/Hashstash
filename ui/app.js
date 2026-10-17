@@ -397,6 +397,21 @@
     function activeDecision() {
         return state.gov?.phase?.Governance || null;
     }
+    // The block after the decision's last tip resolves it in prepare_block,
+    // before any of its transactions, so a conditional trade prepared now can
+    // never be included. This is the same height test consensus applies.
+    const tradingClosedMessage = "Trading is closed: the decision resolves at the start of the next block, before its transactions.";
+    function decisionClosing() {
+        const decision = activeDecision();
+        return !!decision && !!state.status && BigInt(state.status.height) - BigInt(decision.started_height) + 1n >= BigInt(decision.blocks);
+    }
+    // consensus::pass_beats_fail: one block's exact PASS/FAIL comparison.
+    function passBeatsFail(pass, fail, marginBps) {
+        const passShares = BigInt(pass.shares), failShares = BigInt(fail.shares);
+        if (passShares === 0n) return false;
+        if (failShares === 0n) return BigInt(pass.curve_mass) !== 0n;
+        return BigInt(pass.curve_mass) * failShares * 10000n > BigInt(fail.curve_mass) * passShares * (10000n + BigInt(marginBps));
+    }
     function phaseName() {
         return state.gov ? Object.keys(state.gov.phase)[0] : "Auction";
     }
@@ -624,7 +639,7 @@
         $("export-private").disabled = !managerEnabled || !state.session?.wallet_enabled;
         for (const id of [ "copy-key", "copy-receive-key" ]) $(id).disabled = !key();
         $("export-network").disabled = !state.ready;
-        $("trade-submit").disabled = !enabled || !state.quoteOutput || state.quoteOutput.identity !== tradeIdentity();
+        $("trade-submit").disabled = !enabled || decisionClosing() || !state.quoteOutput || state.quoteOutput.identity !== tradeIdentity();
         $("send-submit").disabled = !enabled || !state.sendQuote || state.sendQuote.identity !== sendIdentity();
         document.querySelectorAll(".wallet-action").forEach(button => {
             const form = button.closest("form");
@@ -1524,7 +1539,7 @@
         $("governance-market-details").hidden = !active;
         $("governance-details").hidden = !active && !(name === "Auction" && phase.leader);
         $("stash-context-notice").hidden = !active;
-        text("stash-context-notice", "Fees require hashes in both outcomes.");
+        text("stash-context-notice", decisionClosing() ? tradingClosedMessage : "Fees require hashes in both outcomes.");
         $("gov-result").hidden = !active;
         if (!active) {
             text("gov-result-status", "");
@@ -1591,15 +1606,20 @@
                 if (!hasStash) $(`${id}-price`).title = "No outstanding stash. Its price is zero until a deposit starts the reserve.";
             }
             const funded = !grant || BigInt(gov.pass.grant_escrow) === BigInt(grantTotal(grant.payments));
-            const passLeads = leading * 2n > observed && funded;
-            text("gov-result-status", observed ? passLeads ? "PASS leads" : "FAIL leads" : "Pending");
-            text("gov-result-detail", `${commas(leading)} of ${blockCount(observed)} counted for PASS. ${blockCount(total - observed)} remain.${funded ? "" : " Funding is incomplete."}`);
-            $("gov-result").dataset.outcome = observed ? passLeads ? "pass" : "fail" : "";
-            $("gov-result").title = `${blockCount(observed)} observed. ${criterion} The result is not final until resolution.`;
+            // At the last tip the next block adds one observation from this
+            // tip's closing prices and then resolves before its transactions,
+            // so the outcome is already fixed. Show it as consensus will decide it.
+            const final = decisionClosing();
+            const finalLeading = leading + (passBeatsFail(gov.pass, gov.world, margin) ? 1n : 0n);
+            const passLeads = final ? funded && finalLeading > total / 2n : leading * 2n > observed && funded;
+            text("gov-result-status", final ? passLeads ? "PASS decided" : "FAIL decided" : observed ? passLeads ? "PASS leads" : "FAIL leads" : "Pending");
+            text("gov-result-detail", final ? `${commas(finalLeading)} of ${blockCount(total)} count for PASS, including this block's closing prices. The decision resolves at the start of the next block, before its transactions.${funded ? "" : " Funding is incomplete."}` : `${commas(leading)} of ${blockCount(observed)} counted for PASS. ${blockCount(total - observed)} remain.${funded ? "" : " Funding is incomplete."}`);
+            $("gov-result").dataset.outcome = final || observed ? passLeads ? "pass" : "fail" : "";
+            $("gov-result").title = final ? `The result is fixed: no transaction can change it before resolution. ${criterion}` : `${blockCount(observed)} observed. ${criterion} The result is not final until resolution.`;
             for (const side of ["pass", "fail"]) {
-                const isLeading = !!observed && (side === "pass" ? passLeads : !passLeads);
+                const isLeading = (final || !!observed) && (side === "pass" ? passLeads : !passLeads);
                 $(`${side}-outcome-leader`).hidden = true;
-                $(`${side}-outcome-card`).title = isLeading ? `${side.toUpperCase()} leads. Decision pending.` : "";
+                $(`${side}-outcome-card`).title = isLeading ? final ? `${side.toUpperCase()} is decided. Resolution follows in the next block.` : `${side.toUpperCase()} leads. Decision pending.` : "";
                 $(`${side}-outcome-card`).classList.toggle("is-leading", isLeading);
             }
             number("pass-reserve", gov.pass.reserve);
@@ -2219,6 +2239,7 @@
         }
         try {
             const kind = state.trade, amount = kind === "deposit" ? integer(raw) : stashInteger(raw), outcome = $("trade-outcome").value;
+            if (decisionClosing()) throw new Error(tradingClosedMessage);
             const result = await rpc("stash_quote", {
                 key: key(),
                 kind: kind,
@@ -2801,6 +2822,7 @@
     $("unsigned-download").addEventListener("click", () => downloadText("hashstash-unsigned.json", $("unsigned-output").value));
     bindForm("trade-form", v => {
         const amount = state.trade === "deposit" ? integer(v.amount) : stashInteger(v.amount), ctx = context(v.outcome), quote = state.quoteOutput;
+        if (decisionClosing()) throw new Error(tradingClosedMessage);
         if (activeDecision() && !v.outcome) throw new Error("Choose PASS or FAIL while governance is active.");
         if (!quote || quote.identity !== tradeIdentity()) throw new Error("Wait for a current quote.");
         if (hex(quote.decision) !== hex(ctx.decision)) throw new Error("Decision changed. Refresh and submit again.");
@@ -2931,6 +2953,10 @@
     $("trade-max").addEventListener("click", async () => {
         const outcome = $("trade-outcome").value, selected = outcome === "Pass" ? state.pass : outcome === "Fail" ? state.fail : state.account;
         if (!state.ready || !selected?.account) return;
+        if (decisionClosing()) {
+            feedback($("trade-form"), tradingClosedMessage, true);
+            return;
+        }
         state.tradeAll = state.trade === "redeem";
         let value = BigInt(state.tradeAll ? selected.account.shares : outcome ? outcomeCash(selected) : selected.account.ordinary);
         if (state.trade === "deposit") {

@@ -9,7 +9,43 @@ use crate::{
 use anyhow::{Result, ensure};
 use num_bigint::BigInt;
 use num_traits::{One, Zero};
-use std::{cell::RefCell, cmp::Ordering, collections::BTreeSet};
+use std::{
+    cell::{Cell, OnceCell, RefCell},
+    cmp::Ordering,
+    collections::BTreeSet,
+};
+
+/// Curve evaluations (each a pair of directed logarithms, or one exact power
+/// comparison) that clearing one world may perform. An exhausted budget stops
+/// refining: price brackets keep their proven bounds and the budget search
+/// keeps its best proven candidate. This bounds validation work per block.
+pub const CLEARING_WORK: u64 = 1024;
+/// Root-search probes taken from Newton steps before plain bisection resumes.
+const NEWTON_PROBES: usize = 64;
+/// A budget search wider than one atom stops within this relative precision.
+const BUDGET_PRECISION_BITS: usize = 64;
+
+/// Deterministic count of the curve evaluations spent by one clearing, and the
+/// last price it found as (units, scale): candidates of one clearing have
+/// nearby prices, so each price search starts there.
+struct Work {
+    used: Cell<u64>,
+    limit: u64,
+    last_price: RefCell<Option<(Amount, Amount)>>,
+}
+impl Work {
+    fn spend(&self) -> bool {
+        let used = self.used.get();
+        if used >= self.limit {
+            return false;
+        }
+        self.used.set(used + 1);
+        true
+    }
+    fn exhausted(&self) -> bool {
+        self.used.get() >= self.limit
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Order {
@@ -45,15 +81,6 @@ fn sum(values: &[Amount]) -> Amount {
     values.iter().sum()
 }
 
-fn gcd(mut a: Amount, mut b: Amount) -> Amount {
-    while !b.is_zero() {
-        let next = &a % &b;
-        a = b;
-        b = next;
-    }
-    a
-}
-
 fn simplest_fraction(
     mut a: Amount,
     mut b: Amount,
@@ -78,6 +105,17 @@ fn simplest_fraction(
         (n, denominator) = (&term * &n + denominator, n);
     }
     (n, denominator)
+}
+
+/// A bisection probe strictly inside a bracket wider than one unit. While the
+/// bracket spans more than a factor of two it uses the integer geometric mean,
+/// so a price range of many octaves needs only logarithmically many probes.
+fn bisect(lower: &Amount, upper: &Amount) -> Amount {
+    if !lower.is_zero() && upper > &(lower << 1usize) {
+        (lower * upper).sqrt().max(lower + 1u32).min(upper - 1u32)
+    } else {
+        (lower + upper) >> 1usize
+    }
 }
 
 fn empty(w: &World, buys: &[Order], sells: &[Order]) -> Clearing {
@@ -109,9 +147,26 @@ fn proportional(orders: &[Order], budget: &Amount, total: &Amount) -> Vec<Amount
 }
 
 /// A bracket enclosing the ideal uniform execution price, in units of `scale`.
-/// Exact small-rational curves use integer powers; other curves use directed
-/// logarithm bounds. The two searches deliberately retain unresolved comparisons.
-fn price(w: &World, cash: &Amount, sold: &Amount) -> Result<(Amount, Amount, Amount)> {
+/// Directed logarithm bounds decide most comparisons; exact small-rational
+/// curves settle the rest with integer powers. The search deliberately retains
+/// unresolved comparisons, and every curve evaluation spends clearing work.
+fn price(
+    w: &World,
+    cash: &Amount,
+    sold: &Amount,
+    work: &Work,
+) -> Result<(Amount, Amount, Amount)> {
+    let (low, high, scale) = search_price(w, cash, sold, work)?;
+    *work.last_price.borrow_mut() = Some(((&low + &high) >> 1usize, scale.clone()));
+    Ok((low, high, scale))
+}
+
+fn search_price(
+    w: &World,
+    cash: &Amount,
+    sold: &Amount,
+    work: &Work,
+) -> Result<(Amount, Amount, Amount)> {
     let balance = (cash * &w.shares).cmp(&(sold * &w.curve_mass));
     if balance == Ordering::Equal || w.reserve == w.curve_mass {
         return Ok((w.curve_mass.clone(), w.curve_mass.clone(), w.shares.clone()));
@@ -124,24 +179,43 @@ fn price(w: &World, cash: &Amount, sold: &Amount) -> Result<(Amount, Amount, Amo
     // More than twice the input width resolves an output atom even for tiny
     // prices. It is arithmetic precision, independent of order identifiers.
     let scale = Amount::one() << (2 * bits as usize + 32);
+    let precision = math::clearing_precision(bits);
     let buying = balance == Ordering::Greater;
+    // The ideal price is a chord slope of the convex reserve-by-supply curve, so
+    // it lies between the opening and closing marginal prices. The closing
+    // price is at most M*R'/(R*S) when supply grows and at least that when it
+    // shrinks, with R' = R+D-B*P; solving for P gives M(R+D)/(RS+MB). It bounds
+    // a buy from above and a sale from below, close to the root for small net
+    // trades, which keeps Newton steps inside the bracket from the start.
+    let closing_numerator = &w.curve_mass * (&w.reserve + cash) * &scale;
+    let closing_denominator = &w.reserve * &w.shares + &w.curve_mass * sold;
     let mut lower = if buying {
         &w.curve_mass * &scale / &w.shares
     } else {
-        &w.reserve * &scale / &w.shares
+        (&w.reserve * &scale / &w.shares).max(&closing_numerator / &closing_denominator)
     };
     let mut upper = if buying {
-        ceil(
-            &(&w.curve_mass * (&w.reserve + cash) * &scale),
-            &(&w.shares * &w.reserve),
-        )
+        ceil(&closing_numerator, &closing_denominator)
     } else {
         ceil(&(&w.curve_mass * &scale), &w.shares)
     };
     if buying && !sold.is_zero() {
         upper = upper.min(ceil(&(cash * &scale), sold));
     }
-    let exact_powers = math::small_ratio(&w.reserve, &w.curve_mass).is_some();
+    let exact_ratio = math::small_ratio(&w.reserve, &w.curve_mass);
+    // A one-sided batch has one logarithm independent of the probe: ln((R+D)/R)
+    // for pure buys and ln(S/(S-B)) for pure sales. Bounds depend only on the
+    // ratio, so evaluating it once gives the same comparisons.
+    let fixed_log = OnceCell::new();
+    let fixed = || {
+        fixed_log.get_or_init(|| {
+            if buying {
+                math::curve_log(&(&w.reserve + cash), &w.reserve, precision)
+            } else {
+                math::curve_log(&w.shares, &(&w.shares - sold), precision)
+            }
+        })
+    };
     let last_log = RefCell::new(None::<(Amount, Amount, BigInt, Amount)>);
     let compare_fraction = |p: &Amount, denominator: &Amount| -> Option<Ordering> {
         if p.is_zero() {
@@ -177,18 +251,35 @@ fn price(w: &World, cash: &Amount, sold: &Amount) -> Result<(Amount, Amount, Amo
         } else {
             (reserve_base, next_reserve, supply_base, next_supply)
         };
-        if exact_powers {
-            math::compare_curve_logs(&w.reserve, &w.curve_mass, &a, &b, &c, &d)
+        if !work.spend() {
+            return None;
+        }
+        let (first, second);
+        let (left, right) = if buying && sold.is_zero() {
+            first = math::curve_log(&c, &d, precision);
+            (fixed(), &first)
+        } else if !buying && cash.is_zero() {
+            first = math::curve_log(&a, &b, precision);
+            (&first, fixed())
         } else {
-            let (comparison, midpoint, log_scale) =
-                math::curve_log_evaluation(&w.reserve, &w.curve_mass, &a, &b, &c, &d);
-            *last_log.borrow_mut() = Some((p.clone(), denominator.clone(), midpoint, log_scale));
-            comparison
+            first = math::curve_log(&a, &b, precision);
+            second = math::curve_log(&c, &d, precision);
+            (&first, &second)
+        };
+        let (comparison, midpoint, log_scale) =
+            math::curve_log_evaluation(&w.reserve, &w.curve_mass, left, right);
+        *last_log.borrow_mut() = Some((p.clone(), denominator.clone(), midpoint, log_scale));
+        match (comparison, exact_ratio) {
+            // A proven logarithm comparison already agrees with the exact one.
+            (None, Some(ratio)) if work.spend() => {
+                Some(math::compare_curve_powers(ratio, &a, &b, &c, &d))
+            }
+            _ => comparison,
         }
     };
     let compare = |p: &Amount| compare_fraction(p, &scale);
-    let newton = |p: &Amount| -> Option<Amount> {
-        if exact_powers || p.is_zero() {
+    let newton = |p: &Amount, comparison: Option<Ordering>| -> Option<Amount> {
+        if p.is_zero() {
             return None;
         }
         let cash_scaled = cash * &scale;
@@ -224,7 +315,8 @@ fn price(w: &World, cash: &Amount, sold: &Amount) -> Result<(Amount, Amount, Amo
         let proposal = BigInt::from(p.clone()) - step;
         let proposal = proposal.to_biguint()?;
         if proposal == *p {
-            match compare(p) {
+            // Reuse the comparison just made at p and step to its neighbour.
+            match comparison {
                 Some(Ordering::Less) => Some(p + 1u32),
                 Some(Ordering::Greater) => Some(p - 1u32),
                 _ => None,
@@ -233,36 +325,51 @@ fn price(w: &World, cash: &Amount, sold: &Amount) -> Result<(Amount, Amount, Amo
             Some(proposal)
         }
     };
-    let mut proposal = None;
-    while &upper - &lower > Amount::one() {
-        let mid = proposal
-            .take()
-            .filter(|p| p > &lower && p < &upper)
-            .unwrap_or_else(|| (&lower + &upper) >> 1usize);
-        match compare(&mid) {
+    // Begin where the previous search of this clearing ended, when that lies
+    // inside the bracket; later probes come from Newton steps or bisection.
+    let mut proposal = work
+        .last_price
+        .borrow()
+        .as_ref()
+        .map(|(p, from)| p * &scale / from);
+    let mut newton_probes = 0;
+    while &upper - &lower > Amount::one() && !work.exhausted() {
+        // Newton proposals must lie strictly inside the bracket, and only a
+        // fixed number are used. Bisection then guarantees bounded progress.
+        let mid = match proposal.take().filter(|p| p > &lower && p < &upper) {
+            Some(p) if newton_probes < NEWTON_PROBES => {
+                newton_probes += 1;
+                p
+            }
+            _ => bisect(&lower, &upper),
+        };
+        let comparison = compare(&mid);
+        match comparison {
             Some(Ordering::Less) => {
                 lower = mid.clone();
-                proposal = newton(&mid);
+                proposal = newton(&mid, comparison);
             }
             Some(Ordering::Greater) => {
                 upper = mid.clone();
-                proposal = newton(&mid);
+                proposal = newton(&mid, comparison);
             }
             Some(Ordering::Equal) => return Ok((mid.clone(), mid, scale)),
             None => {
-                if mid > &lower + 1u32
-                    && &mid + 1u32 < upper
-                    && compare(&(&mid - 1u32)) == Some(Ordering::Less)
-                    && compare(&(&mid + 1u32)) == Some(Ordering::Greater)
+                // A bracket edge next to mid needs no further proof, so a root
+                // on the grid costs one neighbour probe rather than a bisection.
+                let below = &mid - 1u32;
+                let above = &mid + 1u32;
+                if (below == lower || compare(&below) == Some(Ordering::Less))
+                    && (above == upper || compare(&above) == Some(Ordering::Greater))
                 {
-                    lower = &mid - 1u32;
-                    upper = &mid + 1u32;
+                    lower = below;
+                    upper = above;
                     break;
                 }
                 // Locate the last proven lower bound and first proven upper
                 // bound independently; never assume the sign of an overlap.
                 let mut hi = mid.clone();
-                while &hi - &lower > Amount::one() {
+                while &hi - &lower > Amount::one() && !work.exhausted() {
                     let probe = (&lower + &hi) >> 1usize;
                     match compare(&probe) {
                         Some(Ordering::Less) => lower = probe,
@@ -271,7 +378,7 @@ fn price(w: &World, cash: &Amount, sold: &Amount) -> Result<(Amount, Amount, Amo
                     }
                 }
                 let mut lo = mid;
-                while &upper - &lo > Amount::one() {
+                while &upper - &lo > Amount::one() && !work.exhausted() {
                     let probe = (&lo + &upper) >> 1usize;
                     match compare(&probe) {
                         Some(Ordering::Greater) => upper = probe,
@@ -286,9 +393,14 @@ fn price(w: &World, cash: &Amount, sold: &Amount) -> Result<(Amount, Amount, Amo
     // Recover exact rational boundaries such as 21/10. A dyadic approximation
     // alone would conservatively lose an atom even when every exact output is
     // integral. Equality is accepted only after the curve comparison proves it.
-    let (n, d) = simplest_fraction(lower.clone(), scale.clone(), upper.clone(), scale.clone());
-    if compare_fraction(&n, &d) == Some(Ordering::Equal) {
-        return Ok((n.clone(), n, d));
+    // Logarithm bounds prove equality only without net movement, which the
+    // early comparisons exclude, so only exact power curves and an exact full
+    // redemption (decided without curve work) can recover a boundary here.
+    if !work.exhausted() && (exact_ratio.is_some() || (sold == &w.shares && cash.is_zero())) {
+        let (n, d) = simplest_fraction(lower.clone(), scale.clone(), upper.clone(), scale.clone());
+        if compare_fraction(&n, &d) == Some(Ordering::Equal) {
+            return Ok((n.clone(), n, d));
+        }
     }
     ensure!(!upper.is_zero(), "zero batch price");
     Ok((lower, upper, scale))
@@ -367,31 +479,37 @@ fn candidate(
     sell_budget: &Amount,
     total_cash: &Amount,
     total_sold: &Amount,
+    work: &Work,
 ) -> Result<Clearing> {
     let mut input_buys = proportional(buys, buy_budget, total_cash);
     let mut input_sells = proportional(sells, sell_budget, total_sold);
-    if w.reserve == w.curve_mass {
-        // Exact reduced-price lots avoid altering a flat quote solely through
-        // integer dust. Unusable input atoms are refunded, not donated.
-        let divisor = gcd(w.reserve.clone(), w.shares.clone());
-        let cash_lot = &w.reserve / &divisor;
-        let share_lot = &w.shares / divisor;
-        for n in &mut input_buys {
-            *n = (&*n / &cash_lot) * &cash_lot;
-        }
-        for n in &mut input_sells {
-            *n = (&*n / &share_lot) * &share_lot;
-        }
-    }
+    let flat = w.reserve == w.curve_mass;
     loop {
         let cash = sum(&input_buys);
         let sold = sum(&input_sells);
         if cash.is_zero() && sold.is_zero() {
             return Ok(empty(w, buys, sells));
         }
-        let (low, high, scale) = price(w, &cash, &sold)?;
+        let (low, high, scale) = price(w, &cash, &sold, work)?;
         let output_buys: Vec<Amount> = input_buys.iter().map(|n| n * &scale / &high).collect();
         let output_sells: Vec<Amount> = input_sells.iter().map(|n| n * &low / &scale).collect();
+        if flat {
+            // The flat price M/S is exact and independent of volume. Each order
+            // pays only the least input that buys its rounded-down output and the
+            // unusable remainder is refunded, not donated. Exact outputs, such as
+            // every trade at a unit-numerator or unit-denominator price like the
+            // genesis rate, leave the price unchanged; any other order raises it
+            // by less than one atom of its input asset, so no reduced-price lot
+            // can grow to the whole reserve or supply.
+            for (input, output) in input_buys.iter_mut().zip(&output_buys) {
+                *input = ceil(&(output * &high), &scale);
+            }
+            for (input, output) in input_sells.iter_mut().zip(&output_sells) {
+                *input = ceil(&(output * &scale), &low);
+            }
+        }
+        let cash = sum(&input_buys);
+        let sold = sum(&input_sells);
         // A dust order does not pay its principal for zero output. All such
         // orders leave together, so array order cannot select the remaining set.
         let mut removed = false;
@@ -429,11 +547,7 @@ fn candidate(
         // Intermediate candidates may exceed the state width. Keep the exact
         // integer result so clearing can refund the surplus instead of making
         // individually valid orders poison their entire block.
-        let mass = if reserve >= w.reserve {
-            &w.curve_mass * &reserve / &w.reserve
-        } else {
-            ceil(&(&w.curve_mass * &reserve), &w.reserve)
-        };
+        let mass = math::scaled_mass(&w.reserve, &w.curve_mass, &reserve);
         let fill = |orders: &[Order], inputs: Vec<Amount>, outputs: Vec<Amount>| {
             orders
                 .iter()
@@ -465,6 +579,37 @@ pub fn clear(
     buys: &[Order],
     sells: &[Order],
     max_price_change_bps: u64,
+) -> Result<Clearing> {
+    Ok(clear_with_work(c, w, buys, sells, max_price_change_bps, CLEARING_WORK)?.0)
+}
+
+/// [clear] with an explicit curve-evaluation limit, also returning the work
+/// spent. Consensus always uses [CLEARING_WORK]; other limits exercise the
+/// deterministic fallback.
+pub fn clear_with_work(
+    c: &Config,
+    w: &World,
+    buys: &[Order],
+    sells: &[Order],
+    max_price_change_bps: u64,
+    limit: u64,
+) -> Result<(Clearing, u64)> {
+    let work = Work {
+        used: Cell::new(0),
+        limit,
+        last_price: RefCell::new(None),
+    };
+    let result = clear_metered(c, w, buys, sells, max_price_change_bps, &work)?;
+    Ok((result, work.used.get()))
+}
+
+fn clear_metered(
+    c: &Config,
+    w: &World,
+    buys: &[Order],
+    sells: &[Order],
+    max_price_change_bps: u64,
+    work: &Work,
 ) -> Result<Clearing> {
     let mut ids = BTreeSet::new();
     for o in buys.iter().chain(sells) {
@@ -505,7 +650,7 @@ pub fn clear(
         c.check_shares(&result.shares)?;
         return Ok(result);
     }
-    let full = candidate(w, buys, sells, &cash, &sold, &cash, &sold)?;
+    let full = candidate(w, buys, sells, &cash, &sold, &cash, &sold, work)?;
     let bps = max_price_change_bps;
     let result =
         if within_range(c, &full) && within_upper(w, &full, bps) && within_lower(w, &full, bps) {
@@ -521,9 +666,9 @@ pub fn clear(
             let mut best = empty(w, buys, sells);
             let evaluate = |budget: &Amount| {
                 if reduce_buys {
-                    candidate(w, buys, sells, budget, &sold, &cash, &sold)
+                    candidate(w, buys, sells, budget, &sold, &cash, &sold, work)
                 } else {
-                    candidate(w, buys, sells, &cash, budget, &cash, &sold)
+                    candidate(w, buys, sells, &cash, budget, &cash, &sold, work)
                 }
             };
             let initial = evaluate(&low)?;
@@ -535,34 +680,69 @@ pub fn clear(
             {
                 best = initial;
             }
-            let mut iteration = 0usize;
-            while low_gap <= BigInt::zero() && &high - &low > Amount::one() {
+            // Consecutive moves of the same end; the other end's weight halves.
+            let (mut low_retained, mut high_retained) = (0usize, 0usize);
+            // Bisections owed after an interpolation that failed to halve the
+            // moved end's relative gap; consecutive failures double them.
+            let (mut failures, mut bisections) = (0usize, 0usize);
+            // Search to one atom, or to a 2^-BUDGET_PRECISION_BITS fraction of a
+            // wider retained budget. Exhausted clearing work keeps the best
+            // proven candidate so far.
+            while low_gap <= BigInt::zero()
+                && &high - &low > (&low >> BUDGET_PRECISION_BITS).max(Amount::one())
+                && !work.exhausted()
+            {
                 // Rational interpolation usually reaches a smooth curve boundary
-                // quickly. Regular bisection guarantees bounded progress when dust
-                // removal makes the integer fill function discontinuous.
-                let mid = if iteration % 4 != 3 && low_gap < BigInt::zero() {
-                    let a = (-&low_gap).to_biguint().unwrap() * &high_divisor;
-                    let b = high_gap.to_biguint().unwrap() * &low_divisor;
+                // quickly; the Illinois weighting stops a convex boundary from
+                // pinning one end. Bisection after failed interpolation bounds
+                // progress when dust removal makes the integer fill function
+                // discontinuous or a nearly flat curve makes it a step.
+                let interpolated = bisections == 0 && low_gap < BigInt::zero();
+                let mid = if interpolated {
+                    let a = ((-&low_gap).to_biguint().unwrap() * &high_divisor)
+                        >> low_retained.saturating_sub(1);
+                    let b = (high_gap.to_biguint().unwrap() * &low_divisor)
+                        >> high_retained.saturating_sub(1);
+                    let (a, b) = (a.max(Amount::one()), b.max(Amount::one()));
                     (&low + (&high - &low) * &a / (a + b))
                         .max(&low + 1u32)
                         .min(&high - 1u32)
                 } else {
-                    (&low + &high) >> 1usize
+                    // A zero-gap or price-free side often ends a few atoms above
+                    // zero, so bisect geometrically from one atom.
+                    bisect(&low.clone().max(Amount::one()), &high).max(&low + 1u32)
                 };
-                iteration += 1;
                 let next = evaluate(&mid)?;
                 let (gap, divisor) = constraint_gap(c, w, &next, bps, reduce_buys);
-                if gap <= BigInt::zero() {
+                let passed = gap <= BigInt::zero();
+                let (old, old_divisor) = if passed {
+                    (&low_gap, &low_divisor)
+                } else {
+                    (&high_gap, &high_divisor)
+                };
+                // Whether the moved end's relative gap at least halved.
+                let halved = gap.magnitude() * old_divisor * 2u32 <= old.magnitude() * &divisor;
+                if passed {
                     if within_upper(w, &next, bps) && within_lower(w, &next, bps) {
                         best = next;
                     }
                     low = mid;
                     low_gap = gap;
                     low_divisor = divisor;
+                    (low_retained, high_retained) = (0, high_retained + 1);
                 } else {
                     high = mid;
                     high_gap = gap;
                     high_divisor = divisor;
+                    (low_retained, high_retained) = (low_retained + 1, 0);
+                }
+                if !interpolated {
+                    bisections = bisections.saturating_sub(1);
+                } else if halved {
+                    failures = 0;
+                } else {
+                    bisections = 1 << failures.min(16);
+                    failures += 1;
                 }
             }
             best

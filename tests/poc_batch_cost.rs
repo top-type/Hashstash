@@ -1,77 +1,35 @@
-//! Proof-of-concept benchmark for findings H6 + M8: unmetered, super-linear
-//! batch-clearing cost on a *curved* world.
+//! Regression benchmark for audit findings F006/F047 (formerly the H6 + M8
+//! proof of concept): batch clearing on a *curved* world must have a
+//! deterministic work bound.
 //!
-//! WHAT THE FINDING SAYS
+//! WHAT THE FINDING SAID
 //! ---------------------
-//! `batch::clear` (src/batch.rs:462) clears a world's amount-only orders by
-//! calling `price` (src/batch.rs:114-295). On a *curved* world -- one where the
-//! reserve R is strictly less than the curve mass M (the state a reserve grant
-//! leaves behind, see tests/half_reserve_grant.rs) -- and whose reduced ratio
-//! R/M does not simplify to a denominator <= 8 (so `math::small_ratio`,
-//! src/math.rs:159, returns `None`), each price comparison runs the general
-//! logarithm path `math::curve_log_evaluation` (src/math.rs:192). That evaluates
-//! `log_atanh` (src/math.rs:43-76) as a 2048-bit fixed-point series of
-//! LOG_TERMS = ceil(2048/3) = 683 terms (src/math.rs:14-15), twice per
-//! comparison. `price` wraps those comparisons in a bisection whose width is
-//! `scale = 1 << (2*bits + 32)` (src/batch.rs:126), i.e. ~2*bits iterations for
-//! inputs of `bits` width (bits <= 512). So a single `clear` on a wide curved
-//! world performs on the order of (2*512) * 2 * 683 big-integer multiplies.
+//! `batch::clear` prices a curved world (reserve R < curve mass M) whose ratio
+//! is not a small rational with directed logarithms. Each comparison evaluated
+//! two fixed 2048-bit, 683-term series; the root search had no progress
+//! safeguard; and a batch breaking MaxPriceChangeBps re-ran the whole price
+//! search inside a stalled regula falsi. One curved clear measured ~15 ms, a
+//! price-cap-breaking deposit ~1.5 s and a near-2^512 quote ~1.2 s, none of it
+//! bounded or charged.
 //!
-//! Two amplifiers make it worse:
-//!   * Breaking the price-move limit (MaxPriceChangeBps) turns the single
-//!     `candidate`/`price` evaluation into an *outer* budget bisection
-//!     (src/batch.rs:539-567) that re-runs the whole curved `price` ~log2(budget)
-//!     (~512) more times.
-//!   * None of this cost is charged as transaction weight, and it is recomputed
-//!     on every mempool selection pass (src/node.rs select_transactions), and the
-//!     public `quote` RPC (src/node.rs:1500) runs it for only 8 work units
-//!     (src/node.rs:3635) on deposit amounts up to 2^512-1 (bound at
-//!     src/node.rs:1522). The RPC path is `quote` -> `preview_trade`
-//!     (src/node.rs:1843) -> `batch::clear` with a single order and
-//!     `cap = max_price_change_bps` (default 1000, src/config.rs:121).
+//! WHAT IS NOW ASSERTED
+//! --------------------
+//! Clearing spends at most `batch::CLEARING_WORK` curve evaluations per world
+//! (`batch::clear_with_work` reports the deterministic count). Logarithm
+//! precision follows the input width, one-sided batches evaluate their fixed
+//! logarithm once, Newton probes are capped and start at the previous price,
+//! the bracket starts at analytic bounds near the root, and the budget search
+//! uses Illinois interpolation with geometric bisection. The scenarios below
+//! assert work ceilings far below the limit, plus a generous wall-clock bound
+//! that only catches order-of-magnitude regressions.
 //!
-//! WHAT THIS BENCHMARK DOES
-//! ------------------------
-//! It calls the lowest public entry point, `hashstash::batch::clear`, directly
-//! (exactly as `preview_trade`/the quote RPC and the mempool selector do) and
-//! measures wall time with `std::time::Instant` for four scenarios:
-//!   (a) flat world  (R == M): the cheap early-return baseline (src/batch.rs:116),
-//!       for K = 1, 16, 128 orders;
-//!   (b) curved world (R < M, interval path) with K small deposits + redeems,
-//!       for K = 1, 16, 128 -- one expensive `price` per clear;
-//!   (c) curved world with one deposit large enough to breach the default
-//!       MaxPriceChangeBps, forcing the outer budget search;
-//!   (d) curved world with a single near-(2^512-1) deposit -- the `quote` case.
+//!   (a) flat world (R == M): no curve evaluation, for K = 1, 16, 128 orders;
+//!   (b) curved world, K small deposits + redeems: one cheap price search;
+//!   (c) curved ~2^511 world, one deposit breaking the default price bound;
+//!   (d) curved 2^256 world, a single near-(2^512-1) deposit (the quote RPC);
+//!   (e) curved ~2^511 world, a wide mixed batch breaking the bound.
 //!
-//! Curved worlds are built directly as `state::World` struct literals (every
-//! field is public and `World: Default`), the same construction used throughout
-//! tests/batch_clearing.rs; no consensus run and no `test-fixtures` feature is
-//! required, so this test auto-discovers and needs NO Cargo.toml change. Using
-//! `curve_mass = reserve*2 + 1` forces the general interval path: gcd(reserve,
-//! 2*reserve+1) = 1, so the reduced denominator 2*reserve+1 is far above 8 and
-//! `small_ratio` returns `None` (see the note at tests/dynamic_curve.rs:50).
-//!
-//! HOW TO RUN
-//! ----------
-//!   cargo test --release --test poc_batch_cost -- --nocapture
-//!
-//! Use --release: the unoptimized debug build is roughly an order of magnitude
-//! slower (the release profile keeps overflow-checks on, so only opt-level
-//! differs), so scenarios (c)/(d) can take tens of seconds unoptimized.
-//! --nocapture lets the printed table through.
-//!
-//! HOW TO INTERPRET
-//! ----------------
-//! Compare the flat baseline (a) against the curved rows (b). The flat clear
-//! returns in microseconds regardless of K; a single curved clear (b) costs
-//! milliseconds -- that is one order's worth of work, unpriced and unbilled.
-//! Rows (c) and (d) show the budget-search amplifier: a single attacker order
-//! costs hundreds of milliseconds to seconds. Because the mempool selector
-//! re-runs `clear` for every candidate and the `quote` RPC exposes (d) for 8
-//! work units, an attacker can pin a validator/node CPU with a trickle of
-//! cheap-to-submit orders or quote requests. The assertions here are
-//! deliberately weak (each clear must simply return `Ok`); the numbers in the
-//! printed table are the actual result of interest.
+//! Run: `cargo test --release --test poc_batch_cost -- --nocapture`
 
 use hashstash::{
     batch::{self, Order},
@@ -79,11 +37,13 @@ use hashstash::{
     state::World,
     types::Amount,
 };
-use num_traits::One;
+use num_traits::{One, Zero};
 use std::time::{Duration, Instant};
 
-/// Build a world from raw reserve / shares / curve_mass. All other `World`
-/// fields are irrelevant to `batch::clear`, which reads only these three.
+/// Generous per-clear wall-clock ceiling in release builds; the deterministic
+/// work ceilings below are the precise assertions.
+const WALL_CLOCK: Duration = Duration::from_secs(10);
+
 fn world(reserve: Amount, shares: Amount, curve_mass: Amount) -> World {
     World {
         reserve,
@@ -93,162 +53,101 @@ fn world(reserve: Amount, shares: Amount, curve_mass: Amount) -> World {
     }
 }
 
-/// A batch order with a unique 32-byte id derived from `n` (clear rejects
-/// duplicate ids), carrying `amount` as its input.
+/// A batch order with a unique 32-byte id derived from `n`.
 fn order(n: u32, amount: Amount) -> Order {
     let mut id = [0u8; 32];
     id[0..4].copy_from_slice(&n.to_be_bytes());
     Order { id, amount }
 }
 
-/// 2^bits as an Amount.
 fn pow2(bits: usize) -> Amount {
     Amount::one() << bits
 }
 
-/// Time a single `batch::clear` call; returns (ok?, filled-first-input, elapsed).
-fn time_clear(
-    c: &Config,
+/// Clear once and check the work ceiling, the wall-clock ceiling and that some
+/// input filled. Returns the curve evaluations spent.
+fn measured(
+    label: &str,
     w: &World,
     buys: &[Order],
     sells: &[Order],
     cap: u64,
-) -> (bool, Amount, Duration) {
+    ceiling: u64,
+) -> u64 {
+    let c = Config::devnet();
     let started = Instant::now();
-    let result = batch::clear(c, w, buys, sells, cap);
+    let (result, work) =
+        batch::clear_with_work(&c, w, buys, sells, cap, batch::CLEARING_WORK).unwrap();
     let elapsed = started.elapsed();
-    let ok = result.is_ok();
-    // A representative "did it do anything" readout: the first filled input.
     let filled = result
-        .ok()
-        .and_then(|r| {
-            r.buys
-                .into_iter()
-                .chain(r.sells)
-                .map(|f| f.input)
-                .find(|i| !is_zero(i))
-        })
-        .unwrap_or_else(Amount::default);
-    (ok, filled, elapsed)
-}
-
-fn is_zero(a: &Amount) -> bool {
-    a.bits() == 0
-}
-
-fn ms(d: Duration) -> f64 {
-    d.as_secs_f64() * 1000.0
-}
-
-fn header() {
+        .buys
+        .iter()
+        .chain(&result.sells)
+        .any(|f| !f.input.is_zero());
     println!(
-        "\n{:<34} {:>6} {:>14} {:>7}",
-        "scenario", "K", "wall (ms)", "ok"
+        "{label:<44} {:>6} {:>10.3} {:>6}",
+        buys.len() + sells.len(),
+        elapsed.as_secs_f64() * 1000.0,
+        work
     );
-    println!("{}", "-".repeat(64));
-}
-
-fn row(label: &str, k: usize, elapsed: Duration, ok: bool) {
-    println!("{:<34} {:>6} {:>14.3} {:>7}", label, k, ms(elapsed), ok);
+    assert!(filled, "{label}: nothing filled");
+    assert!(work <= ceiling, "{label}: {work} curve evaluations > {ceiling}");
+    assert!(work <= batch::CLEARING_WORK);
+    assert!(elapsed < WALL_CLOCK, "{label}: {elapsed:?}");
+    work
 }
 
 #[test]
-fn poc_batch_cost_timings() {
-    let c = Config::devnet();
-    let default_cap = c.initial.max_price_change_bps; // 1000 bps = 10%, the live default
-    let mut all_ok = true;
-
-    header();
-
-    // (a) FLAT world baseline: reserve == curve_mass triggers the early return in
-    // price (src/batch.rs:116), so cost stays flat regardless of K.
-    {
-        let base = pow2(256);
-        let w = world(base.clone(), base.clone(), base.clone()); // R == M (flat)
-        let per_order = Amount::from(1_000_000u64);
-        for k in [1usize, 16, 128] {
-            let buys: Vec<Order> = (0..k as u32).map(|n| order(n, per_order.clone())).collect();
-            let (ok, _filled, elapsed) = time_clear(&c, &w, &buys, &[], u64::MAX);
-            all_ok &= ok;
-            row("(a) flat baseline, 2^256", k, elapsed, ok);
-        }
-    }
-
-    // (b) CURVED world (R < M), interval/log path, K small deposits + redeems.
-    // curve_mass = 2*reserve + 1 => reduced denominator 2*reserve+1 >> 8 =>
-    // small_ratio == None => the 683-term log series runs on every comparison.
-    // cap = u64::MAX so no budget search: this isolates ONE expensive `price`.
-    {
-        let reserve = pow2(256);
-        let curve_mass = &reserve * 2u32 + 1u32;
-        let shares = reserve.clone();
-        let w = world(reserve, shares, curve_mass);
-        let deposit = Amount::from(1_000_000u64); // tiny vs 2^256: still full cost
-        let redeem = Amount::from(1_000_000u64); // share units, << total shares
-        for k in [1usize, 16, 128] {
-            let buys: Vec<Order> = (0..k as u32).map(|n| order(n, deposit.clone())).collect();
-            let sells: Vec<Order> = (0..k as u32)
-                .map(|n| order(500_000 + n, redeem.clone()))
-                .collect();
-            let (ok, _filled, elapsed) = time_clear(&c, &w, &buys, &sells, u64::MAX);
-            all_ok &= ok;
-            row("(b) curved 2^256, deposits+redeems", k, elapsed, ok);
-        }
-    }
-
-    // (c) CURVED world, one deposit large enough to breach MaxPriceChangeBps,
-    // forcing the OUTER budget bisection (src/batch.rs:539-567): the full curved
-    // `price` is re-evaluated ~log2(budget) times. ~511-bit magnitudes, same
-    // shape as tests/batch_clearing.rs::widest_general_curve_price_bound_and_zero_bound.
-    {
-        let reserve = pow2(510) + 137u32;
-        let curve_mass = &reserve * 2u32 + 1u32; // ~2^511, <= 512 bits
-        let shares = reserve.clone();
-        let w = world(reserve.clone(), shares, curve_mass);
-        // Depositing a whole reserve roughly doubles R: a >10% marginal move,
-        // well past the 1000 bps default cap -> budget search engages.
-        let buy = order(0, reserve);
-        let (ok, filled, elapsed) = time_clear(&c, &w, std::slice::from_ref(&buy), &[], default_cap);
-        all_ok &= ok;
-        println!(
-            "\n(c) curved ~2^511, one price-cap-breaking deposit (cap = {default_cap} bps):"
-        );
-        println!(
-            "    wall = {:.3} ms   ok = {ok}   input_filled_nonzero = {}",
-            ms(elapsed),
-            !is_zero(&filled)
-        );
-    }
-
-    // (d) CURVED world, single near-(2^512-1) deposit: the exact shape of the
-    // public `quote` RPC (quote -> preview_trade -> batch::clear with one order,
-    // cap = max_price_change_bps). Amount has 512 bits, the maximum c.check_amount
-    // allows. reserve + cash overflows 512 bits, so within_range fails and the
-    // budget search engages here too.
-    {
-        let reserve = pow2(256);
-        let curve_mass = &reserve * 2u32 + 1u32;
-        let shares = reserve.clone();
-        let w = world(reserve, shares, curve_mass);
-        let near_max = pow2(512) - 1u32; // 2^512 - 1, bits() == 512
-        let buy = order(0, near_max);
-        let (ok, filled, elapsed) = time_clear(&c, &w, std::slice::from_ref(&buy), &[], default_cap);
-        all_ok &= ok;
-        println!("\n(d) curved 2^256, single near-2^512-1 deposit (the quote RPC case):");
-        println!(
-            "    wall = {:.3} ms   ok = {ok}   input_filled_nonzero = {}",
-            ms(elapsed),
-            !is_zero(&filled)
-        );
-    }
-
+fn batch_clearing_work_is_bounded_on_curved_worlds() {
+    let cap = Config::devnet().initial.max_price_change_bps;
     println!(
-        "\nNote: (a)/(b) measure ONE batch clear. The real amplification is at the\n\
-         node layer -- the mempool selector re-runs clear per candidate order and\n\
-         the quote RPC exposes case (d) for 8 work units -- which this micro-\n\
-         benchmark deliberately does not simulate.\n"
+        "\n{:<44} {:>6} {:>10} {:>6}",
+        "scenario", "orders", "wall (ms)", "work"
     );
 
-    // Weak assertion only: the point is the printed timings, not any threshold.
-    assert!(all_ok, "every batch::clear call should return Ok");
+    // (a) Flat worlds use the exact flat price: no curve evaluation at all.
+    let base = pow2(256);
+    let w = world(base.clone(), base.clone(), base);
+    for k in [1u32, 16, 128] {
+        let buys: Vec<Order> = (0..k).map(|n| order(n, 1_000_000u32.into())).collect();
+        assert_eq!(measured("(a) flat 2^256", &w, &buys, &[], u64::MAX, 0), 0);
+    }
+
+    // (b) curve_mass = 2R+1 has no small reduced ratio, so the logarithm path
+    // runs. The opening marginal price bounds the root tightly for small net
+    // trades, so the search needs a handful of evaluations for any K.
+    let reserve = pow2(256);
+    let w = world(reserve.clone(), reserve.clone(), &reserve * 2u32 + 1u32);
+    for k in [1u32, 16, 128] {
+        let buys: Vec<Order> = (0..k).map(|n| order(n, 1_000_000u32.into())).collect();
+        let sells: Vec<Order> = (0..k)
+            .map(|n| order(500_000 + n, 1_000_000u32.into()))
+            .collect();
+        let label = "(b) curved 2^256, deposits + redeems";
+        measured(label, &w, &buys, &sells, u64::MAX, 16);
+    }
+
+    // (c) Depositing a whole reserve roughly doubles R, far past the default
+    // 10% bound, so the budget search runs.
+    let reserve = pow2(510) + 137u32;
+    let w = world(reserve.clone(), reserve.clone(), &reserve * 2u32 + 1u32);
+    let label = "(c) curved ~2^511, bound-breaking deposit";
+    measured(label, &w, &[order(0, reserve)], &[], cap, 400);
+
+    // (d) The quote RPC shape: one near-(2^512-1) deposit, beyond the numeric
+    // range as well as the price bound.
+    let reserve = pow2(256);
+    let w = world(reserve.clone(), reserve.clone(), &reserve * 2u32 + 1u32);
+    let buy = order(0, pow2(512) - 1u32);
+    measured("(d) curved 2^256, near-2^512 deposit", &w, &[buy], &[], cap, 600);
+
+    // (e) A wide mixed batch whose buys break the bound: both logarithms vary
+    // with the probe at full 2048-bit precision.
+    let reserve = pow2(510) + 137u32;
+    let w = world(reserve.clone(), &reserve * 3u32, &reserve * 2u32 + 1u32);
+    let buys: Vec<Order> = (0..64).map(|n| order(n, &reserve / (n + 3))).collect();
+    let sells: Vec<Order> = (0..64)
+        .map(|n| order(1_000 + n, &reserve / (n + 5)))
+        .collect();
+    measured("(e) curved ~2^511, wide mixed batch", &w, &buys, &sells, cap, 600);
 }

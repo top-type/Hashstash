@@ -608,7 +608,7 @@ fn an_entry_that_failed_every_attempt_is_dropped_rather_than_kept_undecided() {
 }
 
 #[test]
-fn a_selection_cut_short_by_block_finishing_keeps_its_tail_pending() {
+fn a_block_finishing_failure_truncates_only_the_template() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 1024 * 1024);
     let view = snapshot(&node);
@@ -620,8 +620,8 @@ fn a_selection_cut_short_by_block_finishing_keeps_its_tail_pending() {
     for tx in &pending[..5] {
         node.submit_transaction(tx.clone()).unwrap();
     }
-    // Finishing now fails for more than two transactions, so the relay's
-    // reselection keeps a finishing prefix of the accepted set.
+    // Finishing now fails for more than two transactions. Admission never
+    // finishes the block, so the relay accepts the newcomer and cuts nothing.
     crate::chain::FAIL_FINISH_ABOVE.with(|limit| limit.set(Some(2)));
     let relayed = node.receive_peer(
         &PeerMessage {
@@ -632,14 +632,21 @@ fn a_selection_cut_short_by_block_finishing_keeps_its_tail_pending() {
         },
         "127.0.0.1".parse().unwrap(),
     );
+    let (selected, backlog, _) = pool(&node);
+    let revision = published(&node);
+    let template = node.template();
     crate::chain::FAIL_FINISH_ABOVE.with(|limit| limit.set(None));
     relayed.unwrap();
-    let (selected, backlog, _) = pool(&node);
-    assert_eq!(ids(&selected), ids(&pending[..2]));
-    // The cut tail was never judged invalid; it used to be dropped as refused.
-    assert_eq!(ids(&backlog), ids(&pending[2..5]));
+    assert_eq!(selected, pending);
+    assert!(backlog.is_empty());
+    // Only the template keeps the finishing prefix. The cut tail was never
+    // judged invalid: it stays selected, and nothing is published.
+    assert_eq!(template.unwrap().transactions, pending[..2]);
+    assert_eq!(published(&node), revision);
+    assert_eq!(pool(&node).0, pending);
     let block = node.mine(1_000_000).unwrap();
-    assert_eq!(ids(&block.transactions), ids(&pending[..5]));
+    assert_eq!(block.transactions, pending[..2]);
+    assert_eq!(node.template().unwrap().transactions, pending[2..]);
 }
 
 #[test]
@@ -678,4 +685,636 @@ fn rejected_transaction_memory_is_bounded_and_scoped() {
     assert!(rejected.contains(&id, &[1; 32], 5));
     assert!(!rejected.contains(&id, &[1; 32], 6), "lost selections end with their pool");
     assert!(!rejected.contains(&id, &[9; 32], 5));
+}
+
+// ---------------------------------------------------------------------------
+// Batch clearing and the node lock (audit F006).
+
+/// A transaction paying the exact minimum fee plus `extra`.
+fn exact(
+    config: &Config,
+    state: &State,
+    secret: &[u8; 32],
+    mut body: TransactionBody,
+    extra: u64,
+) -> Transaction {
+    loop {
+        let tx = crypto::sign(&state.chain_id, &body, secret).unwrap();
+        let fee = fees::quote(config, state, &tx).unwrap().minimum_fee + extra;
+        if tx.body.fee == fee {
+            return tx;
+        }
+        body.fee = fee;
+    }
+}
+fn unsigned(
+    config: &Config,
+    secret: &[u8; 32],
+    nonce: u64,
+    operation: Operation,
+) -> TransactionBody {
+    TransactionBody {
+        data: Vec::new(),
+        sender: crypto::public_key(secret).unwrap(),
+        nonce,
+        fee: Amount::zero(),
+        anchor: codec::block_hash(&codec::genesis_block(config).unwrap()),
+        expiry_blocks: 1_000_000,
+        operation,
+    }
+}
+fn extend(chain: &mut Chain, transactions: Vec<Transaction>) {
+    let time = chain.tip_block().header.timestamp + chain.tip_state().settings.interval as u32;
+    let block = Chain::mine(chain.template(key(), transactions, time).unwrap(), 1_000_000).unwrap();
+    assert!(chain.submit(block, time as u64).unwrap());
+}
+/// A node in its second governance decision. The first, a reserve grant
+/// (as in tests/support/curved.rs), left a sloped curve, so both outcome
+/// worlds start sloped and clearing a trade in either costs curve
+/// evaluations. `other()` is funded as well.
+fn decision_node(directory: &Path, block_bytes: u64) -> Node {
+    let config = configuration(block_bytes);
+    let path = directory.join("node.sqlite");
+    let mut chain = Chain::open(&path, config.clone()).unwrap();
+    let signed = |chain: &Chain, operation: Operation| {
+        let state = chain.tip_state();
+        let nonce = state.account(&key(), None).unwrap().nonce;
+        exact(&config, state, &SECRET, unsigned(&config, &SECRET, nonce, operation), 0)
+    };
+    let until = |chain: &mut Chain, reached: &dyn Fn(&State) -> bool| {
+        for _ in 0..500 {
+            if reached(chain.tip_state()) {
+                return;
+            }
+            extend(chain, Vec::new());
+        }
+        panic!("fixture phase not reached");
+    };
+    for _ in 0..8 {
+        extend(&mut chain, Vec::new());
+    }
+    let funding = signed(
+        &chain,
+        Operation::TransferExact {
+            recipient: other(),
+            amount: 5_000u32.into(),
+        },
+    );
+    extend(&mut chain, vec![funding]);
+    let amount = chain.tip_state().account(&key(), None).unwrap().ordinary / 2u32;
+    let deposit = signed(
+        &chain,
+        Operation::Deposit {
+            amount,
+            decision: None,
+            outcome: None,
+        },
+    );
+    extend(&mut chain, vec![deposit]);
+    until(&mut chain, &|s| matches!(s.phase, crate::state::Phase::Auction(_)));
+    let state = chain.tip_state();
+    let grant = &state.world.reserve / 20u32;
+    assert!(grant > &state.world.revenue + 10u32, "the grant draws reserve");
+    let proposal = signed(
+        &chain,
+        Operation::Propose {
+            round: state.auction_round().unwrap(),
+            description: [251; 32],
+            proposal: Proposal::Grant {
+                payments: vec![GrantPayment {
+                    recipient: crypto::public_key(&[251; 32]).unwrap(),
+                    amount: grant,
+                }],
+            },
+            support: 1u32.into(),
+        },
+    );
+    extend(&mut chain, vec![proposal]);
+    until(&mut chain, &|s| s.decision_id().is_some());
+    // A substantive PASS-world deposit decides the grant.
+    let state = chain.tip_state();
+    let amount = state.account(&key(), Some(Outcome::Pass)).unwrap().ordinary / 2u32;
+    let deposit = signed(
+        &chain,
+        Operation::Deposit {
+            amount,
+            decision: state.decision_id(),
+            outcome: Some(Outcome::Pass),
+        },
+    );
+    extend(&mut chain, vec![deposit]);
+    until(&mut chain, &|s| matches!(s.phase, crate::state::Phase::Auction(_)));
+    let state = chain.tip_state();
+    assert!(state.world.curve_mass > state.world.reserve, "the grant left a sloped curve");
+    let proposal = signed(
+        &chain,
+        Operation::Propose {
+            round: state.auction_round().unwrap(),
+            description: [70; 32],
+            proposal: Proposal::Parameter {
+                parameter: Parameter::Lead,
+                old: state.settings.lead,
+                new: state.settings.lead * 2,
+            },
+            support: 1u32.into(),
+        },
+    );
+    extend(&mut chain, vec![proposal]);
+    until(&mut chain, &|s| s.decision_id().is_some());
+    let state = chain.tip_state();
+    let pass = state.alternative.as_ref().unwrap();
+    assert!(state.world.curve_mass > state.world.reserve && pass.curve_mass > pass.reserve);
+    drop(chain);
+    Node::open(&path, config, key()).unwrap()
+}
+/// A deposit into one outcome world of the current decision.
+fn decision_trade(
+    config: &Config,
+    state: &State,
+    secret: &[u8; 32],
+    nonce: u64,
+    outcome: Outcome,
+    amount: u32,
+) -> Transaction {
+    let operation = Operation::Deposit {
+        amount: amount.into(),
+        decision: state.decision_id(),
+        outcome: Some(outcome),
+    };
+    exact(config, state, secret, unsigned(config, secret, nonce, operation), 0)
+}
+fn relay(node: &Node, transactions: Vec<Transaction>) {
+    node.receive_peer(
+        &PeerMessage {
+            chain: snapshot(node).chain.chain_id(),
+            locator: Vec::new(),
+            blocks: Vec::new(),
+            transactions,
+        },
+        "127.0.0.1".parse().unwrap(),
+    )
+    .unwrap();
+}
+/// What one call cost on this thread: curve evaluations in all, those run
+/// while holding the node lock, and how long it held that lock.
+#[derive(Clone, Copy, Debug, Default)]
+struct Cost {
+    evaluations: u64,
+    under_lock: u64,
+    held: Duration,
+}
+fn metered<T>(call: impl FnOnce() -> T) -> (T, Cost) {
+    let evaluations = crate::batch::thread_curve_evaluations();
+    let under_lock = CLEARING_UNDER_INNER.with(std::cell::Cell::get);
+    let held = INNER_HELD.with(std::cell::Cell::get);
+    let result = call();
+    let cost = Cost {
+        evaluations: crate::batch::thread_curve_evaluations() - evaluations,
+        under_lock: CLEARING_UNDER_INNER.with(std::cell::Cell::get) - under_lock,
+        held: INNER_HELD.with(std::cell::Cell::get) - held,
+    };
+    (result, cost)
+}
+/// An empty child of the tip, mined.
+fn empty_block(node: &Node) -> Block {
+    let candidate = {
+        let i = node.locked().unwrap();
+        i.chain
+            .template(node.miner, Vec::new(), Node::timestamp(&i.chain))
+    };
+    Chain::mine(candidate.unwrap(), 1_000_000).unwrap()
+}
+
+#[test]
+fn admission_spends_no_curve_work_under_the_node_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = decision_node(directory.path(), 64 * 1024)
+        .with_wallet(SECRET)
+        .unwrap();
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let start = nonce(&node, &key());
+    let trade = |nonce: u64, outcome: Outcome, amount: u32| {
+        decision_trade(config, state, &SECRET, nonce, outcome, amount)
+    };
+    let wallet_trade = |outcome: Outcome, amount: u32| {
+        let revision = node.wallets_locked().unwrap().status()["wallet_revision"]
+            .as_u64()
+            .unwrap();
+        let operation = Operation::Deposit {
+            amount: amount.into(),
+            decision: state.decision_id(),
+            outcome: Some(outcome),
+        };
+        // Outlive the trade-free blocks below; the default lifetime is short.
+        let request = json!({
+            "operation":operation,
+            "expected_sender":hex::encode(key()),
+            "wallet_revision":revision,
+            "expiry_blocks":1000
+        });
+        node.wallet_submit(serde_json::from_value(request).unwrap())
+            .unwrap()
+    };
+    let pooled = |id: &Hash| ids(&snapshot(&node).mempool).contains(id);
+    let mut steps: Vec<(&str, usize, Cost, usize)> = Vec::new();
+    let mut step = |name: &'static str, call: &dyn Fn() -> Option<Hash>| {
+        selections();
+        let (accepted, cost) = metered(call);
+        steps.push((name, selections(), cost, snapshot(&node).mempool.len()));
+        if let Some(id) = accepted {
+            assert!(pooled(&id), "{name}: the newcomer is pending");
+        }
+    };
+    let fail = trade(start, Outcome::Fail, 101);
+    let pass = trade(start + 1, Outcome::Pass, 102);
+    let future = trade(start + 2, Outcome::Fail, 103);
+    let unrelated = payment(config, state, &OTHER, nonce(&node, &other()), key(), 1, 0);
+    let submitted = trade(start + 3, Outcome::Pass, 104);
+    for (name, tx) in [
+        ("relay: new FAIL-world trade", fail),
+        ("relay: new PASS-world trade", pass),
+        ("relay: future-nonce trade", future),
+        ("relay: unrelated payment", unrelated),
+    ] {
+        step(name, &|| {
+            relay(&node, vec![tx.clone()]);
+            Some(codec::transaction_id(&tx))
+        });
+    }
+    step("RPC submission: trade", &|| {
+        Some(node.submit_transaction(submitted.clone()).unwrap())
+    });
+    step("hot wallet submission: trade", &|| {
+        Some(wallet_trade(Outcome::Fail, 105))
+    });
+    let block = empty_block(&node);
+    step("trade-free block, pool recovery", &|| {
+        assert!(node.submit_block(block.clone()).unwrap());
+        None
+    });
+    let block = empty_block(&node);
+    step("trade-free block, failed recovery", &|| {
+        FAIL_RECOVERY.with(|fail| fail.set(true));
+        assert!(node.submit_block(block.clone()).unwrap());
+        None
+    });
+    step("hot wallet submission after failed recovery", &|| {
+        Some(wallet_trade(Outcome::Pass, 106))
+    });
+    let pending = snapshot(&node).mempool.clone();
+    let ((), template) = metered(|| {
+        assert_eq!(node.template().unwrap().transactions, pending);
+    });
+    for (name, selected, cost, pending) in &steps {
+        eprintln!(
+            "{name:<44} pending {pending} selections {selected} curve evaluations {:>4} (under the node lock {:>4}) lock held {:?}",
+            cost.evaluations, cost.under_lock, cost.held
+        );
+    }
+    eprintln!(
+        "{:<44} pending {} selections 0 curve evaluations {:>4} (under the node lock {:>4}) lock held {:?}",
+        "template",
+        pending.len(),
+        template.evaluations,
+        template.under_lock,
+        template.held
+    );
+    assert_eq!(pending.len(), 7);
+    let expected = [1, 1, 1, 1, 1, 1, 1, 0, 2];
+    for ((name, selected, cost, _), expected) in steps.iter().zip(expected) {
+        assert_eq!(*selected, expected, "{name}: one selection per change");
+        assert_eq!(cost.under_lock, 0, "{name}: curve work under the node lock");
+        assert_eq!(cost.evaluations, 0, "{name}: admission needs no clearing");
+    }
+    assert!(template.evaluations > 0, "the fixture's trades cost curve work");
+    assert_eq!(template.under_lock, 0, "templates clear off the node lock");
+}
+
+#[test]
+fn equal_rate_replacement_churn_clears_only_when_a_template_is_built() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = decision_node(directory.path(), 64 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let start = nonce(&node, &key());
+    // Same nonce, fee and weight: only the data byte differs. Equal bids go
+    // to the smaller txid, so in descending txid order each one replaces the
+    // last without any fee bump and changes the included trade set.
+    let mut variants: Vec<_> = (0..32u8)
+        .map(|salt| {
+            let operation = Operation::Deposit {
+                amount: 201u32.into(),
+                decision: state.decision_id(),
+                outcome: Some(Outcome::Fail),
+            };
+            let mut body = unsigned(config, &SECRET, start, operation);
+            body.data = vec![salt];
+            exact(config, state, &SECRET, body, 0)
+        })
+        .collect();
+    assert!(variants.iter().all(|tx| tx.body.fee == variants[0].body.fee));
+    variants.sort_by_key(|tx| std::cmp::Reverse(codec::transaction_id(tx)));
+    let revision = published(&node);
+    selections();
+    let mut churn = Cost::default();
+    let mut most = Cost::default();
+    for tx in &variants {
+        let ((), cost) = metered(|| relay(&node, vec![tx.clone()]));
+        assert_eq!(snapshot(&node).mempool, vec![tx.clone()], "each variant is accepted");
+        churn.evaluations += cost.evaluations;
+        churn.under_lock += cost.under_lock;
+        churn.held += cost.held;
+        most.under_lock = most.under_lock.max(cost.under_lock);
+        most.held = most.held.max(cost.held);
+    }
+    let selected = selections();
+    let (block, template) = metered(|| node.template().unwrap());
+    let (_, repeat) = metered(|| node.template().unwrap());
+    eprintln!(
+        "32 equal-rate replacements: {selected} selections, {} publishes; curve evaluations {} (under the node lock {}, at most {} per message); lock held {:?} in all, {:?} at most",
+        published(&node) - revision,
+        churn.evaluations,
+        churn.under_lock,
+        most.under_lock,
+        churn.held,
+        most.held
+    );
+    eprintln!(
+        "then one template: curve evaluations {} (under the node lock {}); a repeat: {}",
+        template.evaluations, template.under_lock, repeat.evaluations
+    );
+    assert_eq!(selected, 32);
+    assert_eq!(published(&node), revision + 32, "every replacement is published");
+    assert_eq!(churn.under_lock, 0);
+    assert_eq!(churn.evaluations, 0);
+    assert_eq!(block.transactions, vec![variants[31].clone()]);
+    assert!(template.evaluations > 0);
+    assert_eq!(template.under_lock, 0);
+    assert_eq!(repeat.evaluations, 0, "an unchanged selection reuses its template");
+}
+
+#[test]
+fn template_clearing_runs_off_the_node_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = decision_node(directory.path(), 64 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let start = nonce(&node, &key());
+    let first = decision_trade(config, state, &SECRET, start, Outcome::Fail, 301);
+    let newcomer = decision_trade(config, state, &SECRET, start + 1, Outcome::Pass, 302);
+    node.submit_transaction(first.clone()).unwrap();
+    let (paused, pause) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel::<()>();
+    let builder = node.clone();
+    let building = std::thread::spawn(move || {
+        crate::chain::TEMPLATE_BUILD_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                paused.send(()).unwrap();
+                resumed.recv().unwrap();
+            }));
+        });
+        metered(|| builder.template())
+    });
+    pause
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the template build started");
+    // While the build is paused before clearing, the node lock is free and
+    // a relayed trade is admitted.
+    let free = node.inner.try_lock().is_ok();
+    relay(&node, vec![newcomer.clone()]);
+    resume.send(()).unwrap();
+    let (stale, cost) = building.join().unwrap();
+    let stale = stale.unwrap();
+    assert!(free, "a template build held the node lock");
+    assert_eq!(pool(&node).0, vec![first.clone(), newcomer.clone()]);
+    assert_eq!(stale.transactions, vec![first.clone()]);
+    assert!(cost.evaluations > 0);
+    assert_eq!(cost.under_lock, 0);
+    let (stored, revision) = {
+        let i = node.locked().unwrap();
+        (i.template.as_ref().map(|entry| entry.selection), i.selection_revision)
+    };
+    assert!(stored.is_some_and(|selection| selection != revision), "kept, but outdated");
+    let fresh = node.template().unwrap();
+    assert_eq!(fresh.transactions, vec![first, newcomer]);
+    // Both are the blocks consensus execution builds, and both mine.
+    for block in [&stale, &fresh] {
+        let expected = {
+            let i = node.locked().unwrap();
+            i.chain.template(
+                node.miner,
+                block.transactions.clone(),
+                block.header.timestamp,
+            )
+        };
+        assert_eq!(codec::encode(&expected.unwrap()), codec::encode(block));
+        Chain::mine(block.clone(), 1_000_000).unwrap();
+    }
+    assert!(node.submit_block(Chain::mine(fresh, 1_000_000).unwrap()).unwrap());
+}
+
+#[test]
+fn node_templates_match_consensus_execution_byte_for_byte() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = decision_node(directory.path(), 64 * 1024);
+    let mut amount = 400;
+    for round in 0..2 {
+        let view = snapshot(&node);
+        let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+        let start = nonce(&node, &key());
+        for offset in 0..4 {
+            let outcome = if offset % 2 == 0 {
+                Outcome::Fail
+            } else {
+                Outcome::Pass
+            };
+            amount += 1;
+            let trade = decision_trade(config, state, &SECRET, start + offset, outcome, amount);
+            node.submit_transaction(trade).unwrap();
+        }
+        let paid = payment(config, state, &OTHER, nonce(&node, &other()), key(), 1, 0);
+        node.submit_transaction(paid).unwrap();
+        let block = node.template().unwrap();
+        assert_eq!(block.transactions, pool(&node).0);
+        assert_eq!(block.transactions.len(), 5);
+        let expected = {
+            let i = node.locked().unwrap();
+            i.chain.template(
+                node.miner,
+                block.transactions.clone(),
+                block.header.timestamp,
+            )
+        };
+        assert_eq!(codec::encode(&expected.unwrap()), codec::encode(&block));
+        let mined = if round == 0 {
+            let mined = Chain::mine(block, 1_000_000).unwrap();
+            assert!(node.submit_block(mined.clone()).unwrap());
+            mined
+        } else {
+            // Another payout key builds its own template the same way.
+            node.mine_to(1_000_000, other()).unwrap()
+        };
+        assert_eq!(snapshot(&node).chain.tip_hash(), codec::block_hash(&mined));
+        assert_eq!(mined.transactions.len(), 5);
+        assert!(pool(&node).0.is_empty());
+    }
+}
+
+#[test]
+fn same_parent_rebuilds_wait_for_the_previous_build_time() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = decision_node(directory.path(), 64 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let start = nonce(&node, &key());
+    let first = decision_trade(config, state, &SECRET, start, Outcome::Fail, 501);
+    let second = decision_trade(config, state, &SECRET, start + 1, Outcome::Pass, 502);
+    node.submit_transaction(first.clone()).unwrap();
+    let (built, retry) = node.template_shared(Freshness::Throttled).unwrap();
+    assert_eq!((built.transactions.clone(), retry), (vec![first.clone()], None));
+    // As if that build had taken a minute.
+    let finished = {
+        let mut i = node.locked().unwrap();
+        let entry = i.template.as_mut().unwrap();
+        entry.cost = Duration::from_secs(60);
+        entry.finished
+    };
+    node.submit_transaction(second.clone()).unwrap();
+    let ((block, retry), cost) = metered(|| node.template_shared(Freshness::Throttled).unwrap());
+    assert!(Arc::ptr_eq(&block, &built), "the same-parent template is served");
+    assert_eq!(retry, Some(finished + Duration::from_secs(60)));
+    assert_eq!(cost.evaluations, 0, "nothing is built inside the window");
+    // Local mining and RPC are never throttled.
+    let ((block, retry), cost) = metered(|| node.template_shared(Freshness::Current).unwrap());
+    assert_eq!((block.transactions.clone(), retry), (vec![first, second], None));
+    assert!(cost.evaluations > 0);
+    assert_eq!(cost.under_lock, 0);
+    let ((again, retry), cost) = metered(|| node.template_shared(Freshness::Throttled).unwrap());
+    assert!(Arc::ptr_eq(&again, &block) && retry.is_none() && cost.evaluations == 0);
+}
+
+#[test]
+fn a_new_tip_template_is_never_throttled() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = decision_node(directory.path(), 64 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let start = nonce(&node, &key());
+    let first = decision_trade(config, state, &SECRET, start, Outcome::Fail, 601);
+    node.submit_transaction(first).unwrap();
+    node.template_shared(Freshness::Throttled).unwrap();
+    node.locked().unwrap().template.as_mut().unwrap().cost = Duration::from_secs(60);
+    let mined = node.mine(1_000_000).unwrap();
+    let second = decision_trade(config, state, &SECRET, start + 1, Outcome::Pass, 602);
+    node.submit_transaction(second.clone()).unwrap();
+    let ((block, retry), cost) = metered(|| node.template_shared(Freshness::Throttled).unwrap());
+    assert_eq!(block.header.previous, codec::block_hash(&mined));
+    assert_eq!((block.transactions.clone(), retry), (vec![second], None));
+    assert!(cost.evaluations > 0);
+    assert_eq!(cost.under_lock, 0);
+}
+
+#[test]
+fn deferred_stratum_refreshes_wait_for_the_interval_and_the_template_throttle() {
+    let last = tokio::time::Instant::now();
+    let interval = last + STRATUM_REFRESH_INTERVAL;
+    assert_eq!(stratum_refresh_at(last, None), interval);
+    assert_eq!(stratum_refresh_at(last, Some(last + Duration::from_millis(1))), interval);
+    let later = last + STRATUM_REFRESH_INTERVAL + Duration::from_secs(3);
+    assert_eq!(stratum_refresh_at(last, Some(later)), later);
+}
+
+#[test]
+#[ignore = "benchmark: cargo test --release --features test-fixtures --lib admission_lock_hold -- --ignored --nocapture"]
+fn admission_lock_hold_at_full_pool() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = decision_node(directory.path(), 2 * 1024 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let limit = mempool_limit(config).min(config.max_signatures);
+    let start = nonce(&node, &key());
+    let full: Vec<_> = (0..limit as u64)
+        .map(|offset| {
+            let outcome = if offset % 2 == 0 {
+                Outcome::Fail
+            } else {
+                Outcome::Pass
+            };
+            let amount = 3 + (offset % 16) as u32;
+            decision_trade(config, state, &SECRET, start + offset, outcome, amount)
+        })
+        .collect();
+    let (installed, fill) = metered(|| {
+        let mut i = node.locked().unwrap();
+        Node::select_pool(&i.chain, node.miner, &full, &HashSet::new(), &HashSet::new())
+            .and_then(|selected| node.install_pool(&mut i, selected))
+    });
+    installed.unwrap();
+    assert_eq!(pool(&node).0.len(), limit);
+    // Newcomer trades that outbid the weakest entry, so each changes the
+    // included trade set; alternately submitted over RPC and relayed.
+    let other_start = nonce(&node, &other());
+    let rounds = 16u64;
+    let mut submitted = Vec::new();
+    let mut relayed = Vec::new();
+    for offset in 0..2 * rounds {
+        let outcome = if offset % 2 == 0 {
+            Outcome::Fail
+        } else {
+            Outcome::Pass
+        };
+        let operation = Operation::Deposit {
+            amount: (40 + offset as u32).into(),
+            decision: state.decision_id(),
+            outcome: Some(outcome),
+        };
+        let body = unsigned(config, &OTHER, other_start + offset, operation);
+        let tx = exact(config, state, &OTHER, body, 10);
+        let id = codec::transaction_id(&tx);
+        let cost = if offset % 2 == 0 {
+            let (accepted, cost) = metered(|| node.submit_transaction(tx.clone()));
+            accepted.unwrap();
+            submitted.push(cost);
+            cost
+        } else {
+            let ((), cost) = metered(|| relay(&node, vec![tx.clone()]));
+            relayed.push(cost);
+            cost
+        };
+        assert!(ids(&pool(&node).0).contains(&id), "{cost:?}");
+    }
+    let (block, template) = metered(|| node.template().unwrap());
+    let summary = |costs: &[Cost]| {
+        let held: Vec<f64> = costs
+            .iter()
+            .map(|c| c.held.as_secs_f64() * 1000.0)
+            .collect();
+        format!(
+            "lock held mean {:.2} ms, max {:.2} ms; curve evaluations under the lock {} in all",
+            held.iter().sum::<f64>() / held.len() as f64,
+            held.iter().copied().fold(0.0, f64::max),
+            costs.iter().map(|c| c.under_lock).sum::<u64>()
+        )
+    };
+    eprintln!(
+        "\npool of {limit} curved trades over both worlds; filling it: {} evaluations, lock held {:?}",
+        fill.evaluations, fill.held
+    );
+    eprintln!("RPC submission x{rounds}: {}", summary(&submitted));
+    eprintln!("peer relay     x{rounds}: {}", summary(&relayed));
+    eprintln!(
+        "template of {} transactions: {} curve evaluations ({} under the lock), lock held {:?}",
+        block.transactions.len(),
+        template.evaluations,
+        template.under_lock,
+        template.held
+    );
+    assert!(
+        submitted
+            .iter()
+            .chain(&relayed)
+            .all(|cost| cost.evaluations == 0)
+    );
+    assert_eq!(template.under_lock, 0);
 }

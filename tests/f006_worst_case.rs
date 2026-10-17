@@ -1,8 +1,11 @@
 //! Audit F006 (node side), measurement only. How far one world's batch
 //! clearing can be driven towards `batch::CLEARING_WORK`, what that costs in
 //! wall time, and what one block execution and one pool reselection cost when
-//! such trades are pending. Production code is unchanged; the only assertions
-//! are the consensus work cap, conservation, and that the cap is reachable.
+//! such trades are pending. The only assertions are the consensus work cap,
+//! conservation, and that the cap is reachable. Node admission no longer
+//! clears at all and templates clear outside the node lock; the lock-hold
+//! regressions and the full-pool benchmark (`admission_lock_hold_at_full_pool`)
+//! are in `src/node/pool_tests.rs`.
 //!
 //! The batches below came from a seeded random search and hill climb over
 //! consensus-valid worlds and batches (reserve plus deposits within the money
@@ -727,22 +730,26 @@ fn bench_pool_reselection_on_a_mined_chain() {
     );
     drop(chain);
 
-    // The node path: each submission reselects the whole pool under the lock.
+    // The node path: each submission reselects the whole pool under the lock,
+    // without finishing the block, so without clearing.
     let node = Node::open(&path, c, key(&OWNER)).unwrap();
     let mut accepted = 0;
     let mut times = Vec::new();
+    let evaluations = batch::thread_curve_evaluations();
     for tx in pool {
         let started = Instant::now();
         let ok = node.submit_transaction(tx).is_ok();
         times.push(started.elapsed().as_secs_f64() * 1000.0);
         accepted += usize::from(ok);
     }
+    let evaluations = batch::thread_curve_evaluations() - evaluations;
     let tail = &times[times.len() - 16..];
     println!(
-        "Node::submit_transaction: {accepted} of {} accepted, mempool {}; last 16 submissions mean {:.2} ms, max {:.2} ms",
+        "Node::submit_transaction: {accepted} of {} accepted, mempool {}; last 16 submissions mean {:.2} ms, max {:.2} ms; curve evaluations {evaluations}",
         times.len(),
         node.status().unwrap()["mempool"],
         tail.iter().sum::<f64>() / tail.len() as f64,
         tail.iter().copied().fold(0.0, f64::max)
     );
+    assert_eq!(evaluations, 0, "admission clears no batch");
 }

@@ -39,6 +39,21 @@ const MEMO_FILLS: usize = 16_384;
 /// depend on what the memo holds.
 static MEMO: Mutex<VecDeque<(Hash, Clearing)>> = Mutex::new(VecDeque::new());
 
+#[cfg(any(test, feature = "test-fixtures"))]
+thread_local! {
+    /// Curve evaluations spent by clearings run on this thread. A memo hit
+    /// spends none. Test instrumentation only; it never affects a result.
+    static CURVE_EVALUATIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Test instrumentation: the curve evaluations clearing has spent on the
+/// calling thread so far, memo hits excluded.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[doc(hidden)]
+pub fn thread_curve_evaluations() -> u64 {
+    CURVE_EVALUATIONS.with(Cell::get)
+}
+
 /// Deterministic count of the curve evaluations spent by one clearing, and the
 /// last price it found as (units, scale): candidates of one clearing have
 /// nearby prices, so each price search starts there.
@@ -708,8 +723,10 @@ pub fn clear_with_work(
         limit,
         last_price: RefCell::new(None),
     };
-    let result = clear_metered(c, w, buys, sells, max_price_change_bps, &work)?;
-    Ok((result, work.used.get()))
+    let result = clear_metered(c, w, buys, sells, max_price_change_bps, &work);
+    #[cfg(any(test, feature = "test-fixtures"))]
+    CURVE_EVALUATIONS.with(|spent| spent.set(spent.get() + work.used.get()));
+    Ok((result?, work.used.get()))
 }
 
 fn clear_metered(

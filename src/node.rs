@@ -641,11 +641,60 @@ thread_local! {
     static POOL_SIGNATURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Fail the next pool recovery on this thread.
     static FAIL_RECOVERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Curve evaluations this thread ran while it held the node lock, and
+    /// how long it held that lock in all.
+    static CLEARING_UNDER_INNER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static INNER_HELD: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+/// The node lock. Test builds meter it: a std mutex is held by one thread and
+/// clearing runs synchronously on that thread, so the change in the thread's
+/// curve evaluations between acquiring and releasing it is exactly the
+/// clearing run while the lock was held.
+#[cfg(not(test))]
+type InnerGuard<'a> = std::sync::MutexGuard<'a, Inner>;
+#[cfg(test)]
+struct InnerGuard<'a> {
+    guard: std::sync::MutexGuard<'a, Inner>,
+    evaluations: u64,
+    acquired: Instant,
+}
+#[cfg(test)]
+impl std::ops::Deref for InnerGuard<'_> {
+    type Target = Inner;
+    fn deref(&self) -> &Inner {
+        &self.guard
+    }
+}
+#[cfg(test)]
+impl std::ops::DerefMut for InnerGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Inner {
+        &mut self.guard
+    }
+}
+#[cfg(test)]
+impl Drop for InnerGuard<'_> {
+    fn drop(&mut self) {
+        let spent = crate::batch::thread_curve_evaluations() - self.evaluations;
+        CLEARING_UNDER_INNER.with(|total| total.set(total.get() + spent));
+        INNER_HELD.with(|total| total.set(total.get() + self.acquired.elapsed()));
+    }
+}
+fn lock_inner(inner: &Mutex<Inner>) -> InnerGuard<'_> {
+    let guard = inner.lock().unwrap_or_else(|_| poisoned("node state"));
+    #[cfg(test)]
+    let guard = InnerGuard {
+        guard,
+        evaluations: crate::batch::thread_curve_evaluations(),
+        acquired: Instant::now(),
+    };
+    guard
 }
 
 struct Inner {
     chain: Chain,
-    /// The next-block selection; templates commit to exactly these entries.
+    /// The next-block selection; templates commit to these entries, or to
+    /// their longest prefix that finishes as a block.
     mempool: Vec<Transaction>,
     /// Pending entries displaced by capacity, retried against later blocks.
     backlog: Vec<Transaction>,
@@ -653,7 +702,11 @@ struct Inner {
     pool_tip: Hash,
     /// Advances with every installed change to the selection or backlog.
     pool_revision: u64,
-    template: Option<Arc<Block>>,
+    /// Advances with every change to the selection itself, and with the tip.
+    selection_revision: u64,
+    /// The configured miner's last template. A selection change leaves it in
+    /// place as a valid same-parent fallback; a tip change removes it.
+    template: Option<TemplateEntry>,
     // Download progress is independent of which branch currently has greatest work.
     downloads: VecDeque<Download>,
     relay_cursor: usize,
@@ -662,6 +715,29 @@ impl Inner {
     fn pending(&self) -> impl Iterator<Item = &Transaction> {
         self.mempool.iter().chain(&self.backlog)
     }
+}
+struct TemplateEntry {
+    block: Arc<Block>,
+    /// The tip it extends.
+    tip: Hash,
+    /// The selection revision its transactions were captured at.
+    selection: u64,
+    /// When its build finished, and how long the build took.
+    finished: Instant,
+    cost: Duration,
+}
+/// How current a template its caller needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Freshness {
+    /// Built for the selection installed when it was asked for: local
+    /// mining and RPC, which are trusted.
+    Current,
+    /// Stratum work. After a selection change, the last same-parent
+    /// template, still a valid block, is served until as long as its build
+    /// took has passed since that build finished, so repeated rebuilds use
+    /// at most half of one core however fast the selection changes. A new
+    /// tip is always built at once.
+    Throttled,
 }
 /// A stored side-branch block whose descendants a peer may still provide,
 /// and the source that delivered it (see `network_guard::peer_source`).
@@ -802,7 +878,7 @@ impl ExplorerWorker {
                             let Some(inner) = inner.upgrade() else {
                                 return Ok(None);
                             };
-                            let guard = inner.lock().unwrap_or_else(|_| poisoned("node state"));
+                            let guard = lock_inner(&inner);
                             explorer.capture(&guard.chain)
                         })();
                         match update {
@@ -997,6 +1073,9 @@ fn proposal_page(
 #[derive(Clone)]
 pub struct Node {
     inner: Arc<Mutex<Inner>>,
+    /// Held for each template build, which runs outside `inner`, so at most
+    /// one runs at a time. Taken before `inner`, never while holding it.
+    template_build: Arc<Mutex<()>>,
     explorer: Arc<ExplorerWorker>,
     explorer_path: Arc<PathBuf>,
     session_token_path: Arc<PathBuf>,
@@ -1093,6 +1172,7 @@ impl Node {
         let inner = Inner {
             pool_tip: chain.tip_hash(),
             pool_revision: 0,
+            selection_revision: 0,
             chain,
             mempool: Vec::new(),
             backlog: Vec::new(),
@@ -1138,6 +1218,7 @@ impl Node {
         explorer.notify();
         Ok(Self {
             inner,
+            template_build: Arc::new(Mutex::new(())),
             explorer,
             explorer_path: Arc::new(crate::local_files::sidecar(path, "explorer.sqlite")),
             session_token_path: Arc::new(session_token_path(path)),
@@ -1327,8 +1408,8 @@ impl Node {
             .await
             .context("wallet reader failed")?
     }
-    fn locked(&self) -> Result<std::sync::MutexGuard<'_, Inner>> {
-        Ok(self.inner.lock().unwrap_or_else(|_| poisoned("node state")))
+    fn locked(&self) -> Result<InnerGuard<'_>> {
+        Ok(lock_inner(&self.inner))
     }
     fn rejected_locked(&self) -> std::sync::MutexGuard<'_, RejectedTransactions> {
         // Only a cache: a panic elsewhere cannot leave it inconsistent.
@@ -1492,7 +1573,10 @@ impl Node {
     /// wait in the backlog; any other newcomer that does not fit is refused.
     /// Every pool entry was authenticated when it entered the pool, and every
     /// detached block transaction when its block executed, so only candidates
-    /// outside `authenticated` have their signatures checked.
+    /// outside `authenticated` have their signatures checked. The selection
+    /// does not finish the block, so it never clears batch trades: a trade's
+    /// fill decides no transaction's validity, and clearing runs only when a
+    /// template is built, outside the node lock.
     fn select_pool(
         chain: &Chain,
         miner: PublicKey,
@@ -1500,7 +1584,7 @@ impl Node {
         retained: &HashSet<Hash>,
         authenticated: &HashSet<Hash>,
     ) -> Result<(Vec<Transaction>, Vec<Transaction>)> {
-        let selection = chain.select_authenticated(
+        let selection = chain.select_admission(
             miner,
             candidates,
             mempool_limit(&chain.config),
@@ -1515,8 +1599,9 @@ impl Node {
         Ok((selection.transactions, backlog))
     }
     /// Retained entries the selection left out only for block capacity. Unless
-    /// the selection was saturated or truncated, or left the sender's own
-    /// candidates unattempted, an entry that still fits the selected block's
+    /// the selection was saturated (or truncated, which an admission selection
+    /// never is) or left the sender's own candidates unattempted, an entry
+    /// that still fits the selected block's
     /// bytes and weight was refused for validity: it is dropped with its sender's
     /// later nonces. Weights quoted against the parent state can only overstate
     /// in-block weights, so a fitting estimate is conservative. The best bids
@@ -1660,7 +1745,7 @@ impl Node {
             .collect())
     }
     /// Install a selected pool, publishing only an actual change. A changed
-    /// next-block selection also invalidates the cached template.
+    /// next-block selection also makes the cached template outdated.
     fn install_pool(
         &self,
         i: &mut Inner,
@@ -1672,7 +1757,7 @@ impl Node {
         i.mempool = mempool;
         i.backlog = backlog;
         if selection_changed {
-            i.template = None;
+            i.selection_revision = i.selection_revision.wrapping_add(1);
         }
         if changed {
             i.pool_revision = i.pool_revision.wrapping_add(1);
@@ -1705,36 +1790,71 @@ impl Node {
         json!({"chain_id":hex::encode(inner.chain.chain_id()), "height":inner.chain.tip_height(), "tip":hex::encode(inner.chain.tip_hash()), "state_root":hex::encode(inner.state_root()), "clock":s.clock, "time_unit":"seconds", "clock_basis":"target_interval", "issued":s.issued.to_str_radix(10), "test_work":inner.chain.config.test_work, "phase":s.phase_name(), "decision":s.decision_id().map(hex::encode), "auction_round":s.auction_round(), "settings":s.settings, "mempool":inner.mempool.len(), "reserve":s.world.reserve.to_str_radix(10), "shares":s.world.shares.to_str_radix(10), "curve_mass":s.world.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(&s.world).to_str_radix(10), "revenue":s.world.revenue.to_str_radix(10), "fee_policy":json!({"minimum_fee_rate":s.settings.minimum_fee_rate.to_string(),"fee_scale":crate::fees::FEE_SCALE,"account_weight":crate::fees::ACCOUNT_WEIGHT})})
     }
     pub fn template(&self) -> Result<Block> {
-        let mut block = self.template_shared()?.as_ref().clone();
+        let mut block = self.template_shared(Freshness::Current)?.0.as_ref().clone();
         block.header.timestamp = block
             .header
             .timestamp
             .max(now().min(u32::MAX as u64) as u32);
         Ok(block)
     }
-    fn template_shared(&self) -> Result<Arc<Block>> {
-        let mut i = self.locked()?;
-        if let Some(template) = &i.template {
-            return Ok(template.clone());
+    /// The configured miner's template for the current tip, committing to the
+    /// installed selection. Finishing a block clears its batch trades, so the
+    /// build runs outside the node lock, one at a time; the lock is held only
+    /// to capture the selection and to store the result. The instant
+    /// returned with a Throttled template that lags the selection is when to
+    /// ask again.
+    fn template_shared(&self, freshness: Freshness) -> Result<(Arc<Block>, Option<Instant>)> {
+        let served = |i: &Inner| -> Option<(Arc<Block>, Option<Instant>)> {
+            let entry = i.template.as_ref()?;
+            let tip = i.chain.tip_hash();
+            if entry.tip != tip {
+                return None;
+            }
+            if entry.selection == i.selection_revision && i.pool_tip == tip {
+                return Some((entry.block.clone(), None));
+            }
+            let retry = entry.finished + entry.cost;
+            (freshness == Freshness::Throttled && Instant::now() < retry)
+                .then(|| (entry.block.clone(), Some(retry)))
+        };
+        if let Some(served) = served(&*self.locked()?) {
+            return Ok(served);
         }
-        let candidates: Vec<Transaction> = i.pending().cloned().collect();
-        // Every pool entry was authenticated when it entered the pool.
-        let retained = Self::pool_ids(&i);
-        let (selected, block) = i.chain.select_template_authenticated(
-            self.miner,
-            &candidates,
-            mempool_limit(&i.chain.config),
-            Self::timestamp(&i.chain),
-            &retained,
-        )?;
-        // The pool normally is this selection already; publish only a change.
-        if selected.transactions != i.mempool || i.pool_tip != i.chain.tip_hash() {
-            let backlog = Self::displaced(&i.chain, self.miner, &selected, &candidates, &retained)?;
-            self.install_pool(&mut i, (selected.transactions, backlog))?;
+        let _build = self.template_build.unpoisoned();
+        loop {
+            let (job, selection) = {
+                let mut i = self.locked()?;
+                // Another build may have finished while this one waited.
+                if let Some(served) = served(&i) {
+                    return Ok(served);
+                }
+                self.refresh_stale_pool(&mut i)?;
+                let job = i.chain.template_job(
+                    self.miner,
+                    i.mempool.clone(),
+                    Self::timestamp(&i.chain),
+                )?;
+                (job, i.selection_revision)
+            };
+            let started = Instant::now();
+            let built = job.build()?;
+            let finished = Instant::now();
+            let block = Arc::new(built.block);
+            let mut i = self.locked()?;
+            // A new tip needs proof of work, so a repeat is rare.
+            if i.chain.tip_hash() != job.previous() {
+                continue;
+            }
+            // Current only if the selection did not change meanwhile.
+            i.template = Some(TemplateEntry {
+                block: block.clone(),
+                tip: job.previous(),
+                selection,
+                finished,
+                cost: finished - started,
+            });
+            return Ok((block, None));
         }
-        let block = Arc::new(block);
-        i.template = Some(block.clone());
-        Ok(block)
     }
     pub fn submit_transaction(&self, tx: Transaction) -> Result<Hash> {
         // Authenticate before waiting for chain state.
@@ -1906,6 +2026,7 @@ impl Node {
         let changed = submitted?;
         if changed {
             i.template = None;
+            i.selection_revision = i.selection_revision.wrapping_add(1);
             let pending: Vec<Transaction> = i.pending().cloned().collect();
             // Recovery may need disk access and cannot roll back a committed
             // block. The new tip is published once, together with its recovered
@@ -1925,6 +2046,7 @@ impl Node {
                     i.backlog.clear();
                     i.pool_tip = old_tip;
                     i.pool_revision = i.pool_revision.wrapping_add(1);
+                    i.selection_revision = i.selection_revision.wrapping_add(1);
                     if let Err(error) = self.publish(&i) {
                         eprintln!("Pending transaction publication deferred: {error:#}");
                     }
@@ -2024,19 +2146,26 @@ impl Node {
             "attempts must be 1..100000000"
         );
         // Mining rewards affect the complete post-state commitment. Build a new
-        // candidate without changing the configured miner or its Stratum cache.
+        // candidate without changing the configured miner or its Stratum
+        // cache, finished outside the node lock like every template.
         let candidate = {
-            let i = self.locked()?;
-            let candidates: Vec<Transaction> = i.pending().cloned().collect();
-            i.chain
-                .select_template_authenticated(
+            let _build = self.template_build.unpoisoned();
+            let job = {
+                let i = self.locked()?;
+                let candidates: Vec<Transaction> = i.pending().cloned().collect();
+                let selection = i.chain.select_admission(
                     recipient,
                     &candidates,
                     mempool_limit(&i.chain.config),
-                    Self::timestamp(&i.chain),
                     &Self::pool_ids(&i),
+                )?;
+                i.chain.template_job(
+                    recipient,
+                    selection.transactions,
+                    Self::timestamp(&i.chain),
                 )?
-                .1
+            };
+            job.build()?.block
         };
         let block = Chain::mine(candidate, max_attempts)?;
         self.submit_block(block.clone())?;
@@ -7265,6 +7394,16 @@ const STRATUM_RATE_SAMPLE: u64 = 4;
 const STRATUM_RATE_FLOOR: Duration = Duration::from_millis(250);
 const STRATUM_SHARE_WINDOW: Duration = Duration::from_secs(8);
 const STRATUM_RATE_LIMITED: &str = "mining session request rate limit";
+/// When a deferred same-parent refresh runs: one interval after the last job,
+/// and not before the node's throttled template may be rebuilt.
+fn stratum_refresh_at(
+    last_job: tokio::time::Instant,
+    retry: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    let interval = last_job + STRATUM_REFRESH_INTERVAL;
+    retry.map_or(interval, |retry| interval.max(retry))
+}
+#[allow(clippy::too_many_arguments)]
 async fn new_job<W: AsyncWrite + Unpin>(
     node: &Node,
     write: &mut W,
@@ -7273,8 +7412,8 @@ async fn new_job<W: AsyncWrite + Unpin>(
     difficulty: f64,
     seen: &mut HashMap<Hash, Hash>,
     worker_id: u32,
+    block: Arc<Block>,
 ) -> Result<(Hash, Hash)> {
-    let block = template_async(node).await?;
     let parent_changed = jobs
         .iter()
         .max_by_key(|(id, _)| *id)
@@ -7314,15 +7453,17 @@ async fn new_job<W: AsyncWrite + Unpin>(
     jobs.insert(id, Arc::new(job));
     Ok(fingerprint)
 }
-async fn template_async(node: &Node) -> Result<Arc<Block>> {
+/// A throttled template, and when to ask again if it lags the selection.
+async fn template_async(node: &Node) -> Result<(Arc<Block>, Option<tokio::time::Instant>)> {
     let permit = timeout(IO_TIMEOUT, node.stratum_workers.clone().acquire_owned()).await??;
     let node = node.clone();
-    tokio::task::spawn_blocking(move || {
+    let (block, retry) = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        node.template_shared()
+        node.template_shared(Freshness::Throttled)
     })
     .await
-    .context("mining template worker failed")?
+    .context("mining template worker failed")??;
+    Ok((block, retry.map(tokio::time::Instant::from_std)))
 }
 fn stratum_session_expired(authorized: bool, connected: Duration) -> bool {
     !authorized && connected >= STRATUM_AUTHORIZATION_WINDOW
@@ -7398,6 +7539,8 @@ async fn stratum_session(
     let mut counter = 0;
     let mut fingerprint: Option<(Hash, Hash)> = None;
     let mut deferred = false;
+    // When the node's throttled template may next be rebuilt, if it lagged.
+    let mut retry: Option<tokio::time::Instant> = None;
     let mut share_window: Option<(tokio::time::Instant, u64)> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut updates = node.work_updates.subscribe();
@@ -7622,9 +7765,12 @@ async fn stratum_session(
                 // A raised difficulty takes effect with the next job, even when the
                 // share that measured the rate was itself refused for it.
                 if authorized && (retarget || (successful && refresh)) {
-                    fingerprint=Some(new_job(&node,&mut write,&mut jobs,&mut counter,difficulty,&mut seen,u32::from_le_bytes(extra)).await?);
+                    let (block, lagging) = template_async(&node).await?;
+                    fingerprint=Some(new_job(&node,&mut write,&mut jobs,&mut counter,difficulty,&mut seen,u32::from_le_bytes(extra),block).await?);
                     last_job=tokio::time::Instant::now();
-                    deferred = false;
+                    // A template that lags the selection is refreshed once the node may rebuild it.
+                    deferred = lagging.is_some();
+                    retry = lagging;
                 }
             }
             changed = updates.changed() => {
@@ -7637,29 +7783,36 @@ async fn stratum_session(
                     if fingerprint.is_some_and(|(parent,_)| parent == tip) && last_job.elapsed() < STRATUM_REFRESH_INTERVAL {
                         deferred = true;
                     } else {
-                        deferred = false;
-                        let block=template_async(&node).await?;
+                        let (block, lagging) = template_async(&node).await?;
                         if fingerprint!=Some((block.header.previous,block.header.merkle_root)) {
-                            fingerprint=Some(new_job(&node,&mut write,&mut jobs,&mut counter,difficulty,&mut seen,u32::from_le_bytes(extra)).await?);
+                            fingerprint=Some(new_job(&node,&mut write,&mut jobs,&mut counter,difficulty,&mut seen,u32::from_le_bytes(extra),block).await?);
                             last_job=tokio::time::Instant::now();
                         }
+                        deferred = lagging.is_some();
+                        retry = lagging;
                     }
                 }
             }
-            _ = tokio::time::sleep_until(last_job + STRATUM_REFRESH_INTERVAL), if deferred => {
-                deferred = false;
-                let block=template_async(&node).await?;
+            _ = tokio::time::sleep_until(stratum_refresh_at(last_job, retry)), if deferred => {
+                let (block, lagging) = template_async(&node).await?;
                 if fingerprint!=Some((block.header.previous,block.header.merkle_root)) {
-                    fingerprint=Some(new_job(&node,&mut write,&mut jobs,&mut counter,difficulty,&mut seen,u32::from_le_bytes(extra)).await?);
+                    fingerprint=Some(new_job(&node,&mut write,&mut jobs,&mut counter,difficulty,&mut seen,u32::from_le_bytes(extra),block).await?);
                     last_job=tokio::time::Instant::now();
                 }
+                deferred = lagging.is_some();
+                retry = lagging;
             }
             _ = tick.tick() => {
                 if stratum_session_expired(authorized,connected.elapsed()) { bail!("mining authorization timed out"); }
                 if !partial_line.is_empty() { let began=partial_since.get_or_insert_with(tokio::time::Instant::now); ensure!(began.elapsed()<IO_TIMEOUT,"mining partial frame timed out"); }
                 if authorized && last_job.elapsed()>=Duration::from_secs(30) {
-                    fingerprint=Some(new_job(&node,&mut write,&mut jobs,&mut counter,difficulty,&mut seen,u32::from_le_bytes(extra)).await?);
+                    let (block, lagging) = template_async(&node).await?;
+                    fingerprint=Some(new_job(&node,&mut write,&mut jobs,&mut counter,difficulty,&mut seen,u32::from_le_bytes(extra),block).await?);
                     last_job=tokio::time::Instant::now();
+                    if lagging.is_some() {
+                        deferred = true;
+                        retry = lagging;
+                    }
                 }
             }
         }

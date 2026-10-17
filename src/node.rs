@@ -331,11 +331,13 @@ fn mempool_hex_page(pool: &[Transaction], offset: usize, limit: usize) -> Result
 }
 
 const MAX_BATCH: usize = peer_wire::MAX_BLOCKS;
-// One reply's block work plus the recipient's loose-transaction and mempool
-// reselection terms stays within one second of peer work refill.
+// One reply's block work plus the recipient's loose-transaction and pool
+// (selection plus backlog) reselection terms stays within one second of peer
+// work refill.
 const PEER_BATCH_WORK: usize = network_guard::PEER_WORK_PER_SECOND as usize
     - peer_wire::MAX_TRANSACTIONS
-    - MAX_ADAPTIVE_MEMPOOL;
+    - MAX_ADAPTIVE_MEMPOOL
+    - MAX_BACKLOG;
 const MAX_SNAPSHOT_KEYS: usize = 256;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 const VERSION_MASK: u32 = 0x1fffe000;
@@ -866,13 +868,16 @@ impl Node {
             inner.chain.max_known_block_bytes(),
         )?));
         // One block at the genesis signature limit, with a full loose batch and
-        // mempool reselection, must always fit a single peer work burst.
+        // pool (selection plus backlog) reselection, must always fit a single
+        // peer work burst.
         guard.allow_work(
             inner
                 .chain
                 .config
                 .max_signatures
-                .saturating_add(1 + peer_wire::MAX_TRANSACTIONS + MAX_ADAPTIVE_MEMPOOL),
+                .saturating_add(
+                    1 + peer_wire::MAX_TRANSACTIONS + MAX_ADAPTIVE_MEMPOOL + MAX_BACKLOG,
+                ),
         )?;
         let explorer_config = inner.chain.config.clone();
         let discovery_path = peer_discovery::path_for(path, inner.chain.chain_id());
@@ -8106,7 +8111,9 @@ mod peer_tests {
             .unwrap();
         assert!(
             session
-                .work(100_001 + peer_wire::MAX_TRANSACTIONS + MAX_ADAPTIVE_MEMPOOL)
+                .work(
+                    100_001 + peer_wire::MAX_TRANSACTIONS + MAX_ADAPTIVE_MEMPOOL + MAX_BACKLOG
+                )
                 .is_ok()
         );
     }

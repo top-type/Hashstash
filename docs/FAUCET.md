@@ -40,9 +40,10 @@ an ordinary transfer or mining rewards paid to the faucet address. Never give
 the faucet a visitor's key or the key to an account holding valuable funds.
 The daemon accepts the usual key-file JSON, with `secret` and `public` fields.
 On Unix it refuses a key file that is a symbolic link or is readable or writable
-by its group or other users (keep `keygen`'s 0600 mode). Parsed copies of the
-secret are wiped, and stored subnet digests use a key derived from the signer,
-never the signing key itself.
+by its group or other users (keep `keygen`'s 0600 mode). The key is read through
+the one opened handle those checks inspected, so a path replaced in between is
+refused. Parsed copies of the secret are wiped, and stored subnet digests use a
+key derived from the signer, never the signing key itself.
 Changing the ledger's network or signer requires a separate ledger. Changing
 `payout` applies to new claims after a restart; recorded payments keep their
 original amounts, and all cooldowns and claim counts are preserved.
@@ -112,10 +113,13 @@ CORS only for the exact configured website origins. POST also requires that
 Origin and JSON content type. It stores keyed subnet digests, not literal IPs.
 HTTP concurrency, request duration, and request-body size are bounded: 16
 requests run at once, and one client network may hold at most four of them.
-The poll loop reads the node snapshot without holding the claim engine, so slow
-node replies do not delay status responses. The faucet's own node RPC client
-ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`; it always connects directly
-to the configured loopback node.
+The poll loop reads the node snapshot, its largest reply, without holding the
+claim engine. Receipt lookups and the rebroadcast of a pending payment still run
+while the engine is held, each with a five-second timeout, so a slow node can
+delay status and claim responses; a request still waiting after 15 seconds
+receives HTTP 503. The faucet's own node RPC client ignores `HTTP_PROXY`,
+`HTTPS_PROXY` and `ALL_PROXY`; it always connects directly to the configured
+loopback node.
 
 `GET /faucet/status` returns:
 
@@ -137,7 +141,12 @@ Other states are `waiting_for_mining`, `unfunded`, `pending`, `cooldown`, `quota
 the governed minimum fee for a payment to a new account now exceeds `max_fee`;
 `capacity_exceeded` means that payment's weight exceeds the governed block
 capacity, so no block could include it. The faucet computes both from the node
-snapshot exactly as node preparation does and signs nothing while either holds.
+snapshot exactly as node preparation does. A payment to an existing account
+omits the account-creation weight, so while either state holds such a claim is
+still paid when its own exact quote fits the capacity and `max_fee`; a claim
+that does not fit is refused before anything is signed or reserved. When even
+an existing account's payment cannot fit, every claim is refused without
+preparing a transaction. The wallet disables its claim button in either state.
 Raise `max_fee`, or wait for capacity to be restored. Refresh errors and pause
 reasons appear only in the operator journal as fixed categories, never in status.
 Add `?address=RECIPIENT_ADDRESS` to receive an optional
@@ -187,25 +196,38 @@ integer before the service signs a payment.
 
 Confirmation requires locating that transaction in canonical block history and
 the configured confirmation depth. A higher account nonce alone is insufficient.
-The faucet uses the node's private `blockreceipt` RPC for this: it returns one
-canonical block hash and whether that block holds the named transaction IDs (at
-most 64), so verification never transfers or parses a whole block.
+The faucet uses the node's private `blockreceipt` RPC for this, so the faucet
+needs a node from a release that provides it; run the faucet and node from the
+same release. The RPC returns one canonical block hash and whether that block
+holds the named transaction IDs (at most 64). No block is ever transferred or
+parsed as JSON. A lookup that names no IDs reads only the node's canonical
+index, and the node loads a block body only to check named IDs. The optional
+`checked` parameter, `{"height":H,"hash":HASH}`, adds `checked_canonical` to
+the reply: whether that block was canonical in the same read.
 
 Every refresh accounts for the nonces the canonical chain consumed. Each nonce
 can pay at most one recorded claim, so these automatic repairs can never pay
 twice:
 
-- The newest confirmed receipt is checked by its block hash, which commits to
-  all older receipts. If that block leaves the canonical chain, the claim is
-  accounted again: found elsewhere it keeps a moved receipt, otherwise it is
-  retried while still valid, and expires after its lifetime.
+- The newest confirmed receipt is checked by its block hash alone, which commits
+  to the payment and to all older receipts. If that block leaves the canonical
+  chain, the claim is accounted again: found elsewhere it keeps a moved
+  receipt, otherwise it is retried while still valid, and expires after its
+  lifetime.
 - A pending claim whose anchor was orphaned, even by a one-block reorganization,
   or whose anchor lies above a shorter chain, keeps its exact bytes and expires
   once the canonical height reaches its expiry height with its nonce unused.
 - A claim recorded as expired that a later branch includes is marked confirmed,
   and any other claim signed with the same nonce becomes expired.
-- Inclusion searches resume across refreshes and inspect at most 64 blocks per
-  refresh. A completed search is not repeated while its blocks stay canonical.
+- A consumed nonce is searched for among every unsettled claim signed with it.
+  Only heights inside some claim's inclusion window are inspected, each for
+  just the claims whose window covers it, so a long run of expired claims or an
+  old expired claim never makes a lookup exceed the node's limit or widen the
+  search. Each lookup confirms the previously inspected block in the same node
+  read; if the chain switched branches in between, the search starts again.
+- Inclusion searches resume across refreshes and make at most 64 block lookups
+  per refresh. A completed search is not repeated while its blocks stay
+  canonical: it then costs one lookup per refresh, which loads no block.
 
 New claims pause, with state `unavailable`, only while a condition holds, and
 resume by themselves once it clears. The journal names it with a fixed category:

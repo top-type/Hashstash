@@ -103,7 +103,7 @@ def main():
 
         def known(name, other):
             status = rpc(ports[name][0], 'peerstatus')
-            assert status['transport'] == 'authenticated-discovery-v2'
+            assert status['transport'] == 'authenticated-discovery'
             assert status['discovery']['enabled']
             endpoint = f'127.0.0.1:{ports[other][1]}'
             return any(p['address'] == endpoint and p.get('last_success', 0) > 0

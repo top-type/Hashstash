@@ -345,8 +345,26 @@
         node.textContent = message;
         node.classList.toggle("error", failed);
     }
+    // Node JSON carries u64 values (settings, proposal parameters, lifetimes)
+    // that can exceed 2^53. Engines without JSON.parse source-text access get
+    // those integer literals quoted first, so each arrives as the same exact
+    // decimal string the source-text path returns instead of failing the
+    // whole response.
+    const jsonSourceText = (() => {
+        try {
+            let source = null;
+            JSON.parse("1", (_key, value, context) => (source = context?.source, value));
+            return source === "1";
+        } catch {
+            return false;
+        }
+    })();
+    function quoteUnsafeIntegers(source) {
+        return source.replace(/"(?:[^"\\]|\\.)*"|(?<![\d.eE+-])-?\d{16,}(?![\d.eE])/g, token => token[0] === '"' || Number.isSafeInteger(Number(token)) ? token : `"${token}"`);
+    }
     async function exactJSON(response) {
-        return JSON.parse(await response.text(), (_key, value, context) => {
+        const source = await response.text();
+        return JSON.parse(jsonSourceText ? source : quoteUnsafeIntegers(source), (_key, value, context) => {
             if (typeof value === "number" && Number.isInteger(value) && !Number.isSafeInteger(value)) {
                 if (!context?.source || !/^-?\d+$/.test(context.source)) throw new Error("This browser cannot safely read a large numeric field from the node.");
                 return context.source;
@@ -671,7 +689,10 @@
         }
     }
     async function refreshFaucet(force = false) {
-        if (!state.ready || faucet.checking) return;
+        // The faucet may be a separately operated origin, and its status query
+        // names the selected address. Ask only while Wallet, where the faucet
+        // control lives, is open.
+        if (!state.ready || faucet.checking || location.hash.split("?")[0] !== "#wallet") return;
         const chain = state.status.chain_id, claimKey = faucetKey(), sequence = faucet.sequence;
         const identity = walletIdentity();
         const current = () => state.ready && chain === state.status?.chain_id && identity === walletIdentity() && sequence === faucet.sequence;
@@ -838,6 +859,7 @@
                 }, null, 2);
                 $("unsigned-dialog").showModal();
                 feedback(form, "Unsigned transaction prepared.");
+                form.id === "propose-form" && rememberDescription(operation);
                 return envelope;
             }
             const signed = await browserWallet.signUnsigned(envelope, expected);
@@ -847,6 +869,7 @@
             });
             const id = data.transaction_id;
             if (!id || id !== signed.transaction_id) throw new Error("The node returned an unexpected transaction ID.");
+            form.id === "propose-form" && rememberDescription(operation);
             toast("Transaction submitted.");
             if (form.id !== "mail-form" || identity === submissionIdentity(form)) {
                 form.id === "mail-form" && mail?.sent();
@@ -1082,6 +1105,7 @@
         chat?.route();
         mail?.route();
         refreshExplanations();
+        refreshFaucet();
     }
     function accountView() {
         const a = state.ready ? snapshotAccount(state.account) : void 0;
@@ -1613,14 +1637,29 @@
         text("gov-decision-message", visibleControls(message));
         node.hidden = !message;
     }
+    // Descriptions are published on chain. This session's own submissions are
+    // remembered in memory until the explorer has them; drafts are never stored.
+    const submittedDescriptions = new Map;
+    function rememberDescription(operation) {
+        const form = $("propose-form");
+        if (!operation?.Propose || form.elements.data_format?.value === "private") return;
+        submittedDescriptions.delete(hex(operation.Propose.description));
+        submittedDescriptions.set(hex(operation.Propose.description), form.elements.description.value.trim());
+        submittedDescriptions.size > 32 && submittedDescriptions.delete(submittedDescriptions.keys().next().value);
+    }
     function savedDescription(hashValue, shared) {
-        let local = "";
-        try {
-            local = localStorage.getItem(`hashstash-description-${hex(hashValue)}`) || "";
-        } catch {/* Legacy local cache is optional. */}
+        const local = submittedDescriptions.get(hex(hashValue)) || "";
         if (typeof HashstashProposalData === "object") return HashstashProposalData.verifiedText(shared, hex(hashValue)) || HashstashProposalData.verifiedText(local, hex(hashValue));
         return local;
     }
+    // Earlier versions wrote every intermediate draft of a description to
+    // localStorage under its own key. Remove that retired cache.
+    try {
+        for (let index = localStorage.length - 1; index >= 0; index--) {
+            const name = localStorage.key(index);
+            typeof name === "string" && name.startsWith("hashstash-description-") && localStorage.removeItem(name);
+        }
+    } catch {/* Cleanup of the retired draft cache is optional. */}
     function refreshExplanations() {
         if (typeof HashstashProposalData !== "object" || !state.ready || location.hash.split("?")[0] !== "#governance") return;
         const chain = state.status.chain_id;
@@ -2851,9 +2890,6 @@
         const encrypted = $("propose-form").elements.data_format?.value === "private";
         const descriptionBytes = encrypted ? new Uint8Array(transactionData($("propose-form")).data_hex.match(/../g).map(value => parseInt(value,16))) : (new TextEncoder).encode(v.description.trim());
         const description = new Uint8Array(await crypto.subtle.digest("SHA-256", descriptionBytes));
-        if (!encrypted) try {
-            localStorage.setItem(`hashstash-description-${hex(Array.from(description))}`, v.description.trim());
-        } catch {/* Local descriptions are optional. */}
         return {
             Propose: {
                 round: auction.round,

@@ -47,6 +47,23 @@ async function run(){
  h.handlers.explorer_governance=()=>response({result:{chain_id:s.status.chain_id,proposals:[{id:missingId,description:sha(text),description_text:text}]}});await h.refresh();await settle();
  eq(h.get('gov-title').textContent,'Set target block interval to 5s','setting changes keep their concrete action title');eq(h.get('gov-grant-payments').hidden,true);
  eq(h.get('gov-decision-message').textContent,text,'the current decision gets its own canonical-data query even outside the proposal page');
+ {
+  // Drafts typed into the description are never written to browser storage;
+  // the retired per-draft cache is removed, and other settings are kept.
+  const entries=new Map([['hashstash-description-'+'ab'.repeat(32),'old abandoned draft'],['hashstash-description-'+'cd'.repeat(32),'another'],['hashstash-chat-muted:x','[]']]);
+  const store={get length(){return entries.size;},key:i=>[...entries.keys()][i]??null,getItem:k=>entries.get(k)??null,setItem:(k,v)=>entries.set(k,String(v)),removeItem:k=>entries.delete(k)};
+  const d=await harness({rationale:true,localStorage:store}),ds=d.currentSnapshot;ds.status.settings.block_bytes=16384;ds.status.fee_policy=s.status.fee_policy;
+  d.handlers.fee_quote=params=>{const {chain_id,tip,state_root,height}=ds.status,data=params.data_hex||'';return response({result:{miner_fee_percent:50,miner_fee:'0',revenue_fee:'1',chain_id,tip,state_root,height,anchor:tip,anchor_height:height,expiry_blocks:params.expiry_blocks??2,expiry_height:String(BigInt(height)+BigInt(params.expiry_blocks??2)),sender:addr(params.sender),sender_public_key:params.sender,fee:'1',minimum_fee:'1',account_creation_fee:'0',grant_recipient_fee:'0',extra_fee:'0',weight:'512',minimum_fee_rate:'1',data_hex:data,data_bytes:data.length/2}});};
+  eq([...entries.keys()],['hashstash-chat-muted:x'],'legacy description drafts are removed at startup');
+  await d.refresh();const form=d.get('propose-form');form.elements.type.value='parameter';form.elements.parameter.value='Interval';form.elements.parameter_value.value='5';form.elements.support.value='0.001';
+  for(const draft of ['Secret first wording','Second wording','Final public explanation']){form.elements.description.value=draft;await form.fire('input');await d.timersDue();await wait(()=>d.get('propose-fee-quote').textContent!=='—');}
+  eq([...entries.keys()],['hashstash-chat-muted:x'],'fee quotes for intermediate drafts write nothing');
+  await form.requestSubmit();eq(d.wallet.length,1,form.feedback.textContent);eq([...entries.keys()],['hashstash-chat-muted:x'],'a successful submission writes nothing either');
+  const mine='ef'.repeat(32);ds.proposals=[{id:mine,proposal:{round:ds.governance.phase.Auction.round,support:'1',description:sha('Final public explanation'),action:{Parameter:{parameter:'Interval',old:15,new:5}},refund_height:null}}];
+  d.handlers.explorer_governance=()=>response({result:{chain_id:ds.status.chain_id,proposals:[{id:mine,description:sha('Final public explanation'),description_text:null}]}});
+  await d.refresh();await d.navigate('#governance');await settle();ok(d.get('proposal-list').textContent.includes('Final public explanation'),'this session still shows its own submitted explanation before the explorer has it');
+  ok(!d.get('proposal-list').textContent.includes('Secret first wording'),'abandoned drafts are not shown');
+ }
  console.log(`${checks} shared-proposal explanation checks passed`);
 }
 run().catch(e=>{console.error(e);process.exitCode=1;});

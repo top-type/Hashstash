@@ -589,7 +589,10 @@ async function harness(options = {}) {
     context.addEventListener = (name,callback)=>windowEvents.set(name,callback);
     context.removeEventListener = (name,callback)=>{if(windowEvents.get(name)===callback)windowEvents.delete(name);};
   }
+  if (options.localStorage) context.localStorage = options.localStorage;
   vm.createContext(context);
+  // Model an engine without JSON.parse source-text access: revivers receive no context.
+  if (options.noJsonSource) vm.runInContext('{const parse=JSON.parse;JSON.parse=(text,reviver)=>parse(text,typeof reviver==="function"?function(key,value){return reviver.call(this,key,value);}:reviver);}', context);
   if (options.realWallet) {
     for (const name of ['vendor/noble.js','browser-wallet.js']) vm.runInContext(fs.readFileSync(path.join(__dirname,'../ui',name),'utf8'),context,{filename:name});
     h.browserApi=context.HashstashBrowserWallet; h.noble=context.HashstashNoble;
@@ -692,6 +695,11 @@ async function run() {
  eq(h.get('connection-label').textContent,'Connected');
  eq(h.get('proposal-parameter').options.map(o=>o.value),['BlockBytes','Interval','Lead','Rest','DecisionBlocks','MinerFeePercent','PassMarginBps','MinimumFeeRate','MaxPriceChangeBps']);
  ok(!/legacy-fee|guide-clockfree-mining|UncleFinder|DifficultyFloor/.test(html));
+ {
+  const field=/<input\b[^>]*id="import-private-key"[^>]*>/.exec(html)?.[0]||'';
+  ok(field&&!/type="password"/.test(field)&&/class="secret-input"/.test(field)&&/data-1p-ignore/.test(field)&&/data-lpignore="true"/.test(field),'the spending key field is not a password field that browsers offer to save and sync');
+  ok(!html.includes('covers the chain identity')&&html.includes('The chain ID is not a signed field'),'the guide does not claim the signature covers the chain ID');
+ }
  eq(h.get('network-phase-label').textContent,'Auction');
  eq(h.get('sidebar-height-value').textContent,'20');
  eq(h.get('sidebar-height').href,'#explorer?block=20');
@@ -783,6 +791,20 @@ async function run() {
   eq(fixture.get('test-work-notice').hidden,false,'fixture mining is clearly identified');
   fixture.currentSnapshot.config.test_work=false;await fixture.refresh();
   eq(fixture.get('test-work-notice').hidden,true,'normal network removes the fixture notice');
+ }
+ {
+  // An on-chain u64 above 2^53 (here a proposed DecisionBlocks value) must not
+  // take the wallet offline in a browser without JSON.parse source-text access.
+  const big='1152921504606846976',legacy=await harness({noJsonSource:true}),state=legacy.currentSnapshot;
+  const raw=(data)=>({ok:true,status:200,text:async()=>JSON.stringify(data).replace('"__BIG__"',big).replace('"__NEG__"','-'+big)});
+  state.proposals=[{id:'ab'.repeat(32),proposal:{round:0,action:{Parameter:{parameter:'DecisionBlocks',old:16,new:'__BIG__'}},description:'00'.repeat(32),support:'1',refund_height:null,offset:'__NEG__',note:'"9007199254740993" stays text',small:9007199254740991,ratio:232.83}}];
+  legacy.handlers.snapshot=p=>raw({result:legacy.snapshotResult(p)});await legacy.refresh();await legacy.navigate('#governance');
+  eq(legacy.get('connection-label').textContent,'Connected',legacy.get('global-alert').textContent);eq(legacy.get('global-alert').hidden,true);
+  ok(legacy.get('proposal-list').textContent.includes('1,152,921,504,606,846,976 blocks'),'the large value is shown exactly');
+  const parsed=[];legacy.handlers.snapshot=p=>{const reply=raw({result:legacy.snapshotResult(p)});return {...reply,text:async()=>{const text=await reply.text();parsed.push(text);return text;}};};await legacy.refresh();
+  ok(parsed.length===1&&parsed[0].includes(`"new":${big}`),'the node sent a bare integer literal');
+  const modern=await harness();modern.currentSnapshot.proposals=state.proposals;modern.handlers.snapshot=p=>raw({result:modern.snapshotResult(p)});await modern.refresh();await modern.navigate('#governance');
+  eq(modern.get('connection-label').textContent,'Connected');eq(modern.get('proposal-list').textContent,legacy.get('proposal-list').textContent,'both parsing paths produce the same view');
  }
  console.log(`Wallet UI: ${checks} current-protocol assertions passed.`);
 }

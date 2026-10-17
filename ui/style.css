@@ -730,6 +730,9 @@ dd { margin:0; text-align:right; font:12px/1.5 var(--mono); overflow-wrap:anywhe
 /* User-authored text takes its own paragraph direction, isolated from the UI around it. */
 .chat-message-text, .decision-message, .mail-subject, .mail-body, .proposal-explanation .proposal-detail, .explorer-proposal .proposal-detail { unicode-bidi: plaintext; }
 .support-preview { margin: 0 0 12px; overflow-wrap: anywhere; }
+/* A spending key is not a password: a text field masked in CSS keeps browser
+   password managers from offering to save and sync it. */
+.secret-input { -webkit-text-security: disc; font-family: var(--mono); }
 .support-preview.error .field-help { color: var(--error); }
 .mail-content { max-width: var(--mail-content-max); }
 .mail-subject { margin: 1rem 0 .5rem; }

@@ -5615,9 +5615,13 @@ impl RpcClient {
             .context("missing RPC result")?;
         Ok((result, bytes.len()))
     }
-    /// Discover the next nonce: the endpoint's account nonce, raised past this
-    /// sender's signature-checked pending transactions. An endpoint can still
-    /// misreport the account nonce or hide pending rows, but cannot invent them.
+    /// Discover the next nonce. An endpoint that reports `pending_nonce`, its
+    /// account nonce raised past its pending transactions, is taken at its
+    /// word, so no raw pending record of any governed size is downloaded.
+    /// Otherwise the account nonce is raised past this sender's
+    /// signature-checked pending transactions. Either way an endpoint can
+    /// misreport the account nonce or hide pending rows, so the review shows
+    /// the chosen nonce and `--nonce` overrides it.
     pub async fn pending_nonce(
         &self,
         sender: &PublicKey,
@@ -5634,6 +5638,18 @@ impl RpcClient {
             let account_nonce = account["account"]["nonce"]
                 .as_u64()
                 .context("invalid nonce")?;
+            if let Some(reported) = account.get("pending_nonce").filter(|v| !v.is_null()) {
+                let nonce = reported.as_u64().context("invalid pending nonce")?;
+                ensure!(
+                    nonce >= account_nonce,
+                    "pending nonce precedes account nonce"
+                );
+                return Ok(PendingNonce {
+                    nonce,
+                    account_nonce,
+                    pending: None,
+                });
+            }
             let (mut nonce, mut pending, mut offset, mut bytes_left) =
                 (account_nonce, 0, 0, budget.bytes);
             while offset < MAX_ADAPTIVE_MEMPOOL {
@@ -5673,7 +5689,7 @@ impl RpcClient {
             Ok(PendingNonce {
                 nonce,
                 account_nonce,
-                pending,
+                pending: Some(pending),
             })
         };
         timeout(budget.time, scan).await.map_err(|_| {
@@ -5690,7 +5706,9 @@ impl RpcClient {
 pub struct PendingNonce {
     pub nonce: u64,
     pub account_nonce: u64,
-    pub pending: usize,
+    /// Signature-checked pending rows from this sender, when the endpoint did
+    /// not report its own pending nonce and the client scanned its mempool.
+    pub pending: Option<usize>,
 }
 
 /// Total reply bytes and time one pending-nonce scan may use, however an

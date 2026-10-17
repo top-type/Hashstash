@@ -331,7 +331,7 @@ struct TransactionArgs {
     /// Optional uninterpreted bytes, encoded as hexadecimal.
     #[arg(long)]
     data_hex: Option<String>,
-    /// Exact nonce; by default the account nonce after this sender's signed pending transactions.
+    /// Exact nonce; by default the endpoint's pending nonce for this sender.
     #[arg(long)]
     nonce: Option<u64>,
 }
@@ -1036,10 +1036,16 @@ impl Prepared {
         )];
         notes.push(match &self.nonce {
             NonceSource::Requested(_) => "Nonce source: --nonce".to_owned(),
-            NonceSource::Discovered(found) => format!(
-                "Nonce source: account nonce {} reported by the endpoint, after {} signed pending transaction(s) from this sender",
-                found.account_nonce, found.pending
-            ),
+            NonceSource::Discovered(found) => match found.pending {
+                Some(pending) => format!(
+                    "Nonce source: account nonce {} reported by the endpoint, after {} signed pending transaction(s) from this sender",
+                    found.account_nonce, pending
+                ),
+                None => format!(
+                    "Nonce source: account nonce {} reported by the endpoint, pending nonce {} after its pending transactions from this sender",
+                    found.account_nonce, found.nonce
+                ),
+            },
         });
         notes.push(match &self.fee {
             Some((fee, ceiling)) => format!(
@@ -1499,6 +1505,11 @@ async fn main() -> Result<()> {
                 .transpose()?
                 .map(|text| stratum_password(&text))
                 .transpose()?;
+            // serve() enforces this too; checking here fails before the replay.
+            ensure!(
+                no_stratum || stratum.ip().is_loopback() || password.is_some(),
+                "a non-loopback Stratum listener requires a password; pass --stratum-password-file"
+            );
             let mut node = Node::open(&data, c, node::parse_account(&miner, &chain_id)?)?;
             let wallet_public = wallet.as_ref().map(|(_, public)| *public);
             if peer_discovery {
@@ -1532,11 +1543,6 @@ async fn main() -> Result<()> {
             drop(wallet);
             if let Some(public) = watch {
                 node = node.with_watch_key(public)?;
-            }
-            if !no_stratum && !stratum.ip().is_loopback() && password.is_none() {
-                eprintln!(
-                    "warning: Stratum on {stratum} has no --stratum-password-file; anyone who can reach it can open worker sessions"
-                );
             }
             if let Some(address) = public_web.filter(|address| !address.ip().is_loopback()) {
                 eprintln!(

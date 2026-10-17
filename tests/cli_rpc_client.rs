@@ -306,8 +306,41 @@ async fn pending_nonce_discovery_counts_only_signed_rows_and_is_bounded() {
         node::PendingNonce {
             nonce: 5,
             account_nonce: 3,
-            pending: 2
+            pending: Some(2)
         }
+    );
+
+    // An endpoint that reports its pending nonce is not scanned, so no raw
+    // pending record of any governed size is downloaded.
+    let reporting = mock(Duration::ZERO, |method, _| match method {
+        "account" => result(json!({"account":{"nonce":3},"pending_nonce":7})),
+        _ => http("500 Internal Server Error", "", b""),
+    })
+    .await;
+    assert_eq!(
+        RpcClient::new(&reporting.url(), false)
+            .unwrap()
+            .pending_nonce(&sender, ScanBudget::DEFAULT)
+            .await
+            .unwrap(),
+        node::PendingNonce {
+            nonce: 7,
+            account_nonce: 3,
+            pending: None
+        }
+    );
+    assert_eq!(reporting.methods(), ["account"]);
+    // A reported pending nonce below the account nonce is refused.
+    let behind = mock(Duration::ZERO, |_, _| {
+        result(json!({"account":{"nonce":3},"pending_nonce":2}))
+    })
+    .await;
+    assert!(
+        RpcClient::new(&behind.url(), false)
+            .unwrap()
+            .pending_nonce(&sender, ScanBudget::DEFAULT)
+            .await
+            .is_err()
     );
 
     // Unsigned or forged rows cannot raise the nonce.
@@ -685,7 +718,7 @@ mod funded {
             format!("Fee: {} atoms", transaction.body.fee),
             "account creation 2048 atoms".into(),
             "ceiling 100000 atoms".into(),
-            "Nonce source: account nonce 0 reported by the endpoint, after 0 signed pending".into(),
+            "Nonce source: account nonce 0 reported by the endpoint, pending nonce 0".into(),
             format!("Network context · unsigned: {}", hex::encode(chain_id)),
         ] {
             assert!(review.contains(&expected), "{expected} missing from {review}");
@@ -718,7 +751,10 @@ mod funded {
         assert!(!wrong.status.success());
         assert!(!directory.path().join("wrong.json").exists());
         let (_, review) = successful(&cli(&prepare("next.json", &[]), &[]).await);
-        assert!(review.contains("after 1 signed pending transaction(s)"), "{review}");
+        assert!(
+            review.contains("account nonce 0 reported by the endpoint, pending nonce 1"),
+            "{review}"
+        );
         let envelope =
             serde_json::from_slice(&std::fs::read(directory.path().join("next.json")).unwrap())
                 .unwrap();

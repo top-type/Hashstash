@@ -127,7 +127,7 @@ Preparation fills the next available nonce, exact total fee, operation, data, cu
 The CLI `send`, `transfer` and `prepare` commands check every prepared field against their request and print a review to stderr before signing or saving; stdout stays machine-readable. The endpoint still reports the fee rate, account nonce, anchor and network, so the CLI limits what it accepts:
 
 - An automatic fee may exceed the requested extra by at most 1,000 atoms (1 hash). `--max-fee` sets a different ceiling for the total; an exact `--fee` needs none.
-- Without `--nonce`, the CLI starts from the endpoint's account nonce, raises it past the sender's signature-checked pending transactions, and requires the node to use that nonce. The review shows both.
+- Without `--nonce`, the CLI uses the endpoint's reported `pending_nonce`, so it downloads no raw pending records. An endpoint that does not report one is scanned instead: the CLI starts from its account nonce and raises it past the sender's signature-checked pending transactions. Either way the CLI requires the node to use that nonce, and the review shows the chosen nonce and the reported account nonce.
 - Plain `http://` is accepted only for loopback IP addresses. Use `https://` for a remote endpoint, or pass `--insecure-http` to accept replies that anyone on the path can forge. Environment proxies and redirects are never followed.
 - A non-loopback `--url` also requires `--config` or `--chain-id`, and the endpoint must report that network. Anchor ancestry is still established only by validating nodes.
 

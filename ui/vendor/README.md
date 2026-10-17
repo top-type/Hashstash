@@ -8,10 +8,15 @@ key validation, SHA256 and x-only ECDH for encrypted mail. Both libraries use th
 Sources: https://github.com/paulmillr/noble-curves and
 https://github.com/paulmillr/noble-hashes. Registry package integrity hashes are
 locked in `scripts/browser-crypto/pnpm-lock.yaml`. `noble.sha256` identifies the
-committed generated asset.
+committed generated asset, but the build rewrites it, so it is not a check on
+its own. `scripts/test_vendor_integrity.cjs` (part of the frontend suite) pins
+the reviewed SHA-256 of `noble.js` separately from the build output; any change
+to the bundle must also change that pin in review.
 
 Rebuild with Node.js and pnpm: in `scripts/browser-crypto`, run
-`pnpm install --frozen-lockfile`, then `pnpm build`. Run
+`pnpm install --frozen-lockfile`, then `pnpm build`. `pnpm run check` rebuilds
+into a temporary directory and fails unless every committed vendor file matches
+the clean build byte for byte. Run
 `node scripts/test_browser_wallet.cjs` from the repository root for official
 BIP340 vectors, Rust transaction/address vectors and wallet isolation checks.
 

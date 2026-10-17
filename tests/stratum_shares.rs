@@ -465,6 +465,43 @@ async fn mining_endpoint_metadata_does_not_expose_password_or_wildcard_url() {
     server.stop().await;
 }
 
+#[tokio::test]
+async fn non_loopback_stratum_listener_requires_a_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = Node::open(
+        &dir.path().join("node.db"),
+        Config::devnet(),
+        crypto::public_key(&[44; 32]).unwrap(),
+    )
+    .unwrap();
+    // An open public listener would let anyone authorize and hold every worker slot.
+    for (address, password) in [
+        ("0.0.0.0:0", None),
+        ("[::]:0", None),
+        ("0.0.0.0:0", Some("")),
+    ] {
+        let mut opts = options(65536.0);
+        opts.stratum = address.parse().unwrap();
+        opts.stratum_password = password.map(str::to_owned);
+        let error = node::serve(n.clone(), opts).await.err().unwrap();
+        assert!(error.to_string().contains("requires a password"), "{error}");
+    }
+    let mut opts = options(65536.0);
+    opts.stratum = "0.0.0.0:0".parse().unwrap();
+    opts.stratum_enabled = false;
+    node::serve(n.clone(), opts).await.unwrap().stop().await;
+    let mut opts = options(65536.0);
+    opts.stratum = "0.0.0.0:0".parse().unwrap();
+    opts.stratum_password = Some("public-mining-password".into());
+    node::serve(n.clone(), opts).await.unwrap().stop().await;
+    // Loopback remains open by default for local miners and proxies.
+    node::serve(n.clone(), options(65536.0))
+        .await
+        .unwrap()
+        .stop()
+        .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn canonical_work_jobs_reject_losing_work_and_pay_only_the_winning_chain() {
     let dir = tempfile::tempdir().unwrap();

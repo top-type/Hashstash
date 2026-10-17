@@ -2262,6 +2262,17 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
     );
     let lease = ServerLease(node.server_active.clone());
     validate_stratum_difficulty(options.stratum_share_difficulty)?;
+    // Without a password anyone reaching the listener could authorize and hold
+    // every worker slot indefinitely; only a loopback listener may run open.
+    ensure!(
+        !options.stratum_enabled
+            || options.stratum.ip().is_loopback()
+            || options
+                .stratum_password
+                .as_deref()
+                .is_some_and(|p| !p.is_empty()),
+        "a non-loopback Stratum listener requires a password"
+    );
     let advertised = options
         .stratum_advertise
         .as_deref()
@@ -2396,7 +2407,13 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
         let password = options.stratum_password.clone();
         let share_difficulty = options.stratum_share_difficulty;
         let mut shutdown = rx.clone();
-        let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        // A Stratum connection holds its slot only until authorization, so
+        // unauthenticated sockets cannot occupy the authorized worker capacity.
+        let limit = Arc::new(Semaphore::new(if kind == 2 {
+            MAX_STRATUM_PENDING
+        } else {
+            MAX_CONNECTIONS
+        }));
         let extranonces = if kind == 2 {
             node.mining_session_ids.clone()
         } else {
@@ -2431,9 +2448,9 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
                     let node = n.clone(); let password = password.clone(); let http=http.clone();
                     let next = extranonces.fetch_add(1, Ordering::Relaxed);
                     let Ok(extranonce) = u32::try_from(next) else { drop(stream); continue };
-                    clients.spawn(async move { let _permit = permit; let _large = large; let _ = stream.set_nodelay(true);
+                    clients.spawn(async move { let mut permit = Some(permit); let _large = large; let _ = stream.set_nodelay(true);
                         let reporter = node.clone();
-                        let result = match kind { 0|3 => http_session(node, stream, http, admission).await, 1 => peer_session(node, stream, admission).await, _ => stratum_session(node, stream, password, share_difficulty, extranonce.to_le_bytes(), admission).await };
+                        let result = match kind { 0|3 => http_session(node, stream, http, admission).await, 1 => peer_session(node, stream, admission).await, _ => stratum_session(node, stream, password, share_difficulty, extranonce.to_le_bytes(), admission, permit.take()).await };
                         // Peer data is untrusted; individual failures close only that connection.
                         if result.is_err() { reporter.peer_event(format!("inbound/{kind}/{address}"), &result); }
                     });
@@ -4071,6 +4088,18 @@ fn stratum_submit_version(
     ensure!(bits & !mask == 0, "version bits outside negotiated mask");
     Ok((job_version & !mask) | bits)
 }
+/// Jobs retained per Stratum connection while its parent remains the tip.
+const MAX_STRATUM_JOBS: usize = 8;
+/// Same-parent template changes reach a connection at most once per interval,
+/// so a retained job survives at least MAX_STRATUM_JOBS intervals of churn.
+const STRATUM_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// Connections awaiting authorization. Authorized workers leave this pool and
+/// are bounded separately by the MAX_CONNECTIONS worker registry.
+const MAX_STRATUM_PENDING: usize = 2 * MAX_CONNECTIONS;
+const STRATUM_AUTHORIZATION_WINDOW: Duration = Duration::from_secs(10);
+/// Accepted reporting shares per window that double a connection's difficulty.
+const STRATUM_WINDOW_SHARES: u32 = 16;
+const STRATUM_SHARE_WINDOW: Duration = Duration::from_secs(8);
 async fn new_job<W: AsyncWrite + Unpin>(
     node: &Node,
     write: &mut W,
@@ -4085,12 +4114,18 @@ async fn new_job<W: AsyncWrite + Unpin>(
         .iter()
         .max_by_key(|(id, _)| *id)
         .is_some_and(|(_, old)| old.block.header.previous != block.header.previous);
-    let clean = parent_changed || jobs.is_empty() || jobs.len() >= 8;
+    let clean = parent_changed || jobs.is_empty();
     if parent_changed {
         seen.clear();
     }
     if clean {
         jobs.clear();
+    } else if jobs.len() >= MAX_STRATUM_JOBS {
+        // Same-parent work remains valid. Retire only the oldest job (IDs are
+        // fixed-width counters) instead of flushing work still in flight.
+        if let Some(oldest) = jobs.keys().min().cloned() {
+            jobs.remove(&oldest);
+        }
     }
     *counter = counter.checked_add(1).context("job counter exhausted")?;
     let id = format!("{counter:016x}");
@@ -4127,7 +4162,7 @@ async fn template_async(node: &Node) -> Result<Arc<Block>> {
     .context("mining template worker failed")?
 }
 fn stratum_session_expired(authorized: bool, connected: Duration) -> bool {
-    !authorized && connected >= Duration::from_secs(30)
+    !authorized && connected >= STRATUM_AUTHORIZATION_WINDOW
 }
 fn disconnected_between_frames(error: &anyhow::Error, partial: &[u8]) -> bool {
     partial.is_empty()
@@ -4149,6 +4184,7 @@ async fn stratum_session(
     floor: f64,
     extra: [u8; 4],
     admission: Session,
+    mut pending: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<()> {
     let admission = Arc::new(admission);
     let (read, mut write) = stream.into_split();
@@ -4165,7 +4201,10 @@ async fn stratum_session(
     let mut jobs: HashMap<String, Arc<StratumJob>> = HashMap::new();
     let mut seen = HashMap::<Hash, Hash>::new();
     let mut counter = 0;
-    let mut fingerprint = None;
+    let mut fingerprint: Option<(Hash, Hash)> = None;
+    let mut deferred = false;
+    let mut window_started = tokio::time::Instant::now();
+    let mut window_shares = 0u32;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut updates = node.work_updates.subscribe();
     let connected = tokio::time::Instant::now();
@@ -4183,13 +4222,17 @@ async fn stratum_session(
                 admission.request()?;
                 admission.bytes(line.len())?;
                 let request = match parse_value_async(&node,line,Surface::Stratum,JsonBody::Ordinary).await { Ok(v) => v, Err(e) => { admission.malformed(); return Err(e); } };
-                ensure!(!stratum_session_expired(authorized,connected.elapsed()), "mining authorization timed out");
+                // An expired, never-authorized connection penalizes its address,
+                // so idle sockets cannot hold connection slots at no cost.
+                if stratum_session_expired(authorized,connected.elapsed()) { admission.malformed(); bail!("mining authorization timed out"); }
                 partial_since = None;
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
                 let method = request.get("method").and_then(Value::as_str).unwrap_or("");
                 let params = request.get("params").and_then(Value::as_array).cloned().unwrap_or_default();
                 let mut submission = None;
                 let mut refresh = false;
+                let mut at_capacity = false;
+                let mut budget = None;
                 let mut result: Result<Value> = (|| {
                     match method {
                         "mining.configure" => {
@@ -4240,17 +4283,22 @@ async fn stratum_session(
                             ensure!(!authorized,"worker already authorized");
                             let name = params.first().and_then(Value::as_str).context("worker name required")?;
                             ensure!(!name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_control), "invalid worker name");
-                            authorized = password.as_ref().is_none_or(|p|params.get(1).and_then(Value::as_str)==Some(p.as_str()));
-                            if authorized {
-                                worker = name.to_owned();
-                                let identity = u32::from_le_bytes(extra);
-                                let mut runtime = node.mining.lock().map_err(|_|anyhow!("mining statistics lock poisoned"))?;
-                                ensure!(runtime.workers.len() < MAX_CONNECTIONS, "mining worker capacity reached");
-                                runtime.workers.insert(identity,MiningWorker {worker:worker.clone(),accepted:0,rejected:0,blocks:0,difficulty,last_share:None});
-                                registration = Some(MiningConnection {runtime:node.mining.clone(),id:identity});
-                                refresh = true;
+                            // Same comparison as the HTTP session token: no early exit on content.
+                            if !password.as_deref().is_none_or(|p|token_matches(params.get(1).and_then(Value::as_str),p)) {
+                                return Ok(json!(false));
                             }
-                            Ok(json!(authorized))
+                            let identity = u32::from_le_bytes(extra);
+                            let mut runtime = node.mining.lock().map_err(|_|anyhow!("mining statistics lock poisoned"))?;
+                            if runtime.workers.len() >= MAX_CONNECTIONS { at_capacity = true; bail!("mining worker capacity reached"); }
+                            runtime.workers.insert(identity,MiningWorker {worker:name.to_owned(),accepted:0,rejected:0,blocks:0,difficulty,last_share:None});
+                            registration = Some(MiningConnection {runtime:node.mining.clone(),id:identity});
+                            // Authorize only once registered. The worker registry now
+                            // bounds this session; free its pre-authorization slot.
+                            worker = name.to_owned();
+                            authorized = true;
+                            drop(pending.take());
+                            refresh = true;
+                            Ok(json!(true))
                         }
                         "mining.extranonce.subscribe" => Ok(json!(true)),
                         "mining.suggest_difficulty" => {
@@ -4279,14 +4327,10 @@ async fn stratum_session(
                     }
                 })();
                 if let Some((job,extra2,timestamp,nonce,version)) = submission {
-                    let permit = timeout(IO_TIMEOUT,node.stratum_workers.clone().acquire_owned()).await??;
-                    let source = job.clone();
-                    let (header,hash) = tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
-                        let header = source.candidate(extra,extra2,timestamp,nonce,version);
-                        let hash = crypto::sha256d(&codec::header_bytes(&header));
-                        (header,hash)
-                    }).await.context("mining proof worker failed")?;
+                    // One fixed-size coinbase and header hash: computing it here
+                    // avoids a worker queue that could time out on a found block.
+                    let header = job.candidate(extra,extra2,timestamp,nonce,version);
+                    let hash = crypto::sha256d(&codec::header_bytes(&header));
                     let candidate = (|| -> Result<(Option<Amount>,bool)> {
                         if seen.contains_key(&hash) { return Err(mining_error(22,"duplicate share")); }
                         let view = node.read_view()?;
@@ -4305,9 +4349,13 @@ async fn stratum_session(
                         Err(error) => Err(error),
                         Ok((work,is_block)) => {
                             let submitted_parent = job.block.header.previous;
+                            let assigned = job.difficulty;
                             let accepted = if is_block {
-                                admission.work(job.block.transactions.len())?;
-                                let permit = timeout(IO_TIMEOUT,node.stratum_workers.clone().acquire_owned()).await??;
+                                // Budgets and worker queues may delay a solved block but
+                                // never discard it: validate first, enforce the budget after.
+                                budget = admission.work(job.block.transactions.len()).err();
+                                // The worker semaphore is never closed; wait without a deadline.
+                                let permit = node.stratum_workers.clone().acquire_owned().await.ok();
                                 let validator = node.clone();
                                 tokio::task::spawn_blocking(move || -> Result<()> {
                                     let _permit = permit;
@@ -4316,14 +4364,29 @@ async fn stratum_session(
                                     block.header = header;
                                     block.extranonce[..4].copy_from_slice(&extra);
                                     block.extranonce[4..].copy_from_slice(&extra2);
-                                    validator.submit_block(block)?;
-                                    Ok(())
-                                }).await.context("mining block worker failed")?
+                                    // A valid block that did not become the tip lost a race
+                                    // with a competing child of the same parent.
+                                    if validator.submit_block(block)? { Ok(()) } else { Err(mining_error(21,"stale job")) }
+                                }).await.unwrap_or_else(|_| Err(anyhow!("mining block worker failed")))
                             } else { Ok(()) };
                             accepted.map(|()| {
                                 seen.insert(hash, submitted_parent);
                                 if let Ok(mut stats) = node.mining.lock() { stats.submission(registration.as_ref().map(|r|r.id),Some((work.as_ref(),is_block))); }
                                 refresh |= is_block;
+                                // Raise a fast reporting stream's difficulty instead of
+                                // letting it reach the session request limit. A job capped
+                                // at network difficulty cannot be raised further.
+                                if work.is_some() {
+                                    if window_started.elapsed() >= STRATUM_SHARE_WINDOW { window_started = tokio::time::Instant::now(); window_shares = 0; }
+                                    window_shares += 1;
+                                    let next = (assigned * 2.0).min(1e18);
+                                    if window_shares >= STRATUM_WINDOW_SHARES && next > difficulty {
+                                        difficulty = next;
+                                        refresh = true;
+                                        window_started = tokio::time::Instant::now();
+                                        window_shares = 0;
+                                    }
+                                }
                                 json!(true)
                             })
                         }
@@ -4337,27 +4400,48 @@ async fn stratum_session(
                     Err(e) => { let code=e.downcast_ref::<StratumError>().map_or(20,|error|error.0); json!({"id":id,"result":null,"error":[code,e.to_string(),null]}) }
                 };
                 write_json(&mut write,&response).await?;
+                // A full worker registry is capacity, not misbehaviour.
+                if denied && at_capacity { bail!("mining worker capacity reached"); }
                 if denied { admission.malformed(); bail!("mining authorization denied"); }
+                if let Some(error) = budget { return Err(error); }
                 // Never evict duplicate evidence while the parent remains valid.
                 // A fresh connection gets a different extranonce and new work.
                 ensure!(seen.len()<MAX_SUBMITTED_HEADERS,"share history capacity reached; reconnect");
                 if successful && authorized && refresh {
                     fingerprint=Some(new_job(&node,&mut write,&mut jobs,&mut counter,difficulty,&mut seen,u32::from_le_bytes(extra)).await?);
                     last_job=tokio::time::Instant::now();
+                    deferred = false;
                 }
             }
             changed = updates.changed() => {
                 changed.context("mining update channel closed")?;
                 if authorized {
-                    let block=template_async(&node).await?;
-                    if fingerprint!=Some((block.header.previous,block.header.merkle_root)) {
-                        fingerprint=Some(new_job(&node,&mut write,&mut jobs,&mut counter,difficulty,&mut seen,u32::from_le_bytes(extra)).await?);
-                        last_job=tokio::time::Instant::now();
+                    // A new tip replaces work at once. Same-parent template changes
+                    // are coalesced so transaction churn cannot retire retained
+                    // jobs faster than one per STRATUM_REFRESH_INTERVAL.
+                    let tip = node.read_view()?.chain.tip_hash();
+                    if fingerprint.is_some_and(|(parent,_)| parent == tip) && last_job.elapsed() < STRATUM_REFRESH_INTERVAL {
+                        deferred = true;
+                    } else {
+                        deferred = false;
+                        let block=template_async(&node).await?;
+                        if fingerprint!=Some((block.header.previous,block.header.merkle_root)) {
+                            fingerprint=Some(new_job(&node,&mut write,&mut jobs,&mut counter,difficulty,&mut seen,u32::from_le_bytes(extra)).await?);
+                            last_job=tokio::time::Instant::now();
+                        }
                     }
                 }
             }
+            _ = tokio::time::sleep_until(last_job + STRATUM_REFRESH_INTERVAL), if deferred => {
+                deferred = false;
+                let block=template_async(&node).await?;
+                if fingerprint!=Some((block.header.previous,block.header.merkle_root)) {
+                    fingerprint=Some(new_job(&node,&mut write,&mut jobs,&mut counter,difficulty,&mut seen,u32::from_le_bytes(extra)).await?);
+                    last_job=tokio::time::Instant::now();
+                }
+            }
             _ = tick.tick() => {
-                ensure!(!stratum_session_expired(authorized,connected.elapsed()),"mining authorization timed out");
+                if stratum_session_expired(authorized,connected.elapsed()) { admission.malformed(); bail!("mining authorization timed out"); }
                 if !partial_line.is_empty() { let began=partial_since.get_or_insert_with(tokio::time::Instant::now); ensure!(began.elapsed()<IO_TIMEOUT,"mining partial frame timed out"); }
                 if authorized && last_job.elapsed()>=Duration::from_secs(30) {
                     fingerprint=Some(new_job(&node,&mut write,&mut jobs,&mut counter,difficulty,&mut seen,u32::from_le_bytes(extra)).await?);
@@ -5671,6 +5755,7 @@ mod tests {
                 DEFAULT_STRATUM_SHARE_DIFFICULTY,
                 id.to_le_bytes(),
                 admission,
+                None,
             ));
             let (read, mut write) = client.into_split();
             let mut read = BufReader::new(read);
@@ -5716,6 +5801,115 @@ mod tests {
             assert_eq!(node.mining_status().unwrap()["workers_connected"], 0);
         }
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn solved_block_waits_for_busy_mining_workers_instead_of_being_dropped() {
+        async fn message<R: AsyncBufRead + Unpin>(read: &mut R) -> Value {
+            let line = timeout(Duration::from_secs(10), bounded_line(read, 16384))
+                .await
+                .expect("mining session stopped responding")
+                .expect("mining session closed");
+            serde_json::from_slice(&line).unwrap()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(
+            &dir.path().join("node.db"),
+            Config::devnet(),
+            crypto::public_key(&[45; 32]).unwrap(),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        let admission = node.guard.admit(peer.ip(), Surface::Stratum).unwrap();
+        let extra1 = 9u32.to_le_bytes();
+        let session = tokio::spawn(stratum_session(
+            node.clone(),
+            server,
+            None,
+            DEFAULT_STRATUM_SHARE_DIFFICULTY,
+            extra1,
+            admission,
+            None,
+        ));
+        let (read, mut write) = client.into_split();
+        let mut read = BufReader::new(read);
+        for (id, method, params) in [
+            (1, "mining.subscribe", json!([])),
+            (2, "mining.authorize", json!(["patient.worker", "x"])),
+        ] {
+            write_json(&mut write, &json!({"id":id,"method":method,"params":params}))
+                .await
+                .unwrap();
+        }
+        let job = loop {
+            let value = message(&mut read).await;
+            assert!(value["error"].is_null(), "{value}");
+            if value["method"] == "mining.notify" {
+                break value;
+            }
+        };
+        let p = &job["params"];
+        let word = |value: &Value| u32::from_str_radix(value.as_str().unwrap(), 16).unwrap();
+        let extra2 = [7u8; 4];
+        let mut coinbase = hex::decode(p[2].as_str().unwrap()).unwrap();
+        coinbase.extend(extra1);
+        coinbase.extend(extra2);
+        coinbase.extend(hex::decode(p[3].as_str().unwrap()).unwrap());
+        let mut previous: Hash = hex::decode(p[1].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        for chunk in previous.chunks_exact_mut(4) {
+            chunk.reverse();
+        }
+        let mut header = Header {
+            version: word(&p[5]),
+            previous,
+            merkle_root: crypto::sha256d(&coinbase),
+            timestamp: word(&p[7]),
+            bits: word(&p[6]),
+            nonce: 0,
+        };
+        let target = math::target_from_bits(header.bits).unwrap();
+        while math::check_pow(&header, &target).is_err() {
+            header.nonce += 1;
+        }
+        // Occupy every mining worker for longer than the I/O timeout. The
+        // solution must wait for capacity rather than end the session.
+        let held = node
+            .stratum_workers
+            .clone()
+            .acquire_many_owned(2)
+            .await
+            .unwrap();
+        write_json(
+            &mut write,
+            &json!({"id":3,"method":"mining.submit","params":["patient.worker",p[0],hex::encode(extra2),format!("{:08x}",header.timestamp),format!("{:08x}",header.nonce)]}),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(IO_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(!session.is_finished(), "busy workers ended the session");
+        assert_eq!(node.status().unwrap()["height"], 0);
+        drop(held);
+        let reply = loop {
+            let value = message(&mut read).await;
+            if value["id"] == 3 {
+                break value;
+            }
+        };
+        assert_eq!(reply["result"], true, "{reply}");
+        assert_eq!(node.status().unwrap()["height"], 1);
+        assert_eq!(node.mining_status().unwrap()["blocks_found"], "1");
+        write.shutdown().await.unwrap();
+        timeout(Duration::from_secs(5), session)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
     #[test]
     fn canonical_rpc_amounts() {
         assert!(parse_amount("01").is_err());
@@ -5728,8 +5922,8 @@ mod tests {
             true,
             Duration::from_secs(24 * 60 * 60)
         ));
-        assert!(stratum_session_expired(false, Duration::from_secs(30)));
-        assert!(!stratum_session_expired(false, Duration::from_secs(29)));
+        assert!(stratum_session_expired(false, Duration::from_secs(10)));
+        assert!(!stratum_session_expired(false, Duration::from_secs(9)));
     }
     #[test]
     fn peer_parser_accepts_large_binary_body_with_configured_record_limits() {

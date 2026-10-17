@@ -100,8 +100,8 @@ fn adversarial_depth_operations_run_on_a_small_stack() {
             assert_eq!(map.root(), canonical);
 
             // Snapshots restore, compare and format the same shape.
-            let restored: Map<u64> =
-                codec::decode(&codec::encode(&original), usize::MAX).unwrap();
+            let bytes = codec::encode(&original);
+            let restored: Map<u64> = codec::decode(&bytes, bytes.len()).unwrap();
             assert_eq!(restored.root(), canonical);
             assert_eq!(restored, original);
             assert_eq!(restored.proof(deepest).unwrap().path.len(), DEPTH);
@@ -130,9 +130,9 @@ fn reworked_operations_keep_original_commitments() {
     for n in (0..700u32).step_by(3) {
         removed.remove(&n.to_be_bytes());
     }
-    let roots = [ordered.root(), removed.root(), build(keys(), true).root()].map(hex::encode);
+    let roots = [ordered.root(), removed.root(), build(keys(), true).root()];
     assert_eq!(
-        roots,
+        roots.map(hex::encode),
         [
             "6cb7cc0acfa7dee8cf9df7380db885edbfae3d3791c650e2c9084bae2d57b33c",
             "1c8baa62454c4c58f5a2eff559b2cc985268d1a6b386731ebe35415aa0628eb6",

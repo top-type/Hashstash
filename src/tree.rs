@@ -572,10 +572,7 @@ mod tests {
         next.insert(key(87), 999);
         let (old_root, new_root) = (original.node.as_ref(), next.node.as_ref());
         assert!(!Arc::ptr_eq(old_root.unwrap(), new_root.unwrap()));
-        assert!(Arc::ptr_eq(
-            &old_root.unwrap().value,
-            &new_root.unwrap().value
-        ));
+        assert!(Arc::ptr_eq(&old_root.unwrap().value, &new_root.unwrap().value));
         assert!(std::ptr::eq(
             original.get(&root_key).unwrap(),
             next.get(&root_key).unwrap()
@@ -585,7 +582,10 @@ mod tests {
             original.get(&root_key).unwrap(),
             next.get(&root_key).unwrap()
         ));
-        assert_eq!(format!("{:?}", populated(1..3)), "{[0, 0, 0, 1]: 3, [0, 0, 0, 2]: 6}");
+        assert_eq!(
+            format!("{:?}", populated(1..3)),
+            "{[0, 0, 0, 1]: 3, [0, 0, 0, 2]: 6}"
+        );
     }
 
     #[test]

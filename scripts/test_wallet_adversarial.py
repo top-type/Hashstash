@@ -78,11 +78,12 @@ def main():
         base = start(node, ['run', '--config', config, '--data', directory / 'chain.sqlite', '--miner', primary['public_key'], '--watch-key', primary['public_key'], '--rpc', f'127.0.0.1:{args.base_port}', '--p2p', f'127.0.0.1:{args.base_port + 1}', '--stratum', f'127.0.0.1:{args.base_port + 2}'], 'node', 'RPC: (http://127\\.0\\.0\\.1:\\d+)/rpc')
         # Above the 64 MiB default, so the configurable review limit is exercised below.
         review_limit = 2 * 32 * 1024 * 1024 + 128 * 1024
-        cold_base = start(signer, ['--port', args.base_port + 3, '--config', config, '--max-review-bytes', review_limit + 64 * 1024], 'cold', 'cold signer: (http://127\\.0\\.0\\.1:\\d+)/')
+        # The session token is only in the printed launch URL, never served.
+        cold_base, token = start(signer, ['--port', args.base_port + 3, '--config', config, '--max-review-bytes', review_limit + 64 * 1024], 'cold', 'cold signer: (http://127\\.0\\.0\\.1:\\d+/#token=[0-9a-f]{64})').split('/#token=')
         status = rpc(base, 'status')
         assert status['time_unit'] == 'seconds'
         check('Adversarial wallet fixture uses canonical-only mining and immediate reserve-grant funding consensus')
-        token = request(cold_base, '/api/session')[1]['token']
+        assert 'token' not in request(cold_base, '/api/session')[1]
 
         def cold(action, value=None, expected=200):
             code, result = request(cold_base, '/api/' + action, {} if value is None else value, token)

@@ -7,7 +7,8 @@ const shares = require('../ui/shares.js');
 const amounts = require('../ui/amounts.js');
 const html = fs.readFileSync(path.join(__dirname,'../cold-ui/index.html'),'utf8');
 const source = fs.readFileSync(path.join(__dirname,'../cold-ui/app.js'),'utf8');
-const publicKey = 'ab'.repeat(32), privateKey = 'cd'.repeat(32);
+const publicKey = 'ab'.repeat(32), privateKey = 'cd'.repeat(32), sessionToken = 'ef'.repeat(32);
+const tabStorage = () => { const values = new Map(); return {getItem:name=>values.has(name)?values.get(name):null,setItem(name,value){values.set(name,String(value));}}; };
 const chainA = '09'.repeat(32), chainB = '10'.repeat(32);
 const addressFor = chain => 'hsh' + chain.slice(0,16) + '1' + 'q'.repeat(58);
 const settle = async () => { for(let index=0;index<50;index++) await Promise.resolve(); };
@@ -30,21 +31,29 @@ async function harness(initialChain = null, maxReview = undefined, server = {}) 
   const review = {fields:null,error:null,body:'abcdef',confirmLifetime:false,maxReview};
   // Mirrors the signer: v2 keys need and belong to the selected network, and
   // reviews never adopt the export's unsigned network context.
-  let serverPublic = server.public ?? null, serverChain = initialChain, derivedFor = null, backupPending = !!server.backupPending;
+  let serverPublic = server.public ?? null, serverChain = initialChain, derivedFor = null, backupPending = !!server.backupPending, idleLocked = false;
   const backup = {format:'hashstash-private-v1',private_key:privateKey,public_key:publicKey};
-  const status = () => ({public_key:serverPublic,chain_id:serverChain,address:serverPublic && serverChain ? addressFor(serverChain) : null,backup_pending:backupPending,
+  const status = () => ({public_key:serverPublic,chain_id:serverChain,address:serverPublic && serverChain ? addressFor(serverChain) : null,backup_pending:backupPending,idle_locked:idleLocked,
     watch:!serverPublic ? null : serverChain ? {format:'hashstash-watch-v2',public_key:serverPublic,chain_id:serverChain,address:addressFor(serverChain)} : {format:'hashstash-watch-v1',public_key:serverPublic}});
   const refuse = error => ({ok:false,json:async()=>({error})});
+  // The session token arrives only in the launch URL fragment.
+  const location = {hash:server.launch ?? `#token=${sessionToken}`,pathname:'/',search:''}, replaced = [], storage = server.storage || tabStorage();
   const context = {
     HashstashShares:shares,
     HashstashAmounts:amounts,
     TextDecoder,
+    location,
+    history:{replaceState(state,title,url){replaced.push(url);location.hash='';}},
+    sessionStorage:storage,
     document:{getElementById:get,querySelectorAll:()=>[...elements.values()],createDocumentFragment:()=>new Element(),createElement:()=>Object.assign(new Element(),{click(){downloads.push({name:this.download,blob:blobs.get(this.href)});}})},
     navigator:{clipboard:{writeText:async text=>copied.push(text)}},setTimeout(){},Blob,
     URL:{createObjectURL(blob){const id='blob:'+blobs.size;blobs.set(id,blob);return id;},revokeObjectURL(){}},
     async fetch(url,options={}) {
       const body = options.body ? JSON.parse(options.body) : null;
       calls.push({url,body,options});
+      if(url!=='/api/session' && options.headers?.['X-Hashstash-Cold-Token']!==sessionToken) return {ok:false,status:403,json:async()=>({error:'Local session required'})};
+      if(['/api/unlock','/api/import','/api/generate','/api/lock'].includes(url)) idleLocked=false;
+      if(url==='/api/review' && idleLocked) return refuse('Wallet locked after a period without use; open it again');
       if(url==='/api/review' && review.error) return refuse(review.error);
       if(url==='/api/unlock') {
         if(body.scheme==='hashstash-passphrase-v2') { if(!serverChain) return refuse('Select the network first'); derivedFor=serverChain; }
@@ -65,7 +74,7 @@ async function harness(initialChain = null, maxReview = undefined, server = {}) 
         if (body?.format!=='hashstash-unsigned-anchor'||!/^[0-9a-f]{64}$/.test(body.chain_id||'')||serverChain!==body.chain_id)return refuse('Unsigned network context does not match the selected network');
       }
       if(url==='/api/sign' && review.confirmLifetime && body.confirm_lifetime!==true) return refuse('Confirm the long transaction lifetime before signing');
-      const data = url === '/api/session' ? {token:'token',max_review_bytes:review.maxReview,...status()} :
+      const data = url === '/api/session' ? {format:'hashstash-cold-v1',max_review_bytes:review.maxReview,idle_lock_seconds:300,...status()} :
         ['/api/unlock','/api/import','/api/network','/api/lock','/api/backup'].includes(url) ? status() :
         url === '/api/generate' ? {...status(),backup} :
         url === '/api/review' ? {...status(),review_token:'review-token',body:review.body,confirm_lifetime:review.confirmLifetime,fields:review.fields || [{label:'Sender',value:addressFor(serverChain)}]} :
@@ -74,10 +83,50 @@ async function harness(initialChain = null, maxReview = undefined, server = {}) 
     }
   };
   vm.runInNewContext(source,context); await settle();
-  return {get,calls,copied,downloads,review};
+  // The signer locks a wallet left unused for its idle period.
+  const idle = () => { if (serverPublic) { serverPublic = null; derivedFor = null; idleLocked = true; } };
+  return {get,calls,copied,downloads,review,location,replaced,storage,idle};
 }
 async function run() {
   let checks=0;
+  {
+    // The token is taken from the launch fragment, which then leaves the
+    // address bar; the session endpoint never carries it.
+    const h=await harness(chainA);
+    assert.equal(h.location.hash,'');checks++;
+    assert.deepEqual(h.replaced,['/']);checks++;
+    assert.equal(h.get('idle-lock-hint').textContent,' An open wallet locks after 5 minutes without use.');checks++;
+    h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
+    assert.equal(h.calls.find(call=>call.url==='/api/unlock').options.headers['X-Hashstash-Cold-Token'],sessionToken);checks++;
+    assert.equal(h.get('wallet').hidden,false);checks++;
+    // A reload of the same tab keeps its session without a fragment.
+    const reloaded=await harness(chainA,undefined,{launch:'',storage:h.storage});
+    reloaded.get('passphrase').value='test';await reloaded.get('unlock-form').fire('submit');
+    assert.equal(reloaded.get('wallet').hidden,false,'a reloaded tab reuses its launch session');checks++;
+    // A page opened without its launch URL explains where the session comes from.
+    const orphan=await harness(chainA,undefined,{launch:'#token=bad'});
+    assert.match(orphan.get('message').textContent,/Open the address the signer printed/);checks++;
+    orphan.get('passphrase').value='test';await orphan.get('unlock-form').fire('submit');
+    assert.match(orphan.get('message').textContent,/no signer session/);checks++;
+    assert.equal(orphan.get('wallet').hidden,true);checks++;
+  }
+  {
+    // A wallet the signer locked for inactivity stops being shown.
+    const h=await harness(chainA);h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
+    h.idle();
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
+    await h.get('review-form').fire('submit');
+    assert.match(h.get('message').textContent,/locked after a period without use/);checks++;
+    assert.equal(h.get('wallet').hidden,true);checks++;
+    assert.equal(h.get('unlock-panel').hidden,false);checks++;
+    // Selecting a network after the idle lock names the right reason.
+    h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
+    h.idle();
+    await h.get('network-change').fire('click');
+    h.get('network-chain').value=chainB;await h.get('network-form').fire('submit');
+    assert.match(h.get('message').textContent,/locked after a period without use/);checks++;
+    assert.equal(h.get('wallet').hidden,true);checks++;
+  }
   {
     const h=await harness();
     assert.equal(h.get('copy-address').disabled,true);checks++;

@@ -114,9 +114,10 @@ def main():
         envelope_file = directory / 'unsigned.json'
         cli('prepare', '--url', url, '--sender', addresses[1], '--operation-file', operation, '--out', envelope_file)
         envelope = json.loads(envelope_file.read_text())
-        cold = start(args.cold, ['--port', '0', '--config', config], 'cold', 'cold signer: (http://127\\.0\\.0\\.1:\\d+)')
+        # The session token is only in the printed launch URL, never served.
+        cold, token = start(args.cold, ['--port', '0', '--config', config], 'cold', 'cold signer: (http://127\\.0\\.0\\.1:\\d+/#token=[0-9a-f]{64})').split('/#token=')
         cold_session = request(cold, '/api/session')[1]
-        token = cold_session['token']
+        assert 'token' not in cold_session
         assert cold_session['chain_id'] == network['chain_id']
         code, unlocked = request(cold, '/api/import', {'private_key': vectors[1]['secret']}, token)
         assert code == 200 and unlocked['address'] == addresses[1], unlocked

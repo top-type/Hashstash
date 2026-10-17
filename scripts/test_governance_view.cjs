@@ -146,7 +146,22 @@ async function run() {
   assert.equal(h.get('gov-proposal-link').hidden, true); checks++;
   assert.equal(h.get('gov-grant-payments').hidden, true); checks++;
   assert.equal(h.get('proposal-heading').textContent, 'Proposal history'); checks++;
-  assert.doesNotMatch(h.get('proposal-list').textContent, /refund|current leader|In decision/i); checks++;
+  assert.doesNotMatch(h.get('proposal-list').textContent, /current leader|In decision/i); checks++;
+  {
+    // Rest lists the round that just ended: losing and timed-out backers are
+    // offered a refund check, and a winner's backers learn theirs became revenue.
+    const { response, settle } = require('./test_wallet_ui.cjs');
+    const cards = h.get('proposal-list').children;
+    for (const card of cards) { assert.match(card.textContent, /Past proposal.*Check refund ↙.*Details ↗/); checks++; }
+    h.handlers.support = params => response({ result: params.proposal === proposal ? { amount: '10', refundable: false, status: 'converted_to_revenue' } : { amount: '10', refundable: true, status: 'refundable' } });
+    const form = h.get('refund-form');
+    await cards[0].children[1].children[1].click(); await settle();
+    assert.equal(form.elements.proposal.value, proposal); checks++;
+    assert.match(form.feedback.textContent, /won its round.*never refundable/); checks++;
+    await cards[1].children[1].children[1].click(); await settle();
+    assert.match(form.feedback.textContent, /Available for refund/); checks++;
+    delete h.handlers.support;
+  }
   s.governance.phase = { Auction: { round: 0, opened: 0, leader: proposal, lead_since: 270 } };
   s.proposals[1].proposal.refund_height = 18; await h.refresh();
   assert.match(h.get('proposal-list').children[0].textContent, /Current auction leader.*Support/); checks++;
@@ -179,6 +194,59 @@ async function run() {
     s.proposals[0].proposal.action = { Parameter: { parameter: 'MinimumFeeRate', old: 1, new: 5 } }; await h.refresh();
     assert.match(preview.textContent, /Minimum fee rate: 0\.001 hash \/ 1,024 weight → 0\.005 hash \/ 1,024 weight/, 'parameter changes show old and new values'); checks++;
     s.proposals[0].proposal.action = decision.proposal; await h.refresh();
+  }
+  {
+    // A summarized grant is never shown as the whole grant: cards and the
+    // Support preview give its payment count and link the full list.
+    const { response, settle } = require('./test_wallet_ui.cjs');
+    const find = (node, test) => test(node) ? node : (node.children || []).map(child => find(child, test)).find(Boolean);
+    Object.assign(s.proposals[0], { truncated: true, payment_count: 4096 }); await h.refresh();
+    const card = h.get('proposal-list').children[0];
+    assert.match(card.textContent, /First 1 of 4,096 payments\. Full list in Explorer ↗/); checks++;
+    assert.ok(find(card, node => node.href === `#explorer?governance=${proposal}`), 'the summary links the complete grant'); checks++;
+    const field = h.get('support-form').elements.proposal;
+    field.value = proposal; await field.fire('input'); await settle();
+    assert.match(h.get('support-proposal-preview').textContent, /First 1 of 4,096 payments/); checks++;
+    field.value = ''; await field.fire('input'); await settle();
+    delete s.proposals[0].truncated; delete s.proposals[0].payment_count;
+
+    // The count reports the whole round, and further pages load against the
+    // snapshot's tip.
+    const third = '34'.repeat(32), fourth = '56'.repeat(32), pages = [];
+    const proposalShortLabel = id => `${id.slice(0, 10)}…${id.slice(-6)}`;
+    const row = (id, support) => ({ id, proposal: { round: 0, action: { Parameter: { parameter: 'MinimumFeeRate', old: 1, new: 5 } }, description: '00'.repeat(32), support, refund_height: null } });
+    s.proposals_total = 4; await h.refresh();
+    assert.equal(h.get('proposal-count').textContent, '2 of 4 proposals'); checks++;
+    let more = h.get('proposal-list').children.at(-1);
+    assert.match(more.textContent, /Load more · 2 not shown/); checks++;
+    h.handlers.proposals = params => { pages.push(params); return response({ result: params.offset === 2 ? [row(third, '3')] : params.offset === 3 ? [row(fourth, '2')] : [] }); };
+    await more.click(); await settle();
+    assert.deepEqual(pages.at(-1), { round: 0, offset: 2, tip: s.status.tip }); checks++;
+    assert.equal(h.get('proposal-count').textContent, '3 of 4 proposals'); checks++;
+    assert.ok(h.get('proposal-list').textContent.includes(proposalShortLabel(third))); checks++;
+    await h.refresh();
+    assert.equal(h.get('proposal-count').textContent, '3 of 4 proposals', 'loaded pages persist while the tip does'); checks++;
+    more = h.get('proposal-list').children.at(-1);
+    await more.click(); await settle();
+    assert.deepEqual(pages.at(-1), { round: 0, offset: 3, tip: s.status.tip }); checks++;
+    assert.equal(h.get('proposal-count').textContent, '4 proposals'); checks++;
+    assert.doesNotMatch(h.get('proposal-list').textContent, /Load more/); checks++;
+    s.status.tip = '77'.repeat(32); await h.refresh();
+    assert.equal(h.get('proposal-count').textContent, '2 of 4 proposals', 'a new tip reorders support, so its pages start over'); checks++;
+    delete h.handlers.proposals; delete s.proposals_total; await h.refresh();
+  }
+  {
+    // A summarized decision grant keeps its exact total and count.
+    s.governance.phase = { Governance: decision };
+    s.governance.pass = { ...s.governance.world, grant_escrow: '4096' };
+    s.pass = s.fail = account;
+    s.governance.decision_grant = { payment_count: 4096, payment_total: '4096', truncated: true };
+    await h.refresh();
+    assert.match(h.get('gov-grant-payments').textContent, /First 1 of 4,096 payments/); checks++;
+    assert.match(h.get('gov-grant-progress').title, /Required: 4\.096 hash/); checks++;
+    assert.doesNotMatch(h.get('gov-result-detail').textContent, /Funding is incomplete/); checks++;
+    assert.match(h.get('overview-governance-text').textContent, /… 4,096 payments$/); checks++;
+    delete s.governance.decision_grant;
   }
   assert.equal(h.wallet.length, 0, 'read-only UI checks never broadcast'); checks++;
   console.log(`governance view: ${checks} checks passed`);

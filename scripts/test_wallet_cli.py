@@ -115,7 +115,9 @@ def main():
         assert 'cannot be used with' in conflict.stderr and (not db.exists())
         check('Hot and watch CLI flags conflict before loading a key or creating a database')
         _, base = start(options.node, run, 'watch', 'RPC: (http://127\\.0\\.0\\.1:\\d+)/rpc')
-        cold_process, cold_base = start(options.cold, ['--port', '0'], 'cold', 'cold signer: (http://127\\.0\\.0\\.1:\\d+)/')
+        # The session token is only in the printed launch URL, never served.
+        cold_process, cold_launch = start(options.cold, ['--port', '0'], 'cold', 'cold signer: (http://127\\.0\\.0\\.1:\\d+/#token=[0-9a-f]{64})')
+        cold_base, token = cold_launch.split('/#token=')
         status = rpc(base, 'status')
         assert status['time_unit'] == 'seconds'
         check('Default CLI creates a timestamp DAA network with block-count decisions and scheduled-second auction/rest timing')
@@ -148,8 +150,7 @@ def main():
         assert rpc(base, 'account', {'key': vector['public_key']})['account']['nonce'] == before
         check('CLI prepares anchor-only bytes with separate network context without reserving a nonce or overwriting a file')
         _, cold_session = request(cold_base, '/api/session')
-        token = cold_session['token']
-        assert cold_session['unlocked'] is False
+        assert cold_session['unlocked'] is False and 'token' not in cold_session
 
         def cold(action, value=None, expected=200):
             code, result = request(cold_base, '/api/' + action, value or {}, token)
@@ -293,10 +294,10 @@ def main():
         check('Replacing or cancelling the review invalidates earlier approval tokens')
         old_token = token
         stop(cold_process)
-        _, cold_base = start(options.cold, ['--port', '0'], 'cold-restored', 'cold signer: (http://127\\.0\\.0\\.1:\\d+)/')
+        _, cold_launch = start(options.cold, ['--port', '0'], 'cold-restored', 'cold signer: (http://127\\.0\\.0\\.1:\\d+/#token=[0-9a-f]{64})')
+        cold_base, token = cold_launch.split('/#token=')
         _, restarted = request(cold_base, '/api/session')
-        assert restarted['unlocked'] is False and restarted['token'] != old_token
-        token = restarted['token']
+        assert restarted['unlocked'] is False and token != old_token
         assert cold('unlock', {'passphrase': vector['passphrase'], 'scheme': 'hashstash-passphrase-v1'})['public_key'] == vector['public_key']
         cold('lock')
         cold('review', fresh, expected=400)

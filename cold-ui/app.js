@@ -5,7 +5,23 @@
   // A generated key's only backup, held until the operator confirms saving it.
   let pendingBackup = null, lifetimeRequired = false, maxReviewBytes = 64 * 1024 * 1024;
   const PASSPHRASE_V1 = 'hashstash-passphrase-v1', PASSPHRASE_V2 = 'hashstash-passphrase-v2';
+  const TOKEN_KEY = 'hashstash-cold-token', IDLE_LOCKED = 'Wallet locked after a period without use; open it again.';
+  const NO_SESSION = 'This page has no signer session. Open the address the signer printed when it started; it ends in #token=….';
   const say = (message = '', isError = false) => { $('message').textContent = message; $('message').classList.toggle('error', isError); };
+  // Loopback is shared by every local account, so the signer never serves its
+  // session token. The launch URL carries it in the fragment, which browsers
+  // never send; keep it for reloads of this tab and clear the address bar.
+  function launchToken() {
+    const launched = /^#token=([0-9a-f]{64})$/.exec(location.hash || '')?.[1];
+    if (launched) {
+      try { sessionStorage.setItem(TOKEN_KEY, launched); } catch { /* This tab then needs its launch URL again after a reload. */ }
+      try { history.replaceState(null, '', location.pathname + location.search); } catch { /* The fragment stays only in this tab's address bar. */ }
+      return launched;
+    }
+    let saved = '';
+    try { saved = sessionStorage.getItem(TOKEN_KEY) || ''; } catch { /* No saved session in this tab. */ }
+    return /^[0-9a-f]{64}$/.test(saved) ? saved : '';
+  }
   function unitText(node, text, unit, className) {
     const offset = text.lastIndexOf(unit);
     node.textContent = text.slice(0, offset);
@@ -85,15 +101,25 @@
     });
     let value;
     try { value = await response.json(); } catch { throw new Error('Signer unavailable'); }
+    if (response.status === 403) throw new Error(NO_SESSION);
     if (!response.ok) throw new Error(value.error || 'Request failed');
     return value;
+  }
+  // The signer locks a wallet left unused; stop showing it once that happened.
+  async function followLock() {
+    if (!publicKey) return;
+    try {
+      const response = await fetch('/api/session', {cache:'no-store',credentials:'same-origin'});
+      const session = await response.json();
+      if (response.ok && !session.public_key) showWallet(null, session);
+    } catch { /* The reported error already explains the failure. */ }
   }
   async function action(work) {
     if (busy) return;
     busy = true;
     document.querySelectorAll('button,input,textarea,select').forEach(element => { element.disabled = true; });
     say();
-    try { await work(); } catch (error) { say(error.message, true); }
+    try { await work(); } catch (error) { say(error.message, true); await followLock(); }
     finally {
       busy = false;
       document.querySelectorAll('button,input,textarea,select').forEach(element => { element.disabled = false; });
@@ -116,9 +142,10 @@
     if (!/^[a-f0-9]{64}$/i.test(selected)) throw new Error('Chain ID must contain 64 hexadecimal characters');
     const result = await api('network', {chain_id:selected});
     if (publicKey && !result.public_key) {
-      // The signer locks a v2 passphrase account when another network is selected.
+      // The signer locks a v2 passphrase account when another network is
+      // selected, and any wallet left unused.
       showWallet(null, result);
-      say('Wallet locked: a v2 passphrase account belongs to the network it was opened for.');
+      say(result.idle_locked ? IDLE_LOCKED : 'Wallet locked: a v2 passphrase account belongs to the network it was opened for.');
     } else networkView(result);
   }
   $('network-change').addEventListener('click', () => action(async () => {
@@ -341,13 +368,17 @@
   $('copy-raw').addEventListener('click', () => action(() => copy($('raw').value)));
   $('export-raw').addEventListener('click', () => download('hashstash-signed.txt', $('raw').value+'\n','text/plain'));
   action(async () => {
+    sessionToken = launchToken();
     const response = await fetch('/api/session', {cache:'no-store',credentials:'same-origin'});
     if (!response.ok) throw new Error('Signer unavailable');
     const session = await response.json();
-    sessionToken = session.token;
     if (Number.isSafeInteger(session.max_review_bytes) && session.max_review_bytes > 0) maxReviewBytes = session.max_review_bytes;
+    const idle = session.idle_lock_seconds;
+    $('idle-lock-hint').textContent = Number.isSafeInteger(idle) && idle > 0 ? ` An open wallet locks after ${idle % 60 ? `${idle} seconds` : idle === 60 ? '1 minute' : `${idle / 60} minutes`} without use.` : '';
+    if (!sessionToken) { showWallet(null, session); throw new Error(NO_SESSION); }
     // After a reload, an unsaved generated key keeps its backup gate.
     const pending = session.public_key && session.backup_pending === true ? (await api('backup')).backup : null;
     showWallet(session.public_key, session, pending);
+    if (session.idle_locked) say(IDLE_LOCKED);
   });
 })();

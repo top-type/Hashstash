@@ -186,11 +186,13 @@ def main():
         send(payment, expected=403)
         unsigned = rpc(base, 'preparetransaction', {'sender': offline['public_key'], 'operation': payment, **fee_fields, 'expiry_blocks': 2})
         unsigned.pop('fee_quote', None)
-        _, cold_base = start(args.cold, ['--port', '0'], 'cold', 'cold signer: (http://127\\.0\\.0\\.1:\\d+)/')
-        _, cold_session = request(cold_base, '/api/session')
+        # The session token is only in the printed launch URL, never served.
+        _, cold_launch = start(args.cold, ['--port', '0'], 'cold', 'cold signer: (http://127\\.0\\.0\\.1:\\d+/#token=[0-9a-f]{64})')
+        cold_base, cold_token = cold_launch.split('/#token=')
+        assert 'token' not in request(cold_base, '/api/session')[1]
 
         def cold(action, value):
-            code, result = request(cold_base, '/api/' + action, value, cold_session['token'])
+            code, result = request(cold_base, '/api/' + action, value, cold_token)
             assert code == 200, (code, result)
             return result
         cold('network', {'chain_id': unsigned['chain_id']})

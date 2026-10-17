@@ -40,8 +40,19 @@ try {
     $signerListener.Server.ExclusiveAddressUse = $true
     $signerListener.Start()
 } finally { $signerListener.Stop() }
-$signerProcess = Start-Process -FilePath $signerPath -ArgumentList $quotedArguments -WindowStyle Hidden -PassThru
+# Loopback is shared by every local account, so the signer never serves its
+# session token. Choose it here and pass it through this process's environment,
+# which other accounts cannot read, then only in the launch URL's fragment.
+$tokenBytes = [byte[]]::new(32)
+$random = [Security.Cryptography.RandomNumberGenerator]::Create()
+try { $random.GetBytes($tokenBytes) } finally { $random.Dispose() }
+$signerToken = -join ($tokenBytes | ForEach-Object { $_.ToString('x2') })
+$env:HASHSTASH_COLD_TOKEN = $signerToken
+try {
+    $signerProcess = Start-Process -FilePath $signerPath -ArgumentList $quotedArguments -WindowStyle Hidden -PassThru
+} finally { Remove-Item Env:\HASHSTASH_COLD_TOKEN -ErrorAction SilentlyContinue }
 $signerUrl = "http://127.0.0.1:$Port/"
+$launchUrl = $signerUrl + '#token=' + $signerToken
 $signerReady = $false
 $signerDeadline = [DateTime]::UtcNow.AddSeconds(15)
 while ([DateTime]::UtcNow -lt $signerDeadline) {
@@ -53,6 +64,6 @@ while ([DateTime]::UtcNow -lt $signerDeadline) {
     Start-Sleep -Milliseconds 100
 }
 if (-not $signerReady) { throw "Signer did not become ready. Process ID: $($signerProcess.Id)" }
-Write-Host "Cold signer: $signerUrl"
-Write-Host "Process ID: $($signerProcess.Id). Lock the wallet when finished; stop this process to close the signer."
-if (-not $NoBrowser) { Start-Process $signerUrl }
+Write-Host "Cold signer: $launchUrl"
+Write-Host "Open that full address; the page needs its #token part. Process ID: $($signerProcess.Id). An open wallet locks after 5 minutes without use; lock it when finished and stop this process to close the signer."
+if (-not $NoBrowser) { Start-Process $launchUrl }

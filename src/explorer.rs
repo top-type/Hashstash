@@ -105,6 +105,8 @@ impl Explorer {
             failed: None,
         }
     }
+    /// `root` is the state root of `s`, which callers cache per published tip.
+    #[allow(clippy::too_many_arguments)]
     pub fn read(
         path: &Path,
         method: &str,
@@ -112,6 +114,7 @@ impl Explorer {
         c: &Config,
         s: &State,
         tip: Hash,
+        root: Hash,
         mempool: &[Transaction],
     ) -> Result<Value> {
         // A separate WAL read transaction never takes the index writer mutex or
@@ -146,7 +149,7 @@ impl Explorer {
             attempt: None,
             failed: None,
         };
-        reader.rpc(method, p, c, s, tip, mempool)
+        reader.rpc_rooted(method, p, c, s, tip, root, mempool)
     }
     pub fn open(path: &Path, chain: &Chain) -> Result<Self> {
         let db = Connection::open(path.with_extension("explorer.sqlite"))?;
@@ -426,6 +429,21 @@ impl Explorer {
         tip: Hash,
         mempool: &[Transaction],
     ) -> Result<Value> {
+        self.rpc_rooted(method, p, c, s, tip, s.root(), mempool)
+    }
+    /// The state root costs a walk of the whole state, so a node passes the
+    /// one it caches per published tip instead of recomputing it per call.
+    #[allow(clippy::too_many_arguments)]
+    fn rpc_rooted(
+        &self,
+        method: &str,
+        p: Value,
+        c: &Config,
+        s: &State,
+        tip: Hash,
+        root: Hash,
+        mempool: &[Transaction],
+    ) -> Result<Value> {
         ensure!(
             self.ready && self.tip == Some(tip),
             "explorer index is updating; try again"
@@ -437,7 +455,7 @@ impl Explorer {
         } else {
             limit(&p)?
         };
-        let mut result = json!({"chain_id":hex::encode(s.chain_id),"tip":hex::encode(tip),"height":s.height,"state_root":hex::encode(s.root())});
+        let mut result = json!({"chain_id":hex::encode(s.chain_id),"tip":hex::encode(tip),"height":s.height,"state_root":hex::encode(root)});
         let mut budget = Budget::new();
         match method {
             "explorer_mail" => {
@@ -2997,6 +3015,7 @@ mod chat_tests {
                 &c,
                 &post,
                 tip,
+                post.root(),
                 &[]
             )
             .unwrap()["messages"]
@@ -3183,6 +3202,7 @@ mod chat_tests {
             &c,
             &post,
             tip,
+            post.root(),
             &[],
         )
         .unwrap();

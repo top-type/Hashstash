@@ -46,6 +46,12 @@ fn dedicated_key(dir: &TempDir) -> (std::path::PathBuf, PublicKey) {
         .unwrap(),
     )
     .unwrap();
+    // The faucet accepts only an owner-only key file, as `hashstash keygen` writes.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     (path, public)
 }
 
@@ -66,6 +72,7 @@ fn faucet_config(
         max_fee: "20".into(),
         cooldown_seconds: 86400,
         subnet_cooldown_seconds: 60,
+        subnet_daily_claims: 10,
         hourly_claims: 100,
         daily_claims: 250,
         lifetime_claims: 1000,
@@ -187,6 +194,22 @@ async fn fixed_payment_is_exact_and_durable_against_repeat_claims_and_restart() 
     assert_eq!(
         hex::encode(codec::transaction_id(transaction)),
         pending["txid"]
+    );
+    // Receipt checks read one canonical hash and named IDs, never a whole block.
+    let receipt = node
+        .rpc(
+            "blockreceipt",
+            json!({"height": mined.height, "txids": [pending["txid"], hex::encode([0u8; 32])]}),
+        )
+        .unwrap();
+    assert_eq!(receipt["hash"], hex::encode(codec::block_hash(&mined)));
+    assert_eq!(receipt["included"], json!([true, false]));
+    assert!(
+        node.rpc(
+            "blockreceipt",
+            json!({"height": mined.height, "txids": vec![hex::encode([0u8; 32]); 65]})
+        )
+        .is_err()
     );
     assert_eq!(transaction.body.sender, donor);
     assert_eq!(transaction.body.nonce, 0);
@@ -312,7 +335,7 @@ async fn fixed_payment_is_exact_and_durable_against_repeat_claims_and_restart() 
     assert_eq!(account(&node, donor)["nonce"], 2);
     restarted.stop().await;
     policy.payout = "9".into();
-    let restarted = faucet::serve(policy).await.unwrap();
+    let restarted = faucet::serve(policy.clone()).await.unwrap();
     wait_status(&client, &restarted, Some(&second_address), |v| {
         v["claim"]["status"] == "confirmed"
     })
@@ -334,6 +357,10 @@ async fn fixed_payment_is_exact_and_durable_against_repeat_claims_and_restart() 
     assert_eq!(amounts, vec!["5", "7"]);
     drop(ledger);
     restarted.stop().await;
+    let summary = faucet::maintain(&policy, faucet::Maintenance::Inspect).unwrap();
+    assert_eq!(summary["claims"]["confirmed"], 2);
+    assert_eq!(summary["latest_receipt"]["nonce"], "1");
+    assert!(summary["pending"].is_null());
     node_server.stop().await;
 }
 

@@ -971,14 +971,23 @@ impl Node {
                 .lock()
                 .map_err(|_| anyhow!("listener health lock poisoned"))?
         );
+        let view = self.read_view()?;
+        // The tip heuristic follows the governed block interval, never below 180 s.
+        let stall_after = view
+            .chain
+            .tip_state()
+            .settings
+            .interval
+            .saturating_mul(12)
+            .max(180);
         Ok(
             json!({"transport":if self.peer_auth.as_ref().is_some_and(|p|p.is_discovery()){"authenticated-discovery"}else if self.peer_auth.is_some(){"pinned-signed"}else{"compact-binary"}, "wire_format":"compact-binary",
             "public_key":self.peer_auth.as_ref().map(|p|hex::encode(p.public_key())), "peers":peers,
             "discovery":discovery_status, "listeners":listeners,
             "observed_at":at, "encrypted":false,
-            "chain_height":self.read_view()?.chain.tip_height(),
+            "chain_height":view.chain.tip_height(),
             "seconds_without_new_tip":at.saturating_sub(self.last_tip_change.load(Ordering::Relaxed)),
-            "chain_stalled":at.saturating_sub(self.last_tip_change.load(Ordering::Relaxed)) >= 180}),
+            "chain_stalled":at.saturating_sub(self.last_tip_change.load(Ordering::Relaxed)) >= stall_after}),
         )
     }
     /// Validation may change the greatest competitive capacity on any branch,
@@ -2625,19 +2634,60 @@ impl Node {
                 Ok(json!({"transaction_id":hex::encode(self.submit_transaction(tx)?)}))
             }
             "getblock" => {
-                let i = self.locked()?;
-                let h = if let Some(h) = params.get("hash").and_then(Value::as_str) {
-                    parse_hash(h)?
-                } else if let Some(height) = params.get("height").and_then(Value::as_u64) {
-                    i.chain
-                        .hash_at_height(height)
-                        .context("unknown active height")?
-                } else {
-                    i.chain.tip_hash()
+                let block = {
+                    let i = self.locked()?;
+                    let h = if let Some(h) = params.get("hash").and_then(Value::as_str) {
+                        parse_hash(h)?
+                    } else if let Some(height) = params.get("height").and_then(Value::as_u64) {
+                        i.chain
+                            .hash_at_height(height)
+                            .context("unknown active height")?
+                    } else {
+                        i.chain.tip_hash()
+                    };
+                    i.chain.block(&h).context("unknown block")?
                 };
-                Ok(serde_json::to_value(
-                    i.chain.block(&h).context("unknown block")?,
-                )?)
+                // The JSON tree of a large block is built after the node lock is released.
+                Ok(serde_json::to_value(block)?)
+            }
+            "blockreceipt" => {
+                // A bounded receipt lookup: one canonical hash and the presence of
+                // a few transaction IDs, never a JSON copy of an arbitrarily large block.
+                let height = params
+                    .get("height")
+                    .and_then(Value::as_u64)
+                    .context("height required")?;
+                let ids = match params.get("txids") {
+                    Some(ids) => {
+                        let ids = ids.as_array().context("txids must be an array")?;
+                        ensure!(ids.len() <= 64, "too many transaction IDs");
+                        ids.iter()
+                            .map(|id| parse_hash(id.as_str().context("txids must be strings")?))
+                            .collect::<Result<Vec<_>>>()?
+                    }
+                    None => Vec::new(),
+                };
+                let block = {
+                    let i = self.locked()?;
+                    let h = i
+                        .chain
+                        .hash_at_height(height)
+                        .context("unknown active height")?;
+                    i.chain.block(&h).context("unknown block")?
+                };
+                let mut included = vec![false; ids.len()];
+                for transaction in &block.transactions {
+                    if included.iter().all(|found| *found) {
+                        break;
+                    }
+                    let id = codec::transaction_id(transaction);
+                    for (found, wanted) in included.iter_mut().zip(&ids) {
+                        *found |= *wanted == id;
+                    }
+                }
+                Ok(
+                    json!({"height":block.height,"hash":hex::encode(codec::block_hash(&block)),"included":included}),
+                )
             }
             "peers" => Ok(json!(
                 *self
@@ -4729,6 +4779,7 @@ async fn http_session(
             | "submitblock"
             | "submittransaction"
             | "getblock"
+            | "blockreceipt"
             | "preparetransaction"
             | "broadcasttransaction"
     );

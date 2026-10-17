@@ -1619,8 +1619,8 @@
         $("gov-grant-payments").hidden = !grant;
         $("gov-grant-payments").replaceChildren();
         if (grant) {
-            renderGrantPayments($("gov-grant-payments"), grant);
-            const funded = gov.pass.grant_escrow, required = grantTotal(grant.payments);
+            renderGrantPayments($("gov-grant-payments"), grant, {...gov.decision_grant, id: proposalId});
+            const funded = gov.pass.grant_escrow, required = decisionGrantTotal(grant);
             let requiredText = hashAmount(required), fundedText = hashAmount(funded);
             // Rounded-equal amounts must not imply a fully funded grant.
                         if (BigInt(funded) < BigInt(required) && fundedText === requiredText) {
@@ -1663,14 +1663,14 @@
             const criterion = `PASS must lead in more than half of ${blockCount(total)}.${margin ? ` A block counts only when its price is more than ${fraction(margin, 100, 2)}% above FAIL.` : " Equal prices add no PASS lead."}`;
             text("gov-subtitle", criterion);
             text("overview-governance-title", "Decision active");
-            text("overview-governance-text", proposalTitle(decision.proposal));
+            text("overview-governance-text", proposalTitle(decision.proposal, gov.decision_grant?.payment_count));
             for (const [id, world, count] of [["pass", gov.pass, leading], ["fail", gov.world, other]]) {
                 text(`${id}-leading-blocks`, commas(count));
                 const hasStash = BigInt(world.shares) > 0n;
                 sharePrice(`${id}-price`, hasStash ? worldPrice(world) : {numerator: "0", denominator: "1"});
                 if (!hasStash) $(`${id}-price`).title = "No outstanding stash. Its price is zero until a deposit starts the reserve.";
             }
-            const funded = !grant || BigInt(gov.pass.grant_escrow) === BigInt(grantTotal(grant.payments));
+            const funded = !grant || BigInt(gov.pass.grant_escrow) === BigInt(decisionGrantTotal(grant));
             // At the last tip the next block adds one observation from this
             // tip's closing prices and then resolves before its transactions,
             // so the outcome is already fixed. Show it as consensus will decide it.
@@ -1708,13 +1708,36 @@
         renderDecisionMessage();
         supportPreview();
     }
-    function proposalTitle(action) {
-        if (action.Grant) return action.Grant.payments.map(payment => `${shortAddress(payment.recipient)} · ${hashAmount(payment.amount)}`).join(" / ");
+    // The snapshot keeps the first payments of a large grant with its count
+    // (`truncated`); a page draws at most that many rows of any grant.
+    const shownGrantPayments = 256;
+    function grantPaymentCount(grant, paymentCount) {
+        const count = Number(paymentCount);
+        return Number.isSafeInteger(count) && count > grant.payments.length ? count : grant.payments.length;
+    }
+    function proposalTitle(action, paymentCount) {
+        if (action.Grant) {
+            const shown = action.Grant.payments.slice(0, shownGrantPayments), count = grantPaymentCount(action.Grant, paymentCount);
+            return shown.map(payment => `${shortAddress(payment.recipient)} · ${hashAmount(payment.amount)}`).join(" / ") + (count > shown.length ? ` / … ${commas(count)} payments` : "");
+        }
         const p = action.Parameter;
         return `Set ${settings[p.parameter][1].toLowerCase()} to ${settingValue(settings[p.parameter][0], p.new, settings[p.parameter][2])}`;
     }
-    function renderGrantPayments(parent, grant) {
-        for(const payment of grant.payments){const row=append(parent,"div","grant-payout"),recipient=address(payment.recipient),link=append(row,"a","explorer-link",recipient);link.href=`#explorer?account=${encodeURIComponent(recipient)}`;link.title=recipient;appendAmount(row,"span","",formatExactHash(payment.amount));}
+    function renderGrantPayments(parent, grant, summary = {}) {
+        const shown = grant.payments.slice(0, shownGrantPayments), count = grantPaymentCount(grant, summary.payment_count);
+        for(const payment of shown){const row=append(parent,"div","grant-payout"),recipient=address(payment.recipient),link=append(row,"a","explorer-link",recipient);link.href=`#explorer?account=${encodeURIComponent(recipient)}`;link.title=recipient;appendAmount(row,"span","",formatExactHash(payment.amount));}
+        if (count <= shown.length) return;
+        // Never present part of a grant as the whole of it.
+        const more = append(parent, "p", "field-help grant-more", `First ${commas(shown.length)} of ${commas(count)} payments. `);
+        if (summary.id) {
+            const link = append(more, "a", "explorer-link", "Full list in Explorer ↗");
+            link.href = `#explorer?governance=${encodeURIComponent(hex(summary.id))}`;
+        }
+    }
+    // A decision grant's total; a summarized one carries it beside its payments.
+    function decisionGrantTotal(grant) {
+        const total = state.gov?.decision_grant?.payment_total;
+        return typeof total === "string" && /^(0|[1-9]\d{0,159})$/.test(total) ? total : grantTotal(grant.payments);
     }
     function renderDecisionMessage() {
         const id = hex(activeDecision()?.proposal_id), node = $("gov-decision-message");
@@ -1749,8 +1772,9 @@
         if (typeof HashstashProposalData !== "object" || !state.ready || location.hash.split("?")[0] !== "#governance") return;
         const chain = state.status.chain_id;
         const activeId = hex(activeDecision()?.proposal_id);
-        const activeRecord = activeId && (state.proposals.find(record => hex(record.id) === activeId) || { id: activeId, proposal: {} });
-        const records = activeRecord ? [activeRecord, ...state.proposals.filter(record => hex(record.id) !== activeId)] : state.proposals;
+        const known = proposalRecords();
+        const activeRecord = activeId && (known.find(record => hex(record.id) === activeId) || { id: activeId, proposal: {} });
+        const records = activeRecord ? [activeRecord, ...known.filter(record => hex(record.id) !== activeId)] : known;
         for (const record of records.slice(0, 40)) {
             const id = hex(record.id), cache = `${chain}:${id}`, request = `${cache}:${state.status.tip}`;
             if (proposalExplanations.has(cache) || explanationRequests.has(request)) continue;
@@ -1775,13 +1799,43 @@
             });
         }
     }
+    // The snapshot holds the first page of its round, best supported first.
+    // Further pages of that order belong to the same tip and are dropped with it.
+    function proposalRecords() {
+        const extra = state.extraProposals;
+        if (!extra || extra.tip !== state.status?.tip) return state.proposals;
+        const listed = new Set(state.proposals.map(record => record.id));
+        return [...state.proposals, ...extra.records.filter(record => !listed.has(record.id))];
+    }
+    function proposalTotal(records) {
+        return Number.isSafeInteger(state.proposalsTotal) && state.proposalsTotal > records.length ? state.proposalsTotal : records.length;
+    }
+    async function loadMoreProposals(button) {
+        const tip = state.status.tip, round = state.proposals[0]?.proposal.round;
+        if (round === void 0) return;
+        const loaded = state.extraProposals?.tip === tip ? state.extraProposals.records : [];
+        button.disabled = true;
+        try {
+            const page = await rpc("proposals", {round, offset: state.proposals.length + loaded.length, tip});
+            if (!Array.isArray(page)) throw new Error("Invalid proposals page.");
+            if (state.status?.tip !== tip) return;
+            state.extraProposals = {tip, records: [...loaded, ...page]};
+            page.length || (state.proposalsTotal = state.proposals.length + loaded.length);
+        } catch (error) {
+            button.title = error.message;
+        } finally {
+            button.disabled = false;
+        }
+        renderProposals();
+    }
     function renderProposals() {
         const list = $("proposal-list");
         const name = phaseName(), phase = state.gov.phase[name], round = phase.round;
-        const records = state.proposals.filter(p => round === void 0 || p.proposal.round === round);
+        const records = proposalRecords().filter(p => round === void 0 || p.proposal.round === round);
+        const total = proposalTotal(records);
         text("proposal-heading", name === "Rest" ? "Proposal history" : "Proposals");
-        text("proposal-count", `${records.length} proposal${records.length === 1 ? "" : "s"}`);
-        if (!renderChanged(list, [ name, phase.leader, phase.proposal_id, key(), records, records.map(record => savedDescription(record.proposal.description, proposalExplanations.get(`${state.status.chain_id}:${hex(record.id)}`))), state.status?.settings ])) return;
+        text("proposal-count", total > records.length ? `${commas(records.length)} of ${commas(total)} proposals` : `${records.length} proposal${records.length === 1 ? "" : "s"}`);
+        if (!renderChanged(list, [ name, phase.leader, phase.proposal_id, key(), records, total, records.map(record => savedDescription(record.proposal.description, proposalExplanations.get(`${state.status.chain_id}:${hex(record.id)}`))), state.status?.settings ])) return;
         list.replaceChildren();
         if (!records.length) {
             const empty = append(list, "div", "panel empty-state");
@@ -1794,7 +1848,7 @@
             const p = record.proposal, row = append(list, "article", "proposal-card" + (record.id === leader ? " is-leader" : ""));
             const main = append(row, "div", "proposal-main");
             if (!p.action.Grant) append(main, "h3", "proposal-title", proposalTitle(p.action));
-            if(p.action.Grant)renderGrantPayments(main,p.action.Grant);
+            if(p.action.Grant)renderGrantPayments(main,p.action.Grant,{payment_count:record.payment_count,id:record.id});
             const description = savedDescription(p.description, proposalExplanations.get(`${state.status.chain_id}:${hex(record.id)}`) ?? record.description_text ?? p.description_text);
             if (description) {
                 const explanation = append(main, "details", "proposal-explanation");
@@ -1809,10 +1863,10 @@
             appendAmount(support, "strong", "", hashAmount(p.support));
             append(support, "small", "", "backing");
             const isSupport = name === "Auction" && p.round === round && !cancelled;
-            if (winner || name === "Rest") {
-                const details = append(side, "a", "button button-light", "Details ↗");
-                details.href = `#explorer?governance=${encodeURIComponent(record.id)}`;
-            } else {
+            // Rest lists the round that just ended. Its losing and timed-out
+            // backers can reclaim support; the check tells a winner's backers
+            // that theirs became revenue.
+            if (!winner) {
                 const button = append(side, "button", "button button-light", isSupport ? "Support ↗" : "Check refund ↙");
                 button.type = "button";
                 button.disabled = !key();
@@ -1831,6 +1885,15 @@
                     feeSoon(form);
                 });
             }
+            if (winner || name === "Rest") {
+                const details = append(side, "a", "button button-light", "Details ↗");
+                details.href = `#explorer?governance=${encodeURIComponent(record.id)}`;
+            }
+        }
+        if (total > records.length) {
+            const more = append(list, "button", "button button-light proposal-more", `Load more · ${commas(total - records.length)} not shown`);
+            more.type = "button";
+            more.addEventListener("click", () => loadMoreProposals(more));
         }
     }
     async function checkSupport(form) {
@@ -1857,10 +1920,11 @@
         const auction = state.gov?.phase?.Auction;
         if (!auction) throw new Error("There is no open auction.");
         const id = hex(hexBytes(value, "Proposal ID")).toLowerCase();
-        const local = state.proposals.find(record => record.id === id);
+        const known = proposalRecords(), local = known.find(record => record.id === id);
         let proposal = local?.proposal;
-        // The snapshot lists at most 128 proposals per round; look up the rest.
-        if (!local && state.proposals.length >= 128) {
+        // The snapshot lists one page of the round; look up the rest.
+        const unlisted = Number.isSafeInteger(state.proposalsTotal) ? state.proposalsTotal > known.length : known.length >= 128;
+        if (!local && unlisted) {
             const chain = state.status.chain_id, cache = `${chain}:${state.status.tip}:${id}`;
             if (!supportLookups.has(cache)) {
                 supportLookups.size > 50 && supportLookups.clear();
@@ -1873,7 +1937,7 @@
             found && (proposal = {round: found.round, action: found.action});
         }
         if (!proposal?.action || String(proposal.round) !== String(auction.round) || proposal.refund_height !== null && proposal.refund_height !== void 0) throw new Error("This ID is not an active proposal in the current auction round.");
-        return {id, action: proposal.action};
+        return {id, action: proposal.action, payment_count: local?.payment_count};
     }
     async function supportPreview() {
         const version = ++supportPreviewVersion, node = $("support-proposal-preview"), raw = $("support-form").elements.proposal.value.trim();
@@ -1895,7 +1959,7 @@
             return;
         }
         append(node, "p", "field-help", `Backs proposal ${proposalShort(target.id)}:`);
-        if (target.action.Grant) renderGrantPayments(node, target.action.Grant);
+        if (target.action.Grant) renderGrantPayments(node, target.action.Grant, target);
         else {
             const p = target.action.Parameter, setting = settings[p?.parameter];
             append(node, "p", "proposal-title", setting ? `${setting[1]}: ${settingValue(setting[0], p.old, setting[2], true)} → ${settingValue(setting[0], p.new, setting[2], true)}` : "Unknown action");
@@ -2060,6 +2124,7 @@
         networkPhaseView();
         state.account = state.pass = state.fail = state.balances = state.status = state.gov = state.miningInfo = null;
         state.proposals = [];
+        state.proposalsTotal = state.extraProposals = null;
         renderDecisionMessage();
         state.mempool = [];
         state.senderMempool = state.pendingNonce = null;
@@ -2175,6 +2240,8 @@
             state.pendingNonce = key() ? snapshot.pending_nonce ?? null : null;
             state.account = account;
             state.proposals = proposals;
+            state.proposalsTotal = Number.isSafeInteger(snapshot.proposals_total) ? snapshot.proposals_total : null;
+            state.extraProposals?.tip === status.tip || (state.extraProposals = null);
             state.pass = pass;
             state.fail = fail;
             state.balances = balances || null;

@@ -109,6 +109,10 @@ async function run() {
     assert.equal(h.get('stash-context-notice').textContent, 'Fees require hashes in both outcomes.', 'one block earlier, trading is open'); checks++;
     assert.ok(quotes() > before, 'and quotes are requested again'); checks++;
     assert.equal(status(), 'PASS leads', 'before the last tip the running count is shown'); checks++;
+    s.governance.progress = { time_unit: 'blocks', trading_closed: true }; await h.refresh();
+    assert.equal(h.get('stash-context-notice').textContent, 'Trading is closed: the decision resolves at the start of the next block, before its transactions.', "the node's trading_closed flag is used when reported"); checks++;
+    assert.equal(h.get('trade-submit').disabled, true); checks++;
+    delete s.governance.progress; await h.refresh();
     h.get('trade-amount').value = ''; await h.get('trade-amount').fire('input'); await h.timersDue(); await h.navigate('#governance');
   }
   decision.blocks = 16;
@@ -194,6 +198,39 @@ async function run() {
     s.proposals[0].proposal.action = { Parameter: { parameter: 'MinimumFeeRate', old: 1, new: 5 } }; await h.refresh();
     assert.match(preview.textContent, /Minimum fee rate: 0\.001 hash \/ 1,024 weight → 0\.005 hash \/ 1,024 weight/, 'parameter changes show old and new values'); checks++;
     s.proposals[0].proposal.action = decision.proposal; await h.refresh();
+    // A round with more proposals than the snapshot's first page: other IDs
+    // resolve through the explorer, which adds refund_height from the tip state.
+    const { response } = require('./test_wallet_ui.cjs'), page = s.proposals;
+    const removed = '9c'.repeat(32), live = '9d'.repeat(32), unknown = '9e'.repeat(32), large = '9f'.repeat(32);
+    s.proposals = [...page, ...Array.from({ length: 126 }, (_, i) => record((0x100 + i).toString(16).padStart(64, '0')))];
+    s.proposals_total = 129; await h.refresh();
+    const lookups = () => h.calls.filter(call => call.body.method === 'explorer_governance' && call.body.params.proposal && call.body.params.proposal.startsWith('9')).length;
+    h.handlers.explorer_governance = p => response({ result: { chain_id: s.status.chain_id, proposals: p.proposal === unknown ? [{ id: p.proposal, round: 0, action: decision.proposal }]
+      : [{ id: p.proposal, round: 0, description: '00'.repeat(32), support: '5', refund_height: p.proposal === removed ? 18 : null, ...(p.proposal === large ? { action_omitted: true } : { action: decision.proposal }) }] } });
+    await enter(removed);
+    assert.equal(lookups(), 1, 'an ID past the 128-row page is looked up'); checks++;
+    assert.match(preview.textContent, /not an active proposal/, 'a removed proposal found through the explorer is refused'); checks++;
+    form.elements.amount.value = '2'; await form.fire('input'); await h.timersDue(); await settle();
+    assert.match(h.get('support-fee-error').textContent, /not an active proposal/, 'and cannot be quoted or signed'); checks++;
+    await enter(live);
+    assert.ok(preview.textContent.includes(addr(key)), 'a live proposal past the page shows its action'); checks++;
+    await enter(unknown);
+    assert.match(preview.textContent, /not an active proposal/, 'an indexed row the tip state does not report is refused'); checks++;
+    await enter(large);
+    assert.match(preview.textContent, /too large to show here/, 'an action the explorer omits is never signed unseen'); checks++;
+    // The page can also stop short of 128 rows; proposals_total decides.
+    s.proposals = page; await h.refresh(); const before = lookups();
+    await enter('9a'.repeat(32)); assert.equal(lookups(), before + 1, 'a short page with more proposals still looks the ID up'); checks++;
+    assert.ok(preview.textContent.includes(addr(key))); checks++;
+    s.proposals_total = page.length; await h.refresh(); const complete = lookups();
+    await enter('9b'.repeat(32));
+    assert.equal(lookups(), complete, 'a page holding every proposal of the round needs no lookup'); checks++;
+    assert.match(preview.textContent, /not an active proposal/); checks++;
+    // A summarized page row says how many payments it leaves out.
+    Object.assign(s.proposals[0], { truncated: true, payment_count: 257 }); await h.refresh(); await enter(proposal);
+    assert.match(preview.textContent, /First 1 of 257 payments\. Full list in Explorer/, 'a truncated grant summary is not shown as the whole grant'); checks++;
+    delete s.proposals[0].truncated; delete s.proposals[0].payment_count; delete s.proposals_total; delete h.handlers.explorer_governance;
+    await enter(''); await h.refresh();
   }
   {
     // A summarized grant is never shown as the whole grant: cards and the

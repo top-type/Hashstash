@@ -39,20 +39,44 @@ async function run(){
  const source=fs.readFileSync(path.join(__dirname,'../ui/app.js'),'utf8'),html=fs.readFileSync(path.join(__dirname,'../ui/index.html'),'utf8'),mailSource=fs.readFileSync(path.join(__dirname,'../ui/mail.js'),'utf8');
  ok(!source.includes("rpc('mine'"));ok(!html.includes('data-mine='));ok(!html.includes('id="automine-toggle"'));ok(!html.includes('id="copy-stratum"'));
  const section=html.slice(html.indexOf('id="view-mail"'),html.indexOf('id="view-guide"'));ok(!section.includes('name="amount"'),'mail does not offer a recipient payment');ok(section.includes('name="message" rows="5" maxlength="768"'));ok(section.includes('title="Up to 768 UTF-8 bytes"'));ok(!mailSource.includes('slice(0,200)'),'historical scanning has no arbitrary cutoff');
- for(const [label,change] of [
-  ['unsigned RPC row',m=>({...m,raw:undefined})],
-  ['changed signature',m=>({...m,raw:m.raw.slice(0,-2)+(m.raw.endsWith('00')?'01':'00')})],
-  ['signed for another network',(m,h)=>h.signFor('fe'.repeat(32),m)],
-  ['claimed sender', (m,h)=>({...m,sender_public_key:h.other,sender:addr(h.other)})],
-  ['changed nonce',m=>({...m,nonce:'1'})],
-  ['changed ciphertext',m=>({...m,data_hex:m.data_hex.slice(0,-2)+(m.data_hex.endsWith('00')?'01':'00')})],
-  ['wrong txid',m=>({...m,txid:key(555)})],
-  ['changed operation',(m,h)=>({...m,operation:{TransferExact:{recipient:h.other,amount:'1'}}})],
+ // A row is unwrapped under its stated context first. An envelope that opens
+ // must then match its signed record before it is shown or checkpointed; one
+ // that does not open is treated as another account's mail.
+ for(const [label,change,decrypted,detected] of [
+  ['unsigned RPC row',m=>({...m,raw:undefined}),0,true],
+  ['changed signature',m=>({...m,raw:m.raw.slice(0,-2)+(m.raw.endsWith('00')?'01':'00')}),1,true],
+  // Signed by the envelope's real sender, so only the network differs.
+  ['signed for another network',(m,h)=>h.signFor('fe'.repeat(32),m,b),1,true],
+  ['claimed sender', (m,h)=>({...m,sender_public_key:h.other,sender:addr(h.other)}),1,false],
+  ['changed nonce',m=>({...m,nonce:'1'}),1,false],
+  ['changed ciphertext',m=>({...m,data_hex:m.data_hex.slice(0,-2)+(m.data_hex.endsWith('00')?'01':'00')}),0,false],
+  ['wrong txid',m=>({...m,txid:key(555)}),1,true],
+  ['changed operation',(m,h)=>({...m,operation:{TransferExact:{recipient:h.other,amount:'1'}}}),1,true],
  ]){
   const h=await setup(),m=await h.message({},h.sender,h.recipient),before=[...h.savedMail.values()][0];let attempts=0;const real=h.decryptMail;h.decryptMail=(...args)=>{attempts++;return real(...args);};
   await h.publish([change(m,h)]);
-  eq(attempts,0,`${label}: reject before decryption`);eq(h.get('mail-list').children.length,0,`${label}: never display`);ok(h.get('mail-error').textContent.includes('could not be verified'),`${label}: report verification failure`);eq([...h.savedMail.values()][0],before,`${label}: never advance persisted checkpoint`);
-  h.history=[m];await h.publish([]);eq(h.get('mail-list').children.length,1,`${label}: the valid signed message remains discoverable`);
+  eq(attempts,decrypted,`${label}: decryption attempts`);eq(h.get('mail-list').children.length,0,`${label}: never display`);
+  if(detected){
+   ok(h.get('mail-error').textContent.includes('could not be verified'),`${label}: report verification failure`);eq([...h.savedMail.values()][0],before,`${label}: never advance persisted checkpoint`);
+   h.history=[m];await h.publish([]);eq(h.get('mail-list').children.length,1,`${label}: the valid signed message remains discoverable`);
+  }else eq(h.get('mail-error').textContent,'',`${label}: an envelope that does not open under the stated context is not ours`);
+ }
+ {
+  // A feed cannot attribute mail to a key that did not sign it: an envelope
+  // encrypted under a claimed sender's context opens, then fails the signed
+  // record check before display.
+  const h=await setup(),s=h.currentSnapshot,data=await h.mailCrypto.encrypt({subject:'Forged',body:'Not from the claimed sender'},{chain_id:s.status.chain_id,sender:h.recipient,recipient:h.sender,nonce:'0'});
+  const signed=h.sign({sender:addr(h.other),nonce:'0',data_hex:data,height:s.status.height+1,position:0,confirmations:1},c,4242);
+  await h.publish([{...signed,sender:addr(h.recipient),sender_public_key:h.recipient}]);
+  eq(h.get('mail-list').children.length,0,'forged sender: never display');ok(h.get('mail-error').textContent.includes('could not be verified'),'forged sender: an opened envelope must match its signed sender');
+  h.history=[signed];await h.publish([]);eq(h.get('mail-list').children.length,0,'under its real signer the envelope does not open');eq(h.get('mail-error').textContent,'');
+ }
+ {
+  // Another account's envelope costs no signature check: a broken signature
+  // on it neither stops the scan nor hides later mail.
+  const h=await setup(),unrelated=await h.message({position:0},h.recipient,h.other),mine=await h.message({position:1},h.sender,h.recipient);
+  await h.publish([{...unrelated,raw:unrelated.raw.slice(0,-2)+(unrelated.raw.endsWith('00')?'01':'00')},mine]);
+  eq(h.get('mail-error').textContent,'','an unopened envelope is not signature-checked');eq(h.get('mail-list').children.length,1,'later own mail is found');ok(h.get('mail-scan-status').textContent.includes('2 checked · 1 found'));
  }
  {
   const h=await setup(),foreign={chain_id:'fe'.repeat(32),sender:h.recipient,recipient:h.sender,nonce:'0'};
@@ -63,7 +87,7 @@ async function run(){
  }
  {
   const h=await setup();let attempts=0;h.decryptMail=async()=>{attempts++;throw Error('not mine');};
-  const m=await h.message({},h.other,h.recipient);delete m.raw;await h.publish([m]);eq(attempts,0,'unrelated mail also requires a sender signature');ok(h.get('mail-error').textContent.includes('could not be verified'));
+  const m=await h.message({},h.other,h.recipient);delete m.raw;await h.publish([m]);eq(attempts,0,'unrelated rows still need their signed record');ok(h.get('mail-error').textContent.includes('could not be verified'));
  }
  {
   const h=await setup(),f=await h.compose();eq(h.wallet.length,0,'typing encrypts and quotes without signing');
@@ -212,6 +236,50 @@ async function run(){
  {
   const h=await setup(),m=await h.message();await h.publish([m]);const saved=[...h.savedMail.entries()].find(([k])=>k.startsWith('hashstash-mail-scan-3:')),prior=JSON.parse(saved[1]);h.savedMail.set=()=>{throw Error('QuotaExceededError');};
   const fresh=await h.message();await h.publish([fresh]);eq(h.get('mail-list').children.length,2,'storage failure preserves a working in-memory inbox');ok(h.get('mail-scan-status').textContent.includes('only for this visit'),'storage failure is visible');eq(JSON.parse(h.savedMail.get(saved[0])).cursor,prior.cursor,'quota failure retains earlier complete cursor');
+ }
+ {
+  // A key this browser creates can have no earlier mail: its first scan
+  // starts above the tip it was created at instead of at genesis.
+  const h=await setup({realWallet:true,publicWeb:true}),s=h.currentSnapshot;h.history.push(await h.message({height:s.status.height},h.recipient,h.other));
+  const birth={height:s.status.height,tip:s.status.tip};await h.navigate('#wallet');await h.get('wallet-create').click();await settle();
+  const created=h.browserStore.snapshot().public_key,startKey=`hashstash-mail-start-1:${s.status.chain_id}:${created}`;
+  eq(JSON.parse(h.savedStorage.get(startKey)),{version:1,height:birth.height,anchor:birth.tip,origin:'created'},'creating a wallet records the tip as its mail scan start');
+  const incoming=await h.message({height:birth.height+1},created,h.other),before=h.calls.length;await h.navigate('#mail');await h.publish([incoming]);
+  const requests=h.calls.slice(before).filter(x=>x.body.method==='explorer_mail').map(x=>x.body.params);
+  eq(requests[0].after,`${birth.height}:9223372036854775807`,'the first scan starts above the creation tip');eq(requests[0].anchor,birth.tip,'anchored at that block');
+  ok(requests.every(p=>Object.hasOwn(p,'after')),'history at or below the start is never requested');
+  eq(h.get('mail-list').children.length,1,'mail sent after creation is found');ok(h.get('mail-list').textContent.includes('Received'));
+  ok(h.get('mail-start-note').textContent.includes(`created in this browser at block ${birth.height}`));ok(h.get('mail-scan-status').textContent.includes(`from block ${birth.height+1}`));eq(h.get('mail-scan-genesis').hidden,false,'a genesis scan is offered');
+  const cleared=h.calls.length;await h.get('mail-clear-cache').click();await h.get('mail-more').click();await h.drain();
+  eq(h.calls.slice(cleared).find(x=>x.body.method==='explorer_mail').body.params.after,`${birth.height}:9223372036854775807`,'clearing the saved scan returns to the start, not to genesis');
+  const genesis=h.calls.length;await h.get('mail-scan-genesis').click();await h.drain();
+  ok(!Object.hasOwn(h.calls.slice(genesis).find(x=>x.body.method==='explorer_mail').body.params,'after'),'Scan from genesis rescans all history');ok(!h.savedStorage.has(startKey),'and forgets the start');
+  eq(h.get('mail-list').children.length,1);eq(h.get('mail-scan-genesis').hidden,true);ok(h.get('mail-start-note').textContent.includes('from genesis'));
+  h.get('import-private-key').value='0'.repeat(63)+'3';await h.get('wallet-import-form').requestSubmit();await settle();
+  ok(![...h.savedStorage.keys()].some(k=>k.startsWith('hashstash-mail-start-1:')&&!k.endsWith(created)),'an imported key gets no guessed start');
+ }
+ {
+  // An imported wallet can choose where its scan begins.
+  const h=await setup(),s=h.currentSnapshot,early=await h.message({},h.sender,h.recipient);await h.publish([early]);
+  const late=await h.message({height:early.height+3},h.sender,h.recipient);await h.publish([late]);eq(h.get('mail-list').children.length,2);
+  const form=h.get('mail-start-form'),startKey=`hashstash-mail-start-1:${s.status.chain_id}:${h.sender}`,tip=s.status.tip;
+  form.elements.height.value=String(s.status.height+1);await form.requestSubmit();await settle();
+  ok(h.get('mail-start-feedback').textContent.includes(`from 0 to ${s.status.height}`),'a start above the tip is refused');eq(h.get('mail-list').children.length,2,'and changes nothing');
+  const before=h.calls.length;form.elements.height.value=String(late.height);await form.requestSubmit();await h.drain();
+  const first=h.calls.slice(before).find(x=>x.body.method==='explorer_mail').body.params;
+  eq(first.after,`${late.height-1}:9223372036854775807`,'a chosen start rescans from that block');eq(first.anchor,tip,'anchored at the current tip');
+  eq(h.get('mail-list').children.length,1,'mail below the chosen block is not scanned');ok(h.get('mail-scan-status').textContent.includes(`from block ${late.height}`));
+  eq(JSON.parse(h.savedMail.get(startKey)),{version:1,height:late.height-1,anchor:tip,origin:'chosen'});ok(h.get('mail-start-note').textContent.includes(`scanned from block ${late.height}`));
+  form.elements.height.value='0';await form.requestSubmit();await h.drain();
+  ok(!h.savedMail.has(startKey),'block 0 scans from genesis');eq(h.get('mail-list').children.length,2,'and finds the earlier mail again');
+ }
+ {
+  // A start whose anchor the node does not know is dropped for a genesis scan.
+  const h=await setup(),m=await h.message();await h.publish([m]);
+  const startKey=`hashstash-mail-start-1:${h.currentSnapshot.status.chain_id}:${h.sender}`,saved=new Map([[startKey,JSON.stringify({version:1,height:m.height,anchor:'ab'.repeat(32),origin:'created'})]]);
+  const restored=await setup({savedMail:saved,initialSnapshot:h.currentSnapshot,history:h.history,invalidAnchor:true}),requests=restored.calls.filter(x=>x.body.method==='explorer_mail').map(x=>x.body.params);
+  eq(requests[0].after,`${m.height}:9223372036854775807`);ok(!Object.hasOwn(requests[1],'after'),'an unknown start anchor falls back to genesis');
+  eq(restored.get('mail-list').children.length,1,'so no mail is missed');ok(!saved.has(startKey),'and the start is dropped');
  }
  {
   const h=await harness({mail:true,empty:true});await h.refresh();await h.navigate('#mail');eq(h.calls.filter(c=>c.body.method==='explorer_mail').length,0);ok(h.get('mail-empty').textContent.includes('Select a wallet'));

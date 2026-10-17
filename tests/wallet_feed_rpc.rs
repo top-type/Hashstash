@@ -1,5 +1,6 @@
 //! Node RPC data the browser wallet relies on: blank chat text agrees with
-//! ui/chat.js, and the snapshot reports the selected sender's pending nonce.
+//! ui/chat.js, and the snapshot reports the selected sender's pending rows
+//! and, once, its pending nonce.
 use hashstash::{codec, config::Config, crypto, node::Node, types::*};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -91,13 +92,15 @@ fn snapshot_reports_the_selected_senders_pending_nonce() {
     let node = funded(&dir, &c);
     let key = hex::encode(owner());
     let snapshot = node.rpc("snapshot", json!({"key":key})).unwrap();
-    assert_eq!(snapshot["pending_nonce"], "0");
+    // A decimal string, like the account read it embeds.
+    assert_eq!(snapshot["account"]["pending_nonce"], "0");
+    assert!(snapshot.get("pending_nonce").is_none(), "reported once");
     assert_eq!(snapshot["sender_mempool"], json!([]));
     for nonce in 0..2 {
         node.submit_transaction(payment(&c, nonce, b"")).unwrap();
     }
     let snapshot = node.rpc("snapshot", json!({"key":key})).unwrap();
-    assert_eq!(snapshot["pending_nonce"], "2");
+    assert_eq!(snapshot["account"]["pending_nonce"], "2");
     let rows = snapshot["sender_mempool"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|row| row["body"]["nonce"].as_u64().unwrap() < 2));
@@ -115,11 +118,11 @@ fn snapshot_reports_the_selected_senders_pending_nonce() {
     );
     // Other senders' rows and unselected snapshots carry nothing extra.
     let anonymous = node.rpc("snapshot", json!({})).unwrap();
-    assert!(anonymous.get("pending_nonce").is_none());
+    assert!(anonymous["account"].is_null());
     assert!(anonymous.get("sender_mempool").is_none());
     let other = node
         .rpc("snapshot", json!({"key":hex::encode(recipient())}))
         .unwrap();
-    assert!(other["pending_nonce"].is_null());
+    assert!(other["account"].is_null());
     assert_eq!(other["sender_mempool"], json!([]));
 }

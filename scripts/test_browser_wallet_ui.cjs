@@ -211,10 +211,10 @@ async function run() {
     const f=await fill(c,alice);await f.requestSubmit();
     assert.equal(broadcasts(c).length,1,f.querySelector().textContent);checks++;
     const own={body:{sender:bob,nonce:0,operation:{TransferExact:{recipient:alice,amount:'100'}}}};
-    c.currentSnapshot.mempool=[];c.currentSnapshot.status.mempool=500;c.currentSnapshot.sender_mempool=[own];c.currentSnapshot.pending_nonce='1';
+    c.currentSnapshot.mempool=[];c.currentSnapshot.status.mempool=500;c.currentSnapshot.sender_mempool=[own];c.currentSnapshot.account={...c.currentSnapshot.account,pending_nonce:1};
     await c.refresh();await c.refresh();
     assert.match(f.querySelector().textContent,/^Pending · /,'the sender page shows the submission pending');checks++;
-    c.currentSnapshot.sender_mempool=[];c.currentSnapshot.pending_nonce='0';await c.refresh();await c.refresh();
+    c.currentSnapshot.sender_mempool=[];c.currentSnapshot.account={...c.currentSnapshot.account,pending_nonce:0};await c.refresh();await c.refresh();
     assert.match(f.querySelector().textContent,/^No longer pending · /,'a complete sender page detects a dropped submission');checks++;
   }
   console.log(`Browser wallet UI: ${checks} integration assertions passed.`);

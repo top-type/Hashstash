@@ -32,6 +32,14 @@ eq(cache.write(chain,wallet,{...state(),entries:[{...row(),raw:undefined}]}).sav
 eq(cache.clear(chain,wallet),{cleared:true});eq(cache.read(chain,wallet),{value:null});eq(cache.read(chain,other).value.entries.length,1,'clearing one cache preserves another wallet');
 const brokenKey=[...values.keys()][0];values.set(brokenKey,'{bad json');ok(cache.read(chain,other).error.includes('beginning'),'malformed local data starts full history scan');
 values.set(brokenKey,JSON.stringify({...state(),version:999}));eq(cache.read(chain,other).value,null,'unknown schema is never reused');
-const disabled=createCache({storage:null});ok(disabled.read(chain,wallet).error.includes('visit'));eq(disabled.write(chain,wallet,state()).saved,false);eq(disabled.clear(chain,wallet).cleared,false);
+// A scan start is kept beside the checkpoint, so clearing one keeps the other.
+{const start={version:1,height:40,anchor,origin:'created'};values.clear();
+ eq(cache.readStart(chain,wallet),null,'accounts start at genesis by default');eq(cache.writeStart(chain,wallet,start),{saved:true});eq(cache.readStart(chain,wallet),start);
+ eq(cache.readStart(chain,other),null,'starts are per account');eq(cache.readStart(other,wallet),null,'and per chain');
+ eq(cache.write(chain,wallet,state()),{saved:true});eq(cache.clear(chain,wallet),{cleared:true});eq(cache.readStart(chain,wallet),start,'clearing the saved scan keeps its start');
+ for(const bad of [{...start,version:2},{...start,height:-1},{...start,height:2**32},{...start,height:1.5},{...start,anchor:'bad'},{...start,origin:'guessed'}])eq(cache.writeStart(chain,other,bad).saved,false,'invalid starts are refused');
+ values.set([...values.keys()].find(k=>k.startsWith('hashstash-mail-start-1:')),'{bad json');eq(cache.readStart(chain,wallet),null,'an unreadable start falls back to genesis');
+ eq(cache.writeStart(chain,wallet,start).saved,true);eq(cache.clearStart(chain,wallet),{cleared:true});eq(cache.readStart(chain,wallet),null);eq(cache.read(chain,wallet),{value:null});}
+const disabled=createCache({storage:null});eq(disabled.readStart(chain,wallet),null);eq(disabled.writeStart(chain,wallet,{version:1,height:0,anchor,origin:'chosen'}).saved,false);ok(disabled.read(chain,wallet).error.includes('visit'));eq(disabled.write(chain,wallet,state()).saved,false);eq(disabled.clear(chain,wallet).cleared,false);
 const fault=createCache({storage:{getItem(){throw Error('SecurityError');},setItem(){throw Error('SecurityError');},removeItem(){throw Error('SecurityError');}}});eq(fault.read(chain,wallet).value,null);eq(fault.write(chain,wallet,state()).saved,false);eq(fault.clear(chain,wallet).cleared,false);
 console.log(`${checks} private mail cache checks passed`);

@@ -16,7 +16,7 @@ The node needs only the public mining key. Keep any private backup inaccessible 
 
 ## API boundaries
 
-Private JSON-RPC is POST `/rpc`, envelope `{jsonrpc:"2.0",id,method,params}`. RPC must bind loopback. Public-web mode exposes an allowlist of reads and signed-transaction submission without server-wallet management, secret material, software mining, configuration changes or arbitrary private methods. Serve browser wallets through HTTPS or localhost.
+Private JSON-RPC is POST `/rpc`, envelope `{jsonrpc:"2.0",id,method,params}`. RPC must bind loopback. Public-web mode exposes an allowlist of reads and signed-transaction submission without server-wallet management, secret material, software mining, configuration changes or arbitrary private methods. Serve browser wallets through HTTPS or localhost. Bind `--public-web` to loopback behind a reverse proxy with per-client limits, such as the [Linux template](../deploy/linux/README.md#public-wallet-website): the listener serves at most eight sessions, and proxied visitors share one admission budget. A directly exposed listener lets one host hold every session.
 
 JSON amounts are canonical nonnegative decimal integer strings; hashes and keys use documented hex strings or 32-byte arrays. RPC currency values are raw atoms. The UI converts 1,000 atoms to one hash and 1,000 share atoms to one stash.
 

@@ -1,51 +1,76 @@
-# Replace PUBLIC_IP with this server's IPv4 address. This proxy deliberately
-# has no route to the private wallet/admin RPC port.
+# Replace PUBLIC_HOST with this server's DNS name (preferred) or IPv4 address.
+# Browsers never apply Strict-Transport-Security to IP-address hosts (RFC 6797
+# section 8.1), so an IP-literal site cannot stop an on-path attacker from
+# stripping a visit that starts at http://. This proxy deliberately has no
+# route to the private wallet/admin RPC port.
+#
+# Every visitor reaches the restricted listener from 127.0.0.1, so all of them
+# share one node admission record: 8 sessions and 131,072 work units/s. One
+# transaction preparation, broadcast or explorer account read costs about
+# 4,200-6,700 units, roughly 20-30 such calls per second for everyone. The
+# per-client JSON-RPC rate below keeps each address far under that shared
+# budget; raising it lets a few clients deny those calls to all visitors.
 limit_req_zone $binary_remote_addr zone=hashstash_web:10m rate=15r/s;
+limit_req_zone $binary_remote_addr zone=hashstash_rpc:10m rate=2r/s;
 limit_conn_zone $binary_remote_addr zone=hashstash_connections:10m;
 
 server {
     listen 80 default_server;
-    server_name PUBLIC_IP;
+    server_name PUBLIC_HOST;
     location ^~ /.well-known/acme-challenge/ {
         root /var/www/hashstash-acme;
         try_files $uri =404;
     }
-    location / { return 308 https://PUBLIC_IP$request_uri; }
+    # A convenience redirect, not protection: an on-path attacker can drop it.
+    location / { return 308 https://PUBLIC_HOST$request_uri; }
 }
 
 server {
     listen 443 ssl default_server;
-    server_name PUBLIC_IP;
-    ssl_certificate /etc/letsencrypt/live/PUBLIC_IP/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/PUBLIC_IP/privkey.pem;
+    server_name PUBLIC_HOST;
+    ssl_certificate /etc/letsencrypt/live/PUBLIC_HOST/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/PUBLIC_HOST/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_session_cache shared:HashstashTLS:10m;
     ssl_session_timeout 1h;
     server_tokens off;
-    if ($host != PUBLIC_IP) { return 421; }
-    # Hex-encoded maximum block record plus JSON framing; the node enforces
-    # the current, usually much smaller, governed transaction capacity.
-    client_max_body_size 65m;
+    if ($host != PUBLIC_HOST) { return 421; }
+    # Only JSON-RPC carries a request body.
+    client_max_body_size 16k;
     client_body_timeout 10s;
     client_header_timeout 10s;
     keepalive_timeout 15s;
     send_timeout 15s;
-    limit_conn hashstash_connections 20;
+    # The node serves at most 8 public sessions in total.
+    limit_conn hashstash_connections 8;
     limit_req zone=hashstash_web burst=60 nodelay;
     limit_req_status 429;
-    add_header Strict-Transport-Security "max-age=86400" always;
+    limit_conn_status 429;
+    # Effective only for a DNS name; ignored for an IP-address host.
+    add_header Strict-Transport-Security "max-age=31536000" always;
     add_header X-Content-Type-Options nosniff always;
     add_header Referrer-Policy no-referrer always;
     add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+    proxy_set_header Host $host;
+    proxy_set_header Connection "";
+    proxy_set_header X-Forwarded-For "";
+    proxy_set_header X-Forwarded-Proto "";
+    proxy_http_version 1.1;
+    proxy_connect_timeout 3s;
+    proxy_read_timeout 20s;
+    proxy_send_timeout 10s;
+    location = /rpc {
+        # The node admits twice the governed BlockBytes plus 128 KiB of JSON
+        # (160 KiB at the default 16 KiB). Raise this only after governance
+        # enlarges blocks beyond 448 KiB.
+        client_max_body_size 1m;
+        # Location limits replace the server-level ones. Sequential callers
+        # are paced rather than refused; floods beyond the burst receive 429.
+        limit_conn hashstash_connections 4;
+        limit_req zone=hashstash_rpc burst=20 delay=10;
+        proxy_pass http://127.0.0.1:18483;
+    }
     location / {
         proxy_pass http://127.0.0.1:18483;
-        proxy_set_header Host $host;
-        proxy_set_header Connection "";
-        proxy_set_header X-Forwarded-For "";
-        proxy_set_header X-Forwarded-Proto "";
-        proxy_http_version 1.1;
-        proxy_connect_timeout 3s;
-        proxy_read_timeout 20s;
-        proxy_send_timeout 10s;
     }
 }

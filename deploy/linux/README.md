@@ -1,6 +1,6 @@
 # Linux nodes
 
-One persistent Hashstash 0.41.0 node per Linux host, managed by systemd. Each node exposes P2P, optionally exposes solo Stratum V1, keeps RPC on loopback, and pays its own configured public key. There is no wallet private key on the server and no software miner in this service. A dedicated peer transport key, when enabled, is separate from all spending keys.
+One persistent Hashstash 0.42.0 node per Linux host, managed by systemd. Each node exposes P2P, optionally exposes solo Stratum V1, keeps RPC on loopback, and pays its own configured public key. There is no wallet private key on the server and no software miner in this service. A dedicated peer transport key, when enabled, is separate from all spending keys.
 
 These files target Debian/Ubuntu with Bash, GNU coreutils, `awk`, `flock`, `useradd`, and systemd. The listener setup uses public IPv4; advertised Stratum endpoints may use DNS. No cloud provider is required by the scripts.
 
@@ -16,7 +16,7 @@ rustc --version --verbose
 cargo --version
 ```
 
-Keep the exact source snapshot, `Cargo.lock`, compiler versions, and binary SHA256 with the deployment record. Use that recorded SHA256 during installation; a hash obtained only from an untrusted download does not establish its origin. Copy the same built binary to hosts with a compatible architecture and Linux runtime. Use a normal build without the `test-fixtures` feature and a configuration with `test_work: false`. The installer pins version 0.41.0 and the complete binary hash under `/opt/hashstash/`; it will not silently upgrade an existing installation.
+Keep the exact source snapshot, `Cargo.lock`, compiler versions, and binary SHA256 with the deployment record. Use that recorded SHA256 during installation; a hash obtained only from an untrusted download does not establish its origin. Copy the same built binary to hosts with a compatible architecture and Linux runtime. Use a normal build without the `test-fixtures` feature and a configuration with `test_work: false`. The installer accepts only the release of its own source snapshot, version 0.42.0, and pins it with the complete binary hash under `/opt/hashstash/`; it will not silently upgrade an existing installation. Use the installer from the same source snapshot as the binary.
 
 ## Prepare shared and per-node files
 
@@ -53,10 +53,11 @@ Supply a separate mining password as a file, containing one nonempty ASCII token
 For a fixed operator-managed network, create a fresh dedicated transport identity for each node on a trusted preparation machine. This key only authenticates peer traffic; do not use a payout, visitor, activity or faucet key. The command prints only its public key and writes a new owner-only file without overwriting an existing file:
 
 ```sh
-./hashstash peer-keygen --out region-a-peer.json
+install -d -m 700 ~/hashstash-keys
+./hashstash peer-keygen --out ~/hashstash-keys/region-a-peer.json
 ```
 
-Exchange the public keys through an independently trusted channel. Set `PEER_KEY_FILE=/etc/hashstash/peer-identity.json` in each node's environment and set `PEER_PINS` to space-separated `IPv4:PORT=PUBLIC_KEY` entries. The endpoints must match `PEERS` exactly: one pin per peer, no duplicates, valid ports and IPv4 addresses without leading zeros. The incoming source IP must match the pin, so account for NAT before configuring it. Supply that node's identity with the installer's `--peer-key-file` argument. The installer validates its dedicated format, key agreement, owner-only permissions and separation from the payout key without opening listeners, then installs it as `hashstash:hashstash` mode `0600` under the root-owned configuration directory. It rejects symlink sources and never reads a wallet key format as a transport key.
+Keep identity files outside any source checkout and out of shared or group-writable directories; `.gitignore` ignores `*peer*.json` only as a backstop. Exchange the public keys through an independently trusted channel. Set `PEER_KEY_FILE=/etc/hashstash/peer-identity.json` in each node's environment and set `PEER_PINS` to space-separated `IPv4:PORT=PUBLIC_KEY` entries. The endpoints must match `PEERS` exactly: one pin per peer, no duplicates, valid ports and IPv4 addresses without leading zeros. The incoming source IP must match the pin, so account for NAT before configuring it. Supply that node's identity with the installer's `--peer-key-file` argument. The installer validates its dedicated format, key agreement, owner-only permissions and separation from the payout key without opening listeners, then installs it as `hashstash:hashstash` mode `0600` under the root-owned configuration directory. It rejects symlink sources and never reads a wallet key format as a transport key.
 
 Pinned transport fails closed when a key or pin is wrong; there is no unauthenticated retry. Omitting both settings selects unauthenticated transport. Authentication protects identity and message integrity, not traffic confidentiality. A fixed set of peers on one provider remains vulnerable to provider/network outages, partitions and compromised peers; it is not an eclipse-resistant discovery network. See [network hardening](../../docs/NETWORK-HARDENING.md).
 
@@ -69,16 +70,16 @@ bash deploy/linux/install.sh \
   --binary /path/hashstash --sha256 RECORDED_BINARY_SHA256 \
   --genesis /path/network.json --genesis-sha256 RECORDED_GENESIS_SHA256 \
   --node-env /path/node.env --stratum-password-file /path/mining-password \
-  --peer-key-file /path/region-a-peer.json --check
+  --peer-key-file ~/hashstash-keys/region-a-peer.json --check
 
 sudo bash deploy/linux/install.sh \
   --binary /path/hashstash --sha256 RECORDED_BINARY_SHA256 \
   --genesis /path/network.json --genesis-sha256 RECORDED_GENESIS_SHA256 \
   --node-env /path/node.env --stratum-password-file /path/mining-password \
-  --peer-key-file /path/region-a-peer.json
+  --peer-key-file ~/hashstash-keys/region-a-peer.json
 ```
 
-Omit `--stratum-password-file` when `STRATUM_ENABLED=false`. Omit `--peer-key-file` only when both peer-authentication settings are absent. `--check` validates inputs without installing or opening listeners. Installation creates a dedicated unprivileged account, root-owned non-secret configuration in `/etc/hashstash`, a pinned binary, and the service definition. The database and its auxiliary files live in `/var/lib/hashstash`. Repeating the installation accepts identical files and refuses conflicts; it never replaces configuration, identities or chain data. It neither enables nor starts the service.
+Omit `--stratum-password-file` when `STRATUM_ENABLED=false`. Omit `--peer-key-file` only when both peer-authentication settings are absent. `--check` validates inputs without installing or opening listeners. The installer first copies every input into a new private directory under `TMPDIR` (default `/tmp`), refusing a location another account could modify, then hashes, validates, runs and installs only those copies and re-hashes the installed binary and genesis. That directory must allow execution; on a host with a `noexec` `/tmp`, set `TMPDIR` to a root-owned executable directory. Installation creates a dedicated unprivileged account, root-owned non-secret configuration in `/etc/hashstash`, a pinned binary, and the service definition. The database and its auxiliary files live in `/var/lib/hashstash`. Repeating the installation accepts identical files and refuses conflicts; it never replaces configuration, identities or chain data. It neither enables nor starts the service.
 
 Before starting, allow inbound TCP P2P from the configured peer hosts and Stratum only when enabled and required by miners. Allow SSH from the administrator's addresses. Keep the RPC port closed to public traffic. The service binds P2P and enabled Stratum to `0.0.0.0` and RPC to `127.0.0.1`.
 
@@ -88,7 +89,7 @@ sudo systemctl status hashstash
 sudo journalctl -u hashstash -n 50 --no-pager
 sudo -u hashstash /usr/local/libexec/hashstash/run-node.sh snapshot
 sudo -u hashstash /usr/local/libexec/hashstash/run-node.sh peers
-sudo -u hashstash /opt/hashstash/0.41.0-RECORDED_BINARY_SHA256/hashstash rpc --url http://127.0.0.1:18480/rpc peerstatus
+sudo -u hashstash /opt/hashstash/0.42.0-RECORDED_BINARY_SHA256/hashstash rpc --url http://127.0.0.1:18480/rpc peerstatus
 ```
 
 These reads do not mine or submit transactions. `snapshot` includes chain height, tip, state root, issuance, phase, and Stratum worker/share counters; `peers` lists endpoints. `peerstatus` adds transport mode, successful exchange times, failures and stalled indicators. Its chain-stalled indicator also becomes true normally when there are no miners. Compare chain IDs first and tip/state roots at the same height across regions. A reachable RPC or connected worker alone does not establish that mining has produced valid blocks. Observe accepted shares, accepted blocks, payout balances, and peer convergence during the first mining run. Use a modest polling interval, such as 10 seconds.
@@ -111,14 +112,18 @@ Open `http://127.0.0.1:18480`, `:19480`, or `:20480` locally. The interface crea
 
 Add `PUBLIC_WEB_PORT=18483` to `node.env` to enable the separate public surface on `127.0.0.1:18483`. Omitting the field leaves it disabled. This listener serves the interface and an allowlist of chain reads, unsigned transaction preparation and signed transaction broadcast. It never exposes the private node wallet, wallet exports, software mining or block submission. The ordinary RPC listener remains private and must not be used as the reverse proxy's upstream.
 
-Use `public-web.nginx.template` with `PUBLIC_IP` replaced by the server's actual IPv4 address. The upstream is only the restricted port 18483. The template sets client request/connection limits and HTTPS delivery; it requires a trusted certificate before activation. Do not serve a hot wallet over public HTTP or instruct users to bypass a certificate warning. Localhost remains suitable for development.
+Use `public-web.nginx.template` with `PUBLIC_HOST` replaced by the server's DNS name, or by its actual IPv4 address. The upstream is only the restricted port 18483. The template sets client request/connection limits and HTTPS delivery; it requires a trusted certificate before activation. Do not serve a hot wallet over public HTTP or instruct users to bypass a certificate warning. Localhost remains suitable for development.
 
-Let’s Encrypt supports IP address certificates with its short-lived profile. Certbot 5.4 or later supports obtaining them through an HTTP webroot challenge. After registering the certificate account and accepting its subscriber agreement, issuance uses:
+Prefer a DNS name. Browsers honour the template's Strict-Transport-Security header only for DNS names; RFC 6797 has them ignore it for IP-address hosts, and an IP address cannot be preloaded. On an IP-literal site, every visit that starts at `http://` can be intercepted by an on-path attacker who suppresses the port-80 redirect and serves a look-alike wallet; existing HTTPS-origin wallets stay unreadable to it, but keys created or imported there are exposed. Publish and bookmark the `https://` address, and tell users never to create or import a wallet on a page reached through `http://`.
+
+Every public visitor reaches the node from the proxy's loopback address, so all visitors share one admission record and work budget (see [network controls](../../docs/NETWORK-HARDENING.md)). The template therefore limits each client address to 2 JSON-RPC requests per second with a burst of 20, so roughly 10 to 15 addresses are needed to exhaust the shared transaction-preparation, broadcast and explorer budget. Raising that rate lets a few clients deny those calls to every visitor; enough addresses can always exhaust a shared quota.
+
+For a DNS name, issue an ordinary certificate through the same webroot, for example `certbot certonly --webroot --webroot-path /var/www/hashstash-acme -d PUBLIC_HOST --cert-name PUBLIC_HOST`. Let’s Encrypt supports IP address certificates with its short-lived profile. Certbot 5.4 or later supports obtaining them through an HTTP webroot challenge. After registering the certificate account and accepting its subscriber agreement, issuance for an IP address uses:
 
 ```sh
 certbot certonly --preferred-profile shortlived \
   --webroot --webroot-path /var/www/hashstash-acme \
-  --ip-address PUBLIC_IP --cert-name PUBLIC_IP
+  --ip-address PUBLIC_HOST --cert-name PUBLIC_HOST
 ```
 
 Serve only `/.well-known/acme-challenge/` from that webroot on port 80 during setup. Then activate the complete HTTPS proxy, and allow public TCP 80 and 443 in both firewalls. Keep 18483 and the private RPC port closed externally. Run `certbot renew` at least twice daily and configure a deploy hook that validates and reloads nginx after renewal. Verify a renewal dry run, certificate validation from another machine, and public rejection of private methods before accepting wallets. Certificate guidance: [Let’s Encrypt's Certbot instructions](https://letsencrypt.org/2026/03/11/shorter-certs-certbot/).
@@ -135,6 +140,6 @@ systemd sends SIGINT, which the node handles for shutdown. Keep the complete `/v
 
 Upgrades are an explicit maintenance step: stop the service, preserve a backup, verify the new release and its chain compatibility, then change the binary pin and any reviewed service files. The installer intentionally refuses to perform this replacement automatically. Never change the genesis file to upgrade a running chain.
 
-The supplied service sets `MemoryHigh=512M`, `MemoryMax=1G` and `TasksMax=128`. These are operator safeguards, not proven capacity requirements: a valid larger state or replay may exceed them and be killed by the kernel. Monitor memory pressure, OOM restarts, disk growth, peers and replay time; adjust limits to measured legitimate demand. Header metadata and replay paths use bounded caches/disk indexes, but account state and retained history still grow. History is not pruned. The default 16 KiB block capacity and a 15-second observed interval alone permit about 94 MB/day of block bodies before database/index overhead; actual growth follows mining and transactions.
+The supplied service runs without capabilities and also restricts system calls to `@system-service` (others fail with `EPERM`), namespaces, kernel and control-group interfaces, writable executable memory, other processes in `/proc`, and core dumps (`LimitCORE=0`). Directives unknown to an older systemd are ignored with a log warning; review `systemd-analyze security hashstash` after installation. It sets `MemoryHigh=512M`, `MemoryMax=1G` and `TasksMax=128`. These are operator safeguards, not proven capacity requirements: a valid larger state or replay may exceed them and be killed by the kernel. Monitor memory pressure, OOM restarts, disk growth, peers and replay time; adjust limits to measured legitimate demand. Header metadata and replay paths use bounded caches/disk indexes, but account state and retained history still grow. History is not pruned. The default 16 KiB block capacity and a 15-second observed interval alone permit about 94 MB/day of block bodies before database/index overhead; actual growth follows mining and transactions.
 
-Run `bash deploy/linux/test-launcher.sh` for isolated launcher argument/admission regressions. It uses a stub binary and temporary files, never the host service paths. `bash deploy/linux/test-install-check.sh /absolute/path/hashstash` exercises read-only installation checks with the real Linux release; it creates only disposable fixture identities/configuration and does not install, enable or start a service.
+Run `bash deploy/linux/test-launcher.sh` for isolated launcher argument/admission regressions. It uses a stub binary and temporary files, never the host service paths. `bash deploy/linux/test-install-check.sh /absolute/path/hashstash` exercises read-only installation checks with the real Linux release; it creates only disposable fixture identities/configuration and does not install, enable or start a service. On Linux, `cargo test --locked --test operator_files` runs both scripts against the freshly built binary and checks that the installer's pinned version matches `Cargo.toml`.

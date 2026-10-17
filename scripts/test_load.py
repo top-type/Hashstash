@@ -6,7 +6,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 # http() waits out and resends a request the node refused with 429 or 503
-# (Retry-After); the report counts them, and the documented load needs none.
+# (Retry-After). The documented load must fit the node's admission budgets,
+# so any such refusal fails the check unless --allow-admission-refusals.
 from test_network import admission_refusals, http, rpc, quoted_miner_fee
 TRANSACTIONS_PER_WAVE = 64
 PAID_FEE = 3
@@ -56,9 +57,17 @@ def main():
     parser.add_argument('--report', type=Path, required=True)
     parser.add_argument('--transactions-per-wave', type=int, default=TRANSACTIONS_PER_WAVE, help='Transactions queued per block, bounded by the current mempool limit.')
     parser.add_argument('--assert-high-occupancy', action='store_true', help='Require every wave above half capacity and verify that block usage cannot change the governed fee rate.')
+    parser.add_argument('--allow-admission-refusals', action='store_true', help='Wait out and resend requests the node refuses with 429 or 503 instead of failing; for custom workloads beyond the documented one, which must need none.')
     args = parser.parse_args()
     if args.rounds < 1 or args.setup_block_limit < 1 or (not 1 <= args.transactions_per_wave <= 4096):
         parser.error('--rounds and --setup-block-limit must be positive')
+
+    def require_admitted(stage):
+        refused = admission_refusals()
+        assert args.allow_admission_refusals or refused == 0, (
+            f'{stage}: the node refused {refused} request(s) on admission grounds (429/503); '
+            'the documented load must fit its budgets. Pass --allow-admission-refusals to tolerate this for a custom workload.')
+
     manifest = json.loads(args.manifest.read_text(encoding='utf-8-sig'))
     nodes = manifest['nodes']
     port = nodes[0]['rpc_port']
@@ -73,6 +82,7 @@ def main():
     assert rpc(port, 'status')['chain_id'] == manifest['chain_id'], 'Network differs from selected manifest'
     setup = prepare_load(port, key, args.rounds, args.setup_block_limit, transactions)
     transfer = {'TransferExact': {'recipient': list(bytes.fromhex(key)), 'amount': '1'}}
+    require_admitted('load setup')
     print(f"PASS load setup: {setup['funded_ordinary']} ordinary HASH covers the fee budget", flush=True)
     batches = []
     with ThreadPoolExecutor(max_workers=3) as executor:
@@ -143,6 +153,7 @@ def main():
                 assert time.monotonic() < deadline, peers
                 time.sleep(0.1)
             batches.append({'batch': wave + 1, 'height': after['height'], 'transactions': transactions, 'transaction_weight': wave_weight, 'block_capacity': before['settings']['block_bytes'], 'occupancy_ratio': wave_weight / before['settings']['block_bytes'], 'wire_json_bytes': len(json.dumps(block)), 'fees_paid': str(fees_paid), 'miner_fees': str(miner_fees), 'before_fee_policy': before['fee_policy'], 'after_fee_policy': after['fee_policy']})
+            require_admitted(f'wave {wave + 1}')
             print(f'PASS full-pool wave {wave + 1}/{args.rounds}: all {transactions} relayed, mined, and reconciled', flush=True)
     empty_rates = []
     rate = rpc(port, 'status')['settings']['minimum_fee_rate']
@@ -153,7 +164,11 @@ def main():
         assert 'fee_market' not in status
         empty_rates.append(rate)
     print('PASS loaded and empty blocks preserve the governed fee rate', flush=True)
-    print(f'PASS admission: {admission_refusals()} refused requests waited out and resent', flush=True)
+    require_admitted('empty blocks')
+    if admission_refusals():
+        print(f'PASS admission (allowed): {admission_refusals()} refused requests waited out and resent', flush=True)
+    else:
+        print('PASS admission: no request was refused (429/503)', flush=True)
     report = {**fixture_mode, 'passed': True, 'node_sha256': hashlib.sha256(Path(manifest['executable']).read_bytes()).hexdigest(), 'transactions': transactions * args.rounds, 'setup': setup, 'empty_block_minimum_rates': empty_rates, 'admission_refusals': admission_refusals(), 'rounds': batches, 'elapsed_seconds': round(time.monotonic() - started, 2), 'final_status': rpc(port, 'status')}
     args.report.write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
 if __name__ == '__main__':

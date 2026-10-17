@@ -434,7 +434,18 @@
             }),
             cache: "no-store"
         });
-        if (!response.ok) throw new Error(`Node request failed (${response.status}).`);
+        if (!response.ok) {
+            // A refusal (429, 503) still carries the node's JSON-RPC error,
+            // and Retry-After says when the request may be sent again.
+            let message = null;
+            try {
+                message = (await exactJSON(response))?.error?.message;
+            } catch {}
+            const wait = response.headers?.get?.("Retry-After") || "";
+            const retry = /^[0-9]{1,5}$/.test(wait) ? wait : null;
+            if (typeof message !== "string" || !message) throw new Error(`Node request failed (${response.status}).`);
+            throw new Error(retry ? `${message} (try again in ${retry} s)` : message);
+        }
         const data = await exactJSON(response);
         if (data.error) throw new Error(data.error.message || "The node rejected this request.");
         return data.result;

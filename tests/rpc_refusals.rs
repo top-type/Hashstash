@@ -1,5 +1,6 @@
-//! The private RPC answers every request it refuses on admission grounds
-//! with a status and a time to retry, and the documented local wallet load
+//! The private RPC answers a request it refuses on admission grounds with a
+//! status and a time to retry (a connection refused before its session
+//! starts, once per address and wait), and the documented local wallet load
 //! fits its budgets.
 use hashstash::{
     config::Config,
@@ -11,7 +12,11 @@ use std::{
     net::SocketAddr,
     time::{Duration, Instant},
 };
-use tokio::{io::AsyncWriteExt, net::TcpStream};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpSocket, TcpStream},
+    time::timeout,
+};
 
 fn options() -> ServerOptions {
     let zero: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -175,6 +180,17 @@ async fn an_exhausted_rpc_budget_is_answered_with_429_and_a_time_to_retry() {
     server.stop().await;
 }
 
+/// An unfinished request from `host`, which holds one private RPC session.
+async fn hold_session(rpc: SocketAddr, host: u8) -> TcpStream {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket
+        .bind(SocketAddr::from(([127, 0, 0, host], 0)))
+        .unwrap();
+    let mut stream = socket.connect(rpc).await.unwrap();
+    stream.write_all(b"POST /rpc HTTP/1.1\r\n").await.unwrap();
+    stream
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn connections_refused_before_their_session_starts_are_answered() {
     let directory = tempfile::tempdir().unwrap();
@@ -183,14 +199,23 @@ async fn connections_refused_before_their_session_starts_are_answered() {
     let node = Node::open(&database, Config::devnet(), miner).unwrap();
     let server = node::serve(node, options()).await.unwrap();
     let rpc = format!("http://{}/rpc", server.rpc);
-    // Eight unfinished requests hold every private RPC session.
+    // Eight other loopback addresses hold every private RPC session, so
+    // 127.0.0.1 is refused for busy sessions, not for its own quota.
     let mut held = Vec::new();
-    for _ in 0..8 {
-        let mut stream = TcpStream::connect(server.rpc).await.unwrap();
-        stream.write_all(b"POST /rpc HTTP/1.1\r\n").await.unwrap();
-        held.push(stream);
+    for host in 2..=9 {
+        held.push(hold_session(server.rpc, host).await);
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
+    // Without a well-formed request line, nothing is answered.
+    let mut bare = TcpStream::connect(server.rpc).await.unwrap();
+    bare.write_all(b"\r\n").await.unwrap();
+    let mut answer = Vec::new();
+    let _ = timeout(Duration::from_secs(5), bare.read_to_end(&mut answer))
+        .await
+        .expect("an unanswered refusal is closed");
+    assert!(answer.is_empty(), "{}", String::from_utf8_lossy(&answer));
+    // That attempt used this address's answer for the next second.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let client = reqwest::Client::new();
     let status = json!({"jsonrpc":"2.0","id":1,"method":"status","params":{}});
     let busy = client
@@ -205,19 +230,66 @@ async fn connections_refused_before_their_session_starts_are_answered() {
         busy.json::<Value>().await.unwrap()["error"]["message"],
         "HTTP sessions busy"
     );
+    // One answer per address and Retry-After: an attempt before it has
+    // passed is closed unanswered, as every refusal used to be.
+    assert!(client.post(&rpc).json(&status).send().await.is_err());
+    // The command-line client reports the node's message and wait.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let cli = node::RpcClient::new(&rpc, false).unwrap();
+    let error = cli
+        .call("status", json!({}), node::RpcLimits::SMALL)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("HTTP 503, retry after 1 s") && error.contains("HTTP sessions busy"),
+        "{error}"
+    );
     drop(held);
-    // Closed sessions return their slots; the refusal cost the client nothing.
+    // A client that waits as told is answered each time, and served once
+    // the closed sessions have returned their slots.
     let mut served = None;
-    for _ in 0..50 {
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
         let response = client.post(&rpc).json(&status).send().await.unwrap();
         if response.status() == 200 {
             served = Some(response);
             break;
         }
         assert_eq!(response.status(), 503);
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let served = served.expect("sessions were released");
     assert_eq!(served.json::<Value>().await.unwrap()["result"]["height"], 0);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_address_past_its_connection_quota_is_told_when_to_return() {
+    let directory = tempfile::tempdir().unwrap();
+    let miner = crypto::public_key(&[124; 32]).unwrap();
+    let database = directory.path().join("chain.sqlite");
+    let node = Node::open(&database, Config::devnet(), miner).unwrap();
+    let server = node::serve(node, options()).await.unwrap();
+    let rpc = format!("http://{}/rpc", server.rpc);
+    // Admission runs before session capacity is taken, so an address
+    // holding its eight connections hears about its own quota.
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        held.push(hold_session(server.rpc, 1).await);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let status = json!({"jsonrpc":"2.0","id":1,"method":"status","params":{}});
+    let client = reqwest::Client::new();
+    let refused = client.post(&rpc).json(&status).send().await.unwrap();
+    assert_eq!(refused.status(), 429);
+    assert_eq!(retry_after(&refused), 1);
+    assert_eq!(
+        refused.json::<Value>().await.unwrap()["error"]["message"],
+        "per-address connection limit"
+    );
+    drop(held);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let served = client.post(&rpc).json(&status).send().await.unwrap();
+    assert_eq!(served.status(), 200);
     server.stop().await;
 }

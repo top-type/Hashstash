@@ -4038,21 +4038,38 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
                         }
                     };
                     if kind == 1 && n.peer_auth.as_ref().is_some_and(|p| !p.allows_ip(address.ip())) { drop(stream); continue; }
+                    let surface=match kind {0|3=>Surface::Rpc,1=>Surface::Peer,_=>Surface::Stratum};
+                    let guard = if web { &http.guard } else { &n.guard };
+                    // As for peers and Stratum, an HTTP connection is admitted before it
+                    // takes listener or session capacity, so an attempt refused for want of
+                    // capacity still spends its address's request unit and respects its
+                    // cooldown. A refused HTTP connection is answered rather than dropped:
+                    // a cooldown or connection quota with 429, busy capacity with 503.
+                    let web_admission = if web {
+                        match guard.admit(address.ip(), surface) {
+                            Ok(admission) => Some(admission),
+                            Err(error) => {
+                                let refusal = HttpRefusal::of(&error)
+                                    .unwrap_or_else(|| HttpRefusal::busy("connection refused"));
+                                refuse_connection(&mut clients, &refusals, guard, address, stream, refusal);
+                                continue
+                            }
+                        }
+                    } else { None };
                     // A Stratum connection's capacity is its pre-authorization slot, which it
                     // holds only until authorization; authorized workers are bounded by the
                     // worker registry, so unauthenticated sockets cannot occupy their capacity.
                     let permit = if kind == 2 { None } else {
                         let Ok(permit) = limit.clone().try_acquire_owned() else {
-                            if web {
+                            if let Some(admission) = web_admission {
+                                drop(admission);
                                 let refusal = HttpRefusal::busy("connection limit reached");
-                                refuse_connection(&mut clients, &refusals, stream, refusal);
+                                refuse_connection(&mut clients, &refusals, guard, address, stream, refusal);
                             }
                             continue
                         };
                         Some(permit)
                     };
-                    let surface=match kind {0|3=>Surface::Rpc,1=>Surface::Peer,_=>Surface::Stratum};
-                    let guard = if kind == 0 || kind == 3 { &http.guard } else { &n.guard };
                     let (admission, capacity, pending) = if kind == 1 {
                         // Rate limits and cooldowns apply before slot selection, so a
                         // connection flood spends its own request budget.
@@ -4071,21 +4088,12 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
                         let Some(id) = SessionIds::allocate(&n.mining_session_ids) else { drop(stream); continue };
                         (admission, SessionCapacity::Mining(id), Some(slot))
                     } else {
-                        // An HTTP connection refused here is answered, not dropped: a
-                        // cooldown or connection quota with 429, busy sessions with 503.
+                        let admission = web_admission.expect("HTTP connections are admitted first");
                         let Ok(permit) = http.sessions.clone().try_acquire_owned() else {
+                            drop(admission);
                             let refusal = HttpRefusal::busy("HTTP sessions busy");
-                            refuse_connection(&mut clients, &refusals, stream, refusal);
+                            refuse_connection(&mut clients, &refusals, guard, address, stream, refusal);
                             continue
-                        };
-                        let admission = match guard.admit(address.ip(), surface) {
-                            Ok(admission) => admission,
-                            Err(error) => {
-                                let refusal = HttpRefusal::of(&error)
-                                    .unwrap_or_else(|| HttpRefusal::busy("connection refused"));
-                                refuse_connection(&mut clients, &refusals, stream, refusal);
-                                continue
-                            }
                         };
                         (admission, SessionCapacity::Http(permit), None)
                     };
@@ -4953,6 +4961,23 @@ fn token_matches(candidate: Option<&str>, expected: &str) -> bool {
         == 0
 }
 
+/// An HTTP/1.x request line's method and target: exactly one space separates
+/// its three non-empty printable ASCII tokens, and it ends in CRLF.
+fn http_request_line(line: &[u8]) -> Result<(&str, &str)> {
+    ensure!(line.ends_with(b"\r\n"), "invalid HTTP request line");
+    let line = std::str::from_utf8(line)?;
+    let parts: Vec<_> = line[..line.len() - 2].split(' ').collect();
+    ensure!(
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_graphic()))
+            && (parts[2] == "HTTP/1.1" || parts[2] == "HTTP/1.0"),
+        "invalid HTTP request line"
+    );
+    Ok((parts[0], parts[1]))
+}
+
 async fn read_http<R: AsyncBufRead + Unpin>(
     read: &mut R,
     local: SocketAddr,
@@ -4970,20 +4995,8 @@ async fn read_http<R: AsyncBufRead + Unpin>(
     };
     let head = tokio::time::Instant::now() + head_timeout;
     let first = tokio::time::timeout_at(head, bounded_line(read, 4096)).await??;
-    ensure!(first.ends_with(b"\r\n"), "invalid HTTP request line");
-    let first = std::str::from_utf8(&first)?;
-    // Exactly one space separates the three request-line tokens.
-    let parts: Vec<_> = first[..first.len() - 2].split(' ').collect();
-    ensure!(
-        parts.len() == 3
-            && parts
-                .iter()
-                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_graphic()))
-            && (parts[2] == "HTTP/1.1" || parts[2] == "HTTP/1.0"),
-        "invalid HTTP request line"
-    );
-    let method = parts[0].to_owned();
-    let path = parts[1].to_owned();
+    let (method, path) = http_request_line(&first)?;
+    let (method, path) = (method.to_owned(), path.to_owned());
     ensure!(
         path.starts_with('/'),
         "absolute request targets are unsupported"
@@ -5112,10 +5125,17 @@ async fn read_http<R: AsyncBufRead + Unpin>(
 /// with unread input usually resets the connection and discards the response,
 /// so end the write side and discard a bounded amount of input first.
 async fn finish_http<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(read: &mut R, write: &mut W) {
+    finish_http_within(read, write, 256 * 1024).await;
+}
+async fn finish_http_within<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+    read: &mut R,
+    write: &mut W,
+    limit: u64,
+) {
     let _ = write.shutdown().await;
     let _ = timeout(
         Duration::from_secs(1),
-        tokio::io::copy(&mut (&mut *read).take(256 * 1024), &mut tokio::io::sink()),
+        tokio::io::copy(&mut (&mut *read).take(limit), &mut tokio::io::sink()),
     )
     .await;
 }
@@ -5176,8 +5196,9 @@ fn http_error(message: &str) -> Value {
 /// when to resend it: 429 for the client's own quota (a cooldown or an
 /// exhausted request, byte or work budget), 503 for local capacity that all
 /// clients share. A charge beyond the quota's whole burst can never be
-/// admitted and is answered 400. Each answer is a short fixed-shape error,
-/// so refusing costs less than the request it refuses.
+/// admitted and is answered 400. Each answer is a short fixed-shape error.
+/// A public reply refused by its byte budget after the request ran is not
+/// one of these: it is answered 200 with a JSON-RPC error.
 struct HttpRefusal {
     status: u16,
     retry_after: Option<u64>,
@@ -5246,35 +5267,51 @@ async fn refuse_request<W: AsyncWrite + Unpin>(
 const HTTP_REFUSAL_REPLIES: usize = 16;
 /// A refused connection's request head is awaited for at most this long,
 /// within the usual 16 KiB head limit, because HTTP clients expect the answer
-/// after their request; one that sends no complete head closes unanswered.
+/// after their request; one that sends no well-formed head closes unanswered.
 const HTTP_REFUSAL_HEAD: Duration = Duration::from_secs(2);
 /// One refusal answer's write deadline. Discarding the client's unread body
 /// afterwards, so the answer is not lost to a reset, has its own bounded
-/// time and size in `finish_http`.
+/// time in `finish_http_within`.
 const HTTP_REFUSAL_WRITE: Duration = Duration::from_secs(1);
-/// Answer a refused HTTP connection while a refusal reply slot is free;
-/// otherwise close it unanswered. Admitted sessions never wait for these.
+/// Unread body bytes discarded after an answer to a connection refused before
+/// its session started: enough for an ordinary RPC or wallet request, and no
+/// more than the head limit, since such a connection's data is not charged.
+const HTTP_REFUSAL_DRAIN: u64 = 16 * 1024;
+/// Answer a refused HTTP connection while a refusal reply slot is free and
+/// its address was not already answered within the Retry-After it was given
+/// (`NetworkGuard::answer_refusal`); otherwise close it unanswered, as
+/// before. Admitted sessions never wait for these.
 fn refuse_connection(
     clients: &mut tokio::task::JoinSet<()>,
     replies: &Arc<Semaphore>,
+    guard: &NetworkGuard,
+    address: SocketAddr,
     stream: TcpStream,
     refusal: HttpRefusal,
 ) {
-    if let Ok(permit) = replies.clone().try_acquire_owned() {
-        clients.spawn(async move {
-            let _permit = permit;
-            refuse_http(stream, refusal).await;
-        });
+    let Ok(permit) = replies.clone().try_acquire_owned() else {
+        return;
+    };
+    let window = Duration::from_secs(refusal.retry_after.unwrap_or(1));
+    if !guard.answer_refusal(address.ip(), Surface::Rpc, window) {
+        return;
     }
+    clients.spawn(async move {
+        let _permit = permit;
+        refuse_http(stream, refusal).await;
+    });
 }
 /// Answer a connection refused before its session started, such as one
 /// arriving during its address's cooldown or while every session is busy.
-/// Only the head's framing is read; nothing in it is parsed or charged.
+/// It is answered only after a request line that passes `read_http`'s check
+/// and a bounded head; nothing else in the head is interpreted or charged.
 async fn refuse_http(stream: TcpStream, refusal: HttpRefusal) {
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
     let head = async {
-        let mut size = 0;
+        let first = bounded_line(&mut read, 4096).await?;
+        http_request_line(&first)?;
+        let mut size = first.len();
         loop {
             let line = bounded_line(&mut read, 4096).await?;
             size += line.len();
@@ -5282,6 +5319,7 @@ async fn refuse_http(stream: TcpStream, refusal: HttpRefusal) {
             if line == b"\r\n" {
                 return anyhow::Ok(());
             }
+            ensure!(line.ends_with(b"\r\n"), "invalid HTTP header line");
         }
     };
     if !matches!(timeout(HTTP_REFUSAL_HEAD, head).await, Ok(Ok(()))) {
@@ -5291,7 +5329,7 @@ async fn refuse_http(stream: TcpStream, refusal: HttpRefusal) {
         timeout(HTTP_REFUSAL_WRITE, refusal.send_error(&mut write)).await,
         Ok(Ok(()))
     ) {
-        finish_http(&mut read, &mut write).await;
+        finish_http_within(&mut read, &mut write, HTTP_REFUSAL_DRAIN).await;
     }
 }
 /// Like peer replies, public-web replies spend the byte budget without
@@ -5728,12 +5766,11 @@ async fn http_session(
     let limit = response_frame;
     let refused = if body.len() > limit {
         Some("RPC response exceeds the local response limit")
-    } else if public
-        && let Err(e) = charge_public_reply(&http.guard, &admission, body.len(), limit)
-    {
-        // Never a cooldown: the node chose the reply's size. The client
-        // retries once its byte budget has refilled.
-        refusal = HttpRefusal::of(&e);
+    } else if public && charge_public_reply(&http.guard, &admission, body.len(), limit).is_err() {
+        // Never a cooldown: the node chose the reply's size. The request has
+        // already run, so this is no admission refusal and keeps the status
+        // its result had: 429 and 503 promise that nothing ran, and a
+        // broadcast whose reply is replaced here may already be relayed.
         Some("public response byte budget exhausted; try again")
     } else {
         None
@@ -6536,12 +6573,18 @@ mod read_admission_tests {
         let frame = http_response_frame(16 * 1024, 48 * 1024 * 1024).unwrap();
         assert!(reply <= frame);
         charge_public_reply(&guard, &session, reply, frame).unwrap();
-        // The next one exceeds the remaining budget: a retryable refusal,
-        // never a cooldown for a size the node chose.
+        // The next one exceeds the remaining budget: a refusal that says when
+        // the budget has refilled, never a cooldown for a size the node chose.
         let refused = charge_public_reply(&guard, &session, reply, frame).unwrap_err();
-        let answer = HttpRefusal::of(&refused).expect("a quota refusal");
-        assert_eq!(answer.status, 429, "{refused}");
-        assert!(answer.retry_after.is_some_and(|s| (1..=4).contains(&s)));
+        let limited = refused
+            .downcast_ref::<network_guard::Limited>()
+            .expect("a quota refusal");
+        assert_eq!(limited.reason, "outgoing network budget exhausted");
+        assert!(
+            limited
+                .retry_after
+                .is_some_and(|wait| wait <= Duration::from_secs(4))
+        );
         session.request().unwrap();
         drop(guard.admit(remote, Surface::Rpc).unwrap());
     }
@@ -6721,6 +6764,8 @@ pub fn rpc_json_values(bytes: &[u8]) -> usize {
     values
 }
 
+/// The most of an HTTP error reply's body read for its JSON error message.
+const RPC_ERROR_BYTES: usize = 64 * 1024;
 /// Client transport for command-line RPC. Plain HTTP is limited to loopback
 /// IP literals unless explicitly allowed; environment proxies and redirects are
 /// never followed, so replies come only from the endpoint the user named.
@@ -6789,7 +6834,33 @@ impl RpcClient {
             !response.status().is_redirection(),
             "RPC endpoint answered with a redirect; use its final URL"
         );
-        let mut response = response.error_for_status()?;
+        let mut response = response;
+        if let Some(failed) = response.error_for_status_ref().err() {
+            // A refusal (429, 503) or other HTTP error still carries the
+            // node's short JSON error; show it, and when to resend, instead
+            // of the bare status.
+            let retry = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| format!(", retry after {value} s"))
+                .unwrap_or_default();
+            let status = response.status().as_u16();
+            let mut bytes = Vec::new();
+            while let Ok(Some(chunk)) = response.chunk().await {
+                if bytes.len() + chunk.len() > RPC_ERROR_BYTES {
+                    return Err(failed.into());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let error = serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .and_then(|mut body| body.get_mut("error").map(Value::take));
+            return Err(match error {
+                Some(error) => anyhow!("RPC error (HTTP {status}{retry}): {error}"),
+                None => failed.into(),
+            });
+        }
         ensure!(
             response.content_length().unwrap_or(0) <= maximum as u64,
             "RPC response too large"

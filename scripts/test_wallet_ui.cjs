@@ -762,6 +762,14 @@ async function run() {
  eq(visitor.get('trade-submit').disabled,true,'a visitor must select and fund a wallet before signing a deposit');
  h.currentSnapshot=s;await h.refresh();
  h.handlers.snapshot=()=>response({error:{message:'offline'}});await h.refresh();eq(h.get('sidebar-height-value').textContent,'—');eq(h.get('network-status').dataset.ready,'false');
+ // An admission refusal (429/503) shows the node's JSON-RPC message and its Retry-After wait; other HTTP failures keep the generic status text.
+ const refused=(status,wait,body)=>({ok:false,status,headers:{get:name=>name==='Retry-After'?wait:null},text:async()=>body});
+ h.handlers.snapshot=()=>refused(429,'2',JSON.stringify({jsonrpc:'2.0',id:1,error:{code:-32000,message:'network rate budget exhausted'}}));await h.refresh();
+ eq(h.get('global-alert').textContent,'Could not refresh the node: network rate budget exhausted (try again in 2 s)');
+ h.handlers.snapshot=()=>refused(503,null,JSON.stringify({error:{message:'HTTP sessions busy'}}));await h.refresh();
+ eq(h.get('global-alert').textContent,'Could not refresh the node: HTTP sessions busy');
+ h.handlers.snapshot=()=>refused(502,null,'<html>bad gateway</html>');await h.refresh();
+ eq(h.get('global-alert').textContent,'Could not refresh the node: Node request failed (502).');
  delete h.handlers.snapshot;s.status.height=1234;await h.refresh();eq(h.get('sidebar-height-value').textContent,'1,234');eq(h.get('sidebar-height').href,'#explorer?block=1234');
  s.status.height=1229;s.status.tip='e'.repeat(64);await h.refresh();eq(h.get('sidebar-height-value').textContent,'1,229');
  h.handlers.snapshot=p=>response({result:{...h.snapshotResult(p),status:{...s.status,chain_id:'f'.repeat(64)}}});

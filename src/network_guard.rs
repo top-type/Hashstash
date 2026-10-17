@@ -316,6 +316,9 @@ struct Record {
     active: usize,
     last: Instant,
     cooldown: Instant,
+    /// Until when a connection refused before its session started goes
+    /// unanswered, because this address was already told when to return.
+    answered_until: Instant,
     strikes: u32,
     requests: Bucket,
     bytes: Bucket,
@@ -327,6 +330,7 @@ impl Record {
             active: 0,
             last: now,
             cooldown: now,
+            answered_until: now,
             strikes: 0,
             requests: Bucket::new(p.request_burst, now),
             bytes: Bucket::new(p.byte_burst, now),
@@ -555,6 +559,38 @@ impl NetworkGuard {
         record.active += 1;
         record.last = now;
         Ok(())
+    }
+    /// Whether to answer an inbound connection from `ip` that was refused
+    /// before its session started, telling it to return after `window` (its
+    /// Retry-After). One such answer per address and window is sent; further
+    /// refused attempts before then are closed unanswered, so a client that
+    /// waits as told is always answered while a flood earns at most one short
+    /// reply per window. The public website's proxy carries many visitors and
+    /// is answered every time; an address without an accounting record (the
+    /// table was full) never is.
+    pub fn answer_refusal(&self, ip: IpAddr, surface: Surface, window: Duration) -> bool {
+        self.answer_refusal_at(ip, surface, window, Instant::now())
+    }
+    fn answer_refusal_at(
+        &self,
+        ip: IpAddr,
+        surface: Surface,
+        window: Duration,
+        now: Instant,
+    ) -> bool {
+        let key = (admission_address(ip), surface, Direction::Inbound);
+        if self.is_proxy(key) {
+            return true;
+        }
+        let mut records = accounting(&self.records);
+        let Some(record) = records.get_mut(&key) else {
+            return false;
+        };
+        if now < record.answered_until {
+            return false;
+        }
+        record.answered_until = now + window;
+        true
     }
     pub fn tracked_addresses(&self) -> usize {
         accounting(&self.records).len()
@@ -1517,6 +1553,53 @@ mod tests {
         assert_eq!(reason, "outgoing network budget exhausted");
         assert!(retry.unwrap() <= Duration::from_secs(1));
         assert!(guard.admit_outbound(ip, Surface::Peer).is_ok());
+    }
+    #[test]
+    fn refused_connections_are_answered_once_per_retry_window() {
+        let guard = Arc::new(NetworkGuard::default());
+        let ip: IpAddr = "192.0.2.12".parse().unwrap();
+        let second = Duration::from_secs(1);
+        let now = Instant::now();
+        // Only an address the accounting table holds is answered.
+        assert!(!guard.answer_refusal_at(ip, Surface::Rpc, second, now));
+        drop(
+            guard
+                .admit_at(ip, Surface::Rpc, Direction::Inbound, now)
+                .unwrap(),
+        );
+        assert!(guard.answer_refusal_at(ip, Surface::Rpc, second, now));
+        // Attempts before the Retry-After it was given are closed unanswered;
+        // one that waits as told is answered again.
+        let early = now + Duration::from_millis(999);
+        assert!(!guard.answer_refusal_at(ip, Surface::Rpc, second, early));
+        assert!(guard.answer_refusal_at(ip, Surface::Rpc, second, now + second));
+        // Windows are per address and service.
+        drop(
+            guard
+                .admit_at(ip, Surface::Stratum, Direction::Inbound, now)
+                .unwrap(),
+        );
+        assert!(guard.answer_refusal_at(ip, Surface::Stratum, second, early));
+        // The public website's proxy speaks for many visitors: every refused
+        // connection of its own is answered.
+        let public = Arc::new(NetworkGuard::for_public_web());
+        let proxy: IpAddr = "127.0.0.1".parse().unwrap();
+        drop(
+            public
+                .admit_at(proxy, Surface::Rpc, Direction::Inbound, now)
+                .unwrap(),
+        );
+        for _ in 0..3 {
+            assert!(public.answer_refusal_at(proxy, Surface::Rpc, second, now));
+        }
+        let visitor: IpAddr = "192.0.2.13".parse().unwrap();
+        drop(
+            public
+                .admit_at(visitor, Surface::Rpc, Direction::Inbound, now)
+                .unwrap(),
+        );
+        assert!(public.answer_refusal_at(visitor, Surface::Rpc, second, now));
+        assert!(!public.answer_refusal_at(visitor, Surface::Rpc, second, now));
     }
     #[test]
     fn public_proxy_cannot_be_banned_by_one_visitor_but_quotas_still_apply() {

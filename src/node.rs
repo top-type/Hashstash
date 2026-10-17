@@ -2069,7 +2069,7 @@ impl Node {
                         let world = |w: &crate::state::World| json!({"reserve":w.reserve.to_str_radix(10),"shares":w.shares.to_str_radix(10),"curve_mass":w.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(w).to_str_radix(10),"account_shares":w.account_shares.to_str_radix(10),"revenue":w.revenue.to_str_radix(10),"grant_escrow":w.grant_escrow.to_str_radix(10)});
                         let progress = if let crate::state::Phase::Governance(d) = &s.phase {
                             let observed = s.height.saturating_sub(d.started_height).min(d.blocks);
-                            json!({"time_unit":"blocks","leading_blocks":d.leading_blocks,"observed_blocks":observed,"blocks":d.blocks,"blocks_remaining":d.blocks.saturating_sub(observed)})
+                            json!({"time_unit":"blocks","leading_blocks":d.leading_blocks,"observed_blocks":observed,"blocks":d.blocks,"blocks_remaining":d.blocks.saturating_sub(observed),"trading_closed":trading_closed(s)})
                         } else {
                             Value::Null
                         };
@@ -2244,6 +2244,7 @@ impl Node {
                     s.decision_id().is_some() == outcome.is_some(),
                     "select PASS or FAIL during governance; omit outcome otherwise"
                 );
+                ensure!(outcome.is_none() || !trading_closed(s), TRADING_CLOSED);
                 let w = match outcome {
                     Some(Outcome::Pass) => {
                         s.alternative.as_ref().context("no active PASS state")?
@@ -2365,6 +2366,7 @@ impl Node {
                     s.decision_id().is_some() == outcome.is_some(),
                     "select PASS or FAIL during governance; omit outcome otherwise"
                 );
+                ensure!(outcome.is_none() || !trading_closed(s), TRADING_CLOSED);
                 let w = match outcome {
                     Some(Outcome::Pass) => {
                         s.alternative.as_ref().context("no active PASS state")?
@@ -2494,9 +2496,9 @@ impl Node {
                 snapshot["payment_available_hash"] =
                     snapshot["account"]["payment_available_hash"].clone();
                 // The mempool page above is capped. Give the selected sender
-                // its own pending rows and its next nonce over the whole pool,
-                // as prepare_locked computes it, so a wallet cannot predict a
-                // stale nonce when its transactions sit past that page.
+                // its own pending rows, so a wallet still sees its transactions
+                // when they sit past that page. Its next nonce over the whole
+                // pool, as prepare_locked computes it, is `account.pending_nonce`.
                 if let Some(key) = key {
                     let sender = parse_account(key, &chain_id)?;
                     let own: Vec<Transaction> = i
@@ -2505,18 +2507,6 @@ impl Node {
                         .filter(|tx| tx.body.sender == sender)
                         .cloned()
                         .collect();
-                    let confirmed = i
-                        .chain
-                        .tip_state()
-                        .account(&sender, None)
-                        .map(|a| a.nonce);
-                    let nonce = own
-                        .iter()
-                        .map(|tx| tx.body.nonce.saturating_add(1))
-                        .chain(confirmed)
-                        .max();
-                    snapshot["pending_nonce"] =
-                        nonce.map_or(Value::Null, |n| json!(n.to_string()));
                     // Charged like the global page above, before it is built.
                     charge(meter, mempool_work(&own, 0, 128, "summary"))?;
                     snapshot["sender_mempool"] = mempool_page(&own, 0, 128, true)?;
@@ -2912,6 +2902,31 @@ fn parse_outcome(v: &Value) -> Result<Option<Outcome>> {
         Some("Fail" | "fail") => Ok(Some(Outcome::Fail)),
         _ => bail!("outcome must be pass or fail"),
     }
+}
+const TRADING_CLOSED: &str = "conditional trading is closed: the decision resolves at the start of the next block, before its transactions";
+/// The child of this tip resolves its decision in prepare_block before any of
+/// its transactions (the same `height - started_height == blocks` test), so no
+/// conditional Deposit or Redeem prepared at this tip can ever be included.
+fn trading_closed(s: &State) -> bool {
+    let crate::state::Phase::Governance(d) = &s.phase else {
+        return false;
+    };
+    s.height
+        .checked_add(1)
+        .and_then(|next| next.checked_sub(d.started_height))
+        == Some(d.blocks)
+}
+fn conditional(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Deposit {
+            decision: Some(_),
+            ..
+        } | Operation::Redeem {
+            decision: Some(_),
+            ..
+        }
+    )
 }
 
 fn check_operation_bounds(config: &Config, operation: &Operation) -> Result<()> {
@@ -4089,6 +4104,11 @@ fn wallet_body(
         "expiry height must allow inclusion"
     );
     check_operation_bounds(c, &request.operation)?;
+    // Quotes, preparation and hot-wallet sends refuse what admission would.
+    ensure!(
+        !(conditional(&request.operation) && trading_closed(s)),
+        TRADING_CLOSED
+    );
     let data = transaction_data(
         c.transaction_bytes(&s.settings),
         request.data_hex.as_deref(),
@@ -7006,10 +7026,12 @@ mod tests {
         let encoded = address::encode(&key, &view.chain.chain_id()).unwrap();
         let unknown = hex::encode(crypto::public_key(&[3; 32]).unwrap());
         let original = Node::read_rpc(&view, "snapshot", json!({"key":key_hex})).unwrap();
-        // The selected key also gets its pending rows and next nonce.
-        assert_eq!(original.as_object().unwrap().len(), 12);
+        // The selected key also gets its pending rows; its next nonce is
+        // reported once, by the embedded account read.
+        assert_eq!(original.as_object().unwrap().len(), 11);
         assert_eq!(original["proposals_total"], 0);
-        assert!(original["pending_nonce"].is_string());
+        assert!(original.get("pending_nonce").is_none());
+        assert_eq!(original["account"]["pending_nonce"], 0);
         assert!(original["sender_mempool"].is_array());
         assert!(original.get("balances").is_none());
         let mut snapshot = Node::read_rpc(
@@ -7582,6 +7604,105 @@ mod tests {
             }
         }
         assert_ne!(before_values[0], before_values[1]);
+    }
+    #[test]
+    fn conditional_trading_closes_at_the_decisions_last_tip() {
+        let (mut view, key) = stash_read_fixture();
+        let decision = |blocks| {
+            crate::state::Phase::Governance(crate::state::Decision {
+                id: [3; 32],
+                epoch: 1,
+                round: 0,
+                proposal_id: [4; 32],
+                proposal: Proposal::Parameter {
+                    parameter: Parameter::BlockBytes,
+                    old: 1_048_576,
+                    new: 2_097_152,
+                }
+                .into(),
+                started: 0,
+                started_height: 0,
+                blocks,
+                leading_blocks: 0,
+            })
+        };
+        let s = Arc::make_mut(&mut view.chain.state);
+        // The fixture tip is height 7: its child, height 8, resolves an
+        // eight-block decision before any of its transactions.
+        s.phase = decision(8);
+        s.alternative = Some(s.world.clone());
+        let request = |operation| WalletRequest {
+            operation,
+            fee: None,
+            extra_fee: None,
+            data_hex: None,
+            expiry_blocks: None,
+            anchor: None,
+            nonce: None,
+        };
+        let deposit = Operation::Deposit {
+            amount: 10u32.into(),
+            decision: Some([3; 32]),
+            outcome: Some(Outcome::Pass),
+        };
+        let redeem = Operation::Redeem {
+            shares: 1u32.into(),
+            decision: Some([3; 32]),
+            outcome: Some(Outcome::Fail),
+        };
+        let closed =
+            |error: anyhow::Error| error.to_string().contains("conditional trading is closed");
+        let governance = Node::read_rpc(&view, "governance", json!({})).unwrap();
+        assert_eq!(governance["progress"]["trading_closed"], true);
+        assert_eq!(governance["progress"]["blocks_remaining"], 1);
+        for (method, params) in [
+            (
+                "stash_quote",
+                json!({"key":hex::encode(key),"kind":"deposit","amount":"10","outcome":"pass"}),
+            ),
+            (
+                "stash_quote",
+                json!({"key":hex::encode(key),"kind":"redeem","amount":"1","outcome":"fail"}),
+            ),
+            ("quote", json!({"kind":"deposit","amount":"10","outcome":"fail"})),
+        ] {
+            assert!(closed(Node::read_rpc(&view, method, params).unwrap_err()), "{method}");
+        }
+        for operation in [deposit.clone(), redeem.clone()] {
+            let fee = json!({"sender":hex::encode(key),"operation":operation});
+            assert!(closed(Node::read_rpc(&view, "fee_quote", fee).unwrap_err()));
+            assert!(closed(Node::prepare_view(&view, key, request(operation)).unwrap_err()));
+        }
+        // Operations common to both outcomes still execute in that block.
+        let recipient = crypto::public_key(&[2; 32]).unwrap();
+        let transfer = Operation::TransferExact {
+            recipient,
+            amount: 1u32.into(),
+        };
+        assert!(Node::prepare_view(&view, key, request(transfer)).is_ok());
+        // One block earlier the same decision still trades.
+        Arc::make_mut(&mut view.chain.state).phase = decision(9);
+        view.cache = Arc::default();
+        let governance = Node::read_rpc(&view, "governance", json!({})).unwrap();
+        assert_eq!(governance["progress"]["trading_closed"], false);
+        assert!(
+            Node::read_rpc(
+                &view,
+                "stash_quote",
+                json!({"key":hex::encode(key),"kind":"deposit","amount":"10","outcome":"pass"})
+            )
+            .is_ok()
+        );
+        assert!(
+            Node::read_rpc(
+                &view,
+                "quote",
+                json!({"kind":"deposit","amount":"10","outcome":"fail"})
+            )
+            .is_ok()
+        );
+        assert!(Node::prepare_view(&view, key, request(deposit)).is_ok());
+        assert!(Node::prepare_view(&view, key, request(redeem)).is_ok());
     }
     #[test]
     fn stash_quotes_handle_empty_dust_and_exhausted_curves() {

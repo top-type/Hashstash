@@ -803,15 +803,21 @@ async function run() {
  }
  {
   // Under congestion a user's pending send can sit past the 128-row global
-  // mempool page. The node reports that sender's own rows and next nonce.
+  // mempool page. The node reports that sender's own rows, and its account
+  // read the next nonce over the whole pool.
   const busy=await harness(),state=busy.currentSnapshot;
   state.mempool=Array.from({length:128},(_,n)=>({body:{sender:recipient,nonce:n,operation:{TransferExact:{recipient:publicKey,amount:'1'}}}}));state.status.mempool=129;
   const own={body:{sender:publicKey,nonce:0,operation:{TransferExact:{recipient,amount:'200'}}}};
-  busy.handlers.snapshot=p=>response({result:{...busy.snapshotResult(p),sender_mempool:[own],pending_nonce:'1'}});await busy.refresh();
+  const keyed=(rows,nonce)=>p=>{const base=busy.snapshotResult(p);return response({result:{...base,sender_mempool:rows,account:{...base.account,pending_nonce:nonce}}});};
+  busy.handlers.snapshot=keyed([own],1);await busy.refresh();
   eq(busy.get('activity-panel').hidden,false,'a pending send past the global page is still shown');ok(busy.get('activity-list').textContent.includes(amounts.formatHash('200')));
   const form=busy.get('send-form');form.elements.recipient.value=addr(recipient);form.elements.amount.value=amounts.exactInput('1');await form.fire('input');await busy.timersDue();await form.requestSubmit();
   eq(busy.wallet.length,1,form.feedback.textContent);eq(busy.calls.filter(c=>c.body.method==='preparetransaction').at(-1).body.params.nonce,1,'the wallet requests the node’s pending nonce, not the stale confirmed one');
-  busy.handlers.snapshot=p=>response({result:{...busy.snapshotResult(p),sender_mempool:[],pending_nonce:'0'}});await busy.refresh();
+  // The sender's own page is capped too; the account's pending nonce is not.
+  busy.handlers.snapshot=keyed(Array.from({length:128},(_,n)=>({body:{...own.body,nonce:n}})),130);await busy.refresh();
+  form.elements.amount.value=amounts.exactInput('2');await form.fire('input');await busy.timersDue();await form.requestSubmit();
+  eq(busy.calls.filter(c=>c.body.method==='preparetransaction').at(-1).body.params.nonce,130,'past 128 own pending rows the account’s pending nonce still decides');
+  busy.handlers.snapshot=keyed([],0);await busy.refresh();
   eq(busy.get('activity-panel').hidden,true,'the sender rows replace the page filter, including when empty');
  }
  {

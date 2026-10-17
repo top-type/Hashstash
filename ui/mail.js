@@ -8,7 +8,10 @@
   // copy and counted, so the checkpoint still advances; anyone can send an
   // address enough mail to fill it. A rescan from the beginning shows them.
   // Discovery rests briefly after each budget of candidates, then continues.
-  const CACHE_PREFIX='hashstash-mail-scan-3:',CACHE_LIMIT=256,CACHE_BYTES=2*1024*1024,SCAN_BUDGET=100,SCAN_REST_MS=250;
+  // A scan start (the tip when this browser created the wallet, or a block
+  // chosen in Mail settings) is kept apart from the checkpoint, so clearing
+  // the saved scan returns to it rather than to genesis.
+  const CACHE_PREFIX='hashstash-mail-scan-3:',START_PREFIX='hashstash-mail-start-1:',CACHE_LIMIT=256,CACHE_BYTES=2*1024*1024,SCAN_BUDGET=100,SCAN_REST_MS=250,END='9223372036854775807';
   function cacheEntry(entry){
     const position=entry.position??entry.tx_position??0;
     if(!validId(entry.txid)||!Number.isSafeInteger(entry.height)||entry.height<0||!Number.isSafeInteger(position)||position<0||typeof entry.raw!=='string'||entry.raw.length>CACHE_BYTES||!/^(?:[0-9a-f]{2})+$/.test(entry.raw))throw Error('Invalid cached mail.');
@@ -18,7 +21,13 @@
   }
   function createCache(options={}){
     let storage;try{storage=Object.hasOwn(options,'storage')?options.storage:root.localStorage;}catch(_){}
-    const cacheKey=(chain,key)=>{if(!validId(chain)||!validId(key))throw Error('Invalid mail cache identity.');return CACHE_PREFIX+chain+':'+key;};
+    const cacheKey=(chain,key,prefix=CACHE_PREFIX)=>{if(!validId(chain)||!validId(key))throw Error('Invalid mail cache identity.');return prefix+chain+':'+key;};
+    // Scan only blocks above height; anchor is a canonical block at or above
+    // it, checked by the node like a checkpoint's.
+    const validStart=value=>{
+      if(!value||value.version!==1||!Number.isSafeInteger(value.height)||value.height<0||value.height>0xffffffff||!validId(value.anchor)||!['created','chosen'].includes(value.origin))throw Error('Invalid mail scan start.');
+      return {version:1,height:value.height,anchor:value.anchor,origin:value.origin};
+    };
     const validate=value=>{
       const omitted=value?.omitted??0;
       if(!value||value.version!==3||!validCursor(value.cursor)||!validId(value.anchor)||!Number.isSafeInteger(value.scanned)||value.scanned<0||!Number.isSafeInteger(omitted)||omitted<0||!Array.isArray(value.entries)||value.entries.length>CACHE_LIMIT)throw Error('Invalid cached mail.');
@@ -43,11 +52,15 @@
         try{if(!storage)throw Error();const checked=validate(bounded(value)),encoded=JSON.stringify(checked);if(encoded.length>CACHE_BYTES)throw Error();storage.setItem(cacheKey(chain,key),encoded);return {saved:true};}
         catch(_){return {saved:false,error:'Local mail storage is full or unavailable. Later progress is kept only for this visit; the last complete checkpoint is preserved.'};}
       },
-      clear(chain,key){try{if(!storage||typeof storage.removeItem!=='function')throw Error();storage.removeItem(cacheKey(chain,key));return {cleared:true};}catch(_){return {cleared:false,error:'This browser could not clear its local mail cache.'};}}
+      clear(chain,key){try{if(!storage||typeof storage.removeItem!=='function')throw Error();storage.removeItem(cacheKey(chain,key));return {cleared:true};}catch(_){return {cleared:false,error:'This browser could not clear its local mail cache.'};}},
+      // An unreadable start is ignored: the scan then begins at genesis.
+      readStart(chain,key){try{if(!storage)return null;const text=storage.getItem(cacheKey(chain,key,START_PREFIX));return text==null||text.length>1024?null:validStart(JSON.parse(text));}catch(_){return null;}},
+      writeStart(chain,key,value){try{if(!storage)throw Error();storage.setItem(cacheKey(chain,key,START_PREFIX),JSON.stringify(validStart(value)));return {saved:true};}catch(_){return {saved:false,error:'This browser could not save the mail scan start; it applies only for this visit.'};}},
+      clearStart(chain,key){try{if(!storage||typeof storage.removeItem!=='function')throw Error();storage.removeItem(cacheKey(chain,key,START_PREFIX));return {cleared:true};}catch(_){return {cleared:false,error:'This browser could not clear its mail scan start.'};}}
     });
   }
   function create({rpc,getIdentity,recipientKey,decrypt,verifySigned,encodeAddress,onDraftChange=()=>{},document=root.document,location=root.location,cache=createCache()}){
-    const $=id=>document.getElementById(id),form=$('mail-form');let context={},sequence=0,prepared=null,preparing=null,checkedTip='',verifiedTip='',cursor=null,anchor=null,opened=new Map(),lastWallet='',loading=false,paused=false,scanned=0,visibleCount=50,rendered='',cacheLoaded=false,restoreEntries=[],storageNote='',omitted=0;
+    const $=id=>document.getElementById(id),form=$('mail-form');let context={},sequence=0,prepared=null,preparing=null,checkedTip='',verifiedTip='',cursor=null,anchor=null,opened=new Map(),lastWallet='',loading=false,paused=false,scanned=0,visibleCount=50,rendered='',cacheLoaded=false,restoreEntries=[],storageNote='',omitted=0,start=null;
     const active=()=>location.hash.split('?')[0]==='#mail',eligible=()=>active()&&context.ready&&context.available&&context.key&&context.can_decrypt;
     const add=(p,t,c,text)=>{const n=document.createElement(t);n.className=c;if(text!==undefined)n.textContent=text;p.appendChild(n);return n;};
     const identity=()=>getIdentity(),yieldTask=()=>new Promise(resolve=>root.setTimeout(resolve,0));
@@ -55,7 +68,10 @@
     function invalidate(){prepared=null;preparing=null;}
     function error(message){$('mail-error').textContent=message;$('mail-error').hidden=!message;}
     function resetScan(){opened.clear();cursor=null;anchor=null;checkedTip='';verifiedTip='';scanned=0;omitted=0;visibleCount=50;rendered='';$('mail-list').replaceChildren();error('');}
-    function blank(){invalidate();resetScan();paused=false;cacheLoaded=false;restoreEntries=[];storageNote='';}
+    function blank(){invalidate();resetScan();paused=false;cacheLoaded=false;restoreEntries=[];storageNote='';start=null;}
+    // Begin a scan without a checkpoint at this account's start, if it has one.
+    function fromStart(){if(start){cursor=`${start.height}:${END}`;anchor=start.anchor;}}
+    function startNote(text,failed=false){const node=$('mail-start-feedback');if(node){node.textContent=text;node.classList.toggle('error',failed);}}
     function render(){
       const verified=verifiedTip===context.tip;
       $('mail-empty').hidden=verified&&opened.size>0;
@@ -63,9 +79,12 @@
       $('mail-scan-status').textContent=context.key&&context.can_decrypt?(loading?`Scanning · ${scanned} checked · ${opened.size} found`:paused?`Paused · ${scanned} checked`:!verified&&checkedTip?'Verification pending':verified?`${scanned} checked · ${opened.size} found`:''):'';
       if(context.key&&context.can_decrypt&&storageNote)$('mail-scan-status').textContent+=' · '+storageNote;
       if(context.key&&context.can_decrypt&&omitted)$('mail-scan-status').textContent+=` · ${omitted} earlier message${omitted===1?' is':'s are'} not kept in this browser; clear the saved scan to show ${omitted===1?'it':'them'} again`;
+      if(context.key&&context.can_decrypt&&start)$('mail-scan-status').textContent+=` · from block ${start.height+1}`;
       $('mail-more').hidden=!context.can_decrypt||!context.key||(!loading&&!paused);$('mail-more').textContent=paused?'Continue scan':'Pause scan';
       $('mail-show-more').hidden=!verified||opened.size<=visibleCount;
       if($('mail-clear-cache'))$('mail-clear-cache').disabled=!context.key||!context.can_decrypt;
+      if($('mail-start-note'))$('mail-start-note').textContent=!context.key||!context.can_decrypt?'':!start?'Mail is scanned from genesis.':start.origin==='created'?`This wallet was created in this browser at block ${start.height}, so mail is scanned from block ${start.height+1}.`:`Mail is scanned from block ${start.height+1}.`;
+      if($('mail-scan-genesis'))$('mail-scan-genesis').hidden=!start||!context.key||!context.can_decrypt;
       if(!active())return;
       const entries=verified?[...opened.values()].sort((a,b)=>b.entry.height-a.entry.height||(b.entry.position??b.entry.tx_position??0)-(a.entry.position??a.entry.tx_position??0)):[];
       const signature=JSON.stringify([lastWallet,context.height,visibleCount,entries.map(({entry,clear})=>[entry.txid,entry.height,entry.position,clear])]);if(signature===rendered)return;
@@ -84,7 +103,7 @@
     async function load(){
       if(!eligible()||loading||paused)return;
       loading=true;const version=++sequence,stamp=lastWallet;let restarted=false,truncated=false,checkedThisPass=0;
-      if(!cacheLoaded){cacheLoaded=true;const saved=cache.read(context.chain_id,context.key);storageNote=saved.error||'';if(saved.value){cursor=saved.value.cursor;anchor=saved.value.anchor;scanned=saved.value.scanned;omitted=saved.value.omitted;restoreEntries=saved.value.entries;}}
+      if(!cacheLoaded){cacheLoaded=true;const saved=cache.read(context.chain_id,context.key);storageNote=saved.error||'';start=cache.readStart(context.chain_id,context.key);if(saved.value){cursor=saved.value.cursor;anchor=saved.value.anchor;scanned=saved.value.scanned;omitted=saved.value.omitted;restoreEntries=saved.value.entries;}else fromStart();}
       const current=()=>version===sequence&&stamp===lastWallet&&eligible()&&!paused;render();
       try{
         do{
@@ -96,7 +115,9 @@
             // or below the reported fork height and continues from there once.
             const fork=/blocks above height (\d{1,16}) were replaced/.exec(String(e.message)),forkCursor=fork&&`${fork[1]}:9223372036854775807`;
             if(forkCursor&&!truncated&&!restarted&&cursor&&compareCursor(forkCursor,cursor)<0){const height=Number(fork[1]);truncated=true;for(const [txid,value] of opened)if(value.entry.height>height)opened.delete(txid);restoreEntries=restoreEntries.filter(entry=>entry.height<=height);cursor=forkCursor;verifiedTip='';render();continue;}
-            if(String(e.message).includes('Mail scan anchor is no longer canonical')&&!restarted){resetScan();restoreEntries=[];const cleared=cache.clear(context.chain_id,context.key);storageNote=cleared.error||'';restarted=true;render();continue;}
+            // Without a fork height, rescan from genesis. The start's anchor
+            // may be the unknown one, so the start is dropped as well.
+            if(String(e.message).includes('Mail scan anchor is no longer canonical')&&!restarted){resetScan();restoreEntries=[];const cleared=cache.clear(context.chain_id,context.key);storageNote=cleared.error||'';if(start){cache.clearStart(context.chain_id,context.key);start=null;}restarted=true;render();continue;}
             throw e;
           }
           if(!current())return;
@@ -111,33 +132,45 @@
             const source=entries[index],restoring=index<restoreCount,position=source.position??source.tx_position??0;
             if(!validId(source.txid)||!Number.isSafeInteger(source.height)||source.height<0||source.height>result.indexed_height||!Number.isSafeInteger(position)||position<0||compareCursor(`${source.height}:${position}`,result.scan_cursor)>0)throw Error('Invalid shared mail response.');
             if(!current())return;
-            let signed;
+            // A restored row is this account's own mail: derive its sender,
+            // nonce and ciphertext from the verified signed record. A new row
+            // is first unwrapped under the feed's stated context, and only an
+            // envelope that opens is verified against its signed record, still
+            // before it is shown or checkpointed. Most envelopes are not ours,
+            // so they cost no signature check. A feed that alters an
+            // envelope's sender, nonce or ciphertext can hide it, as it can by
+            // leaving the row out, but cannot attribute it to another sender.
+            let claimed;
             try{
-              const expected={txid:source.txid};
-              if(!restoring){
+              if(restoring){const signed=verifySigned(source.raw,{txid:source.txid});claimed={sender:signed.sender,nonce:signed.nonce,data_hex:signed.data_hex,signed};}
+              else{
                 const sender=source.sender_public_key||source.sender;
-                if(!validId(sender)||!/^\d{1,20}$/.test(String(source.nonce))||typeof source.data_hex!=='string')throw Error();
-                Object.assign(expected,{sender,nonce:String(source.nonce),data_hex:source.data_hex});
-                if(source.operation!==undefined)expected.operation=source.operation;
+                if(!validId(sender)||!/^\d{1,20}$/.test(String(source.nonce))||typeof source.data_hex!=='string'||typeof source.raw!=='string')throw Error();
+                claimed={sender,nonce:String(source.nonce),data_hex:source.data_hex};
               }
-              signed=verifySigned(source.raw,expected);
             }catch(_){
               if(restoring){restoreFailed=true;break;}
               throw Error('Mail transaction signature or details could not be verified.');
             }
-            const sender=signed.sender,entry={txid:signed.txid,raw:source.raw,sender_public_key:sender,nonce:signed.nonce,data_hex:signed.data_hex,height:source.height,position};
-            // Sender authentication is mandatory even for another user's mail.
             // Decryption failure alone is normal: most envelopes are not ours.
-            try{
-              root.HashstashMailCrypto.parse(entry.data_hex);
-              const clear=await decrypt(entry.data_hex,{chain_id:context.chain_id,sender,nonce:String(entry.nonce)},identity());
-              if(!current())return;
-              if(validId(clear?.recipient)&&typeof clear.subject==='string'&&typeof clear.body==='string'&&(sender===context.key||clear.recipient===context.key))found.push({entry,clear});else if(index<restoreCount)throw Error('Cached mail authentication failed.');
-            }catch(_){if(!current())return;if(index<restoreCount){restoreFailed=true;break;}}
+            let clear=null;
+            try{root.HashstashMailCrypto.parse(claimed.data_hex);clear=await decrypt(claimed.data_hex,{chain_id:context.chain_id,sender:claimed.sender,nonce:claimed.nonce},identity());}catch(_){}
+            if(!current())return;
+            if(validId(clear?.recipient)&&typeof clear.subject==='string'&&typeof clear.body==='string'&&(claimed.sender===context.key||clear.recipient===context.key)){
+              let signed=claimed.signed;
+              if(!signed){
+                try{
+                  const expected={txid:source.txid,sender:claimed.sender,nonce:claimed.nonce,data_hex:claimed.data_hex};
+                  if(source.operation!==undefined)expected.operation=source.operation;
+                  signed=verifySigned(source.raw,expected);
+                }catch(_){throw Error('Mail transaction signature or details could not be verified.');}
+              }
+              found.push({entry:{txid:signed.txid,raw:source.raw,sender_public_key:signed.sender,nonce:signed.nonce,data_hex:signed.data_hex,height:source.height,position},clear});
+            }else if(restoring){restoreFailed=true;break;}
             if((index+1)%4===0){await yieldTask();if(!current())return;}
           }
           if(!current())return;
-          if(restoreFailed){resetScan();restoreEntries=[];const cleared=cache.clear(context.chain_id,context.key);storageNote=cleared.error||'';render();continue;}
+          if(restoreFailed){resetScan();fromStart();restoreEntries=[];const cleared=cache.clear(context.chain_id,context.key);storageNote=cleared.error||'';render();continue;}
           // Commit the cursor and authenticated messages together. A cancelled
           // page is retried rather than silently skipping its remaining mail.
           for(const value of found)opened.set(value.entry.txid,value);
@@ -157,9 +190,24 @@
     $('mail-more').addEventListener('click',()=>{paused=!paused;if(paused){sequence++;loading=false;render();}else load();});
     $('mail-show-more').addEventListener('click',()=>{visibleCount+=50;render();});
     function clearCache(){
-      if(!context.key)return;sequence++;loading=false;const result=cache.clear(context.chain_id,context.key);blank();cacheLoaded=true;paused=true;storageNote=result.error||'Local mail cache cleared. Continue to scan again.';render();
+      if(!context.key)return;sequence++;loading=false;const result=cache.clear(context.chain_id,context.key);blank();cacheLoaded=true;start=cache.readStart(context.chain_id,context.key);fromStart();paused=true;storageNote=result.error||'Local mail cache cleared. Continue to scan again.';render();
+    }
+    // Rescan this account from a chosen first block (0 is genesis). The
+    // current tip anchors a chosen start, as it would a checkpoint.
+    function rescanFrom(first){
+      if(!eligible())return;
+      sequence++;loading=false;const cleared=cache.clear(context.chain_id,context.key);blank();cacheLoaded=true;
+      const result=first>0?cache.writeStart(context.chain_id,context.key,start={version:1,height:first-1,anchor:context.tip,origin:'chosen'}):cache.clearStart(context.chain_id,context.key);
+      storageNote=result.error||cleared.error||'';fromStart();render();load();
     }
     $('mail-clear-cache')?.addEventListener('click',clearCache);
+    $('mail-start-form')?.addEventListener('submit',event=>{
+      event.preventDefault();const text=String($('mail-start-form').elements.height.value).trim();
+      if(!eligible()||!Number.isSafeInteger(context.height)){startNote('Select a wallet with its private key and wait for the node.',true);return;}
+      if(!/^\d{1,10}$/.test(text)||Number(text)>context.height){startNote(`Enter a block height from 0 to ${context.height}.`,true);return;}
+      startNote('');rescanFrom(Number(text));
+    });
+    $('mail-scan-genesis')?.addEventListener('click',()=>{startNote('');rescanFrom(0);});
     return Object.freeze({
       async prepare(){
         const id=draftId();if(prepared?.id===id)return prepared.data;if(preparing?.id===id)return preparing.promise;
@@ -179,6 +227,12 @@
       route(){if(!active()){sequence++;loading=false;render();return;}render();if(checkedTip!==context.tip)load();},
       clear(){sequence++;loading=false;blank();render();},
       clearCache,
+      // A key this browser just generated can have no mail at or below the
+      // tip it was created at, so its first scan starts above that block.
+      recordStart({chain_id,key,height,tip}){
+        if(cache.read(chain_id,key).value||cache.readStart(chain_id,key))return false;
+        return cache.writeStart(chain_id,key,{version:1,height,anchor:tip,origin:'created'}).saved;
+      },
     });
   }
   return Object.freeze({create,createCache});

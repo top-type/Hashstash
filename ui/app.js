@@ -16,7 +16,7 @@
         proposals: [],
         mempool: [],
         senderMempool: null,
-        pendingNonce: null,
+        proposalsTotal: null,
         ready: false,
         contextEpoch: 0,
         refreshing: false,
@@ -444,11 +444,14 @@
     }
     // The block after the decision's last tip resolves it in prepare_block,
     // before any of its transactions, so a conditional trade prepared now can
-    // never be included. This is the same height test consensus applies.
+    // never be included. The node reports this as progress.trading_closed and
+    // refuses such quotes; without that field, apply the same height test.
     const tradingClosedMessage = "Trading is closed: the decision resolves at the start of the next block, before its transactions.";
     function decisionClosing() {
         const decision = activeDecision();
-        return !!decision && !!state.status && BigInt(state.status.height) - BigInt(decision.started_height) + 1n >= BigInt(decision.blocks);
+        if (!decision) return false;
+        if (typeof state.gov?.progress?.trading_closed === "boolean") return state.gov.progress.trading_closed;
+        return !!state.status && BigInt(state.status.height) - BigInt(decision.started_height) + 1n >= BigInt(decision.blocks);
     }
     // consensus::pass_beats_fail: one block's exact PASS/FAIL comparison.
     // Mirrors consensus::pass_beats_fail: a world without Stash has no
@@ -945,14 +948,16 @@
         }
     }
     // The snapshot's global mempool page is capped at 128 rows. The node also
-    // reports the selected sender's own pending rows and its next nonce over
-    // the whole pool, the value preparetransaction requires.
+    // reports the selected sender's own pending rows, and its account read
+    // gives the next nonce over the whole pool, the value preparetransaction
+    // requires.
     function ownPending() {
         return Array.isArray(state.senderMempool) ? state.senderMempool : state.mempool.filter(tx => hex(tx.body?.sender) === key());
     }
     function nextNonce() {
         let nonce = BigInt(state.account?.account?.nonce || "0");
-        /^\d{1,20}$/.test(String(state.pendingNonce ?? "")) && BigInt(state.pendingNonce) > nonce && (nonce = BigInt(state.pendingNonce));
+        const pending = String(state.account?.pending_nonce ?? "");
+        /^\d{1,20}$/.test(pending) && BigInt(pending) > nonce && (nonce = BigInt(pending));
         for (const transaction of ownPending()) hex(transaction.body?.sender) === key() && BigInt(transaction.body.nonce) >= nonce && (nonce = BigInt(transaction.body.nonce) + 1n);
         return nonce;
     }
@@ -1858,9 +1863,12 @@
         if (!auction) throw new Error("There is no open auction.");
         const id = hex(hexBytes(value, "Proposal ID")).toLowerCase();
         const local = state.proposals.find(record => record.id === id);
-        let proposal = local?.proposal;
-        // The snapshot lists at most 128 proposals per round; look up the rest.
-        if (!local && state.proposals.length >= 128) {
+        let proposal = local?.proposal, omitted = false;
+        // The snapshot's first page can stop short of the round's
+        // proposals_total (128 rows, or sooner on its byte budget); look up
+        // the rest. The explorer adds refund_height from the tip state, so a
+        // row without it is not a live proposal.
+        if (!local && !(state.proposalsTotal !== null && state.proposalsTotal <= state.proposals.length)) {
             const chain = state.status.chain_id, cache = `${chain}:${state.status.tip}:${id}`;
             if (!supportLookups.has(cache)) {
                 supportLookups.size > 50 && supportLookups.clear();
@@ -1870,10 +1878,16 @@
                 }).then(result => result.chain_id === chain && result.proposals?.find(item => item.id === id) || null).catch(() => null));
             }
             const found = await supportLookups.get(cache);
-            found && (proposal = {round: found.round, action: found.action});
+            if (found && Object.hasOwn(found, "refund_height")) {
+                proposal = {round: found.round, action: found.action, refund_height: found.refund_height};
+                omitted = found.action_omitted === true;
+            }
         }
-        if (!proposal?.action || String(proposal.round) !== String(auction.round) || proposal.refund_height !== null && proposal.refund_height !== void 0) throw new Error("This ID is not an active proposal in the current auction round.");
-        return {id, action: proposal.action};
+        if (!(proposal?.action || omitted) || String(proposal.round) !== String(auction.round) || proposal.refund_height !== null && proposal.refund_height !== void 0) throw new Error("This ID is not an active proposal in the current auction round.");
+        if (omitted) throw new Error("This proposal is too large to show here, so this form will not sign support for it. Review it in the Explorer.");
+        // A page row too large to list whole carries only its first payments.
+        const hidden = local?.truncated === true && proposal.action.Grant ? Math.max(0, Number(local.payment_count) - proposal.action.Grant.payments.length) : 0;
+        return {id, action: proposal.action, hidden};
     }
     async function supportPreview() {
         const version = ++supportPreviewVersion, node = $("support-proposal-preview"), raw = $("support-form").elements.proposal.value.trim();
@@ -1895,8 +1909,13 @@
             return;
         }
         append(node, "p", "field-help", `Backs proposal ${proposalShort(target.id)}:`);
-        if (target.action.Grant) renderGrantPayments(node, target.action.Grant);
-        else {
+        if (target.action.Grant) {
+            renderGrantPayments(node, target.action.Grant);
+            if (target.hidden) {
+                const more = append(node, "a", "explorer-link", `${commas(target.hidden)} more payment${target.hidden === 1 ? " is" : "s are"} not listed here; review the full grant in the Explorer.`);
+                more.href = `#explorer?governance=${encodeURIComponent(target.id)}`;
+            }
+        } else {
             const p = target.action.Parameter, setting = settings[p?.parameter];
             append(node, "p", "proposal-title", setting ? `${setting[1]}: ${settingValue(setting[0], p.old, setting[2], true)} → ${settingValue(setting[0], p.new, setting[2], true)}` : "Unknown action");
         }
@@ -2062,7 +2081,7 @@
         state.proposals = [];
         renderDecisionMessage();
         state.mempool = [];
-        state.senderMempool = state.pendingNonce = null;
+        state.senderMempool = state.proposalsTotal = null;
         document.querySelectorAll("form").forEach(form => {
             // Public Explorer searches are independent of the selected wallet.
             if (!form.querySelector(".form-feedback")) return;
@@ -2172,9 +2191,9 @@
             state.gov = gov;
             state.mempool = mempool;
             state.senderMempool = key() && Array.isArray(snapshot.sender_mempool) ? snapshot.sender_mempool : null;
-            state.pendingNonce = key() ? snapshot.pending_nonce ?? null : null;
             state.account = account;
             state.proposals = proposals;
+            state.proposalsTotal = Number.isSafeInteger(snapshot.proposals_total) ? snapshot.proposals_total : null;
             state.pass = pass;
             state.fail = fail;
             state.balances = balances || null;
@@ -2676,7 +2695,13 @@
         modeButtons();
         try {
             let result;
-            if (action === "create") result = await browserWallet.create(guard); else if (action === "import") {
+            if (action === "create") {
+                // Creating a key resets the context, so note the tip first: Mail
+                // for the new key starts above it instead of at genesis.
+                const tip = state.ready && state.status && { chain_id: state.status.chain_id, height: state.status.height, tip: state.status.tip };
+                result = await browserWallet.create(guard);
+                tip && /^[0-9a-f]{64}$/.test(result?.public_key || "") && mail?.recordStart({ ...tip, key: result.public_key });
+            } else if (action === "import") {
                 if (values.public_key && HashstashBrowserWallet.publicKey(values.private_key) !== values.public_key) throw new Error("Backup public key does not match.");
                 result = await browserWallet.importPrivate(values.private_key, guard);
             } else if (action === "watch") result = await browserWallet.watch(values.public_key, guard); else if (action === "select") result = await browserWallet.select(values.id, guard); else {

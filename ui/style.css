@@ -737,6 +737,10 @@ dd { margin:0; text-align:right; font:12px/1.5 var(--mono); overflow-wrap:anywhe
 .mail-content { max-width: var(--mail-content-max); }
 .mail-subject { margin: 1rem 0 .5rem; }
 .mail-message .button { margin-top: .5rem; }
+.mail-start { margin: 0 0 12px; }
+.mail-start label { margin-bottom: 10px; }
+#mail-start-feedback.error { color: var(--error); }
+.mail-settings-actions { display: flex; flex-wrap: wrap; gap: 8px 20px; }
 .proposal-explanation summary { cursor: pointer; }
 .governance-common { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:baseline; gap:8px 16px; padding:20px 0; border-bottom:1px solid var(--line); }
 .governance-common > span { color: var(--muted); font-size: .85rem; }

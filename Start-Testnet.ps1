@@ -82,6 +82,8 @@ function Assert-MiningSettings($Settings) {
         if ($endpoint.Length -gt 320 -or $endpoint -notmatch '^(?:\[[0-9A-Fa-f:.]+\]|[a-zA-Z0-9.-]+):([0-9]{1,5})$' -or [int]$Matches[1] -lt 1 -or [int]$Matches[1] -gt 65535 -or $endpoint -match '^(?:0\.0\.0\.0|\[::\]):') { throw 'StratumAdvertise must be a reachable HOST:PORT, without a URL prefix or wildcard address.' }
     }
     if ($Settings.password_file -and -not (Test-Path -LiteralPath ([string]$Settings.password_file) -PathType Leaf)) { throw 'StratumPasswordFile does not exist.' }
+    # The node refuses a non-loopback Stratum listener without a password; fail before creating a network.
+    if (-not [Net.IPAddress]::IsLoopback($parsed) -and -not $Settings.password_file) { throw 'A non-loopback StratumBindIPAddress requires StratumPasswordFile.' }
 }
 
 function Wait-NodeReady($Node, [string]$ExpectedExecutable) {

@@ -91,6 +91,7 @@ try {
     Reject { & $start -Fresh -DataRoot $fixture -Executable $Executable -BasePort $BasePort -StratumBindIPAddress 'not-an-ip' -NoBrowser } 'must be an IP address'
     Reject { & $start -Fresh -DataRoot $fixture -Executable $Executable -BasePort $BasePort -ShareDifficulty 0 -NoBrowser } 'ShareDifficulty must'
     Reject { & $start -Fresh -DataRoot $fixture -Executable $Executable -BasePort $BasePort -StratumAdvertise '0.0.0.0:18482' -NoBrowser } 'reachable HOST:PORT'
+    Reject { & $start -Fresh -DataRoot $fixture -Executable $Executable -BasePort $BasePort -StratumBindIPAddress '0.0.0.0' -NoBrowser } 'requires StratumPasswordFile'
     Check (-not (Test-Path -LiteralPath (Join-Path $fixture 'testnet-latest.json'))) 'Invalid mining options create no network or latest pointer'
     $passwordFile = Join-Path $fixture 'public test password.txt'
     [IO.File]::WriteAllText($passwordFile, 'launcher-test-password', [Text.UTF8Encoding]::new($false))

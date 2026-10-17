@@ -530,7 +530,8 @@ fn new_governance_records_pay_record_weight() {
     cheap.body.fee = (Amount::from(bytes) * &rate + Amount::from(fees::FEE_SCALE - 1))
         / Amount::from(fees::FEE_SCALE);
     let cheap = crypto::sign(&cheap.body, &ATTACKER).unwrap();
-    assert!(consensus::execute(&c, &s, &s.root(), &key(&ATTACKER), &0u32.into(), &[cheap]).is_err());
+    let rejected = consensus::execute(&c, &s, &s.root(), &key(&ATTACKER), &0u32.into(), &[cheap]);
+    assert!(rejected.is_err());
     let s = step(&c, &s, &[tx]);
     // A new supporter creates a record; the proposer adds to its own.
     for (secret, record) in [(&DEFENDER, true), (&ATTACKER, false)] {

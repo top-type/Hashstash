@@ -4963,7 +4963,10 @@ mod tests {
         let encoded = address::encode(&key, &view.chain.chain_id()).unwrap();
         let unknown = hex::encode(crypto::public_key(&[3; 32]).unwrap());
         let original = Node::read_rpc(&view, "snapshot", json!({"key":key_hex})).unwrap();
-        assert_eq!(original.as_object().unwrap().len(), 9);
+        // The selected key also gets its pending rows and next nonce.
+        assert_eq!(original.as_object().unwrap().len(), 11);
+        assert!(original["pending_nonce"].is_string());
+        assert!(original["sender_mempool"].is_array());
         assert!(original.get("balances").is_none());
         let mut snapshot = Node::read_rpc(
             &view,

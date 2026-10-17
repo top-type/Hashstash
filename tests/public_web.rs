@@ -424,9 +424,18 @@ async fn public_mining_status_and_storage_errors_hide_operator_details() {
         .json::<Value>()
         .await
         .unwrap();
-    assert!(local["result"]["stratum"]["bind_address"].is_string());
-    // The public mining panel keeps its advertised endpoint and workers, but
-    // never the operator's Stratum bind interface.
+    let bind = local["result"]["stratum"]["bind_address"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Without --stratum-advertise the local connect URL is derived from the
+    // bind address.
+    assert_eq!(
+        local["result"]["stratum"]["connect_url"],
+        format!("stratum+tcp://{bind}")
+    );
+    // The public mining panel keeps its workers, but never the operator's
+    // Stratum bind interface, including inside a derived connect URL.
     for (method, pointer) in [
         ("mining", "/result/stratum"),
         ("snapshot", "/result/mining/stratum"),
@@ -439,8 +448,9 @@ async fn public_mining_status_and_storage_errors_hide_operator_details() {
         let stratum = value.pointer(pointer).unwrap();
         assert!(stratum.get("bind_address").is_none(), "{method}");
         assert!(stratum.get("loopback_only").is_none(), "{method}");
-        assert!(stratum["connect_url"].is_string(), "{method}");
+        assert!(stratum["connect_url"].is_null(), "{method}");
         assert_eq!(stratum["password_required"], false);
+        assert!(!value.to_string().contains(&bind), "{method}");
     }
     // An unopenable derived index reports a generic public error; the local
     // listener and the operator's log keep the full storage detail.
@@ -471,6 +481,29 @@ async fn public_mining_status_and_storage_errors_hide_operator_details() {
             .contains("explorer.sqlite"),
         "{detailed}"
     );
+    server.stop().await;
+    // An explicitly advertised endpoint is meant for miners and stays public.
+    let node = Node::open(&directory.path().join("advertised.sqlite"), config(), key).unwrap();
+    let server = node::serve(
+        node,
+        ServerOptions {
+            stratum_advertise: Some("pool.example.net:3333".into()),
+            ..options()
+        },
+    )
+    .await
+    .unwrap();
+    let public = format!("http://{}", server.public_web.unwrap());
+    let value = request(&client, &public, "mining", json!({}))
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(
+        value["result"]["stratum"]["connect_url"],
+        "stratum+tcp://pool.example.net:3333"
+    );
+    assert!(value["result"]["stratum"].get("bind_address").is_none());
     server.stop().await;
 }
 

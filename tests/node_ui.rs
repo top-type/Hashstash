@@ -193,7 +193,7 @@ async fn embedded_assets_session_and_atomic_pending_wallet_nonces() {
         .rpc("account", json!({"key":hex::encode(public)}))
         .unwrap();
     assert_eq!(pending["account"]["nonce"], 0);
-    assert_eq!(pending["pending_nonce"], 2);
+    assert_eq!(pending["pending_nonce"], "2");
     n.mine(100_000).unwrap();
     assert_eq!(
         n.rpc("account", json!({"key":hex::encode(recipient)}))

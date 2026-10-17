@@ -84,6 +84,14 @@ fn response_frame_bytes(transaction_bytes: usize) -> Result<usize> {
             .min(isize::MAX as usize),
     ))
 }
+/// A confirmed record stays servable after governance lowers capacity, so the
+/// HTTP frame follows the greatest validated block capacity (the active
+/// history's or a competitive branch's), as request admission does.
+fn http_response_frame(transaction_bytes: usize, known_block_bytes: u64) -> Result<usize> {
+    response_frame_bytes(
+        transaction_bytes.max(usize::try_from(known_block_bytes).unwrap_or(isize::MAX as usize)),
+    )
+}
 /// Read responses charge one admission work unit per this many projected JSON
 /// values: about one grant payment, matching the per-recipient request charge.
 const RESPONSE_VALUES_PER_WORK: usize = 32;
@@ -362,6 +370,9 @@ struct MiningRuntime {
     enabled: bool,
     bind_address: Option<SocketAddr>,
     connect_url: Option<String>,
+    /// Whether `connect_url` came from `--stratum-advertise`. A URL derived
+    /// from the bind address names an operator interface and stays private.
+    advertised: bool,
     password_required: bool,
     difficulty: f64,
     started: Instant,
@@ -377,6 +388,7 @@ impl Default for MiningRuntime {
             enabled: false,
             bind_address: None,
             connect_url: None,
+            advertised: false,
             password_required: false,
             difficulty: DEFAULT_STRATUM_SHARE_DIFFICULTY,
             started: Instant::now(),
@@ -753,6 +765,129 @@ impl ReadView {
             .proposals
             .get_or_init(|| ProposalIndex::build(self.chain.tip_state()))
     }
+    /// The governance projection with a large decision grant summarized, so
+    /// the retained copy stays bounded however many payments the grant has.
+    fn governance_summary(&self) -> Value {
+        self.cache
+            .governance
+            .get_or_init(|| governance_value(self, true))
+            .clone()
+    }
+}
+
+/// Payments of the decision grant projected into governance responses.
+fn decision_payments(s: &State) -> usize {
+    match &s.phase {
+        crate::state::Phase::Governance(d) => grant_payments(&d.proposal),
+        _ => 0,
+    }
+}
+
+/// The governance projection. `decision_grant` reports a decision grant's
+/// payment count and total; a summary keeps only the first
+/// SUMMARY_GRANT_PAYMENTS of a larger grant in `phase` and sets `truncated`.
+fn governance_value(i: &ReadView, summary: bool) -> Value {
+    let s = i.chain.tip_state();
+    let world = |w: &crate::state::World| json!({"reserve":w.reserve.to_str_radix(10),"shares":w.shares.to_str_radix(10),"curve_mass":w.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(w).to_str_radix(10),"account_shares":w.account_shares.to_str_radix(10),"revenue":w.revenue.to_str_radix(10),"grant_escrow":w.grant_escrow.to_str_radix(10)});
+    let progress = if let crate::state::Phase::Governance(d) = &s.phase {
+        let observed = s.height.saturating_sub(d.started_height).min(d.blocks);
+        json!({"time_unit":"blocks","leading_blocks":d.leading_blocks,"observed_blocks":observed,"blocks":d.blocks,"blocks_remaining":d.blocks.saturating_sub(observed)})
+    } else {
+        Value::Null
+    };
+    let summarized;
+    let (phase, decision_grant) = match &s.phase {
+        crate::state::Phase::Governance(d) => match &*d.proposal {
+            Proposal::Grant { payments } => {
+                let truncated = summary && payments.len() > SUMMARY_GRANT_PAYMENTS;
+                // Consensus validated the grant; only its amounts are summed.
+                let total: Amount = payments.iter().map(|payment| &payment.amount).sum();
+                let grant = json!({"payment_count":payments.len(),"payment_total":total.to_str_radix(10),"truncated":truncated});
+                if truncated {
+                    summarized = crate::state::Phase::Governance(crate::state::Decision {
+                        proposal: Arc::new(truncated_proposal(&d.proposal)),
+                        ..d.clone()
+                    });
+                    (&summarized, grant)
+                } else {
+                    (&s.phase, grant)
+                }
+            }
+            Proposal::Parameter { .. } => (&s.phase, Value::Null),
+        },
+        _ => (&s.phase, Value::Null),
+    };
+    json!({"phase":phase,"decision_grant":decision_grant,"height":s.height,"state_root":hex::encode(i.state_root()),"clock":s.clock,"time_unit":"seconds","clock_basis":"target_interval","settings":s.settings,"frozen":s.frozen,"pass_margin_bps":s.frozen.pass_margin_bps.unwrap_or(0).to_string(),"world":world(&s.world),"pass":s.alternative.as_ref().map(world),"auction_escrow":s.auction_escrow.to_str_radix(10),"progress":progress})
+}
+
+/// One page of proposal rows, charged per row and projected payment before
+/// it is built. A summary page (the wallet snapshot) keeps the first
+/// SUMMARY_GRANT_PAYMENTS of any larger grant; a full page summarizes a row
+/// only when it alone cannot fit the page budget.
+fn proposal_page(
+    i: &ReadView,
+    ids: &[Hash],
+    summary: bool,
+    meter: Option<&Session>,
+) -> Result<Value> {
+    let s = i.chain.tip_state();
+    let rows = ids
+        .iter()
+        .map(|id| {
+            let proposal = s.proposals.get(id).context("indexed proposal missing")?;
+            Ok((id, proposal))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let projected = |proposal: &crate::state::ProposalRecord| {
+        let payments = grant_payments(&proposal.action);
+        if summary {
+            payments.min(SUMMARY_GRANT_PAYMENTS)
+        } else {
+            payments
+        }
+    };
+    charge(
+        meter,
+        rows.iter()
+            .map(|(_, proposal)| 1 + projected(proposal))
+            .fold(0, usize::saturating_add),
+    )?;
+    let mut page = JsonPage::new();
+    for (id, proposal) in rows {
+        let summarize = || -> Result<Value> {
+            let record = crate::state::ProposalRecord {
+                round: proposal.round,
+                proposer: proposal.proposer,
+                description: proposal.description,
+                action: truncated_proposal(&proposal.action).into(),
+                support: proposal.support.clone(),
+                refund_height: proposal.refund_height,
+            };
+            Ok(serde_json::to_value(Truncated {
+                row: ProposalPageRow {
+                    id: hex::encode(id),
+                    proposal: &record,
+                },
+                truncated: true,
+                payment_count: grant_payments(&proposal.action),
+            })?)
+        };
+        let accepted = if summary && grant_payments(&proposal.action) > SUMMARY_GRANT_PAYMENTS {
+            page.push(&summarize()?)?
+        } else {
+            page.push_summarized(
+                &ProposalPageRow {
+                    id: hex::encode(id),
+                    proposal,
+                },
+                summarize,
+            )?
+        };
+        if !accepted {
+            break;
+        }
+    }
+    Ok(Value::Array(page.items))
 }
 #[derive(Clone)]
 pub struct Node {
@@ -2058,24 +2193,16 @@ impl Node {
                 Ok(quote)
             }
             "governance" => {
-                let s = i.chain.tip_state();
                 // The inline decision grant is projected into every response.
-                if let crate::state::Phase::Governance(d) = &s.phase {
-                    charge(meter, grant_payments(&d.proposal))?;
-                }
-                Ok(i.cache
-                    .governance
-                    .get_or_init(|| {
-                        let world = |w: &crate::state::World| json!({"reserve":w.reserve.to_str_radix(10),"shares":w.shares.to_str_radix(10),"curve_mass":w.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(w).to_str_radix(10),"account_shares":w.account_shares.to_str_radix(10),"revenue":w.revenue.to_str_radix(10),"grant_escrow":w.grant_escrow.to_str_radix(10)});
-                        let progress = if let crate::state::Phase::Governance(d) = &s.phase {
-                            let observed = s.height.saturating_sub(d.started_height).min(d.blocks);
-                            json!({"time_unit":"blocks","leading_blocks":d.leading_blocks,"observed_blocks":observed,"blocks":d.blocks,"blocks_remaining":d.blocks.saturating_sub(observed)})
-                        } else {
-                            Value::Null
-                        };
-                        json!({"phase":s.phase,"height":s.height,"state_root":hex::encode(i.state_root()),"clock":s.clock,"time_unit":"seconds","clock_basis":"target_interval","settings":s.settings,"frozen":s.frozen,"pass_margin_bps":s.frozen.pass_margin_bps.unwrap_or(0).to_string(),"world":world(&s.world),"pass":s.alternative.as_ref().map(world),"auction_escrow":s.auction_escrow.to_str_radix(10),"progress":progress})
-                    })
-                    .clone())
+                let payments = decision_payments(i.chain.tip_state());
+                charge(meter, payments)?;
+                Ok(if payments > SUMMARY_GRANT_PAYMENTS {
+                    // A complete grant can be as large as governed capacity
+                    // admits, so it is built per paid call and never retained.
+                    governance_value(i, false)
+                } else {
+                    i.governance_summary()
+                })
             }
             "proposals" => {
                 let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -2085,52 +2212,22 @@ impl Node {
                     .unwrap_or(128)
                     .min(128) as usize;
                 let round = params.get("round").and_then(Value::as_u64);
-                let s = i.chain.tip_state();
+                // Round pages follow support, which changes between tips. A
+                // client paging one listing names the tip of its first page.
+                if let Some(tip) = params.get("tip") {
+                    let tip = parse_hash(tip.as_str().context("tip must be a block hash")?)?;
+                    ensure!(
+                        tip == i.chain.tip_hash(),
+                        "proposal pages changed with a new tip; restart from offset 0"
+                    );
+                }
                 let index = i.proposal_index();
                 let ids = match round {
                     Some(round) => index.rounds.get(&round).map_or(&[][..], Vec::as_slice),
                     None => &index.all,
                 };
                 let ids = ids.get(offset..).unwrap_or_default();
-                let ids = &ids[..ids.len().min(limit)];
-                let mut work = 0usize;
-                for id in ids {
-                    let proposal = s.proposals.get(id).context("indexed proposal missing")?;
-                    work = work.saturating_add(1 + grant_payments(&proposal.action));
-                }
-                charge(meter, work)?;
-                let mut page = JsonPage::new();
-                for id in ids {
-                    let proposal = s.proposals.get(id).context("indexed proposal missing")?;
-                    let accepted = page.push_summarized(
-                        &ProposalPageRow {
-                            id: hex::encode(id),
-                            proposal,
-                        },
-                        || {
-                            let summary = crate::state::ProposalRecord {
-                                round: proposal.round,
-                                proposer: proposal.proposer,
-                                description: proposal.description,
-                                action: truncated_proposal(&proposal.action).into(),
-                                support: proposal.support.clone(),
-                                refund_height: proposal.refund_height,
-                            };
-                            Ok(serde_json::to_value(Truncated {
-                                row: ProposalPageRow {
-                                    id: hex::encode(id),
-                                    proposal: &summary,
-                                },
-                                truncated: true,
-                                payment_count: grant_payments(&proposal.action),
-                            })?)
-                        },
-                    )?;
-                    if !accepted {
-                        break;
-                    }
-                }
-                Ok(Value::Array(page.items))
+                proposal_page(i, &ids[..ids.len().min(limit)], false, meter)
             }
             "support" => {
                 let key = parse_account(required_str(&params, "key")?, &chain_id)?;
@@ -2218,13 +2315,15 @@ impl Node {
                 let payment_available = s.common_spendable(&key).unwrap_or_default();
                 // Nonces are common to both outcomes. Clients obtain the next
                 // pending nonce without downloading every raw pending record.
+                // A decimal string, as in snapshot, so no client rounds it.
                 let pending_nonce = i
                     .mempool
                     .iter()
                     .filter(|tx| tx.body.sender == key)
                     .fold(a.nonce, |nonce, tx| {
                         nonce.max(tx.body.nonce.saturating_add(1))
-                    });
+                    })
+                    .to_string();
                 Ok(
                     json!({"key":hex::encode(key), "account":a, "pending_nonce":pending_nonce, "payment_available_hash":payment_available.to_str_radix(10), "price_hash_per_share":{"numerator":numerator.to_str_radix(10),"denominator":den.to_str_radix(10)}, "stash_value_hash":{"numerator":value.to_str_radix(10),"denominator":den.to_str_radix(10)}, "stash_withdrawal_hash":withdrawal.to_str_radix(10)}),
                 )
@@ -2469,17 +2568,31 @@ impl Node {
                 } else {
                     Value::Null
                 };
+                // A wallet summary: grants above SUMMARY_GRANT_PAYMENTS keep
+                // their first payments with a count, so polling stays bounded
+                // however large a grant is; `proposals` and `governance`
+                // return complete records.
                 let proposals = match round {
                     Some(round) => {
-                        Self::read_rpc_metered(i, "proposals", json!({"round":round}), meter)?
+                        let ids = i
+                            .proposal_index()
+                            .rounds
+                            .get(&round)
+                            .map_or(&[][..], Vec::as_slice);
+                        proposal_page(i, &ids[..ids.len().min(128)], true, meter)?
                     }
                     None => json!([]),
                 };
+                charge(
+                    meter,
+                    decision_payments(i.chain.tip_state()).min(SUMMARY_GRANT_PAYMENTS),
+                )?;
+                let governance = i.governance_summary();
                 charge(meter, mempool_work(&i.mempool, 0, 128, "summary"))?;
                 let mut snapshot = json!({
                     "status":Self::status_locked(i),
                     "config":i.chain.config,
-                    "governance":Self::read_rpc_metered(i,"governance",json!({}),meter)?,
+                    "governance":governance,
                     "proposals":proposals,
                     // The page holds the round's leader first, then the best
                     // supported; the total says whether more pages exist.
@@ -2584,7 +2697,8 @@ impl Node {
         }
         .map_err(public_error)?;
         // The public mining panel shows workers and the advertised endpoint;
-        // the Stratum bind interface stays private to the operator.
+        // the Stratum bind interface stays private to the operator, including
+        // inside a connect URL derived from it without --stratum-advertise.
         let mining = match method {
             "mining" => Some(&mut result),
             "snapshot" => result.get_mut("mining"),
@@ -2596,6 +2710,14 @@ impl Node {
         {
             stratum.remove("bind_address");
             stratum.remove("loopback_only");
+            let advertised = self
+                .mining
+                .lock()
+                .map_err(|_| anyhow!("mining statistics lock poisoned"))?
+                .advertised;
+            if !advertised {
+                stratum.insert("connect_url".into(), Value::Null);
+            }
         }
         Ok(result)
     }
@@ -2607,6 +2729,7 @@ impl Node {
     ) -> Result<Value> {
         if crate::explorer::METHODS.contains(&method) {
             let view = self.read_view()?;
+            charge(admission, explorer_state_work(method, view.chain.tip_state()))?;
             return Explorer::read(
                 &self.explorer_path,
                 method,
@@ -2614,6 +2737,7 @@ impl Node {
                 &view.chain.config,
                 view.chain.tip_state(),
                 view.chain.tip_hash(),
+                view.state_root(),
                 &view.mempool,
             );
         }
@@ -2644,7 +2768,7 @@ impl Node {
                     &i.chain.config,
                     i.chain.tip_state(),
                     i.chain.tip_hash(),
-                    i.chain.tip_state().root(),
+                    i.state_root(),
                     &body,
                 )?;
 
@@ -2815,6 +2939,17 @@ fn public_error(error: anyhow::Error) -> anyhow::Error {
         anyhow!("node storage is temporarily unavailable")
     } else {
         error
+    }
+}
+/// Explorer work that grows with the live state, beyond the flat method price.
+/// Every governance page projects the live phase, including the decision's
+/// inline grant, so it is charged per payment as the governance RPC is.
+fn explorer_state_work(method: &str, s: &State) -> usize {
+    match &s.phase {
+        crate::state::Phase::Governance(d) if method == "explorer_governance" => {
+            grant_payments(&d.proposal)
+        }
+        _ => 0,
     }
 }
 /// Admission work for one curve valuation. A flat curve has exact closed forms.
@@ -3438,6 +3573,7 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
         *mining = MiningRuntime {
             enabled: options.stratum_enabled,
             bind_address: options.stratum_enabled.then_some(addresses.2),
+            advertised: options.stratum_enabled && advertised.is_some(),
             connect_url: if options.stratum_enabled {
                 advertised.or_else(|| {
                     (!addresses.2.ip().is_unspecified())
@@ -4504,6 +4640,19 @@ async fn http_response_limited<W: AsyncWrite + Unpin>(
 fn http_error(message: &str) -> Value {
     json!({"error":{"message":message}})
 }
+/// Like peer replies, public-web replies spend the byte budget without
+/// penalty: the node chose their size, so an exhausted budget only asks the
+/// client to retry. The public byte burst covers the whole response frame, so
+/// one maximal valid reply waits for refill instead of never fitting.
+fn charge_public_reply(
+    guard: &NetworkGuard,
+    admission: &Session,
+    bytes: usize,
+    frame: usize,
+) -> Result<()> {
+    guard.allow_frame(frame)?;
+    admission.outgoing(bytes, 0)
+}
 
 async fn http_session(
     node: Node,
@@ -4520,6 +4669,16 @@ async fn http_session(
             .config
             .transaction_bytes(&view.chain.tip_state().settings)
     };
+    let response_frame = http_response_frame(
+        transaction_bytes,
+        node.known_block_bytes.load(Ordering::Acquire),
+    )?;
+    if http.public {
+        // The public guard never sees the private capacity updates. Its byte
+        // burst admits one response frame, so a large valid reply waits for
+        // refill instead of never fitting.
+        http.guard.allow_frame(response_frame)?;
+    }
     let request = match timeout(
         IO_TIMEOUT,
         read_http(
@@ -4863,12 +5022,11 @@ async fn http_session(
     drop(response);
     // A valid record may need more than the fixed service frame once
     // governance raises capacity; the frame then follows that capacity.
-    let limit = response_frame_bytes(transaction_bytes)?;
+    let limit = response_frame;
     let refused = if body.len() > limit {
         Some("RPC response exceeds the local response limit")
-    } else if public && admission.bytes(body.len()).is_err() {
-        // Like peer replies, public responses spend the byte budget.
-        Some("network rate budget exhausted")
+    } else if public && charge_public_reply(&http.guard, &admission, body.len(), limit).is_err() {
+        Some("public response byte budget exhausted; try again")
     } else {
         None
     };
@@ -5261,7 +5419,7 @@ mod read_admission_tests {
     }
 
     #[test]
-    fn governance_grant_projection_is_charged_and_cached_per_tip() {
+    fn governance_grant_projection_is_charged_and_summarized_for_wallets() {
         let mut s = curved();
         s.phase = Phase::Governance(Decision {
             id: [5; 32],
@@ -5274,21 +5432,72 @@ mod read_admission_tests {
             blocks: 10,
             leading_blocks: 0,
         });
+        // The decision proposal is also the first row of its round.
+        s.proposals.insert(vec![6; 32], record(0, 5, grant(4096)));
+        // Every explorer governance page projects the live phase too.
+        assert_eq!(explorer_state_work("explorer_governance", &s), 4096);
+        assert_eq!(explorer_state_work("explorer_blocks", &s), 0);
+        assert_eq!(explorer_state_work("explorer_governance", &curved()), 0);
         let view = view(s, vec![]);
         let error = Node::read_rpc_metered(&view, "governance", json!({}), Some(&drained()))
             .unwrap_err();
         assert!(error.to_string().contains("budget"), "{error}");
-        let first = Node::read_rpc(&view, "governance", json!({})).unwrap();
+        let payments = |value: &Value| {
+            value["phase"]["Governance"]["proposal"]["Grant"]["payments"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        let full = Node::read_rpc(&view, "governance", json!({})).unwrap();
+        assert_eq!(payments(&full), 4096);
         assert_eq!(
-            first["phase"]["Governance"]["proposal"]["Grant"]["payments"]
+            full["decision_grant"],
+            json!({"payment_count":4096,"payment_total":"4096","truncated":false})
+        );
+        assert_eq!(full["state_root"], hex::encode(view.chain.tip_state().root()));
+        // A complete projection is built per paid call and never retained.
+        assert!(view.cache.governance.get().is_none());
+        assert_eq!(Node::read_rpc(&view, "governance", json!({})).unwrap(), full);
+        // Wallet polling carries one bounded summary per tip, of the decision
+        // and of its proposal row alike.
+        let snapshot = Node::read_rpc(&view, "snapshot", json!({})).unwrap();
+        let governance = &snapshot["governance"];
+        assert_eq!(payments(governance), SUMMARY_GRANT_PAYMENTS);
+        assert_eq!(
+            governance["decision_grant"],
+            json!({"payment_count":4096,"payment_total":"4096","truncated":true})
+        );
+        assert_eq!(view.cache.governance.get(), Some(governance));
+        let row = &snapshot["proposals"][0];
+        assert_eq!(row["truncated"], true);
+        assert_eq!(row["payment_count"], 4096);
+        assert_eq!(
+            row["proposal"]["action"]["Grant"]["payments"]
                 .as_array()
                 .unwrap()
                 .len(),
-            4096
+            SUMMARY_GRANT_PAYMENTS
         );
-        assert!(view.cache.governance.get().is_some());
-        assert_eq!(Node::read_rpc(&view, "governance", json!({})).unwrap(), first);
-        assert_eq!(first["state_root"], hex::encode(view.chain.tip_state().root()));
+        // A direct proposals page keeps the complete grant.
+        let page = Node::read_rpc(&view, "proposals", json!({"round":0})).unwrap();
+        assert!(page[0].get("truncated").is_none());
+        // Each is charged for what it projects: a budget below one complete
+        // grant still serves the bounded snapshot.
+        let budget = || {
+            let session = Arc::new(NetworkGuard::for_public_web())
+                .admit("127.0.0.1".parse().unwrap(), Surface::Rpc)
+                .unwrap();
+            session.work(1_048_576 - 2048).unwrap();
+            session
+        };
+        for method in ["governance", "proposals"] {
+            let error =
+                Node::read_rpc_metered(&view, method, json!({"round":0}), Some(&budget()))
+                    .unwrap_err();
+            assert!(error.to_string().contains("budget"), "{method}: {error}");
+        }
+        let polled = Node::read_rpc_metered(&view, "snapshot", json!({}), Some(&budget()));
+        assert!(polled.is_ok(), "{:?}", polled.err());
     }
 
     #[test]
@@ -5369,6 +5578,14 @@ mod read_admission_tests {
         let page = Node::read_rpc(&auction, "proposals", json!({"round":0,"offset":1,"limit":2}))
             .unwrap();
         assert_eq!(ids(&page), hex_ids(&[2, 3]));
+        // Support order changes between tips, so a listing paged across
+        // blocks could skip a row; naming the first page's tip refuses that.
+        let tip = hex::encode(auction.chain.tip_hash());
+        let bound = json!({"round":0,"offset":1,"limit":2,"tip":tip});
+        assert_eq!(ids(&Node::read_rpc(&auction, "proposals", bound).unwrap()), hex_ids(&[2, 3]));
+        let stale = json!({"round":0,"offset":1,"tip":hex::encode([8; 32])});
+        let error = Node::read_rpc(&auction, "proposals", stale).unwrap_err();
+        assert!(error.to_string().contains("restart from offset 0"), "{error}");
         assert!(
             Node::read_rpc(&auction, "proposals", json!({"round":0,"offset":9}))
                 .unwrap()
@@ -5466,7 +5683,10 @@ mod read_admission_tests {
         let view = view(curved(), vec![pending(0), pending(1)]);
         let account = Node::read_rpc(&view, "account", json!({"key":hex::encode(key())})).unwrap();
         assert_eq!(account["account"]["nonce"], 0);
-        assert_eq!(account["pending_nonce"], 2);
+        // The same decimal-string encoding as snapshot's pending_nonce.
+        assert_eq!(account["pending_nonce"], "2");
+        let snapshot = Node::read_rpc(&view, "snapshot", json!({"key":hex::encode(key())})).unwrap();
+        assert_eq!(snapshot["pending_nonce"], account["pending_nonce"]);
         assert_eq!(response_frame_bytes(16 * 1024).unwrap(), MAX_RESPONSE_FRAME);
         let governed = 200 * 1024 * 1024;
         assert!(response_frame_bytes(governed).unwrap() > 2 * governed);
@@ -5474,6 +5694,36 @@ mod read_admission_tests {
             response_frame_bytes(usize::MAX).unwrap(),
             isize::MAX as usize
         );
+        // After governance lowers capacity, a confirmed record from the larger
+        // history still fits: the frame follows the greatest validated capacity.
+        assert_eq!(
+            http_response_frame(16 * 1024, governed as u64).unwrap(),
+            response_frame_bytes(governed).unwrap()
+        );
+        assert_eq!(
+            http_response_frame(governed, 16 * 1024).unwrap(),
+            response_frame_bytes(governed).unwrap()
+        );
+    }
+
+    #[test]
+    fn public_replies_spend_bytes_without_penalty_and_one_frame_always_fits() {
+        // A directly connected visitor, for whom a penalty starts a cooldown.
+        let remote: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let guard = Arc::new(NetworkGuard::for_public_web());
+        let session = guard.admit(remote, Surface::Rpc).unwrap();
+        // One valid reply above the 66 MiB baseline burst, as a governed
+        // capacity allows; the frame for that capacity covers it.
+        let reply = 100 * 1024 * 1024;
+        let frame = http_response_frame(16 * 1024, 48 * 1024 * 1024).unwrap();
+        assert!(reply <= frame);
+        charge_public_reply(&guard, &session, reply, frame).unwrap();
+        // The next one exceeds the remaining budget: a retryable refusal,
+        // never a cooldown for a size the node chose.
+        let refused = charge_public_reply(&guard, &session, reply, frame).unwrap_err();
+        assert!(refused.is::<network_guard::Busy>(), "{refused}");
+        session.request().unwrap();
+        drop(guard.admit(remote, Surface::Rpc).unwrap());
     }
 
     #[test]
@@ -5770,7 +6020,13 @@ impl RpcClient {
                 .as_u64()
                 .context("invalid nonce")?;
             if let Some(reported) = account.get("pending_nonce").filter(|v| !v.is_null()) {
-                let nonce = reported.as_u64().context("invalid pending nonce")?;
+                // A decimal string; earlier endpoints sent a JSON number.
+                let nonce = match reported {
+                    // Canonical digits only; parsing then rejects values above u64.
+                    Value::String(text) => parse_amount(text).ok().and_then(|_| text.parse().ok()),
+                    other => other.as_u64(),
+                }
+                .context("invalid pending nonce")?;
                 ensure!(
                     nonce >= account_nonce,
                     "pending nonce precedes account nonce"

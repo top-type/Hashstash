@@ -330,18 +330,42 @@ async fn pending_nonce_discovery_counts_only_signed_rows_and_is_bounded() {
         }
     );
     assert_eq!(reporting.methods(), ["account"]);
-    // A reported pending nonce below the account nonce is refused.
-    let behind = mock(Duration::ZERO, |_, _| {
-        result(json!({"account":{"nonce":3},"pending_nonce":2}))
+    // Current endpoints report it as a decimal string, like snapshot does.
+    let decimal = mock(Duration::ZERO, |method, _| match method {
+        "account" => result(json!({"account":{"nonce":3},"pending_nonce":"8"})),
+        _ => http("500 Internal Server Error", "", b""),
     })
     .await;
-    assert!(
-        RpcClient::new(&behind.url(), false)
+    assert_eq!(
+        RpcClient::new(&decimal.url(), false)
             .unwrap()
             .pending_nonce(&sender, ScanBudget::DEFAULT)
             .await
-            .is_err()
+            .unwrap()
+            .nonce,
+        8
     );
+    // A reported pending nonce below the account nonce, or one that is not a
+    // canonical u64, is refused.
+    for reported in [
+        json!(2),
+        json!("2"),
+        json!("08"),
+        json!("+8"),
+        json!("18446744073709551616"),
+    ] {
+        let behind = mock(Duration::ZERO, move |_, _| {
+            result(json!({"account":{"nonce":3},"pending_nonce":reported.clone()}))
+        })
+        .await;
+        assert!(
+            RpcClient::new(&behind.url(), false)
+                .unwrap()
+                .pending_nonce(&sender, ScanBudget::DEFAULT)
+                .await
+                .is_err()
+        );
+    }
 
     // Unsigned or forged rows cannot raise the nonce.
     let mut forged = signed_transfer(secret, 40);

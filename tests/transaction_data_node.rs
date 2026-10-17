@@ -225,7 +225,10 @@ async fn hot_wallet_data_reaches_peer_mempool_mined_block_and_reopened_database(
     let response = client
         .post(format!("{base}/api/wallet"))
         .header("Origin", &base)
-        .header("X-Hashstash-Token", session["token"].as_str().unwrap())
+        .header(
+            "X-Hashstash-Token",
+            std::fs::read_to_string(&server.session_token_file).unwrap(),
+        )
         .json(&request)
         .send()
         .await

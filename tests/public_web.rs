@@ -64,6 +64,8 @@ async fn public_session_and_routes_never_expose_or_control_server_wallet() {
         .unwrap();
     assert_eq!(local["public_key"], hex::encode(server_key));
     assert_eq!(local["public_web"], false);
+    assert!(local.get("token").is_none());
+    let token = std::fs::read_to_string(&server.session_token_file).unwrap();
     let exposed: Value = client
         .get(format!("{public}/api/session"))
         .send()
@@ -91,7 +93,7 @@ async fn public_session_and_routes_never_expose_or_control_server_wallet() {
     for path in ["/api/wallet", "/api/wallet/manage"] {
         for action in ["create", "import", "export", "select", "remove"] {
             let response = client.post(format!("{public}{path}"))
-                .header("X-Hashstash-Token", local["token"].as_str().unwrap())
+                .header("X-Hashstash-Token", &token)
                 .json(&json!({"action":action,"revision":local["wallet_revision"],"id":local["wallet_id"]}))
                 .send().await.unwrap();
             assert_eq!(response.status(), 403, "{path}: {action}");
@@ -255,6 +257,23 @@ async fn public_wallet_prepares_exact_unsigned_intent_and_broadcasts_only_signed
         hex::encode(codec::transaction_id(&signed))
     );
     assert_eq!(node.status().unwrap()["mempool"], 1);
+    // A pending record's minimum fee is a current quote, never a recorded charge.
+    let txid = hex::encode(codec::transaction_id(&signed));
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    let pending = loop {
+        let result = node.rpc("explorer_transaction", json!({"txid":txid}));
+        match result {
+            Err(error)
+                if error.to_string().contains("index is updating")
+                    && std::time::Instant::now() < until =>
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await
+            }
+            result => break result.unwrap(),
+        }
+    };
+    assert_eq!(pending["transaction"]["status"], "pending");
+    assert_eq!(pending["transaction"]["fee_estimated"], true);
     node.mine(100_000).unwrap();
     let account = request(
         &client,
@@ -387,6 +406,71 @@ async fn public_connections_and_malformed_cooldowns_do_not_exhaust_private_rpc()
         0
     );
     drop(held);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_mining_status_and_storage_errors_hide_operator_details() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = crypto::public_key(&[109; 32]).unwrap();
+    let path = directory.path().join("chain.sqlite");
+    let node = Node::open(&path, config(), key).unwrap();
+    let server = node::serve(node, options()).await.unwrap();
+    let public = format!("http://{}", server.public_web.unwrap());
+    let private = format!("http://{}", server.rpc);
+    let client = reqwest::Client::new();
+    let local = request(&client, &private, "mining", json!({}))
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert!(local["result"]["stratum"]["bind_address"].is_string());
+    // The public mining panel keeps its advertised endpoint and workers, but
+    // never the operator's Stratum bind interface.
+    for (method, pointer) in [
+        ("mining", "/result/stratum"),
+        ("snapshot", "/result/mining/stratum"),
+    ] {
+        let value = request(&client, &public, method, json!({}))
+            .await
+            .json::<Value>()
+            .await
+            .unwrap();
+        let stratum = value.pointer(pointer).unwrap();
+        assert!(stratum.get("bind_address").is_none(), "{method}");
+        assert!(stratum.get("loopback_only").is_none(), "{method}");
+        assert!(stratum["connect_url"].is_string(), "{method}");
+        assert_eq!(stratum["password_required"], false);
+    }
+    // An unopenable derived index reports a generic public error; the local
+    // listener and the operator's log keep the full storage detail.
+    std::fs::remove_file(path.with_extension("explorer.sqlite")).unwrap();
+    let hidden = request(&client, &public, "explorer_blocks", json!({}))
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(
+        hidden["error"]["message"],
+        "node storage is temporarily unavailable"
+    );
+    assert!(
+        !hidden
+            .to_string()
+            .contains(directory.path().to_str().unwrap())
+    );
+    let detailed = request(&client, &private, "explorer_blocks", json!({}))
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert!(
+        detailed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("explorer.sqlite"),
+        "{detailed}"
+    );
     server.stop().await;
 }
 

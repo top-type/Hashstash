@@ -6,7 +6,7 @@ Search accepts a block height, block hash, transaction ID, or checksummed accoun
 
 ## Reading history
 
-A confirmed transaction belongs to the node's current canonical chain. Its confirmation count is the number of blocks from its inclusion through the current tip. A reorganization can change that status. Pending transactions have not yet been included. Their fee is the exact signed amount; the required minimum and its split are a quote for the current state until inclusion.
+A confirmed transaction belongs to the node's current canonical chain. Its confirmation count is the number of blocks from its inclusion through the current tip. A reorganization can change that status. Pending transactions have not yet been included. Their fee is the exact signed amount; the required minimum and its split are a quote for the current state until inclusion, marked `fee_estimated: true`.
 
 An orphaned block or transaction was previously indexed on the canonical chain and has since been detached. The Explorer retains those known records for direct lookup. It does not claim to have observed every block produced by every miner.
 

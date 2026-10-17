@@ -78,7 +78,7 @@ On the signing computer, run:
 .\Start-ColdWallet.ps1
 ```
 
-This opens the separate `bin/hashstash-cold.exe` tool at `http://127.0.0.1:19580/`. It serves its own embedded interface and makes no node or peer connections. For offline signing, run it on a disconnected computer. No browser extensions or downloaded assets are needed.
+This opens the separate `bin/hashstash-cold.exe` tool at `http://127.0.0.1:19580/`. It serves its own embedded interface and makes no node or peer connections. For offline signing, run it on a disconnected computer. No browser extensions or downloaded assets are needed. Its browser session is not an access-control boundary: any local process can reach the signer while it is unlocked, so use it only on a single-user computer and lock it after signing.
 
 The launcher uses the latest local network configuration when available; `-Config PATH` or `-ChainId HEX` selects it explicitly. On a disconnected computer, set the network by importing the small file exported from **Explorer → Network → Identity → Export network**, or paste its full chain ID into the signer's Network field. A known network is required to copy an address or export its watch-only file. Changing networks clears a pending transaction review. An export with different network context is rejected. This context is unsigned and catches accidental mismatches; the receiving node must verify that the signed anchor belongs to its branch.
 
@@ -133,6 +133,8 @@ The browser manager does not call server-wallet endpoints. It serializes local s
 Opt-in node wallets store keys and selection beside the chain database: `chain.sqlite` uses `chain.wallets.sqlite`. These keys are separate from browser wallets. Import a key file or an explicitly exported private-key backup through Wallet to use that account in the browser.
 
 The private loopback listener exposes session-authorized wallet tools: `GET /api/session` lists wallet IDs and the current revision; `POST /api/wallet/manage` with `action:"export"`, its `id`, and that `revision` returns a backup when authorized with the local session token in `X-Hashstash-Token`. Export only the intended key and keep the private listener private. These routes and the `/api/wallet` signer are unavailable on the public-web listener. Normal browser use never calls them.
+
+Loopback TCP is not an access-control boundary: every local account and service, and anyone using an SSH forward of the port, can reach it. The node therefore never serves the session token over HTTP. Each server start writes a new random token to the session token file beside the chain database (`chain.sqlite` uses `chain.session-token`). It is created fresh with owner-only permissions on Unix; on Windows it inherits the data directory ACL, so keep that directory private. Local tools running as the node's account read the token from that file. A token from an earlier start is rejected. Wallet requests with a missing or wrong token, or to an unknown path, are rejected before their body is read.
 
 ## Recovery and transaction formats
 

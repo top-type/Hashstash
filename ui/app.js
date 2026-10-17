@@ -1707,7 +1707,7 @@
                 round: round,
                 proposal: v.proposal.trim()
             });
-            feedback(form, `${formatExactHash(String(data.amount))} of your support. ${data.refundable ? "Available for refund." : "Not currently refundable."}`);
+            feedback(form, `${formatExactHash(String(data.amount))} of your support. ${data.status === "converted_to_revenue" ? "This proposal won its round; its support became revenue and is never refundable." : data.refundable ? "Available for refund." : data.status === "none" ? "Nothing to refund." : "Not currently refundable."}`);
         } catch (error) {
             feedback(form, error.message, true);
         }

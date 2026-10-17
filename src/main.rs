@@ -750,31 +750,16 @@ async fn send_operation(
     let nonce = if let Some(n) = nonce {
         n
     } else {
-        let mut n = account["account"]["nonce"]
+        // The node reports the next nonce after its pending transactions, so
+        // the CLI never downloads raw pending records of any governed size.
+        let confirmed = account["account"]["nonce"]
             .as_u64()
             .context("invalid nonce")?;
-        let mut offset = 0;
-        while offset < node::MAX_ADAPTIVE_MEMPOOL {
-            let pending =
-                node::call_rpc(url, "mempool", json!({"offset":offset,"format":"hex"})).await?;
-            let page = pending.as_array().context("invalid mempool response")?;
-            ensure!(page.len() <= 128, "mempool page exceeds requested limit");
-            if page.is_empty() {
-                break;
-            }
-            for v in page {
-                let tx = hashstash::wallet::decode_signed(
-                    v.get("raw")
-                        .and_then(Value::as_str)
-                        .context("mempool signed transaction missing")?,
-                )?;
-                if tx.body.sender == sender {
-                    n = n.max(tx.body.nonce.checked_add(1).context("nonce exhausted")?);
-                }
-            }
-            offset += page.len();
-        }
-        n
+        let pending = account["pending_nonce"]
+            .as_u64()
+            .context("invalid pending nonce")?;
+        ensure!(pending >= confirmed, "pending nonce precedes account nonce");
+        pending
     };
     let body: TransactionBody = {
         let mut request = fee_request;

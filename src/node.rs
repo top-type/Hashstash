@@ -68,6 +68,31 @@ fn admission_frame_bytes(config: &Config, capacity: u64) -> Result<usize> {
 }
 // Local response service limit; independent of canonical record validity.
 pub(crate) const MAX_RESPONSE_FRAME: usize = 193 * 1024 * 1024;
+/// A governed capacity can make one valid record's hexadecimal response exceed
+/// the fixed service limit; the HTTP frame then grows with that capacity.
+fn response_frame_bytes(transaction_bytes: usize) -> Result<usize> {
+    Ok(MAX_RESPONSE_FRAME.max(
+        transaction_request_bytes(transaction_bytes)?
+            .saturating_add(64 * 1024)
+            .min(isize::MAX as usize),
+    ))
+}
+/// Read responses charge one admission work unit per this many projected JSON
+/// values: about one grant payment, matching the per-recipient request charge.
+const RESPONSE_VALUES_PER_WORK: usize = 32;
+/// Admission work for one exact curved-price evaluation: a few milliseconds of
+/// 2048-bit series arithmetic, about 1/256 s of the RPC work refill rate.
+const CURVE_EVALUATION_WORK: usize = 512;
+/// Grant payments kept by a display summary of a record too large for a page.
+const SUMMARY_GRANT_PAYMENTS: usize = 256;
+
+/// Charge read work once its actual size is known. In-process calls are unmetered.
+fn charge(meter: Option<&Session>, work: usize) -> Result<()> {
+    match meter {
+        Some(session) if work > 0 => session.work(work),
+        _ => Ok(()),
+    }
+}
 
 /// Bound collection responses before constructing their generic JSON trees.
 /// The cursor/offset always advances by returned rows, including when either
@@ -85,7 +110,7 @@ impl JsonPage {
             values_left: network_guard::MAX_JSON_VALUES,
         }
     }
-    fn push<T: Serialize>(&mut self, row: &T) -> Result<bool> {
+    fn encode<T: Serialize>(&self, row: &T) -> Result<(Vec<u8>, usize)> {
         struct BoundedJson {
             bytes: Vec<u8>,
             maximum: usize,
@@ -102,25 +127,40 @@ impl JsonPage {
                 Ok(())
             }
         }
-        let prepare = || -> Result<(Vec<u8>, usize)> {
-            let mut output = BoundedJson {
-                bytes: Vec::new(),
-                maximum: self.bytes_left,
-            };
-            serde_json::to_writer(&mut output, row)?;
-            let values =
-                network_guard::preflight_json_value_count(&output.bytes, self.values_left)?;
-            Ok((output.bytes, values))
+        let mut output = BoundedJson {
+            bytes: Vec::new(),
+            maximum: self.bytes_left,
         };
-        let (bytes, values) = match prepare() {
-            Ok(record) => record,
-            Err(_) if !self.items.is_empty() => return Ok(false),
-            Err(error) => return Err(error),
-        };
+        serde_json::to_writer(&mut output, row)?;
+        let values = network_guard::preflight_json_value_count(&output.bytes, self.values_left)?;
+        Ok((output.bytes, values))
+    }
+    fn accept(&mut self, (bytes, values): (Vec<u8>, usize)) -> Result<bool> {
         self.items.push(serde_json::from_slice(&bytes)?);
         self.bytes_left -= bytes.len();
         self.values_left -= values;
         Ok(true)
+    }
+    fn push<T: Serialize>(&mut self, row: &T) -> Result<bool> {
+        match self.encode(row) {
+            Ok(record) => self.accept(record),
+            Err(_) if !self.items.is_empty() => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+    /// A first row too large for an empty page is replaced by its bounded
+    /// summary, so one large record never makes a page, or a snapshot that
+    /// embeds it, unavailable. Later oversized rows still start the next page.
+    fn push_summarized<T: Serialize>(
+        &mut self,
+        row: &T,
+        summary: impl FnOnce() -> Result<Value>,
+    ) -> Result<bool> {
+        match self.encode(row) {
+            Ok(record) => self.accept(record),
+            Err(_) if !self.items.is_empty() => Ok(false),
+            Err(_) => self.push(&summary()?),
+        }
     }
 }
 
@@ -128,6 +168,53 @@ impl JsonPage {
 struct ProposalPageRow<'a> {
     id: String,
     proposal: &'a crate::state::ProposalRecord,
+}
+
+/// A display row whose grant payments were cut to SUMMARY_GRANT_PAYMENTS.
+#[derive(Serialize)]
+struct Truncated<T> {
+    #[serde(flatten)]
+    row: T,
+    truncated: bool,
+    payment_count: usize,
+}
+
+fn grant_payments(proposal: &Proposal) -> usize {
+    match proposal {
+        Proposal::Grant { payments } => payments.len(),
+        Proposal::Parameter { .. } => 0,
+    }
+}
+fn truncated_proposal(proposal: &Proposal) -> Proposal {
+    match proposal {
+        Proposal::Grant { payments } => Proposal::Grant {
+            payments: payments
+                .iter()
+                .take(SUMMARY_GRANT_PAYMENTS)
+                .cloned()
+                .collect(),
+        },
+        other => other.clone(),
+    }
+}
+fn truncated_operation(operation: &Operation) -> (Operation, usize) {
+    match operation {
+        Operation::Propose {
+            round,
+            description,
+            proposal,
+            support,
+        } => (
+            Operation::Propose {
+                round: *round,
+                description: *description,
+                proposal: truncated_proposal(proposal),
+                support: support.clone(),
+            },
+            grant_payments(proposal),
+        ),
+        other => (other.clone(), 0),
+    }
 }
 
 #[derive(Serialize)]
@@ -152,20 +239,55 @@ struct PendingRow<'a> {
     body: PendingBody<'a>,
 }
 
+fn pending_row<'a>(body: &TransactionBody, operation: &'a Operation) -> PendingRow<'a> {
+    PendingRow {
+        body: PendingBody {
+            sender: body.sender,
+            nonce: body.nonce,
+            fee: body.fee.to_str_radix(10),
+            anchor: body.anchor,
+            expiry_blocks: body.expiry_blocks,
+            operation,
+        },
+    }
+}
+
+/// Pre-charged projection work for mempool rows: one unit per row and grant
+/// payment, plus one per 32 data bytes (JSON numbers) for full JSON rows; hex
+/// rows cost one unit per KiB of hexadecimal output.
+fn mempool_work(pool: &[Transaction], offset: usize, limit: usize, format: &str) -> usize {
+    pool.iter()
+        .skip(offset)
+        .take(limit)
+        .map(|transaction| {
+            let payments = match &transaction.body.operation {
+                Operation::Propose { proposal, .. } => grant_payments(proposal),
+                _ => 0,
+            };
+            let data = transaction.body.data.len();
+            1 + match format {
+                "summary" => payments,
+                "hex" => (payments * 34 + data) / 512,
+                _ => payments + data / RESPONSE_VALUES_PER_WORK,
+            }
+        })
+        .fold(0, usize::saturating_add)
+}
+
 fn mempool_page(pool: &[Transaction], offset: usize, limit: usize, summary: bool) -> Result<Value> {
     let mut page = JsonPage::new();
     for transaction in pool.iter().skip(offset).take(limit) {
         let accepted = if summary {
             let body = &transaction.body;
-            page.push(&PendingRow {
-                body: PendingBody {
-                    sender: body.sender,
-                    nonce: body.nonce,
-                    fee: body.fee.to_str_radix(10),
-                    anchor: body.anchor,
-                    expiry_blocks: body.expiry_blocks,
-                    operation: &body.operation,
-                },
+            // Summaries never fail on one huge pending grant; a bounded
+            // display copy keeps snapshots and wallets available.
+            page.push_summarized(&pending_row(body, &body.operation), || {
+                let (operation, payment_count) = truncated_operation(&body.operation);
+                Ok(serde_json::to_value(Truncated {
+                    row: pending_row(body, &operation),
+                    truncated: true,
+                    payment_count,
+                })?)
             })?
         } else {
             page.push(&RawMempoolRow {
@@ -403,6 +525,66 @@ impl PublishedChain {
 struct ReadView {
     chain: PublishedChain,
     mempool: Vec<Transaction>,
+    cache: Arc<TipCache>,
+}
+/// Read-only results derived from one published tip state. Views of the same
+/// tip share it across mempool changes, so repeated reads never rebuild them.
+#[derive(Default)]
+struct TipCache {
+    root: std::sync::OnceLock<Hash>,
+    governance: std::sync::OnceLock<Value>,
+    proposals: std::sync::OnceLock<ProposalIndex>,
+}
+/// Consensus keys proposals by ID only and never removes them. This local
+/// index is built once per tip, so a round page never walks all history.
+struct ProposalIndex {
+    /// Every proposal ID in consensus key order, for unfiltered pages.
+    all: Vec<Hash>,
+    /// Each round's IDs: its leader, decision or winner first, then by
+    /// support (highest first) and ID. Cheap spam cannot hide better-backed
+    /// proposals behind ground IDs that sort first.
+    rounds: std::collections::BTreeMap<u64, Vec<Hash>>,
+}
+impl ProposalIndex {
+    fn build(s: &State) -> Self {
+        let mut all = Vec::with_capacity(s.proposals.len());
+        let mut rounds = std::collections::BTreeMap::<u64, Vec<(&Amount, Hash)>>::new();
+        for (key, proposal) in s.proposals.iter() {
+            let Ok(id) = Hash::try_from(key) else {
+                continue;
+            };
+            all.push(id);
+            rounds
+                .entry(proposal.round)
+                .or_default()
+                .push((&proposal.support, id));
+        }
+        let first = |round: u64| match &s.phase {
+            crate::state::Phase::Auction(a) if a.round == round && a.leader.is_some() => a.leader,
+            crate::state::Phase::Governance(d) if d.round == round => Some(d.proposal_id),
+            _ => match s.rounds.get(&round.to_be_bytes()).map(|r| &r.status) {
+                Some(crate::state::RoundStatus::Won(id)) => Some(*id),
+                _ => None,
+            },
+        };
+        let rounds = rounds
+            .into_iter()
+            .map(|(round, mut ids)| {
+                let first = first(round);
+                ids.sort_by(|(a_support, a), (b_support, b)| {
+                    (Some(*b) == first)
+                        .cmp(&(Some(*a) == first))
+                        .then_with(|| b_support.cmp(a_support))
+                        .then_with(|| a.cmp(b))
+                });
+                (round, ids.into_iter().map(|(_, id)| id).collect())
+            })
+            .collect();
+        Self { all, rounds }
+    }
+    fn round_len(&self, round: u64) -> usize {
+        self.rounds.get(&round).map_or(0, Vec::len)
+    }
 }
 /// The worker owns only a weak node reference. Dropping the last node closes its
 /// coalesced wake queue and joins the worker before its derived DB is reopened.
@@ -481,7 +663,19 @@ impl ReadView {
                 state: Arc::new(inner.chain.tip_state().clone()),
             },
             mempool: inner.mempool.clone(),
+            cache: Arc::default(),
         }
+    }
+    fn state_root(&self) -> Hash {
+        *self
+            .cache
+            .root
+            .get_or_init(|| self.chain.tip_state().root())
+    }
+    fn proposal_index(&self) -> &ProposalIndex {
+        self.cache
+            .proposals
+            .get_or_init(|| ProposalIndex::build(self.chain.tip_state()))
     }
 }
 #[derive(Clone)]
@@ -489,6 +683,7 @@ pub struct Node {
     inner: Arc<Mutex<Inner>>,
     explorer: Arc<ExplorerWorker>,
     explorer_path: Arc<PathBuf>,
+    session_token_path: Arc<PathBuf>,
     miner: PublicKey,
     wallets: Arc<Mutex<WalletStore>>,
     startup_wallet_mode: Option<&'static str>,
@@ -560,6 +755,7 @@ impl Node {
             inner,
             explorer,
             explorer_path: Arc::new(path.with_extension("explorer.sqlite")),
+            session_token_path: Arc::new(session_token_path(path)),
             miner,
             wallets: Arc::new(Mutex::new(wallets)),
             startup_wallet_mode: None,
@@ -646,15 +842,18 @@ impl Node {
             &inner.chain.config,
             inner.chain.max_known_block_bytes(),
         )?)?;
-        let next = Arc::new(ReadView::capture(inner));
+        let mut next = ReadView::capture(inner);
         let mut published = self
             .published
             .write()
             .map_err(|_| anyhow!("snapshot lock poisoned"))?;
         if published.chain.tip_hash() != next.chain.tip_hash() {
             self.last_tip_change.store(now(), Ordering::Relaxed);
+        } else {
+            // A mempool-only change keeps the tip's derived read results.
+            next.cache = published.cache.clone();
         }
-        *published = next;
+        *published = Arc::new(next);
         self.work_updates
             .send_modify(|revision| *revision = revision.wrapping_add(1));
         self.explorer.notify();
@@ -764,7 +963,7 @@ impl Node {
     }
     fn status_locked(inner: &ReadView) -> Value {
         let s = inner.chain.tip_state();
-        json!({"chain_id":hex::encode(inner.chain.chain_id()), "height":inner.chain.tip_height(), "tip":hex::encode(inner.chain.tip_hash()), "state_root":hex::encode(s.root()), "clock":s.clock, "time_unit":"seconds", "clock_basis":"target_interval", "issued":s.issued.to_str_radix(10), "test_work":inner.chain.config.test_work, "phase":s.phase_name(), "decision":s.decision_id().map(hex::encode), "auction_round":s.auction_round(), "settings":s.settings, "mempool":inner.mempool.len(), "reserve":s.world.reserve.to_str_radix(10), "shares":s.world.shares.to_str_radix(10), "curve_mass":s.world.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(&s.world).to_str_radix(10), "revenue":s.world.revenue.to_str_radix(10), "fee_policy":json!({"minimum_fee_rate":s.settings.minimum_fee_rate.to_string(),"fee_scale":crate::fees::FEE_SCALE,"account_weight":crate::fees::ACCOUNT_WEIGHT})})
+        json!({"chain_id":hex::encode(inner.chain.chain_id()), "height":inner.chain.tip_height(), "tip":hex::encode(inner.chain.tip_hash()), "state_root":hex::encode(inner.state_root()), "clock":s.clock, "time_unit":"seconds", "clock_basis":"target_interval", "issued":s.issued.to_str_radix(10), "test_work":inner.chain.config.test_work, "phase":s.phase_name(), "decision":s.decision_id().map(hex::encode), "auction_round":s.auction_round(), "settings":s.settings, "mempool":inner.mempool.len(), "reserve":s.world.reserve.to_str_radix(10), "shares":s.world.shares.to_str_radix(10), "curve_mass":s.world.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(&s.world).to_str_radix(10), "revenue":s.world.revenue.to_str_radix(10), "fee_policy":json!({"minimum_fee_rate":s.settings.minimum_fee_rate.to_string(),"fee_scale":crate::fees::FEE_SCALE,"account_weight":crate::fees::ACCOUNT_WEIGHT})})
     }
     pub fn template(&self) -> Result<Block> {
         let mut block = self.template_shared()?.as_ref().clone();
@@ -1180,7 +1379,18 @@ impl Node {
         }
         Ok(())
     }
+    #[cfg(test)]
     fn read_rpc(i: &ReadView, method: &str, params: Value) -> Result<Value> {
+        Self::read_rpc_metered(i, method, params, None)
+    }
+    /// The admission session, when present, is charged for work that depends
+    /// on request operands or on state size, before that work is performed.
+    fn read_rpc_metered(
+        i: &ReadView,
+        method: &str,
+        params: Value,
+        meter: Option<&Session>,
+    ) -> Result<Value> {
         let chain_id = i.chain.chain_id();
         match method {
             "address" | "validateaddress" => {
@@ -1209,7 +1419,7 @@ impl Node {
                     .nonce
                     .unwrap_or_else(|| s.account(&sender, None).map_or(0, |a| a.nonce));
                 let body = wallet_body(c, s, i.chain.tip_hash(), sender, nonce, request)?;
-                fee_quote_json(c, s, i.chain.tip_hash(), &body)
+                fee_quote_json(c, s, i.chain.tip_hash(), i.state_root(), &body)
             }
             "transfer_quote" => {
                 let c = &i.chain.config;
@@ -1257,7 +1467,7 @@ impl Node {
                     .nonce
                     .unwrap_or_else(|| s.account(&sender, None).map_or(0, |a| a.nonce));
                 let body = wallet_body(c, s, i.chain.tip_hash(), sender, nonce, request)?;
-                let mut quote = fee_quote_json(c, s, i.chain.tip_hash(), &body)?;
+                let mut quote = fee_quote_json(c, s, i.chain.tip_hash(), i.state_root(), &body)?;
                 let fee = parse_amount(required_str(&quote, "fee")?)?;
                 let total = &amount + &fee;
                 c.check_amount(&total)?;
@@ -1271,16 +1481,23 @@ impl Node {
             }
             "governance" => {
                 let s = i.chain.tip_state();
-                let world = |w: &crate::state::World| json!({"reserve":w.reserve.to_str_radix(10),"shares":w.shares.to_str_radix(10),"curve_mass":w.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(w).to_str_radix(10),"account_shares":w.account_shares.to_str_radix(10),"revenue":w.revenue.to_str_radix(10),"grant_escrow":w.grant_escrow.to_str_radix(10)});
-                let progress = if let crate::state::Phase::Governance(d) = &s.phase {
-                    let observed = s.height.saturating_sub(d.started_height).min(d.blocks);
-                    json!({"time_unit":"blocks","leading_blocks":d.leading_blocks,"observed_blocks":observed,"blocks":d.blocks,"blocks_remaining":d.blocks.saturating_sub(observed)})
-                } else {
-                    Value::Null
-                };
-                Ok(
-                    json!({"phase":s.phase,"height":s.height,"state_root":hex::encode(s.root()),"clock":s.clock,"time_unit":"seconds","clock_basis":"target_interval","settings":s.settings,"frozen":s.frozen,"pass_margin_bps":s.frozen.pass_margin_bps.unwrap_or(0).to_string(),"world":world(&s.world),"pass":s.alternative.as_ref().map(world),"auction_escrow":s.auction_escrow.to_str_radix(10),"progress":progress}),
-                )
+                // The inline decision grant is projected into every response.
+                if let crate::state::Phase::Governance(d) = &s.phase {
+                    charge(meter, grant_payments(&d.proposal))?;
+                }
+                Ok(i.cache
+                    .governance
+                    .get_or_init(|| {
+                        let world = |w: &crate::state::World| json!({"reserve":w.reserve.to_str_radix(10),"shares":w.shares.to_str_radix(10),"curve_mass":w.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(w).to_str_radix(10),"account_shares":w.account_shares.to_str_radix(10),"revenue":w.revenue.to_str_radix(10),"grant_escrow":w.grant_escrow.to_str_radix(10)});
+                        let progress = if let crate::state::Phase::Governance(d) = &s.phase {
+                            let observed = s.height.saturating_sub(d.started_height).min(d.blocks);
+                            json!({"time_unit":"blocks","leading_blocks":d.leading_blocks,"observed_blocks":observed,"blocks":d.blocks,"blocks_remaining":d.blocks.saturating_sub(observed)})
+                        } else {
+                            Value::Null
+                        };
+                        json!({"phase":s.phase,"height":s.height,"state_root":hex::encode(i.state_root()),"clock":s.clock,"time_unit":"seconds","clock_basis":"target_interval","settings":s.settings,"frozen":s.frozen,"pass_margin_bps":s.frozen.pass_margin_bps.unwrap_or(0).to_string(),"world":world(&s.world),"pass":s.alternative.as_ref().map(world),"auction_escrow":s.auction_escrow.to_str_radix(10),"progress":progress})
+                    })
+                    .clone())
             }
             "proposals" => {
                 let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -1290,20 +1507,47 @@ impl Node {
                     .unwrap_or(128)
                     .min(128) as usize;
                 let round = params.get("round").and_then(Value::as_u64);
+                let s = i.chain.tip_state();
+                let index = i.proposal_index();
+                let ids = match round {
+                    Some(round) => index.rounds.get(&round).map_or(&[][..], Vec::as_slice),
+                    None => &index.all,
+                };
+                let ids = ids.get(offset..).unwrap_or_default();
+                let ids = &ids[..ids.len().min(limit)];
+                let mut work = 0usize;
+                for id in ids {
+                    let proposal = s.proposals.get(id).context("indexed proposal missing")?;
+                    work = work.saturating_add(1 + grant_payments(&proposal.action));
+                }
+                charge(meter, work)?;
                 let mut page = JsonPage::new();
-                for (id, proposal) in i
-                    .chain
-                    .tip_state()
-                    .proposals
-                    .iter()
-                    .filter(|(_, p)| round.is_none_or(|r| r == p.round))
-                    .skip(offset)
-                    .take(limit)
-                {
-                    if !page.push(&ProposalPageRow {
-                        id: hex::encode(id),
-                        proposal,
-                    })? {
+                for id in ids {
+                    let proposal = s.proposals.get(id).context("indexed proposal missing")?;
+                    let accepted = page.push_summarized(
+                        &ProposalPageRow {
+                            id: hex::encode(id),
+                            proposal,
+                        },
+                        || {
+                            let summary = crate::state::ProposalRecord {
+                                round: proposal.round,
+                                description: proposal.description,
+                                action: truncated_proposal(&proposal.action),
+                                support: proposal.support.clone(),
+                                refund_height: proposal.refund_height,
+                            };
+                            Ok(serde_json::to_value(Truncated {
+                                row: ProposalPageRow {
+                                    id: hex::encode(id),
+                                    proposal: &summary,
+                                },
+                                truncated: true,
+                                payment_count: grant_payments(&proposal.action),
+                            })?)
+                        },
+                    )?;
+                    if !accepted {
                         break;
                     }
                 }
@@ -1327,6 +1571,7 @@ impl Node {
                     .supports
                     .get(&crate::state::support_key(round, &proposal, &key));
                 let next_height = s.height.checked_add(1).context("height exhausted")?;
+                let won = matches!(&r.status, crate::state::RoundStatus::Won(winner) if *winner == proposal);
                 let eligible = match &r.status {
                     crate::state::RoundStatus::Won(winner) => {
                         *winner != proposal && next_height >= r.refund_height
@@ -1336,8 +1581,17 @@ impl Node {
                         p.refund_height.is_some_and(|h| next_height >= h)
                     }
                 };
+                // A winning round's support became revenue when its decision
+                // opened; the retained record is never refundable. A refund
+                // removes the record, so "none" also covers claimed support.
+                let status = match record {
+                    None => "none",
+                    Some(_) if won => "converted_to_revenue",
+                    Some(_) if eligible => "refundable",
+                    Some(_) => "locked",
+                };
                 Ok(
-                    json!({"amount":record.map_or_else(||"0".to_owned(),|r|r.amount.to_str_radix(10)),"refundable":record.is_some() && eligible}),
+                    json!({"amount":record.map_or_else(||"0".to_owned(),|r|r.amount.to_str_radix(10)),"refundable":record.is_some() && eligible,"status":status}),
                 )
             }
             "mempool" => {
@@ -1347,15 +1601,20 @@ impl Node {
                     .and_then(Value::as_u64)
                     .unwrap_or(128)
                     .min(128) as usize;
-                match params
+                let format = params
                     .get("format")
                     .and_then(Value::as_str)
-                    .unwrap_or("json")
-                {
-                    "json" => mempool_page(&i.mempool, offset, limit, false)
-                        .context("mempool JSON page is too large; request format: hex"),
-                    "hex" => mempool_hex_page(&i.mempool, offset, limit),
-                    _ => bail!("mempool format must be json or hex"),
+                    .unwrap_or("json");
+                ensure!(
+                    matches!(format, "json" | "hex"),
+                    "mempool format must be json or hex"
+                );
+                charge(meter, mempool_work(&i.mempool, offset, limit, format))?;
+                if format == "hex" {
+                    mempool_hex_page(&i.mempool, offset, limit)
+                } else {
+                    mempool_page(&i.mempool, offset, limit, false)
+                        .context("mempool JSON page is too large; request format: hex")
                 }
             }
             "account" => {
@@ -1369,6 +1628,7 @@ impl Node {
                     }
                     _ => &s.world,
                 };
+                charge(meter, curve_evaluation_work(world))?;
                 let (numerator, den) = if world.shares.is_zero() {
                     (Amount::from(1u32), i.chain.config.share_scale.clone())
                 } else {
@@ -1377,8 +1637,17 @@ impl Node {
                 let value = &a.shares * &numerator;
                 let withdrawal = stash_withdrawal(world, &a.shares)?;
                 let payment_available = s.common_spendable(&key).unwrap_or_default();
+                // Nonces are common to both outcomes. Clients obtain the next
+                // pending nonce without downloading every raw pending record.
+                let pending_nonce = i
+                    .mempool
+                    .iter()
+                    .filter(|tx| tx.body.sender == key)
+                    .fold(a.nonce, |nonce, tx| {
+                        nonce.max(tx.body.nonce.saturating_add(1))
+                    });
                 Ok(
-                    json!({"key":hex::encode(key), "account":a, "payment_available_hash":payment_available.to_str_radix(10), "price_hash_per_share":{"numerator":numerator.to_str_radix(10),"denominator":den.to_str_radix(10)}, "stash_value_hash":{"numerator":value.to_str_radix(10),"denominator":den.to_str_radix(10)}, "stash_withdrawal_hash":withdrawal.to_str_radix(10)}),
+                    json!({"key":hex::encode(key), "account":a, "pending_nonce":pending_nonce, "payment_available_hash":payment_available.to_str_radix(10), "price_hash_per_share":{"numerator":numerator.to_str_radix(10),"denominator":den.to_str_radix(10)}, "stash_value_hash":{"numerator":value.to_str_radix(10),"denominator":den.to_str_radix(10)}, "stash_withdrawal_hash":withdrawal.to_str_radix(10)}),
                 )
             }
             "stash_quote" => {
@@ -1429,6 +1698,8 @@ impl Node {
                     c.check_amount(&amount)?;
                 }
                 ensure!(all || !amount.is_zero(), "amount must be positive");
+                // Valuations before and after, plus a withdrawal share search.
+                charge(meter, 3 * curve_evaluation_work(w))?;
                 let before = stash_withdrawal(w, &a.shares)?;
                 let is_buy = kind == "deposit";
                 let (amount, input) = if is_buy {
@@ -1464,6 +1735,10 @@ impl Node {
                     ensure!(burn <= a.shares, "insufficient shares");
                     (target, burn)
                 };
+                charge(
+                    meter,
+                    trade_work(w, is_buy, &input, s.settings.max_price_change_bps),
+                )?;
                 let (filled, output, after_world) =
                     preview_trade(c, w, is_buy, &input, s.settings.max_price_change_bps)?;
                 let share_after = if is_buy {
@@ -1492,7 +1767,7 @@ impl Node {
                     "share_before":a.shares.to_str_radix(10), "share_after":share_after.to_str_radix(10),
                     "stash_before_hash":before.to_str_radix(10), "stash_after_hash":after.to_str_radix(10),
                     "outcome":outcome, "decision":s.decision_id().map(hex::encode),
-                    "height":s.height, "tip":hex::encode(i.chain.tip_hash()), "state_root":hex::encode(s.root()),
+                    "height":s.height, "tip":hex::encode(i.chain.tip_hash()), "state_root":hex::encode(i.state_root()),
                     "transaction_fee_included":false, "indicative":true, "partial_fill_possible":true,
                     "execution":"block_batch", "max_price_change_bps":s.settings.max_price_change_bps
                 }))
@@ -1525,6 +1800,13 @@ impl Node {
                 let is_buy = match required_str(&params, "kind")? {
                     "deposit" => {
                         c.check_amount(&amount)?;
+                        // Every deposit is debited from account cash, so a
+                        // larger hypothetical order can never execute. Only a
+                        // curved price search depends on the order's size.
+                        ensure!(
+                            curve_evaluation_work(w) == 0 || amount <= w.account_cash,
+                            "deposit exceeds circulating account cash"
+                        );
                         true
                     }
                     "redeem" => {
@@ -1538,6 +1820,10 @@ impl Node {
                     _ => bail!("kind must be deposit or redeem"),
                 };
                 ensure!(!amount.is_zero(), "amount must be positive");
+                charge(
+                    meter,
+                    trade_work(w, is_buy, &amount, s.settings.max_price_change_bps),
+                )?;
                 let (filled, output, _) =
                     preview_trade(c, w, is_buy, &amount, s.settings.max_price_change_bps)?;
                 Ok(json!({
@@ -1546,7 +1832,7 @@ impl Node {
                     "input_filled":filled.to_str_radix(10), "input_unfilled":(&amount-&filled).to_str_radix(10),
                     "kind":params.get("kind"), "outcome":params.get("outcome"),
                     "decision":s.decision_id().map(hex::encode), "transaction_fee_included":false,
-                    "height":s.height, "state_root":hex::encode(s.root()),
+                    "height":s.height, "state_root":hex::encode(i.state_root()),
                     "reserve":w.reserve.to_str_radix(10), "shares":w.shares.to_str_radix(10),
                     "indicative":true, "partial_fill_possible":true, "execution":"block_batch",
                     "max_price_change_bps":s.settings.max_price_change_bps
@@ -1588,13 +1874,15 @@ impl Node {
                     {
                         return Ok(Value::Null);
                     }
-                    Self::read_rpc(i, "account", request)
+                    Self::read_rpc_metered(i, "account", request, meter)
                 };
                 let conditional = i.chain.tip_state().alternative.is_some();
+                // Rest lists the round that just ended, never all history.
                 let round = match &i.chain.tip_state().phase {
                     crate::state::Phase::Auction(auction) => Some(auction.round),
                     crate::state::Phase::Governance(decision) => Some(decision.round),
-                    crate::state::Phase::Rest(_) => None,
+                    crate::state::Phase::Rest(_) => (!i.chain.tip_state().rounds.is_empty())
+                        .then_some(i.chain.tip_state().last_round),
                 };
                 let ordinary = account(None)?;
                 let fail = if conditional {
@@ -1602,11 +1890,21 @@ impl Node {
                 } else {
                     Value::Null
                 };
+                let proposals = match round {
+                    Some(round) => {
+                        Self::read_rpc_metered(i, "proposals", json!({"round":round}), meter)?
+                    }
+                    None => json!([]),
+                };
+                charge(meter, mempool_work(&i.mempool, 0, 128, "summary"))?;
                 let mut snapshot = json!({
                     "status":Self::status_locked(i),
                     "config":i.chain.config,
-                    "governance":Self::read_rpc(i,"governance",json!({}))?,
-                    "proposals":Self::read_rpc(i,"proposals",json!({"round":round}))?,
+                    "governance":Self::read_rpc_metered(i,"governance",json!({}),meter)?,
+                    "proposals":proposals,
+                    // The page holds the round's leader first, then the best
+                    // supported; the total says whether more pages exist.
+                    "proposals_total":round.map_or(0, |round| i.proposal_index().round_len(round)),
                     "mempool":mempool_page(&i.mempool,0,128,true)?,
                     "account":ordinary,
                     "pass":if conditional { account(Some("pass"))? } else { Value::Null },
@@ -1668,14 +1966,31 @@ impl Node {
             public_rpc_allowed(method),
             "method is unavailable on public web"
         );
-        if matches!(method, "fee_quote" | "transfer_quote") {
+        let mut result = if matches!(method, "fee_quote" | "transfer_quote") {
             // The private RPC convenience fallback reads the selected server
             // wallet. Public requests must always identify their own sender.
             required_str(&params, "sender")?;
             let view = self.read_view()?;
-            return Self::read_rpc(&view, method, params);
+            Self::read_rpc_metered(&view, method, params, Some(admission))
+        } else {
+            self.rpc_with_admission(method, params, Some(admission))
         }
-        self.rpc_with_admission(method, params, Some(admission))
+        .map_err(public_error)?;
+        // The public mining panel shows workers and the advertised endpoint;
+        // the Stratum bind interface stays private to the operator.
+        let mining = match method {
+            "mining" => Some(&mut result),
+            "snapshot" => result.get_mut("mining"),
+            _ => None,
+        };
+        if let Some(stratum) = mining
+            .and_then(|mining| mining.get_mut("stratum"))
+            .and_then(Value::as_object_mut)
+        {
+            stratum.remove("bind_address");
+            stratum.remove("loopback_only");
+        }
+        Ok(result)
     }
     fn rpc_with_admission(
         &self,
@@ -1721,6 +2036,7 @@ impl Node {
                     &i.chain.config,
                     i.chain.tip_state(),
                     i.chain.tip_hash(),
+                    i.chain.tip_state().root(),
                     &body,
                 )?;
 
@@ -1737,7 +2053,7 @@ impl Node {
                         .cloned()
                         .unwrap_or_else(|| json!(hex::encode(self.miner)));
                 }
-                Self::read_rpc(&i, method, params)
+                Self::read_rpc_metered(&i, method, params, admission)
             }
             "broadcasttransaction" => {
                 let request: BroadcastRequest = serde_json::from_value(params)?;
@@ -1815,7 +2131,7 @@ impl Node {
             }
             _ => {
                 let i = self.read_view()?;
-                let mut result = Self::read_rpc(&i, method, params)?;
+                let mut result = Self::read_rpc_metered(&i, method, params, admission)?;
                 if method == "snapshot" {
                     result["mining"] = self.mining_status()?;
                 }
@@ -1839,6 +2155,51 @@ impl Node {
         Ok(result)
     }
 }
+/// Public callers get no local storage detail such as a database path; the
+/// operator's log keeps the full error. Request validation errors pass through.
+fn public_error(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .chain()
+        .any(|cause| cause.is::<rusqlite::Error>() || cause.is::<std::io::Error>())
+    {
+        eprintln!("Public RPC storage error: {error:#}");
+        anyhow!("node storage is temporarily unavailable")
+    } else {
+        error
+    }
+}
+/// Admission work for one curve valuation. A flat curve has exact closed forms.
+fn curve_evaluation_work(w: &crate::state::World) -> usize {
+    if w.shares.is_zero() || w.reserve == w.curve_mass {
+        0
+    } else {
+        CURVE_EVALUATION_WORK
+    }
+}
+
+/// Pre-charged admission work for one single-order clearing estimate. An order
+/// that cannot move the curve price by half the per-block limit clears with a
+/// price evaluation or two; a larger one may search its executable budget with
+/// about one evaluation per input bit. Purchases move the price by at most the
+/// reserve growth; sales by at most the sold supply scaled by mass/reserve.
+fn trade_work(w: &crate::state::World, is_buy: bool, input: &Amount, bps: u64) -> usize {
+    let evaluation = curve_evaluation_work(w);
+    if evaluation == 0 {
+        return 0;
+    }
+    let small = if is_buy {
+        input * 20_000u32 <= &w.reserve * bps
+    } else {
+        input * &w.curve_mass * 20_000u32 <= &w.shares * &w.reserve * bps
+    };
+    let evaluations = if small {
+        2
+    } else {
+        2 + usize::try_from(input.bits()).unwrap_or(usize::MAX)
+    };
+    evaluations.saturating_mul(evaluation)
+}
+
 /// A one-order estimate. Actual fills depend on the full set of included orders.
 fn preview_trade(
     c: &Config,
@@ -2186,6 +2547,33 @@ async fn read_peer_frame<R: AsyncBufRead + Unpin>(
     Ok(out)
 }
 
+/// The private listener's session token lives in this file next to the node
+/// database, rewritten at every server start. Loopback TCP is shared by every
+/// local account and service, so only clients able to read the node's own
+/// files can use server-wallet endpoints.
+pub fn session_token_path(database: &Path) -> PathBuf {
+    database.with_extension("session-token")
+}
+fn write_session_token(path: &Path, token: &str) -> Result<()> {
+    // Never write through an existing file or link; create a fresh one that
+    // only the node's account can read (Windows inherits the directory ACL).
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("session token file cannot be replaced"),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(path)
+        .context("session token file cannot be created")?;
+    std::io::Write::write_all(&mut file, token.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct ServerOptions {
     pub rpc: SocketAddr,
@@ -2221,6 +2609,8 @@ pub struct Server {
     pub p2p: SocketAddr,
     pub stratum: SocketAddr,
     pub stratum_enabled: bool,
+    /// Owner-only file with this run's private session token.
+    pub session_token_file: PathBuf,
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
     mining: Arc<Mutex<MiningRuntime>>,
@@ -2337,6 +2727,8 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
     let mut random_token = [0u8; 32];
     getrandom::fill(&mut random_token)
         .map_err(|e| anyhow!("session randomness unavailable: {e}"))?;
+    let session_token = hex::encode(random_token);
+    write_session_token(&node.session_token_path, &session_token)?;
     {
         let mut mining = node
             .mining
@@ -2361,7 +2753,7 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
     }
     let private_http = Arc::new(HttpContext {
         public: false,
-        session_token: Some(hex::encode(random_token)),
+        session_token: Some(session_token),
         sessions: node.rpc_sessions.clone(),
         parsers: node.rpc_parsers.clone(),
         workers: node.rpc_workers.clone(),
@@ -2470,6 +2862,7 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
         p2p: addresses.1,
         stratum: addresses.2,
         stratum_enabled: options.stratum_enabled,
+        session_token_file: node.session_token_path.as_ref().clone(),
         mining: node.mining.clone(),
         stop,
         tasks,
@@ -2962,7 +3355,13 @@ fn wallet_body(
     Ok(body)
 }
 
-fn fee_quote_json(c: &Config, s: &State, tip: Hash, body: &TransactionBody) -> Result<Value> {
+fn fee_quote_json(
+    c: &Config,
+    s: &State,
+    tip: Hash,
+    state_root: Hash,
+    body: &TransactionBody,
+) -> Result<Value> {
     ensure!(
         body.anchor == tip,
         "fee quote anchor differs from its snapshot"
@@ -2987,7 +3386,7 @@ fn fee_quote_json(c: &Config, s: &State, tip: Hash, body: &TransactionBody) -> R
        "miner_fee":quote.miner_fee.to_str_radix(10), "revenue_fee":quote.revenue_fee.to_str_radix(10),
        "miner_fee_percent":quote.miner_fee_percent,
        "weight":quote.weight.to_string(), "minimum_fee_rate":s.settings.minimum_fee_rate.to_string(),
-       "chain_id":hex::encode(s.chain_id), "height":s.height, "tip":hex::encode(tip), "state_root":hex::encode(s.root()),
+       "chain_id":hex::encode(s.chain_id), "height":s.height, "tip":hex::encode(tip), "state_root":hex::encode(state_root),
        "sender":address::encode(&body.sender,&s.chain_id)?, "sender_public_key":hex::encode(body.sender),
        "payment_available_hash":s.common_spendable(&body.sender).unwrap_or_default().to_str_radix(10),
        "nonce":body.nonce, "anchor":hex::encode(body.anchor), "anchor_height":s.height,
@@ -3129,13 +3528,19 @@ async fn read_http<R: AsyncBufRead + Unpin>(
     admission: &Session,
     public: bool,
     transaction_bytes: usize,
+    session_token: Option<&str>,
 ) -> Result<HttpRequest> {
     let first = bounded_line(read, 4096).await?;
     ensure!(first.ends_with(b"\r\n"), "invalid HTTP request line");
     let first = std::str::from_utf8(&first)?;
-    let parts: Vec<_> = first.split_ascii_whitespace().collect();
+    // Exactly one space separates the three request-line tokens.
+    let parts: Vec<_> = first[..first.len() - 2].split(' ').collect();
     ensure!(
-        parts.len() == 3 && (parts[2] == "HTTP/1.1" || parts[2] == "HTTP/1.0"),
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_graphic()))
+            && (parts[2] == "HTTP/1.1" || parts[2] == "HTTP/1.0"),
         "invalid HTTP request line"
     );
     let method = parts[0].to_owned();
@@ -3189,9 +3594,31 @@ async fn read_http<R: AsyncBufRead + Unpin>(
     }
     let length = headers
         .get("content-length")
-        .map(|s| s.parse::<usize>())
+        .map(|s| -> Result<usize> {
+            // 1*DIGIT only: no sign, whitespace or list syntax.
+            ensure!(
+                !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()),
+                "invalid HTTP content length"
+            );
+            Ok(s.parse::<usize>()?)
+        })
         .transpose()?;
+    let wallet = path == "/api/wallet" || path == "/api/wallet/manage";
     let length = if method == "POST" {
+        // Route and authorize before any body byte is read or allocated.
+        ensure!(path == "/rpc" || wallet, "resource not found");
+        ensure!(
+            !(public && wallet),
+            "forbidden: server wallet endpoints are unavailable on public web"
+        );
+        ensure!(
+            !wallet
+                || token_matches(
+                    headers.get("x-hashstash-token").map(String::as_str),
+                    session_token.unwrap_or(""),
+                ),
+            "forbidden: invalid session token"
+        );
         ensure!(
             headers
                 .get("content-type")
@@ -3210,17 +3637,20 @@ async fn read_http<R: AsyncBufRead + Unpin>(
         length
             <= if path == "/rpc" || path == "/api/wallet" {
                 transaction_request_bytes(transaction_bytes)?
-            } else if public || path == "/api/wallet/manage" {
-                128 * 1024
             } else {
-                MAX_FRAME
+                128 * 1024
             },
         "HTTP body too large"
     );
     admission.request()?;
     admission.bytes(length.saturating_add(size))?;
-    let mut body = vec![0; length];
-    read.read_exact(&mut body).await?;
+    // Grow only with received bytes: a claimed length alone never allocates.
+    let mut body = Vec::with_capacity(length.min(64 * 1024));
+    (&mut *read)
+        .take(length as u64)
+        .read_to_end(&mut body)
+        .await?;
+    ensure!(body.len() == length, "HTTP body ended early");
     Ok(HttpRequest {
         method,
         path,
@@ -3229,13 +3659,34 @@ async fn read_http<R: AsyncBufRead + Unpin>(
     })
 }
 
+/// After an early error the client may still be sending its body. Closing
+/// with unread input usually resets the connection and discards the response,
+/// so end the write side and discard a bounded amount of input first.
+async fn finish_http<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(read: &mut R, write: &mut W) {
+    let _ = write.shutdown().await;
+    let _ = timeout(
+        Duration::from_secs(1),
+        tokio::io::copy(&mut (&mut *read).take(256 * 1024), &mut tokio::io::sink()),
+    )
+    .await;
+}
+
 async fn http_response<W: AsyncWrite + Unpin>(
     write: &mut W,
     status: u16,
     content_type: &str,
     body: &[u8],
 ) -> Result<()> {
-    ensure!(body.len() <= MAX_RESPONSE_FRAME, "HTTP response too large");
+    http_response_limited(write, status, content_type, body, MAX_RESPONSE_FRAME).await
+}
+async fn http_response_limited<W: AsyncWrite + Unpin>(
+    write: &mut W,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    limit: usize,
+) -> Result<()> {
+    ensure!(body.len() <= limit, "HTTP response too large");
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -3276,28 +3727,41 @@ async fn http_session(
     };
     let request = match timeout(
         IO_TIMEOUT,
-        read_http(&mut read, local, &admission, http.public, transaction_bytes),
+        read_http(
+            &mut read,
+            local,
+            &admission,
+            http.public,
+            transaction_bytes,
+            http.session_token.as_deref(),
+        ),
     )
     .await
     {
         Ok(Ok(request)) => request,
         failed => {
-            let message = match failed {
-                Ok(Err(e)) => e.to_string(),
-                _ => "HTTP request timed out".into(),
+            let (message, drain) = match failed {
+                Ok(Err(e)) => (e.to_string(), true),
+                _ => ("HTTP request timed out".into(), false),
             };
             let status = if message.starts_with("forbidden:") {
                 403
+            } else if message == "resource not found" {
+                404
             } else {
                 400
             };
-            return http_response(
+            let sent = http_response(
                 &mut write,
                 status,
                 "application/json",
                 &serde_json::to_vec(&http_error(&message))?,
             )
             .await;
+            if drain && sent.is_ok() {
+                finish_http(&mut read, &mut write).await;
+            }
+            return sent;
         }
     };
     if request.method == "GET" {
@@ -3365,16 +3829,13 @@ async fn http_session(
         }
         if request.path == "/api/session" {
             let chain_id = node.read_view()?.chain.chain_id();
+            // Loopback is shared by every local account and service, so the
+            // session token is never served here. Clients that may use server
+            // wallets read it from the owner-only session token file.
             let mut data = if http.public {
                 json!({"address_hrp":address::hrp(&chain_id)})
             } else {
-                let mut data = node.wallet_status()?;
-                data["token"] = json!(
-                    http.session_token
-                        .as_deref()
-                        .context("missing private session token")?
-                );
-                data
+                node.wallet_status()?
             };
             data["browser_wallet"] = json!(true);
             data["public_web"] = json!(http.public);
@@ -3573,8 +4034,9 @@ async fn http_session(
     }
 
     admission.work(cost)?;
-    let result = if value.get("jsonrpc") != Some(&Value::String("2.0".into())) {
-        Err(anyhow!("jsonrpc must be 2.0"))
+    let public = http.public;
+    let (result, admission) = if value.get("jsonrpc") != Some(&Value::String("2.0".into())) {
+        (Err(anyhow!("jsonrpc must be 2.0")), admission)
     } else {
         let slots = if mutation {
             http.mutations.clone()
@@ -3584,26 +4046,41 @@ async fn http_session(
         let permit = timeout(IO_TIMEOUT, slots.acquire_owned()).await??;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            if http.public {
+            let result = if public {
                 node.public_rpc(&method, params, &admission)
             } else {
                 node.rpc_with_admission(&method, params, Some(&admission))
-            }
+            };
+            (result, admission)
         })
         .await
         .context("RPC worker failed")?
     };
     let response = match result {
-        Ok(v) => json!({"jsonrpc":"2.0","id":id,"result":v}),
-        Err(e) => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":e.to_string()}}),
+        Ok(v) => json!({"jsonrpc":"2.0","id":id.clone(),"result":v}),
+        Err(e) => {
+            json!({"jsonrpc":"2.0","id":id.clone(),"error":{"code":-32000,"message":e.to_string()}})
+        }
     };
-    http_response(
-        &mut write,
-        200,
-        "application/json",
-        &serde_json::to_vec(&response)?,
-    )
-    .await
+    let mut body = serde_json::to_vec(&response)?;
+    drop(response);
+    // A valid record may need more than the fixed service frame once
+    // governance raises capacity; the frame then follows that capacity.
+    let limit = response_frame_bytes(transaction_bytes)?;
+    let refused = if body.len() > limit {
+        Some("RPC response exceeds the local response limit")
+    } else if public && admission.bytes(body.len()).is_err() {
+        // Like peer replies, public responses spend the byte budget.
+        Some("network rate budget exhausted")
+    } else {
+        None
+    };
+    if let Some(message) = refused {
+        body = serde_json::to_vec(
+            &json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":message}}),
+        )?;
+    }
+    http_response_limited(&mut write, 200, "application/json", &body, limit).await
 }
 
 fn rpc_cost(method: &str, params: &Value) -> usize {
@@ -3829,6 +4306,436 @@ mod capacity_work_tests {
         assert_eq!(raw[0]["body"], expected["body"]);
         assert_eq!(raw[0]["signature"], expected["signature"]);
         assert_eq!(raw[0]["display_operation"], expected["body"]["operation"]);
+    }
+}
+
+#[cfg(test)]
+mod read_admission_tests {
+    use super::*;
+    use crate::state::{
+        Auction, Decision, Phase, ProposalRecord, RoundRecord, RoundStatus, SupportRecord,
+    };
+
+    fn key() -> PublicKey {
+        crypto::public_key(&[1; 32]).unwrap()
+    }
+    /// A curved world (reserve below curve mass) with one funded account.
+    fn curved() -> State {
+        let c = Config::devnet();
+        let mut s = State::genesis(&c);
+        let scale = Amount::from(10u32).pow(18);
+        s.world
+            .put(
+                key(),
+                Account {
+                    ordinary: 1000u32.into(),
+                    shares: &scale * 1000u32,
+                    ..Account::default()
+                },
+                &c,
+            )
+            .unwrap();
+        s.world.reserve = 1000u32.into();
+        s.world.curve_mass = 5000u32.into();
+        s.world.shares = &scale * 1000u32;
+        s.issued = 2000u32.into();
+        s.height = 7;
+        s.phase = Phase::Auction(Auction {
+            round: 0,
+            opened: 0,
+            leader: None,
+            lead_since: 0,
+            replacement_height: 0,
+        });
+        s
+    }
+    fn view(s: State, mempool: Vec<Transaction>) -> ReadView {
+        ReadView {
+            chain: PublishedChain {
+                config: Arc::new(Config::devnet()),
+                tip: [9; 32],
+                state: Arc::new(s),
+            },
+            mempool,
+            cache: Arc::default(),
+        }
+    }
+    /// A loopback proxy session (no cooldown) with its work burst spent.
+    fn drained() -> Session {
+        let session = Arc::new(NetworkGuard::for_public_web())
+            .admit("127.0.0.1".parse().unwrap(), Surface::Rpc)
+            .unwrap();
+        session.work(1_048_576).unwrap();
+        session
+    }
+    fn record(round: u64, support: u32, action: Proposal) -> ProposalRecord {
+        ProposalRecord {
+            round,
+            description: [0; 32],
+            action,
+            support: support.into(),
+            refund_height: None,
+        }
+    }
+    fn parameter() -> Proposal {
+        Proposal::Parameter {
+            parameter: Parameter::BlockBytes,
+            old: 16_384,
+            new: 32_768,
+        }
+    }
+    fn grant(count: usize) -> Proposal {
+        Proposal::Grant {
+            payments: vec![
+                GrantPayment {
+                    recipient: key(),
+                    amount: 1u32.into(),
+                };
+                count
+            ],
+        }
+    }
+    fn hex_ids(ids: &[u8]) -> Vec<String> {
+        ids.iter().map(|id| hex::encode([*id; 32])).collect()
+    }
+    fn ids(page: &Value) -> Vec<String> {
+        page.as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn curve_quotes_are_clamped_and_charged_before_their_search() {
+        let s = curved();
+        let bps = s.settings.max_price_change_bps;
+        let w = &s.world;
+        let mut flat = w.clone();
+        flat.curve_mass = flat.reserve.clone();
+        assert_eq!(trade_work(&flat, true, &Amount::from(1000u32), bps), 0);
+        assert_eq!(curve_evaluation_work(&flat), 0);
+        assert_eq!(
+            trade_work(w, true, &Amount::from(10u32), bps),
+            2 * CURVE_EVALUATION_WORK
+        );
+        // An order able to cross the price cap pays for its budget search.
+        assert_eq!(
+            trade_work(w, true, &Amount::from(1000u32), bps),
+            12 * CURVE_EVALUATION_WORK
+        );
+        // Sales scale by mass/reserve (5 here): 1% of supply is within half
+        // of a 10% cap, 2% may not be.
+        assert_eq!(bps, 1000);
+        let small = &w.shares / 100u32;
+        assert_eq!(trade_work(w, false, &small, bps), 2 * CURVE_EVALUATION_WORK);
+        assert!(trade_work(w, false, &(&small * 2u32), bps) > 2 * CURVE_EVALUATION_WORK);
+        let curved_view = view(s.clone(), vec![]);
+        for amount in [
+            "1001".to_owned(),
+            ((Amount::from(1u32) << 512usize) - 1u32).to_str_radix(10),
+        ] {
+            let error =
+                Node::read_rpc(&curved_view, "quote", json!({"kind":"deposit","amount":amount}))
+                    .unwrap_err();
+            assert!(error.to_string().contains("account cash"), "{error}");
+        }
+        let deposit = json!({"kind":"deposit","amount":"10"});
+        assert!(Node::read_rpc(&curved_view, "quote", deposit.clone()).is_ok());
+        let error = Node::read_rpc_metered(&curved_view, "quote", deposit.clone(), Some(&drained()))
+            .unwrap_err();
+        assert!(error.to_string().contains("budget"), "{error}");
+        let stash = json!({"key":hex::encode(key()),"kind":"redeem","amount":"1"});
+        let account = json!({"key":hex::encode(key())});
+        for (method, params) in [("stash_quote", stash), ("account", account)] {
+            assert!(Node::read_rpc(&curved_view, method, params.clone()).is_ok());
+            let error = Node::read_rpc_metered(&curved_view, method, params, Some(&drained()))
+                .unwrap_err();
+            assert!(error.to_string().contains("budget"), "{method}: {error}");
+        }
+        // A flat curve has no size-dependent search and remains cheap.
+        let mut s = s;
+        s.world.curve_mass = s.world.reserve.clone();
+        let flat_view = view(s, vec![]);
+        assert!(Node::read_rpc_metered(&flat_view, "quote", deposit, Some(&drained())).is_ok());
+    }
+
+    #[test]
+    fn governance_grant_projection_is_charged_and_cached_per_tip() {
+        let mut s = curved();
+        s.phase = Phase::Governance(Decision {
+            id: [5; 32],
+            epoch: 1,
+            round: 0,
+            proposal_id: [6; 32],
+            proposal: grant(4096),
+            started: 0,
+            started_height: 0,
+            blocks: 10,
+            leading_blocks: 0,
+        });
+        let view = view(s, vec![]);
+        let error = Node::read_rpc_metered(&view, "governance", json!({}), Some(&drained()))
+            .unwrap_err();
+        assert!(error.to_string().contains("budget"), "{error}");
+        let first = Node::read_rpc(&view, "governance", json!({})).unwrap();
+        assert_eq!(
+            first["phase"]["Governance"]["proposal"]["Grant"]["payments"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4096
+        );
+        assert!(view.cache.governance.get().is_some());
+        assert_eq!(Node::read_rpc(&view, "governance", json!({})).unwrap(), first);
+        assert_eq!(first["state_root"], hex::encode(view.chain.tip_state().root()));
+    }
+
+    #[test]
+    fn oversized_grant_rows_are_summarized_instead_of_failing_pages() {
+        let mut s = curved();
+        // About 35 JSON values per payment: one record exceeds the page budget.
+        let large = grant(64_000);
+        s.proposals.insert(vec![1; 32], record(0, 5, large.clone()));
+        s.proposals.insert(vec![2; 32], record(0, 4, parameter()));
+        let pending = Transaction {
+            body: TransactionBody {
+                sender: key(),
+                nonce: 0,
+                fee: 1u32.into(),
+                anchor: [9; 32],
+                expiry_blocks: 10,
+                operation: Operation::Propose {
+                    round: 0,
+                    description: [0; 32],
+                    proposal: large,
+                    support: 1u32.into(),
+                },
+                data: Vec::new(),
+            },
+            signature: [0; 64],
+        };
+        let view = view(s, vec![pending]);
+        let page = Node::read_rpc(&view, "proposals", json!({"round":0})).unwrap();
+        assert_eq!(ids(&page), [hex::encode([1; 32]), hex::encode([2; 32])]);
+        assert_eq!(page[0]["truncated"], true);
+        assert_eq!(page[0]["payment_count"], 64_000);
+        assert_eq!(
+            page[0]["proposal"]["action"]["Grant"]["payments"]
+                .as_array()
+                .unwrap()
+                .len(),
+            SUMMARY_GRANT_PAYMENTS
+        );
+        assert!(page[1].get("truncated").is_none());
+        let snapshot = Node::read_rpc(&view, "snapshot", json!({})).unwrap();
+        assert_eq!(snapshot["proposals"][0]["truncated"], true);
+        assert_eq!(snapshot["proposals_total"], 2);
+        let summary = &snapshot["mempool"][0];
+        assert_eq!(summary["truncated"], true);
+        assert_eq!(summary["payment_count"], 64_000);
+        assert_eq!(summary["body"]["nonce"], 0);
+        // Full JSON mempool rows keep their explicit hexadecimal fallback.
+        assert!(
+            Node::read_rpc(&view, "mempool", json!({}))
+                .unwrap_err()
+                .to_string()
+                .contains("format: hex")
+        );
+        // The projected grant is charged before any page is built.
+        let error =
+            Node::read_rpc_metered(&view, "proposals", json!({"round":0}), Some(&drained()))
+                .unwrap_err();
+        assert!(error.to_string().contains("budget"), "{error}");
+    }
+
+    #[test]
+    fn round_pages_are_indexed_ranked_by_support_and_lead_with_the_leader() {
+        let mut s = curved();
+        for (id, round, support) in [(0u8, 1, 50), (1, 0, 5), (2, 0, 9), (3, 0, 9), (4, 0, 1)] {
+            s.proposals
+                .insert(vec![id; 32], record(round, support, parameter()));
+        }
+        s.phase = Phase::Auction(Auction {
+            round: 0,
+            opened: 0,
+            leader: Some([4; 32]),
+            lead_since: 0,
+            replacement_height: 0,
+        });
+        let auction = view(s.clone(), vec![]);
+        let round = Node::read_rpc(&auction, "proposals", json!({"round":0})).unwrap();
+        assert_eq!(ids(&round), hex_ids(&[4, 2, 3, 1]));
+        let page = Node::read_rpc(&auction, "proposals", json!({"round":0,"offset":1,"limit":2}))
+            .unwrap();
+        assert_eq!(ids(&page), hex_ids(&[2, 3]));
+        assert!(
+            Node::read_rpc(&auction, "proposals", json!({"round":0,"offset":9}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let all = Node::read_rpc(&auction, "proposals", json!({})).unwrap();
+        assert_eq!(ids(&all), hex_ids(&[0, 1, 2, 3, 4]));
+        let snapshot = Node::read_rpc(&auction, "snapshot", json!({})).unwrap();
+        assert_eq!(ids(&snapshot["proposals"]), hex_ids(&[4, 2, 3, 1]));
+        assert_eq!(snapshot["proposals_total"], 4);
+        // Rest lists the round that just ended, with its winner first.
+        s.phase = Phase::Rest(crate::state::Rest {
+            until: 100,
+            pending: None,
+        });
+        s.rounds.insert(
+            0u64.to_be_bytes().to_vec(),
+            RoundRecord {
+                status: RoundStatus::Won([3; 32]),
+                refund_height: 7,
+            },
+        );
+        s.last_round = 0;
+        let rest = Node::read_rpc(&view(s.clone(), vec![]), "snapshot", json!({})).unwrap();
+        assert_eq!(ids(&rest["proposals"]), hex_ids(&[3, 2, 1, 4]));
+        s.rounds = crate::tree::Map::new();
+        let genesis = Node::read_rpc(&view(s, vec![]), "snapshot", json!({})).unwrap();
+        assert!(genesis["proposals"].as_array().unwrap().is_empty());
+        assert_eq!(genesis["proposals_total"], 0);
+    }
+
+    #[test]
+    fn support_status_tells_converted_locked_refundable_and_none_apart() {
+        let mut s = curved();
+        for (id, round) in [(1u8, 0u64), (2, 0), (3, 0), (4, 1)] {
+            s.proposals.insert(vec![id; 32], record(round, 5, parameter()));
+        }
+        for (round, status) in [(0u64, RoundStatus::Won([1; 32])), (1, RoundStatus::Open)] {
+            s.rounds.insert(
+                round.to_be_bytes().to_vec(),
+                RoundRecord {
+                    status,
+                    refund_height: 7,
+                },
+            );
+        }
+        for (round, id) in [(0u64, 1u8), (0, 2), (1, 4)] {
+            s.supports.insert(
+                crate::state::support_key(round, &[id; 32], &key()),
+                SupportRecord {
+                    round,
+                    proposal: [id; 32],
+                    sender: key(),
+                    amount: 5u32.into(),
+                },
+            );
+        }
+        let view = view(s, vec![]);
+        for (id, round, status, refundable) in [
+            (1u8, 0u64, "converted_to_revenue", false),
+            (2, 0, "refundable", true),
+            (3, 0, "none", false),
+            (4, 1, "locked", false),
+        ] {
+            let support = Node::read_rpc(
+                &view,
+                "support",
+                json!({"key":hex::encode(key()),"proposal":hex::encode([id; 32]),"round":round}),
+            )
+            .unwrap();
+            assert_eq!(support["status"], status, "{id}");
+            assert_eq!(support["refundable"], refundable, "{id}");
+        }
+    }
+
+    #[test]
+    fn account_reports_the_pending_nonce_and_responses_follow_capacity() {
+        let pending = |nonce| Transaction {
+            body: TransactionBody {
+                sender: key(),
+                nonce,
+                fee: 1u32.into(),
+                anchor: [9; 32],
+                expiry_blocks: 10,
+                operation: Operation::Refund {
+                    round: 0,
+                    proposal: [0; 32],
+                },
+                data: Vec::new(),
+            },
+            signature: [0; 64],
+        };
+        let view = view(curved(), vec![pending(0), pending(1)]);
+        let account = Node::read_rpc(&view, "account", json!({"key":hex::encode(key())})).unwrap();
+        assert_eq!(account["account"]["nonce"], 0);
+        assert_eq!(account["pending_nonce"], 2);
+        assert_eq!(response_frame_bytes(16 * 1024).unwrap(), MAX_RESPONSE_FRAME);
+        let governed = 200 * 1024 * 1024;
+        assert!(response_frame_bytes(governed).unwrap() > 2 * governed);
+        assert_eq!(
+            response_frame_bytes(usize::MAX).unwrap(),
+            isize::MAX as usize
+        );
+    }
+
+    async fn parse(raw: &[u8], token: Option<&str>) -> Result<HttpRequest> {
+        let session = Arc::new(NetworkGuard::default())
+            .admit("127.0.0.1".parse().unwrap(), Surface::Rpc)
+            .unwrap();
+        let mut read = tokio::io::BufReader::new(raw);
+        read_http(
+            &mut read,
+            "127.0.0.1:18480".parse().unwrap(),
+            &session,
+            false,
+            16 * 1024,
+            token,
+        )
+        .await
+    }
+    fn post(path: &str, headers: &str, body: &str) -> Vec<u8> {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:18480\r\nContent-Type: application/json\r\n{headers}\r\n{body}"
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn http_requests_are_canonical_and_routed_before_any_body_is_read() {
+        let valid = parse(&post("/rpc", "Content-Length: 2\r\n", "{}"), None)
+            .await
+            .unwrap();
+        assert_eq!((valid.method.as_str(), valid.body.as_slice()), ("POST", &b"{}"[..]));
+        for length in ["+2", " 2,2", "0x2", "-0", ""] {
+            let raw = post("/rpc", &format!("Content-Length: {length}\r\n"), "{}");
+            assert!(parse(&raw, None).await.is_err(), "{length:?}");
+        }
+        for line in ["POST  /rpc HTTP/1.1", "POST\t/rpc HTTP/1.1", "POST /rpc HTTP/1.1 "] {
+            let raw = format!("{line}\r\nHost: 127.0.0.1:18480\r\nContent-Length: 0\r\n\r\n");
+            let error = parse(raw.as_bytes(), None).await.err().unwrap();
+            assert_eq!(error.to_string(), "invalid HTTP request line", "{line:?}");
+        }
+        // Each claims a large body that never arrives. Routing and wallet
+        // authorization fail before any body byte is awaited or allocated.
+        let claimed = "Content-Length: 131072\r\n";
+        let unrouted = parse(&post("/unknown", claimed, ""), None).await;
+        assert_eq!(unrouted.err().unwrap().to_string(), "resource not found");
+        let unauthorized = parse(&post("/api/wallet/manage", claimed, ""), Some("secret")).await;
+        assert_eq!(
+            unauthorized.err().unwrap().to_string(),
+            "forbidden: invalid session token"
+        );
+        let authorized = parse(
+            &post(
+                "/api/wallet/manage",
+                &format!("X-Hashstash-Token: secret\r\n{claimed}"),
+                "{}",
+            ),
+            Some("secret"),
+        )
+        .await;
+        assert_eq!(
+            authorized.err().unwrap().to_string(),
+            "HTTP body ended early"
+        );
     }
 }
 
@@ -4900,6 +5807,7 @@ mod tests {
                     state: Arc::new(s),
                 },
                 mempool: vec![],
+                cache: Arc::default(),
             },
             key,
         )
@@ -4937,7 +5845,8 @@ mod tests {
         let encoded = address::encode(&key, &view.chain.chain_id()).unwrap();
         let unknown = hex::encode(crypto::public_key(&[3; 32]).unwrap());
         let original = Node::read_rpc(&view, "snapshot", json!({"key":key_hex})).unwrap();
-        assert_eq!(original.as_object().unwrap().len(), 9);
+        assert_eq!(original.as_object().unwrap().len(), 10);
+        assert_eq!(original["proposals_total"], 0);
         assert!(original.get("balances").is_none());
         let mut snapshot = Node::read_rpc(
             &view,

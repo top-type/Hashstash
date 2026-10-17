@@ -132,7 +132,10 @@ async fn watch_only_http_exports_and_broadcasts_but_never_signs() {
     assert_eq!(session["miner"], hex::encode(miner));
     let denied = client
         .post(format!("{base}/api/wallet"))
-        .header("X-Hashstash-Token", session["token"].as_str().unwrap())
+        .header(
+            "X-Hashstash-Token",
+            std::fs::read_to_string(&server.session_token_file).unwrap(),
+        )
         .json(&json!({"operation":donation(),"extra_fee":"0"}))
         .send()
         .await

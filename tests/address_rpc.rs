@@ -38,6 +38,7 @@ async fn session_wallet_metadata_and_watch_import_use_chain_checked_addresses() 
     let server = node::serve(node.clone(), options()).await.unwrap();
     let base = format!("http://{}", server.rpc);
     let empty = session(&base).await;
+    let token = std::fs::read_to_string(&server.session_token_file).unwrap();
     assert!(empty["address"].is_null());
     assert_eq!(empty["address_hrp"], address::hrp(&chain));
     let client = reqwest::Client::new();
@@ -54,7 +55,7 @@ async fn session_wallet_metadata_and_watch_import_use_chain_checked_addresses() 
             .unwrap()
             .starts_with("application/javascript")
     );
-    let watched: Value = client.post(format!("{base}/api/wallet/manage")).header("X-Hashstash-Token",empty["token"].as_str().unwrap()).json(&json!({"action":"watch","name":"Address account","public_key":encoded.to_uppercase(),"revision":empty["wallet_revision"]})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let watched: Value = client.post(format!("{base}/api/wallet/manage")).header("X-Hashstash-Token",&token).json(&json!({"action":"watch","name":"Address account","public_key":encoded.to_uppercase(),"revision":empty["wallet_revision"]})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
     assert_eq!(watched["address"], encoded);
     assert_eq!(watched["public_key"], hex::encode(public));
     assert_eq!(watched["wallets"][0]["address"], encoded);
@@ -62,10 +63,10 @@ async fn session_wallet_metadata_and_watch_import_use_chain_checked_addresses() 
     let after = session(&base).await;
     let wrong_chain = [99; 32];
     let wrong = address::encode(&public, &wrong_chain).unwrap();
-    let rejected = client.post(format!("{base}/api/wallet/manage")).header("X-Hashstash-Token",empty["token"].as_str().unwrap()).json(&json!({"action":"watch","name":"Wrong network","public_key":wrong,"revision":watched["wallet_revision"]})).send().await.unwrap();
+    let rejected = client.post(format!("{base}/api/wallet/manage")).header("X-Hashstash-Token",&token).json(&json!({"action":"watch","name":"Wrong network","public_key":wrong,"revision":watched["wallet_revision"]})).send().await.unwrap();
     assert_eq!(rejected.status(), 400);
     assert_eq!(session(&base).await, after);
-    let duplicate: Value = client.post(format!("{base}/api/wallet/manage")).header("X-Hashstash-Token",empty["token"].as_str().unwrap()).json(&json!({"action":"watch","name":"Raw duplicate","public_key":hex::encode(public),"revision":watched["wallet_revision"]})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let duplicate: Value = client.post(format!("{base}/api/wallet/manage")).header("X-Hashstash-Token",&token).json(&json!({"action":"watch","name":"Raw duplicate","public_key":hex::encode(public),"revision":watched["wallet_revision"]})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
     assert_eq!(duplicate, watched);
     server.stop().await;
 }

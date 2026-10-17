@@ -1111,6 +1111,10 @@ fn tx_value(
         v["asset"] = json!(asset);
     }
     conditional_fields(&operation, &mut v);
+    // A pending minimum is a quote for the current tip, not a recorded charge.
+    if height.is_none() {
+        v["fee_estimated"] = json!(true);
+    }
     Ok(v)
 }
 

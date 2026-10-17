@@ -5,19 +5,40 @@ fn repository(path: &str) -> String {
     fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).unwrap()
 }
 
-/// Dotted three-part numbers such as release versions; IPv4 addresses have four parts.
+/// Dotted three-part numbers that name a Hashstash release, such as
+/// "Hashstash 0.42.0", "version=0.42.0" or "/opt/hashstash/0.42.0-". Other
+/// products' versions (nginx, systemd) may appear; IPv4 addresses have four parts.
 fn release_numbers(text: &str) -> Vec<&str> {
-    text.split(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .map(|run| run.trim_matches('.'))
-        .filter(|run| {
-            let parts: Vec<_> = run.split('.').collect();
-            parts.len() == 3 && parts.iter().all(|part| !part.is_empty())
-        })
-        .collect()
+    const CONTEXTS: [&str; 5] = ["hashstash ", "hashstash/", "version ", "version=", "release "];
+    let lower = text.to_ascii_lowercase();
+    let mut found = Vec::new();
+    let mut start = None;
+    for (index, c) in text.char_indices().chain([(text.len(), ' ')]) {
+        if c.is_ascii_digit() || c == '.' {
+            start.get_or_insert(index);
+            continue;
+        }
+        let Some(begin) = start.take() else { continue };
+        let run = text[begin..index].trim_start_matches('.');
+        let begin = index - run.len();
+        let run = run.trim_end_matches('.');
+        let parts: Vec<_> = run.split('.').collect();
+        if parts.len() == 3
+            && parts.iter().all(|part| !part.is_empty())
+            && CONTEXTS.iter().any(|context| lower[..begin].ends_with(context))
+        {
+            found.push(run);
+        }
+    }
+    found
 }
 
 #[test]
 fn linux_installer_accepts_exactly_this_release() {
+    assert_eq!(
+        release_numbers("Hashstash 0.41.0 behind nginx 1.15.7 at 10.0.0.1, version=0.40.1."),
+        ["0.41.0", "0.40.1"]
+    );
     let version = env!("CARGO_PKG_VERSION");
     let installer = repository("deploy/linux/install.sh");
     assert!(
@@ -110,6 +131,43 @@ fn public_web_proxy_limits_json_rpc_per_client() {
         .expect("dedicated JSON-RPC location");
     assert!(location.contains("limit_req zone=hashstash_rpc "));
     assert!(location.contains("limit_conn hashstash_connections "));
+    // `delay=` needs nginx 1.15.7, and the deployment guide must say so.
+    if template.contains(" delay=") {
+        assert!(repository("deploy/linux/README.md").contains("nginx 1.15.7 or later"));
+    }
+}
+
+#[test]
+fn public_web_proxy_names_each_visitor_and_stays_within_node_sessions() {
+    use hashstash::network_guard::{PUBLIC_WEB_SESSIONS, PUBLIC_WEB_VISITOR_SESSIONS};
+    let template = repository("deploy/linux/public-web.nginx.template");
+    // The node keys visitor records on this header, so the proxy must
+    // overwrite it. A location-level proxy_set_header would drop it.
+    assert!(
+        template
+            .lines()
+            .any(|line| line.trim() == "proxy_set_header X-Real-IP $remote_addr;")
+    );
+    for location in template.split("location ").skip(1) {
+        let block = location.split('}').next().unwrap();
+        assert!(!block.contains("proxy_set_header"), "location {block}");
+    }
+    let limits = |name: &str| -> Vec<usize> {
+        let prefix = format!("limit_conn {name} ");
+        template
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(&prefix))
+            .map(|rest| rest.trim_end_matches(';').parse().unwrap())
+            .collect()
+    };
+    // One client stays below the node's per-visitor cap, and all clients
+    // together within its public session pool, in every proxied location.
+    let per_client = limits("hashstash_connections");
+    assert!(per_client.len() >= 2, "{per_client:?}");
+    for limit in per_client {
+        assert!(limit <= PUBLIC_WEB_VISITOR_SESSIONS && limit < PUBLIC_WEB_SESSIONS);
+    }
+    assert_eq!(limits("hashstash_upstream"), [PUBLIC_WEB_SESSIONS; 2]);
 }
 
 #[cfg(target_os = "linux")]

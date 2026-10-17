@@ -58,7 +58,7 @@ try {
     Check (@($restarted|Where-Object {$_.wallet_mode -ne 'none' -or $_.wallets.Count -ne 0}).Count -eq 0) 'Restart preserves empty wallet managers without loading mining-key backups'
     $node = $empty.nodes[0]
     $origin = "http://127.0.0.1:$($node.rpc_port)"
-    $created = Invoke-RestMethod -Uri ($origin+'/api/wallet/manage') -Method Post -ContentType 'application/json' -Headers @{'Origin'=$origin;'X-Hashstash-Token'=$restarted[0].token} -Body (@{action='create';name='First wallet';revision=$restarted[0].wallet_revision}|ConvertTo-Json) -TimeoutSec 5
+    $created = Invoke-RestMethod -Uri ($origin+'/api/wallet/manage') -Method Post -ContentType 'application/json' -Headers @{'Origin'=$origin;'X-Hashstash-Token'=(Get-Content -LiteralPath ([IO.Path]::ChangeExtension([string]$node.data_file, 'session-token')) -Raw)} -Body (@{action='create';name='First wallet';revision=$restarted[0].wallet_revision}|ConvertTo-Json) -TimeoutSec 5
     Check ($created.wallets.Count -eq 1 -and $created.wallet_mode -eq 'hot') 'First explicit wallet creation adds exactly one hot account'
     [void](Call-Node $node 'mine' @{count=1;recipient=$created.public_key})
     $minedStatus = Call-Node $node 'status'

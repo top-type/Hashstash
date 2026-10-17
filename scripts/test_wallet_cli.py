@@ -123,7 +123,7 @@ def main():
         assert session['wallet_mode'] == 'watch' and session['wallet_enabled'] is False
         assert session['public_key'] == vector['public_key']
         payment = transfer_operation(vector['public_key'])
-        status, _ = request(base, '/api/wallet', {'operation': payment, 'extra_fee': '0', 'expected_sender': session['public_key'], 'wallet_revision': session['wallet_revision']}, session['token'])
+        status, _ = request(base, '/api/wallet', {'operation': payment, 'extra_fee': '0', 'expected_sender': session['public_key'], 'wallet_revision': session['wallet_revision']}, db.with_suffix('.session-token').read_text())
         assert status == 403
         check('Watch-only node exposes its public key and rejects hot signing')
         cli('mine', '--url', base + '/rpc', '--count', '12')

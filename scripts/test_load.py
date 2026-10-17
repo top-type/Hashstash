@@ -63,6 +63,8 @@ def main():
     fixture_mode = require_test_work(rpc(port, 'config'))
     key = nodes[0]['public_key']
     session = http(port, '/api/session')
+    # The wallet token is only in the node's owner-only file, never served.
+    session['token'] = Path(nodes[0]['data_file']).with_suffix('.session-token').read_text()
     assert session['wallet_enabled'] and session['public_key'] == key, 'Start the audit network with -SeedWallets.'
     started = time.monotonic()
     transactions = args.transactions_per_wave

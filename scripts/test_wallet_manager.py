@@ -82,6 +82,9 @@ def main():
             return ['run', '--config', configuration_path, '--data', chain_path, '--miner', primary['public_key'], '--rpc', address, '--p2p', '127.0.0.1:0', '--stratum', '127.0.0.1:0']
         node_process, base = start(args.node, node_arguments(), 'node', 'RPC: (http://127\\.0\\.0\\.1:\\d+)/rpc')
         _, session = request(base, '/api/session')
+        # Wallet tools read the token from the node's owner-only file.
+        assert 'token' not in session
+        session['token'] = chain_path.with_suffix('.session-token').read_text()
         assert session['wallet_mode'] == 'none' and (not session['wallet_enabled'])
         assert session['wallet_id'] is None and session['public_key'] is None and (session['wallets'] == [])
         assert session['address'] is None
@@ -238,6 +241,7 @@ def main():
         _, restarted_base = start(args.node, node_arguments(base.removeprefix('http://')), 'node-restored', 'RPC: (http://127\\.0\\.0\\.1:\\d+)/rpc')
         assert restarted_base == base
         _, restarted = request(base, '/api/session')
+        restarted['token'] = chain_path.with_suffix('.session-token').read_text()
         assert restarted['token'] != session['token']
         assert restarted['wallet_id'] == hot_id and restarted['public_key'] == primary['public_key']
         assert sorted((wallet['id'] for wallet in restarted['wallets'])) == persisted_ids

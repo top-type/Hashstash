@@ -61,7 +61,7 @@ async function harness(initialChain = null, maxReview = undefined, server = {}) 
       }
       if(url==='/api/network') { if(derivedFor&&derivedFor!==body.chain_id) serverPublic=derivedFor=null; serverChain=body.chain_id; }
       if(url==='/api/review') {
-        if (!serverChain) return refuse('Select this signer’s network before reviewing; export network context is unsigned');
+        if (!serverChain) return refuse('Select this signer’s network before reviewing; the signature is bound to it');
         if (body?.format!=='hashstash-unsigned-anchor'||!/^[0-9a-f]{64}$/.test(body.chain_id||'')||serverChain!==body.chain_id)return refuse('Unsigned network context does not match the selected network');
       }
       if(url==='/api/sign' && review.confirmLifetime && body.confirm_lifetime!==true) return refuse('Confirm the long transaction lifetime before signing');
@@ -644,8 +644,8 @@ async function run() {
     assert.equal(h.get('review-rationale-warning').hidden,true);checks++;
   }
   assert.ok(html.includes('Anchor ancestry and expiry are checked by the receiving node.'));checks++;
-  assert.ok(html.includes('Network context is not signed.'));checks++;
-  assert.ok(html.includes('use a separate key there'));checks++;
+  assert.ok(html.includes('The signature commits to the selected network’s chain ID, so no other network accepts it.'));checks++;
+  assert.ok(!html.includes('Network context is not signed'));checks++;
   assert.match(html, /id="import-method"><option value="private">Private key/);checks++;
   assert.match(html, /<option value="legacy">Legacy v1 passphrase · restore only<\/option>/);checks++;
   assert.ok(html.includes('unsalted brain-wallet derivation'));checks++;

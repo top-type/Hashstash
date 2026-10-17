@@ -17,7 +17,7 @@ async fn large_transaction_review_uses_record_capacity_while_control_requests_st
         .ok("sign", json!({"review_token":reviewed["review_token"]}))
         .await;
     assert_eq!(
-        wallet::decode_signed(signed["raw"].as_str().unwrap())
+        wallet::decode_signed(signed["raw"].as_str().unwrap(), &[9; 32])
             .unwrap()
             .body,
         expected
@@ -86,7 +86,7 @@ async fn data_review_exposes_full_bytes_and_changed_data_invalidates_prior_appro
     let signed = signer
         .ok("sign", json!({"review_token":updated["review_token"]}))
         .await;
-    let transaction = wallet::decode_signed(signed["raw"].as_str().unwrap()).unwrap();
+    let transaction = wallet::decode_signed(signed["raw"].as_str().unwrap(), &[9; 32]).unwrap();
     assert_eq!(transaction.body, expected);
     assert_eq!(transaction.body.data, changed_data);
     signer.server.stop().await;
@@ -400,7 +400,7 @@ async fn exact_fee_review_signs_total_and_rejects_ambiguous_envelopes() {
         .ok("sign", json!({"review_token":review["review_token"]}))
         .await;
     assert_eq!(
-        wallet::decode_signed(signed["raw"].as_str().unwrap())
+        wallet::decode_signed(signed["raw"].as_str().unwrap(), &[9; 32])
             .unwrap()
             .body,
         expected
@@ -626,13 +626,14 @@ async fn all_operations_sign_the_exact_reviewed_bytes_with_exact_large_fields() 
         let signed = signer
             .ok("sign", json!({"review_token":reviewed["review_token"]}))
             .await;
-        let transaction = wallet::decode_signed(signed["raw"].as_str().unwrap()).unwrap();
+        let transaction = wallet::decode_signed(signed["raw"].as_str().unwrap(), &[9; 32]).unwrap();
         assert_eq!(transaction.body, expected);
         assert_eq!(
             signed["txid"],
             hex::encode(codec::transaction_id(&transaction))
         );
-        crypto::verify(&transaction).unwrap();
+        crypto::verify(&[9; 32], &transaction).unwrap();
+        assert!(crypto::verify(&[10; 32], &transaction).is_err());
         assert_eq!(
             signer
                 .post("sign", json!({"review_token":reviewed["review_token"]}))
@@ -826,6 +827,54 @@ async fn actual_cold_http_signing_round_trip_broadcasts_and_mines() {
     signer.server.stop().await;
 }
 
+/// A hostile preparer anchors a body on another network where the same key
+/// holds funds and labels the export with the signer's network. The review
+/// passes, but the signature binds the selected chain ID, so the network the
+/// anchor came from rejects it.
+#[tokio::test]
+async fn relabelled_exports_are_signed_for_the_selected_network_only() {
+    use hashstash::{config::Config, node::Node};
+    let selected = Config::devnet().chain_id();
+    let signer = Signer::with_chain(Some(selected)).await;
+    let sender = signer.unlock(PHRASE).await;
+    let mut other = Config::devnet();
+    other.network = "hashstash-relabel-target".into();
+    assert_ne!(other.chain_id(), selected);
+    let directory = tempfile::tempdir().unwrap();
+    let node = Node::open(&directory.path().join("other.sqlite"), other, sender)
+        .unwrap()
+        .with_watch_key(sender)
+        .unwrap();
+    for _ in 0..12 {
+        node.mine(100_000).unwrap();
+    }
+    let recipient = crypto::public_key(&[29; 32]).unwrap();
+    let mut unsigned = node.rpc("preparetransaction",json!({"sender":hex::encode(sender),"extra_fee":"1","operation":Operation::TransferExact{recipient,amount:5u32.into(),}})).unwrap();
+    unsigned.as_object_mut().unwrap().remove("fee_quote");
+    unsigned["chain_id"] = json!(hex::encode(selected));
+    let reviewed = signer.ok("review", unsigned).await;
+    assert!(reviewed["fields"].as_array().unwrap().iter().any(|f| {
+        f["label"] == "Network · signed" && f["value"] == hex::encode(selected)
+    }));
+    let signed = signer
+        .ok("sign", json!({"review_token":reviewed["review_token"]}))
+        .await;
+    let refused = node
+        .rpc("broadcasttransaction", json!({"raw":signed["raw"]}))
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("signature for this network"),
+        "{refused}"
+    );
+    node.mine(100_000).unwrap();
+    assert_eq!(
+        node.rpc("account", json!({"key":hex::encode(sender)}))
+            .unwrap()["account"]["nonce"],
+        0
+    );
+    signer.server.stop().await;
+}
+
 #[tokio::test]
 async fn importing_private_keys_signs_and_invalidates_previous_reviews() {
     let signer = Signer::start().await;
@@ -864,7 +913,7 @@ async fn importing_private_keys_signs_and_invalidates_previous_reviews() {
         .ok("sign", json!({"review_token":reviewed["review_token"]}))
         .await;
     assert_eq!(
-        wallet::decode_signed(signed["raw"].as_str().unwrap())
+        wallet::decode_signed(signed["raw"].as_str().unwrap(), &[9; 32])
             .unwrap()
             .body,
         expected
@@ -1084,7 +1133,7 @@ async fn generated_keys_are_random_return_one_backup_and_sign() {
         .ok("sign", json!({"review_token":review["review_token"]}))
         .await;
     assert_eq!(
-        wallet::decode_signed(signed["raw"].as_str().unwrap())
+        wallet::decode_signed(signed["raw"].as_str().unwrap(), &[9; 32])
             .unwrap()
             .body,
         expected
@@ -1151,7 +1200,7 @@ async fn long_lifetimes_need_explicit_confirmation_before_signing() {
                 json!({"review_token":review["review_token"],"confirm_lifetime":true}),
             )
             .await;
-        let transaction = wallet::decode_signed(signed["raw"].as_str().unwrap()).unwrap();
+        let transaction = wallet::decode_signed(signed["raw"].as_str().unwrap(), &[9; 32]).unwrap();
         assert_eq!(transaction.body.expiry_blocks, lifetime);
     }
     signer.server.stop().await;

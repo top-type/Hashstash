@@ -23,7 +23,7 @@ fn signed(c: &Config, s: &State, secret: &[u8; 32], operation: Operation) -> Tra
         data: vec![],
     };
     for _ in 0..16 {
-        let tx = crypto::sign(&body, secret).unwrap();
+        let tx = crypto::sign(&s.chain_id, &body, secret).unwrap();
         let minimum = fees::quote(c, s, &tx).unwrap().minimum_fee;
         if minimum == body.fee {
             return tx;

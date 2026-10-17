@@ -470,6 +470,7 @@ async fn bounded_seeded_peer_mutations_and_invalid_transactions_preserve_state()
     let valid = hello(&node);
     let secret = [102; 32];
     let invalid = crypto::sign(
+        &configuration().chain_id(),
         &TransactionBody {
             data: Vec::new(),
             sender: crypto::public_key(&secret).unwrap(),
@@ -746,6 +747,7 @@ async fn concurrent_invalid_signature_batches_leave_coherent_rpc_snapshots_respo
     let before = node.status().unwrap();
     let secret = [106; 32];
     let original = crypto::sign(
+        &configuration().chain_id(),
         &TransactionBody {
             data: Vec::new(),
             sender: crypto::public_key(&secret).unwrap(),
@@ -971,9 +973,11 @@ async fn stratum_admits_and_mines_a_complete_256_transaction_job() {
     let secret = [101; 32];
     let public = crypto::public_key(&secret).unwrap();
     node.mine(100_000).unwrap();
+    let chain_id = configuration().chain_id();
     let candidates: Vec<_> = (0..node::MAX_MEMPOOL as u64)
         .map(|nonce| {
             crypto::sign(
+                &chain_id,
                 &TransactionBody {
                     data: Vec::new(),
                     sender: public,

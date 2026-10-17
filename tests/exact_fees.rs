@@ -31,6 +31,7 @@ fn sign(
     offset: u64,
 ) -> Transaction {
     crypto::sign(
+        &s.chain_id,
         &TransactionBody {
             data: Vec::new(),
             sender: key(secret),
@@ -180,12 +181,12 @@ fn invalid_transfer_operations_are_rejected_atomically_and_direct_data_is_bound(
     ] {
         let mut body = tx.body.clone();
         body.operation = operation;
-        rejected_unchanged(&c, &s, &crypto::sign(&body, &ALICE).unwrap());
+        rejected_unchanged(&c, &s, &crypto::sign(&s.chain_id, &body, &ALICE).unwrap());
     }
     let mut changed = tx.clone();
     changed.body.data = vec![0, 255, 128];
     rejected_unchanged(&c, &s, &changed);
-    let valid = crypto::sign(&changed.body, &ALICE).unwrap();
+    let valid = crypto::sign(&s.chain_id, &changed.body, &ALICE).unwrap();
     let next = step(&c, &s, &MINER, 0, &[valid]);
     assert_eq!(balance(&next, &BOB), 1u32.into());
     assert_eq!(c.governance_parameters().len(), 9);
@@ -647,7 +648,7 @@ fn governed_capacity_change_applies_next_block_without_repricing_activation_tran
     let nonce = activated.account(&key(&ALICE), None).unwrap().nonce;
     for (offset, tx) in too_many.iter_mut().enumerate() {
         tx.body.nonce = nonce + offset as u64;
-        *tx = crypto::sign(&tx.body, &ALICE).unwrap();
+        *tx = crypto::sign(&activated.chain_id, &tx.body, &ALICE).unwrap();
     }
     // Recipients now exist, so make distinct new accounts to retain the weight.
     for (offset, tx) in too_many.iter_mut().enumerate() {
@@ -657,7 +658,7 @@ fn governed_capacity_change_applies_next_block_without_repricing_activation_tran
             recipient: key(&secret),
             amount: 1u32.into(),
         };
-        *tx = crypto::sign(&tx.body, &ALICE).unwrap();
+        *tx = crypto::sign(&activated.chain_id, &tx.body, &ALICE).unwrap();
     }
     assert!(
         consensus::execute(

@@ -329,7 +329,7 @@ fn world_mut(s: &mut State, o: Option<Outcome>) -> Result<&mut World> {
 /// the signed anchor's ancestry and lifetime before admitting a transaction.
 pub fn apply_transaction(c: &Config, s: &mut State, t: &Transaction) -> Result<()> {
     let prepared = fees::PreparedTransaction::with_limit(t, c.transaction_bytes(&s.settings))?;
-    crypto::verify(t)?;
+    crypto::verify(&s.chain_id, t)?;
     let quote = Some(prepared.quote(c, s)?);
     let opening = s.clone();
     let mut next = s.clone();
@@ -985,7 +985,7 @@ pub fn execute_with_fills(
     for t in transactions {
         let prepared =
             fees::PreparedTransaction::with_limit(t, c.transaction_bytes(&parent.settings))?;
-        crypto::verify(t)?;
+        crypto::verify(&parent.chain_id, t)?;
         execution.apply_prepared_transaction(c, &prepared)?;
     }
     finish_block_with_fills(c, parent, parent_hash, miner, block_work, execution)
@@ -1277,6 +1277,7 @@ mod transaction_batch_tests {
             amount: amount.into(),
         };
         crypto::sign(
+            &s.chain_id,
             &TransactionBody {
                 data: Vec::new(),
                 sender: sender(),
@@ -1448,6 +1449,7 @@ mod reserve_model_tests {
             _ => 1,
         };
         crypto::sign(
+            &s.chain_id,
             &TransactionBody {
                 data: Vec::new(),
                 sender: owner(),

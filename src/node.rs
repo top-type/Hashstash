@@ -1142,14 +1142,15 @@ impl Node {
         let local = now().min(u32::MAX as u64) as u32;
         local.max(chain.tip_block().header.timestamp)
     }
-    /// Shape and authentication of the exact signed bytes; failures are permanent.
-    fn screen_signed(tx: &Transaction) -> Result<()> {
+    /// Shape and authentication of the exact signed bytes for this node's
+    /// chain ID; failures are permanent.
+    fn screen_signed(chain_id: &Hash, tx: &Transaction) -> Result<()> {
         ensure!(
             tx.body.expiry_blocks > 0,
             "transaction lifetime must be positive"
         );
         ensure!(tx.body.nonce < u64::MAX, "invalid or exhausted nonce");
-        crypto::verify(tx).context("invalid transaction signature")
+        crypto::verify(chain_id, tx).context("invalid transaction signature")
     }
     /// Cheap checks against the current tip, before any signature check or
     /// selection: size, signed anchor and lifetime, and an unused sender nonce.
@@ -1408,7 +1409,7 @@ impl Node {
     }
     pub fn submit_transaction(&self, tx: Transaction) -> Result<Hash> {
         // Authenticate before waiting for chain state.
-        Self::screen_signed(&tx)
+        Self::screen_signed(&self.read_view()?.chain.chain_id(), &tx)
             .map_err(|error| anyhow!("transaction not valid in next block: {error:#}"))?;
         let mut i = self.locked()?;
         self.submit_locked(&mut i, tx)
@@ -1467,7 +1468,8 @@ impl Node {
                 nonce: request.nonce,
             },
         )?;
-        self.submit_locked(&mut i, crypto::sign(&body, &secret)?)
+        let chain_id = i.chain.tip_state().chain_id;
+        self.submit_locked(&mut i, crypto::sign(&chain_id, &body, &secret)?)
     }
     fn prepare_locked(
         &self,
@@ -1915,8 +1917,9 @@ impl Node {
                 }
             }
         }
+        let chain_id = view.chain.chain_id();
         fresh.retain(|(id, tx)| {
-            let authentic = Self::screen_signed(tx).is_ok();
+            let authentic = Self::screen_signed(&chain_id, tx).is_ok();
             if !authentic {
                 self.rejected_locked().insert(*id, None);
             }
@@ -2665,7 +2668,7 @@ impl Node {
             }
             "broadcasttransaction" => {
                 let request: BroadcastRequest = serde_json::from_value(params)?;
-                let tx = wallet::decode_signed(&request.raw)?;
+                let tx = wallet::decode_signed(&request.raw, &self.read_view()?.chain.chain_id())?;
                 Ok(json!({"transaction_id":hex::encode(self.submit_transaction(tx)?)}))
             }
             "getblock" => {
@@ -5041,6 +5044,7 @@ mod capacity_work_tests {
         )
         .unwrap();
         let transaction = crypto::sign(
+            &config.chain_id(),
             &TransactionBody {
                 sender,
                 nonce: 17,
@@ -5087,7 +5091,7 @@ mod capacity_work_tests {
             hex::encode(codec::transaction_id(&transaction))
         );
         assert_eq!(
-            wallet::decode_signed(full[0]["raw"].as_str().unwrap()).unwrap(),
+            wallet::decode_signed(full[0]["raw"].as_str().unwrap(), &config.chain_id()).unwrap(),
             transaction
         );
         assert!(
@@ -5750,11 +5754,12 @@ impl RpcClient {
     /// account nonce raised past its pending transactions, is taken at its
     /// word, so no raw pending record of any governed size is downloaded.
     /// Otherwise the account nonce is raised past this sender's
-    /// signature-checked pending transactions. Either way an endpoint can
-    /// misreport the account nonce or hide pending rows, so the review shows
-    /// the chosen nonce and `--nonce` overrides it.
+    /// signature-checked pending transactions, verified for `chain_id`. Either
+    /// way an endpoint can misreport the account nonce or hide pending rows, so
+    /// the review shows the chosen nonce and `--nonce` overrides it.
     pub async fn pending_nonce(
         &self,
+        chain_id: &Hash,
         sender: &PublicKey,
         budget: ScanBudget,
     ) -> Result<PendingNonce> {
@@ -5808,6 +5813,7 @@ impl RpcClient {
                         row.get("raw")
                             .and_then(Value::as_str)
                             .context("mempool signed transaction missing")?,
+                        chain_id,
                     )?;
                     if tx.body.sender == *sender {
                         pending += 1;
@@ -6488,7 +6494,18 @@ mod tests {
         let mut envelope = prepared.clone();
         envelope.as_object_mut().unwrap().remove("fee_quote");
         let body = wallet::decode_unsigned(&serde_json::from_value(envelope).unwrap()).unwrap();
-        let tx = crypto::sign(&body, &secret).unwrap();
+        let foreign = crypto::sign(&[0; 32], &body, &secret).unwrap();
+        assert!(
+            node.rpc(
+                "broadcasttransaction",
+                json!({"raw":wallet::signed_hex(&foreign)})
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("signature for this network"),
+            "a signature for another chain ID is rejected"
+        );
+        let tx = crypto::sign(&before.chain_id, &body, &secret).unwrap();
         let raw = wallet::signed_hex(&tx);
         node.rpc("broadcasttransaction", json!({"raw":raw}))
             .unwrap();
@@ -6977,6 +6994,7 @@ mod tests {
         let mut s = view.chain.tip_state().clone();
         let sender = crypto::public_key(&[1; 32]).unwrap();
         let transaction = crypto::sign(
+            &s.chain_id,
             &TransactionBody {
                 data: Vec::new(),
                 sender,
@@ -7157,6 +7175,7 @@ mod tests {
             outcome: Some(Outcome::Pass),
         };
         let tx = crypto::sign(
+            &state.chain_id,
             &TransactionBody {
                 data: Vec::new(),
                 sender: key,
@@ -8067,6 +8086,7 @@ mod peer_tests {
         let secp = Secp256k1::new();
         let pair = Keypair::from_secret_key(&secp, &SecretKey::from_byte_array(secret).unwrap());
         let anchor = codec::block_hash(&codec::genesis_block(&config).unwrap());
+        let chain_id = config.chain_id();
         let mut nonce = 0;
         for _ in 0..2 {
             let transactions = (0..config.max_signatures)
@@ -8084,8 +8104,7 @@ mod peer_tests {
                         data: vec![],
                     };
                     nonce += 1;
-                    let message =
-                        crypto::tagged_hash(crypto::TRANSACTION_TAG, &codec::encode(&body));
+                    let message = crypto::signing_message(&chain_id, &body);
                     Transaction {
                         signature: *secp.sign_schnorr_no_aux_rand(&message, &pair).as_ref(),
                         body,

@@ -25,6 +25,7 @@ fn config(decision_blocks: u64, lead: u64) -> Config {
 }
 fn sign(s: &State, secret: &[u8; 32], fee: u32, operation: Operation) -> Transaction {
     crypto::sign(
+        &s.chain_id,
         &TransactionBody {
             sender: key(secret),
             nonce: s.account(&key(secret), None).unwrap().nonce,

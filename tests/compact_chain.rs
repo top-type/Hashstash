@@ -48,9 +48,11 @@ fn selection_accounts_for_real_body_bytes_and_new_account_weight() {
             )
             .unwrap();
             chain.submit(first, u64::from(c.genesis_time + 15)).unwrap();
+            let chain_id = c.chain_id();
             let candidates: Vec<_> = (0..100)
                 .map(|nonce| {
                     crypto::sign(
+                        &chain_id,
                         &TransactionBody {
                             sender: miner(1),
                             nonce,

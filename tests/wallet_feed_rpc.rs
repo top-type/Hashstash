@@ -26,6 +26,7 @@ fn funded(dir: &tempfile::TempDir, c: &Config) -> Node {
 }
 fn payment(c: &Config, nonce: u64, data: &[u8]) -> Transaction {
     crypto::sign(
+        &c.chain_id(),
         &TransactionBody {
             sender: owner(),
             nonce,

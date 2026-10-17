@@ -42,7 +42,7 @@ fn payment(
         },
     };
     loop {
-        let tx = crypto::sign(&body, secret).unwrap();
+        let tx = crypto::sign(&state.chain_id, &body, secret).unwrap();
         let fee = fees::quote(config, state, &tx).unwrap().minimum_fee + extra;
         if tx.body.fee == fee {
             return tx;

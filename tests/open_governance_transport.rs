@@ -128,6 +128,7 @@ async fn large_governed_block_relays_compactly_and_survives_reopen() {
     let transactions: Vec<_> = (0..3_500)
         .map(|nonce| {
             let transaction = crypto::sign(
+                &chain.tip_state().chain_id,
                 &TransactionBody {
                     sender: miner,
                     nonce: nonce_before + nonce,

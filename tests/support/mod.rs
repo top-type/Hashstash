@@ -24,7 +24,7 @@ pub fn sign_minimum(
         let weight = bytes + if creation { 1024 } else { 0 } + grant_recipients * 1024;
         let fee = (Amount::from(weight) * s.settings.minimum_fee_rate + 1023u32) / 1024u32 + extra;
         if body.fee == fee {
-            return crypto::sign(&body, secret).unwrap();
+            return crypto::sign(&s.chain_id, &body, secret).unwrap();
         }
         body.fee = fee;
     }

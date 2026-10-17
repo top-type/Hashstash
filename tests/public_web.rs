@@ -227,7 +227,8 @@ async fn public_wallet_prepares_exact_unsigned_intent_and_broadcasts_only_signed
     assert_eq!(body.expiry_blocks, 100);
     assert_eq!(body.data, vec![0xab; 600]);
     assert_eq!(node.status().unwrap()["mempool"], 0);
-    let mut signed = crypto::sign(&body, &secret).unwrap();
+    let chain_id = wallet::unsigned_chain(&unsigned).unwrap();
+    let mut signed = crypto::sign(&chain_id, &body, &secret).unwrap();
     signed.signature[0] ^= 1;
     let invalid = request(
         &client,
@@ -241,7 +242,7 @@ async fn public_wallet_prepares_exact_unsigned_intent_and_broadcasts_only_signed
     .unwrap();
     assert!(invalid.get("error").is_some());
     assert_eq!(node.status().unwrap()["mempool"], 0);
-    let signed = crypto::sign(&body, &secret).unwrap();
+    let signed = crypto::sign(&chain_id, &body, &secret).unwrap();
     let accepted = request(
         &client,
         &public,

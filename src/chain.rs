@@ -1424,7 +1424,7 @@ impl Chain {
                 continue;
             }
             result.signatures_checked += 1;
-            if crypto::verify(transaction).is_err() {
+            if crypto::verify(&self.tip_state.chain_id, transaction).is_err() {
                 continue;
             }
             let Ok(quote) = fees::quote(&self.config, &execution.state, transaction) else {
@@ -1914,6 +1914,7 @@ mod cache_tests {
             .unwrap();
         let owner = crypto::public_key(&[91; 32]).unwrap();
         let tx = crypto::sign(
+            &chain.chain_id(),
             &TransactionBody {
                 sender: owner,
                 nonce: 0,

@@ -738,7 +738,7 @@ class WireTests(unittest.TestCase):
                     body, raw = ca.make_body(public, i, 1000000, 'ab' * 32, 2, inner,
                         b'Automated test'.hex() if i == 0 else '')
                     ca.save_new(root / f'body{i}.json', body)
-                    cli.run(['sign', '--key', root / 'test.key', '--body', root / f'body{i}.json', '--out', root / f'signed{i}.json'])
+                    cli.run(['sign', '--key', root / 'test.key', '--body', root / f'body{i}.json', '--out', root / f'signed{i}.json', '--chain-id', CHAIN])
                     signed = json.loads((root / f'signed{i}.json').read_text())
                     wire = ca.signed_wire(signed, body, raw)
                     ca.save_new(root / f'raw{i}.hex', wire.hex(), text=True)

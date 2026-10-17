@@ -108,7 +108,8 @@ fn rationale_check(body: &TransactionBody, description: &Hash) -> &'static str {
 #[serde(deny_unknown_fields)]
 pub struct UnsignedEnvelope {
     pub format: String,
-    /// Unsigned network context for address display; ancestry requires a node.
+    /// The network the export was prepared for, outside the body. A signer
+    /// signs for its own selected network and rejects a differing context.
     pub chain_id: String,
     pub body: String,
 }
@@ -121,7 +122,8 @@ pub fn unsigned(body: &TransactionBody, chain_id: &Hash) -> UnsignedEnvelope {
     }
 }
 
-/// Decode display context, without claiming it is authenticated by the signature.
+/// Decode the export's network context. Nothing authenticates it: compare it
+/// with the network the signer selected, which the signature then binds.
 pub fn unsigned_chain(envelope: &UnsignedEnvelope) -> Result<Hash> {
     ensure!(
         envelope.chain_id.len() == 64
@@ -183,11 +185,20 @@ pub fn signed_hex(transaction: &Transaction) -> String {
     hex::encode(codec::encode(transaction))
 }
 
-pub fn decode_signed(raw: &str) -> Result<Transaction> {
+/// Decode a signed record and verify its signature for the network `chain_id`.
+pub fn decode_signed(raw: &str, chain_id: &Hash) -> Result<Transaction> {
+    let transaction = decode_signed_record(raw)?;
+    crypto::verify(chain_id, &transaction)
+        .map_err(|_| anyhow::anyhow!("invalid transaction signature for this network"))?;
+    Ok(transaction)
+}
+
+/// The canonical shape of a signed record, without its signature check. A
+/// signature verifies only for one chain ID; the receiving node checks it.
+pub fn decode_signed_record(raw: &str) -> Result<Transaction> {
     let bytes = raw_bytes(raw)?;
     let transaction: Transaction = codec::decode(&bytes, bytes.len())?;
     validate_body(&transaction.body)?;
-    crypto::verify(&transaction)?;
     Ok(transaction)
 }
 
@@ -335,16 +346,14 @@ pub fn review(body: &TransactionBody, chain_id: Option<&Hash>) -> Vec<ReviewFiel
             value,
         })
     };
+    // The signing message commits to this chain ID, so no other network
+    // accepts the signature, whichever network the anchor came from.
     if let Some(chain) = chain_id {
-        add("Network context · unsigned", hex::encode(chain));
+        add("Network · signed", hex::encode(chain));
     }
     add(
         "Anchor validation",
         "Ancestry and expiry are checked by the receiving node".into(),
-    );
-    add(
-        "Network check",
-        "The signature does not name a network: it is valid only where the anchor block exists, which this review cannot verify. Use a separate key for each network that holds value".into(),
     );
     add("Sender", account(&body.sender));
     add("Nonce", body.nonce.to_string());
@@ -573,7 +582,8 @@ mod governance_review_tests {
         assert!(
             fields
                 .iter()
-                .any(|field| field.label == "Network context · unsigned")
+                .any(|field| field.label == "Network · signed"
+                    && field.value == hex::encode([42; 32]))
         );
         assert!(
             fields
@@ -587,6 +597,7 @@ mod governance_review_tests {
                 .any(|field| field.label == "Sender"
                     && field.value == hex::encode(transaction.sender))
         );
+        assert!(!without_context.iter().any(|f| f.label.starts_with("Network")));
         for malformed in [String::new(), "00".into(), "g".repeat(64), "AA".repeat(32)] {
             let mut changed = first.clone();
             changed.chain_id = malformed;
@@ -689,11 +700,10 @@ mod governance_review_tests {
     }
 
     #[test]
-    fn cold_review_flags_long_lifetimes_and_unverified_network() {
+    fn cold_review_flags_long_lifetimes_and_names_the_signed_network() {
         let mut transaction = body(Parameter::DecisionBlocks, 60, 120);
         let fields = review(&transaction, Some(&[42; 32]));
-        assert!(fields.iter().any(|f| f.label == "Network check"
-            && f.value.contains("does not name a network")));
+        assert_eq!(fields[0].label, "Network · signed");
         assert!(!fields.iter().any(|f| f.label == "Lifetime warning"));
         for (lifetime, warned) in [
             (LONG_LIFETIME_BLOCKS, false),

@@ -81,6 +81,7 @@ fn tx(node: &Node, c: &Config, operation: Operation, offset: u64, data: Vec<u8>)
         .unwrap()
         + offset;
     crypto::sign(
+        &c.chain_id(),
         &TransactionBody {
             sender: owner(),
             nonce,
@@ -717,6 +718,7 @@ fn governed_whole_fee_rpc_and_explorer_match_exact_signed_fee() {
                 + 7
         );
         let transaction = crypto::sign(
+            &c.chain_id(),
             &TransactionBody {
                 data: Vec::new(),
                 sender: owner(),

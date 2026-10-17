@@ -119,10 +119,10 @@ fn newly_ready_priority_candidate_precedes_unrelated_entries_at_capacity() {
     // one-atom fees all round to zero miner revenue and then sort by txid.
     let mut pending_body = self_payment(&chain, &SECRET, 2).body;
     pending_body.fee = 5u32.into();
-    let pending = crypto::sign(&pending_body, &SECRET).unwrap();
+    let pending = crypto::sign(&chain.chain_id(), &pending_body, &SECRET).unwrap();
     let mut predecessor_body = self_payment(&chain, &SECRET, 1).body;
     predecessor_body.fee = 3u32.into();
-    let predecessor = crypto::sign(&predecessor_body, &SECRET).unwrap();
+    let predecessor = crypto::sign(&chain.chain_id(), &predecessor_body, &SECRET).unwrap();
     let unrelated: Vec<_> = (0..255)
         .map(|nonce| self_payment(&chain, &other_secret, nonce))
         .collect();
@@ -248,7 +248,7 @@ fn repeated_state_failures_have_a_linear_per_sender_operation_budget() {
             )
             .body;
             body.fee = 100u32.into();
-            crypto::sign(&body, &SECRET).unwrap()
+            crypto::sign(&chain.chain_id(), &body, &SECRET).unwrap()
         })
         .collect();
     let failing = candidates.len();
@@ -378,7 +378,8 @@ fn governed_capacity_shrink_evicts_large_pending_transactions_and_refreshes_temp
     );
     pending.body.data = vec![7; 20 * 1024];
     pending.body.fee = 1000u32.into();
-    pending = crypto::sign(&pending.body, &SECRET).unwrap();
+    let chain_id = chain.chain_id();
+    pending = crypto::sign(&chain_id, &pending.body, &SECRET).unwrap();
     let timestamp = chain.tip_block().header.timestamp + config.initial.interval as u32;
     let activation =
         Chain::mine(chain.template(key(), vec![], timestamp).unwrap(), 100_000).unwrap();
@@ -393,7 +394,7 @@ fn governed_capacity_shrink_evicts_large_pending_transactions_and_refreshes_temp
     assert!(node.template().unwrap().transactions.is_empty());
     assert!(node.submit_transaction(pending.clone()).is_err());
     pending.body.data.truncate(8 * 1024);
-    pending = crypto::sign(&pending.body, &SECRET).unwrap();
+    pending = crypto::sign(&chain_id, &pending.body, &SECRET).unwrap();
     assert!(codec::encode(&pending).len() > 4096);
     node.submit_transaction(pending.clone()).unwrap();
     assert_eq!(node.template().unwrap().transactions, vec![pending]);

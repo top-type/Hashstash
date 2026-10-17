@@ -40,6 +40,8 @@ const STYLE: &str = include_str!("../cold-ui/style.css");
 struct Review {
     token: String,
     body: TransactionBody,
+    /// The selected network the review showed; the signature binds it.
+    chain_id: Hash,
     long_lifetime: bool,
 }
 
@@ -481,10 +483,10 @@ async fn review(State(app): State<App>, bytes: Bytes) -> Response {
     job(app, move |state| {
         state.review = None;
         let public = state.public.ok_or_else(|| anyhow!("Open a wallet first"))?;
-        // Only the operator selects the network. Export context is unsigned, so
-        // it is checked against that selection and never adopted.
+        // Only the operator selects the network, and the signature binds that
+        // selection. Export context is checked against it, never adopted.
         let selected = state.chain_id.ok_or_else(|| {
-            anyhow!("Select this signer's network before reviewing; export network context is unsigned")
+            anyhow!("Select this signer's network before reviewing; the signature is bound to it")
         })?;
         let envelope = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow!("Invalid unsigned transaction envelope"))?;
@@ -499,7 +501,7 @@ async fn review(State(app): State<App>, bytes: Bytes) -> Response {
             "Export network context differs from the selected network"
         );
         let review_token = token()?;
-        let fields: Vec<_> = wallet::review(&body, Some(&chain_id))
+        let fields: Vec<_> = wallet::review(&body, Some(&selected))
             .into_iter()
             .map(|field| json!({"label":field.label,"value":field.value}))
             .collect();
@@ -508,6 +510,7 @@ async fn review(State(app): State<App>, bytes: Bytes) -> Response {
         state.review = Some(Review {
             token: review_token.clone(),
             body,
+            chain_id: selected,
             long_lifetime,
         });
         let mut status = state.status()?;
@@ -539,8 +542,8 @@ async fn sign(State(app): State<App>, bytes: Bytes) -> Response {
             !review.long_lifetime || request.confirm_lifetime,
             "Confirm the long transaction lifetime before signing"
         );
-        let transaction = crypto::sign(&review.body, secret)?;
-        crypto::verify(&transaction)?;
+        let transaction = crypto::sign(&review.chain_id, &review.body, secret)?;
+        crypto::verify(&review.chain_id, &transaction)?;
         state.review = None;
         Ok(json!({"raw":wallet::signed_hex(&transaction),"txid":hex::encode(codec::transaction_id(&transaction))}))
     }).await

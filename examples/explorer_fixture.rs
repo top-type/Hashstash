@@ -20,7 +20,11 @@ fn signed(node: &Node, operation: Operation, data: Vec<u8>, offset: u64) -> Resu
         .map_err(|_| anyhow::anyhow!("invalid tip hash length"))?;
     let quote = node.rpc("fee_quote", json!({"sender":hex::encode(public), "operation":operation, "data_hex":hex::encode(&data), "extra_fee":"1", "nonce":nonce, "anchor":hex::encode(anchor), "expiry_blocks":2}))?;
     let fee: Amount = quote["fee"].as_str().context("fee missing")?.parse()?;
+    let chain_id: Hash = hex::decode(status["chain_id"].as_str().context("chain id missing")?)?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid chain id length"))?;
     crypto::sign(
+        &chain_id,
         &TransactionBody {
             sender: public,
             nonce,

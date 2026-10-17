@@ -31,6 +31,7 @@ fn transfer(recipient: PublicKey) -> Operation {
 
 fn signed(c: &Config, s: &State, operation: Operation, data: Vec<u8>, offset: u64) -> Transaction {
     crypto::sign(
+        &s.chain_id,
         &TransactionBody {
             sender: key(&ALICE),
             nonce: s.account(&key(&ALICE), None).map_or(0, |a| a.nonce) + offset,
@@ -155,7 +156,10 @@ fn data_bytes_are_fully_charged_and_fee_distribution_is_unchanged() {
         inadequate.data = vec![0; 2_048];
         transfer(key(&BOB))
     };
-    assert!(rejected(&c, &s, &crypto::sign(&inadequate, &ALICE).unwrap()).contains("minimum"));
+    assert!(
+        rejected(&c, &s, &crypto::sign(&s.chain_id, &inadequate, &ALICE).unwrap())
+            .contains("minimum")
+    );
 }
 
 #[test]
@@ -175,10 +179,10 @@ fn mutation_removal_and_reordering_invalidate_signature_and_do_not_charge() {
             changed.body.data = data;
             transfer(key(&BOB))
         };
-        assert!(crypto::verify(&changed).is_err());
+        assert!(crypto::verify(&s.chain_id, &changed).is_err());
         rejected(&c, &s, &changed);
     }
-    crypto::verify(&original).unwrap();
+    crypto::verify(&s.chain_id, &original).unwrap();
     let mut next = s.clone();
     consensus::apply_transaction(&c, &mut next, &original).unwrap();
     assert!(rejected(&c, &next, &original).contains("nonce"));

@@ -339,7 +339,7 @@ fn deep_side_branch_anchors_resolve_through_skip_links() {
     let nonce = branch.tip_state().account(&key(), None).unwrap().nonce;
     let mut deep = self_payment(&branch, nonce).body;
     deep.anchor = anchors[2];
-    let deep = crypto::sign(&deep, &SECRET).unwrap();
+    let deep = crypto::sign(&branch.chain_id(), &deep, &SECRET).unwrap();
     let block = append(&mut branch, vec![deep], 99_000);
     assert!(!chain.submit(block.clone(), block.header.timestamp as u64).unwrap());
     assert!(chain.block(&codec::block_hash(&block)).is_some());
@@ -347,7 +347,7 @@ fn deep_side_branch_anchors_resolve_through_skip_links() {
     let nonce = branch.tip_state().account(&key(), None).unwrap().nonce;
     let mut foreign = self_payment(&branch, nonce).body;
     foreign.anchor = chain.hash_at_height(15).unwrap();
-    let foreign = crypto::sign(&foreign, &SECRET).unwrap();
+    let foreign = crypto::sign(&branch.chain_id(), &foreign, &SECRET).unwrap();
     let mut invalid = branch.template(key(), vec![], next_time(&branch)).unwrap();
     invalid.transactions = vec![foreign];
     invalid.header.merkle_root = codec::merkle_root(&invalid).unwrap();

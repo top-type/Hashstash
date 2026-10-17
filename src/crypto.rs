@@ -8,7 +8,7 @@ use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey, schnorr::Signature};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
-pub const TRANSACTION_TAG: &str = "Hashstash/anchor-only-transaction";
+pub const TRANSACTION_TAG: &str = "Hashstash/chain-bound-transaction";
 
 pub fn sha256d(bytes: &[u8]) -> Hash {
     Sha256::digest(Sha256::digest(bytes)).into()
@@ -16,12 +16,24 @@ pub fn sha256d(bytes: &[u8]) -> Hash {
 
 /// BIP340's tagged SHA256 construction; this is a single SHA256, not SHA256d.
 pub fn tagged_hash(tag: &str, bytes: &[u8]) -> Hash {
+    tagged_hash_parts(tag, &[bytes])
+}
+
+/// `tagged_hash` of the concatenated `parts`, without copying them.
+fn tagged_hash_parts(tag: &str, parts: &[&[u8]]) -> Hash {
     let tag_digest = Sha256::digest(tag.as_bytes());
     let mut h = Sha256::new();
     h.update(tag_digest);
     h.update(tag_digest);
-    h.update(bytes);
+    parts.iter().for_each(|part| h.update(part));
     h.finalize().into()
+}
+
+/// The BIP340 message of a transaction: `tagged_hash(TRANSACTION_TAG,
+/// chain_id || encode(body))`. The chain ID is signed but not transmitted, so
+/// a signature verifies only on the network it was made for.
+pub fn signing_message(chain_id: &Hash, body: &TransactionBody) -> Hash {
+    tagged_hash_parts(TRANSACTION_TAG, &[chain_id, &codec::encode(body)])
 }
 
 /// HMAC-SHA256 (RFC 2104) of the concatenated `parts`. Key-derived pads are
@@ -177,14 +189,15 @@ pub fn public_key(secret: &[u8; 32]) -> Result<PublicKey> {
     Ok(public)
 }
 
-pub fn sign(body: &TransactionBody, secret: &[u8; 32]) -> Result<Transaction> {
+/// Signs `body` for the network `chain_id`; no other network accepts it.
+pub fn sign(chain_id: &Hash, body: &TransactionBody, secret: &[u8; 32]) -> Result<Transaction> {
     ensure!(
         body.sender == public_key(secret)?,
         "secret does not authorize the sender"
     );
     let secp = Secp256k1::new();
     let mut pair = Keypair::from_seckey_byte_array(&secp, *secret)?;
-    let message = tagged_hash(TRANSACTION_TAG, &codec::encode(body));
+    let message = signing_message(chain_id, body);
     // Fresh BIP340 auxiliary randomness hardens nonce generation against side channels.
     let mut auxiliary = Zeroizing::new([0u8; 32]);
     let random = getrandom::fill(auxiliary.as_mut());
@@ -197,10 +210,11 @@ pub fn sign(body: &TransactionBody, secret: &[u8; 32]) -> Result<Transaction> {
     })
 }
 
-pub fn verify(tx: &Transaction) -> Result<()> {
+/// Verifies a signature made for the network `chain_id`.
+pub fn verify(chain_id: &Hash, tx: &Transaction) -> Result<()> {
     let key = XOnlyPublicKey::from_byte_array(tx.body.sender)?;
     let signature = Signature::from_byte_array(tx.signature);
-    let message = tagged_hash(TRANSACTION_TAG, &codec::encode(&tx.body));
+    let message = signing_message(chain_id, &tx.body);
     Secp256k1::verification_only().verify_schnorr(&signature, &message, &key)?;
     Ok(())
 }
@@ -323,27 +337,78 @@ mod tests {
                 amount: 2u32.into(),
             },
         };
-        let signed = sign(&body, &key).unwrap();
-        verify(&signed).unwrap();
+        let chain = [7; 32];
+        let signed = sign(&chain, &body, &key).unwrap();
+        verify(&chain, &signed).unwrap();
         let mut changed = signed.clone();
         changed.body.sender[0] ^= 1;
-        assert!(verify(&changed).is_err());
+        assert!(verify(&chain, &changed).is_err());
         changed = signed.clone();
         changed.body.nonce += 1;
-        assert!(verify(&changed).is_err());
+        assert!(verify(&chain, &changed).is_err());
         changed = signed.clone();
         changed.body.fee += 1u32;
-        assert!(verify(&changed).is_err());
+        assert!(verify(&chain, &changed).is_err());
         changed = signed.clone();
         changed.body.expiry_blocks += 1;
-        assert!(verify(&changed).is_err());
+        assert!(verify(&chain, &changed).is_err());
         changed = signed.clone();
         changed.body.anchor[0] ^= 1;
-        assert!(verify(&changed).is_err());
+        assert!(verify(&chain, &changed).is_err());
         changed = signed.clone();
         changed.signature[63] ^= 1;
-        assert!(verify(&changed).is_err());
-        assert!(sign(&body, &[2; 32]).is_err());
+        assert!(verify(&chain, &changed).is_err());
+        assert!(sign(&chain, &body, &[2; 32]).is_err());
+    }
+
+    /// A body anchored on one network but signed while another was selected
+    /// is valid nowhere: every node verifies against its own chain ID.
+    #[test]
+    fn signatures_bind_the_chain_id_without_transmitting_it() {
+        let secret = [1; 32];
+        let body = TransactionBody {
+            sender: public_key(&secret).unwrap(),
+            nonce: 0,
+            fee: 1u32.into(),
+            anchor: [3; 32],
+            expiry_blocks: 2,
+            operation: Operation::TransferExact {
+                recipient: public_key(&[2; 32]).unwrap(),
+                amount: 1u32.into(),
+            },
+            data: vec![],
+        };
+        let (testnet, other) = ([11; 32], [12; 32]);
+        let signed = sign(&testnet, &body, &secret).unwrap();
+        verify(&testnet, &signed).unwrap();
+        assert!(verify(&other, &signed).is_err());
+        let mut changed = testnet;
+        for byte in 0..32 {
+            changed[byte] ^= 1;
+            assert!(verify(&changed, &signed).is_err(), "chain byte {byte}");
+            changed[byte] ^= 1;
+        }
+        assert_eq!(codec::encode(&signed).len(), codec::encode(&body).len() + 64);
+        // The documented construction, built here without tagged_hash.
+        let tag = Sha256::digest(b"Hashstash/chain-bound-transaction");
+        let mut expected = Sha256::new();
+        expected.update(tag);
+        expected.update(tag);
+        expected.update(testnet);
+        expected.update(codec::encode(&body));
+        let expected: Hash = expected.finalize().into();
+        assert_eq!(signing_message(&testnet, &body), expected);
+        let pair = Keypair::from_secret_key(
+            &Secp256k1::new(),
+            &SecretKey::from_byte_array(secret).unwrap(),
+        );
+        let external = Secp256k1::new().sign_schnorr_with_aux_rand(&expected, &pair, &[0; 32]);
+        let external = Transaction {
+            body: body.clone(),
+            signature: *external.as_ref(),
+        };
+        verify(&testnet, &external).unwrap();
+        assert!(verify(&other, &external).is_err());
     }
     #[test]
     fn anchored_transactions_use_a_distinct_signing_domain() {
@@ -362,18 +427,28 @@ mod tests {
         };
         let secp = Secp256k1::new();
         let pair = Keypair::from_secret_key(&secp, &SecretKey::from_byte_array(secret).unwrap());
-        for tag in ["Hashstash/Transaction", "Hashstash/anchored-transaction"] {
-            let former_digest = tagged_hash(tag, &codec::encode(&body));
+        let chain = [4; 32];
+        let encoded = codec::encode(&body);
+        let chained = [chain.as_slice(), &encoded].concat();
+        // Earlier domains, including the network-independent anchor-only one.
+        for (tag, message) in [
+            ("Hashstash/Transaction", &encoded),
+            ("Hashstash/anchored-transaction", &encoded),
+            ("Hashstash/anchor-only-transaction", &encoded),
+            ("Hashstash/anchor-only-transaction", &chained),
+            (TRANSACTION_TAG, &encoded),
+        ] {
+            let former_digest = tagged_hash(tag, message);
             let signature = secp.sign_schnorr_with_aux_rand(&former_digest, &pair, &[0; 32]);
             let former_domain = Transaction {
                 body: body.clone(),
                 signature: *signature.as_ref(),
             };
             assert!(
-                verify(&former_domain).is_err(),
+                verify(&chain, &former_domain).is_err(),
                 "accepted former domain {tag}"
             );
         }
-        verify(&sign(&body, &secret).unwrap()).unwrap();
+        verify(&chain, &sign(&chain, &body, &secret).unwrap()).unwrap();
     }
 }

@@ -701,7 +701,7 @@ async function run() {
  {
   const field=/<input\b[^>]*id="import-private-key"[^>]*>/.exec(html)?.[0]||'';
   ok(field&&!/type="password"/.test(field)&&/class="secret-input"/.test(field)&&/data-1p-ignore/.test(field)&&/data-lpignore="true"/.test(field),'the spending key field is not a password field that browsers offer to save and sync');
-  ok(!html.includes('covers the chain identity')&&html.includes('The chain ID is not a signed field'),'the guide does not claim the signature covers the chain ID');
+  ok(!html.includes('The chain ID is not a signed field')&&html.includes('commits to the network\'s chain ID'),'the guide states that signatures bind the chain ID');
  }
  eq(h.get('network-phase-label').textContent,'Auction');
  eq(h.get('sidebar-height-value').textContent,'20');

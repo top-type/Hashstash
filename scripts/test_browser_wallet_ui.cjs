@@ -88,7 +88,7 @@ async function run() {
   assert.equal(broadcasts(a).length,1,a.get('send-form').querySelector().textContent);checks++;
   const raw=Buffer.from(broadcasts(a)[0].body.params.raw,'hex'),body=raw.subarray(0,-64),signature=raw.subarray(-64);
   assert.equal(raw.length,body.length+64);checks++;
-  const tag=sha(Buffer.from('Hashstash/anchor-only-transaction')),message=sha(Buffer.concat([tag,tag,body]));
+  const tag=sha(Buffer.from('Hashstash/chain-bound-transaction')),message=sha(Buffer.concat([tag,tag,Buffer.from(a.currentSnapshot.status.chain_id,'hex'),body]));
   assert.equal(a.noble.schnorr.verify(Uint8Array.from(signature),Uint8Array.from(message),Uint8Array.from(Buffer.from(alice,'hex'))),true);checks++;
   const decoded=a.browserApi.decodeUnsigned({format:'hashstash-unsigned-anchor',chain_id:a.currentSnapshot.status.chain_id,body:body.toString('hex')});
   assert.equal(decoded.sender,alice);checks++;
@@ -157,7 +157,7 @@ async function run() {
     assert.equal(decoded.operation.TransferExact.amount,'1','public text has no special payment threshold');checks++;
     assert.equal(decoded.fee,'1');checks++;
     assert.equal(Buffer.from(decoded.data_hex,'hex').toString(),'Public test message 🌱');checks++;
-    const tag=sha(Buffer.from('Hashstash/anchor-only-transaction')),message=sha(Buffer.concat([tag,tag,body]));
+    const tag=sha(Buffer.from('Hashstash/chain-bound-transaction')),message=sha(Buffer.concat([tag,tag,Buffer.from(c.currentSnapshot.status.chain_id,'hex'),body]));
     assert.equal(c.noble.schnorr.verify(Uint8Array.from(raw.subarray(-64)),Uint8Array.from(message),Uint8Array.from(Buffer.from(bob,'hex'))),true);checks++;
     const intent={chain_id:c.currentSnapshot.status.chain_id,sender:bob,nonce:'0',anchor:c.currentSnapshot.status.tip,expiry_blocks:'2',operation:{Donate:{amount:'1',decision:null,outcome:null}},fee:'1',data_hex:''};
     assert.throws(()=>c.browserApi.verifyUnsigned(envelope,intent),/unsupported fields/i);checks++;

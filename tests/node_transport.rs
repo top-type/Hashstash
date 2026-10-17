@@ -31,6 +31,7 @@ fn signed(
     amount: u32,
 ) -> Transaction {
     crypto::sign(
+        &c.chain_id(),
         &TransactionBody {
             data: Vec::new(),
             sender: crypto::public_key(secret).unwrap(),
@@ -435,8 +436,10 @@ async fn large_legal_loose_transaction_relays_alongside_blocks_without_stalling_
     )
     .unwrap();
     source.mine(2_000_000).unwrap();
+    let chain_id = config.chain_id();
     let make = |nonce, data| {
         crypto::sign(
+            &chain_id,
             &TransactionBody {
                 sender: miner,
                 nonce,

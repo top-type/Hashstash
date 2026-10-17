@@ -37,7 +37,11 @@ function browser(p=profile(),hostname='wallet.example',protocol='https:') {
 const LE=(n,size)=>{n=BigInt(n);const b=Buffer.alloc(size);for(let i=0;i<size;i++){b[i]=Number(n&255n);n>>=8n;}return b;};
 const compact=n=>{n=BigInt(n);return n<251n?LE(n,1):n<=0xffffn?Buffer.concat([LE(251,1),LE(n,2)]):n<=0xffffffffn?Buffer.concat([LE(252,1),LE(n,4)]):Buffer.concat([LE(253,1),LE(n,8)]);};
 const vector=b=>Buffer.concat([compact(b.length),b]);
-const signedFields=({chain_id,...fields})=>fields;
+// Signed-record expectations keep chain_id: the signature binds that network.
+const signedFields=({wallet_id,wallet_revision,...fields})=>fields;
+const CHAIN_TAG='Hashstash/chain-bound-transaction';
+// Independent signing message: SHA256(tag || tag || chain ID || body).
+const chainMessage=(chain,body)=>{const tag=createHash('sha256').update(CHAIN_TAG).digest();return createHash('sha256').update(Buffer.concat([tag,tag,Buffer.from(chain,'hex'),body])).digest();};
 const amt=n=>{n=BigInt(n);if(n===0n)return vector(Buffer.alloc(0));let h=n.toString(16);if(h.length%2)h='0'+h;return vector(Buffer.from(h,'hex').reverse());};
 function transferFixture(api,changes={}) {
   const secret='13'.repeat(32),sender=api.publicKey(secret),recipient=api.publicKey('14'.repeat(32));
@@ -145,7 +149,7 @@ async function run() {
   equal(Object.hasOwn(b.api.decodeUnsigned(f.envelope),'chain_id'),false);
   for(const chain_id of [undefined,null,'', 'AA'.repeat(32),Array(32).fill(39)])throws(()=>b.api.decodeUnsigned({...f.envelope,chain_id}),/network context/);
   throws(()=>b.api.decodeUnsigned({...f.envelope,format:'hashstash-unsigned-v1'}),/unsigned transaction/);
-  equal(JSON.stringify(b.api.decodeUnsigned({...f.envelope,chain_id:'28'.repeat(32)})),JSON.stringify(b.api.decodeUnsigned(f.envelope)),'network context is outside signed bytes');
+  equal(JSON.stringify(b.api.decodeUnsigned({...f.envelope,chain_id:'28'.repeat(32)})),JSON.stringify(b.api.decodeUnsigned(f.envelope)),'network context is outside the body bytes');
   equal(Buffer.from(f.envelope.body,'hex').subarray(0,32).toString('hex'),expected.sender,'sender is the first body field');
   for (const chain of ['ff'.repeat(32),'not-a-chain','']) throws(()=>b.api.verifyUnsigned(f.envelope,{...expected,chain_id:chain}));
   for(const parameter of ['AccountCharge','StaleTargetBps','UncleFinderPercent','UncleIncluderPercent','DifficultyFloor']) {
@@ -215,8 +219,8 @@ async function run() {
     const [operation,inner]=operationVectors[0],data=Buffer.alloc(256*1024,0xa5),envelope=oracleEnvelope(inner,data),intent={...expected,operation,data_hex:data.toString('hex')};
     b.api.verifyUnsigned(envelope,intent);checks++;
     equal(b.api.decodeUnsigned(envelope).data_hex,intent.data_hex,'larger blocks can carry data beyond the former wallet ceiling');
-    const signed=store.signUnsigned(envelope,intent),raw=Buffer.from(signed.raw,'hex'),body=raw.subarray(0,-64),tag=createHash('sha256').update('Hashstash/anchor-only-transaction').digest();
-    ok(b.noble.schnorr.verify(raw.subarray(-64),createHash('sha256').update(Buffer.concat([tag,tag,body])).digest(),Buffer.from(expected.sender,'hex')),'large payload has a valid signature over every byte');
+    const signed=store.signUnsigned(envelope,intent),raw=Buffer.from(signed.raw,'hex'),body=raw.subarray(0,-64);
+    ok(b.noble.schnorr.verify(raw.subarray(-64),chainMessage(expected.chain_id,body),Buffer.from(expected.sender,'hex')),'large payload has a valid signature over every byte');
     equal(raw.length,envelope.body.length/2+64);
     equal(b.api.verifySigned(signed.raw,{...signedFields(intent),txid:signed.transaction_id}).data_hex,intent.data_hex);
   }
@@ -244,38 +248,47 @@ async function run() {
   throws(()=>b.api.decodeUnsigned(oracleEnvelope(Buffer.concat([compact(1n<<32n)]))),/too large/);
   const signed=store.signUnsigned(f.envelope,expected),raw=Buffer.from(signed.raw,'hex'),body=Buffer.from(f.envelope.body,'hex');
   equal(raw.length,body.length+64);equal(raw.subarray(0,body.length).toString('hex'),f.envelope.body);equal(raw.subarray(body.length).length,64);
-  const tag=createHash('sha256').update('Hashstash/anchor-only-transaction').digest(),message=createHash('sha256').update(Buffer.concat([tag,tag,body])).digest();
-  ok(b.noble.schnorr.verify(raw.subarray(-64),message,Buffer.from(expected.sender,'hex')));
+  ok(b.noble.schnorr.verify(raw.subarray(-64),chainMessage(expected.chain_id,body),Buffer.from(expected.sender,'hex')));
+  ok(!b.noble.schnorr.verify(raw.subarray(-64),chainMessage('28'.repeat(32),body),Buffer.from(expected.sender,'hex')),'the signature binds the store network');
   equal(signed.transaction_id,createHash('sha256').update(createHash('sha256').update(raw).digest()).digest('hex'));
   // Mail authenticates the complete signed transaction locally. Encryption
   // alone cannot establish that the claimed sender authorized a message.
   const verified=b.api.verifySigned(signed.raw,{...signedFields(expected),txid:signed.transaction_id});
   equal(verified.txid,signed.transaction_id);equal(verified.sender,expected.sender);equal(verified.nonce,expected.nonce);equal(verified.data_hex,expected.data_hex);ok(Object.isFrozen(verified));
-  equal(b.api.verifySigned(signed.raw).txid,signed.transaction_id);
+  const verifyFor=(raw,chain_id=expected.chain_id)=>b.api.verifySigned(raw,{chain_id});
+  equal(verifyFor(signed.raw).txid,signed.transaction_id);
   equal(Object.hasOwn(verified,'chain_id'),false);
-  throws(()=>b.api.verifySigned(signed.raw,{chain_id:expected.chain_id}),/not a signed field/);
-  equal(b.api.verifySigned(signed.raw.toUpperCase()).txid,signed.transaction_id);
-  for(const [field,value] of Object.entries({sender:b.api.publicKey('15'.repeat(32)),nonce:'1',anchor:'32'.repeat(32),expiry_blocks:'1',data_hex:'00',txid:'00'.repeat(32),operation:{TransferExact:{...expected.operation.TransferExact,amount:'101'}}}))throws(()=>b.api.verifySigned(signed.raw,{[field]:value}),/does not match/);
-  for(const invalid of [null,[],false])throws(()=>b.api.verifySigned(signed.raw,invalid),/expectations/);
-  throws(()=>b.api.verifySigned(signed.raw,{nonce:9007199254740992}),/exact/);
-  for(const invalid of [null,{},'', 'a','zz','00'.repeat(64)])throws(()=>b.api.verifySigned(invalid),/invalid/i);
-  for(const length of [1,32,64,65,raw.length-1])throws(()=>b.api.verifySigned(raw.subarray(0,length).toString('hex')));
-  throws(()=>b.api.verifySigned(signed.raw+'00'));
-  const signBody=(bytes,secret=f.secret,domain='Hashstash/anchor-only-transaction')=>{
-    const tag=createHash('sha256').update(domain).digest(),message=createHash('sha256').update(Buffer.concat([tag,tag,bytes])).digest();
+  // Verification needs the network, and another network's chain ID fails.
+  for(const missing of [{},{txid:signed.transaction_id},{chain_id:'27'}])throws(()=>b.api.verifySigned(signed.raw,missing),/Chain ID/);
+  throws(()=>verifyFor(signed.raw,'28'.repeat(32)),/signature for this network/);
+  equal(verifyFor(signed.raw.toUpperCase()).txid,signed.transaction_id);
+  for(const [field,value] of Object.entries({sender:b.api.publicKey('15'.repeat(32)),nonce:'1',anchor:'32'.repeat(32),expiry_blocks:'1',data_hex:'00',txid:'00'.repeat(32),operation:{TransferExact:{...expected.operation.TransferExact,amount:'101'}}}))throws(()=>b.api.verifySigned(signed.raw,{chain_id:expected.chain_id,[field]:value}),/does not match/);
+  for(const invalid of [null,[],false,undefined])throws(()=>b.api.verifySigned(signed.raw,invalid),/expectations/);
+  throws(()=>b.api.verifySigned(signed.raw,{chain_id:expected.chain_id,nonce:9007199254740992}),/exact/);
+  for(const invalid of [null,{},'', 'a','zz','00'.repeat(64)])throws(()=>verifyFor(invalid),/invalid/i);
+  for(const length of [1,32,64,65,raw.length-1])throws(()=>verifyFor(raw.subarray(0,length).toString('hex')));
+  throws(()=>verifyFor(signed.raw+'00'));
+  const signBody=(bytes,secret=f.secret,domain=CHAIN_TAG,prefix=Buffer.from(expected.chain_id,'hex'))=>{
+    const tag=createHash('sha256').update(domain).digest(),message=createHash('sha256').update(Buffer.concat([tag,tag,prefix,bytes])).digest();
     const signature=b.noble.schnorr.sign(message,Buffer.from(secret,'hex'),Buffer.alloc(32));
     return Buffer.concat([bytes,signature]).toString('hex');
   };
+  equal(verifyFor(signBody(body)).sender,expected.sender,'the independent construction is the signing message');
+  throws(()=>verifyFor(signBody(body,f.secret,CHAIN_TAG,Buffer.from('28'.repeat(32),'hex'))),/signature/);
   const forgedSender=Buffer.from(body);Buffer.from(b.api.publicKey('15'.repeat(32)),'hex').copy(forgedSender,0);
-  throws(()=>b.api.verifySigned(signBody(forgedSender)),/signature/);
-  throws(()=>b.api.verifySigned(signBody(body,f.secret,'Hashstash/UnrelatedSignature')),/signature/);
-  throws(()=>b.api.verifySigned(signBody(body,f.secret,'Hashstash/Transaction')),/signature/);
-  throws(()=>b.api.verifySigned(signBody(body,f.secret,'Hashstash/anchored-transaction')),/signature/);
+  throws(()=>verifyFor(signBody(forgedSender)),/signature/);
+  throws(()=>verifyFor(signBody(body,f.secret,'Hashstash/UnrelatedSignature')),/signature/);
+  // Earlier domains, including the network-independent anchor-only one.
+  for(const domain of ['Hashstash/Transaction','Hashstash/anchored-transaction','Hashstash/anchor-only-transaction']) {
+    throws(()=>verifyFor(signBody(body,f.secret,domain,Buffer.alloc(0))),/signature/);
+    throws(()=>verifyFor(signBody(body,f.secret,domain)),/signature/);
+  }
+  throws(()=>verifyFor(signBody(body,f.secret,CHAIN_TAG,Buffer.alloc(0))),/signature/);
   const legacyBody=Buffer.concat([Buffer.from(expected.chain_id,'hex'),body]);
-  throws(()=>b.api.verifySigned(signBody(legacyBody,f.secret,'Hashstash/anchored-transaction')));
+  throws(()=>verifyFor(signBody(legacyBody,f.secret,'Hashstash/anchored-transaction',Buffer.alloc(0))));
   throws(()=>b.api.decodeUnsigned({...f.envelope,body:legacyBody.toString('hex')}));
-  throws(()=>b.api.verifySigned(signBody(Buffer.concat([body,Buffer.from([0])]))),/bytes/);
-  for(let i=0;i<raw.length;i++){const changed=Buffer.from(raw);changed[i]^=1;throws(()=>b.api.verifySigned(changed.toString('hex')));}
+  throws(()=>verifyFor(signBody(Buffer.concat([body,Buffer.from([0])]))),/bytes/);
+  for(let i=0;i<raw.length;i++){const changed=Buffer.from(raw);changed[i]^=1;throws(()=>verifyFor(changed.toString('hex')));}
   // Tamper each byte: no field, opaque suffix or discriminator can escape review.
   for(let i=0;i<body.length;i++) {const changed=Buffer.from(body);changed[i]^=1;throws(()=>store.signUnsigned({...f.envelope,body:changed.toString('hex')},expected));}
   for(const [k,v] of Object.entries({chain_id:'28'.repeat(32),sender:b.api.publicKey('15'.repeat(32)),nonce:'1',anchor:'32'.repeat(32),expiry_blocks:'100',fee:'1201',data_hex:'00'})) throws(()=>b.api.verifyUnsigned(f.envelope,{...expected,[k]:v}));
@@ -319,15 +332,15 @@ async function run() {
   const feeOffset=32+compact(expected.nonce).length, afterFee=feeOffset+amt(expected.fee).length;
   const extraLimb=Buffer.concat([body.subarray(0,feeOffset),compact(3),LE(expected.fee,2),Buffer.from([0]),body.subarray(afterFee)]);
   throws(()=>b.api.decodeUnsigned({...f.envelope,body:extraLimb.toString('hex')}),/Noncanonical amount/);
-  throws(()=>b.api.verifySigned(signBody(extraLimb)),/Noncanonical amount/);
+  throws(()=>verifyFor(signBody(extraLimb)),/Noncanonical amount/);
   const zero=transferFixture(b.api,{fee:'0',extra_fee:'0'}),zeroBody=Buffer.from(zero.envelope.body,'hex');
   const paddedZero=Buffer.concat([zeroBody.subarray(0,feeOffset),Buffer.from([1,0]),zeroBody.subarray(feeOffset+1)]);
   throws(()=>b.api.decodeUnsigned({...zero.envelope,body:paddedZero.toString('hex')}),/Noncanonical amount/);
-  throws(()=>b.api.verifySigned(signBody(paddedZero)),/Noncanonical amount/);
+  throws(()=>verifyFor(signBody(paddedZero)),/Noncanonical amount/);
   for(const malformed of [Buffer.concat([LE(251,1),LE(250,2)]),Buffer.concat([LE(252,1),LE(65535,4)]),Buffer.concat([LE(253,1),LE(0xffffffffn,8)]),Buffer.concat([LE(254,1),LE(1,16)]),LE(255,1)]) {
     const changed=Buffer.concat([body.subarray(0,32),malformed,body.subarray(feeOffset)]);
     throws(()=>b.api.decodeUnsigned({...f.envelope,body:changed.toString('hex')}),/Noncanonical integer|Invalid integer/);
-    throws(()=>b.api.verifySigned(signBody(changed)),/Noncanonical integer|Invalid integer/);
+    throws(()=>verifyFor(signBody(changed)),/Noncanonical integer|Invalid integer/);
   }
   for(const malformed of [LE(251,1),Buffer.from([252,1,2]),Buffer.from([253,1,2,3])]) {
     throws(()=>b.api.decodeUnsigned({...f.envelope,body:Buffer.concat([body.subarray(0,32),malformed]).toString('hex')}),/Truncated/);
@@ -336,11 +349,11 @@ async function run() {
   throws(()=>b.api.decodeUnsigned({...plain.envelope,body:plainBody.subarray(0,-1).toString('hex')}),/Truncated/);
   const overlongEnum=Buffer.concat([plainBody.subarray(0,outerOffset),Buffer.from([251,0,0]),plainBody.subarray(outerOffset+1)]);
   throws(()=>b.api.decodeUnsigned({...f.envelope,body:overlongEnum.toString('hex')}),/Noncanonical integer/);
-  throws(()=>b.api.verifySigned(signBody(overlongEnum)),/Noncanonical integer/);
+  throws(()=>verifyFor(signBody(overlongEnum)),/Noncanonical integer/);
   const vectorOffset=outerOffset+1+32+amt(100).length;
   const overlongLength=Buffer.concat([plainBody.subarray(0,vectorOffset),Buffer.from([251,plainBody[vectorOffset],0]),plainBody.subarray(vectorOffset+1)]);
   throws(()=>b.api.decodeUnsigned({...f.envelope,body:overlongLength.toString('hex')}),/Noncanonical integer/);
-  throws(()=>b.api.verifySigned(signBody(overlongLength)),/Noncanonical integer/);
+  throws(()=>verifyFor(signBody(overlongLength)),/Noncanonical integer/);
   const hugeLength=Buffer.concat([plainBody.subarray(0,vectorOffset),compact(32*1024*1024+1)]);
   throws(()=>b.api.decodeUnsigned({...f.envelope,body:hugeLength.toString('hex')}),/too large/);
   const obsoleteField={...expected,operation:{TransferExact:{...expected.operation.TransferExact,max_account_charge:'0'}}};

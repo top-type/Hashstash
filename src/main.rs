@@ -121,6 +121,16 @@ enum Command {
         body: PathBuf,
         #[arg(long)]
         out: PathBuf,
+        /// Genesis configuration of the network the signature is bound to.
+        #[arg(
+            long,
+            conflicts_with = "chain_id",
+            required_unless_present = "chain_id"
+        )]
+        config: Option<PathBuf>,
+        /// Chain ID of that network, instead of --config.
+        #[arg(long)]
+        chain_id: Option<String>,
     },
     /// Sign and submit any protocol operation, filling the block anchor and account nonce.
     Send {
@@ -1098,7 +1108,7 @@ async fn prepare_verified(
         Some(nonce) => NonceSource::Requested(nonce),
         None => NonceSource::Discovered(
             client
-                .pending_nonce(&sender, node::ScanBudget::DEFAULT)
+                .pending_nonce(&chain_id, &sender, node::ScanBudget::DEFAULT)
                 .await?,
         ),
     };
@@ -1240,7 +1250,7 @@ async fn send_operation(
             public == sender,
             "key file changed while preparing the transaction"
         );
-        crypto::sign(&prepared.body, &secret)?
+        crypto::sign(&prepared.chain_id, &prepared.body, &secret)?
     };
     let result = broadcast_signed(client, &signed, &wallet::signed_hex(&signed)).await?;
     Ok(json!({"txid":result["transaction_id"]}))
@@ -1364,20 +1374,30 @@ async fn main() -> Result<()> {
                 )?
             );
         }
-        Command::Sign { key, body, out } => {
+        Command::Sign {
+            key,
+            body,
+            out,
+            config,
+            chain_id,
+        } => {
             let (secret, public) = key_file(&key)?;
-            // The strict unsigned export is accepted too, so the review shows its network.
+            // The operator names the network; the signature binds it. An
+            // unsigned export's own context must agree and is never adopted.
+            let chain_id = address_chain(config.as_deref(), chain_id.as_deref())?;
             let input = read_json(&body)?;
-            let (body, chain_id) = if input.get("format").is_some() {
+            let body = if input.get("format").is_some() {
                 let envelope: wallet::UnsignedEnvelope = serde_json::from_value(input)?;
-                (
-                    wallet::decode_unsigned(&envelope)?,
-                    Some(wallet::unsigned_chain(&envelope)?),
-                )
+                let body = wallet::decode_unsigned(&envelope)?;
+                ensure!(
+                    wallet::unsigned_chain(&envelope)? == chain_id,
+                    "unsigned export was prepared for another network"
+                );
+                body
             } else {
                 let body: TransactionBody = serde_json::from_value(input)?;
                 hashstash::wallet::validate_body(&body)?;
-                (body, None)
+                body
             };
             ensure!(
                 body.sender == public,
@@ -1391,8 +1411,8 @@ async fn main() -> Result<()> {
                     body.expiry_blocks
                 ));
             }
-            print_review("Signing transaction:", &body, chain_id.as_ref(), &notes);
-            let signed = crypto::sign(&body, &secret)?;
+            print_review("Signing transaction:", &body, Some(&chain_id), &notes);
+            let signed = crypto::sign(&chain_id, &body, &secret)?;
             write_new(&out, &signed, false)?;
             println!("Signed transaction saved in {}", out.display());
         }
@@ -1458,7 +1478,8 @@ async fn main() -> Result<()> {
                 raw.context("signed transaction missing")?
             };
             let raw = raw.trim();
-            let transaction = hashstash::wallet::decode_signed(raw)?;
+            // The endpoint verifies the signature for its own chain ID.
+            let transaction = hashstash::wallet::decode_signed_record(raw)?;
             let result = broadcast_signed(&endpoint.client()?, &transaction, raw).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
@@ -2407,7 +2428,7 @@ mod tests {
             "Total debit: 25 atoms".to_owned(),
             "Nonce: 4".to_owned(),
             format!("Recipient: {}", address::encode(&recipient, &chain).unwrap()),
-            format!("Network context · unsigned: {}", hex::encode(chain)),
+            format!("Network · signed: {}", hex::encode(chain)),
             "Data bytes: 200".to_owned(),
             format!("Data hex: {}...", "ab".repeat(64)),
         ] {

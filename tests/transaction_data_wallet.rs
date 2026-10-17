@@ -2,6 +2,9 @@
 use hashstash::{codec, crypto, types::*, wallet};
 use std::collections::BTreeMap;
 
+/// The network these offline records are signed for.
+const CHAIN: [u8; 32] = [39; 32];
+
 fn operation() -> Operation {
     Operation::TransferExact {
         recipient: crypto::public_key(&[20; 32]).unwrap(),
@@ -35,9 +38,9 @@ fn unsigned_and_signed_exports_preserve_every_data_byte_and_show_complete_hex() 
         let decoded = wallet::decode_unsigned(&serde_json::from_str(&exported).unwrap()).unwrap();
         assert_eq!(decoded, body);
         assert_eq!(decoded.data, data);
-        let signed = crypto::sign(&decoded, &[19; 32]).unwrap();
+        let signed = crypto::sign(&CHAIN, &decoded, &[19; 32]).unwrap();
         assert_eq!(
-            wallet::decode_signed(&wallet::signed_hex(&signed)).unwrap(),
+            wallet::decode_signed(&wallet::signed_hex(&signed), &CHAIN).unwrap(),
             signed
         );
         let fields: BTreeMap<_, _> = wallet::review(&body, Some(&[39; 32]))
@@ -61,7 +64,7 @@ fn unsigned_and_signed_exports_preserve_every_data_byte_and_show_complete_hex() 
 
 #[test]
 fn signatures_bind_data_and_every_transaction_header_field() {
-    let original = crypto::sign(&body((0..=255).collect()), &[19; 32]).unwrap();
+    let original = crypto::sign(&CHAIN, &body((0..=255).collect()), &[19; 32]).unwrap();
     let mut variants = Vec::new();
     for mutation in 0..8 {
         let mut changed = original.clone();
@@ -92,9 +95,9 @@ fn signatures_bind_data_and_every_transaction_header_field() {
         variants.push(changed);
     }
     for changed in variants {
-        assert!(wallet::decode_signed(&wallet::signed_hex(&changed)).is_err());
+        assert!(wallet::decode_signed(&wallet::signed_hex(&changed), &CHAIN).is_err());
     }
-    assert!(wallet::decode_signed(&wallet::signed_hex(&original)).is_ok());
+    assert!(wallet::decode_signed(&wallet::signed_hex(&original), &CHAIN).is_ok());
 }
 
 #[test]

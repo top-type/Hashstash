@@ -1306,7 +1306,7 @@ impl Engine {
     /// A stored claim must still be exactly its signed fixed intent before it
     /// is retried.
     fn verify_stored(&self, claim: &Claim) -> Result<()> {
-        let tx = wallet::decode_signed(&claim.raw)?;
+        let tx = wallet::decode_signed(&claim.raw, &self.chain)?;
         ensure!(
             claim.height.checked_add(tx.body.expiry_blocks) == Some(claim.expiry),
             "stored faucet lifetime differs from its signed transaction"
@@ -1439,7 +1439,7 @@ impl Engine {
             &operation,
             &self.maximum_fee,
         )?;
-        let tx = crypto::sign(&body, &self.secret)?;
+        let tx = crypto::sign(&self.chain, &body, &self.secret)?;
         let claim = Claim {
             address: canonical,
             amount_hashes: self.payout.to_str_radix(10),
@@ -2552,7 +2552,8 @@ mod tests {
                 }
             }
             "broadcasttransaction" => {
-                let transaction = wallet::decode_signed(p["raw"].as_str().unwrap()).unwrap();
+                let transaction =
+                    wallet::decode_signed(p["raw"].as_str().unwrap(), &[7; 32]).unwrap();
                 let txid = codec::transaction_id(&transaction);
                 if !node
                     .transactions
@@ -2708,7 +2709,7 @@ mod tests {
             "pending"
         );
         let next = engine.ledger.pending().unwrap().unwrap();
-        assert_eq!(wallet::decode_signed(&next.raw).unwrap().body.nonce, 1);
+        assert_eq!(wallet::decode_signed(&next.raw, &[7; 32]).unwrap().body.nonce, 1);
         assert_eq!(node.lock().await.transactions.len(), 2);
         task.abort();
     }
@@ -2769,7 +2770,7 @@ mod tests {
         let newer = engine.claim(&recipient(4), "fresh-subnet").await.unwrap();
         assert_eq!(newer["amount_hashes"], "1000000000000000");
         let claim = engine.ledger.pending().unwrap().unwrap();
-        let tx = wallet::decode_signed(&claim.raw).unwrap();
+        let tx = wallet::decode_signed(&claim.raw, &[7; 32]).unwrap();
         assert_eq!(tx.body.nonce, 1);
         assert_eq!(
             tx.body.operation.clone(),
@@ -2847,7 +2848,7 @@ mod tests {
         engine.claim(&recipient(5), "c").await.unwrap();
         // The next payment reuses the unconsumed nonce, so only one can ever apply.
         let next = engine.ledger.pending().unwrap().unwrap();
-        assert_eq!(wallet::decode_signed(&next.raw).unwrap().body.nonce, 0);
+        assert_eq!(wallet::decode_signed(&next.raw, &[7; 32]).unwrap().body.nonce, 0);
         assert_eq!(node.lock().await.transactions.len(), 3);
         task.abort();
     }
@@ -2928,7 +2929,8 @@ mod tests {
         );
         assert_eq!(engine.state().unwrap(), "ready");
         engine.claim(&recipient(4), "b").await.unwrap();
-        let next = wallet::decode_signed(&engine.ledger.pending().unwrap().unwrap().raw).unwrap();
+        let next = wallet::decode_signed(&engine.ledger.pending().unwrap().unwrap().raw, &[7; 32])
+            .unwrap();
         assert_eq!(next.body.nonce, 0);
         assert_eq!(next.body.anchor, codec::block_hash(&block(4, vec![])));
         assert_eq!(node.lock().await.transactions.len(), 2);
@@ -3272,7 +3274,7 @@ mod tests {
         assert_eq!(engine.state().unwrap(), "ready");
         engine.claim(&recipient(4), "b").await.unwrap();
         let next = engine.ledger.pending().unwrap().unwrap();
-        assert_eq!(wallet::decode_signed(&next.raw).unwrap().body.nonce, 1);
+        assert_eq!(wallet::decode_signed(&next.raw, &[7; 32]).unwrap().body.nonce, 1);
         task.abort();
     }
 
@@ -3311,7 +3313,7 @@ mod tests {
         );
         engine.claim(&recipient(5), "c").await.unwrap();
         let next = engine.ledger.pending().unwrap().unwrap();
-        assert_eq!(wallet::decode_signed(&next.raw).unwrap().body.nonce, 1);
+        assert_eq!(wallet::decode_signed(&next.raw, &[7; 32]).unwrap().body.nonce, 1);
         task.abort();
     }
 
@@ -3357,7 +3359,7 @@ mod tests {
         );
         engine.claim(&recipient(4), "b").await.unwrap();
         let next = engine.ledger.pending().unwrap().unwrap();
-        assert_eq!(wallet::decode_signed(&next.raw).unwrap().body.nonce, 0);
+        assert_eq!(wallet::decode_signed(&next.raw, &[7; 32]).unwrap().body.nonce, 0);
         assert_ne!(next.txid, first["txid"]);
         task.abort();
     }

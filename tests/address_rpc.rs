@@ -139,7 +139,7 @@ fn rpc_addresses_keep_same_accounts_and_signed_transaction_bytes() {
             .unwrap()
             .contains_key("chain_id")
     );
-    let transaction = crypto::sign(&body, &secret).unwrap();
+    let transaction = crypto::sign(&chain, &body, &secret).unwrap();
     node.rpc(
         "broadcasttransaction",
         json!({"raw":wallet::signed_hex(&transaction)}),

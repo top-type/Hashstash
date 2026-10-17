@@ -168,18 +168,23 @@ fn browser_signatures_verify_in_rust_for_every_current_operation() {
     assert_eq!(signed.len(), bodies.len());
     assert_eq!(signed.len(), 25);
     for (index, (signed, expected)) in signed.iter().zip(&bodies).enumerate() {
-        let tx = wallet::decode_signed(signed["raw"].as_str().unwrap()).unwrap();
+        let tx = wallet::decode_signed(signed["raw"].as_str().unwrap(), &[39; 32]).unwrap();
         assert_eq!(&tx.body, expected, "case {index}");
         assert_eq!(
             signed["transaction_id"],
             hex::encode(codec::transaction_id(&tx)),
             "case {index}"
         );
-        crypto::verify(&tx).unwrap();
+        crypto::verify(&[39; 32], &tx).unwrap();
+        // The browser binds its store's chain ID, which no other network accepts.
+        assert!(
+            crypto::verify(&[40; 32], &tx).is_err(),
+            "another network accepted case {index}"
+        );
         let mut changed = tx.clone();
         changed.body.fee += 1u32;
         assert!(
-            crypto::verify(&changed).is_err(),
+            crypto::verify(&[39; 32], &changed).is_err(),
             "fee tampering accepted in case {index}"
         );
     }

@@ -822,7 +822,7 @@ class Activity:
                 self.grant_check(action['operation'], allowed, fresh, fee)
             save_new(directory / 'body.json', body)
             self.ledger.update(ident, body=compact(body), nonce=nonce, expiry=height + expiry_blocks)
-            self.cli.run(['sign', '--key', self.c['accounts'][index]['key_file'], '--body', directory / 'body.json', '--out', directory / 'signed.json'])
+            self.cli.run(['sign', '--key', self.c['accounts'][index]['key_file'], '--body', directory / 'body.json', '--out', directory / 'signed.json', '--chain-id', self.c['chain_id']])
             row = self.ledger.db.execute('SELECT * FROM intents WHERE id=?', (ident,)).fetchone()
             self.finish_signature(row)
             row = self.ledger.db.execute('SELECT * FROM intents WHERE id=?', (ident,)).fetchone()

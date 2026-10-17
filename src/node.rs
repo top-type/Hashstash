@@ -75,6 +75,8 @@ fn admission_frame_bytes(config: &Config, capacity: u64) -> Result<usize> {
 }
 // Local response service limit; independent of canonical record validity.
 pub(crate) const MAX_RESPONSE_FRAME: usize = 193 * 1024 * 1024;
+/// Transaction IDs one `blockreceipt` lookup may name.
+pub(crate) const MAX_RECEIPT_TXIDS: usize = 64;
 /// A governed capacity can make one valid record's hexadecimal response exceed
 /// the fixed service limit; the HTTP frame then grows with that capacity.
 fn response_frame_bytes(transaction_bytes: usize) -> Result<usize> {
@@ -2695,23 +2697,47 @@ impl Node {
                 let ids = match params.get("txids") {
                     Some(ids) => {
                         let ids = ids.as_array().context("txids must be an array")?;
-                        ensure!(ids.len() <= 64, "too many transaction IDs");
+                        ensure!(ids.len() <= MAX_RECEIPT_TXIDS, "too many transaction IDs");
                         ids.iter()
                             .map(|id| parse_hash(id.as_str().context("txids must be strings")?))
                             .collect::<Result<Vec<_>>>()?
                     }
                     None => Vec::new(),
                 };
-                let block = {
+                // An optional earlier lookup to confirm in the same read, so a
+                // caller's inspected blocks are known to share one canonical chain.
+                let checked = match params.get("checked") {
+                    Some(checked) => {
+                        let at = checked
+                            .get("height")
+                            .and_then(Value::as_u64)
+                            .context("checked height required")?;
+                        let hash = checked
+                            .get("hash")
+                            .and_then(Value::as_str)
+                            .context("checked hash required")?;
+                        Some((at, parse_hash(hash)?))
+                    }
+                    None => None,
+                };
+                let (hash, block, checked_canonical) = {
                     let i = self.locked()?;
                     let h = i
                         .chain
                         .hash_at_height(height)
                         .context("unknown active height")?;
-                    i.chain.block(&h).context("unknown block")?
+                    let checked_canonical = checked
+                        .map(|(at, hash)| i.chain.hash_at_height(at) == Some(hash));
+                    // Without IDs the canonical index answers; no body is loaded.
+                    let block = if ids.is_empty() {
+                        None
+                    } else {
+                        Some(i.chain.block(&h).context("unknown block")?)
+                    };
+                    (h, block, checked_canonical)
                 };
                 let mut included = vec![false; ids.len()];
-                for transaction in &block.transactions {
+                for transaction in block.iter().flat_map(|block| &block.transactions) {
                     if included.iter().all(|found| *found) {
                         break;
                     }
@@ -2720,9 +2746,12 @@ impl Node {
                         *found |= *wanted == id;
                     }
                 }
-                Ok(
-                    json!({"height":block.height,"hash":hex::encode(codec::block_hash(&block)),"included":included}),
-                )
+                let mut result =
+                    json!({"height":height,"hash":hex::encode(hash),"included":included});
+                if let Some(canonical) = checked_canonical {
+                    result["checked_canonical"] = json!(canonical);
+                }
+                Ok(result)
             }
             "peers" => Ok(json!(
                 *self

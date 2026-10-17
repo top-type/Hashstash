@@ -39,7 +39,7 @@ const CLOCK_TOLERANCE_SECONDS: i64 = 300;
 const FRESHNESS_INTERVALS: u64 = 12;
 /// Replies other than snapshots are small fixed-shape records.
 const RPC_REPLY_BYTES: usize = 4 * 1024 * 1024;
-/// Block receipts inspected per refresh while locating a consumed nonce.
+/// Block receipt lookups per refresh while locating a consumed nonce.
 const SCAN_BLOCKS_PER_REFRESH: u64 = 64;
 /// Reorganized receipts accounted again per refresh.
 const RECEIPT_REPAIRS_PER_REFRESH: usize = 8;
@@ -228,20 +228,35 @@ impl std::error::Error for Fault {}
 /// Loads the dedicated signer from a regular, owner-only file and wipes every
 /// parsed copy of the secret.
 fn read_signer(path: &Path) -> Result<(Zeroizing<[u8; 32]>, PublicKey)> {
+    use std::io::Read;
     let metadata = std::fs::symlink_metadata(path)?;
     ensure!(
         metadata.is_file() && metadata.len() <= 4096,
         "faucet key must be a regular file of at most 4096 bytes"
     );
+    // Read through one handle, and require that handle to be the regular file
+    // inspected above: a path swapped for a symbolic link in between fails.
+    let file = std::fs::File::open(path)?;
+    let opened = file.metadata()?;
+    ensure!(
+        opened.is_file() && opened.len() <= 4096,
+        "faucet key must be a regular file of at most 4096 bytes"
+    );
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         ensure!(
-            metadata.permissions().mode() & 0o077 == 0,
+            opened.dev() == metadata.dev() && opened.ino() == metadata.ino(),
+            "faucet key file changed while it was opened"
+        );
+        ensure!(
+            opened.permissions().mode() & 0o077 == 0,
             "faucet key file must be owner-only (0600)"
         );
     }
-    let bytes = Zeroizing::new(std::fs::read(path)?);
+    // Preallocated, so reading does not leave a reallocated copy of the secret.
+    let mut bytes = Zeroizing::new(Vec::with_capacity(4097));
+    file.take(4097).read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= 4096, "key file is too large");
     let mut key: Value = serde_json::from_slice(&bytes)?;
     let wiped = |value: Option<Value>| match value {
@@ -412,6 +427,7 @@ impl Ledger {
             CREATE INDEX IF NOT EXISTS claim_subnet ON claims(subnet,created);
             CREATE INDEX IF NOT EXISTS claim_created ON claims(created);
             CREATE INDEX IF NOT EXISTS claim_nonce ON claims(nonce);
+            CREATE INDEX IF NOT EXISTS claim_receipt ON claims(receipt_height) WHERE status='confirmed';
             CREATE UNIQUE INDEX IF NOT EXISTS one_pending ON claims(status) WHERE status='pending';")?;
         for (name, value) in [
             ("chain", hex::encode(chain)),
@@ -501,12 +517,19 @@ impl Ledger {
     fn top_receipt(&self) -> Result<Option<(Claim, u64, String)>> {
         Ok(self.db.query_row(&format!("SELECT {CLAIM_COLUMNS},receipt_height,receipt_hash FROM claims WHERE status='confirmed' ORDER BY receipt_height DESC,rowid DESC LIMIT 1"), [], |r| Ok((row_claim(r)?, r.get(9)?, r.get(10)?))).optional()?)
     }
-    /// Every claim signed with `nonce` that is not a confirmed payment.
-    fn unsettled(&self, nonce: u64) -> Result<Vec<Claim>> {
-        let mut query = self.db.prepare(&format!(
-            "SELECT {CLAIM_COLUMNS} FROM claims WHERE nonce=?1 AND status<>'confirmed' ORDER BY rowid"
-        ))?;
-        let rows = query.query_map([nonce.to_string()], row_claim)?;
+    /// The inclusion window of every claim signed with `nonce` that is not a
+    /// confirmed payment.
+    fn unsettled(&self, nonce: u64) -> Result<Vec<Window>> {
+        let mut query = self.db.prepare(
+            "SELECT txid,height,expiry FROM claims WHERE nonce=?1 AND status<>'confirmed' ORDER BY rowid",
+        )?;
+        let rows = query.query_map([nonce.to_string()], |r| {
+            Ok(Window {
+                txid: r.get(0)?,
+                first: r.get::<_, u64>(1)?.saturating_add(1),
+                last: r.get(2)?,
+            })
+        })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
     fn first_nonce(&self) -> Result<Option<u64>> {
@@ -785,6 +808,8 @@ struct BlockReceipt {
     height: u64,
     hash: String,
     included: Vec<bool>,
+    #[serde(default)]
+    checked_canonical: Option<bool>,
 }
 
 /// Calls the loopback node. Snapshot replies grow with governed content, so they
@@ -836,26 +861,44 @@ enum Located {
     Incomplete,
 }
 
-/// Progress locating which recorded claim consumed one nonce. Inspected heights
-/// are trusted only while the highest inspected block remains canonical.
+/// Heights `first..=last` at which one recorded claim could be included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Window {
+    txid: String,
+    first: u64,
+    last: u64,
+}
+
+/// Progress locating which recorded claim consumed one nonce. Only heights
+/// inside some claim's window are inspected, each for just the claims it
+/// covers. Every inspection confirms the previous one in the same node read,
+/// so inspected blocks share one chain and are trusted while the highest of
+/// them remains canonical.
 struct Scan {
     nonce: u64,
-    txids: Vec<String>,
-    low: u64,
+    windows: Vec<Window>,
     next: u64,
     checked: Option<(u64, Hash)>,
     found: Option<(u64, Hash, String)>,
 }
 impl Scan {
-    fn new(nonce: u64, txids: Vec<String>, low: u64) -> Self {
+    fn new(nonce: u64, windows: Vec<Window>) -> Self {
         Self {
             nonce,
-            txids,
-            low,
-            next: low,
+            next: windows.iter().map(|w| w.first).min().unwrap_or(0),
+            windows,
             checked: None,
             found: None,
         }
+    }
+    /// The lowest height from `next` through `high` that some window covers.
+    fn upcoming(&self, high: u64) -> Option<u64> {
+        self.windows
+            .iter()
+            .filter(|w| w.last >= self.next)
+            .map(|w| w.first.max(self.next))
+            .min()
+            .filter(|at| *at <= high)
     }
 }
 
@@ -930,19 +973,42 @@ impl Engine {
     async fn rpc<T: DeserializeOwned>(&mut self, method: &str, params: Value) -> Result<T> {
         node_rpc(&self.client, &self.config.rpc_url, method, params).await
     }
+    /// The canonical block at `height` and which of `txids` it holds. With
+    /// `checked`, `None` means that earlier block is no longer canonical; the
+    /// node reads both heights together, so a returned block shares its chain.
     async fn block_receipt(
         &mut self,
         height: u64,
         txids: &[String],
-    ) -> Result<(Hash, Vec<bool>)> {
-        let receipt: BlockReceipt = self
-            .rpc("blockreceipt", json!({"height":height,"txids":txids}))
-            .await?;
+        checked: Option<(u64, Hash)>,
+    ) -> Result<Option<(Hash, Vec<bool>)>> {
         ensure!(
-            receipt.height == height && receipt.included.len() == txids.len(),
+            txids.len() <= crate::node::MAX_RECEIPT_TXIDS,
+            "too many receipt transaction IDs"
+        );
+        let mut params = json!({"height":height,"txids":txids});
+        if let Some((at, hash)) = checked {
+            params["checked"] = json!({"height":at,"hash":hex::encode(hash)});
+        }
+        let receipt: BlockReceipt = self.rpc("blockreceipt", params).await?;
+        ensure!(
+            receipt.height == height
+                && receipt.included.len() == txids.len()
+                && receipt.checked_canonical.is_some() == checked.is_some(),
             "node returned another block receipt"
         );
-        Ok((parse_hash(&receipt.hash)?, receipt.included))
+        if receipt.checked_canonical == Some(false) {
+            return Ok(None);
+        }
+        Ok(Some((parse_hash(&receipt.hash)?, receipt.included)))
+    }
+    /// The canonical block hash at `height`, read from the node's index alone.
+    async fn canonical_hash(&mut self, height: u64) -> Result<Hash> {
+        Ok(self
+            .block_receipt(height, &[], None)
+            .await?
+            .context("missing block receipt")?
+            .0)
     }
     fn mining(&self) -> bool {
         // Freshness follows the governed interval, so slower blocks never make
@@ -962,10 +1028,11 @@ impl Engine {
     fn display_time(&self) -> i64 {
         self.ledger.clock(now()).unwrap_or_else(|_| now())
     }
-    /// The exact weight and automatic fee of this faucet's payment to a new
-    /// account under the latest governed settings, derived as node preparation
-    /// derives them: the fee's own encoded length is part of its charge.
-    fn payout_requirements(&self) -> Result<Option<(u64, Amount)>> {
+    /// The exact weight and automatic fee of this faucet's payment under the
+    /// latest governed settings, derived as node preparation derives them: the
+    /// fee's own encoded length is part of its charge, and a payment to a new
+    /// account adds the account-creation weight.
+    fn payout_requirements(&self, new_account: bool) -> Result<Option<(u64, Amount)>> {
         let (Some(settings), Some(anchor)) = (self.settings, self.tip) else {
             return Ok(None);
         };
@@ -990,7 +1057,7 @@ impl Engine {
             })
             .len();
             let weight = u64::try_from(encoded)?
-                .checked_add(fees::ACCOUNT_WEIGHT)
+                .checked_add(if new_account { fees::ACCOUNT_WEIGHT } else { 0 })
                 .context("faucet payment weight overflow")?;
             let fee = (Amount::from(weight) * &rate + Amount::from(fees::FEE_SCALE - 1))
                 / fees::FEE_SCALE;
@@ -1001,7 +1068,26 @@ impl Engine {
         }
         anyhow::bail!("faucet fee estimate did not converge")
     }
-    fn state(&self) -> Result<&'static str> {
+    /// The governed limit, if any, that refuses this kind of payment.
+    fn payout_limit(&self, new_account: bool) -> Result<Option<&'static str>> {
+        let (Some(settings), Some((weight, fee))) =
+            (self.settings, self.payout_requirements(new_account)?)
+        else {
+            return Ok(None);
+        };
+        Ok(if weight > settings.block_bytes {
+            Some("capacity_exceeded")
+        } else if fee > self.maximum_fee {
+            Some("fee_cap_exceeded")
+        } else {
+            None
+        })
+    }
+    /// Whether a claim may be prepared. Governed limits refuse every claim here
+    /// only when even a payment to an existing account, the lightest kind,
+    /// could not be included within the fee allowance. Otherwise each claim's
+    /// exact quote decides, before anything is signed or reserved.
+    fn availability(&self) -> Result<&'static str> {
         if self.fault.is_some() {
             return Ok("unavailable");
         }
@@ -1019,21 +1105,25 @@ impl Engine {
         if !self.ledger.budget(&self.config, time)? {
             return Ok("quota_reached");
         }
-        // A payment to a new account is the costliest claim. Governance can make
-        // it unincludable or more expensive than the operator's fee allowance.
-        if let (Some(settings), Some((weight, fee))) = (self.settings, self.payout_requirements()?)
-        {
-            if weight > settings.block_bytes {
-                return Ok("capacity_exceeded");
-            }
-            if fee > self.maximum_fee {
-                return Ok("fee_cap_exceeded");
-            }
+        if let Some(limit) = self.payout_limit(false)? {
+            return Ok(limit);
         }
         if self.funds < &self.payout + &self.maximum_fee {
             return Ok("unfunded");
         }
         Ok("ready")
+    }
+    fn state(&self) -> Result<&'static str> {
+        let state = self.availability()?;
+        // A payment to a new account is the costliest claim. Governance can make
+        // it unincludable or more expensive than the operator's fee allowance,
+        // which status reports although existing accounts can still be paid.
+        if state == "ready"
+            && let Some(limit) = self.payout_limit(true)?
+        {
+            return Ok(limit);
+        }
+        Ok(state)
     }
     /// Journals operator-relevant state changes by fixed name only.
     fn report_state(&mut self) {
@@ -1192,8 +1282,9 @@ impl Engine {
         Ok(None)
     }
     /// Checks the newest confirmed receipt with one block-hash lookup. Its block
-    /// commits to all older receipts. A receipt that left the canonical chain is
-    /// accounted again from its nonce.
+    /// commits to its own transactions, which included the payment, and to all
+    /// older receipts. A receipt that left the canonical chain is accounted
+    /// again from its nonce.
     async fn verify_receipts(&mut self, height: u64) -> Result<Receipts> {
         for _ in 0..RECEIPT_REPAIRS_PER_REFRESH {
             let Some((claim, at, hash)) = self.ledger.top_receipt()? else {
@@ -1203,14 +1294,7 @@ impl Engine {
                 // A shorter chain cannot show yet whether this payment survived.
                 return Err(Fault("node_behind_ledger").into());
             }
-            let (canonical, included) = self
-                .block_receipt(at, std::slice::from_ref(&claim.txid))
-                .await?;
-            if hex::encode(canonical) == hash {
-                ensure!(
-                    included == [true],
-                    "confirmed faucet receipt lacks its payment"
-                );
+            if hex::encode(self.canonical_hash(at).await?) == hash {
                 return Ok(Receipts::Verified(Some(claim.nonce)));
             }
             let status = if self.ledger.pending()?.is_some() {
@@ -1229,15 +1313,11 @@ impl Engine {
     /// Finds the recorded claim that consumed `nonce` and confirms it at depth.
     /// A consumed nonce matching no recorded claim means the key signed elsewhere.
     async fn settle(&mut self, nonce: u64, height: u64) -> Result<Option<&'static str>> {
-        let claims = self.ledger.unsettled(nonce)?;
-        let (Some(low), Some(high)) = (
-            claims.iter().map(|c| c.height.saturating_add(1)).min(),
-            claims.iter().map(|c| c.expiry).max(),
-        ) else {
+        let windows = self.ledger.unsettled(nonce)?;
+        if windows.is_empty() {
             return Err(Fault("nonce_conflict").into());
-        };
-        let txids = claims.into_iter().map(|c| c.txid).collect();
-        match self.locate(nonce, txids, low, high.min(height)).await? {
+        }
+        match self.locate(nonce, windows, height).await? {
             Located::Found(at, hash, txid) => {
                 // Other bytes signed with this nonce can never apply on this chain.
                 self.ledger.db.execute(
@@ -1254,54 +1334,87 @@ impl Engine {
             Located::Incomplete => Ok(Some("verifying_payments")),
         }
     }
-    /// Searches heights `low..=high` for any of `txids`, resuming earlier progress
-    /// while it remains canonical and inspecting a bounded number of blocks.
-    async fn locate(
-        &mut self,
-        nonce: u64,
-        txids: Vec<String>,
-        low: u64,
-        high: u64,
-    ) -> Result<Located> {
+    /// Searches the recorded windows through `high` for the claim that consumed
+    /// `nonce`, resuming earlier progress while it remains canonical.
+    async fn locate(&mut self, nonce: u64, windows: Vec<Window>, high: u64) -> Result<Located> {
         let mut scan = match self.scan.take() {
-            Some(scan) if scan.nonce == nonce && scan.txids == txids && scan.low == low => scan,
-            _ => Scan::new(nonce, txids, low),
+            Some(scan) if scan.nonce == nonce && scan.windows == windows => scan,
+            _ => Scan::new(nonce, windows),
         };
+        // Progress survives a failed lookup and resumes on the next refresh.
+        let located = self.advance(&mut scan, high).await;
+        self.scan = Some(scan);
+        located
+    }
+    /// Inspects a bounded number of blocks, asking each only for the claims
+    /// whose windows cover its height. Heights no window covers are skipped.
+    async fn advance(&mut self, scan: &mut Scan, high: u64) -> Result<Located> {
         if let Some((at, hash, txid)) = scan.found.clone() {
-            if at <= high {
-                let (canonical, included) =
-                    self.block_receipt(at, std::slice::from_ref(&txid)).await?;
-                if canonical == hash && included == [true] {
-                    self.scan = Some(scan);
-                    return Ok(Located::Found(at, hash, txid));
-                }
-            }
-            scan = Scan::new(nonce, scan.txids, low);
-        } else if let Some((at, hash)) = scan.checked
-            && (at > high || self.block_receipt(at, &[]).await?.0 != hash)
-        {
-            scan = Scan::new(nonce, scan.txids, low);
-        }
-        let end = high.min(scan.next.saturating_add(SCAN_BLOCKS_PER_REFRESH - 1));
-        while scan.next <= end {
-            let at = scan.next;
-            let (hash, included) = self.block_receipt(at, &scan.txids).await?;
-            if let Some(index) = included.iter().position(|found| *found) {
-                let txid = scan.txids[index].clone();
-                scan.found = Some((at, hash, txid.clone()));
-                self.scan = Some(scan);
+            // The recorded hash commits to the block that held the payment.
+            if at <= high && self.canonical_hash(at).await? == hash {
                 return Ok(Located::Found(at, hash, txid));
             }
-            scan.checked = Some((at, hash));
+            *scan = Scan::new(scan.nonce, std::mem::take(&mut scan.windows));
+        }
+        let mut budget = SCAN_BLOCKS_PER_REFRESH;
+        loop {
+            let Some(at) = scan.upcoming(high) else {
+                // Every height that could hold a recorded claim was inspected.
+                if let Some((at, hash)) = scan.checked
+                    && (at > high || self.canonical_hash(at).await? != hash)
+                {
+                    *scan = Scan::new(scan.nonce, std::mem::take(&mut scan.windows));
+                    continue;
+                }
+                return Ok(Located::Missing);
+            };
+            if budget == 0 {
+                return Ok(Located::Incomplete);
+            }
+            let txids: Vec<String> = scan
+                .windows
+                .iter()
+                .filter(|w| w.first <= at && at <= w.last)
+                .map(|w| w.txid.clone())
+                .collect();
+            let mut block = None;
+            let mut found = None;
+            let mut moved = false;
+            // One height's IDs are inspected together, so every refresh makes
+            // progress even when more claims than one lookup names share it.
+            for chunk in txids.chunks(crate::node::MAX_RECEIPT_TXIDS) {
+                budget = budget.saturating_sub(1);
+                let Some((hash, included)) = self.block_receipt(at, chunk, scan.checked).await?
+                else {
+                    moved = true;
+                    break;
+                };
+                if block.is_some_and(|seen| seen != hash) {
+                    moved = true;
+                    break;
+                }
+                block = Some(hash);
+                if let Some(index) = included.iter().position(|found| *found) {
+                    found = Some(chunk[index].clone());
+                    break;
+                }
+            }
+            if moved {
+                // The canonical chain changed between inspections. Blocks from
+                // different branches never prove absence, so start again.
+                *scan = Scan::new(scan.nonce, std::mem::take(&mut scan.windows));
+                continue;
+            }
+            match (block, found) {
+                (Some(hash), Some(txid)) => {
+                    scan.found = Some((at, hash, txid.clone()));
+                    return Ok(Located::Found(at, hash, txid));
+                }
+                (Some(hash), None) => scan.checked = Some((at, hash)),
+                (None, _) => {}
+            }
             scan.next = at + 1;
         }
-        let complete = scan.next > high;
-        self.scan = Some(scan);
-        Ok(if complete {
-            Located::Missing
-        } else {
-            Located::Incomplete
-        })
     }
     /// A stored claim must still be exactly its signed fixed intent before it
     /// is retried.
@@ -1366,7 +1479,7 @@ impl Engine {
             return Ok(result);
         }
         ensure!(
-            self.state()? == "ready",
+            self.availability()? == "ready",
             "Faucet is waiting for mining, funds, or its next allowance"
         );
         self.ledger
@@ -2513,6 +2626,15 @@ mod tests {
         fee_rate: u64,
         interval: u64,
         receipts: usize,
+        /// Receipt lookups that named transaction IDs, so the node loaded a block.
+        loaded_blocks: usize,
+        /// Recipients that already have accounts and pay no creation weight.
+        existing: Vec<PublicKey>,
+        /// After this many receipt lookups, these blocks replace the branch.
+        switch_after: Option<(usize, Vec<Block>)>,
+    }
+    fn mock_hash(node: &MockNode, height: u64) -> Hash {
+        codec::block_hash(node.blocks.get(&height).unwrap_or(&block(height, vec![])))
     }
     async fn mock_rpc(
         State(node): State<Arc<Mutex<MockNode>>>,
@@ -2533,7 +2655,13 @@ mod tests {
                         amount: 1u32.into(),
                     };
                 }
-                let body = TransactionBody {
+                let new_account = match &operation {
+                    Operation::TransferExact { recipient, .. } => {
+                        !node.existing.contains(recipient)
+                    }
+                    _ => true,
+                };
+                let mut body = TransactionBody {
                     data: Vec::new(),
                     sender: hex::decode(p["sender"].as_str().unwrap())
                         .unwrap()
@@ -2542,18 +2670,28 @@ mod tests {
                     nonce: p["nonce"].as_u64().unwrap(),
                     anchor: parse_hash(p["anchor"].as_str().unwrap()).unwrap(),
                     expiry_blocks: p["expiry_blocks"].as_u64().unwrap(),
-                    fee: 2u32.into(),
+                    fee: Amount::zero(),
                     operation,
                 };
                 {
+                    // The automatic fee pays for its own encoded length, as on a node.
+                    let weight = loop {
+                        let encoded = codec::encode(&Transaction {
+                            body: body.clone(),
+                            signature: [0; 64],
+                        });
+                        let weight = encoded.len() as u64
+                            + if new_account { fees::ACCOUNT_WEIGHT } else { 0 };
+                        let fee = (Amount::from(weight) * node.fee_rate
+                            + Amount::from(fees::FEE_SCALE - 1))
+                            / fees::FEE_SCALE;
+                        if fee == body.fee {
+                            break weight;
+                        }
+                        body.fee = fee;
+                    };
                     let mut result =
                         serde_json::to_value(wallet::unsigned(&body, &[7; 32])).unwrap();
-                    let weight = codec::encode(&Transaction {
-                        body: body.clone(),
-                        signature: [0; 64],
-                    })
-                    .len()
-                        + 1024;
                     result["fee_quote"] = json!({"chain_id":hex::encode([7; 32]),"tip":hex::encode(body.anchor),"anchor":hex::encode(body.anchor),"state_root":hex::encode([0;32]),"height":node.height,"anchor_height":node.height,"expiry_blocks":body.expiry_blocks,"expiry_height":node.height.checked_add(body.expiry_blocks).unwrap(),"weight":weight.to_string()});
                     result
                 }
@@ -2578,17 +2716,20 @@ mod tests {
             "blockreceipt" => {
                 node.receipts += 1;
                 let height = p["height"].as_u64().unwrap();
-                if height > node.height {
-                    return Json(json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"unknown active height"}})).into_response();
+                let ids = p["txids"].as_array().unwrap();
+                // The node's own limits: active heights and at most 64 IDs.
+                if height > node.height || ids.len() > crate::node::MAX_RECEIPT_TXIDS {
+                    return Json(json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"invalid receipt request"}})).into_response();
+                }
+                if !ids.is_empty() {
+                    node.loaded_blocks += 1;
                 }
                 let block = node
                     .blocks
                     .get(&height)
                     .cloned()
                     .unwrap_or_else(|| block(height, vec![]));
-                let included = p["txids"]
-                    .as_array()
-                    .unwrap()
+                let included = ids
                     .iter()
                     .map(|id| {
                         block
@@ -2597,7 +2738,25 @@ mod tests {
                             .any(|t| hex::encode(codec::transaction_id(t)) == id.as_str().unwrap())
                     })
                     .collect::<Vec<_>>();
-                json!({"height":height,"hash":hex::encode(codec::block_hash(&block)),"included":included})
+                let hash = hex::encode(codec::block_hash(&block));
+                let mut result = json!({"height":height,"hash":hash,"included":included});
+                if let Some(checked) = p.get("checked") {
+                    let at = checked["height"].as_u64().unwrap();
+                    let canonical = at <= node.height
+                        && hex::encode(mock_hash(&node, at)) == checked["hash"].as_str().unwrap();
+                    result["checked_canonical"] = json!(canonical);
+                }
+                if node
+                    .switch_after
+                    .as_ref()
+                    .is_some_and(|(after, ..)| node.receipts >= *after)
+                {
+                    let (_, branch) = node.switch_after.take().unwrap();
+                    for replacement in branch {
+                        node.blocks.insert(replacement.height, replacement);
+                    }
+                }
+                result
             }
             other => panic!("unexpected RPC {other}"),
         };
@@ -2707,6 +2866,11 @@ mod tests {
             moved,
             hex::encode(codec::block_hash(&node.lock().await.blocks[&3]))
         );
+        // A canonical receipt is verified by its block hash alone, which commits
+        // to the payment; no block body is loaded.
+        let loaded = node.lock().await.loaded_blocks;
+        engine.refresh().await.unwrap();
+        assert_eq!(node.lock().await.loaded_blocks, loaded);
         assert_eq!(
             engine.claim(&recipient(3), "a").await.unwrap()["txid"],
             result["txid"]
@@ -3264,12 +3428,17 @@ mod tests {
         assert_eq!(diagnostics.error.unwrap().category, "nonce_conflict");
         assert_eq!(engine.state().unwrap(), "unavailable");
         assert!(engine.claim(&recipient(4), "b").await.is_err());
-        // A completed search is not repeated: one canonical check per refresh.
-        let before = node.lock().await.receipts;
+        // A completed search is not repeated: one canonical check per refresh,
+        // answered from the node's index without loading a block.
+        let (before, loaded) = {
+            let node = node.lock().await;
+            (node.receipts, node.loaded_blocks)
+        };
         for _ in 0..3 {
             assert!(engine.refresh().await.is_err());
         }
         assert_eq!(node.lock().await.receipts - before, 3);
+        assert_eq!(node.lock().await.loaded_blocks, loaded);
         assert_eq!(node.lock().await.transactions.len(), 1);
         // After review the operator accepts the external spend; nothing is deleted.
         let summary = maintain(&c, Maintenance::AcceptSpentNonce(0)).unwrap();
@@ -3398,6 +3567,119 @@ mod tests {
         task.abort();
     }
 
+    #[tokio::test]
+    async fn more_same_nonce_claims_than_one_receipt_lookup_names_still_settle() {
+        let dir = TempDir::new().unwrap();
+        let (mut engine, _, node, task) = ready_engine(&dir, |_| {}).await;
+        // Congestion keeps each payment out of its two-block window, so every
+        // claim expires with its nonce unused and the next one signs it again.
+        let expired = crate::node::MAX_RECEIPT_TXIDS + 6;
+        for n in 0..expired {
+            engine
+                .claim(&recipient(100 + n as u8), &format!("net-{n}"))
+                .await
+                .unwrap();
+            node.lock().await.height += 2;
+            engine.refresh().await.unwrap();
+            assert!(engine.ledger.pending().unwrap().is_none());
+        }
+        let paid = engine.claim(&recipient(200), "net-paid").await.unwrap();
+        assert_eq!(engine.ledger.unsettled(0).unwrap().len(), expired + 1);
+        {
+            let mut node = node.lock().await;
+            let payment = node.transactions.last().unwrap().clone();
+            let at = node.height + 1;
+            node.blocks.insert(at, block(at, vec![payment]));
+            node.nonce = 1;
+            node.height = at + 1;
+        }
+        // Each lookup names only the claims whose window covers its height, so
+        // none exceeds the node's limit, and the windows are searched in steps.
+        for _ in 0..2 {
+            engine.refresh().await.unwrap();
+            assert_eq!(engine.fault, Some("verifying_payments"));
+        }
+        engine.refresh().await.unwrap();
+        assert!(engine.fault.is_none());
+        let status = engine.status(Some(&recipient(200)), "net-paid").unwrap();
+        assert_eq!(status["claim"]["status"], "confirmed");
+        assert_eq!(status["claim"]["txid"], paid["txid"]);
+        assert_eq!(engine.ledger.unsettled(0).unwrap().len(), expired);
+        engine.claim(&recipient(201), "net-next").await.unwrap();
+        let next = engine.ledger.pending().unwrap().unwrap();
+        assert_eq!(wallet::decode_signed(&next.raw, &[7; 32]).unwrap().body.nonce, 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_old_expired_claim_does_not_widen_the_inclusion_search() {
+        let dir = TempDir::new().unwrap();
+        let (mut engine, _, node, task) = ready_engine(&dir, |_| {}).await;
+        engine.claim(&recipient(3), "a").await.unwrap();
+        node.lock().await.height = 4;
+        engine.refresh().await.unwrap();
+        // Visitors return long after that claim expired; the next claim signs
+        // the same unused nonce.
+        node.lock().await.height = 5_000;
+        engine.refresh().await.unwrap();
+        let paid = engine.claim(&recipient(4), "b").await.unwrap();
+        let before = {
+            let mut node = node.lock().await;
+            let payment = node.transactions[1].clone();
+            node.blocks.insert(5_001, block(5_001, vec![payment]));
+            node.nonce = 1;
+            node.height = 5_002;
+            node.receipts
+        };
+        engine.refresh().await.unwrap();
+        assert!(engine.fault.is_none());
+        let status = engine.status(Some(&recipient(4)), "b").unwrap();
+        assert_eq!(status["claim"]["status"], "confirmed");
+        assert_eq!(status["claim"]["txid"], paid["txid"]);
+        // Only heights inside a recorded window are inspected: 3, 4 and 5,001.
+        assert_eq!(node.lock().await.receipts - before, 3);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn branch_switch_between_receipt_lookups_restarts_the_search() {
+        let dir = TempDir::new().unwrap();
+        let (mut engine, _, node, task) = ready_engine(&dir, |_| {}).await;
+        let first = engine.claim(&recipient(3), "a").await.unwrap();
+        {
+            let mut node = node.lock().await;
+            let payment = node.transactions[0].clone();
+            node.blocks.insert(4, block(4, vec![payment.clone()]));
+            // Height 3 is inspected on this branch. Before height 4 is, the node
+            // switches to one that includes the payment at height 3 instead.
+            let mut moved = block(3, vec![payment]);
+            moved.header.nonce = 88;
+            let mut empty = block(4, vec![]);
+            empty.header.nonce = 89;
+            node.switch_after = Some((node.receipts + 1, vec![moved, empty]));
+            node.nonce = 1;
+            node.height = 4;
+        }
+        // Blocks of two branches never prove the payment absent, so the search
+        // starts again on the new branch and finds it.
+        engine.refresh().await.unwrap();
+        assert!(engine.fault.is_none());
+        let paid = engine.status(Some(&recipient(3)), "a").unwrap();
+        assert_eq!(paid["claim"]["status"], "confirmed");
+        assert_eq!(paid["claim"]["txid"], first["txid"]);
+        let receipt: String = engine
+            .ledger
+            .db
+            .query_row(
+                "SELECT receipt_hash FROM claims WHERE status='confirmed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipt, hex::encode(mock_hash(&*node.lock().await, 3)));
+        task.abort();
+    }
+
     #[test]
     fn local_payout_estimate_matches_consensus_fee_rules() {
         let dir = TempDir::new().unwrap();
@@ -3405,6 +3687,8 @@ mod tests {
         let chain = crate::config::Config::devnet();
         let mut state = crate::state::State::genesis(&chain);
         engine.tip = Some([3; 32]);
+        let existing = crypto::public_key(&[10; 32]).unwrap();
+        state.world.put(existing, Default::default(), &chain).unwrap();
         for (rate, nonce, payout) in [
             (1, 0, "1"),
             (7, 300, "1000000000000"),
@@ -3418,33 +3702,38 @@ mod tests {
             });
             engine.nonce = nonce;
             engine.payout = amount(payout).unwrap();
-            let (weight, fee) = engine.payout_requirements().unwrap().unwrap();
-            let body = TransactionBody {
-                sender: engine.sender,
-                nonce,
-                fee: fee.clone(),
-                anchor: [3; 32],
-                expiry_blocks: engine.config.expiry_blocks,
-                operation: Operation::TransferExact {
-                    recipient: crypto::public_key(&[9; 32]).unwrap(),
-                    amount: engine.payout.clone(),
-                },
-                data: Vec::new(),
-            };
-            let quote = fees::quote(
-                &chain,
-                &state,
-                &Transaction {
-                    body,
-                    signature: [0; 64],
-                },
-            )
-            .unwrap();
-            assert_eq!(
-                (quote.weight, quote.minimum_fee),
-                (weight, fee),
-                "rate {rate}"
-            );
+            for (new_account, recipient) in [
+                (true, crypto::public_key(&[9; 32]).unwrap()),
+                (false, existing),
+            ] {
+                let (weight, fee) = engine.payout_requirements(new_account).unwrap().unwrap();
+                let body = TransactionBody {
+                    sender: engine.sender,
+                    nonce,
+                    fee: fee.clone(),
+                    anchor: [3; 32],
+                    expiry_blocks: engine.config.expiry_blocks,
+                    operation: Operation::TransferExact {
+                        recipient,
+                        amount: engine.payout.clone(),
+                    },
+                    data: Vec::new(),
+                };
+                let quote = fees::quote(
+                    &chain,
+                    &state,
+                    &Transaction {
+                        body,
+                        signature: [0; 64],
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    (quote.weight, quote.minimum_fee),
+                    (weight, fee),
+                    "rate {rate}, new account {new_account}"
+                );
+            }
         }
     }
 
@@ -3452,29 +3741,60 @@ mod tests {
     async fn governed_fee_and_capacity_limits_pause_before_signing_or_reserving() {
         let dir = TempDir::new().unwrap();
         let (mut engine, _, node, task) = ready_engine(&dir, |_| {}).await;
-        let (weight, fee) = engine.payout_requirements().unwrap().unwrap();
+        let (weight, fee) = engine.payout_requirements(true).unwrap().unwrap();
         assert!(weight > fees::ACCOUNT_WEIGHT && fee == 2u32.into());
-        // A higher governed fee rate exceeds the operator's fee allowance.
+        let (light, _) = engine.payout_requirements(false).unwrap().unwrap();
+        assert_eq!(light + fees::ACCOUNT_WEIGHT, weight);
+        // Recipient 9 already has an account, so its payment is lighter.
+        node.lock()
+            .await
+            .existing
+            .push(address::decode(&recipient(9), &[7; 32]).unwrap());
+        let refused = |engine: &Engine| {
+            assert!(engine.ledger.last(&recipient(3)).unwrap().is_none());
+            assert!(engine.ledger.last(&recipient(9)).unwrap().is_none());
+        };
+        // A higher governed fee rate exceeds the operator's allowance for a new
+        // account. That claim is refused at its exact quote without reserving.
         node.lock().await.fee_rate = 1_000_000;
         engine.refresh().await.unwrap();
         assert_eq!(engine.state().unwrap(), "fee_cap_exceeded");
         assert_eq!(engine.status(None, "a").unwrap()["available"], false);
         assert!(engine.claim(&recipient(3), "a").await.is_err());
-        // Capacity below a new account's payment weight could never include it.
+        refused(&engine);
+        // When even an existing account's payment exceeds it, nothing is prepared.
+        node.lock().await.fee_rate = 10_000_000;
+        engine.refresh().await.unwrap();
+        assert_eq!(engine.availability().unwrap(), "fee_cap_exceeded");
+        assert!(engine.claim(&recipient(9), "a").await.is_err());
+        refused(&engine);
+        // Capacity below a payment's weight could never include it.
         {
             let mut node = node.lock().await;
             node.fee_rate = 1;
-            node.block_bytes = weight - 1;
+            node.block_bytes = light - 1;
         }
+        engine.refresh().await.unwrap();
+        assert_eq!(engine.availability().unwrap(), "capacity_exceeded");
+        assert!(engine.claim(&recipient(9), "a").await.is_err());
+        node.lock().await.block_bytes = weight - 1;
         engine.refresh().await.unwrap();
         assert_eq!(engine.state().unwrap(), "capacity_exceeded");
         assert!(engine.claim(&recipient(3), "a").await.is_err());
-        assert!(engine.ledger.last(&recipient(3)).unwrap().is_none());
+        refused(&engine);
         assert!(node.lock().await.transactions.is_empty());
         node.lock().await.block_bytes = weight;
         engine.refresh().await.unwrap();
         assert_eq!(engine.state().unwrap(), "ready");
-        engine.claim(&recipient(3), "a").await.unwrap();
+        // The status states describe a new account's payment. A claim to an
+        // existing account that fits is still paid while either state holds.
+        node.lock().await.block_bytes = weight - 1;
+        engine.refresh().await.unwrap();
+        assert_eq!(engine.state().unwrap(), "capacity_exceeded");
+        assert_eq!(
+            engine.claim(&recipient(9), "a").await.unwrap()["status"],
+            "pending"
+        );
         assert_eq!(node.lock().await.transactions.len(), 1);
         task.abort();
     }
@@ -3543,7 +3863,7 @@ mod tests {
         c.subnet_daily_claims = 3;
         let sender = crypto::public_key(&[41; 32]).unwrap();
         let mut ledger = Ledger::open(&c.database, &[7; 32], &sender, &c.payout).unwrap();
-        for index in ["claim_created", "claim_nonce"] {
+        for index in ["claim_created", "claim_nonce", "claim_receipt"] {
             assert_eq!(
                 ledger
                     .db
@@ -3556,6 +3876,23 @@ mod tests {
                 1
             );
         }
+        // Every refresh reads the newest receipt from its partial index instead
+        // of sorting all confirmed claims.
+        let plan = ledger
+            .db
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT {CLAIM_COLUMNS},receipt_height,receipt_hash FROM claims WHERE status='confirmed' ORDER BY receipt_height DESC,rowid DESC LIMIT 1"
+            ))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|step| step.contains("claim_receipt"))
+                && !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
         let start = 1_000_000;
         for n in 0..3u8 {
             let claim = record(n + 1, start + 60 * i64::from(n));

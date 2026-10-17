@@ -204,6 +204,29 @@ async fn fixed_payment_is_exact_and_durable_against_repeat_claims_and_restart() 
         .unwrap();
     assert_eq!(receipt["hash"], hex::encode(codec::block_hash(&mined)));
     assert_eq!(receipt["included"], json!([true, false]));
+    // Without IDs only the canonical index is read. A named earlier block is
+    // confirmed canonical in the same read, so both share one chain.
+    let parent = node
+        .rpc("blockreceipt", json!({"height": mined.height - 1}))
+        .unwrap();
+    assert_eq!(parent["hash"], hex::encode(mined.header.previous));
+    assert_eq!(parent["included"], json!([]));
+    assert!(parent.get("checked_canonical").is_none());
+    let checked = |hash: Value| {
+        let earlier = json!({"height": mined.height - 1, "hash": hash});
+        node.rpc(
+            "blockreceipt",
+            json!({"height": mined.height, "txids": [], "checked": earlier}),
+        )
+        .unwrap()
+    };
+    let linked = checked(parent["hash"].clone());
+    assert_eq!(linked["hash"], receipt["hash"]);
+    assert_eq!(linked["checked_canonical"], true);
+    assert_eq!(
+        checked(json!(hex::encode([0u8; 32])))["checked_canonical"],
+        false
+    );
     assert!(
         node.rpc(
             "blockreceipt",

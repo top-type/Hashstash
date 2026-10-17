@@ -10,7 +10,9 @@
 //! proposal identifiers) are chosen by users. Depth is therefore logarithmic only
 //! in expectation: ground keys can lengthen one path by a level per key. Every
 //! operation, including dropping and restoring a map, walks paths with explicit
-//! heap worklists, so no depth exhausts a thread stack.
+//! heap worklists, so no depth exhausts a thread stack. Work still follows
+//! depth: an update copies and rehashes one node per level of its path, so
+//! updates under a ground path cost time linear in its length.
 
 use crate::{codec, crypto, types::Hash};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeSeq};
@@ -253,10 +255,16 @@ impl<V> Map<V> {
     }
 
     pub fn get(&self, key: &[u8]) -> Option<&V> {
+        self.get_shared(key).map(|value| &**value)
+    }
+
+    /// The stored value itself, for a holder that must outlive this version
+    /// without copying it.
+    pub fn get_shared(&self, key: &[u8]) -> Option<&Arc<V>> {
         let mut next = self.node.as_deref();
         while let Some(n) = next {
             match key.cmp(n.key.as_slice()) {
-                std::cmp::Ordering::Equal => return Some(&*n.value),
+                std::cmp::Ordering::Equal => return Some(&n.value),
                 std::cmp::Ordering::Less => next = n.left.as_deref(),
                 std::cmp::Ordering::Greater => next = n.right.as_deref(),
             }
@@ -573,9 +581,9 @@ mod tests {
         let (old_root, new_root) = (original.node.as_ref(), next.node.as_ref());
         assert!(!Arc::ptr_eq(old_root.unwrap(), new_root.unwrap()));
         assert!(Arc::ptr_eq(&old_root.unwrap().value, &new_root.unwrap().value));
-        assert!(std::ptr::eq(
-            original.get(&root_key).unwrap(),
-            next.get(&root_key).unwrap()
+        assert!(Arc::ptr_eq(
+            original.get_shared(&root_key).unwrap(),
+            next.get_shared(&root_key).unwrap()
         ));
         assert_eq!(next.remove(&key(87)), Some(999));
         assert!(std::ptr::eq(

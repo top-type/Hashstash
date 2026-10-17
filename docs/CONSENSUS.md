@@ -87,7 +87,7 @@ For each block, physical expected work is W = floor(2^256 / (target + 1)). Produ
 
 ## Accounts, reserve and governance
 
-State uses persistent authenticated maps. The deterministic treap has priorities derived from keys, canonical roots independent of insertion order, and shared immutable subtrees. Account updates copy changed paths rather than cloning all accounts. Priorities are public and many keys are user-chosen, so depth is logarithmic only in expectation: ground keys can build one arbitrarily deep path. Implementations must therefore not recurse per tree level, including when freeing or restoring a map. Account field order is ordinary:Amount, shares:Amount, nonce:u64, epoch:u64. Each outcome's cash is its ordinary field; there is no extra conditional balance field. Public-key bytes are the map key, not an extra account field.
+State uses persistent authenticated maps. The deterministic treap has priorities derived from keys, canonical roots independent of insertion order, and shared immutable subtrees. Account updates copy changed paths rather than cloning all accounts. Priorities are public and many keys are user-chosen, so depth is logarithmic only in expectation: ground keys can build one arbitrarily deep path. Implementations must therefore not recurse per tree level, including when freeing or restoring a map. This is a known limitation of the commitment, not only of an implementation: every update on such a path copies and rehashes one node per level, so its cost grows linearly with the path's depth, and each paid account creation with a ground key can add a level. Accounts are never removed, so a ground path is permanent. Consensus deliberately neither caps depth nor prices it, because ground spines can also push other users' keys deep. Removing the dependence needs a different commitment (see [remaining limits](NETWORK-HARDENING.md#remaining-limits)). Account field order is ordinary:Amount, shares:Amount, nonce:u64, epoch:u64. Each outcome's cash is its ordinary field; there is no extra conditional balance field. Public-key bytes are the map key, not an extra account field.
 
 The account `epoch` is internal bookkeeping for governance context. Each decision increments `last_epoch`; account reads normalize the returned tag to that decision's number, or zero outside a decision. Stored records retain the context used when written. Changing this tag does not change a balance, mint funds or perform the PASS/FAIL split: the two account-tree roots hold those alternatives. The field participates in the account commitment and its stored value cannot exceed `last_epoch`. It is not a Unix timestamp.
 
@@ -99,15 +99,15 @@ Grant eligibility requires positive, representable payments fully backed by avai
 
 Amount-only Deposit and Redeem operations are reserved from opening balances and cleared together once per world. The signed fee is paid even on a zero fill. Unfilled inputs are returned. Exact rounded closing marginal prices respect MaxPriceChangeBps. No order identifier or transaction position selects a rounding beneficiary. [Batch clearing](SPECIFICATION.md#amount-only-block-clearing) defines price determination, proportional allocation, dust handling, the per-world limit of 1,024 curve evaluations and the remaining miner inclusion power.
 
-Decision fields are id, epoch, round, proposal_id, proposal, started (scheduled clock), started_height, blocks, leading_blocks. The last three are u64. The opening height plus blocks is the resolution height; the observation occurs before that block’s transactions. The decision ID is tagged_hash("Hashstash/decision", encode((chain_id, round, proposal_id, started_height, parent_hash))). Here parent_hash is the block hash of the opening block's parent. Anyone who knows that parent and the maturing leader can compute the ID before the opening block exists, and same-parent siblings share it.
+Decision fields are id, epoch, round, proposal_id, proposal, started (scheduled clock), started_height, blocks, leading_blocks. The last three are u64. The proposal field is a copy of the winning action, which is committed once, in the actions map under proposal_id; the state root's phase commitment therefore omits it (see State commitments). The opening height plus blocks is the resolution height; the observation occurs before that block’s transactions. The decision ID is tagged_hash("Hashstash/decision", encode((chain_id, round, proposal_id, started_height, parent_hash))). Here parent_hash is the block hash of the opening block's parent. Anyone who knows that parent and the maturing leader can compute the ID before the opening block exists, and same-parent siblings share it.
 
-A proposal ID is tagged_hash("Hashstash/proposal", encode((chain_id, round, proposer, description, proposal))), where proposer is the sender of the registering Propose. Proposal record fields are round, proposer, description, action, support, refund_height. A sender can register a given ID once; an identical Propose from another sender registers a separate proposal, so copying a pending Propose cannot invalidate it or replace its attached data.
+A proposal ID is tagged_hash("Hashstash/proposal", encode((chain_id, round, proposer, description, proposal))), where proposer is the sender of the registering Propose. Proposal record fields are round, proposer, description, support, refund_height. Registration also writes the proposal (its action) once into the actions map under the same ID; nothing updates it later. Support and cancellation rewrite only the record, so their hashing work does not depend on how many payments a grant lists. A sender can register a given ID once; an identical Propose from another sender registers a separate proposal, so copying a pending Propose cannot invalidate it or replace its attached data.
 
 ## State commitments
 
 World root is tagged_hash("Hashstash/world", encode((accounts.root(), reserve, shares, revenue, grant_escrow, curve_mass, account_cash, account_shares))). Each dynamic curve field is committed.
 
-The state root is tagged_hash("Hashstash/state", encode((A,B))). A contains chain_id, height, clock, issued, settings, frozen, world.root(), optional alternative.root(), phase. Clock is cumulative scheduled seconds. B contains proposal/support/round/ranking roots, auction_escrow, last_round, last_epoch. Field and tuple ordering is consensus-critical.
+The state root is tagged_hash("Hashstash/state", encode((A,B))). A contains chain_id, height, clock, issued, settings, frozen, world.root(), optional alternative.root(), phase commitment. Clock is cumulative scheduled seconds. The phase commitment encodes the phase with its own tags and fields, except that a Governance decision omits its proposal field: id, epoch, round, proposal_id, started, started_height, blocks, leading_blocks. B contains proposal/action/support/round/ranking roots, auction_escrow, last_round, last_epoch. Field and tuple ordering is consensus-critical.
 
 Tree domains are Hashstash/TreeEmpty, Hashstash/TreeValue, Hashstash/TreePriority and Hashstash/TreeNode. Protocol roots commit to authenticated map roots rather than their in-memory representation. All changes, including fees and protocol payments, must reproduce the declared state root.
 
@@ -117,6 +117,7 @@ Each map is a treap ordered by key bytes. A key's priority is tagged_hash("Hashs
 | --- | --- | --- |
 | accounts (each world) | 32-byte public key | Account |
 | proposals | 32-byte proposal ID | ProposalRecord |
+| actions | 32-byte proposal ID | Proposal, written once at registration |
 | supports | tagged_hash("Hashstash/support", encode((round, proposal_id, sender))) | SupportRecord |
 | rounds | round number as 8 big-endian bytes | RoundRecord |
 | ranking | support amount as a 64-byte big-endian magnitude, then the bitwise NOT of the proposal ID (96 bytes) | proposal ID |
@@ -125,10 +126,10 @@ A proposal ID is tagged_hash("Hashstash/proposal", encode((chain_id, round, prop
 
 | Record | Fields and tags |
 | --- | --- |
-| ProposalRecord | round:u64, proposer[32], description[32], action:Proposal, support:Amount, refund_height:Option<u64> |
+| ProposalRecord | round:u64, proposer[32], description[32], support:Amount, refund_height:Option<u64> |
 | SupportRecord | round:u64, proposal[32], sender[32], amount:Amount |
 | RoundRecord | status:RoundStatus, refund_height:u64; RoundStatus tags Open=0, Won(proposal ID)=1, Timeout=2 |
-| Phase | Auction=0, Governance=1 (Decision, above), Rest=2 |
+| Phase | Auction=0, Governance=1 (Decision, above, committed without proposal), Rest=2 |
 | Auction | round:u64, opened:u64, leader:Option<[32]>, lead_since:u64, replacement_height:u64 |
 | Rest | until:u64, pending:Option<(Parameter, u64)> |
 

@@ -470,13 +470,15 @@ fn transaction_inner(
                 s.proposals.get(&id).is_none(),
                 "proposal already registered"
             );
+            // The action is committed once; support updates rewrite only the
+            // record, however many payments a grant lists.
+            s.actions.insert(id.to_vec(), proposal.clone());
             s.proposals.insert(
                 id.to_vec(),
                 ProposalRecord {
                     round: *round,
                     proposer: b.sender,
                     description: *description,
-                    action: proposal.clone().into(),
                     support: Amount::zero(),
                     refund_height: None,
                 },
@@ -729,11 +731,11 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
                     candidate = inc;
                 }
             }
-            let p = s
-                .proposals
+            let action = s
+                .actions
                 .get(&candidate)
-                .context("missing ranked proposal")?;
-            if can_open(c, s, &p.action).is_ok() {
+                .context("missing ranked proposal action")?;
+            if can_open(c, s, action).is_ok() {
                 break Some(candidate);
             }
             cancel(s, &mut a, &candidate)?;
@@ -756,7 +758,12 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
             .get(&id)
             .context("missing auction leader")?
             .clone();
-        if can_open(c, s, &p.action).is_ok() {
+        let action = s
+            .actions
+            .get_shared(&id)
+            .context("missing auction leader action")?
+            .clone();
+        if can_open(c, s, &action).is_ok() {
             s.auction_escrow = s
                 .auction_escrow
                 .checked_sub(&p.support)
@@ -785,7 +792,7 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
                 epoch: s.last_epoch,
                 round: a.round,
                 proposal_id: id,
-                proposal: p.action,
+                proposal: action,
                 started: s.clock,
                 started_height: s.height,
                 blocks: s.frozen.decision_blocks,

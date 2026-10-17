@@ -5,7 +5,9 @@
 //! to print "survived depth N" for any N; tests/treap_depth.rs keeps a smaller
 //! spine on a 128 KiB stack as a regression test. The description below is the
 //! original analysis. Ground depth still costs one node copy per level on each
-//! update of that path; it no longer aborts the process.
+//! update of that path; it no longer aborts the process. That linear cost is a
+//! documented limit of the commitment (docs/NETWORK-HARDENING.md, "Remaining
+//! limits").
 //!
 //! `Map` (src/tree.rs) is a treap whose node priority is
 //! `tagged_hash("Hashstash/TreePriority", key)` (tree.rs:52). The binary-search

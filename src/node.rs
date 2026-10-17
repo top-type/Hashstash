@@ -174,7 +174,16 @@ impl JsonPage {
 #[derive(Serialize)]
 struct ProposalPageRow<'a> {
     id: String,
-    proposal: &'a crate::state::ProposalRecord,
+    proposal: ProposalView<'a>,
+}
+
+/// One `proposal` object for clients: the record and its action, which
+/// consensus keeps in a separate write-once map.
+#[derive(Serialize)]
+struct ProposalView<'a> {
+    #[serde(flatten)]
+    record: &'a crate::state::ProposalRecord,
+    action: &'a Proposal,
 }
 
 /// A display row whose grant payments were cut to SUMMARY_GRANT_PAYMENTS.
@@ -2093,36 +2102,33 @@ impl Node {
                 };
                 let ids = ids.get(offset..).unwrap_or_default();
                 let ids = &ids[..ids.len().min(limit)];
+                let action_of = |id: &Hash| s.actions.get(id).context("indexed proposal missing");
                 let mut work = 0usize;
                 for id in ids {
-                    let proposal = s.proposals.get(id).context("indexed proposal missing")?;
-                    work = work.saturating_add(1 + grant_payments(&proposal.action));
+                    work = work.saturating_add(1 + grant_payments(action_of(id)?));
                 }
                 charge(meter, work)?;
                 let mut page = JsonPage::new();
                 for id in ids {
-                    let proposal = s.proposals.get(id).context("indexed proposal missing")?;
+                    let record = s.proposals.get(id).context("indexed proposal missing")?;
+                    let action = action_of(id)?;
                     let accepted = page.push_summarized(
                         &ProposalPageRow {
                             id: hex::encode(id),
-                            proposal,
+                            proposal: ProposalView { record, action },
                         },
                         || {
-                            let summary = crate::state::ProposalRecord {
-                                round: proposal.round,
-                                proposer: proposal.proposer,
-                                description: proposal.description,
-                                action: truncated_proposal(&proposal.action).into(),
-                                support: proposal.support.clone(),
-                                refund_height: proposal.refund_height,
-                            };
+                            let summary = truncated_proposal(action);
                             Ok(serde_json::to_value(Truncated {
                                 row: ProposalPageRow {
                                     id: hex::encode(id),
-                                    proposal: &summary,
+                                    proposal: ProposalView {
+                                        record,
+                                        action: &summary,
+                                    },
                                 },
                                 truncated: true,
-                                payment_count: grant_payments(&proposal.action),
+                                payment_count: grant_payments(action),
                             })?)
                         },
                     )?;
@@ -4971,25 +4977,27 @@ mod capacity_work_tests {
     #[test]
     fn proposal_response_pages_preserve_every_row_at_byte_and_value_boundaries() {
         let recipient = crypto::public_key(&[43; 32]).unwrap();
+        let action = Proposal::Grant {
+            payments: vec![GrantPayment {
+                recipient,
+                amount: 1u32.into(),
+            }],
+        };
         let records: Vec<_> = (0..3)
             .map(|round| crate::state::ProposalRecord {
                 round,
                 proposer: recipient,
                 description: [44; 32],
-                action: Proposal::Grant {
-                    payments: vec![GrantPayment {
-                        recipient,
-                        amount: 1u32.into(),
-                    }],
-                }
-                .into(),
                 support: 1u32.into(),
                 refund_height: None,
             })
             .collect();
         let first = ProposalPageRow {
             id: hex::encode([0; 32]),
-            proposal: &records[0],
+            proposal: ProposalView {
+                record: &records[0],
+                action: &action,
+            },
         };
         let encoded = serde_json::to_vec(&first).unwrap();
         let values =
@@ -5005,11 +5013,14 @@ mod capacity_work_tests {
                 } else {
                     page.values_left = values + values / 2;
                 }
-                for (index, proposal) in records.iter().enumerate().skip(offset) {
+                for (index, record) in records.iter().enumerate().skip(offset) {
                     if !page
                         .push(&ProposalPageRow {
                             id: hex::encode([index as u8; 32]),
-                            proposal,
+                            proposal: ProposalView {
+                                record,
+                                action: &action,
+                            },
                         })
                         .unwrap()
                     {
@@ -5167,15 +5178,18 @@ mod read_admission_tests {
         session.work(1_048_576).unwrap();
         session
     }
-    fn record(round: u64, support: u32, action: Proposal) -> ProposalRecord {
-        ProposalRecord {
-            round,
-            proposer: [0; 32],
-            description: [0; 32],
-            action: action.into(),
-            support: support.into(),
-            refund_height: None,
-        }
+    fn register(s: &mut State, id: u8, round: u64, support: u32, action: Proposal) {
+        s.actions.insert(vec![id; 32], action);
+        s.proposals.insert(
+            vec![id; 32],
+            ProposalRecord {
+                round,
+                proposer: [0; 32],
+                description: [0; 32],
+                support: support.into(),
+                refund_height: None,
+            },
+        );
     }
     fn parameter() -> Proposal {
         Proposal::Parameter {
@@ -5296,8 +5310,8 @@ mod read_admission_tests {
         let mut s = curved();
         // About 35 JSON values per payment: one record exceeds the page budget.
         let large = grant(64_000);
-        s.proposals.insert(vec![1; 32], record(0, 5, large.clone()));
-        s.proposals.insert(vec![2; 32], record(0, 4, parameter()));
+        register(&mut s, 1, 0, 5, large.clone());
+        register(&mut s, 2, 0, 4, parameter());
         let pending = Transaction {
             body: TransactionBody {
                 sender: key(),
@@ -5353,8 +5367,7 @@ mod read_admission_tests {
     fn round_pages_are_indexed_ranked_by_support_and_lead_with_the_leader() {
         let mut s = curved();
         for (id, round, support) in [(0u8, 1, 50), (1, 0, 5), (2, 0, 9), (3, 0, 9), (4, 0, 1)] {
-            s.proposals
-                .insert(vec![id; 32], record(round, support, parameter()));
+            register(&mut s, id, round, support, parameter());
         }
         s.phase = Phase::Auction(Auction {
             round: 0,
@@ -5406,7 +5419,7 @@ mod read_admission_tests {
     fn support_status_tells_converted_locked_refundable_and_none_apart() {
         let mut s = curved();
         for (id, round) in [(1u8, 0u64), (2, 0), (3, 0), (4, 1)] {
-            s.proposals.insert(vec![id; 32], record(round, 5, parameter()));
+            register(&mut s, id, round, 5, parameter());
         }
         for (round, status) in [(0u64, RoundStatus::Won([1; 32])), (1, RoundStatus::Open)] {
             s.rounds.insert(

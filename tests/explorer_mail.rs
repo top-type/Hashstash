@@ -59,7 +59,8 @@ fn signed(c: &Config, nonce: u64, operation: Operation, data: Vec<u8>) -> Transa
         &TransactionBody {
             sender: key(91),
             nonce,
-            fee: 4u32.into(),
+            // Covers the proposal record and payout weight of the grant below.
+            fee: 8u32.into(),
             anchor: hashstash::codec::block_hash(&hashstash::codec::genesis_block(c).unwrap()),
             expiry_blocks: 1000,
             operation,

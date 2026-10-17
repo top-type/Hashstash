@@ -211,25 +211,20 @@ fn long_intervals_resolve_escrow_without_losing_funds() {
 
 #[test]
 fn proposals_that_no_longer_fit_at_activation_are_refunded_without_halting_blocks() {
-    // A short height range keeps the governed lifetime bound near the end
-    // of the clock range, where a value can fit at submission but not at
-    // its projected activation one decision later.
+    // Each block advances the clock and uses up one remaining height alike,
+    // so on most chains the lifetime bound is the same at submission and at
+    // activation. A chain whose clock range ends before its height limit
+    // instead nears the clock's end, where a value can fit at submission but
+    // not at its projected activation one decision later.
     let mut c = config();
-    c.max_height = 1_000;
+    c.max_height = i64::MAX as u64;
     c.validate().unwrap();
     let mut s = funded(&c);
-    let new = 1_000;
-    let mut changed = s.settings.clone();
-    changed.decision_blocks = new;
     let interval = s.settings.interval;
-    let span = interval * c.max_height
-        + c.auction_timeout_for(&changed).unwrap()
-        + new * interval
-        + changed.rest
-        + 2 * interval;
-    // The including block's clock leaves 20 seconds of slack at submission;
-    // activation comes decision_blocks * interval later.
-    s.clock = u64::MAX - span - 20 - interval;
+    let timeout = c.auction_timeout_for(&s.settings).unwrap();
+    // The including block's clock leaves 20 seconds of slack for the auction
+    // timeout at submission; activation comes decision_blocks * interval later.
+    s.clock = u64::MAX - timeout - 20 - interval;
     if let Phase::Auction(a) = &mut s.phase {
         a.opened = s.clock;
         a.lead_since = s.clock;
@@ -238,9 +233,9 @@ fn proposals_that_no_longer_fit_at_activation_are_refunded_without_halting_block
     let tx = propose(
         &s,
         Proposal::Parameter {
-            parameter: Parameter::DecisionBlocks,
-            old: s.settings.decision_blocks,
-            new,
+            parameter: Parameter::MinerFeePercent,
+            old: 50,
+            new: 40,
         },
     );
     let next = step(&c, &s, 0, &[tx]);
@@ -255,7 +250,7 @@ fn proposals_that_no_longer_fit_at_activation_are_refunded_without_halting_block
             .refund_height
             .is_some()
     );
-    assert_eq!(next.settings.decision_blocks, c.initial.decision_blocks);
+    assert_eq!(next.settings.miner_fee_percent, Some(50));
     let advanced = step(&c, &next, 0, &[]);
     assert_eq!(advanced.clock, next.clock + c.initial.interval);
 }
@@ -279,18 +274,26 @@ fn clock_and_deadline_exhaustion_are_errors_without_mutating_parent() {
 }
 
 #[test]
-fn grant_retains_the_last_atom_required_by_nonempty_stash() {
+fn grant_draws_at_most_half_of_a_live_reserve() {
+    // Audit F010: a grant of all but one reserve atom left both outcomes on
+    // a curve too steep for any fill until resolution.
     let c = config();
     let s = funded(&c);
     let capacity = consensus::grant_capacity(&s.world);
-    assert_eq!(capacity, &s.world.revenue + &s.world.reserve - 1u32);
+    assert_eq!(capacity, &s.world.revenue + (&s.world.reserve >> 1usize));
     let mut world = s.world.clone();
     consensus::grant_reserve(&c, &mut world, &capacity).unwrap();
-    assert_eq!(world.reserve, 1u32.into());
+    assert_eq!(world.reserve, &s.world.reserve - (&s.world.reserve >> 1usize));
     world.validate(&c, &s.issued, &s.auction_escrow).unwrap();
     let before = world.root();
     assert!(consensus::grant_reserve(&c, &mut world, &1u32.into()).is_err());
     assert_eq!(before, world.root());
+    let mut world = s.world.clone();
+    assert!(consensus::grant_reserve(&c, &mut world, &(capacity + 1u32)).is_err());
+    // One reserve atom still remains under any live Stash.
+    world.reserve = 1u32.into();
+    world.revenue = Amount::from(0u32);
+    assert_eq!(consensus::grant_capacity(&world), Amount::from(0u32));
 }
 
 #[test]
@@ -336,7 +339,8 @@ fn replenished_reserve_funds_repeated_grants_without_historical_spending_limits(
         },
     );
     s = step(&c, &s, 0, &[tx]);
-    let grant = &unit * 300u32;
+    // Half of the reserve, the most one grant may draw.
+    let grant = &unit * 200u32;
     for _ in 0..4 {
         assert!(consensus::grant_capacity(&s.world) >= grant);
         let tx = propose(
@@ -379,7 +383,7 @@ fn replenished_reserve_funds_repeated_grants_without_historical_spending_limits(
                 amount: 1u32.into(),
             },
         );
-        tx.body.fee = &unit * 299u32;
+        tx.body.fee = grant.clone();
         tx = crypto::sign(&tx.body, &SECRET).unwrap();
         s = step(&c, &s, 0, &[tx]);
     }
@@ -392,26 +396,53 @@ fn replenished_reserve_funds_repeated_grants_without_historical_spending_limits(
 
 #[test]
 fn active_decision_audit_checks_the_pending_value_at_its_activation_clock() {
-    let c = config();
+    // A clock range shorter than the height range lets the decision open
+    // near the clock's end (see the test above).
+    let mut c = config();
+    c.max_height = i64::MAX as u64;
+    c.initial.decision_blocks = 4;
+    c.validate().unwrap();
     let s = funded(&c);
+    let (old, new) = (c.initial.decision_blocks, 3);
     let tx = propose(
         &s,
         Proposal::Parameter {
             parameter: Parameter::DecisionBlocks,
-            old: s.settings.decision_blocks,
-            new: 71,
+            old,
+            new,
         },
     );
-    let mut opened = step(&c, &s, 0, &[tx]);
-    let Phase::Governance(d) = &mut opened.phase else {
+    let opened = step(&c, &s, 0, &[tx]);
+    let Phase::Governance(d) = &opened.phase else {
         panic!("missing decision")
     };
-    d.proposal = Proposal::Parameter {
-        parameter: Parameter::DecisionBlocks,
-        old: s.settings.decision_blocks,
-        new: u64::MAX - d.started,
-    }
-    .into();
-    // The proposed duration fits at decision opening but not at activation.
-    assert!(opened.validate(&c).is_err());
+    let height = d.started_height;
+    let length = d.blocks * opened.frozen.interval;
+    let opened_at = |started| {
+        let mut shifted = opened.clone();
+        shifted.clock = started;
+        if let Phase::Governance(d) = &mut shifted.phase {
+            d.started = started;
+        }
+        shifted
+    };
+    // Activation follows one decision later and must leave the next
+    // auction's timeout representable under the pending value.
+    let latest = u64::MAX - c.auction_timeout_for(&opened.frozen).unwrap() - length;
+    opened_at(latest).validate(&c).unwrap();
+    let error = opened_at(latest + 1).validate(&c).unwrap_err();
+    assert!(
+        error.to_string().contains("schedule deadline overflow"),
+        "{error}"
+    );
+    // The same governed value still fits at the decision's opening clock.
+    c.parameter_change_at(
+        &opened.frozen,
+        Parameter::DecisionBlocks,
+        old,
+        new,
+        latest + 1,
+        height,
+    )
+    .unwrap();
 }

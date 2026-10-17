@@ -475,12 +475,13 @@
         if (name === "Auction") {
             const timeout = remaining(BigInt(phase.opened) + auctionTimeout());
             const lead = phase.leader ? remaining(BigInt(phase.lead_since) + BigInt(state.gov.frozen.lead)) : null;
-            // A completed eligible lead is checked before timeout in the same block.
+            // A leader opens its decision when its lead completes or, at the
+            // latest, at the timeout; only an auction without one times out.
             const wins = lead !== null && blocks(lead) <= blocks(timeout);
             seconds = wins ? lead : timeout;
             total = wins ? BigInt(state.gov.frozen.lead) : auctionTimeout();
-            end = wins ? "decision" : "auction timeout";
-            summaryEnd = wins ? "to decision" : "to timeout";
+            end = lead !== null ? "decision" : "auction timeout";
+            summaryEnd = lead !== null ? "to decision" : "to timeout";
         } else if (name === "Governance") {
             const totalBlocks = BigInt(phase.blocks), elapsed = BigInt(state.status.height) - BigInt(phase.started_height);
             const completedBlocks = elapsed < 0n ? 0n : elapsed > totalBlocks ? totalBlocks : elapsed;
@@ -996,7 +997,7 @@
         if (result.tip !== state.status.tip || result.state_root !== state.status.state_root || result.height !== state.status.height) throw new QuoteRefreshPending("Updating quote for the latest block.");
     }
     function checkFeeQuote(result, extra, form, operation = null) {
-        for (const field of [ "fee", "minimum_fee", "account_creation_fee", "grant_recipient_fee", "extra_fee", "weight", "minimum_fee_rate" ]) if (typeof result[field] !== "string" || !/^(0|[1-9]\d{0,159})$/.test(result[field])) throw new Error("Invalid fee quote.");
+        for (const field of [ "fee", "minimum_fee", "account_creation_fee", "grant_recipient_fee", "record_fee", "extra_fee", "weight", "minimum_fee_rate" ]) if (typeof result[field] !== "string" || !/^(0|[1-9]\d{0,159})$/.test(result[field])) throw new Error("Invalid fee quote.");
         if (result.chain_id !== state.status.chain_id) throw new Error("Fee quote belongs to a different network.");
         checkQuoteSnapshot(result);
         if (result.anchor !== state.status.tip || String(result.anchor_height) !== String(state.status.height) || String(result.expiry_blocks) !== String(transactionExpiry(form)) || BigInt(result.expiry_height) !== BigInt(state.status.height) + BigInt(transactionExpiry(form))) throw new Error("Fee quote does not match the transaction lifetime.");
@@ -1012,6 +1013,9 @@
         if (weight > BigInt(transactionByteLimit())) throw new Error("Transaction exceeds the block capacity.");
         if (price !== BigInt(state.status.settings.minimum_fee_rate) || price > 18446744073709551615n) throw new Error("Minimum fee rate changed. Refresh for the current rate.");
         if (BigInt(result.minimum_fee) !== (price * weight + 1023n) / 1024n || creation !== 0n && (creation !== price || weight < 1024n)) throw new Error("Invalid fee quote weight.");
+        // A new proposal or support record carries 1,024 weight at the same rate.
+        const record = BigInt(result.record_fee);
+        if (record !== 0n && (record !== price || weight < 1024n) || operation?.Propose && record !== price || operation && !operation.Propose && !operation.Support && record !== 0n) throw new Error("Invalid governance record fee.");
         const grantFee=BigInt(result.grant_recipient_fee);
         const grantCount=operation?.Propose?.proposal?.Grant?.payments?.length || 0;
         if(grantFee!==price*BigInt(grantCount) || grantFee>BigInt(result.minimum_fee) || weight < BigInt(grantCount)*1024n || grantCount && creation!==0n)throw new Error("Invalid grant recipient fee.");
@@ -1027,12 +1031,16 @@
     function checkPreparedWeight(body, quote, operation) {
         // The quoted weight, and so the minimum fee, came from the node.
         // Re-derive it from the exact prepared bytes: the body plus a 64-byte
-        // signature, 1,024 per grant recipient and, only for a payment that
-        // creates its recipient's account, another 1,024.
-        const base = BigInt(body.length / 2 + 64), recipients = BigInt(operation?.Propose?.proposal?.Grant?.payments?.length || 0);
-        const extra = BigInt(quote?.weight ?? -1) - base - recipients * 1024n, creation = BigInt(quote?.account_creation_fee ?? 0) !== 0n;
-        const creates = !!operation?.TransferExact && extra === 1024n && (creation || BigInt(quote?.minimum_fee_rate ?? 1) === 0n);
-        if (!(extra === 0n && !creation || creates)) throw new Error("The quoted fee weight does not match the prepared transaction.");
+        // signature, 1,024 per grant recipient, 1,024 for a proposal's records
+        // and, only for a payment that creates its recipient's account or a
+        // support that creates its sender's record, another 1,024.
+        const base = BigInt(body.length / 2 + 64), recipients = BigInt(operation?.Propose?.proposal?.Grant?.payments?.length || 0), records = operation?.Propose ? 1024n : 0n;
+        const extra = BigInt(quote?.weight ?? -1) - base - recipients * 1024n - records, free = BigInt(quote?.minimum_fee_rate ?? 1) === 0n;
+        const creation = BigInt(quote?.account_creation_fee ?? 0) !== 0n, record = BigInt(quote?.record_fee ?? 0) !== 0n;
+        const creates = !!operation?.TransferExact && extra === 1024n && (creation || free) && !record;
+        const supports = !!operation?.Support && extra === 1024n && (record || free) && !creation;
+        const plain = extra === 0n && !creation && (operation?.Propose ? record || free : !record);
+        if (!(plain || creates || supports)) throw new Error("The quoted fee weight does not match the prepared transaction.");
     }
     function clearFeeAllocation(form) {
         const node = $(form.id.replace("-form", "-fee-allocation"));
@@ -1057,8 +1065,17 @@
             allocation.title = "The entire fee, including the optional extra, follows the miner/revenue split in effect when the transaction is included.";
             allocation.hidden = false;
         }
-        feeError(form, "");
+        feeError(form, scheduledChangeNote(result));
         modeButtons();
+    }
+    // A pending fee-rate increase or capacity decrease that takes effect within
+    // the transaction's lifetime leaves it valid only for the blocks before.
+    function scheduledChangeNote(result) {
+        const change = result.scheduled_change;
+        if (!change || change.valid_after !== false || !Number.isSafeInteger(change.effective_height) || !/^(0|[1-9]\d{0,159})$/.test(String(change.minimum_fee))) return "";
+        if (change.parameter === "MinimumFeeRate") return `The minimum fee rises to ${formatExactHash(change.minimum_fee)} from block ${commas(change.effective_height)}, so this transaction is valid only before that block. Add the difference as an optional extra to keep its whole lifetime.`;
+        if (change.parameter === "BlockBytes") return `Block capacity falls from block ${commas(change.effective_height)}, and this transaction will no longer fit after that block.`;
+        return "";
     }
     function feeError(form, message) {
         const node = $(form.id.replace("-form", "-fee-error"));
@@ -1649,7 +1666,7 @@
         if (name === "Auction") {
             text("gov-round", `Round ${phase.round}`);
             text("gov-title", phase.leader ? `Leader ${proposalShort(phase.leader)}` : "Auction open");
-            text("gov-subtitle", phase.leader ? "The leading proposal advances after its required lead." : "Choose the next proposal.");
+            text("gov-subtitle", phase.leader ? "The leading proposal advances after its required lead or at the auction timeout." : "Choose the next proposal.");
             text("overview-governance-title", "Auction open");
             text("overview-governance-text", phase.leader ? `Leader ${proposalShort(phase.leader)}` : "No leader");
         } else if (active) {
@@ -1960,7 +1977,7 @@
         text("guide-fees", `Transaction weight determines the minimum fee. Governance sets its rate and the miner's share. The entire fee, including any extra, currently goes ${s.settings.miner_fee_percent}% to the miner and ${100 - Number(s.settings.miner_fee_percent)}% to revenue.`);
         text("guide-proposals", "A proposal requests a grant or sets a new value for one network setting. Decision length uses blocks. Auction lead, rest and target interval use whole seconds. The miner’s fee share uses whole percentages from 0 to 100; PASS margin and the price-change limit use 0.01% steps. Block capacity uses weight; the minimum fee rate uses raw hashes per 1,024 weight.");
         text("guide-revenue-flow", "Revenue fills the gap between reserve and curve mass. This raises the reserve ratio toward 100%, making the curve flatter while keeping its current price and stash supply unchanged. Once the gap is filled, further revenue waits outside the reserve.");
-        text("guide-grant-flow", "At the start of a grant decision, PASS sets aside the proposed payments from waiting revenue, then reserve. Drawing from reserve lowers its ratio and makes the curve steeper, while the current price and stash supply stay unchanged. If PASS wins, the recipients receive those payments. If FAIL wins, its reserve and balances continue.");
+        text("guide-grant-flow", "At the start of a grant decision, PASS sets aside the proposed payments from waiting revenue, then at most half of the reserve. FAIL moves the same reserve amount to its waiting revenue. Both curves become equally steeper, while the current price and stash supply stay unchanged. If PASS wins, the recipients receive those payments. If FAIL wins, revenue refills its reserve as far as the curve allows; FAIL sales during the decision paid the steeper curve's lower price and can leave part of that amount as revenue.");
         text("network-height", commas(s.height));
         number("network-issued", s.issued);
         text("network-clock", protocolDuration(s.clock));
@@ -2962,7 +2979,7 @@
             const quote = await rpc("grant_quote", {
                 amount: amount
             });
-            if (!quote.feasible) throw new Error("Grant exceeds the available revenue and withdrawable reserve.");
+            if (!quote.feasible) throw new Error("Grant exceeds the available revenue and half of the reserve.");
             proposal = {
                 Grant: {
                     payments
@@ -3030,6 +3047,7 @@
         }
         state.tradeAll = state.trade === "redeem";
         let value = BigInt(state.tradeAll ? selected.account.shares : outcome ? outcomeCash(selected) : selected.account.ordinary);
+        let warning = "";
         if (state.trade === "deposit") {
             const identity = tradeIdentity(), snapshot = state.status.state_root, balance = value;
             try {
@@ -3062,11 +3080,17 @@
                     });
                     if (identity !== tradeIdentity() || snapshot !== state.status?.state_root || !state.ready) return;
                     checkFeeQuote(fee, extra, $("trade-form"));
+                    // Fees need cash already held in every outcome. Keep one
+                    // more minimum fee in this one, so the account can still
+                    // sell the Stash it buys or pay later.
+                    const reserve = BigInt(fee.minimum_fee);
+                    warning = "";
                     if (outcome && true) {
                         const opposite = outcome === "Pass" ? state.fail : state.pass;
                         if (!opposite?.account || BigInt(opposite.account.ordinary) < BigInt(fee.fee)) throw new Error("The other outcome needs enough hashes for the fee.");
+                        if (BigInt(opposite.account.ordinary) - BigInt(fee.fee) < reserve) warning = "This leaves the other outcome too little for another fee, which blocks later transactions until the account receives hashes.";
                     }
-                    const next = balance - BigInt(fee.fee);
+                    const next = balance - BigInt(fee.fee) - reserve;
                     if (next >= value) break;
                     value = next;
                 }
@@ -3077,6 +3101,7 @@
         }
         $("trade-amount").value = state.tradeAll ? HashstashShares.exactInput(value > 0n ? value : 0n) : exactInput(value > 0n ? value : 0n);
         quoteSoon();
+        feedback($("trade-form"), warning);
     });
     $("proposal-type").addEventListener("change", () => {
         const grant = $("proposal-type").value === "grant";

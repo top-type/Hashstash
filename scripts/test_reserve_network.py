@@ -128,7 +128,8 @@ class ReserveAudit(Audit):
             reserve, mass = int(world['reserve']), int(world['curve_mass'])
             assert 0 <= reserve <= mass
             assert (reserve == 0) == (shares == 0) == (mass == 0)
-            capacity = int(world['revenue']) + max(0, reserve - 1)
+            # Waiting revenue plus at most half of the reserve, rounded down.
+            capacity = int(world['revenue']) + reserve // 2
             assert int(world['grant_capacity']) == capacity
             # Revenue waits beside a bent curve only while a decision is open.
             if outcome is None and shares and int(world['revenue']):

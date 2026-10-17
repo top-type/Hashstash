@@ -4183,6 +4183,7 @@ fn fee_quote_json(
        "fee":quote.fee.to_str_radix(10), "minimum_fee":quote.minimum_fee.to_str_radix(10),
        "account_creation_fee":quote.account_creation_fee.to_str_radix(10),
        "grant_recipient_fee":quote.grant_recipient_fee.to_str_radix(10),
+       "record_fee":quote.record_fee.to_str_radix(10),
        "extra_fee":quote.extra_fee.to_str_radix(10),
        "miner_fee":quote.miner_fee.to_str_radix(10), "revenue_fee":quote.revenue_fee.to_str_radix(10),
        "miner_fee_percent":quote.miner_fee_percent,
@@ -4195,6 +4196,9 @@ fn fee_quote_json(
        "operation":body.operation,
        "data_hex":hex::encode(&body.data), "data_bytes":body.data.len()
     });
+    if let Some(change) = scheduled_change(s, body, &quote) {
+        value["scheduled_change"] = change;
+    }
     if matches!(
         body.operation,
         Operation::Deposit { .. } | Operation::Redeem { .. }
@@ -4204,6 +4208,53 @@ fn fee_quote_json(
         value["unfilled_input_returned"] = json!(true);
     }
     Ok(value)
+}
+
+/// A pending MinimumFeeRate or BlockBytes change that takes effect within the
+/// quoted lifetime. The activating block still uses the tip's settings and
+/// the blocks after it use the new value, under which this fee or size may no
+/// longer be valid. The quote stays exact; clients warn or defer instead.
+fn scheduled_change(
+    s: &State,
+    body: &TransactionBody,
+    quote: &crate::fees::FeeQuote,
+) -> Option<Value> {
+    let crate::state::Phase::Rest(rest) = &s.phase else {
+        return None;
+    };
+    let (parameter, new) = rest.pending?;
+    if !matches!(
+        parameter,
+        Parameter::MinimumFeeRate | Parameter::BlockBytes
+    ) {
+        return None;
+    }
+    // The first block whose scheduled clock reaches the deadline activates it.
+    let remaining = rest.until.saturating_sub(s.clock);
+    let blocks = remaining.div_ceil(s.settings.interval.max(1)).max(1);
+    let activation = s.height.saturating_add(blocks);
+    let effective = activation.saturating_add(1);
+    if effective > s.height.saturating_add(body.expiry_blocks) {
+        return None;
+    }
+    let mut settings = s.settings.clone();
+    settings.set(parameter, new);
+    let minimum = (Amount::from(quote.weight) * settings.minimum_fee_rate
+        + Amount::from(crate::fees::FEE_SCALE - 1))
+        / crate::fees::FEE_SCALE;
+    let bytes = codec::encode(&Transaction {
+        body: body.clone(),
+        signature: [0; 64],
+    })
+    .len() as u64;
+    let valid = body.fee >= minimum
+        && quote.weight <= settings.block_bytes
+        && bytes <= settings.block_bytes;
+    Some(json!({
+        "parameter": parameter, "value": new.to_string(),
+        "activation_height": activation, "effective_height": effective,
+        "minimum_fee": minimum.to_str_radix(10), "valid_after": valid
+    }))
 }
 
 fn transaction_data(max_bytes: usize, input: Option<&str>) -> Result<Vec<u8>> {
@@ -5156,6 +5207,7 @@ mod read_admission_tests {
             leader: None,
             lead_since: 0,
             replacement_height: 0,
+            displaced: Vec::new(),
         });
         s
     }
@@ -5375,6 +5427,7 @@ mod read_admission_tests {
             leader: Some([4; 32]),
             lead_since: 0,
             replacement_height: 0,
+            displaced: Vec::new(),
         });
         let auction = view(s.clone(), vec![]);
         let round = Node::read_rpc(&auction, "proposals", json!({"round":0})).unwrap();
@@ -6541,6 +6594,67 @@ mod tests {
         assert_eq!(quote["fee"], "1");
         assert_eq!(quote["minimum_fee"], "1");
     }
+    #[test]
+    fn quotes_report_a_fee_or_capacity_change_due_within_their_lifetime() {
+        // Audit F157: a two-block transaction prepared at the activation parent
+        // has only the activation block left under the old settings.
+        use crate::state::{Phase, Rest};
+        let c = Config::devnet();
+        let mut s = State::genesis(&c);
+        let interval = s.settings.interval;
+        s.height = 10;
+        s.clock = 10 * interval;
+        let body = |expiry_blocks, fee: u32| TransactionBody {
+            sender: [1; 32],
+            nonce: 0,
+            fee: fee.into(),
+            anchor: [2; 32],
+            expiry_blocks,
+            // A new recipient: 1,024 creation weight on top of the bytes.
+            operation: Operation::TransferExact {
+                recipient: [3; 32],
+                amount: 1u32.into(),
+            },
+            data: vec![],
+        };
+        let check = |s: &State, body: TransactionBody| {
+            let tx = Transaction {
+                body,
+                signature: [0; 64],
+            };
+            let quote = crate::fees::quote(&c, s, &tx).unwrap();
+            assert_eq!(quote.minimum_fee, 2u32.into());
+            scheduled_change(s, &tx.body, &quote)
+        };
+        let rest = |delay, pending| {
+            Phase::Rest(Rest {
+                until: 10 * interval + delay,
+                pending: Some(pending),
+            })
+        };
+        s.phase = rest(interval, (Parameter::MinimumFeeRate, 2));
+        let change = check(&s, body(2, 2)).unwrap();
+        assert_eq!(change["parameter"], "MinimumFeeRate");
+        assert_eq!(change["activation_height"], 11);
+        assert_eq!(change["effective_height"], 12);
+        assert_eq!(change["minimum_fee"], "3");
+        assert_eq!(change["valid_after"], false);
+        assert_eq!(check(&s, body(2, 3)).unwrap()["valid_after"], true);
+        // A one-block lifetime ends with the activation block itself.
+        assert!(check(&s, body(1, 2)).is_none());
+        // A partial interval still activates at the next block boundary.
+        s.phase = rest(interval + 1, (Parameter::MinimumFeeRate, 2));
+        assert!(check(&s, body(2, 2)).is_none());
+        assert_eq!(check(&s, body(3, 2)).unwrap()["effective_height"], 13);
+        // Other settings never invalidate a quoted fee or size.
+        s.phase = rest(interval, (Parameter::MinerFeePercent, 10));
+        assert!(check(&s, body(2, 2)).is_none());
+        let capacity = crate::config::MIN_GOVERNED_BLOCK_BYTES;
+        s.phase = rest(interval, (Parameter::BlockBytes, capacity));
+        let change = check(&s, body(2, 2)).unwrap();
+        assert_eq!(change["value"], capacity.to_string());
+        assert_eq!(change["valid_after"], false);
+    }
     fn quote_with_expiry(mut quote: Value, expiry: u64) -> Value {
         for field in [
             "recipient",
@@ -6971,6 +7085,7 @@ mod tests {
             leader: None,
             lead_since: 0,
             replacement_height: 0,
+            displaced: Vec::new(),
         });
         s.world.validate(&c, &s.issued, &s.auction_escrow).unwrap();
         (

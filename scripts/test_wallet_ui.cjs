@@ -438,8 +438,9 @@ async function harness(options = {}) {
   // default 448-byte prepared body plus its signature.
   h.fee = (params={}, size=512n) => {
     const {chain_id,tip,state_root,height,settings}=h.currentSnapshot.status;
-    const rate=BigInt(settings.minimum_fee_rate),recipients=BigInt(params.operation?.Propose?.proposal?.Grant?.payments?.length||0),weight=BigInt(size)+1024n*recipients,base=(rate*weight+1023n)/1024n,paid=params.fee===undefined?base+BigInt(params.extra_fee||'0'):BigInt(params.fee),priority=String(paid-base),data=params.data_hex||'',percent=settings.miner_fee_percent,miner=paid*BigInt(percent)/100n;
-    return {chain_id,tip,state_root,height,anchor:tip,anchor_height:height,expiry_blocks:params.expiry_blocks??2,expiry_height:String(BigInt(height)+BigInt(params.expiry_blocks??2)),sender:addr(params.sender),sender_public_key:params.sender,fee:String(paid),minimum_fee:String(base),account_creation_fee:'0',grant_recipient_fee:String(rate*recipients),extra_fee:priority,weight:String(weight),minimum_fee_rate:String(rate),miner_fee_percent:percent,miner_fee:String(miner),revenue_fee:String(paid-miner),data_hex:data,data_bytes:data.length/2};
+    // A Propose also carries 1,024 weight for its proposal and support records.
+    const rate=BigInt(settings.minimum_fee_rate),recipients=BigInt(params.operation?.Propose?.proposal?.Grant?.payments?.length||0),records=params.operation?.Propose?1n:0n,weight=BigInt(size)+1024n*(recipients+records),base=(rate*weight+1023n)/1024n,paid=params.fee===undefined?base+BigInt(params.extra_fee||'0'):BigInt(params.fee),priority=String(paid-base),data=params.data_hex||'',percent=settings.miner_fee_percent,miner=paid*BigInt(percent)/100n;
+    return {chain_id,tip,state_root,height,anchor:tip,anchor_height:height,expiry_blocks:params.expiry_blocks??2,expiry_height:String(BigInt(height)+BigInt(params.expiry_blocks??2)),sender:addr(params.sender),sender_public_key:params.sender,fee:String(paid),minimum_fee:String(base),account_creation_fee:'0',grant_recipient_fee:String(rate*recipients),record_fee:String(rate*records),extra_fee:priority,weight:String(weight),minimum_fee_rate:String(rate),miner_fee_percent:percent,miner_fee:String(miner),revenue_fee:String(paid-miner),data_hex:data,data_bytes:data.length/2};
   };
   h.transferQuote = (params={},overrides={}) => {
     const f=h.fee(params);return {...f,recipient:addr(params.recipient),public_key:params.recipient,amount:params.amount,recipient_receives:params.amount,total_debit:String(BigInt(params.amount)+BigInt(f.fee)),pending:false,...overrides};
@@ -799,6 +800,7 @@ async function run() {
   const inflated=await send(await harness(),{weight:'4096'});eq(inflated.signed,false,'an inflated weight is refused before signing');ok(inflated.feedback.includes('quoted fee weight does not match'),inflated.feedback);
   const creation=await send(await harness(),{weight:'1536',account_creation_fee:'1'});eq(creation.signed,true,'a payment that creates its recipient may add 1,024 weight: '+creation.feedback);
   const unexplained=await send(await harness(),{weight:'1536'});eq(unexplained.signed,false,'extra weight needs an account-creation charge');
+  const recorded=await send(await harness(),{weight:'1536',record_fee:'1'});eq(recorded.signed,false,'a payment never creates a governance record');
   const free=await harness();free.currentSnapshot.status.settings.minimum_fee_rate=0;await free.refresh();const zero=await send(free,{weight:'1536'});eq(zero.signed,true,'at a zero rate account creation has no charge to show: '+zero.feedback);
  }
  {

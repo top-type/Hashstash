@@ -1411,6 +1411,13 @@ impl Engine {
             weight <= settings.block_bytes,
             "prepared faucet payment exceeds block capacity"
         );
+        // A fee-rate increase or capacity decrease due within this lifetime
+        // would leave the payment only the activation block. Defer the claim
+        // rather than spend the visitor's allowance on that one chance.
+        ensure!(
+            quote["scheduled_change"]["valid_after"] != false,
+            "Faucet is waiting for a scheduled network change; try again in a few blocks"
+        );
         let envelope = wallet::UnsignedEnvelope {
             chain_id: result["chain_id"]
                 .as_str()

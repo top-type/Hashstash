@@ -463,7 +463,7 @@ fn transaction_inner(
                     parameter,
                     old,
                     new,
-                } => c.parameter_change_at(&s.frozen, *parameter, *old, *new, s.clock)?,
+                } => c.parameter_change_at(&s.frozen, *parameter, *old, *new, s.clock, s.height)?,
             }
             let id = proposal_id(&s.chain_id, *round, &b.sender, description, proposal);
             ensure!(
@@ -590,17 +590,12 @@ pub fn replenish_reserve(c: &Config, w: &mut World) -> Result<()> {
     Ok(())
 }
 
-/// Cash available for a grant. Outstanding Stash needs nonzero backing for
-/// its redemption and price arithmetic, so one raw unit remains while shares exist.
+/// Cash available for a grant: all waiting revenue and at most half of the
+/// reserve, rounded down. Both outcomes open on the drawn curve, so one grant
+/// can at most halve their reserve ratio and cannot make either outcome too
+/// steep to trade. A live reserve therefore always keeps at least one raw unit.
 pub fn grant_capacity(w: &World) -> Amount {
-    &w.revenue
-        + if w.shares.is_zero() {
-            w.reserve.clone()
-        } else if w.reserve > Amount::from(1u32) {
-            &w.reserve - 1u32
-        } else {
-            Amount::zero()
-        }
+    &w.revenue + (&w.reserve >> 1usize)
 }
 
 /// Set aside the whole grant at decision opening. Shares and curve mass remain
@@ -641,10 +636,23 @@ fn eligible(c: &Config, s: &State, p: &Proposal) -> Result<()> {
                 s.frozen.interval,
             )?;
             let activation = rounded_deadline(resolution, s.frozen.rest, s.frozen.interval)?;
-            c.parameter_change_at(&s.frozen, *parameter, *old, *new, activation)?;
+            let height = activation_height(
+                s.height,
+                s.frozen.decision_blocks,
+                s.frozen.rest,
+                s.frozen.interval,
+            );
+            c.parameter_change_at(&s.frozen, *parameter, *old, *new, activation, height)?;
         }
     }
     Ok(())
+}
+/// The block that activates a change after `blocks` decision blocks and its
+/// rest. It saturates: a change that cannot activate in range has no lifetime.
+pub(crate) fn activation_height(height: u64, blocks: u64, rest: u64, interval: u64) -> u64 {
+    height
+        .saturating_add(blocks)
+        .saturating_add(rest.div_ceil(interval.max(1)))
 }
 pub(crate) fn rounded_deadline(clock: u64, duration: u64, interval: u64) -> Result<u64> {
     ensure!(interval > 0, "zero schedule interval");
@@ -709,6 +717,14 @@ fn cancel(s: &mut State, a: &mut Auction, id: &Hash) -> Result<()> {
     }
     Ok(())
 }
+/// The most recently displaced proposal that is still active. Cancelled
+/// proposals are forgotten, so a cancelled leader never counts as having
+/// taken the lead from the proposal it displaced.
+fn displaced_incumbent(s: &State, a: &mut Auction) -> Option<Hash> {
+    a.displaced
+        .retain(|(id, _)| s.proposals.get(id).is_some_and(|p| p.refund_height.is_none()));
+    a.displaced.last().map(|(id, _)| *id)
+}
 fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
     let Phase::Auction(mut a) = s.phase.clone() else {
         return Ok(());
@@ -716,13 +732,18 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
     if s.height >= a.replacement_height {
         // A proposal that could not open now never leads. Each one is
         // cancelled when it reaches the top, so it cannot displace an
-        // eligible leader and restart that leader's lead period.
+        // eligible leader and restart that leader's lead period. After a
+        // leader is cancelled, the proposal it displaced is the incumbent.
         let best = loop {
             let Some(top) = s.ranking.last().map(|(_, id)| *id) else {
                 break None;
             };
+            let incumbent = match a.leader {
+                Some(id) => Some(id),
+                None => displaced_incumbent(s, &mut a),
+            };
             let mut candidate = top;
-            if let Some(inc) = a.leader
+            if let Some(inc) = incumbent
                 && inc != top
             {
                 let ip = s.proposals.get(&inc).context("missing auction leader")?;
@@ -741,8 +762,21 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
             cancel(s, &mut a, &candidate)?;
         };
         if best != a.leader {
+            if let Some(old) = a.leader {
+                // A strictly higher bid took the lead from an active leader.
+                a.displaced.retain(|(id, _)| *id != old);
+                a.displaced.push((old, a.lead_since));
+                a.lead_since = s.clock;
+            } else if let Some((id, since)) = a.displaced.last().copied()
+                && best == Some(id)
+            {
+                // The cancelled leader's interruption does not count.
+                a.displaced.pop();
+                a.lead_since = since;
+            } else {
+                a.lead_since = s.clock;
+            }
             a.leader = best;
-            a.lead_since = s.clock;
         }
     }
     s.phase = Phase::Auction(a.clone());
@@ -750,8 +784,15 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
         .clock
         .checked_sub(a.lead_since)
         .context("auction lead starts in the future")?;
+    let elapsed = s
+        .clock
+        .checked_sub(a.opened)
+        .context("auction opens in the future")?;
+    let timed_out = elapsed >= c.auction_timeout_for(&s.frozen)?;
+    // At the timeout the leader opens even before its lead matures, so
+    // outbidding it late wins the round instead of refunding every bid.
     if let Some(id) = a.leader
-        && led >= s.frozen.lead
+        && (led >= s.frozen.lead || timed_out)
     {
         let p = s
             .proposals
@@ -821,11 +862,7 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
             s.phase = Phase::Auction(a.clone());
         }
     }
-    let elapsed = s
-        .clock
-        .checked_sub(a.opened)
-        .context("auction opens in the future")?;
-    if elapsed >= c.auction_timeout_for(&s.frozen)? {
+    if timed_out {
         timeout(s, a.round);
     }
     Ok(())
@@ -1195,7 +1232,8 @@ fn finish_block_with_fills(
         && s.clock >= r.until
     {
         if let Some((p, v)) = r.pending {
-            c.parameter_change_at(&parent.frozen, p, parent.frozen.get(p), v, s.clock)?;
+            let old = parent.frozen.get(p);
+            c.parameter_change_at(&parent.frozen, p, old, v, s.clock, s.height)?;
             s.settings.set(p, v);
         }
         c.validate_governance_settings(&s.settings)?;
@@ -1212,6 +1250,7 @@ fn finish_block_with_fills(
             leader: None,
             lead_since: s.clock,
             replacement_height: s.height + 1,
+            displaced: Vec::new(),
         });
         s.rounds.insert(
             s.last_round.to_be_bytes().to_vec(),
@@ -1447,11 +1486,13 @@ mod reserve_model_tests {
         panic!("initial rest did not end");
     }
     fn signed(s: &State, operation: Operation, offset: u64) -> Transaction {
+        // A proposal or new support record adds one record weight.
         let fee = match &operation {
             Operation::Propose {
                 proposal: Proposal::Grant { payments },
                 ..
-            } => 1 + payments.len() as u32,
+            } => 2 + payments.len() as u32,
+            Operation::Propose { .. } | Operation::Support { .. } => 2,
             _ => 1,
         };
         crypto::sign(
@@ -1700,7 +1741,8 @@ mod reserve_model_tests {
         assert!(grant_reserve(&c, &mut w, &(&capacity + 1u32)).is_err());
         assert_eq!(w.root(), before);
         grant_reserve(&c, &mut w, &capacity).unwrap();
-        assert_eq!(w.reserve, 1u32.into());
+        // The largest grant leaves half the reserve, rounded up.
+        assert_eq!(w.reserve, &s.world.reserve - (&s.world.reserve >> 1usize));
         assert_eq!(w.curve_mass, s.world.curve_mass);
         w.validate(&c, &s.issued, &s.auction_escrow).unwrap();
     }
@@ -1866,7 +1908,7 @@ mod reserve_model_tests {
         assert!(grant_reserve(&c, &mut world, &(&capacity + 1u32)).is_err());
         assert_eq!(before, world.root());
         grant_reserve(&c, &mut world, &capacity).unwrap();
-        assert_eq!(world.reserve, 1u32.into());
+        assert_eq!(world.reserve, &s.world.reserve - (&s.world.reserve >> 1usize));
         let reserved = world.root();
         assert!(grant_reserve(&c, &mut world, &1u32.into()).is_err());
         assert_eq!(reserved, world.root());
@@ -1889,15 +1931,17 @@ mod reserve_model_tests {
         assert!(corrupt.validate(&c).is_err());
     }
     #[test]
-    fn grant_capacity_retains_only_nonzero_stash_backing() {
+    fn grant_capacity_draws_at_most_half_the_reserve() {
         let c = config();
+        // Waiting revenue and at most half of the reserve, rounded down.
         for (reserve, revenue, shares, expected) in [
             (0u32, 0u32, 0u32, 0u32),
             (0, 5, 0, 5),
             (1, 0, 1, 0),
             (1, 5, 1, 5),
             (2, 0, 1, 1),
-            (19, 0, 1, 18),
+            (19, 0, 1, 9),
+            (19, 3, 1, 12),
         ] {
             let mut w = World {
                 reserve: reserve.into(),
@@ -1908,7 +1952,7 @@ mod reserve_model_tests {
             assert_eq!(grant_capacity(&w), expected.into());
             if expected > 0 {
                 grant_reserve(&c, &mut w, &expected.into()).unwrap();
-                assert_eq!(w.reserve, u32::from(shares > 0).into());
+                assert_eq!(w.reserve, (reserve - reserve / 2).into());
                 assert!(w.revenue.is_zero());
             }
         }

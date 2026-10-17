@@ -695,7 +695,7 @@ fn governed_minimum_rate_changes_only_after_rest_and_leaves_signed_fee_exact() {
             },
             support: 10u32.into(),
         },
-        1,
+        2,
         0,
         0,
     );
@@ -751,7 +751,8 @@ fn governed_minimum_rate_changes_only_after_rest_and_leaves_signed_fee_exact() {
 #[test]
 fn prepaid_grant_settlement_leaves_capacity_but_new_miner_still_counts() {
     let mut c = config();
-    c.initial.block_bytes = 2048;
+    // Room for the one-payout proposal, its payout and its proposal record.
+    c.initial.block_bytes = 2048 + fees::RECORD_WEIGHT;
     c.validate().unwrap();
     let mut s = decision(&c, true);
     let buy = sign(
@@ -786,19 +787,24 @@ fn prepaid_grant_settlement_leaves_capacity_but_new_miner_still_counts() {
     let both = step(&c, &s, &MINER, 1, std::slice::from_ref(&payment));
     assert_eq!(balance(&both, &BOB), 1_000u32.into());
     assert_eq!(balance(&both, &MINER), Amount::from(1u32) + quote.miner_fee);
-    // A separate new payment recipient plus the new miner still exceeds 2048.
-    let new_account = transfer(&c, &s, key(&[64; 32]), 1, 2, 0, 0);
-    assert!(
-        consensus::execute(
-            &c,
-            &s,
-            &s.root(),
-            &key(&MINER),
-            &1u32.into(),
-            &[new_account]
-        )
-        .is_err()
-    );
+    // A separate new payment recipient plus the new miner still exceeds the
+    // capacity once the payment carries enough data.
+    let mut padded = transfer(&c, &s, key(&[64; 32]), 1, 3, 0, 0).body;
+    padded.data = vec![0; 1_000];
+    let new_account = crypto::sign(&padded, &ALICE).unwrap();
+    let weight = fees::quote(&c, &s, &new_account).unwrap().weight;
+    assert!(weight <= c.initial.block_bytes);
+    assert!(weight + fees::ACCOUNT_WEIGHT > c.initial.block_bytes);
+    let error = consensus::execute(
+        &c,
+        &s,
+        &s.root(),
+        &key(&MINER),
+        &1u32.into(),
+        &[new_account],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("capacity"), "{error}");
     // A grant recipient can also mine; its new account counts only once as miner weight.
     let paid_miner = step(&c, &s, &BOB, 1, std::slice::from_ref(&payment));
     assert_eq!(

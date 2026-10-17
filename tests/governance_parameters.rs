@@ -80,7 +80,8 @@ fn parameters_accept_direct_values_and_zero_where_defined() {
             MAX_GOVERNED_DURATION / c.initial.interval,
         ),
         (Parameter::Interval, 61),
-        (Parameter::Interval, c.daa_half_life),
+        // The longest interval that still leaves the 60-second lead room.
+        (Parameter::Interval, c.auction_timeout - 2 * c.initial.lead),
         (Parameter::MinimumFeeRate, 0),
         (Parameter::MinimumFeeRate, 2),
         (Parameter::MaxPriceChangeBps, 1),
@@ -115,6 +116,8 @@ fn parameters_accept_direct_values_and_zero_where_defined() {
         (Parameter::Rest, u64::MAX - 1),
         // A step beyond the ASERT half life starves the next target.
         (Parameter::Interval, c.daa_half_life + 1),
+        (Parameter::Interval, c.daa_half_life),
+        (Parameter::Interval, c.auction_timeout - 2 * c.initial.lead + 1),
         (Parameter::Interval, 86_400),
         (Parameter::Interval, 1 << 40),
         // Pinned prices can never produce a PASS lead.
@@ -151,6 +154,43 @@ fn parameters_accept_direct_values_and_zero_where_defined() {
 }
 
 #[test]
+fn interval_increases_recheck_the_lead_and_decision_bounds() {
+    // Audit F028: two separately valid decisions must not combine into a lead
+    // that a late leader cannot reach or a decision far beyond 2^22 seconds.
+    let c = Config::devnet();
+    let interval = c.initial.interval;
+    let mut lead = c.initial.clone();
+    lead.lead = (c.auction_timeout - interval) / 2;
+    c.parameter_change(&c.initial, Parameter::Lead, c.initial.lead, lead.lead)
+        .unwrap();
+    let mut decision = c.initial.clone();
+    decision.decision_blocks = MAX_GOVERNED_DURATION / interval;
+    c.parameter_change(
+        &c.initial,
+        Parameter::DecisionBlocks,
+        c.initial.decision_blocks,
+        decision.decision_blocks,
+    )
+    .unwrap();
+    for settings in [&lead, &decision] {
+        for longer in [interval + 2, 900] {
+            assert!(
+                c.parameter_change(settings, Parameter::Interval, interval, longer)
+                    .is_err(),
+                "{longer}"
+            );
+        }
+        // A shorter interval only helps, so settings outside the bounds can
+        // still move back toward them.
+        c.parameter_change(settings, Parameter::Interval, interval, 1)
+            .unwrap();
+    }
+    // The same longer interval is fine with the default lead and decision.
+    c.parameter_change(&c.initial, Parameter::Interval, interval, 900)
+        .unwrap();
+}
+
+#[test]
 fn deadlines_are_checked_through_the_whole_height_range() {
     let c = Config::testnet();
     let settings = &c.initial;
@@ -165,17 +205,18 @@ fn deadlines_are_checked_through_the_whole_height_range() {
         + settings.rest
         + 2 * settings.interval;
     let latest = u64::MAX - span;
-    let change = |clock| {
+    let change = |clock, height| {
         c.parameter_change_at(
             settings,
             Parameter::DecisionBlocks,
             settings.decision_blocks,
             decision,
             clock,
+            height,
         )
     };
-    change(latest).unwrap();
-    assert!(change(latest + 1).is_err());
+    change(latest, 0).unwrap();
+    assert!(change(latest + 1, 0).is_err());
     // The same value is valid without a clock, then stale late in the range.
     c.parameter_change(
         settings,
@@ -184,7 +225,48 @@ fn deadlines_are_checked_through_the_whole_height_range() {
         decision,
     )
     .unwrap();
-    assert!(change(latest + settings.interval).is_err());
+    assert!(change(latest + settings.interval, 0).is_err());
+    // Audit F012: only the remaining heights add clock. Each block advances
+    // both, so the same change stays valid on its schedule.
+    for height in [1, 1_000, c.max_height] {
+        let clock = latest + settings.interval * height;
+        change(clock, height).unwrap();
+        assert!(change(clock + 1, height).is_err());
+    }
+}
+
+#[test]
+fn a_clock_range_shorter_than_the_height_range_still_allows_governance() {
+    // Audit F012: interval * max_height overflowed for every interval above
+    // one, so this valid genesis rejected every parameter proposal.
+    let mut c = Config::testnet();
+    c.max_height = i64::MAX as u64;
+    c.validate().unwrap();
+    let s = &c.initial;
+    for (parameter, new) in [
+        (Parameter::MinerFeePercent, 40),
+        (Parameter::PassMarginBps, 100),
+        (Parameter::Rest, s.rest - 1),
+        (Parameter::Interval, s.interval - 1),
+        (Parameter::DecisionBlocks, s.decision_blocks - 1),
+    ] {
+        c.parameter_change_at(s, parameter, s.get(parameter), new, 15, 1)
+            .unwrap();
+    }
+    // A change may not reach further past the clock range than now.
+    for (parameter, new) in [
+        (Parameter::Rest, s.rest + 1),
+        (Parameter::Interval, s.interval + 1),
+        (Parameter::DecisionBlocks, s.decision_blocks + 1),
+    ] {
+        let error = c
+            .parameter_change_at(s, parameter, s.get(parameter), new, 15, 1)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("overflow before the height limit"),
+            "{parameter:?}: {error}"
+        );
+    }
 }
 
 #[test]
@@ -207,7 +289,7 @@ fn rest_cannot_reach_the_deadline_overflow_window_after_activation() {
         c.validate_governance_settings_at(&changed, activation)
             .unwrap();
         assert!(
-            c.parameter_change_at(settings, Parameter::Rest, settings.rest, rest, activation)
+            c.parameter_change_at(settings, Parameter::Rest, settings.rest, rest, activation, 0)
                 .is_err()
         );
     }
@@ -217,6 +299,7 @@ fn rest_cannot_reach_the_deadline_overflow_window_after_activation() {
         settings.rest,
         MAX_GOVERNED_DURATION,
         activation,
+        0,
     )
     .unwrap();
 }

@@ -17,7 +17,8 @@ fn config() -> Config {
     c.initial.rest = 60;
     c.initial.lead = 30;
     c.initial.decision_blocks = 12;
-    c.initial.block_bytes = 4096;
+    // Three payouts and the proposal record, with room for the signed bytes.
+    c.initial.block_bytes = 4096 + fees::RECORD_WEIGHT;
     c.validate().unwrap();
     c
 }
@@ -181,11 +182,13 @@ fn grant_execution_weight_is_fixed_even_for_existing_recipients() {
     let entries = payments(&[2000, 3000, 4000]);
     let tx = propose(&s, entries.clone());
     let quote = fees::quote(&c, &s, &tx).unwrap();
+    // Three payouts and the proposal's own record.
     assert_eq!(
         quote.weight,
-        codec::encode(&tx).len() as u64 + 3 * fees::ACCOUNT_WEIGHT
+        codec::encode(&tx).len() as u64 + 3 * fees::ACCOUNT_WEIGHT + fees::RECORD_WEIGHT
     );
     assert_eq!(quote.grant_recipient_fee, 3u32.into());
+    assert_eq!(quote.record_fee, 1u32.into());
     assert!(quote.account_creation_fee.is_zero());
     let seed = sign(
         &s,
@@ -223,13 +226,23 @@ fn aggregate_grant_cannot_exceed_funds_by_splitting_payments() {
 }
 
 #[test]
-fn multi_recipient_grant_can_spend_more_than_half_the_reserve() {
+fn multi_recipient_grant_can_spend_half_the_reserve_and_no_more() {
+    // Audit F010: both outcomes open on the drawn curve, so one grant may
+    // draw at most half of the reserve. A larger draw used to be eligible,
+    // up to all but one atom, and could leave both outcomes untradeable.
     let c = config();
-    let entries = payments(&[300_000, 300_000]);
-    let opening = active(&c, entries.clone());
+    let start = funded(&c);
+    let proposal = propose(&start, payments(&[300_000, 300_000]));
+    let s = step(&c, &start, key(181), 0, &[cover_fee(&c, &start, proposal)]);
+    assert!(s.decision_id().is_none());
+    assert!(s.proposals.iter().all(|(_, p)| p.refund_height.is_some()));
+    let entries = payments(&[250_000, 250_000]);
+    let opening = activate(&c, start, entries.clone());
     let escrow = &opening.alternative.as_ref().unwrap().grant_escrow;
-    assert_eq!(escrow, &Amount::from(600_000u32));
-    assert!(escrow * 2u32 > opening.world.reserve);
+    assert_eq!(escrow, &Amount::from(500_000u32));
+    for world in [&opening.world, opening.alternative.as_ref().unwrap()] {
+        assert!(&world.reserve * 2u32 >= world.curve_mass);
+    }
     let closing = before_resolution(&c, opening, true);
     let settled = step(&c, &closing, key(181), 0, &[]);
     for payment in entries {
@@ -331,7 +344,7 @@ fn grant_recipient_miner_still_consumes_one_account_creation_weight() {
             amount: 1u32.into(),
         },
         0,
-        vec![0; 3300],
+        vec![0; 3300 + fees::RECORD_WEIGHT as usize],
     );
     let quote = fees::quote(&c, &closing, &tx).unwrap();
     assert!(quote.weight <= c.initial.block_bytes);
@@ -372,7 +385,8 @@ fn grant_lists_use_existing_transaction_bytes_and_prepaid_block_weight() {
     c.initial.block_bytes = 16_384;
     let s = funded(&c);
     let (entries, fits, exceeds_weight) = capacity_grants(&c, &s);
-    assert_eq!(entries.len(), 15);
+    // Sixteen weight units of 1,024 less the signed bytes and proposal record.
+    assert_eq!(entries.len(), 14);
     assert!(codec::encode(&exceeds_weight).len() < c.transaction_bytes(&s.settings));
     assert!(fees::quote(&c, &s, &exceeds_weight).unwrap().weight > c.initial.block_bytes);
     step(&c, &s, key(181), 0, &[fits]);

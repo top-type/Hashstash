@@ -35,7 +35,8 @@ id_rsa*
 id_ed25519*
 /credentials*
 /wallet*.json
-/peer*.json
+# Transport identities (peer-keygen output, chain.peer-key.json) and peer books.
+*peer*.json
 /node.env
 /network.json
 *.exe

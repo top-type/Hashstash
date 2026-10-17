@@ -34,6 +34,27 @@ MemoryMax=1G
 TasksMax=128
 RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Containment after a memory-safety bug in a native dependency (bundled SQLite,
+# secp256k1). Unlisted system calls fail with EPERM instead of killing the node.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+PrivateIPC=true
+RemoveIPC=true
+# Crash dumps could copy the peer identity or Stratum password.
+LimitCORE=0
 SyslogIdentifier=hashstash
 
 [Install]

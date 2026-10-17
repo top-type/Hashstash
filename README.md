@@ -95,6 +95,8 @@ HASHSTASH_TEST_BINARY="$PWD/target/release/hashstash" python3 -B -m unittest dis
 
 The committed browser bundle supports normal builds and frontend tests. See [browser build instructions](ui/vendor/README.md) to regenerate it, and [validation](docs/VALIDATION.md) for test coverage and limits.
 
+Consensus encoding depends on exact dependency behaviour: `bincode`, `serde` and `num-bigint` are pinned exactly in `Cargo.toml`, and frozen byte vectors in `tests/codec_vectors.rs` and `tests/commitment_encoding.rs` must pass unchanged after any dependency update. Before a release, audit the committed `Cargo.lock` (for example with `cargo audit` or `cargo deny check advisories`). Two advisories are currently accepted: bincode 1.x is unmaintained (RUSTSEC-2025-0141), and any replacement must reproduce the same bytes; the SQLite bundled by `libsqlite3-sys` 0.30.1 (3.46) predates the 2025 fixes for CVE-2025-29087 and CVE-2025-6965, which need attacker-controlled SQL, while Hashstash executes only constant SQL text with bound parameters. Upgrade `rusqlite` when its new bundled SQLite has been reviewed.
+
 ## Reference
 
 - [Protocol specification](docs/SPECIFICATION.md), [consensus encoding](docs/CONSENSUS.md), [reserve mathematics](docs/RESERVE.md)

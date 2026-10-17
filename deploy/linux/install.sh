@@ -2,17 +2,30 @@
 set -euo pipefail
 umask 077
 fail() { printf 'Hashstash install: %s\n' "$*" >&2; exit 1; }
+# The only accepted release; it must equal Cargo.toml (tests/operator_files.rs).
+version=0.42.0
 usage() {
-    cat <<'EOF'
-Usage: sudo bash install.sh --binary /path/hashstash --sha256 HEX \
-  --genesis /path/network.json --genesis-sha256 HEX --node-env /path/node.env \
-  [--stratum-password-file /path/mining-password] \
+    cat <<EOF
+Usage: sudo bash install.sh --binary /path/hashstash --sha256 HEX \\
+  --genesis /path/network.json --genesis-sha256 HEX --node-env /path/node.env \\
+  [--stratum-password-file /path/mining-password] \\
   [--peer-key-file /path/dedicated-peer-identity.json] [--check]
 
-Installs Hashstash 0.41.0 without starting or enabling it. Existing files must
+Installs Hashstash $version without starting or enabling it. Existing files must
 match exactly; configuration and databases are never replaced. --check performs
 read-only input validation and needs no root privileges.
 EOF
+}
+# Another account must not be able to rename or replace entries below this directory.
+private_directory() {
+    local path=$1 owner mode
+    while true; do
+        read -r owner mode < <(stat -c '%u %a' -- "$path") || return 1
+        [[ "$owner" == 0 || "$owner" == "$EUID" ]] || return 1
+        (( (8#$mode & 8#022) == 0 || (8#$mode & 8#1000) )) || return 1
+        [[ "$path" != / ]] || return 0
+        path=$(dirname -- "$path")
+    done
 }
 binary= sha256= genesis= genesis_sha256= node_env= password_file= peer_key_file= check=false
 while (( $# )); do
@@ -37,7 +50,7 @@ done
 sha256=${sha256,,}
 genesis_sha256=${genesis_sha256,,}
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-for command in sha256sum realpath cmp stat install awk od tr; do command -v "$command" >/dev/null || fail "missing command: $command"; done
+for command in sha256sum realpath cmp cp mktemp stat install awk od tr; do command -v "$command" >/dev/null || fail "missing command: $command"; done
 binary=$(realpath -e -- "$binary")
 genesis=$(realpath -e -- "$genesis")
 node_env=$(realpath -e -- "$node_env")
@@ -46,6 +59,24 @@ if [[ -n "$peer_key_file" ]]; then
     [[ -f "$peer_key_file" && ! -L "$peer_key_file" ]] || fail 'peer identity source must be a regular file, not a symlink'
     peer_key_file=$(realpath -e -- "$peer_key_file")
 fi
+# Hash, validate, execute and install only private copies. A source replaced
+# after this point cannot reach root execution or the hash-named binary pin.
+stage_parent=$(realpath -e -- "${TMPDIR:-/tmp}")
+private_directory "$stage_parent" || fail "staging directory is modifiable by another account: $stage_parent (set TMPDIR)"
+stage=$(mktemp -d "$stage_parent/hashstash-install.XXXXXXXX")
+trap 'rm -rf -- "$stage"' EXIT
+[[ $(stat -c '%u:%a' -- "$stage") == "$EUID:700" ]] || fail 'staging directory is not private'
+stage_input() {
+    [[ -f "$1" ]] || fail "input is not a regular file: $1"
+    # Mode is preserved for the executable and owner-only identity checks.
+    cp --no-dereference --preserve=mode -- "$1" "$stage/$2"
+    [[ -f "$stage/$2" && ! -L "$stage/$2" ]] || fail "input changed while copying: $1"
+}
+stage_input "$binary" hashstash; binary=$stage/hashstash
+stage_input "$genesis" network.json; genesis=$stage/network.json
+stage_input "$node_env" node.env; node_env=$stage/node.env
+if [[ -n "$password_file" ]]; then stage_input "$password_file" stratum-password; password_file=$stage/stratum-password; fi
+if [[ -n "$peer_key_file" ]]; then stage_input "$peer_key_file" peer-identity.json; peer_key_file=$stage/peer-identity.json; fi
 peer_key_destination= stratum_enabled=true
 while IFS= read -r line || [[ -n "$line" ]]; do
     line=${line%$'\r'}
@@ -62,19 +93,23 @@ actual=$(sha256sum -- "$binary"); actual=${actual%% *}
 [[ $(od -An -tx1 -N4 -- "$binary" | tr -d ' \n') == 7f454c46 ]] || fail 'binary must be a Linux ELF executable'
 actual=$(sha256sum -- "$genesis"); actual=${actual%% *}
 [[ "$actual" == "$genesis_sha256" ]] || fail 'shared genesis SHA256 does not match'
-[[ $("$binary" --version) == 'hashstash 0.41.0' ]] || fail 'expected Hashstash 0.41.0 Linux binary'
+[[ $("$binary" --version) == "hashstash $version" ]] || fail "expected Hashstash $version Linux binary"
 bash "$script_dir/run-node.sh" check "$node_env" "$binary" "$genesis" "$password_file" "$peer_key_file"
 printf 'Shared genesis SHA256: %s\n' "$(sha256sum -- "$genesis" | awk '{print $1}')"
 "$binary" network --config "$genesis"
 if [[ "$check" == true ]]; then exit 0; fi
 (( EUID == 0 )) || fail 'installation requires root; use --check for read-only validation'
 for command in getent useradd flock systemctl; do command -v "$command" >/dev/null || fail "missing command: $command"; done
-# Serialize repeat installs. No service state is changed by this script.
-exec 9>/run/lock/hashstash-install.lock
+# Serialize repeat installs. No service state is changed by this script. The
+# lock lives in root-only /run, not world-writable /run/lock, so no other
+# account can pre-create, hold or redirect it; it is never truncated.
+lock=/run/hashstash-install.lock
+private_directory /run || fail 'refusing install lock: /run is modifiable by another account'
+[[ ! -L "$lock" && ( ! -e "$lock" || -f "$lock" ) ]] || fail "refusing unexpected install lock: $lock"
+exec 9>>"$lock"
 flock -n 9 || fail 'another Hashstash installer is running'
-binary_dest="/opt/hashstash/0.41.0-$sha256/hashstash"
-pointer=$(mktemp)
-trap 'rm -f -- "$pointer"' EXIT
+binary_dest="/opt/hashstash/$version-$sha256/hashstash"
+pointer=$stage/binary.path
 printf '%s\n' "$binary_dest" > "$pointer"
 sources=("$binary" "$genesis" "$node_env" "$pointer" "$script_dir/run-node.sh" "$script_dir/hashstash.service")
 destinations=("$binary_dest" /etc/hashstash/network.json /etc/hashstash/node.env /etc/hashstash/binary.path /usr/local/libexec/hashstash/run-node.sh /etc/systemd/system/hashstash.service)
@@ -126,6 +161,11 @@ for index in "${!sources[@]}"; do
         install -o "${owners[$index]}" -g "${groups[$index]}" -m "${modes[$index]}" -- "${sources[$index]}" "$destination"
     fi
 done
+# The pinned paths must hold exactly the recorded hashes.
+actual=$(sha256sum -- "$binary_dest"); actual=${actual%% *}
+[[ "$actual" == "$sha256" ]] || fail "installed binary SHA256 does not match: $binary_dest"
+actual=$(sha256sum -- /etc/hashstash/network.json); actual=${actual%% *}
+[[ "$actual" == "$genesis_sha256" ]] || fail 'installed genesis SHA256 does not match: /etc/hashstash/network.json'
 systemctl daemon-reload
 printf 'Installed. Service was not enabled or started; existing chain data was preserved.\n'
 printf 'After configuring the host firewall: sudo systemctl enable --now hashstash\n'

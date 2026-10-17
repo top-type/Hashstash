@@ -30,14 +30,21 @@ PEER_KEY_FILE=/etc/hashstash/peer-identity.json
 PEER_PINS=192.0.2.2:18481=$other
 EOF
 }
+stage_tmpdir=
 check() {
-  bash "$repo/deploy/linux/install.sh" --binary "$binary" --sha256 "$binary_hash" \
+  TMPDIR=${stage_tmpdir:-${TMPDIR:-/tmp}} bash "$repo/deploy/linux/install.sh" --binary "$binary" --sha256 "$binary_hash" \
     --genesis "$fixture/network.json" --genesis-sha256 "$genesis_hash" \
     --node-env "$fixture/node.env" "$@" --check > "$fixture/out" 2> "$fixture/err"
 }
 pass() { check "$@" || { cat "$fixture/err" >&2; exit 1; }; checks=$((checks+1)); }
 reject() { if check "$@"; then printf 'Unexpected install-check acceptance\n' >&2; exit 1; fi; checks=$((checks+1)); }
 base; pass --peer-key-file "$fixture/peer.json"
+# Inputs are staged privately; a directory other accounts can rename into is refused.
+mkdir -- "$fixture/shared"; chmod 777 -- "$fixture/shared"
+stage_tmpdir=$fixture/shared; reject --peer-key-file "$fixture/peer.json"
+grep -Fq 'staging directory is modifiable by another account' "$fixture/err"; checks=$((checks+1))
+chmod 1777 -- "$fixture/shared"; pass --peer-key-file "$fixture/peer.json"; stage_tmpdir=
+[[ -z $(ls -A -- "$fixture/shared") ]]; checks=$((checks+1))
 chmod 644 "$fixture/peer.json"; reject --peer-key-file "$fixture/peer.json"; chmod 600 "$fixture/peer.json"
 ln -s "$fixture/peer.json" "$fixture/peer-link.json"; reject --peer-key-file "$fixture/peer-link.json"
 "$binary" keygen --out "$fixture/wallet.json" > "$fixture/keygen.out"

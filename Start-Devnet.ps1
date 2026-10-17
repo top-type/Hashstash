@@ -11,7 +11,7 @@ if (-not (Test-Path -LiteralPath $hashstashExe)) {
     $hashstashExe = Join-Path $PSScriptRoot 'bin/hashstash.exe'
 }
 if (-not (Test-Path -LiteralPath $hashstashExe)) {
-    throw 'Build the node with cargo build --release first.'
+    throw 'Build the node with cargo build --release --locked first.'
 }
 New-Item -ItemType Directory -Path $DataDirectory -Force | Out-Null
 $networkFile = Join-Path $DataDirectory 'network.json'

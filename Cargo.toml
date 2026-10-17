@@ -176,6 +176,10 @@ name = "selection_budget"
 required-features = ["test-fixtures"]
 
 [[test]]
+name = "side_branch_capacity"
+required-features = ["test-fixtures"]
+
+[[test]]
 name = "snapshot_history"
 required-features = ["test-fixtures"]
 

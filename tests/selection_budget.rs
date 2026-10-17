@@ -261,8 +261,56 @@ fn repeated_state_failures_have_a_linear_per_sender_operation_budget() {
     );
     assert_eq!(result.signatures_checked, candidates.len());
     assert_eq!(result.transactions, valid);
+    // Each failing candidate was tried, so its sender is not left undecided.
+    assert!(result.exhausted_senders.is_empty());
     append(&mut chain, result.transactions);
     assert!(chain.tip_state().account(&missing, None).is_none());
+}
+
+#[test]
+fn only_candidates_their_budget_never_reached_leave_a_sender_undecided() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut chain = Chain::open(&directory.path().join("chain.db"), configuration()).unwrap();
+    for _ in 0..5 {
+        append(&mut chain, vec![]);
+    }
+    let other_secret = [63; 32];
+    let other = crypto::public_key(&other_secret).unwrap();
+    let fund = Operation::TransferExact {
+        recipient: other,
+        amount: 5000u32.into(),
+    };
+    let fund = signed(&chain, &SECRET, 0, fund, 0);
+    append(&mut chain, vec![fund]);
+    let with_fee = |secret: &[u8; 32], nonce: u64, amount: u32, fee: u32| {
+        let recipient = crypto::public_key(secret).unwrap();
+        let operation = Operation::TransferExact {
+            recipient,
+            amount: amount.into(),
+        };
+        let mut body = signed(&chain, secret, nonce, operation, 0).body;
+        body.fee = fee.into();
+        crypto::sign(&body, secret).unwrap()
+    };
+    // A high-fee zero transfer that always fails is retried after every
+    // acceptance of the other sender until its own sender's budget is spent;
+    // that sender's valid, lowest-fee alternative at the same nonce is then
+    // never attempted.
+    let failing = with_fee(&SECRET, 1, 0, 1000);
+    let alternative = self_payment(&chain, &SECRET, 1);
+    let others: Vec<_> = (0..16)
+        .map(|nonce| with_fee(&other_secret, nonce, 1, 100))
+        .collect();
+    let mut candidates = vec![failing, alternative];
+    candidates.extend(others.iter().cloned());
+    let result = chain.select_transactions(key(), &candidates, 256).unwrap();
+    assert_eq!(result.transactions, others);
+    assert!(result.budget_exhausted);
+    assert_eq!(
+        result.exhausted_senders,
+        std::collections::BTreeSet::from([key()])
+    );
+    assert!(!result.truncated);
 }
 
 #[test]

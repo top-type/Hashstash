@@ -451,10 +451,11 @@
         return !!decision && !!state.status && BigInt(state.status.height) - BigInt(decision.started_height) + 1n >= BigInt(decision.blocks);
     }
     // consensus::pass_beats_fail: one block's exact PASS/FAIL comparison.
+    // Mirrors consensus::pass_beats_fail: a world without Stash has no
+    // market price, so a block with either world empty adds no PASS lead.
     function passBeatsFail(pass, fail, marginBps) {
         const passShares = BigInt(pass.shares), failShares = BigInt(fail.shares);
-        if (passShares === 0n) return false;
-        if (failShares === 0n) return BigInt(pass.curve_mass) !== 0n;
+        if (passShares === 0n || failShares === 0n) return false;
         return BigInt(pass.curve_mass) * failShares * 10000n > BigInt(fail.curve_mass) * passShares * (10000n + BigInt(marginBps));
     }
     function phaseName() {

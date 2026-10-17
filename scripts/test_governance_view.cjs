@@ -87,6 +87,10 @@ async function run() {
   assert.equal(status(), 'FAIL decided', 'equal closing prices add no PASS block, so 8 of 16 already means FAIL even though 8 of 15 leads'); checks++;
   decision.blocks = 15; decision.started_height = s.status.height - 14; decision.leading_blocks = 7; s.governance.pass.curve_mass = '10000'; await h.refresh();
   assert.equal(status(), 'PASS decided', 'the mirror case: 7 of 14 trails, but the closing block makes 8 of 15'); checks++;
+  const failWorld = { ...s.governance.world }; Object.assign(s.governance.world, { reserve: '0', shares: '0', curve_mass: '0' }); await h.refresh();
+  assert.equal(status(), 'FAIL decided', 'an empty FAIL world adds no PASS block, whatever PASS trades at'); checks++;
+  Object.assign(s.governance.world, failWorld); await h.refresh();
+  assert.equal(status(), 'PASS decided'); checks++;
   s.governance.pass.grant_escrow = '9'; await h.refresh();
   assert.equal(status(), 'FAIL decided', 'an underfunded grant cannot be decided for PASS'); checks++;
   s.governance.pass.grant_escrow = '10';

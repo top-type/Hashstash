@@ -442,6 +442,8 @@ fn governance_evidence_contributions_same_height_proposals_and_reorg() {
         .unwrap();
     assert_eq!(event["txid"], hex::encode(refund_id));
     assert_eq!(event["amount"], "10");
+    // The refund credits its signer, so history shows it as received.
+    assert_eq!(event["role"], "recipient");
     let target = a.status().unwrap()["height"].as_u64().unwrap() + 3;
     while b.status().unwrap()["height"].as_u64().unwrap() < target {
         a.submit_block(b.mine(1_000_000).unwrap()).unwrap();

@@ -734,6 +734,16 @@ impl Chain {
             .map(|(_, state)| state.clone());
         checkpoint.or_else(|| self.cache.borrow().states.get(hash).cloned())
     }
+    /// The newest retained active-chain checkpoint at or below `height`, at most
+    /// about half that height's depth below it. Like cached_state, it never replays.
+    pub fn checkpoint_at_or_below(&self, height: u64) -> Option<(Hash, Arc<State>)> {
+        self.checkpoints
+            .borrow()
+            .range(..=height)
+            .next_back()
+            .filter(|(height, (hash, _))| self.hash_at_height(**height) == Some(*hash))
+            .map(|(_, (hash, state))| (*hash, state.clone()))
+    }
     /// Recently validated or reconstructed states outside the active-chain checkpoints.
     pub fn cached_state_count(&self) -> usize {
         self.cache.borrow().states.len()

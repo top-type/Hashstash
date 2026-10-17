@@ -22,7 +22,8 @@ fn governance_snapshot_keeps_current_proposal_after_more_than_one_page_of_histor
                 data: Vec::new(),
                 sender: public,
                 nonce,
-                fee: 1u32.into(),
+                // Covers a proposal's record weight at the preset rate.
+                fee: 2u32.into(),
                 anchor: hashstash::codec::block_hash(
                     &hashstash::codec::genesis_block(&config).unwrap(),
                 ),

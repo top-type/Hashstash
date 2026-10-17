@@ -3,7 +3,7 @@
 use hashstash::{
     codec,
     config::Config,
-    consensus, crypto,
+    consensus, crypto, fees,
     state::{Phase, RoundStatus, State, proposal_id},
     types::*,
 };
@@ -509,6 +509,46 @@ fn the_leader_at_the_auction_timeout_wins_instead_of_a_refunded_timeout() {
         s.rounds.get(&0u64.to_be_bytes()).unwrap().status,
         RoundStatus::Won(id) if id == last
     ));
+}
+
+/// Audit F046. Proposal and support records are never pruned, yet a
+/// Parameter proposal and a new support record paid only their byte weight,
+/// less per permanent record than creating an account.
+#[test]
+fn new_governance_records_pay_record_weight() {
+    let c = config(4, 4 * Config::testnet().initial.interval);
+    let s = funded(&c);
+    let rate = Amount::from(c.initial.minimum_fee_rate);
+    let (tx, id) = propose(&s, &ATTACKER, 91, miner_fee(40), 1);
+    let quote = fees::quote(&c, &s, &tx).unwrap();
+    let bytes = codec::encode(&tx).len() as u64;
+    assert_eq!(quote.weight, bytes + fees::RECORD_WEIGHT);
+    assert_eq!(quote.record_fee, rate);
+    // A fee that covers only the bytes no longer suffices.
+    let mut cheap = tx.clone();
+    cheap.body.fee = (Amount::from(bytes) * &rate + Amount::from(fees::FEE_SCALE - 1))
+        / Amount::from(fees::FEE_SCALE);
+    let cheap = crypto::sign(&cheap.body, &ATTACKER).unwrap();
+    assert!(consensus::execute(&c, &s, &s.root(), &key(&ATTACKER), &0u32.into(), &[cheap]).is_err());
+    let s = step(&c, &s, &[tx]);
+    // A new supporter creates a record; the proposer adds to its own.
+    for (secret, record) in [(&DEFENDER, true), (&ATTACKER, false)] {
+        let tx = sign(
+            &s,
+            secret,
+            4,
+            Operation::Support {
+                round: 0,
+                proposal: id,
+                amount: 1u32.into(),
+            },
+        );
+        let quote = fees::quote(&c, &s, &tx).unwrap();
+        let bytes = codec::encode(&tx).len() as u64;
+        let weight = if record { fees::RECORD_WEIGHT } else { 0 };
+        assert_eq!(quote.weight, bytes + weight);
+        assert_eq!(quote.record_fee.is_zero(), !record);
+    }
 }
 
 /// Audit F109: ties keep the incumbent, otherwise the smallest proposal ID

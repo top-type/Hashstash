@@ -73,8 +73,12 @@ async function run(){
   await h.get('trade-max').click();ok(f.feedback.textContent.includes('other outcome'),'max explains insufficient opposite fee balance');
  }
  {
-  const h=await setup('1000','400'),f=h.get('trade-form');await h.get('trade-max').click();await h.timersDue();await h.timersDue();eq(amounts.parseAmount(f.elements.amount.value),'999','PASS max reserves exact fee');eq(h.calls.filter(c=>c.body.method==='fee_quote').at(-1).body.params.operation.Deposit.outcome,'Pass');
-  f.elements.outcome.value='Fail';await h.get('trade-outcome').fire('change');await h.get('trade-max').click();await h.timersDue();await h.timersDue();eq(amounts.parseAmount(f.elements.amount.value),'399','FAIL max uses own smaller balance');
+  // Audit F161: max also keeps one minimum fee, so the account can still sell.
+  const h=await setup('1000','400'),f=h.get('trade-form');await h.get('trade-max').click();await h.timersDue();await h.timersDue();eq(amounts.parseAmount(f.elements.amount.value),'998','PASS max reserves the exact fee and one follow-up fee');eq(h.calls.filter(c=>c.body.method==='fee_quote').at(-1).body.params.operation.Deposit.outcome,'Pass');eq(f.feedback.textContent,'','enough cash remains for another fee in FAIL');
+  f.elements.outcome.value='Fail';await h.get('trade-outcome').fire('change');await h.get('trade-max').click();await h.timersDue();await h.timersDue();eq(amounts.parseAmount(f.elements.amount.value),'398','FAIL max uses own smaller balance');
+ }
+ {
+  const h=await setup('1000','1'),f=h.get('trade-form');await h.get('trade-max').click();await h.timersDue();await h.timersDue();eq(amounts.parseAmount(f.elements.amount.value),'998');ok(f.feedback.textContent.includes('other outcome too little for another fee'),'max warns when the other outcome keeps no follow-up fee');
  }
  {
   const h=await setup('0','2'),f=h.get('trade-form');await h.tradeTab('redeem');await h.get('trade-max').click();await h.timersDue();await h.timersDue();eq(h.get('trade-submit').disabled,true,'withdrawal proceeds cannot fund fees before the batch clears');await f.fire('submit');eq(h.wallet.length,0);

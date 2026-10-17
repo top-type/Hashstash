@@ -25,8 +25,8 @@ async function run(){
  }
  {
   const h=await setup();await h.fill([[h.keys[1],'10'],[h.keys[0],'20'],[h.keys[1],'30']]);eq(h.get('grant-total').textContent,'0.06 hash');
-  const latest=h.calls.filter(c=>c.body.method==='fee_quote').at(-1);assert.ok(latest,h.get('propose-fee-error').textContent||h.get('wallet-feedback').textContent);const quote=latest.body.params;eq(quote.operation.Propose.proposal.Grant.payments.map(p=>[bytes(p.recipient).toString('hex'),p.amount]),[[h.keys[0],'20'],[h.keys[1],'40']],'duplicate destinations combine and sort before the fee quote');eq(h.calls.filter(c=>c.body.method==='grant_quote').at(-1).body.params,{amount:'60'});eq(h.get('propose-fee-quote').textContent,'0.003 hash');
-  await h.form.requestSubmit();eq(broadcasts(h).length,1,h.form.feedback.textContent);const raw=bytes(broadcasts(h)[0].body.params.raw),body=raw.subarray(0,-64),decoded=h.browserApi.decodeUnsigned({format:'hashstash-unsigned-anchor',chain_id:h.currentSnapshot.status.chain_id,body:body.toString('hex')});eq(JSON.parse(JSON.stringify(decoded.operation.Propose.proposal.Grant.payments)),[{recipient:h.keys[0],amount:'20'},{recipient:h.keys[1],amount:'40'}]);eq(decoded.fee,'3','grant payments do not include the proposal fee');
+  const latest=h.calls.filter(c=>c.body.method==='fee_quote').at(-1);assert.ok(latest,h.get('propose-fee-error').textContent||h.get('wallet-feedback').textContent);const quote=latest.body.params;eq(quote.operation.Propose.proposal.Grant.payments.map(p=>[bytes(p.recipient).toString('hex'),p.amount]),[[h.keys[0],'20'],[h.keys[1],'40']],'duplicate destinations combine and sort before the fee quote');eq(h.calls.filter(c=>c.body.method==='grant_quote').at(-1).body.params,{amount:'60'});eq(h.get('propose-fee-quote').textContent,'0.004 hash','two payouts and the proposal record each add 1,024 weight');
+  await h.form.requestSubmit();eq(broadcasts(h).length,1,h.form.feedback.textContent);const raw=bytes(broadcasts(h)[0].body.params.raw),body=raw.subarray(0,-64),decoded=h.browserApi.decodeUnsigned({format:'hashstash-unsigned-anchor',chain_id:h.currentSnapshot.status.chain_id,body:body.toString('hex')});eq(JSON.parse(JSON.stringify(decoded.operation.Propose.proposal.Grant.payments)),[{recipient:h.keys[0],amount:'20'},{recipient:h.keys[1],amount:'40'}]);eq(decoded.fee,'4','grant payments do not include the proposal fee');
   const tag=sha(Buffer.from('Hashstash/anchor-only-transaction')),digest=sha(Buffer.concat([tag,tag,body]));ok(h.noble.schnorr.verify(raw.subarray(-64),digest,bytes(decoded.sender)),'the real browser signs all payouts with the current domain');
  }
  for(const advance of [0,2]){
@@ -46,19 +46,24 @@ async function run(){
   const h=await setup();await h.fill([[h.keys[0],'20'],[h.keys[1],'40']]);await h.grantRow(0).remove.click();eq(h.get('grant-payments').children.length,1);eq(h.get('grant-total').textContent,exactInput('40')+' hash');eq(h.grantRow(0).remove.disabled,true);await h.grantRow(0).remove.click();eq(h.get('grant-payments').children.length,1,'the last recipient cannot be removed');for(let i=1;i<32;i++)await h.get('grant-add').click();eq(h.get('grant-payments').children.length,32);eq(h.get('grant-add').disabled,false,'no independent recipient-count cutoff');
  }
  {
-  const h=await setup(),keys=Array.from({length:32},(_,i)=>h.browserApi.publicKey(BigInt(i+10).toString(16).padStart(64,'0'))).sort();await h.fill(keys.map(key=>[key,'1']));await h.form.requestSubmit();eq(broadcasts(h).length,1,h.form.feedback.textContent);const raw=bytes(broadcasts(h)[0].body.params.raw),decoded=h.browserApi.decodeUnsigned({format:'hashstash-unsigned-anchor',chain_id:h.currentSnapshot.status.chain_id,body:raw.subarray(0,-64).toString('hex')});eq(decoded.operation.Propose.proposal.Grant.payments.length,32);eq(decoded.fee,String(Math.ceil((raw.length+32*1024)/1024)),'upfront recipient weight scales beyond sixteen');ok(Number(decoded.fee)>=33);
+  const h=await setup(),keys=Array.from({length:32},(_,i)=>h.browserApi.publicKey(BigInt(i+10).toString(16).padStart(64,'0'))).sort();await h.fill(keys.map(key=>[key,'1']));await h.form.requestSubmit();eq(broadcasts(h).length,1,h.form.feedback.textContent);const raw=bytes(broadcasts(h)[0].body.params.raw),decoded=h.browserApi.decodeUnsigned({format:'hashstash-unsigned-anchor',chain_id:h.currentSnapshot.status.chain_id,body:raw.subarray(0,-64).toString('hex')});eq(decoded.operation.Propose.proposal.Grant.payments.length,32);eq(decoded.fee,String(Math.ceil((raw.length+33*1024)/1024)),'upfront recipient weight scales beyond sixteen, plus the proposal record');ok(Number(decoded.fee)>=33);
  }
  {
   const h=await setup();h.currentSnapshot.status.settings.block_bytes=2048;await h.refresh();await h.fill([[h.keys[0],'1'],[h.keys[1],'1']]);await h.form.requestSubmit();eq(broadcasts(h).length,0,'a smaller block weight can reject even two recipients');ok(h.get('propose-fee-error').textContent.includes('block capacity'));
  }
  {
-  const h=await setup();h.fee=h.nominalFee;h.currentSnapshot.status.settings.block_bytes=2048;await h.refresh();h.form.elements.description.value='a'.repeat(2000);await h.fill([[h.keys[0],'1']]);await h.form.requestSubmit();eq(broadcasts(h).length,0,'signed bytes must fit the block capacity even when the node understates quote weight');ok(h.form.feedback.textContent.includes('block capacity'));
+  // The understated quote still counts the payout and proposal record weight.
+  const h=await setup();h.fee=p=>h.nominalFee(p,0n);h.currentSnapshot.status.settings.block_bytes=2048;await h.refresh();h.form.elements.description.value='a'.repeat(2000);await h.fill([[h.keys[0],'1']]);await h.form.requestSubmit();eq(broadcasts(h).length,0,'signed bytes must fit the block capacity even when the node understates quote weight');ok(h.form.feedback.textContent.includes('block capacity'));
  }
  for(const invalid of ['0','-1','1.0000000000000000001','9'.repeat(160)]){
   const h=await setup();await h.fill([[h.keys[0],'1']]);h.grantRow().amount.value=invalid;await h.grantRow().amount.fire('input');await h.timersDue();await h.form.requestSubmit();eq(broadcasts(h).length,0,'invalid exact amount cannot sign');
  }
  for(const fee of [undefined,'0','1','3','1.5']){
   const h=await setup(),original=h.fee;h.fee=p=>({...original(p),grant_recipient_fee:fee});await h.fill([[h.keys[0],'20'],[h.keys[1],'40']]);await h.form.requestSubmit();eq(broadcasts(h).length,0,'incorrect or missing grant recipient charge cannot sign');ok(h.get('propose-fee-error').textContent.includes('fee'));
+ }
+ // Audit F046: every proposal pays 1,024 weight for its permanent records.
+ for(const fee of [undefined,'0','2']){
+  const h=await setup(),original=h.fee;h.fee=p=>({...original(p),record_fee:fee});await h.fill([[h.keys[0],'20'],[h.keys[1],'40']]);await h.form.requestSubmit();eq(broadcasts(h).length,0,'incorrect or missing proposal record charge cannot sign');ok(h.get('propose-fee-error').textContent.includes('fee'));
  }
  {
   const h=await setup();h.handlers.grant_quote=()=>response({result:{feasible:false}});await h.fill([[h.keys[0],'20'],[h.keys[1],'40']]);await h.form.requestSubmit();eq(broadcasts(h).length,0,'an infeasible aggregate cannot be proposed');ok(h.form.feedback.textContent.includes('available revenue'));

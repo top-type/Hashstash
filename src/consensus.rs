@@ -1479,11 +1479,13 @@ mod reserve_model_tests {
         panic!("initial rest did not end");
     }
     fn signed(s: &State, operation: Operation, offset: u64) -> Transaction {
+        // A proposal or new support record adds one record weight.
         let fee = match &operation {
             Operation::Propose {
                 proposal: Proposal::Grant { payments },
                 ..
-            } => 1 + payments.len() as u32,
+            } => 2 + payments.len() as u32,
+            Operation::Propose { .. } | Operation::Support { .. } => 2,
             _ => 1,
         };
         crypto::sign(

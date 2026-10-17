@@ -4177,6 +4177,7 @@ fn fee_quote_json(
        "fee":quote.fee.to_str_radix(10), "minimum_fee":quote.minimum_fee.to_str_radix(10),
        "account_creation_fee":quote.account_creation_fee.to_str_radix(10),
        "grant_recipient_fee":quote.grant_recipient_fee.to_str_radix(10),
+       "record_fee":quote.record_fee.to_str_radix(10),
        "extra_fee":quote.extra_fee.to_str_radix(10),
        "miner_fee":quote.miner_fee.to_str_radix(10), "revenue_fee":quote.revenue_fee.to_str_radix(10),
        "miner_fee_percent":quote.miner_fee_percent,

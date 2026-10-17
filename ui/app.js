@@ -997,7 +997,7 @@
         if (result.tip !== state.status.tip || result.state_root !== state.status.state_root || result.height !== state.status.height) throw new QuoteRefreshPending("Updating quote for the latest block.");
     }
     function checkFeeQuote(result, extra, form, operation = null) {
-        for (const field of [ "fee", "minimum_fee", "account_creation_fee", "grant_recipient_fee", "extra_fee", "weight", "minimum_fee_rate" ]) if (typeof result[field] !== "string" || !/^(0|[1-9]\d{0,159})$/.test(result[field])) throw new Error("Invalid fee quote.");
+        for (const field of [ "fee", "minimum_fee", "account_creation_fee", "grant_recipient_fee", "record_fee", "extra_fee", "weight", "minimum_fee_rate" ]) if (typeof result[field] !== "string" || !/^(0|[1-9]\d{0,159})$/.test(result[field])) throw new Error("Invalid fee quote.");
         if (result.chain_id !== state.status.chain_id) throw new Error("Fee quote belongs to a different network.");
         checkQuoteSnapshot(result);
         if (result.anchor !== state.status.tip || String(result.anchor_height) !== String(state.status.height) || String(result.expiry_blocks) !== String(transactionExpiry(form)) || BigInt(result.expiry_height) !== BigInt(state.status.height) + BigInt(transactionExpiry(form))) throw new Error("Fee quote does not match the transaction lifetime.");
@@ -1013,6 +1013,9 @@
         if (weight > BigInt(transactionByteLimit())) throw new Error("Transaction exceeds the block capacity.");
         if (price !== BigInt(state.status.settings.minimum_fee_rate) || price > 18446744073709551615n) throw new Error("Minimum fee rate changed. Refresh for the current rate.");
         if (BigInt(result.minimum_fee) !== (price * weight + 1023n) / 1024n || creation !== 0n && (creation !== price || weight < 1024n)) throw new Error("Invalid fee quote weight.");
+        // A new proposal or support record carries 1,024 weight at the same rate.
+        const record = BigInt(result.record_fee);
+        if (record !== 0n && (record !== price || weight < 1024n) || operation?.Propose && record !== price || operation && !operation.Propose && !operation.Support && record !== 0n) throw new Error("Invalid governance record fee.");
         const grantFee=BigInt(result.grant_recipient_fee);
         const grantCount=operation?.Propose?.proposal?.Grant?.payments?.length || 0;
         if(grantFee!==price*BigInt(grantCount) || grantFee>BigInt(result.minimum_fee) || weight < BigInt(grantCount)*1024n || grantCount && creation!==0n)throw new Error("Invalid grant recipient fee.");
@@ -1028,12 +1031,16 @@
     function checkPreparedWeight(body, quote, operation) {
         // The quoted weight, and so the minimum fee, came from the node.
         // Re-derive it from the exact prepared bytes: the body plus a 64-byte
-        // signature, 1,024 per grant recipient and, only for a payment that
-        // creates its recipient's account, another 1,024.
-        const base = BigInt(body.length / 2 + 64), recipients = BigInt(operation?.Propose?.proposal?.Grant?.payments?.length || 0);
-        const extra = BigInt(quote?.weight ?? -1) - base - recipients * 1024n, creation = BigInt(quote?.account_creation_fee ?? 0) !== 0n;
-        const creates = !!operation?.TransferExact && extra === 1024n && (creation || BigInt(quote?.minimum_fee_rate ?? 1) === 0n);
-        if (!(extra === 0n && !creation || creates)) throw new Error("The quoted fee weight does not match the prepared transaction.");
+        // signature, 1,024 per grant recipient, 1,024 for a proposal's records
+        // and, only for a payment that creates its recipient's account or a
+        // support that creates its sender's record, another 1,024.
+        const base = BigInt(body.length / 2 + 64), recipients = BigInt(operation?.Propose?.proposal?.Grant?.payments?.length || 0), records = operation?.Propose ? 1024n : 0n;
+        const extra = BigInt(quote?.weight ?? -1) - base - recipients * 1024n - records, free = BigInt(quote?.minimum_fee_rate ?? 1) === 0n;
+        const creation = BigInt(quote?.account_creation_fee ?? 0) !== 0n, record = BigInt(quote?.record_fee ?? 0) !== 0n;
+        const creates = !!operation?.TransferExact && extra === 1024n && (creation || free) && !record;
+        const supports = !!operation?.Support && extra === 1024n && (record || free) && !creation;
+        const plain = extra === 0n && !creation && (operation?.Propose ? record || free : !record);
+        if (!(plain || creates || supports)) throw new Error("The quoted fee weight does not match the prepared transaction.");
     }
     function clearFeeAllocation(form) {
         const node = $(form.id.replace("-form", "-fee-allocation"));
@@ -3031,6 +3038,7 @@
         }
         state.tradeAll = state.trade === "redeem";
         let value = BigInt(state.tradeAll ? selected.account.shares : outcome ? outcomeCash(selected) : selected.account.ordinary);
+        let warning = "";
         if (state.trade === "deposit") {
             const identity = tradeIdentity(), snapshot = state.status.state_root, balance = value;
             try {
@@ -3063,11 +3071,17 @@
                     });
                     if (identity !== tradeIdentity() || snapshot !== state.status?.state_root || !state.ready) return;
                     checkFeeQuote(fee, extra, $("trade-form"));
+                    // Fees need cash already held in every outcome. Keep one
+                    // more minimum fee in this one, so the account can still
+                    // sell the Stash it buys or pay later.
+                    const reserve = BigInt(fee.minimum_fee);
+                    warning = "";
                     if (outcome && true) {
                         const opposite = outcome === "Pass" ? state.fail : state.pass;
                         if (!opposite?.account || BigInt(opposite.account.ordinary) < BigInt(fee.fee)) throw new Error("The other outcome needs enough hashes for the fee.");
+                        if (BigInt(opposite.account.ordinary) - BigInt(fee.fee) < reserve) warning = "This leaves the other outcome too little for another fee, which blocks later transactions until the account receives hashes.";
                     }
-                    const next = balance - BigInt(fee.fee);
+                    const next = balance - BigInt(fee.fee) - reserve;
                     if (next >= value) break;
                     value = next;
                 }
@@ -3078,6 +3092,7 @@
         }
         $("trade-amount").value = state.tradeAll ? HashstashShares.exactInput(value > 0n ? value : 0n) : exactInput(value > 0n ? value : 0n);
         quoteSoon();
+        feedback($("trade-form"), warning);
     });
     $("proposal-type").addEventListener("change", () => {
         const grant = $("proposal-type").value === "grant";

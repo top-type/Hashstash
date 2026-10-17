@@ -876,28 +876,40 @@ fn verify_automatic_fee(
         .checked_add(grant_weight)
         .context("transaction weight overflow")?;
     let reported_weight = quoted("weight")?;
-    // Account creation still consumes weight when its governed fee is zero.
-    // Infer its presence from the only two valid weights, then verify the fee.
-    let creates_account = reported_weight != Amount::from(base_weight);
-    let weight = if creates_account {
-        ensure!(
-            matches!(&body.operation, Operation::TransferExact { recipient, .. } if *recipient != body.sender),
-            "invalid account creation weight quote"
-        );
-        base_weight
-            .checked_add(fees::ACCOUNT_WEIGHT)
-            .context("transaction weight overflow")?
-    } else {
-        base_weight
+    // Account and record creation still consume weight when the governed fee
+    // is zero. A Propose always creates its records; whether a recipient
+    // account or the sender's support record exists is known only to the
+    // node, so infer that from the only two valid weights, then verify fees.
+    let extra_weight = reported_weight != Amount::from(base_weight);
+    let creates_record = match &body.operation {
+        Operation::Propose { .. } => true,
+        Operation::Support { .. } => extra_weight,
+        _ => false,
+    };
+    let creates_account = extra_weight && !creates_record;
+    ensure!(
+        !creates_account
+            || matches!(&body.operation, Operation::TransferExact { recipient, .. } if *recipient != body.sender),
+        "invalid account creation weight quote"
+    );
+    let weight = base_weight
+        .checked_add(if creates_account { fees::ACCOUNT_WEIGHT } else { 0 })
+        .and_then(|n| n.checked_add(if creates_record { fees::RECORD_WEIGHT } else { 0 }))
+        .context("transaction weight overflow")?;
+    let charge = |created: bool| {
+        if created {
+            price.clone()
+        } else {
+            Amount::zero()
+        }
     };
     ensure!(
-        creation
-            == if creates_account {
-                price.clone()
-            } else {
-                Amount::zero()
-            },
+        creation == charge(creates_account),
         "invalid account creation fee quote"
+    );
+    ensure!(
+        quoted("record_fee")? == charge(creates_record),
+        "invalid governance record fee quote"
     );
     let minimum = (Amount::from(weight) * &price + Amount::from(fees::FEE_SCALE - 1))
         / Amount::from(fees::FEE_SCALE);
@@ -1968,7 +1980,7 @@ mod tests {
                 }
                 body.fee = exact;
             };
-            let quote = json!({"minimum_fee_rate":"100","weight":weight.to_string(),"minimum_fee":minimum.to_string(),"account_creation_fee":creation.to_string(),"grant_recipient_fee":"0","extra_fee":"3","fee":body.fee.to_string()});
+            let quote = json!({"minimum_fee_rate":"100","weight":weight.to_string(),"minimum_fee":minimum.to_string(),"account_creation_fee":creation.to_string(),"grant_recipient_fee":"0","record_fee":"0","extra_fee":"3","fee":body.fee.to_string()});
             assert!(verify_automatic_fee(&body, &quote, &status, &extra).is_ok());
             assert!(verify_automatic_fee(&body, &Value::Null, &status, &extra).is_err());
             assert!(verify_automatic_fee(&body, &quote, &Value::Null, &extra).is_err());
@@ -1983,6 +1995,7 @@ mod tests {
                 "minimum_fee",
                 "account_creation_fee",
                 "grant_recipient_fee",
+                "record_fee",
                 "extra_fee",
                 "fee",
                 "minimum_fee_rate",
@@ -2034,7 +2047,7 @@ mod tests {
         let status = json!({"fee_policy":{"minimum_fee_rate":rate.to_string()}});
         let quote = json!({"minimum_fee_rate":rate.to_string(),"weight":weight.to_string(),
             "minimum_fee":body.fee.to_string(),"account_creation_fee":"0","grant_recipient_fee":"0",
-            "extra_fee":"0","fee":body.fee.to_string()});
+            "record_fee":"0","extra_fee":"0","fee":body.fee.to_string()});
         let breakdown = verify_automatic_fee(&body, &quote, &status, &Amount::zero()).unwrap();
         assert_eq!(breakdown.minimum, body.fee);
         assert_eq!(breakdown.rate, Amount::from(rate));
@@ -2098,7 +2111,7 @@ mod tests {
                     + creation_weight;
                 let quote = json!({"minimum_fee_rate":"0","weight":weight.to_string(),
                     "minimum_fee":"0","account_creation_fee":"0","grant_recipient_fee":"0",
-                    "extra_fee":extra.to_string(),"fee":extra.to_string()});
+                    "record_fee":"0","extra_fee":extra.to_string(),"fee":extra.to_string()});
                 verify_automatic_fee(&body, &quote, &status, &extra.into()).unwrap();
                 for (field, value) in [
                     ("weight", (weight + 1).to_string()),
@@ -2186,7 +2199,8 @@ mod tests {
                 signature: [0; 64],
             })
             .len() as u64
-                + 40 * fees::ACCOUNT_WEIGHT;
+                + 40 * fees::ACCOUNT_WEIGHT
+                + fees::RECORD_WEIGHT;
             let minimum = Amount::from((weight * 100).div_ceil(fees::FEE_SCALE));
             if body.fee == minimum {
                 break (weight, minimum);
@@ -2194,10 +2208,62 @@ mod tests {
             body.fee = minimum;
         };
         let status = json!({"fee_policy":{"minimum_fee_rate":"100"}});
-        let mut quote = json!({"minimum_fee_rate":"100","weight":weight.to_string(),"minimum_fee":minimum.to_string(),"account_creation_fee":"0","grant_recipient_fee":"4000","extra_fee":"0","fee":body.fee.to_string()});
+        let mut quote = json!({"minimum_fee_rate":"100","weight":weight.to_string(),"minimum_fee":minimum.to_string(),"account_creation_fee":"0","grant_recipient_fee":"4000","record_fee":"100","extra_fee":"0","fee":body.fee.to_string()});
         assert!(verify_automatic_fee(&body, &quote, &status, &0u32.into()).is_ok());
-        quote["grant_recipient_fee"] = json!("100");
+        for (field, value) in [("grant_recipient_fee", "100"), ("record_fee", "0")] {
+            let mut altered = quote.clone();
+            altered[field] = json!(value);
+            assert!(verify_automatic_fee(&body, &altered, &status, &0u32.into()).is_err());
+        }
+        // Audit F046: a Propose always pays for its proposal record.
+        quote["weight"] = json!((weight - fees::RECORD_WEIGHT).to_string());
         assert!(verify_automatic_fee(&body, &quote, &status, &0u32.into()).is_err());
+    }
+
+    #[test]
+    fn automatic_support_fee_accepts_record_weight_only_with_its_charge() {
+        // Audit F046: a new support record pays record weight; adding to the
+        // sender's existing record does not. Only the node knows which.
+        let status = json!({"fee_policy":{"minimum_fee_rate":"100"}});
+        for record in [0, fees::RECORD_WEIGHT] {
+            let mut body = TransactionBody {
+                sender: crypto::public_key(&[6; 32]).unwrap(),
+                nonce: 0,
+                fee: 0u32.into(),
+                anchor: [38; 32],
+                expiry_blocks: 100,
+                data: vec![],
+                operation: Operation::Support {
+                    round: 0,
+                    proposal: [3; 32],
+                    amount: 1u32.into(),
+                },
+            };
+            let (weight, minimum) = loop {
+                let weight = hashstash::codec::encode(&hashstash::types::Transaction {
+                    body: body.clone(),
+                    signature: [0; 64],
+                })
+                .len() as u64
+                    + record;
+                let minimum = Amount::from((weight * 100).div_ceil(fees::FEE_SCALE));
+                if body.fee == minimum {
+                    break (weight, minimum);
+                }
+                body.fee = minimum;
+            };
+            let charge = if record == 0 { "0" } else { "100" };
+            let quote = json!({"minimum_fee_rate":"100","weight":weight.to_string(),"minimum_fee":minimum.to_string(),"account_creation_fee":"0","grant_recipient_fee":"0","record_fee":charge,"extra_fee":"0","fee":body.fee.to_string()});
+            verify_automatic_fee(&body, &quote, &status, &0u32.into()).unwrap();
+            for (field, value) in [
+                ("record_fee", if record == 0 { "100" } else { "0" }),
+                ("account_creation_fee", "100"),
+            ] {
+                let mut altered = quote.clone();
+                altered[field] = json!(value);
+                assert!(verify_automatic_fee(&body, &altered, &status, &0u32.into()).is_err());
+            }
+        }
     }
 
     #[test]

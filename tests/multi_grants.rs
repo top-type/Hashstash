@@ -17,7 +17,8 @@ fn config() -> Config {
     c.initial.rest = 60;
     c.initial.lead = 30;
     c.initial.decision_blocks = 12;
-    c.initial.block_bytes = 4096;
+    // Three payouts and the proposal record, with room for the signed bytes.
+    c.initial.block_bytes = 4096 + fees::RECORD_WEIGHT;
     c.validate().unwrap();
     c
 }
@@ -181,11 +182,13 @@ fn grant_execution_weight_is_fixed_even_for_existing_recipients() {
     let entries = payments(&[2000, 3000, 4000]);
     let tx = propose(&s, entries.clone());
     let quote = fees::quote(&c, &s, &tx).unwrap();
+    // Three payouts and the proposal's own record.
     assert_eq!(
         quote.weight,
-        codec::encode(&tx).len() as u64 + 3 * fees::ACCOUNT_WEIGHT
+        codec::encode(&tx).len() as u64 + 3 * fees::ACCOUNT_WEIGHT + fees::RECORD_WEIGHT
     );
     assert_eq!(quote.grant_recipient_fee, 3u32.into());
+    assert_eq!(quote.record_fee, 1u32.into());
     assert!(quote.account_creation_fee.is_zero());
     let seed = sign(
         &s,
@@ -341,7 +344,7 @@ fn grant_recipient_miner_still_consumes_one_account_creation_weight() {
             amount: 1u32.into(),
         },
         0,
-        vec![0; 3300],
+        vec![0; 3300 + fees::RECORD_WEIGHT as usize],
     );
     let quote = fees::quote(&c, &closing, &tx).unwrap();
     assert!(quote.weight <= c.initial.block_bytes);
@@ -382,7 +385,8 @@ fn grant_lists_use_existing_transaction_bytes_and_prepaid_block_weight() {
     c.initial.block_bytes = 16_384;
     let s = funded(&c);
     let (entries, fits, exceeds_weight) = capacity_grants(&c, &s);
-    assert_eq!(entries.len(), 15);
+    // Sixteen weight units of 1,024 less the signed bytes and proposal record.
+    assert_eq!(entries.len(), 14);
     assert!(codec::encode(&exceeds_weight).len() < c.transaction_bytes(&s.settings));
     assert!(fees::quote(&c, &s, &exceeds_weight).unwrap().weight > c.initial.block_bytes);
     step(&c, &s, key(181), 0, &[fits]);

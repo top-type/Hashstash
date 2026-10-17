@@ -199,7 +199,9 @@ The transaction signs one exact fee. Its minimum is:
 ```text
 weight = signed transaction bytes + execution_weight
 execution_weight = 1024 for a transfer to a new account
-                 = 1024 * payment_count for a grant proposal
+                 = 1024 for a parameter proposal
+                 = 1024 * (payment_count + 1) for a grant proposal
+                 = 1024 for a Support that creates the sender's support record
                  = 0 otherwise
 minimum_fee = ceil(weight * governed_minimum_fee_rate / 1024)
 require signed_fee >= minimum_fee
@@ -207,7 +209,7 @@ miner_fee = floor(signed_fee * miner_fee_percent / 100)
 revenue_fee = signed_fee - miner_fee
 ```
 
-The entire signed fee is charged. If an earlier transaction has already created a transfer recipient, its creation weight and required minimum can fall but the signed payment stays unchanged. Grant proposal execution weight is fixed per recipient, whether or not that account exists. The proposal fee is not refunded when a grant loses or never activates, or when recipients receive accounts before settlement. This fee is separate from refundable auction support. Its miner share goes to the proposal's inclusion miner; no further fee is deducted from payouts. An optional extra is a quote-builder input, not a separately signed amount. The minimum rate can be zero. Empty or full blocks do not change it. Allocation conserves each fee exactly, including rounding.
+The entire signed fee is charged. If an earlier transaction has already created a transfer recipient, its creation weight and required minimum can fall but the signed payment stays unchanged. Grant proposal execution weight is fixed per recipient, whether or not that account exists. Proposal and support records stay in consensus state permanently, so every proposal also pays 1,024 weight for its proposal record and first support record, and a Support pays it when the sender has no support record for that proposal yet; adding to an existing record does not. Like account creation, the Support charge depends on the state before the transaction. The proposal fee is not refunded when a grant loses or never activates, or when recipients receive accounts before settlement. This fee is separate from refundable auction support. Its miner share goes to the proposal's inclusion miner; no further fee is deducted from payouts. An optional extra is a quote-builder input, not a separately signed amount. The minimum rate can be zero. Empty or full blocks do not change it. Allocation conserves each fee exactly, including rounding.
 
 Node policy selects executable transactions by miner fee per weight, respecting nonce dependencies. At a zero miner share, fee-ranking ties use transaction IDs. Other valid transaction selections remain consensus-valid. The governed body limit also bounds transaction weight, including prepaid grant execution, and new mining-account weight. Only mandatory grant settlement writes are exempt from this weight limit; their number was bounded by the proposal’s admitted bytes and prepaid execution weight. There is no separate recipient-count limit. A complete signed proposal may use the including block’s available byte and weight capacity. There is no separate transaction-size setting. Maintained presets start with 16 KiB of capacity; governance can set a different representable capacity. Transport and API admission apply separate resource limits. Block framing and any mining-account creation also consume capacity. During governance, one logical payment-account creation counts once.
 

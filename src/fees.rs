@@ -1,10 +1,19 @@
 //! Exact transaction fees with a governed minimum price per 1024 weight units.
-use crate::{codec, config::Config, state::State, types::*};
+use crate::{
+    codec,
+    config::Config,
+    state::{State, support_key},
+    types::*,
+};
 use anyhow::{Result, ensure};
 use num_traits::Zero;
 
 pub const FEE_SCALE: u64 = 1024;
 pub const ACCOUNT_WEIGHT: u64 = 1024;
+/// Execution weight for the governance records a transaction creates: a
+/// proposal with its first support record, or a new support record. Like
+/// accounts, they stay in every node's state, so they pay for it in advance.
+pub const RECORD_WEIGHT: u64 = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FeeQuote {
@@ -13,6 +22,8 @@ pub struct FeeQuote {
     pub account_creation_fee: Amount,
     /// Fixed prepaid settlement work for every grant recipient.
     pub grant_recipient_fee: Amount,
+    /// Fixed charge for a new proposal or support record.
+    pub record_fee: Amount,
     /// Signed exact full charge, including any voluntary extra.
     pub fee: Amount,
     pub extra_fee: Amount,
@@ -88,17 +99,35 @@ impl<'a> PreparedTransaction<'a> {
             }
             _ => false,
         };
+        // Proposal and support records are never pruned. A repeated Support
+        // only adds to the sender's existing record.
+        let creates_record = match self.operation() {
+            Operation::Propose { .. } => true,
+            Operation::Support {
+                round, proposal, ..
+            } => s
+                .supports
+                .get(&support_key(*round, proposal, &t.body.sender))
+                .is_none(),
+            _ => false,
+        };
         let grant_weight = grant_recipients
             .checked_mul(ACCOUNT_WEIGHT)
             .ok_or_else(|| anyhow::anyhow!("grant settlement weight overflow"))?;
         let weight = u64::try_from(self.encoded_len())?
             .checked_add(if creates_account { ACCOUNT_WEIGHT } else { 0 })
+            .and_then(|n| n.checked_add(if creates_record { RECORD_WEIGHT } else { 0 }))
             .and_then(|n| n.checked_add(grant_weight))
             .ok_or_else(|| anyhow::anyhow!("transaction weight overflow"))?;
         let rate = Amount::from(s.settings.minimum_fee_rate);
         let minimum_fee = (Amount::from(weight) * &rate + Amount::from(FEE_SCALE - 1)) / FEE_SCALE;
         c.check_amount(&minimum_fee)?;
         let account_creation_fee = if creates_account {
+            rate.clone()
+        } else {
+            Amount::zero()
+        };
+        let record_fee = if creates_record {
             rate.clone()
         } else {
             Amount::zero()
@@ -118,6 +147,7 @@ impl<'a> PreparedTransaction<'a> {
             minimum_fee,
             account_creation_fee,
             grant_recipient_fee: rate * grant_recipients,
+            record_fee,
             fee,
             extra_fee,
             miner_fee,

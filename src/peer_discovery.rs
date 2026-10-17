@@ -697,7 +697,7 @@ impl AddressBook {
 }
 
 pub fn path_for(database: &Path, chain: Hash) -> PathBuf {
-    database.with_extension(format!("peers-{}.json", hex::encode(chain)))
+    crate::local_files::sidecar(database, &format!("peers-{}.json", hex::encode(chain)))
 }
 
 #[cfg(test)]

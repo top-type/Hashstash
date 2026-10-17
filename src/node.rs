@@ -895,7 +895,7 @@ impl Node {
         Ok(Self {
             inner,
             explorer,
-            explorer_path: Arc::new(path.with_extension("explorer.sqlite")),
+            explorer_path: Arc::new(crate::local_files::sidecar(path, "explorer.sqlite")),
             session_token_path: Arc::new(session_token_path(path)),
             miner,
             wallets: Arc::new(Mutex::new(wallets)),
@@ -3236,26 +3236,18 @@ async fn read_peer_frame<R: AsyncBufRead + Unpin>(
 /// local account and service, so only clients able to read the node's own
 /// files can use server-wallet endpoints.
 pub fn session_token_path(database: &Path) -> PathBuf {
-    database.with_extension("session-token")
+    crate::local_files::sidecar(database, "session-token")
 }
 fn write_session_token(path: &Path, token: &str) -> Result<()> {
     // Never write through an existing file or link; create a fresh one that
-    // only the node's account can read (Windows inherits the directory ACL).
+    // only the node's account can read.
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("session token file cannot be replaced"),
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options
-        .open(path)
-        .context("session token file cannot be created")?;
-    std::io::Write::write_all(&mut file, token.as_bytes())?;
-    file.sync_all()?;
-    Ok(())
+    crate::local_files::write_private(path, token.as_bytes())
+        .context("session token file cannot be created")
 }
 
 #[derive(Clone)]

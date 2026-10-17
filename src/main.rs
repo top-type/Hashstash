@@ -596,6 +596,10 @@ fn write_new(path: &Path, value: &impl serde::Serialize, private: bool) -> Resul
             path.display()
         )
     })?;
+    if private {
+        // Owner-only before any key byte is written, on Windows too.
+        hashstash::local_files::restrict_to_owner(path)?;
+    }
     // Key files pass through this buffer; wipe it rather than freeing it intact.
     file.write_all(&Zeroizing::new(serde_json::to_vec_pretty(value)?))?;
     file.write_all(b"\n")?;
@@ -1544,7 +1548,10 @@ async fn main() -> Result<()> {
                 let key_path = match peer_key_file {
                     Some(path) => path,
                     None => {
-                        let path = data.with_extension("peer-key.json");
+                        // Earlier releases named it from the stem alone, so
+                        // net.db and net.sqlite shared one identity.
+                        hashstash::local_files::adopt_legacy_secret(&data, "peer-key.json")?;
+                        let path = hashstash::local_files::sidecar(&data, "peer-key.json");
                         ensure_peer_key_file(&path)?;
                         path
                     }

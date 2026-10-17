@@ -149,7 +149,7 @@ impl Explorer {
         reader.rpc(method, p, c, s, tip, mempool)
     }
     pub fn open(path: &Path, chain: &Chain) -> Result<Self> {
-        let db = Connection::open(path.with_extension("explorer.sqlite"))?;
+        let db = Connection::open(crate::local_files::sidecar(path, "explorer.sqlite"))?;
         db.busy_timeout(std::time::Duration::from_millis(500))?;
         db.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;

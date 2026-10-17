@@ -15,6 +15,7 @@ pub mod crypto;
 pub mod explorer;
 pub mod faucet;
 pub mod fees;
+pub mod local_files;
 pub mod mail;
 pub mod math;
 pub mod network_guard;

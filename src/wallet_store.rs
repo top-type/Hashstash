@@ -1,13 +1,16 @@
 //! Local wallet selection and keys. This database is independent of chain state.
 use crate::{
-    address, crypto,
+    address, crypto, local_files,
     types::{Hash, PublicKey},
 };
 use anyhow::{Context, Result, anyhow, ensure};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_WALLETS: usize = 256;
@@ -90,45 +93,90 @@ pub(crate) struct WalletStore {
     fresh: bool,
     chain_id: Hash,
 }
-/// Hot secrets are stored unencrypted, so the database is owner-only on Unix.
-/// SQLite gives its rollback journal the database file's mode. Windows files
-/// inherit the containing folder's ACL.
-fn restrict_permissions(path: &Path) -> Result<()> {
-    #[cfg(unix)]
+/// The rollback journal SQLite keeps beside `path`.
+fn journal_path(path: &Path) -> PathBuf {
+    let mut journal = path.as_os_str().to_owned();
+    journal.push("-journal");
+    journal.into()
+}
+
+/// Copies wallet storage from its earlier stem-based name, which another
+/// chain database may share, when this chain database has none of its own.
+/// The original stays for any other node that still uses it.
+fn adopt_legacy(chain_path: &Path, path: &Path) -> Result<()> {
+    let Some(legacy) = local_files::legacy_sidecar(chain_path, "wallets.sqlite") else {
+        return Ok(());
+    };
+    if std::fs::symlink_metadata(path).is_ok()
+        || !std::fs::symlink_metadata(&legacy).is_ok_and(|m| m.is_file())
     {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("cannot open wallet storage {}", path.display()))?;
-        if std::fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("cannot restrict wallet storage {}", path.display()))?;
-        }
+        return Ok(());
     }
-    #[cfg(not(unix))]
-    let _ = path;
+    // A consistent snapshot, written under a temporary name restricted
+    // before it holds any key, then moved into place.
+    let mut unique = [0u8; 8];
+    getrandom::fill(&mut unique).map_err(|e| anyhow!("randomness unavailable: {e}"))?;
+    let temporary = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .context("wallet storage path needs a file name")?
+            .to_string_lossy(),
+        hex::encode(unique)
+    ));
+    let copied = (|| -> Result<()> {
+        local_files::create_private(&temporary)?;
+        let source = Connection::open_with_flags(&legacy, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        source.execute(
+            "VACUUM INTO ?1",
+            [temporary
+                .to_str()
+                .context("wallet storage path is not valid Unicode")?],
+        )?;
+        drop(source);
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if copied.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    copied.with_context(|| format!("cannot copy wallet storage {}", legacy.display()))?;
+    eprintln!(
+        "Copied wallet storage {} to {}, its name for this chain database. The original keeps its keys for any other chain database that shared its name; remove it once no node uses it.",
+        legacy.display(),
+        path.display()
+    );
     Ok(())
 }
 
 impl WalletStore {
+    /// Hot secrets are stored unencrypted, so the database and its journal
+    /// are owner-only (`local_files::restrict_to_owner`). The journal persists
+    /// (TRUNCATE mode) with that protection instead of being recreated with
+    /// the directory's defaults for every write.
     pub fn open(chain_path: &Path, chain_id: Hash) -> Result<Self> {
-        let path = chain_path.with_extension("wallets.sqlite");
+        let path = local_files::sidecar(chain_path, "wallets.sqlite");
         ensure!(
             path != chain_path,
             "chain database path conflicts with wallet storage"
         );
-        restrict_permissions(&path)?;
+        adopt_legacy(chain_path, &path)?;
+        let journal = journal_path(&path);
+        local_files::create_private(&path)
+            .with_context(|| format!("cannot open wallet storage {}", path.display()))?;
+        local_files::create_private(&journal)?;
         let mut connection = Connection::open(&path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.execute_batch("PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;
+        connection.execute_batch("PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;
             CREATE TABLE IF NOT EXISTS wallets(id TEXT PRIMARY KEY,name TEXT NOT NULL,public BLOB NOT NULL,secret BLOB);
             CREATE TABLE IF NOT EXISTS wallet_selection(singleton INTEGER PRIMARY KEY CHECK(singleton=1),active TEXT NOT NULL,revision TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS wallet_network(singleton INTEGER PRIMARY KEY CHECK(singleton=1),chain_id TEXT NOT NULL);")?;
-        // Keys are independent of chain state, but sidecar names derive from the
-        // chain path's stem: say so when another network opens this store.
+        // SQLite discards an empty journal beside a new, empty database and
+        // creates its own for the schema; restrict that one before any key.
+        if journal.exists() {
+            local_files::restrict_to_owner(&journal)?;
+        }
+        // Keys are independent of chain state and may be shared by networks
+        // that use the same storage: say so when another network opens it.
         let previous: Option<String> = connection
             .query_row(
                 "SELECT chain_id FROM wallet_network WHERE singleton=1",
@@ -610,18 +658,62 @@ mod tests {
                 .query_row("SELECT chain_id FROM wallet_network", [], |r| r.get(0))
                 .unwrap()
         };
+        // The journal persists (TRUNCATE mode), so its protection does too.
+        let journal = journal_path(&wallets);
+        assert_eq!(std::fs::metadata(&journal).unwrap().len(), 0);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = || std::fs::metadata(&wallets).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode(), 0o600);
-            std::fs::set_permissions(&wallets, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&wallets), 0o600);
+            assert_eq!(mode(&journal), 0o600);
+            for file in [&wallets, &journal] {
+                std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
             drop(WalletStore::open(&path, [1; 32]).unwrap());
-            assert_eq!(mode(), 0o600, "existing permissive storage is tightened");
+            assert_eq!(mode(&wallets), 0o600, "existing permissive storage is tightened");
+            assert_eq!(mode(&journal), 0o600);
         }
         assert!(wallets.exists());
         let reopened = WalletStore::open(&path, [2; 32]).unwrap();
         assert_eq!(network(&reopened), hex::encode([2; 32]));
         assert_eq!(reopened.entries.len(), 1, "keys remain shared across networks");
+    }
+
+    /// `net.db` and `net.sqlite` once shared `net.wallets.sqlite`. Each now
+    /// has its own store; an existing stem-named store is copied, not moved.
+    #[test]
+    fn chain_databases_with_one_stem_get_separate_wallet_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite = dir.path().join("net.sqlite");
+        let mut shared = WalletStore::open(&sqlite, [1; 32]).unwrap();
+        manage(&mut shared, json!({"action":"import","private_key":hex::encode([3;32])}));
+        let saved = shared.status();
+        drop(shared);
+        let legacy = dir.path().join("net.wallets.sqlite");
+        assert!(legacy.exists());
+        let db = dir.path().join("net.db");
+        let mut copied = WalletStore::open(&db, [1; 32]).unwrap();
+        assert_eq!(copied.status(), saved, "an upgrade keeps the keys it used");
+        let own = dir.path().join("net.db-wallets.sqlite");
+        assert!(own.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&own).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // The stores now diverge: changes to one never reach the other.
+        manage(&mut copied, json!({"action":"create"}));
+        drop(copied);
+        assert_eq!(WalletStore::open(&sqlite, [1; 32]).unwrap().status(), saved);
+        assert_eq!(WalletStore::open(&db, [1; 32]).unwrap().entries.len(), 2);
+        assert!(
+            !std::fs::read_dir(dir.path())
+                .unwrap()
+                .any(|entry| entry.unwrap().file_name().to_string_lossy().ends_with(".tmp"))
+        );
+        // A new store under a name of its own copies nothing.
+        let fresh = WalletStore::open(&dir.path().join("other.db"), [1; 32]).unwrap();
+        assert!(fresh.entries.is_empty());
     }
 }

@@ -76,7 +76,7 @@ Network and governance views expose each world’s reserve, curve mass, dynamic 
 
 ## Node storage
 
-The Explorer maintains a separate derived SQLite index next to the chain database. For `chain.sqlite`, the index is `chain.explorer.sqlite`. It uses the existing validated chain history and does not change consensus rules, state commitments, transaction encodings, rewards, or mining templates.
+The Explorer maintains a separate derived SQLite index next to the chain database. For `chain.sqlite`, the index is `chain.explorer.sqlite`; a chain database with another file name `F` uses `F-explorer.sqlite`, so two chain databases never share an index, and the chain database's exclusive lock keeps a second node from opening the same one. It uses the existing validated chain history and does not change consensus rules, state commitments, transaction encodings, rewards, or mining templates.
 
 The index records its network and schema version, catches up from stored history at startup, and follows canonical reorganizations. It can be reconstructed from the chain database. Index failure makes Explorer queries unavailable rather than accepting different blocks or modifying balances. Keep the chain database and its configuration when backing up a node; the Explorer database is a rebuildable convenience.
 

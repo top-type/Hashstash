@@ -1,7 +1,7 @@
 //! Bounded local RPC, fork-aware peer synchronization and solo Stratum V1.
 use crate::{
     address,
-    chain::Chain,
+    chain::{Chain, MAX_SELECTION_CANDIDATES, SelectionResult},
     codec,
     config::Config,
     crypto,
@@ -21,7 +21,7 @@ use num_traits::{ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
@@ -38,6 +38,7 @@ use tokio::{
     task::JoinHandle,
     time::timeout,
 };
+use zeroize::Zeroizing;
 
 pub const MAX_CONNECTIONS: usize = 64;
 pub const MAX_MEMPOOL: usize = 256;
@@ -46,6 +47,12 @@ pub const MAX_ADAPTIVE_MEMPOOL: usize = 4096;
 fn mempool_limit(_config: &Config) -> usize {
     MAX_ADAPTIVE_MEMPOOL
 }
+/// Previously pooled transactions that lost only to block capacity. They wait
+/// beside the next-block selection, bounded by this count and one block's bytes.
+pub const MAX_BACKLOG: usize = MAX_MEMPOOL;
+/// Detached blocks plus their transactions examined by one reorg recovery.
+const MAX_RECOVERY_EXAMINED: usize = 2 * MAX_SELECTION_CANDIDATES;
+const MAX_REJECTED_TRANSACTIONS: usize = 4096;
 pub const MAX_FRAME: usize = 32 * 1024 * 1024;
 // Service pagination target only. It never bounds a canonical record.
 const JSON_PAGE_BYTES: usize = 32 * 1024 * 1024;
@@ -378,13 +385,75 @@ pub fn parse_account(s: &str, chain_id: &Hash) -> Result<PublicKey> {
     }
 }
 
+/// A panic while shared node state was held may have left it half updated.
+/// Exit so a supervisor restarts from durable storage instead of keeping a live
+/// process that can no longer validate, mine or accept mutations.
+fn poisoned(lock: &str) -> ! {
+    eprintln!("fatal: {lock} lock poisoned by an earlier panic; exiting for a supervised restart");
+    std::process::exit(70)
+}
+
+/// Recently rejected relay identities. Shape and signature failures are
+/// permanent for the exact signed bytes; other rejections hold for one tip.
+#[derive(Default)]
+struct RejectedTransactions {
+    entries: HashMap<Hash, Option<Hash>>,
+    order: VecDeque<Hash>,
+}
+impl RejectedTransactions {
+    fn contains(&self, id: &Hash, tip: &Hash) -> bool {
+        self.entries
+            .get(id)
+            .is_some_and(|scope| scope.is_none_or(|at| at == *tip))
+    }
+    fn insert(&mut self, id: Hash, scope: Option<Hash>) {
+        if self.entries.insert(id, scope).is_none() {
+            self.order.push_back(id);
+        }
+        while self.order.len() > MAX_REJECTED_TRANSACTIONS {
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
+            }
+        }
+    }
+}
+
+fn compact_size_len(n: usize) -> usize {
+    match n {
+        0..=252 => 1,
+        253..=65535 => 3,
+        65536..=0xffff_ffff => 5,
+        _ => 9,
+    }
+}
+
+#[cfg(test)]
+mod pool_tests;
+#[cfg(test)]
+thread_local! {
+    /// Signatures checked by pool selections on this thread.
+    static POOL_SIGNATURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Fail the next pool recovery on this thread.
+    static FAIL_RECOVERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 struct Inner {
     chain: Chain,
+    /// The next-block selection; templates commit to exactly these entries.
     mempool: Vec<Transaction>,
+    /// Pending entries displaced by capacity, retried against later blocks.
+    backlog: Vec<Transaction>,
+    /// Tip the pool was last selected against; differs only after a failed recovery.
+    pool_tip: Hash,
     template: Option<Arc<Block>>,
     // Download progress is independent of which branch currently has greatest work.
     downloads: VecDeque<Hash>,
     relay_cursor: usize,
+}
+impl Inner {
+    fn pending(&self) -> impl Iterator<Item = &Transaction> {
+        self.mempool.iter().chain(&self.backlog)
+    }
 }
 struct PublishedChain {
     config: Arc<Config>,
@@ -430,7 +499,7 @@ impl ExplorerWorker {
                             let Some(inner) = inner.upgrade() else {
                                 return Ok(None);
                             };
-                            let guard = inner.lock().map_err(|_| anyhow!("node lock poisoned"))?;
+                            let guard = inner.lock().unwrap_or_else(|_| poisoned("node state"));
                             explorer.capture(&guard.chain)
                         })();
                         match update {
@@ -485,7 +554,7 @@ impl ReadView {
                 tip: inner.chain.tip_hash(),
                 state: Arc::new(inner.chain.tip_state().clone()),
             },
-            mempool: inner.mempool.clone(),
+            mempool: inner.pending().cloned().collect(),
         }
     }
 }
@@ -522,6 +591,9 @@ pub struct Node {
     discovery_id: Hash,
     last_tip_change: Arc<AtomicU64>,
     server_active: Arc<AtomicBool>,
+    // Read by transport tasks on runtime workers, which never take the node lock.
+    known_block_bytes: Arc<AtomicU64>,
+    rejected: Arc<Mutex<RejectedTransactions>>,
 }
 #[derive(Default)]
 struct PeerHealth {
@@ -568,9 +640,21 @@ impl Drop for SessionId {
 impl Node {
     pub fn open(path: &Path, config: Config, miner: PublicKey) -> Result<Self> {
         ensure!(crypto::valid_key(&miner), "invalid miner public key");
+        // The wallet sidecar cannot be rebuilt and fails closed. Check it before
+        // the full history replay, so a damaged file stops startup immediately.
+        config.validate()?;
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let wallets = WalletStore::open(path, config.chain_id())?;
+        let chain = Chain::open(path, config)?;
         let inner = Inner {
-            chain: Chain::open(path, config)?,
+            pool_tip: chain.tip_hash(),
+            chain,
             mempool: Vec::new(),
+            backlog: Vec::new(),
             template: None,
             downloads: VecDeque::new(),
             relay_cursor: 0,
@@ -581,7 +665,7 @@ impl Node {
             Explorer::unavailable()
         });
         let published = Arc::new(RwLock::new(Arc::new(ReadView::capture(&inner))));
-        let wallets = WalletStore::open(path, inner.chain.chain_id())?;
+        let known_block_bytes = inner.chain.max_known_block_bytes();
         let guard = Arc::new(NetworkGuard::with_frame_limit(admission_frame_bytes(
             &inner.chain.config,
             inner.chain.max_known_block_bytes(),
@@ -638,6 +722,8 @@ impl Node {
             discovery_id,
             last_tip_change: Arc::new(AtomicU64::new(now())),
             server_active: Arc::new(AtomicBool::new(false)),
+            known_block_bytes: Arc::new(AtomicU64::new(known_block_bytes)),
+            rejected: Arc::new(Mutex::new(RejectedTransactions::default())),
         })
     }
     /// Require pinned transport for every peer connection; never falls back to plaintext.
@@ -699,16 +785,21 @@ impl Node {
             "chain_stalled":at.saturating_sub(self.last_tip_change.load(Ordering::Relaxed)) >= 180}),
         )
     }
+    /// Validation may learn a larger governed capacity on any branch, including
+    /// without a tip change. Record it for transport tasks and admission.
+    fn note_capacity(&self, chain: &Chain) -> Result<()> {
+        let capacity = chain.max_known_block_bytes();
+        self.known_block_bytes.fetch_max(capacity, Ordering::AcqRel);
+        self.guard
+            .allow_frame(admission_frame_bytes(&chain.config, capacity)?)
+    }
     fn publish(&self, inner: &Inner) -> Result<()> {
-        self.guard.allow_frame(admission_frame_bytes(
-            &inner.chain.config,
-            inner.chain.max_known_block_bytes(),
-        )?)?;
+        self.note_capacity(&inner.chain)?;
         let next = Arc::new(ReadView::capture(inner));
         let mut published = self
             .published
             .write()
-            .map_err(|_| anyhow!("snapshot lock poisoned"))?;
+            .unwrap_or_else(|_| poisoned("snapshot"));
         if published.chain.tip_hash() != next.chain.tip_hash() {
             self.last_tip_change.store(now(), Ordering::Relaxed);
         }
@@ -722,29 +813,27 @@ impl Node {
         Ok(self
             .published
             .read()
-            .map_err(|_| anyhow!("snapshot lock poisoned"))?
+            .unwrap_or_else(|_| poisoned("snapshot"))
             .clone())
     }
+    // Transport limits are read on runtime workers. They use the published
+    // configuration and recorded capacity, never the node lock, which block
+    // validation and pool selection may hold for a long time.
     fn peer_limits(&self) -> Result<peer_wire::Limits> {
-        let inner = self.locked()?;
-        let limits = peer_wire::Limits::for_capacity(
-            &inner.chain.config,
-            inner.chain.max_known_block_bytes(),
-        );
-        self.guard.allow_frame(admission_frame_bytes(
-            &inner.chain.config,
-            inner.chain.max_known_block_bytes(),
-        )?)?;
+        let view = self.read_view()?;
+        let capacity = self.known_block_bytes.load(Ordering::Acquire);
+        let limits = peer_wire::Limits::for_capacity(&view.chain.config, capacity);
+        self.guard
+            .allow_frame(admission_frame_bytes(&view.chain.config, capacity)?)?;
         Ok(limits)
     }
     fn peer_exchange_timeout(&self) -> Result<Duration> {
-        let inner = self.locked()?;
         // A peer may be validating the block we just sent before it answers.
         // Keep the ordinary deadline, adding one second per governed MiB;
         // the actual wire representation bounds this allowance as well.
-        let bytes = inner
-            .chain
-            .max_known_block_bytes()
+        let bytes = self
+            .known_block_bytes
+            .load(Ordering::Acquire)
             .min(peer_wire::MAX_WIRE_PAYLOAD_BYTES as u64);
         Ok(IO_TIMEOUT + Duration::from_secs(bytes / (1024 * 1024)))
     }
@@ -770,17 +859,27 @@ impl Node {
         Ok(self)
     }
     fn wallets_locked(&self) -> Result<std::sync::MutexGuard<'_, WalletStore>> {
-        self.wallets
-            .lock()
-            .map_err(|_| anyhow!("wallet lock poisoned"))
+        Ok(self.wallets.lock().unwrap_or_else(|_| poisoned("wallet")))
     }
-    fn wallet_status(&self) -> Result<Value> {
-        Ok(self.wallets_locked()?.status())
+    /// Wallet-store reads for async handlers run on the blocking pool, so a
+    /// store write in progress never parks a runtime worker.
+    async fn wallet_read<T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&WalletStore) -> T + Send + 'static,
+    ) -> Result<T> {
+        let node = self.clone();
+        tokio::task::spawn_blocking(move || Ok(read(&*node.wallets_locked()?)))
+            .await
+            .context("wallet reader failed")?
     }
     fn locked(&self) -> Result<std::sync::MutexGuard<'_, Inner>> {
-        self.inner
+        Ok(self.inner.lock().unwrap_or_else(|_| poisoned("node state")))
+    }
+    fn rejected_locked(&self) -> std::sync::MutexGuard<'_, RejectedTransactions> {
+        // Only a cache: a panic elsewhere cannot leave it inconsistent.
+        self.rejected
             .lock()
-            .map_err(|_| anyhow!("node state lock poisoned"))
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     fn listener_error(&self, kind: i32, error: &std::io::Error, delay: Duration) {
         let name = match kind {
@@ -826,23 +925,231 @@ impl Node {
         let local = now().min(u32::MAX as u64) as u32;
         local.max(chain.tip_block().header.timestamp)
     }
-    fn selected(
+    /// Shape and authentication of the exact signed bytes; failures are permanent.
+    fn screen_signed(tx: &Transaction) -> Result<()> {
+        ensure!(
+            tx.body.expiry_blocks > 0,
+            "transaction lifetime must be positive"
+        );
+        ensure!(tx.body.nonce < u64::MAX, "invalid or exhausted nonce");
+        crypto::verify(tx).context("invalid transaction signature")
+    }
+    /// Cheap checks against the current tip, before any signature check or
+    /// selection: size, signed anchor and lifetime, and an unused sender nonce.
+    /// New submissions also need a funded sender; recovered detached entries may
+    /// still be funded by another recovered transaction.
+    fn admissible(chain: &Chain, tx: &Transaction, require_account: bool) -> Result<()> {
+        let state = chain.tip_state();
+        ensure!(
+            codec::encode(tx).len() <= chain.config.transaction_bytes(&state.settings),
+            "transaction too large"
+        );
+        ensure!(
+            tx.body.expiry_blocks > 0 && tx.body.nonce < u64::MAX,
+            "invalid lifetime or nonce"
+        );
+        chain.validate_transaction_anchor(tx)?;
+        match state.account(&tx.body.sender, None) {
+            Some(account) => ensure!(tx.body.nonce >= account.nonce, "nonce already used"),
+            None => ensure!(!require_account, "sender account does not exist"),
+        }
+        Ok(())
+    }
+    fn pool_ids(i: &Inner) -> HashSet<Hash> {
+        i.pending().map(codec::transaction_id).collect()
+    }
+    /// One next-block selection plus its capacity-displaced backlog. Only
+    /// `retained` identities, entries already pooled or recovered from detached
+    /// blocks, may wait in the backlog; a newcomer that does not fit is refused.
+    fn select_pool(
         chain: &Chain,
         miner: PublicKey,
         candidates: &[Transaction],
-    ) -> Result<Vec<Transaction>> {
-        Ok(chain
-            .select_transactions(miner, candidates, mempool_limit(&chain.config))?
-            .transactions)
+        retained: &HashSet<Hash>,
+    ) -> Result<(Vec<Transaction>, Vec<Transaction>)> {
+        let selection =
+            chain.select_transactions(miner, candidates, mempool_limit(&chain.config))?;
+        #[cfg(test)]
+        POOL_SIGNATURES.with(|count| count.set(count.get() + selection.signatures_checked));
+        let backlog = Self::displaced(chain, miner, &selection, candidates, retained)?;
+        Ok((selection.transactions, backlog))
     }
-    fn combine_candidates(first: &[Transaction], second: &[Transaction]) -> Vec<Transaction> {
+    /// Retained entries the selection left out only for block capacity. Unless
+    /// the selection was saturated, an entry that still fits the selected block's
+    /// bytes and weight was refused for validity: it is dropped with its sender's
+    /// later nonces. Weights quoted against the parent state can only overstate
+    /// in-block weights, so a fitting estimate is conservative. The best bids
+    /// are kept within MAX_BACKLOG entries and one block's bytes.
+    fn displaced(
+        chain: &Chain,
+        miner: PublicKey,
+        selection: &SelectionResult,
+        candidates: &[Transaction],
+        retained: &HashSet<Hash>,
+    ) -> Result<Vec<Transaction>> {
+        struct Waiting<'a> {
+            transaction: &'a Transaction,
+            id: Hash,
+            bytes: usize,
+            fee: Amount,
+            weight: u64,
+        }
+        let better = |a: &Waiting<'_>, b: &Waiting<'_>| {
+            (&b.fee * Amount::from(a.weight))
+                .cmp(&(&a.fee * Amount::from(b.weight)))
+                .then_with(|| a.id.cmp(&b.id))
+        };
+        let state = chain.tip_state();
+        let byte_limit = usize::try_from(state.settings.block_bytes).unwrap_or(usize::MAX);
+        let limit = mempool_limit(&chain.config).min(chain.config.max_signatures);
+        let saturated = selection.budget_exhausted || selection.transactions.len() >= limit;
+        let height = state.height.checked_add(1).context("candidate height overflow")?;
+        let (prefix, suffix) = codec::coinbase_parts(height, &miner, &ZERO_HASH);
+        let system = prefix.len() + 8 + suffix.len();
+        // The selection's own body accounting, counting one further record.
+        let mut used_bytes = compact_size_len(selection.transactions.len() + 2)
+            + compact_size_len(system)
+            + system
+            + 32;
+        // Weighted capacity equals block bytes; a missing miner account may
+        // reserve one account weight.
+        let weight_limit = state.settings.block_bytes;
+        let mut used_weight = if state.account(&miner, None).is_none() {
+            fees::ACCOUNT_WEIGHT
+        } else {
+            0
+        };
+        let mut next = BTreeMap::new();
         let mut seen = HashSet::new();
-        first
-            .iter()
-            .chain(second)
-            .filter(|tx| seen.insert(codec::transaction_id(tx)))
+        for tx in &selection.transactions {
+            let bytes = codec::encode(tx).len();
+            used_bytes = used_bytes.saturating_add(compact_size_len(bytes) + bytes);
+            let weight = fees::quote(&chain.config, state, tx).map_or(u64::MAX, |quote| quote.weight);
+            used_weight = used_weight.saturating_add(weight);
+            seen.insert(codec::transaction_id(tx));
+            let nonce = next.entry(tx.body.sender).or_insert(0);
+            *nonce = tx.body.nonce.saturating_add(1).max(*nonce);
+        }
+        let mut senders = BTreeMap::<PublicKey, Vec<Waiting<'_>>>::new();
+        for transaction in candidates {
+            let id = codec::transaction_id(transaction);
+            if !retained.contains(&id)
+                || !seen.insert(id)
+                || Self::admissible(chain, transaction, false).is_err()
+            {
+                continue;
+            }
+            let Ok(quote) = fees::quote(&chain.config, state, transaction) else {
+                continue;
+            };
+            senders
+                .entry(transaction.body.sender)
+                .or_default()
+                .push(Waiting {
+                    transaction,
+                    id,
+                    bytes: codec::encode(transaction).len(),
+                    fee: quote.miner_fee,
+                    weight: quote.weight,
+                });
+        }
+        let mut first = BTreeMap::new();
+        let mut waiting = Vec::new();
+        for (sender, mut entries) in senders {
+            entries.sort_by(|a, b| {
+                let nonce = a.transaction.body.nonce.cmp(&b.transaction.body.nonce);
+                nonce.then_with(|| better(a, b))
+            });
+            let start = next.get(&sender).copied().unwrap_or_else(|| {
+                state.account(&sender, None).map_or(0, |account| account.nonce)
+            });
+            first.insert(sender, start);
+            let mut expected = start;
+            for entry in entries {
+                let nonce = entry.transaction.body.nonce;
+                // Used, replaced or outbid at an equal nonce; then a nonce gap.
+                if nonce < expected {
+                    continue;
+                }
+                if nonce > expected {
+                    break;
+                }
+                let fits = used_bytes.saturating_add(compact_size_len(entry.bytes) + entry.bytes)
+                    <= byte_limit
+                    && used_weight.saturating_add(entry.weight) <= weight_limit;
+                if fits && !saturated && expected == start {
+                    break;
+                }
+                waiting.push(entry);
+                expected += 1;
+            }
+        }
+        waiting.sort_by(|a, b| better(a, b));
+        let room = MAX_BACKLOG.min(limit.saturating_sub(selection.transactions.len()));
+        let mut bytes = 0usize;
+        let mut kept = BTreeMap::<PublicKey, HashSet<u64>>::new();
+        let mut backlog = Vec::new();
+        for entry in waiting {
+            if backlog.len() == room {
+                break;
+            }
+            let Some(total) = bytes
+                .checked_add(entry.bytes)
+                .filter(|total| *total <= byte_limit)
+            else {
+                continue;
+            };
+            bytes = total;
+            kept.entry(entry.transaction.body.sender)
+                .or_default()
+                .insert(entry.transaction.body.nonce);
+            backlog.push(entry);
+        }
+        // An evicted predecessor strands every later nonce from its sender.
+        backlog.retain(|entry| {
+            let sender = &entry.transaction.body.sender;
+            (first[sender]..entry.transaction.body.nonce).all(|nonce| kept[sender].contains(&nonce))
+        });
+        Ok(backlog
+            .into_iter()
+            .map(|entry| entry.transaction.clone())
+            .collect())
+    }
+    /// Install a selected pool, publishing only an actual change. A changed
+    /// next-block selection also invalidates the cached template.
+    fn install_pool(
+        &self,
+        i: &mut Inner,
+        (mempool, backlog): (Vec<Transaction>, Vec<Transaction>),
+    ) -> Result<bool> {
+        i.pool_tip = i.chain.tip_hash();
+        let selection_changed = mempool != i.mempool;
+        let changed = selection_changed || backlog != i.backlog;
+        i.mempool = mempool;
+        i.backlog = backlog;
+        if selection_changed {
+            i.template = None;
+        }
+        if changed {
+            self.publish(i)?;
+        }
+        Ok(changed)
+    }
+    /// The pool is selected for the current tip after every change; only an
+    /// incomplete reorg recovery can leave entries from an earlier tip.
+    fn refresh_stale_pool(&self, i: &mut Inner) -> Result<()> {
+        if i.pool_tip == i.chain.tip_hash() {
+            return Ok(());
+        }
+        let candidates: Vec<Transaction> = i
+            .pending()
+            .filter(|tx| Self::admissible(&i.chain, tx, false).is_ok())
             .cloned()
-            .collect()
+            .collect();
+        let retained = candidates.iter().map(codec::transaction_id).collect();
+        let pool = Self::select_pool(&i.chain, self.miner, &candidates, &retained)?;
+        self.install_pool(i, pool)?;
+        Ok(())
     }
     pub fn status(&self) -> Result<Value> {
         let view = self.read_view()?;
@@ -865,31 +1172,37 @@ impl Node {
         if let Some(template) = &i.template {
             return Ok(template.clone());
         }
+        let candidates: Vec<Transaction> = i.pending().cloned().collect();
         let (selected, block) = i.chain.select_template(
             self.miner,
-            &i.mempool,
+            &candidates,
             mempool_limit(&i.chain.config),
             Self::timestamp(&i.chain),
         )?;
-        i.mempool = selected.transactions;
-        self.publish(&i)?;
+        // The pool normally is this selection already; publish only a change.
+        if selected.transactions != i.mempool || i.pool_tip != i.chain.tip_hash() {
+            let retained = candidates.iter().map(codec::transaction_id).collect();
+            let backlog = Self::displaced(&i.chain, self.miner, &selected, &candidates, &retained)?;
+            self.install_pool(&mut i, (selected.transactions, backlog))?;
+        }
         let block = Arc::new(block);
         i.template = Some(block.clone());
         Ok(block)
     }
     pub fn submit_transaction(&self, tx: Transaction) -> Result<Hash> {
+        // Authenticate before waiting for chain state.
+        Self::screen_signed(&tx)
+            .map_err(|error| anyhow!("transaction not valid in next block: {error:#}"))?;
         let mut i = self.locked()?;
         self.submit_locked(&mut i, tx)
     }
     fn submit_locked(&self, i: &mut Inner, tx: Transaction) -> Result<Hash> {
         let id = codec::transaction_id(&tx);
-        if i.mempool.iter().any(|t| codec::transaction_id(t) == id) {
+        if i.pending().any(|t| codec::transaction_id(t) == id) {
             return Ok(id);
         }
-        ensure!(
-            i.mempool.len() < mempool_limit(&i.chain.config),
-            "mempool full"
-        );
+        // There is no separate count gate: selection ranks a newcomer against
+        // the whole pool by fee, so a better bid displaces the weakest entry.
         ensure!(
             codec::encode(&tx).len()
                 <= i.chain
@@ -897,16 +1210,17 @@ impl Node {
                     .transaction_bytes(&i.chain.tip_state().settings),
             "transaction too large"
         );
-        let mut candidates = i.mempool.clone();
+        Self::admissible(&i.chain, &tx, true)
+            .map_err(|error| anyhow!("transaction not valid in next block: {error}"))?;
+        let retained = Self::pool_ids(i);
+        let mut candidates: Vec<Transaction> = i.pending().cloned().collect();
         candidates.push(tx);
-        let selected = Self::selected(&i.chain, self.miner, &candidates)?;
+        let pool = Self::select_pool(&i.chain, self.miner, &candidates, &retained)?;
         ensure!(
-            selected.iter().any(|t| codec::transaction_id(t) == id),
+            pool.0.iter().any(|t| codec::transaction_id(t) == id),
             "transaction not valid in next block or block capacity exhausted"
         );
-        i.mempool = selected;
-        i.template = None;
-        self.publish(i)?;
+        self.install_pool(i, pool)?;
         Ok(id)
     }
     fn wallet_submit(&self, request: HotWalletRequest) -> Result<Hash> {
@@ -914,9 +1228,14 @@ impl Node {
             &request.expected_sender,
             &self.read_view()?.chain.chain_id(),
         )?;
-        // Keep selection fixed until the signed transaction has been accepted.
-        let wallets = self.wallets_locked()?;
-        let secret = wallets.selected_secret(&sender, request.wallet_revision)?;
+        // Copy the key checked against the selection revision and release the
+        // wallet lock before waiting for chain state: wallet status readers must
+        // never queue behind block validation or pool selection.
+        let secret = Zeroizing::new(
+            *self
+                .wallets_locked()?
+                .selected_secret(&sender, request.wallet_revision)?,
+        );
         let mut i = self.locked()?;
         let body = self.prepare_locked(
             &mut i,
@@ -931,7 +1250,7 @@ impl Node {
                 nonce: request.nonce,
             },
         )?;
-        self.submit_locked(&mut i, crypto::sign(&body, secret)?)
+        self.submit_locked(&mut i, crypto::sign(&body, &secret)?)
     }
     fn prepare_locked(
         &self,
@@ -939,23 +1258,50 @@ impl Node {
         sender: PublicKey,
         request: WalletRequest,
     ) -> Result<TransactionBody> {
-        check_operation_bounds(&i.chain.config, &request.operation)?;
+        // Every pool change already reselects for the current tip.
+        self.refresh_stale_pool(i)?;
+        Self::prepare_body(
+            &i.chain.config,
+            i.chain.tip_state(),
+            i.chain.tip_hash(),
+            i.pending(),
+            sender,
+            request,
+        )
+    }
+    /// Prepare from one published view without the node lock.
+    fn prepare_view(
+        view: &ReadView,
+        sender: PublicKey,
+        request: WalletRequest,
+    ) -> Result<TransactionBody> {
+        Self::prepare_body(
+            &view.chain.config,
+            view.chain.tip_state(),
+            view.chain.tip_hash(),
+            view.mempool.iter(),
+            sender,
+            request,
+        )
+    }
+    fn prepare_body<'a>(
+        config: &Config,
+        state: &State,
+        tip: Hash,
+        pending: impl Iterator<Item = &'a Transaction>,
+        sender: PublicKey,
+        request: WalletRequest,
+    ) -> Result<TransactionBody> {
+        check_operation_bounds(config, &request.operation)?;
         ensure!(
             request.expiry_blocks.is_none_or(|blocks| blocks > 0),
             "expiry_blocks must be positive"
         );
-        let selected = Self::selected(&i.chain, self.miner, &i.mempool)?;
-        if selected != i.mempool {
-            i.mempool = selected;
-            i.template = None;
-            self.publish(i)?;
-        }
-        let state = i.chain.tip_state();
         let account = state
             .account(&sender, None)
             .context("sender account has not been funded")?;
         let mut nonce = account.nonce;
-        for tx in &i.mempool {
+        for tx in pending {
             if tx.body.sender == sender {
                 nonce = nonce.max(tx.body.nonce.checked_add(1).context("nonce exhausted")?);
             }
@@ -965,72 +1311,119 @@ impl Node {
             request.nonce.is_none_or(|requested| requested == nonce),
             "requested nonce differs from pending nonce"
         );
-        let body = wallet_body(
-            &i.chain.config,
-            state,
-            i.chain.tip_hash(),
-            sender,
-            nonce,
-            request,
-        )?;
+        let body = wallet_body(config, state, tip, sender, nonce, request)?;
         let unsigned_size = codec::encode(&body).len();
         // A signed transaction adds exactly 64 signature bytes.
         ensure!(
-            unsigned_size.saturating_add(64) <= i.chain.config.transaction_bytes(&state.settings),
+            unsigned_size.saturating_add(64) <= config.transaction_bytes(&state.settings),
             "transaction too large"
         );
         Ok(body)
     }
+    /// Returns whether the block became the tip. A committed block is reported
+    /// as accepted even when the following pool recovery fails.
     pub fn submit_block(&self, block: Block) -> Result<bool> {
         let mut i = self.locked()?;
         let old_tip = i.chain.tip_hash();
-        let changed = i.chain.submit_with_replay_budget(block, now(), 64)?;
+        let submitted = i.chain.submit_with_replay_budget(block, now(), 64);
+        // Validation can learn a larger governed capacity on any branch.
+        if let Err(error) = self.note_capacity(&i.chain) {
+            eprintln!("Peer capacity allowance unchanged: {error:#}");
+        }
+        let changed = submitted?;
         if changed {
             i.template = None;
-            let pending = std::mem::take(&mut i.mempool);
+            let mut pending = std::mem::take(&mut i.mempool);
+            pending.append(&mut i.backlog);
             // Publish the newly committed tip immediately, with an empty valid pool.
             // Recovery may need disk access and cannot roll back a committed block.
-            self.publish(&i)?;
-            // Recover transactions from the abandoned branch, including same-height forks.
-            let mut left = i.chain.block(&old_tip).context("old tip missing")?;
-            let mut right = i.chain.tip_block().clone();
-            let mut detached = Vec::new();
-            while codec::block_hash(&left) != codec::block_hash(&right) {
-                if left.height >= right.height && left.height > 0 {
-                    detached.push(codec::block_hash(&left));
-                    left = i
-                        .chain
-                        .block(&left.header.previous)
-                        .context("old branch parent missing")?;
-                } else {
-                    right = i
-                        .chain
-                        .block(&right.header.previous)
-                        .context("new branch parent missing")?;
+            let recovered = (|| -> Result<()> {
+                self.publish(&i)?;
+                self.recover_pool(&mut i, old_tip, &pending)
+            })();
+            if let Err(error) = recovered {
+                // Keep every earlier entry; the next selection revalidates them.
+                eprintln!("Pending transaction recovery deferred: {error:#}");
+                i.mempool = pending;
+                i.backlog.clear();
+                i.pool_tip = old_tip;
+                if let Err(error) = self.publish(&i) {
+                    eprintln!("Pending transaction publication deferred: {error:#}");
                 }
             }
-            // Preserve valid pending entries, then recover detached transactions.
-            // Capacity is charged only to accepted, unique candidates.
-            let mut recovered = Self::selected(&i.chain, self.miner, &pending)?;
-            for hash in detached.into_iter().rev() {
-                let block = i.chain.block(&hash).context("detached block missing")?;
-                for chunk in block.transactions.chunks(MAX_MEMPOOL) {
-                    let priority = Self::combine_candidates(&pending, &recovered);
-                    let selected = Self::selected(&i.chain, self.miner, &priority)?;
-                    let candidates = Self::combine_candidates(&selected, chunk);
-                    recovered = Self::selected(&i.chain, self.miner, &candidates)?;
-                }
-            }
-            let priority = Self::combine_candidates(&pending, &recovered);
-            let recovered = Self::selected(&i.chain, self.miner, &priority)?;
-            i.mempool = recovered;
-            self.publish(&i)?;
         }
         Ok(changed)
     }
+    /// Rebuild the pool for a new tip with one bounded selection, including
+    /// transactions from an abandoned branch or same-height fork. Only header
+    /// metadata is walked to the fork point, and each detached body is loaded
+    /// once, oldest first, so nonce predecessors precede their successors.
+    /// Anchor and nonce checks drop stale entries before any signature check;
+    /// examination stops after MAX_RECOVERY_EXAMINED blocks and transactions.
+    fn recover_pool(&self, i: &mut Inner, old_tip: Hash, pending: &[Transaction]) -> Result<()> {
+        #[cfg(test)]
+        ensure!(
+            !FAIL_RECOVERY.with(|fail| fail.replace(false)),
+            "injected recovery failure"
+        );
+        // The new branch is canonical: its fork point is the first old-branch
+        // ancestor that is the canonical block at its own height.
+        let mut detached = Vec::new();
+        let mut cursor = old_tip;
+        loop {
+            let height = i
+                .chain
+                .block_height(&cursor)?
+                .context("old branch block missing")?;
+            if i.chain.hash_at_height(height) == Some(cursor) {
+                break;
+            }
+            detached.push(cursor);
+            cursor = i
+                .chain
+                .block_parent(&cursor)?
+                .context("old branch parent missing")?;
+        }
+        let mut ids = HashSet::new();
+        let mut candidates = Vec::new();
+        for tx in pending {
+            if ids.insert(codec::transaction_id(tx))
+                && Self::admissible(&i.chain, tx, false).is_ok()
+            {
+                candidates.push(tx.clone());
+            }
+        }
+        let mut examined = 0usize;
+        'blocks: for hash in detached.iter().rev() {
+            examined += 1;
+            if examined > MAX_RECOVERY_EXAMINED {
+                break;
+            }
+            let block = i.chain.block(hash).context("detached block missing")?;
+            for tx in &block.transactions {
+                examined += 1;
+                if examined > MAX_RECOVERY_EXAMINED || candidates.len() >= MAX_SELECTION_CANDIDATES
+                {
+                    break 'blocks;
+                }
+                if ids.insert(codec::transaction_id(tx))
+                    && Self::admissible(&i.chain, tx, false).is_ok()
+                {
+                    candidates.push(tx.clone());
+                }
+            }
+        }
+        candidates.truncate(MAX_SELECTION_CANDIDATES);
+        // Each candidate was pooled or included before, so each may wait.
+        let retained = candidates.iter().map(codec::transaction_id).collect();
+        let pool = Self::select_pool(&i.chain, self.miner, &candidates, &retained)?;
+        self.install_pool(i, pool)?;
+        Ok(())
+    }
+    /// Also used on runtime workers, so it compares with the published tip.
+    /// Submitting a solved block still validates it against the chain itself.
     fn mining_job_eligible(&self, block: &Block) -> Result<bool> {
-        let i = self.locked()?;
-        Ok(i.chain.tip_hash() == block.header.previous)
+        Ok(self.read_view()?.chain.tip_hash() == block.header.previous)
     }
     pub fn mine(&self, max_attempts: u64) -> Result<Block> {
         ensure!(
@@ -1057,10 +1450,11 @@ impl Node {
         // candidate without changing the configured miner or its Stratum cache.
         let candidate = {
             let i = self.locked()?;
+            let candidates: Vec<Transaction> = i.pending().cloned().collect();
             i.chain
                 .select_template(
                     recipient,
-                    &i.mempool,
+                    &candidates,
                     mempool_limit(&i.chain.config),
                     Self::timestamp(&i.chain),
                 )?
@@ -1287,24 +1681,63 @@ impl Node {
         // Admit the batch together. Revalidating every growing prefix here made
         // one ordinary full-pool relay need tens of thousands of signature checks.
         // Outdated/duplicate entries remain expected during synchronization.
-        let mut i = self.locked()?;
-        let mut ids: HashSet<_> = i.mempool.iter().map(codec::transaction_id).collect();
-        let mut candidates = i.mempool.clone();
-        for tx in &msg.transactions {
-            if codec::encode(tx).len()
-                <= i.chain
-                    .config
-                    .transaction_bytes(&i.chain.tip_state().settings)
-                && ids.insert(codec::transaction_id(tx))
-            {
-                candidates.push(tx.clone());
+        if msg.transactions.is_empty() {
+            return Ok(());
+        }
+        // Authenticate unseen entries before taking the node lock. Rejected
+        // identities are remembered, so replayed junk never reaches selection.
+        let view = self.read_view()?;
+        let mut seen: HashSet<_> = view.mempool.iter().map(codec::transaction_id).collect();
+        let mut fresh = Vec::new();
+        {
+            let rejected = self.rejected_locked();
+            for tx in &msg.transactions {
+                let id = codec::transaction_id(tx);
+                if !rejected.contains(&id, &view.chain.tip_hash()) && seen.insert(id) {
+                    fresh.push((id, tx));
+                }
             }
         }
-        if candidates.len() != i.mempool.len() {
-            i.mempool = Self::selected(&i.chain, self.miner, &candidates)?;
-            i.template = None;
-            self.publish(&i)?;
+        fresh.retain(|(id, tx)| {
+            let authentic = Self::screen_signed(tx).is_ok();
+            if !authentic {
+                self.rejected_locked().insert(*id, None);
+            }
+            authentic
+        });
+        if fresh.is_empty() {
+            return Ok(());
         }
+        let mut i = self.locked()?;
+        let tip = i.chain.tip_hash();
+        let retained = Self::pool_ids(&i);
+        let mut candidates: Vec<Transaction> = i.pending().cloned().collect();
+        let mut added = Vec::new();
+        for (id, tx) in fresh {
+            if retained.contains(&id) {
+                continue;
+            }
+            if Self::admissible(&i.chain, tx, true).is_err() {
+                self.rejected_locked().insert(id, Some(tip));
+                continue;
+            }
+            candidates.push(tx.clone());
+            added.push(id);
+        }
+        // Reselect only for a new admissible candidate.
+        if added.is_empty() {
+            return Ok(());
+        }
+        let pool = Self::select_pool(&i.chain, self.miner, &candidates, &retained)?;
+        let selected: HashSet<_> = pool.0.iter().map(codec::transaction_id).collect();
+        {
+            // A refused newcomer is not reconsidered until the tip changes.
+            let mut rejected = self.rejected_locked();
+            for id in added.into_iter().filter(|id| !selected.contains(id)) {
+                rejected.insert(id, Some(tip));
+            }
+        }
+        self.install_pool(&mut i, pool)?;
         Ok(())
     }
     fn read_rpc(i: &ReadView, method: &str, params: Value) -> Result<Value> {
@@ -1826,10 +2259,11 @@ impl Node {
             "mining" => self.mining_status(),
             "preparetransaction" => {
                 let request: PrepareRequest = serde_json::from_value(params)?;
-                let sender = parse_account(&request.sender, &self.read_view()?.chain.chain_id())?;
-                let mut i = self.locked()?;
-                let body = self.prepare_locked(
-                    &mut i,
+                // Public preparation reads one published view, never the node lock.
+                let i = self.read_view()?;
+                let sender = parse_account(&request.sender, &i.chain.chain_id())?;
+                let body = Self::prepare_view(
+                    &i,
                     sender,
                     WalletRequest {
                         operation: request.operation,
@@ -3624,7 +4058,7 @@ async fn http_session(
             let mut data = if http.public {
                 json!({"address_hrp":address::hrp(&chain_id)})
             } else {
-                let mut data = node.wallet_status()?;
+                let mut data = node.wallet_read(WalletStore::status).await?;
                 data["token"] = json!(
                     http.session_token
                         .as_deref()
@@ -3686,7 +4120,8 @@ async fn http_session(
         )
         .await;
     }
-    let disabled_signer = request.path == "/api/wallet" && !node.wallets_locked()?.hot_enabled();
+    let disabled_signer =
+        request.path == "/api/wallet" && !node.wallet_read(WalletStore::hot_enabled).await?;
     if wallet_endpoint
         && (!token_matches(
             request.token.as_deref(),

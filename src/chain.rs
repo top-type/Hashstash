@@ -450,6 +450,10 @@ impl Chain {
     pub fn block_height(&self, hash: &Hash) -> Result<Option<u64>> {
         Ok(self.load_entry(hash)?.map(|entry| entry.height))
     }
+    /// Parent of a locally validated block, from header metadata without its body.
+    pub fn block_parent(&self, hash: &Hash) -> Result<Option<Hash>> {
+        Ok(self.load_entry(hash)?.map(|entry| entry.header.previous))
+    }
 
     /// Check the signed preparation reference against the next block on this
     /// tip, returning its fixed, derived expiry height. Membership in this

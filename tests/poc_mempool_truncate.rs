@@ -9,14 +9,19 @@
 //!
 //! `Node::receive_peer` replaces its mempool with this selection, so honest
 //! pending transactions survive one peer message full of such candidates.
+//!
+//! A related prior finding: one forged transaction used to force a selection
+//! over the whole mempool, re-verifying every signature, before it was refused.
 
 use hashstash::{
     chain::{Chain, SELECTION_ATTEMPTS_PER_CANDIDATE},
     codec,
     config::Config,
     crypto,
+    node::{self, Node},
     types::*,
 };
+use std::time::Instant;
 
 mod support;
 
@@ -206,4 +211,88 @@ fn persistent_failures_use_only_their_senders_budget() {
     let mined = Chain::mine(template, 1_000_000).unwrap();
     let mut chain = chain;
     assert!(chain.submit(mined, time as u64).unwrap());
+}
+
+/// Config-only transaction builder for the `Node` (no `Chain` handle): a
+/// genesis-anchored self-payment at a fixed fee above the minimum.
+fn node_self_payment(c: &Config, secret: &[u8; 32], nonce: u64) -> Transaction {
+    let sender = crypto::public_key(secret).unwrap();
+    crypto::sign(
+        &TransactionBody {
+            data: Vec::new(),
+            sender,
+            nonce,
+            fee: 10u32.into(), // >= minimum for a small self-payment
+            anchor: codec::block_hash(&codec::genesis_block(c).unwrap()),
+            expiry_blocks: 100_000,
+            operation: Operation::TransferExact {
+                recipient: sender,
+                amount: 1u32.into(),
+            },
+        },
+        secret,
+    )
+    .unwrap()
+}
+
+/// Related prior finding: one bad-signature transaction used to force a
+/// full-mempool signature re-verification on the public `submit_transaction`
+/// path (the same path `receive_peer` uses), under the node lock. Submission
+/// and relay now authenticate a transaction before taking the node lock, so a
+/// forged record is refused without any selection; this asserts the fix.
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn h9_bad_signature_is_refused_before_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = configuration(1024 * 1024); // hold a full mempool
+    let node = Node::open(&dir.path().join("timing.db"), config.clone(), key()).unwrap();
+
+    // Fund the miner via coinbase.
+    for _ in 0..10 {
+        node.mine(100_000).unwrap();
+    }
+
+    // Fill the mempool with honest self-payments.
+    let target = node::MAX_MEMPOOL; // 256
+    for nonce in 0..target as u64 {
+        node.submit_transaction(node_self_payment(&config, &SECRET, nonce))
+            .unwrap();
+    }
+    let filled = node.status().unwrap()["mempool"].as_u64().unwrap() as usize;
+
+    // Resubmitting an existing transaction short-circuits before any
+    // selection or signature work.
+    let dup = node_self_payment(&config, &SECRET, 0);
+    let t0 = Instant::now();
+    let _ = node.submit_transaction(dup);
+    let dup_elapsed = t0.elapsed();
+
+    // One transaction with a bad signature cannot short-circuit (its id differs).
+    // Before the fix submit_locked re-ran selection over the whole mempool,
+    // re-verifying every signature before rejecting it.
+    let mut bad = node_self_payment(&config, &SECRET, 0);
+    bad.signature[0] ^= 1;
+    let before = node.rpc("mempool", serde_json::json!({"format":"hex"})).unwrap();
+    let t1 = Instant::now();
+    let rejected = node.submit_transaction(bad);
+    let bad_elapsed = t1.elapsed();
+
+    println!("=== H9 related: forged transaction refused before selection ===");
+    println!("mempool size:                         {filled}");
+    println!("duplicate resubmit (short-circuit):   {dup_elapsed:?}");
+    println!("bad-signature resubmit (one verify):  {bad_elapsed:?}");
+    println!("bad transaction rejected:             {}", rejected.is_err());
+
+    assert!(filled >= 1, "mempool should have been filled");
+    // The forged record is refused by its own authentication, never by a
+    // selection over the pool, and the pool is untouched.
+    let error = rejected.expect_err("bad signature must be rejected").to_string();
+    assert!(error.contains("invalid transaction signature"), "{error}");
+    assert_eq!(
+        node.rpc("mempool", serde_json::json!({"format":"hex"})).unwrap(),
+        before
+    );
 }

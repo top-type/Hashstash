@@ -174,6 +174,27 @@ async function run() {
     const snapshots=c.calls.slice(start).filter(call=>call.body.method==='snapshot');assert.ok(snapshots.length>0);checks++;for(const request of snapshots){assert.deepEqual(request.body.params.keys,[before.public_key],'snapshot queries selected wallet only');checks++;}
     const next=c.calls.length;await c.chooseWallet(others[0]);await c.refresh();const selectedRequests=JSON.stringify(c.calls.slice(next));assert.ok(selectedRequests.includes(others[0]),'explicit selection permits reading that account');checks++;for(const key of others.slice(1)){assert.equal(selectedRequests.includes(key),false,'selecting one wallet does not reveal the others');checks++;}
   }
+  // A submission the node drops (expiry, reorganized anchor or decision) does
+  // not keep a stale pending indicator; a used nonce ends it without an error.
+  {
+    const c=await setup();c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();
+    const f=await fill(c,alice);await f.requestSubmit();
+    assert.equal(broadcasts(c).length,1,f.querySelector().textContent);checks++;
+    assert.match(f.querySelector().textContent,/^Pending · /);checks++;
+    c.currentSnapshot.mempool=[{body:{sender:bob,nonce:0,operation:{TransferExact:{recipient:alice,amount:'100'}}}}];c.currentSnapshot.status.mempool=1;
+    await c.refresh();await c.refresh();
+    assert.match(f.querySelector().textContent,/^Pending · /,'a pooled submission stays pending');checks++;
+    c.currentSnapshot.mempool=[];c.currentSnapshot.status.mempool=0;await c.refresh();
+    assert.match(f.querySelector().textContent,/^Pending · /,'one empty pool view is not conclusive');checks++;
+    await c.refresh();
+    assert.match(f.querySelector().textContent,/^No longer pending · .*Prepare it again\.$/);checks++;
+    await (await fill(c,alice)).requestSubmit();
+    assert.equal(broadcasts(c).length,2,f.querySelector().textContent);checks++;
+    c.currentSnapshot.account.account.nonce=1;await c.refresh();
+    assert.match(f.querySelector().textContent,/^Mined or replaced · /);checks++;
+    c.currentSnapshot.account.account.nonce=0;await c.refresh();await c.refresh();
+    assert.match(f.querySelector().textContent,/^Mined or replaced · /,'a settled submission is no longer followed');checks++;
+  }
   console.log(`Browser wallet UI: ${checks} integration assertions passed.`);
 }
 run().catch(error=>{console.error(error);process.exitCode=1;});

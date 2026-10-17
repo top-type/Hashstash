@@ -935,6 +935,8 @@ impl Node {
             policy.public_key() != self.miner,
             "peer identity must be separate from the mining/spending account"
         );
+        // Saved, seeded and later imported wallet accounts must differ as well.
+        self.wallets_locked()?.reserve_peer_identity(policy.public_key())?;
         self.peer_auth = Some(policy);
         Ok(self)
     }
@@ -5746,13 +5748,16 @@ impl RpcClient {
             .context("missing RPC result")?;
         Ok((result, bytes.len()))
     }
-    /// Discover the next nonce. An endpoint that reports `pending_nonce`, its
-    /// account nonce raised past its pending transactions, is taken at its
-    /// word, so no raw pending record of any governed size is downloaded.
-    /// Otherwise the account nonce is raised past this sender's
-    /// signature-checked pending transactions. Either way an endpoint can
-    /// misreport the account nonce or hide pending rows, so the review shows
-    /// the chosen nonce and `--nonce` overrides it.
+    /// Discover the next nonce. A loopback endpoint's reported `pending_nonce`,
+    /// its account nonce raised past its pending transactions, is taken at its
+    /// word, so no raw pending record of any governed size is downloaded, as is
+    /// a remote one equal to the account nonce. Otherwise a remote endpoint
+    /// could plant a future nonce, so the client scans its mempool: the account
+    /// nonce rises past this sender's signature-checked pending transactions
+    /// while they use consecutive nonces, as an honest pool holds them, and
+    /// must reach any reported pending nonce. An endpoint can still misreport
+    /// the account nonce or hide pending rows, so the review shows the chosen
+    /// nonce and `--nonce` overrides it.
     pub async fn pending_nonce(
         &self,
         sender: &PublicKey,
@@ -5769,20 +5774,26 @@ impl RpcClient {
             let account_nonce = account["account"]["nonce"]
                 .as_u64()
                 .context("invalid nonce")?;
-            if let Some(reported) = account.get("pending_nonce").filter(|v| !v.is_null()) {
-                let nonce = reported.as_u64().context("invalid pending nonce")?;
-                ensure!(
-                    nonce >= account_nonce,
-                    "pending nonce precedes account nonce"
-                );
-                return Ok(PendingNonce {
-                    nonce,
-                    account_nonce,
-                    pending: None,
-                });
-            }
-            let (mut nonce, mut pending, mut offset, mut bytes_left) =
-                (account_nonce, 0, 0, budget.bytes);
+            let reported = match account.get("pending_nonce").filter(|v| !v.is_null()) {
+                Some(reported) => {
+                    let nonce = reported.as_u64().context("invalid pending nonce")?;
+                    ensure!(
+                        nonce >= account_nonce,
+                        "pending nonce precedes account nonce"
+                    );
+                    if self.loopback || nonce == account_nonce {
+                        return Ok(PendingNonce {
+                            nonce,
+                            account_nonce,
+                            pending: None,
+                        });
+                    }
+                    Some(nonce)
+                }
+                None => None,
+            };
+            let mut own = std::collections::BTreeSet::new();
+            let (mut offset, mut bytes_left) = (0, budget.bytes);
             while offset < MAX_ADAPTIVE_MEMPOOL {
                 // Each row holds two strings, so the value budget stays small
                 // however large the raw transactions are.
@@ -5810,12 +5821,25 @@ impl RpcClient {
                             .context("mempool signed transaction missing")?,
                     )?;
                     if tx.body.sender == *sender {
-                        pending += 1;
-                        let next = tx.body.nonce.checked_add(1).context("nonce exhausted")?;
-                        nonce = nonce.max(next);
+                        own.insert(tx.body.nonce);
                     }
                 }
                 offset += page.len();
+            }
+            // Honest pools reject nonce gaps, so a row past one justifies nothing.
+            let (mut nonce, mut pending) = (account_nonce, 0);
+            for used in own.range(account_nonce..) {
+                if *used != nonce {
+                    break;
+                }
+                nonce = nonce.checked_add(1).context("nonce exhausted")?;
+                pending += 1;
+            }
+            if let Some(reported) = reported {
+                ensure!(
+                    nonce >= reported,
+                    "RPC endpoint reports pending nonce {reported}, but its signed pending transactions from this sender reach only nonce {nonce}; check the account's next nonce on a node you trust and pass --nonce"
+                );
             }
             Ok(PendingNonce {
                 nonce,
@@ -5837,8 +5861,8 @@ impl RpcClient {
 pub struct PendingNonce {
     pub nonce: u64,
     pub account_nonce: u64,
-    /// Signature-checked pending rows from this sender, when the endpoint did
-    /// not report its own pending nonce and the client scanned its mempool.
+    /// Consecutive signature-checked pending nonces from this sender, when the
+    /// client scanned the mempool instead of taking the reported pending nonce.
     pub pending: Option<usize>,
 }
 

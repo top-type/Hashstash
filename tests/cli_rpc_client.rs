@@ -404,6 +404,128 @@ async fn pending_nonce_discovery_counts_only_signed_rows_and_is_bounded() {
     assert!(started.elapsed() < Duration::from_secs(10));
 }
 
+/// The same loopback mock, reached through a host name, counts as remote.
+fn remote(mock: &Mock) -> RpcClient {
+    let url = format!("http://localhost:{}/rpc", mock.address.port());
+    let client = RpcClient::new(&url, true).unwrap();
+    assert!(!client.is_loopback());
+    client
+}
+
+#[tokio::test]
+async fn a_remote_pending_nonce_above_the_account_needs_consecutive_signed_rows() {
+    let secret = [35u8; 32];
+    let sender = crypto::public_key(&secret).unwrap();
+    let row = |tx: &hashstash::types::Transaction| {
+        json!({"txid":hex::encode(hashstash::codec::transaction_id(tx)),"raw":wallet::signed_hex(tx)})
+    };
+    let endpoint = |claimed: u64, rows: Vec<Value>| {
+        mock(Duration::ZERO, move |method, params| match method {
+            "account" => result(json!({"account":{"nonce":3},"pending_nonce":claimed})),
+            "mempool" if params["offset"] == 0 => result(json!(rows)),
+            _ => result(json!([])),
+        })
+    };
+    // A bare claim plants nonce 4 with no signed transaction behind it.
+    let bare = endpoint(4, Vec::new()).await;
+    let error = remote(&bare)
+        .pending_nonce(&sender, ScanBudget::DEFAULT)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("--nonce"), "{error}");
+    // A withheld nonce-4 transaction cannot justify 5 while nonce 3 is unused.
+    let gap = endpoint(5, vec![row(&signed_transfer(secret, 4))]).await;
+    assert!(
+        remote(&gap)
+            .pending_nonce(&sender, ScanBudget::DEFAULT)
+            .await
+            .is_err()
+    );
+    let consecutive = vec![row(&signed_transfer(secret, 4)), row(&signed_transfer(secret, 3))];
+    let justified = endpoint(5, consecutive.clone()).await;
+    assert_eq!(
+        remote(&justified)
+            .pending_nonce(&sender, ScanBudget::DEFAULT)
+            .await
+            .unwrap(),
+        node::PendingNonce {
+            nonce: 5,
+            account_nonce: 3,
+            pending: Some(2)
+        }
+    );
+    // A loopback endpoint and a claim equal to the account nonce scan nothing.
+    let local = endpoint(5, consecutive).await;
+    let found = RpcClient::new(&local.url(), false)
+        .unwrap()
+        .pending_nonce(&sender, ScanBudget::DEFAULT)
+        .await
+        .unwrap();
+    assert_eq!((found.nonce, found.pending), (5, None));
+    let current = endpoint(3, Vec::new()).await;
+    let found = remote(&current)
+        .pending_nonce(&sender, ScanBudget::DEFAULT)
+        .await
+        .unwrap();
+    assert_eq!((found.nonce, found.pending), (3, None));
+    assert_eq!(local.methods(), ["account"]);
+    assert_eq!(current.methods(), ["account"]);
+}
+
+#[tokio::test]
+async fn a_remote_endpoint_cannot_choose_the_nonce_of_a_long_lifetime() {
+    let chain = hex::encode([36u8; 32]);
+    let status = json!({"chain_id":chain,"tip":hex::encode([37u8; 32]),"height":9});
+    let endpoint = mock(Duration::ZERO, move |method, _| match method {
+        "status" => result(status.clone()),
+        _ => http("500 Internal Server Error", "", b""),
+    })
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let out = directory.path().join("unsigned.json");
+    let sender = hex::encode(crypto::public_key(&[38; 32]).unwrap());
+    let operation = serde_json::to_string(&Operation::TransferExact {
+        recipient: crypto::public_key(&[39; 32]).unwrap(),
+        amount: 1u32.into(),
+    })
+    .unwrap();
+    let url = format!("http://localhost:{}/rpc", endpoint.address.port());
+    let prepare = |extra: &[&str]| {
+        let mut command = args(&[
+            "prepare",
+            "--url",
+            &url,
+            "--insecure-http",
+            "--chain-id",
+            &chain,
+            "--sender",
+            &sender,
+            "--operation",
+            &operation,
+            "--out",
+            out.to_str().unwrap(),
+        ]);
+        command.extend(args(extra));
+        command
+    };
+    let refused = cli(&prepare(&["--expiry-blocks", "500"]), &[]).await;
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("pass --nonce"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(endpoint.methods(), ["status"]);
+    // An explicit nonce, or the default lifetime, proceeds to the endpoint.
+    for extra in [&["--expiry-blocks", "500", "--nonce", "0"][..], &[][..]] {
+        let output = cli(&prepare(extra), &[]).await;
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("pass --nonce"));
+    }
+    assert!(endpoint.methods().len() > 3, "{:?}", endpoint.methods());
+    assert!(!out.exists());
+}
+
 #[tokio::test]
 async fn broadcast_rejects_an_endpoint_reporting_another_transaction_id() {
     let transaction = signed_transfer([23; 32], 0);
@@ -782,6 +904,50 @@ mod funded {
             )
             .await,
         );
+
+        // A second endpoint must hold the anchor on its canonical chain of this network.
+        let (_, review) = successful(
+            &cli(&prepare("anchored.json", &["--anchor-url", &url]), &[]).await,
+        );
+        assert!(
+            review.contains("Anchor check: a canonical block of this network at --anchor-url"),
+            "{review}"
+        );
+        let status = node.status().unwrap();
+        let (tip, height) = (status["tip"].clone(), status["height"].as_u64().unwrap());
+        let chain = hex::encode(chain_id);
+        for (case, network, block) in [
+            (
+                "foreign",
+                hex::encode([9u8; 32]),
+                json!({"hash":tip,"height":height,"status":"confirmed"}),
+            ),
+            (
+                "height",
+                chain.clone(),
+                json!({"hash":tip,"height":height + 1,"status":"confirmed"}),
+            ),
+            (
+                "orphaned",
+                chain.clone(),
+                json!({"hash":tip,"height":height,"status":"orphaned"}),
+            ),
+        ] {
+            let anchor = mock(Duration::ZERO, move |method, _| match method {
+                "status" => result(json!({"chain_id":network})),
+                _ => result(json!({"block":block})),
+            })
+            .await;
+            let out = format!("{case}.json");
+            let output = cli(&prepare(&out, &["--anchor-url", &anchor.url()]), &[]).await;
+            assert!(!output.status.success(), "{case}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("--anchor-url"),
+                "{case}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!directory.path().join(&out).exists(), "{case}");
+        }
         server.stop().await;
     }
 

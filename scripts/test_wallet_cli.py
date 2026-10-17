@@ -221,14 +221,16 @@ def main():
         assert rpc(base, 'account', {'key': other['public_key']})['account']['ordinary'] == '7'
         third = vectors[2]
         cli('transfer', '--url', base + '/rpc', '--key', key_file, '--recipient', third['public_key'], '--amount', '2', '--max-account-charge', '0', success=False)
-        cli('transfer', '--url', base + '/rpc', '--key', key_file, '--recipient', third['public_key'], '--amount', '2', '--max-fee', '1', success=False)
+        # --max-fee is a ceiling: the quote, including account creation, exceeds 1 atom.
+        ceiling = cli('transfer', '--url', base + '/rpc', '--key', key_file, '--recipient', third['public_key'], '--amount', '2', '--max-fee', '1', success=False)
+        assert 'atom ceiling' in ceiling.stderr, ceiling.stderr
         cli('transfer', '--url', base + '/rpc', '--key', key_file, '--recipient', third['public_key'], '--amount', '2', '--fee', '1', success=False)
         assert rpc(base, 'mempool') == []
         cli('transfer', '--url', base + '/rpc', '--key', key_file, '--recipient', third['public_key'], '--amount', '2')
         assert 'max_account_charge' not in rpc(base, 'mempool')[0]['display_operation']['TransferExact']
         cli('mine', '--url', base + '/rpc', '--count', '1')
         assert rpc(base, 'account', {'key': third['public_key']})['account']['ordinary'] == '2'
-        check('CLI transfer selects current exact amounts, signs an exact fee, and rejects obsolete arguments or insufficient fees')
+        check('CLI transfer selects current exact amounts, signs an exact fee, and rejects obsolete arguments, quotes above its fee ceiling or insufficient fees')
         payload = (bytes(range(256)) * 12)[:3000] + b'<script>stored bytes only</script>\x00\r\n'
         data_unsigned = directory / 'data-unsigned.json'
         cli('prepare', '--url', base + '/rpc', '--sender', vector['public_key'], '--operation-file', operation_file, '--data-hex', payload.hex().upper(), '--out', data_unsigned)

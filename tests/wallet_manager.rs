@@ -444,3 +444,52 @@ fn rpc_mining_recipient_changes_payout_with_valid_state_but_keeps_default_miner(
         assert!(snapshot[field].is_null());
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_identity_is_never_a_saved_seeded_or_imported_server_wallet() {
+    use hashstash::peer_auth::Policy;
+    let dir = tempfile::tempdir().unwrap();
+    let miner = crypto::public_key(&[73; 32]).unwrap();
+    let peer_secret = [74; 32];
+    let peer = crypto::public_key(&peer_secret).unwrap();
+    let identity = || Policy::discovery(peer_secret, vec![]).unwrap();
+
+    // An account saved by an earlier start, before the identity was configured.
+    let saved = dir.path().join("saved.sqlite");
+    drop(
+        Node::open(&saved, Config::devnet(), miner)
+            .unwrap()
+            .with_watch_key(peer)
+            .unwrap(),
+    );
+    let reopened = Node::open(&saved, Config::devnet(), miner).unwrap();
+    let error = reopened.with_peer_auth(identity()).err().unwrap();
+    assert!(error.to_string().contains("peer identity"), "{error}");
+
+    let node = Node::open(&dir.path().join("fresh.sqlite"), Config::devnet(), miner)
+        .unwrap()
+        .with_peer_auth(identity())
+        .unwrap();
+    assert!(node.clone().with_wallet(peer_secret).is_err());
+    assert!(node.clone().with_watch_key(peer).is_err());
+    let server = node::serve(node.clone(), options()).await.unwrap();
+    let base = format!("http://{}", server.rpc);
+    let token = std::fs::read_to_string(&server.session_token_file).unwrap();
+    let empty = session(&base).await;
+    for request in [
+        json!({"action":"import","private_key":hex::encode(peer_secret),"revision":empty["wallet_revision"]}),
+        json!({"action":"watch","public_key":hex::encode(peer),"revision":empty["wallet_revision"]}),
+    ] {
+        let (code, reply) = manage(&base, &token, request).await;
+        assert_eq!(code, 400, "{reply}");
+    }
+    assert_eq!(session(&base).await, empty);
+    let (code, _) = manage(
+        &base,
+        &token,
+        json!({"action":"watch","public_key":hex::encode(miner),"revision":empty["wallet_revision"]}),
+    )
+    .await;
+    assert_eq!(code, 200);
+    server.stop().await;
+}

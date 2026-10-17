@@ -3832,33 +3832,264 @@ mod capacity_work_tests {
     }
 }
 
-pub async fn call_rpc(url: &str, method: &str, params: Value) -> Result<Value> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .build()?;
-    let mut response = client
-        .post(url)
-        .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
-        .send()
-        .await?
-        .error_for_status()?;
-    ensure!(
-        response.content_length().unwrap_or(0) <= MAX_RESPONSE_FRAME as u64,
-        "RPC response too large"
-    );
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
+/// Reply bounds for one client RPC call. Bytes bound the transfer; the JSON
+/// value budget bounds the in-memory tree a compact hostile reply could expand to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RpcLimits {
+    pub bytes: usize,
+    pub values: usize,
+}
+impl RpcLimits {
+    /// Fixed-shape replies such as status, account, mining and submission results.
+    pub const SMALL: Self = Self {
+        bytes: 1024 * 1024,
+        values: 65_536,
+    };
+    /// Caller-selected methods whose reply shape is unknown; frame bound only.
+    pub const FRAME: Self = Self {
+        bytes: MAX_RESPONSE_FRAME,
+        values: usize::MAX,
+    };
+    /// Replies that echo their request, such as `preparetransaction`, stay
+    /// proportional to it: hex bodies double bytes and the quote repeats the operation.
+    pub fn echoing(params: &Value) -> Result<Self> {
+        let request = serde_json::to_vec(params)?;
+        Ok(Self {
+            bytes: request
+                .len()
+                .saturating_mul(4)
+                .saturating_add(Self::SMALL.bytes)
+                .min(MAX_RESPONSE_FRAME),
+            values: rpc_json_values(&request)
+                .saturating_mul(2)
+                .saturating_add(Self::SMALL.values),
+        })
+    }
+}
+
+/// Count JSON strings, scalars and containers without building a tree.
+/// Malformed input is counted conservatively and later rejected by serde.
+pub fn rpc_json_values(bytes: &[u8]) -> usize {
+    let (mut values, mut quoted, mut escaped, mut scalar) = (0usize, false, false, false);
+    for &b in bytes {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' | b'[' | b'{' => {
+                values += 1;
+                quoted = b == b'"';
+                scalar = false;
+            }
+            b',' | b':' | b']' | b'}' => scalar = false,
+            _ if b.is_ascii_whitespace() => scalar = false,
+            _ => {
+                values += usize::from(!scalar);
+                scalar = true;
+            }
+        }
+    }
+    values
+}
+
+/// Client transport for command-line RPC. Plain HTTP is limited to loopback
+/// IP literals unless explicitly allowed; environment proxies and redirects are
+/// never followed, so replies come only from the endpoint the user named.
+pub struct RpcClient {
+    url: reqwest::Url,
+    loopback: bool,
+    client: reqwest::Client,
+}
+impl RpcClient {
+    pub fn new(url: &str, insecure_http: bool) -> Result<Self> {
+        let parsed = reqwest::Url::parse(url).context("invalid RPC URL")?;
         ensure!(
-            bytes.len() + chunk.len() <= MAX_RESPONSE_FRAME,
+            parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.query().is_none()
+                && parsed.fragment().is_none(),
+            "RPC URL must not contain credentials, a query or a fragment"
+        );
+        let loopback = parsed
+            .host_str()
+            .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback());
+        match parsed.scheme() {
+            "https" => {}
+            "http" => ensure!(
+                loopback || insecure_http,
+                "plain HTTP RPC is limited to loopback IP addresses; use https:// or pass --insecure-http"
+            ),
+            _ => bail!("RPC URL must use http or https"),
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .https_only(parsed.scheme() == "https")
+            .build()?;
+        Ok(Self {
+            url: parsed,
+            loopback,
+            client,
+        })
+    }
+    /// True only for a loopback IP literal, never for a resolvable host name.
+    pub fn is_loopback(&self) -> bool {
+        self.loopback
+    }
+    pub async fn call(&self, method: &str, params: Value, limits: RpcLimits) -> Result<Value> {
+        Ok(self.call_measured(method, params, limits).await?.0)
+    }
+    /// Also return the reply's byte length so callers can budget a whole scan.
+    pub async fn call_measured(
+        &self,
+        method: &str,
+        params: Value,
+        limits: RpcLimits,
+    ) -> Result<(Value, usize)> {
+        let maximum = limits.bytes.min(MAX_RESPONSE_FRAME);
+        let response = self
+            .client
+            .post(self.url.clone())
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+            .send()
+            .await?;
+        ensure!(
+            !response.status().is_redirection(),
+            "RPC endpoint answered with a redirect; use its final URL"
+        );
+        let mut response = response.error_for_status()?;
+        ensure!(
+            response.content_length().unwrap_or(0) <= maximum as u64,
             "RPC response too large"
         );
-        bytes.extend_from_slice(&chunk);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            ensure!(
+                bytes.len() + chunk.len() <= maximum,
+                "RPC response too large"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        ensure!(
+            rpc_json_values(&bytes) <= limits.values,
+            "RPC response exceeds its JSON value budget"
+        );
+        let mut v: Value = serde_json::from_slice(&bytes)?;
+        if let Some(error) = v.get("error") {
+            bail!("RPC error: {error}");
+        }
+        let result = v
+            .get_mut("result")
+            .map(Value::take)
+            .context("missing RPC result")?;
+        Ok((result, bytes.len()))
     }
-    let v: Value = serde_json::from_slice(&bytes)?;
-    if let Some(error) = v.get("error") {
-        bail!("RPC error: {error}");
+    /// Discover the next nonce: the endpoint's account nonce, raised past this
+    /// sender's signature-checked pending transactions. An endpoint can still
+    /// misreport the account nonce or hide pending rows, but cannot invent them.
+    pub async fn pending_nonce(
+        &self,
+        sender: &PublicKey,
+        budget: ScanBudget,
+    ) -> Result<PendingNonce> {
+        let scan = async {
+            let account = self
+                .call(
+                    "account",
+                    json!({"key":hex::encode(sender)}),
+                    RpcLimits::SMALL,
+                )
+                .await?;
+            let account_nonce = account["account"]["nonce"]
+                .as_u64()
+                .context("invalid nonce")?;
+            let (mut nonce, mut pending, mut offset, mut bytes_left) =
+                (account_nonce, 0, 0, budget.bytes);
+            while offset < MAX_ADAPTIVE_MEMPOOL {
+                // Each row holds two strings, so the value budget stays small
+                // however large the raw transactions are.
+                let (page, bytes) = self
+                    .call_measured(
+                        "mempool",
+                        json!({"offset":offset,"format":"hex"}),
+                        RpcLimits {
+                            bytes: bytes_left,
+                            values: 4096,
+                        },
+                    )
+                    .await
+                    .context("pending transaction scan failed or exceeded its byte budget; pass --nonce")?;
+                bytes_left -= bytes;
+                let page = page.as_array().context("invalid mempool response")?;
+                ensure!(page.len() <= 128, "mempool page exceeds requested limit");
+                if page.is_empty() {
+                    break;
+                }
+                for row in page {
+                    let tx = wallet::decode_signed(
+                        row.get("raw")
+                            .and_then(Value::as_str)
+                            .context("mempool signed transaction missing")?,
+                    )?;
+                    if tx.body.sender == *sender {
+                        pending += 1;
+                        let next = tx.body.nonce.checked_add(1).context("nonce exhausted")?;
+                        nonce = nonce.max(next);
+                    }
+                }
+                offset += page.len();
+            }
+            Ok(PendingNonce {
+                nonce,
+                account_nonce,
+                pending,
+            })
+        };
+        timeout(budget.time, scan).await.map_err(|_| {
+            anyhow!(
+                "pending transaction scan exceeded {} seconds; pass --nonce",
+                budget.time.as_secs()
+            )
+        })?
     }
-    v.get("result").cloned().context("missing RPC result")
+}
+
+/// A client-discovered nonce and what it was derived from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingNonce {
+    pub nonce: u64,
+    pub account_nonce: u64,
+    pub pending: usize,
+}
+
+/// Total reply bytes and time one pending-nonce scan may use, however an
+/// endpoint paginates. An honest mempool holds at most one next block.
+#[derive(Clone, Copy, Debug)]
+pub struct ScanBudget {
+    pub bytes: usize,
+    pub time: Duration,
+}
+impl ScanBudget {
+    pub const DEFAULT: Self = Self {
+        bytes: 2 * MAX_RESPONSE_FRAME,
+        time: Duration::from_secs(300),
+    };
+}
+
+pub async fn call_rpc(url: &str, method: &str, params: Value) -> Result<Value> {
+    RpcClient::new(url, false)?
+        .call(method, params, RpcLimits::FRAME)
+        .await
 }
 
 pub fn validate_stratum_difficulty(difficulty: f64) -> Result<()> {

@@ -1,13 +1,15 @@
 use anyhow::{Context, Result, anyhow, ensure};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use hashstash::{
     address,
     config::Config,
     crypto, fees, math,
-    node::{self, Node, ServerOptions},
+    node::{self, Node, RpcClient, RpcLimits, ServerOptions},
     types::{Amount, Hash, Operation, PublicKey, TransactionBody},
+    wallet,
 };
 use num_traits::{One, Zero};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -15,6 +17,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
 };
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Parser)]
 #[command(
@@ -41,6 +44,10 @@ enum Command {
         /// Development block counts, or longer block counts for interactive use.
         #[arg(long, value_enum, default_value = "dev")]
         preset: InitPreset,
+        /// Genesis Unix time in seconds; defaults to this computer's clock.
+        /// Block 1 must be later, so a fast clock delays every node's first block.
+        #[arg(long)]
+        genesis_time: Option<u32>,
     },
     /// Generate a BIP340 key file. Existing files are never overwritten.
     Keygen {
@@ -105,7 +112,8 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Sign a TransactionBody JSON document offline, using a local key file.
+    /// Low-level automation signer for a TransactionBody JSON or unsigned export.
+    /// It prints a review to stderr but does not ask; prefer the cold signer.
     Sign {
         #[arg(long)]
         key: PathBuf,
@@ -116,8 +124,10 @@ enum Command {
     },
     /// Sign and submit any protocol operation, filling the block anchor and account nonce.
     Send {
-        #[arg(long, default_value = "http://127.0.0.1:18480/rpc")]
-        url: String,
+        #[command(flatten)]
+        endpoint: Endpoint,
+        #[command(flatten)]
+        network: NetworkPin,
         #[arg(long)]
         key: PathBuf,
         #[arg(
@@ -128,25 +138,18 @@ enum Command {
         operation: Option<String>,
         #[arg(long)]
         operation_file: Option<PathBuf>,
-        /// Exact total fee in whole atoms (1000 atoms = 1 hash); quote the minimum when omitted.
-        #[arg(long, conflicts_with = "extra_fee")]
-        fee: Option<String>,
-        /// Extra fee in whole atoms, shared using the governed fee split; zero when omitted.
-        #[arg(long)]
-        extra_fee: Option<String>,
-        /// Optional uninterpreted bytes, encoded as hexadecimal.
-        #[arg(long)]
-        data_hex: Option<String>,
-        #[arg(long)]
-        nonce: Option<u64>,
+        #[command(flatten)]
+        options: TransactionArgs,
         /// Validity after the signed anchor block; defaults to 2 blocks.
         #[arg(long)]
         expiry_blocks: Option<u64>,
     },
     /// Prepare an unsigned transaction for the offline signer. No private key is used.
     Prepare {
-        #[arg(long, default_value = "http://127.0.0.1:18480/rpc")]
-        url: String,
+        #[command(flatten)]
+        endpoint: Endpoint,
+        #[command(flatten)]
+        network: NetworkPin,
         #[arg(long)]
         sender: String,
         #[arg(
@@ -157,15 +160,8 @@ enum Command {
         operation: Option<String>,
         #[arg(long)]
         operation_file: Option<PathBuf>,
-        /// Exact total fee in whole atoms (1000 atoms = 1 hash); quote the minimum when omitted.
-        #[arg(long, conflicts_with = "extra_fee")]
-        fee: Option<String>,
-        /// Extra fee in whole atoms, shared using the governed fee split; zero when omitted.
-        #[arg(long)]
-        extra_fee: Option<String>,
-        /// Optional uninterpreted bytes, encoded as hexadecimal.
-        #[arg(long)]
-        data_hex: Option<String>,
+        #[command(flatten)]
+        options: TransactionArgs,
         /// Validity after the signed anchor block; defaults to 2 blocks.
         #[arg(long)]
         expiry_blocks: Option<u64>,
@@ -174,8 +170,8 @@ enum Command {
     },
     /// Broadcast canonical signed transaction hex from the offline signer.
     Broadcast {
-        #[arg(long, default_value = "http://127.0.0.1:18480/rpc")]
-        url: String,
+        #[command(flatten)]
+        endpoint: Endpoint,
         #[arg(
             long,
             conflicts_with = "raw_file",
@@ -246,9 +242,10 @@ enum Command {
         stratum_password_file: Option<PathBuf>,
     },
     /// Call a JSON-RPC method. Params may be inline JSON or a JSON file.
+    /// Replies are bounded only by the response frame; query endpoints you trust.
     Rpc {
-        #[arg(long, default_value = "http://127.0.0.1:18480/rpc")]
-        url: String,
+        #[command(flatten)]
+        endpoint: Endpoint,
         method: String,
         #[arg(long, default_value = "{}")]
         params: String,
@@ -257,8 +254,8 @@ enum Command {
     },
     /// CPU-mine a bounded number of development blocks through a running node.
     Mine {
-        #[arg(long, default_value = "http://127.0.0.1:18480/rpc")]
-        url: String,
+        #[command(flatten)]
+        endpoint: Endpoint,
         #[arg(long, default_value_t = 1)]
         count: u64,
         #[arg(long, default_value_t = 1_000_000)]
@@ -269,8 +266,10 @@ enum Command {
     },
     /// Send an exact recipient amount, paying fees on top.
     Transfer {
-        #[arg(long, default_value = "http://127.0.0.1:18480/rpc")]
-        url: String,
+        #[command(flatten)]
+        endpoint: Endpoint,
+        #[command(flatten)]
+        network: NetworkPin,
         #[arg(long)]
         key: PathBuf,
         #[arg(long)]
@@ -278,16 +277,63 @@ enum Command {
         #[arg(long)]
         /// Whole monetary atoms (1000 atoms = 1 hash).
         amount: String,
-        /// Exact total fee in whole atoms (1000 atoms = 1 hash); quote the minimum when omitted.
-        #[arg(long, conflicts_with = "extra_fee")]
-        fee: Option<String>,
-        /// Extra fee in whole atoms, shared using the governed fee split; zero when omitted.
-        #[arg(long)]
-        extra_fee: Option<String>,
-        /// Optional uninterpreted bytes, encoded as hexadecimal.
-        #[arg(long)]
-        data_hex: Option<String>,
+        #[command(flatten)]
+        options: TransactionArgs,
     },
+}
+
+/// The RPC endpoint of a networked command.
+#[derive(Args)]
+struct Endpoint {
+    #[arg(long, default_value = "http://127.0.0.1:18480/rpc")]
+    url: String,
+    /// Permit plain HTTP to a non-loopback endpoint, whose replies anyone on the path can forge.
+    #[arg(long)]
+    insecure_http: bool,
+}
+impl Endpoint {
+    fn client(&self) -> Result<RpcClient> {
+        RpcClient::new(&self.url, self.insecure_http)
+    }
+}
+
+/// The network a signed or prepared transaction is intended for.
+#[derive(Args)]
+struct NetworkPin {
+    /// Genesis configuration of the intended network; a non-loopback --url requires a pin.
+    #[arg(long = "config", conflicts_with = "chain_id")]
+    network_config: Option<PathBuf>,
+    /// Chain ID of the intended network, instead of --config.
+    #[arg(long)]
+    chain_id: Option<String>,
+}
+impl NetworkPin {
+    fn chain(&self) -> Result<Option<Hash>> {
+        if self.network_config.is_none() && self.chain_id.is_none() {
+            return Ok(None);
+        }
+        address_chain(self.network_config.as_deref(), self.chain_id.as_deref()).map(Some)
+    }
+}
+
+/// Fee, data and nonce choices shared by send, transfer and prepare.
+#[derive(Args)]
+struct TransactionArgs {
+    /// Exact total fee in whole atoms (1000 atoms = 1 hash); quote the minimum when omitted.
+    #[arg(long, conflicts_with_all = ["extra_fee", "max_fee"])]
+    fee: Option<String>,
+    /// Extra fee in whole atoms, shared using the governed fee split; zero when omitted.
+    #[arg(long)]
+    extra_fee: Option<String>,
+    /// Highest automatically quoted total fee in whole atoms; defaults to the extra fee plus 1000.
+    #[arg(long)]
+    max_fee: Option<String>,
+    /// Optional uninterpreted bytes, encoded as hexadecimal.
+    #[arg(long)]
+    data_hex: Option<String>,
+    /// Exact nonce; by default the account nonce after this sender's signed pending transactions.
+    #[arg(long)]
+    nonce: Option<u64>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -367,17 +413,24 @@ fn calibrate_initial_target(config: &mut Config, hashrate: &str) -> Result<()> {
     Ok(())
 }
 
-fn initial_config(preset: InitPreset, hashrate: Option<&str>) -> Result<Config> {
+fn initial_config(
+    preset: InitPreset,
+    hashrate: Option<&str>,
+    genesis_time: Option<u32>,
+) -> Result<Config> {
     let mut config = match preset {
         InitPreset::Dev => Config::devnet(),
         InitPreset::Slow => Config::slow_testnet(),
     };
     // New CLI-created chains start their timestamp schedule at creation.
-    config.genesis_time = u32::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs(),
-    )?;
+    config.genesis_time = match genesis_time {
+        Some(time) => time,
+        None => u32::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+        )?,
+    };
     if let Some(rate) = hashrate {
         calibrate_initial_target(&mut config, rate)?;
         let mut unique = [0u8; 8];
@@ -387,6 +440,129 @@ fn initial_config(preset: InitPreset, hashrate: Option<&str>) -> Result<Config> 
     config.validate()?;
     Ok(config)
 }
+
+/// Genesis time of the built-in presets; no release of this program predates it.
+const CLOCK_FLOOR: u64 = 1_770_000_000;
+
+/// Genesis time is part of the chain identity and block 1 must follow it, so
+/// flag a genesis that correct clocks would see as future, or an implausible clock.
+fn genesis_warnings(config: &Config, now: u64) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let genesis = u64::from(config.genesis_time);
+    if genesis > now.saturating_add(config.future_seconds.into()) {
+        warnings.push(format!(
+            "genesis time is {} seconds after this computer's clock; nodes defer block 1 until {}",
+            genesis - now,
+            utc_text(genesis)
+        ));
+    }
+    if now < CLOCK_FLOOR {
+        warnings.push(format!(
+            "this computer's clock reads {}, earlier than this release; check it before sharing the configuration",
+            utc_text(now)
+        ));
+    }
+    warnings
+}
+
+/// Render Unix seconds as proleptic Gregorian UTC, without a time-zone database.
+fn utc_text(seconds: u64) -> String {
+    let (days, rest) = (seconds / 86_400, seconds % 86_400);
+    // Civil-from-days over 400-year eras of 146,097 days, with March-based years.
+    let shifted = days + 719_468;
+    let (era, day_of_era) = (shifted / 146_097, shifted % 146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = era * 400 + year_of_era + u64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
+}
+
+/// The Linux launcher's rule: one printable ASCII token of at most 256
+/// characters. An empty file must not silently become the empty password.
+fn stratum_password(text: &str) -> Result<String> {
+    let password = text.trim_end_matches(['\r', '\n']);
+    ensure!(
+        !password.is_empty()
+            && password.len() <= 256
+            && password.bytes().all(|b| b.is_ascii_graphic()),
+        "Stratum password must be one nonempty printable ASCII token of at most 256 characters"
+    );
+    Ok(password.to_owned())
+}
+
+/// Create the automatic discovery identity without ever leaving a partial file
+/// under its final name: write a temporary file, then link it into place without
+/// overwriting. An empty file from an interrupted earlier start is replaced.
+fn ensure_peer_key_file(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {
+            fs::remove_file(path)
+                .with_context(|| format!("remove empty peer identity {}", path.display()))?;
+        }
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", path.display()));
+        }
+    }
+    let name = path
+        .file_name()
+        .context("peer identity path needs a file name")?;
+    let mut unique = [0u8; 8];
+    getrandom::fill(&mut unique).map_err(|e| anyhow!("randomness unavailable: {e}"))?;
+    let temporary = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        name.to_string_lossy(),
+        hex::encode(unique)
+    ));
+    if let Err(error) = hashstash::peer_auth::generate_key_file(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    let published = match fs::hard_link(&temporary, path) {
+        // A concurrent start published its identity first; keep that one.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        result => result,
+    };
+    let removed = fs::remove_file(&temporary);
+    published.with_context(|| format!("publish peer identity {}", path.display()))?;
+    removed.with_context(|| format!("remove temporary {}", temporary.display()))?;
+    #[cfg(unix)]
+    {
+        // Make the new directory entry durable as well as the file contents.
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+        fs::File::open(parent.unwrap_or(Path::new(".")))?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Peer transport keys are public network identities; never link one to a
+/// server wallet account the operator also configured.
+fn check_peer_identity(
+    peer: PublicKey,
+    wallet: Option<PublicKey>,
+    watch: Option<PublicKey>,
+) -> Result<()> {
+    ensure!(
+        wallet != Some(peer) && watch != Some(peer),
+        "peer identity must differ from the server wallet account"
+    );
+    Ok(())
+}
+
 fn read_json(path: &Path) -> Result<Value> {
     Ok(serde_json::from_slice(
         &fs::read(path).with_context(|| format!("read {}", path.display()))?,
@@ -410,31 +586,53 @@ fn write_new(path: &Path, value: &impl serde::Serialize, private: bool) -> Resul
             path.display()
         )
     })?;
-    file.write_all(&serde_json::to_vec_pretty(value)?)?;
+    // Key files pass through this buffer; wipe it rather than freeing it intact.
+    file.write_all(&Zeroizing::new(serde_json::to_vec_pretty(value)?))?;
     file.write_all(b"\n")?;
     file.sync_all()?;
     Ok(())
 }
-fn key_file(path: &Path) -> Result<([u8; 32], PublicKey)> {
-    let v = read_json(path)?;
-    let (private_field, public_field) = if let Some(format) = v.get("format") {
+
+/// A spending key file, in the legacy `secret`/`public` form or the
+/// `hashstash-private-v1` export. Secret text is wiped when the record drops.
+#[derive(Deserialize)]
+struct SpendingKeyFile {
+    format: Option<String>,
+    private_key: Option<String>,
+    public_key: Option<String>,
+    secret: Option<String>,
+    public: Option<String>,
+}
+impl Drop for SpendingKeyFile {
+    fn drop(&mut self) {
+        self.private_key.zeroize();
+        self.secret.zeroize();
+    }
+}
+fn key_file(path: &Path) -> Result<(Zeroizing<[u8; 32]>, PublicKey)> {
+    let bytes = Zeroizing::new(fs::read(path).with_context(|| format!("read {}", path.display()))?);
+    let file: SpendingKeyFile = serde_json::from_slice(&bytes)?;
+    let (private_field, public_field) = if let Some(format) = &file.format {
         ensure!(
             format == "hashstash-private-v1",
             "unsupported private wallet format"
         );
-        ("private_key", "public_key")
+        (&file.private_key, &file.public_key)
     } else {
-        ("secret", "public")
+        (&file.secret, &file.public)
     };
-    let secret = node::parse_hash(
-        v.get(private_field)
-            .and_then(Value::as_str)
+    let mut secret = Zeroizing::new([0u8; 32]);
+    hex::decode_to_slice(
+        private_field
+            .as_deref()
             .context("key file requires a private key")?,
-    )?;
+        secret.as_mut(),
+    )
+    .map_err(|_| anyhow!("expected 32-byte hexadecimal value"))?;
     let public = crypto::public_key(&secret)?;
-    if let Some(p) = v.get(public_field) {
+    if let Some(p) = public_field {
         ensure!(
-            node::parse_key(p.as_str().context("public key must be hexadecimal text")?)? == public,
+            node::parse_key(p)? == public,
             "key file public/secret mismatch"
         );
     }
@@ -577,14 +775,64 @@ fn fee_amount(text: &str) -> Result<Amount> {
     Ok(amount)
 }
 
-/// Recompute a quoted fee using independently fetched network settings and the
-/// exact requested extra; the node cannot silently enlarge the signed payment.
+/// The node-derived part of an automatic fee may be at most 1000 atoms (1 hash)
+/// unless `--max-fee` raises the ceiling.
+const DEFAULT_QUOTED_FEE_CEILING: u32 = 1000;
+
+/// The exact total an automatic quote may reach. Its rate comes from the
+/// endpoint, so a local ceiling bounds what a dishonest endpoint can charge.
+/// An exact `--fee` is its own ceiling.
+fn fee_ceiling(request: &Value, max_fee: Option<&str>) -> Result<Option<Amount>> {
+    if request.get("fee").is_some() {
+        ensure!(
+            max_fee.is_none(),
+            "an exact fee cannot be combined with a fee ceiling"
+        );
+        return Ok(None);
+    }
+    let extra = fee_amount(
+        request["extra_fee"]
+            .as_str()
+            .context("missing requested extra fee")?,
+    )?;
+    let ceiling = match max_fee {
+        Some(text) => fee_amount(text)?,
+        None => &extra + DEFAULT_QUOTED_FEE_CEILING,
+    };
+    ensure!(
+        ceiling >= extra,
+        "fee ceiling is below the requested extra fee"
+    );
+    Ok(Some(ceiling))
+}
+
+fn check_fee_ceiling(fee: &Amount, ceiling: Option<&Amount>) -> Result<()> {
+    if let Some(ceiling) = ceiling {
+        ensure!(
+            fee <= ceiling,
+            "quoted fee of {fee} atoms exceeds the {ceiling} atom ceiling; pass --max-fee or an exact --fee to authorize it"
+        );
+    }
+    Ok(())
+}
+
+/// The components of an automatic fee, as recomputed locally.
+struct FeeBreakdown {
+    rate: Amount,
+    weight: u64,
+    minimum: Amount,
+    account_creation: Amount,
+}
+
+/// Recompute a quoted fee from the status fee rate and the exact requested
+/// extra. Both come from the same endpoint, so this proves only that its
+/// replies agree; the caller's fee ceiling bounds a dishonest endpoint.
 fn verify_automatic_fee(
     body: &TransactionBody,
     quote: &Value,
     status: &Value,
     extra: &Amount,
-) -> Result<()> {
+) -> Result<FeeBreakdown> {
     let quoted = |name: &str| -> Result<Amount> {
         fee_amount(quote[name].as_str().context("missing fee quote field")?)
     };
@@ -593,6 +841,10 @@ fn verify_automatic_fee(
             .as_str()
             .context("missing minimum fee rate")?,
     )?;
+    ensure!(
+        price.bits() <= 64,
+        "minimum fee rate exceeds its consensus range"
+    );
     ensure!(
         quoted("minimum_fee_rate")? == price,
         "fee setting changed while preparing; retry the transaction"
@@ -647,7 +899,7 @@ fn verify_automatic_fee(
             },
         "invalid account creation fee quote"
     );
-    let minimum = (Amount::from(weight) * price + Amount::from(fees::FEE_SCALE - 1))
+    let minimum = (Amount::from(weight) * &price + Amount::from(fees::FEE_SCALE - 1))
         / Amount::from(fees::FEE_SCALE);
     let exact = &minimum + extra;
     ensure!(
@@ -658,7 +910,12 @@ fn verify_automatic_fee(
             && body.fee == exact,
         "prepared fee does not match the network fee calculation"
     );
-    Ok(())
+    Ok(FeeBreakdown {
+        rate: price,
+        weight,
+        minimum,
+        account_creation: creation,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -724,85 +981,154 @@ fn verify_prepared_snapshot(body: &TransactionBody, quote: &Value, status: &Valu
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn send_operation(
-    url: &str,
-    key: &Path,
+/// A non-loopback endpoint must be pinned to the intended network, and a
+/// pinned network must match the network the endpoint reports.
+fn pinned_network(pin: Option<Hash>, reported: Hash, loopback: bool) -> Result<Hash> {
+    match pin {
+        Some(pinned) => {
+            ensure!(
+                pinned == reported,
+                "RPC endpoint is on network {}, not the selected {}",
+                hex::encode(reported),
+                hex::encode(pinned)
+            );
+            Ok(pinned)
+        }
+        None => {
+            ensure!(
+                loopback,
+                "a non-loopback --url requires --config or --chain-id for the intended network"
+            );
+            Ok(reported)
+        }
+    }
+}
+
+enum NonceSource {
+    Requested(u64),
+    Discovered(node::PendingNonce),
+}
+impl NonceSource {
+    fn value(&self) -> u64 {
+        match self {
+            Self::Requested(nonce) => *nonce,
+            Self::Discovered(found) => found.nonce,
+        }
+    }
+}
+
+/// A preparation whose every signed field has been checked against the request.
+struct Prepared {
+    envelope: wallet::UnsignedEnvelope,
+    body: TransactionBody,
+    chain_id: Hash,
+    anchor_height: u64,
+    nonce: NonceSource,
+    fee: Option<(FeeBreakdown, Amount)>,
+}
+impl Prepared {
+    /// Context the signed body alone does not show, including what the endpoint chose.
+    fn notes(&self, client: &RpcClient) -> Vec<String> {
+        let mut notes = vec![format!(
+            "Anchor height: {}; includable through block {}",
+            self.anchor_height,
+            self.anchor_height.saturating_add(self.body.expiry_blocks)
+        )];
+        notes.push(match &self.nonce {
+            NonceSource::Requested(_) => "Nonce source: --nonce".to_owned(),
+            NonceSource::Discovered(found) => format!(
+                "Nonce source: account nonce {} reported by the endpoint, after {} signed pending transaction(s) from this sender",
+                found.account_nonce, found.pending
+            ),
+        });
+        notes.push(match &self.fee {
+            Some((fee, ceiling)) => format!(
+                "Fee quote: minimum {} atoms for weight {} at {} atoms per {} weight, including account creation {} atoms; ceiling {} atoms",
+                fee.minimum,
+                fee.weight,
+                fee.rate,
+                fees::FEE_SCALE,
+                fee.account_creation,
+                ceiling
+            ),
+            None => "Fee source: exact --fee".to_owned(),
+        });
+        if !client.is_loopback()
+            && self.body.expiry_blocks > wallet::default_expiry_blocks(&self.body.operation)
+        {
+            notes.push(format!(
+                "warning: a remote endpoint can withhold this transaction for its {}-block lifetime. If it never confirms, cancel it by confirming another transaction with nonce {} first, such as a 1-atom transfer to yourself with --nonce {}",
+                self.body.expiry_blocks, self.body.nonce, self.body.nonce
+            ));
+        }
+        notes
+    }
+}
+
+/// Prepare through the endpoint, then verify network, sender, nonce, anchor,
+/// lifetime, operation, data and fee before anything is signed or exported.
+async fn prepare_verified(
+    client: &RpcClient,
+    network: &NetworkPin,
+    sender: &str,
     operation: Value,
-    fee: Option<String>,
-    extra_fee: Option<String>,
-    data_hex: Option<String>,
-    nonce: Option<u64>,
+    options: TransactionArgs,
     expiry_blocks: Option<u64>,
-) -> Result<Value> {
-    let (secret, sender) = key_file(key)?;
-    let status = node::call_rpc(url, "status", json!({})).await?;
-    let mut fee_request = transaction_fee_request(fee, extra_fee)?;
-    add_requested_data(&mut fee_request, data_hex)?;
-    let chain_id = node::parse_hash(status["chain_id"].as_str().context("missing chain id")?)?;
+) -> Result<Prepared> {
+    let status = client.call("status", json!({}), RpcLimits::SMALL).await?;
+    let reported = node::parse_hash(status["chain_id"].as_str().context("missing chain id")?)?;
+    let chain_id = pinned_network(network.chain()?, reported, client.is_loopback())?;
+    let sender = node::parse_account(sender, &chain_id)?;
+    let mut request = transaction_fee_request(options.fee, options.extra_fee)?;
+    let ceiling = fee_ceiling(&request, options.max_fee.as_deref())?;
+    add_requested_data(&mut request, options.data_hex)?;
     let operation = operation_addresses(operation, &chain_id)?;
     let operation: Operation = serde_json::from_value(operation)?;
-    let expiry_blocks =
-        expiry_blocks.unwrap_or_else(|| hashstash::wallet::default_expiry_blocks(&operation));
+    let expiry_blocks = expiry_blocks.unwrap_or_else(|| wallet::default_expiry_blocks(&operation));
     ensure!(expiry_blocks > 0, "expiry blocks must be positive");
-    let account = node::call_rpc(url, "account", json!({"key":hex::encode(sender)})).await?;
     let anchor = node::parse_hash(status["tip"].as_str().context("missing status tip")?)?;
-    let nonce = if let Some(n) = nonce {
-        n
-    } else {
-        let mut n = account["account"]["nonce"]
-            .as_u64()
-            .context("invalid nonce")?;
-        let mut offset = 0;
-        while offset < node::MAX_ADAPTIVE_MEMPOOL {
-            let pending =
-                node::call_rpc(url, "mempool", json!({"offset":offset,"format":"hex"})).await?;
-            let page = pending.as_array().context("invalid mempool response")?;
-            ensure!(page.len() <= 128, "mempool page exceeds requested limit");
-            if page.is_empty() {
-                break;
-            }
-            for v in page {
-                let tx = hashstash::wallet::decode_signed(
-                    v.get("raw")
-                        .and_then(Value::as_str)
-                        .context("mempool signed transaction missing")?,
-                )?;
-                if tx.body.sender == sender {
-                    n = n.max(tx.body.nonce.checked_add(1).context("nonce exhausted")?);
-                }
-            }
-            offset += page.len();
-        }
-        n
+    let anchor_height = status["height"].as_u64().context("invalid status height")?;
+    let nonce = match options.nonce {
+        Some(nonce) => NonceSource::Requested(nonce),
+        None => NonceSource::Discovered(
+            client
+                .pending_nonce(&sender, node::ScanBudget::DEFAULT)
+                .await?,
+        ),
     };
-    let body: TransactionBody = {
-        let mut request = fee_request;
-        request["sender"] = json!(hex::encode(sender));
-        request["operation"] = serde_json::to_value(&operation)?;
-        request["nonce"] = json!(nonce);
-        request["anchor"] = json!(hex::encode(anchor));
-        request["expiry_blocks"] = json!(expiry_blocks);
-        let response = node::call_rpc(url, "preparetransaction", request.clone()).await?;
-        let quote = response.get("fee_quote").cloned().unwrap_or(Value::Null);
-        let envelope = prepared_envelope(response)?;
-        let body = hashstash::wallet::decode_unsigned(&envelope)?;
-        ensure!(
-            hashstash::wallet::unsigned_chain(&envelope)? == chain_id,
-            "prepared export has another network context"
-        );
-        verify_prepared_body(
-            &body,
-            sender,
-            &operation,
-            nonce,
-            anchor,
-            expiry_blocks,
-            &request,
-        )?;
-        verify_prepared_snapshot(&body, &quote, &status)?;
-        if request.get("fee").is_none() {
-            verify_automatic_fee(
+    request["sender"] = json!(hex::encode(sender));
+    request["operation"] = serde_json::to_value(&operation)?;
+    request["nonce"] = json!(nonce.value());
+    request["anchor"] = json!(hex::encode(anchor));
+    request["expiry_blocks"] = json!(expiry_blocks);
+    let response = client
+        .call(
+            "preparetransaction",
+            request.clone(),
+            RpcLimits::echoing(&request)?,
+        )
+        .await?;
+    let quote = response.get("fee_quote").cloned().unwrap_or(Value::Null);
+    // Check the returned wire package before signing or saving it.
+    let envelope = prepared_envelope(response)?;
+    let body = wallet::decode_unsigned(&envelope)?;
+    ensure!(
+        wallet::unsigned_chain(&envelope)? == chain_id,
+        "prepared export has another network context"
+    );
+    verify_prepared_body(
+        &body,
+        sender,
+        &operation,
+        nonce.value(),
+        anchor,
+        expiry_blocks,
+        &request,
+    )?;
+    verify_prepared_snapshot(&body, &quote, &status)?;
+    let fee = match ceiling {
+        Some(ceiling) => {
+            let breakdown = verify_automatic_fee(
                 &body,
                 &quote,
                 &status,
@@ -812,15 +1138,106 @@ async fn send_operation(
                         .context("missing requested extra fee")?,
                 )?,
             )?;
+            check_fee_ceiling(&body.fee, Some(&ceiling))?;
+            Some((breakdown, ceiling))
         }
-        body
+        None => None,
     };
-    node::call_rpc(
-        url,
-        "submittransaction",
-        serde_json::to_value(crypto::sign(&body, &secret)?)?,
+    Ok(Prepared {
+        envelope,
+        body,
+        chain_id,
+        anchor_height,
+        nonce,
+        fee,
+    })
+}
+
+/// Review lines for a body about to be signed or exported. `· HASH` values
+/// are raw atoms; long data is abbreviated after its byte count.
+fn review_lines(body: &TransactionBody, chain_id: Option<&Hash>) -> Vec<String> {
+    wallet::review(body, chain_id)
+        .into_iter()
+        .map(|field| {
+            let mut value = field.value;
+            if field.label == "Data hex" && value.len() > 128 {
+                value.truncate(128);
+                value.push_str("...");
+            }
+            match field.label.strip_suffix(" · HASH") {
+                Some(label) => format!("{label}: {value} atoms"),
+                None => format!("{}: {value}", field.label),
+            }
+        })
+        .collect()
+}
+
+/// Reviews go to stderr so stdout stays machine-readable.
+fn print_review(title: &str, body: &TransactionBody, chain_id: Option<&Hash>, notes: &[String]) {
+    eprintln!("{title}");
+    for line in review_lines(body, chain_id).iter().chain(notes) {
+        eprintln!("  {line}");
+    }
+}
+
+/// Broadcast canonical signed bytes, which every listener accepts. The endpoint
+/// must report the locally computed transaction ID.
+async fn broadcast_signed(
+    client: &RpcClient,
+    transaction: &hashstash::types::Transaction,
+    raw: &str,
+) -> Result<Value> {
+    let id = hex::encode(hashstash::codec::transaction_id(transaction));
+    let result = client
+        .call(
+            "broadcasttransaction",
+            json!({"raw":raw}),
+            RpcLimits::SMALL,
+        )
+        .await?;
+    ensure!(
+        result["transaction_id"].as_str() == Some(id.as_str()),
+        "RPC endpoint reported another transaction ID"
+    );
+    Ok(result)
+}
+
+/// The key file is read for its public key, then again only to sign, so the
+/// secret is not held in memory across RPC round trips.
+async fn send_operation(
+    client: &RpcClient,
+    key: &Path,
+    network: &NetworkPin,
+    operation: Value,
+    options: TransactionArgs,
+    expiry_blocks: Option<u64>,
+) -> Result<Value> {
+    let sender = key_file(key)?.1;
+    let prepared = prepare_verified(
+        client,
+        network,
+        &hex::encode(sender),
+        operation,
+        options,
+        expiry_blocks,
     )
-    .await
+    .await?;
+    print_review(
+        "Signing transaction:",
+        &prepared.body,
+        Some(&prepared.chain_id),
+        &prepared.notes(client),
+    );
+    let signed = {
+        let (secret, public) = key_file(key)?;
+        ensure!(
+            public == sender,
+            "key file changed while preparing the transaction"
+        );
+        crypto::sign(&prepared.body, &secret)?
+    };
+    let result = broadcast_signed(client, &signed, &wallet::signed_hex(&signed)).await?;
+    Ok(json!({"txid":result["transaction_id"]}))
 }
 
 #[tokio::main]
@@ -830,13 +1247,19 @@ async fn main() -> Result<()> {
             config,
             hashrate,
             preset,
+            genesis_time,
         } => {
-            let c = initial_config(preset, hashrate.as_deref())?;
+            let c = initial_config(preset, hashrate.as_deref(), genesis_time)?;
+            for warning in genesis_warnings(&c, node::now()) {
+                eprintln!("warning: {warning}");
+            }
             write_new(&config, &c, false)?;
             println!(
-                "Created {}\nChain ID: {}",
+                "Created {}\nChain ID: {}\nGenesis time: {} ({})",
                 config.display(),
-                hex::encode(c.chain_id())
+                hex::encode(c.chain_id()),
+                c.genesis_time,
+                utc_text(c.genesis_time.into())
             );
         }
         Command::PeerKeygen { out } => {
@@ -864,15 +1287,26 @@ async fn main() -> Result<()> {
         }
         Command::Keygen { out } => {
             let (secret, public) = loop {
-                let mut secret = [0u8; 32];
-                getrandom::fill(&mut secret).map_err(|e| anyhow!("randomness unavailable: {e}"))?;
+                let mut secret = Zeroizing::new([0u8; 32]);
+                getrandom::fill(secret.as_mut())
+                    .map_err(|e| anyhow!("randomness unavailable: {e}"))?;
                 if let Ok(public) = crypto::public_key(&secret) {
                     break (secret, public);
                 }
             };
+            // Serialize borrowed text so no intermediate JSON tree copies the secret.
+            #[derive(Serialize)]
+            struct NewKeyFile<'a> {
+                public: String,
+                secret: &'a str,
+            }
+            let secret_hex = Zeroizing::new(hex::encode(&*secret));
             write_new(
                 &out,
-                &json!({"secret":hex::encode(secret), "public":hex::encode(public)}),
+                &NewKeyFile {
+                    public: hex::encode(public),
+                    secret: &secret_hex,
+                },
                 true,
             )?;
             println!(
@@ -926,25 +1360,43 @@ async fn main() -> Result<()> {
         }
         Command::Sign { key, body, out } => {
             let (secret, public) = key_file(&key)?;
-            let body: TransactionBody = serde_json::from_value(read_json(&body)?)?;
-            hashstash::wallet::validate_body(&body)?;
+            // The strict unsigned export is accepted too, so the review shows its network.
+            let input = read_json(&body)?;
+            let (body, chain_id) = if input.get("format").is_some() {
+                let envelope: wallet::UnsignedEnvelope = serde_json::from_value(input)?;
+                (
+                    wallet::decode_unsigned(&envelope)?,
+                    Some(wallet::unsigned_chain(&envelope)?),
+                )
+            } else {
+                let body: TransactionBody = serde_json::from_value(input)?;
+                hashstash::wallet::validate_body(&body)?;
+                (body, None)
+            };
             ensure!(
                 body.sender == public,
                 "transaction sender differs from signing key"
             );
+            let default_lifetime = wallet::default_expiry_blocks(&body.operation);
+            let mut notes = Vec::new();
+            if body.expiry_blocks > default_lifetime {
+                notes.push(format!(
+                    "warning: lifetime of {} blocks exceeds the {default_lifetime}-block default",
+                    body.expiry_blocks
+                ));
+            }
+            print_review("Signing transaction:", &body, chain_id.as_ref(), &notes);
             let signed = crypto::sign(&body, &secret)?;
             write_new(&out, &signed, false)?;
             println!("Signed transaction saved in {}", out.display());
         }
         Command::Send {
-            url,
+            endpoint,
+            network,
             key,
             operation,
             operation_file,
-            fee,
-            extra_fee,
-            data_hex,
-            nonce,
+            options,
             expiry_blocks,
         } => {
             let operation = if let Some(file) = operation_file {
@@ -952,31 +1404,22 @@ async fn main() -> Result<()> {
             } else {
                 serde_json::from_str(operation.as_deref().context("operation missing")?)?
             };
+            let client = endpoint.client()?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &send_operation(
-                        &url,
-                        &key,
-                        operation,
-                        fee,
-                        extra_fee,
-                        data_hex,
-                        nonce,
-                        expiry_blocks
-                    )
-                    .await?
+                    &send_operation(&client, &key, &network, operation, options, expiry_blocks)
+                        .await?
                 )?
             );
         }
         Command::Prepare {
-            url,
+            endpoint,
+            network,
             sender,
             operation,
             operation_file,
-            fee,
-            extra_fee,
-            data_hex,
+            options,
             expiry_blocks,
             out,
         } => {
@@ -985,80 +1428,32 @@ async fn main() -> Result<()> {
             } else {
                 serde_json::from_str(operation.as_deref().context("operation missing")?)?
             };
-            let status = node::call_rpc(&url, "status", json!({})).await?;
-            let chain_id =
-                node::parse_hash(status["chain_id"].as_str().context("missing chain id")?)?;
-            let operation = operation_addresses(operation, &chain_id)?;
-            let parsed_operation: Operation = serde_json::from_value(operation.clone())?;
-            let expiry_blocks = expiry_blocks
-                .unwrap_or_else(|| hashstash::wallet::default_expiry_blocks(&parsed_operation));
-            ensure!(expiry_blocks > 0, "expiry blocks must be positive");
-            let mut request = transaction_fee_request(fee, extra_fee)?;
-            add_requested_data(&mut request, data_hex)?;
-            request["sender"] = json!(sender);
-            request["operation"] = operation;
-            let anchor = node::parse_hash(status["tip"].as_str().context("missing status tip")?)?;
-            request["anchor"] = json!(hex::encode(anchor));
-            request["expiry_blocks"] = json!(expiry_blocks);
-            let automatic = request.get("fee").is_none();
-            let response = node::call_rpc(&url, "preparetransaction", request.clone()).await?;
-            let quote = response.get("fee_quote").cloned().unwrap_or(Value::Null);
-            // Check the returned wire package before saving it for the offline signer.
-            let envelope = prepared_envelope(response)?;
-            let body = hashstash::wallet::decode_unsigned(&envelope)?;
-            verify_prepared_data(&body, &request)?;
-            ensure!(
-                hashstash::wallet::unsigned_chain(&envelope)? == chain_id,
-                "prepared export has another network context"
+            let client = endpoint.client()?;
+            let prepared =
+                prepare_verified(&client, &network, &sender, operation, options, expiry_blocks)
+                    .await?;
+            print_review(
+                "Prepared transaction:",
+                &prepared.body,
+                Some(&prepared.chain_id),
+                &prepared.notes(&client),
             );
-            ensure!(
-                body.sender
-                    == node::parse_account(
-                        request["sender"].as_str().context("missing sender")?,
-                        &chain_id
-                    )?,
-                "prepared transaction has another sender"
-            );
-            ensure!(
-                body.operation
-                    == serde_json::from_value::<Operation>(request["operation"].clone())?,
-                "prepared transaction has another operation"
-            );
-            ensure!(
-                body.anchor == anchor && body.expiry_blocks == expiry_blocks,
-                "prepared transaction has another anchor or lifetime"
-            );
-            verify_prepared_snapshot(&body, &quote, &status)?;
-            if automatic {
-                verify_automatic_fee(
-                    &body,
-                    &quote,
-                    &status,
-                    &fee_amount(
-                        request["extra_fee"]
-                            .as_str()
-                            .context("missing requested extra fee")?,
-                    )?,
-                )?;
-            } else {
-                ensure!(
-                    body.fee
-                        == fee_amount(request["fee"].as_str().context("missing requested fee")?)?,
-                    "prepared transaction has another fee"
-                );
-            }
-            write_new(&out, &envelope, false)?;
+            write_new(&out, &prepared.envelope, false)?;
             println!("Unsigned transaction saved in {}", out.display());
         }
-        Command::Broadcast { url, raw, raw_file } => {
+        Command::Broadcast {
+            endpoint,
+            raw,
+            raw_file,
+        } => {
             let raw = if let Some(file) = raw_file {
                 fs::read_to_string(file)?
             } else {
                 raw.context("signed transaction missing")?
             };
             let raw = raw.trim();
-            hashstash::wallet::decode_signed(raw)?;
-            let result = node::call_rpc(&url, "broadcasttransaction", json!({"raw":raw})).await?;
+            let transaction = hashstash::wallet::decode_signed(raw)?;
+            let result = broadcast_signed(&endpoint.client()?, &transaction, raw).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Run {
@@ -1085,7 +1480,27 @@ async fn main() -> Result<()> {
         } => {
             let c: Config = serde_json::from_value(read_json(&config)?)?;
             let chain_id = c.chain_id();
+            // Check wallet seeds and the password before opening the database.
+            let wallet = match &wallet_key {
+                Some(path) => {
+                    ensure!(
+                        rpc.ip().is_loopback(),
+                        "a local wallet requires a loopback RPC address"
+                    );
+                    Some(key_file(path)?)
+                }
+                None => None,
+            };
+            let watch = watch_key
+                .map(|public| node::parse_account(&public, &chain_id))
+                .transpose()?;
+            let password = stratum_password_file
+                .map(fs::read_to_string)
+                .transpose()?
+                .map(|text| stratum_password(&text))
+                .transpose()?;
             let mut node = Node::open(&data, c, node::parse_account(&miner, &chain_id)?)?;
+            let wallet_public = wallet.as_ref().map(|(_, public)| *public);
             if peer_discovery {
                 let options = hashstash::peer_discovery::Options {
                     enabled: true,
@@ -1098,35 +1513,36 @@ async fn main() -> Result<()> {
                     Some(path) => path,
                     None => {
                         let path = data.with_extension("peer-key.json");
-                        if !path.exists() {
-                            hashstash::peer_auth::generate_key_file(&path)?;
-                        }
+                        ensure_peer_key_file(&path)?;
                         path
                     }
                 };
-                node = node
-                    .with_peer_auth(hashstash::peer_auth::Policy::discovery_from_file(
-                        &key_path, peer_pin,
-                    )?)?
-                    .with_discovery(options)?;
+                let policy =
+                    hashstash::peer_auth::Policy::discovery_from_file(&key_path, peer_pin)?;
+                check_peer_identity(policy.public_key(), wallet_public, watch)?;
+                node = node.with_peer_auth(policy)?.with_discovery(options)?;
             } else if let Some(path) = peer_key_file {
-                node =
-                    node.with_peer_auth(hashstash::peer_auth::Policy::from_file(&path, peer_pin)?)?;
+                let policy = hashstash::peer_auth::Policy::from_file(&path, peer_pin)?;
+                check_peer_identity(policy.public_key(), wallet_public, watch)?;
+                node = node.with_peer_auth(policy)?;
             }
-            if let Some(path) = wallet_key {
-                ensure!(
-                    rpc.ip().is_loopback(),
-                    "a local wallet requires a loopback RPC address"
+            if let Some((secret, _)) = &wallet {
+                node = node.with_wallet(**secret)?;
+            }
+            drop(wallet);
+            if let Some(public) = watch {
+                node = node.with_watch_key(public)?;
+            }
+            if !no_stratum && !stratum.ip().is_loopback() && password.is_none() {
+                eprintln!(
+                    "warning: Stratum on {stratum} has no --stratum-password-file; anyone who can reach it can open worker sessions"
                 );
-                node = node.with_wallet(key_file(&path)?.0)?;
             }
-            if let Some(public) = watch_key {
-                node = node.with_watch_key(node::parse_account(&public, &chain_id)?)?;
+            if let Some(address) = public_web.filter(|address| !address.ip().is_loopback()) {
+                eprintln!(
+                    "warning: public web on {address} is plain HTTP; serve browsers only through an HTTPS reverse proxy"
+                );
             }
-            let password = stratum_password_file
-                .map(fs::read_to_string)
-                .transpose()?
-                .map(|s| s.trim_end_matches(['\r', '\n']).to_owned());
             let server = node::serve(
                 node.clone(),
                 ServerOptions {
@@ -1160,7 +1576,7 @@ async fn main() -> Result<()> {
             server.stop().await;
         }
         Command::Rpc {
-            url,
+            endpoint,
             method,
             params,
             params_file,
@@ -1172,11 +1588,16 @@ async fn main() -> Result<()> {
             };
             println!(
                 "{}",
-                serde_json::to_string_pretty(&node::call_rpc(&url, &method, p).await?)?
+                serde_json::to_string_pretty(
+                    &endpoint
+                        .client()?
+                        .call(&method, p, RpcLimits::FRAME)
+                        .await?
+                )?
             );
         }
         Command::Mine {
-            url,
+            endpoint,
             count,
             attempts,
             recipient,
@@ -1187,24 +1608,28 @@ async fn main() -> Result<()> {
             }
             println!(
                 "{}",
-                serde_json::to_string_pretty(&node::call_rpc(&url, "mine", params).await?)?
+                serde_json::to_string_pretty(
+                    &endpoint
+                        .client()?
+                        .call("mine", params, RpcLimits::SMALL)
+                        .await?
+                )?
             );
         }
         Command::Transfer {
-            url,
+            endpoint,
+            network,
             key,
             recipient,
             amount,
-            fee,
-            extra_fee,
-            data_hex,
+            options,
         } => {
             let operation = json!({"TransferExact":{"recipient":recipient,"amount":amount}});
+            let client = endpoint.client()?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &send_operation(&url, &key, operation, fee, extra_fee, data_hex, None, None)
-                        .await?
+                    &send_operation(&client, &key, &network, operation, options, None).await?
                 )?
             );
         }
@@ -1299,14 +1724,19 @@ mod tests {
                     args.extend(["--recipient", "address", "--amount", "1"]);
                 }
             }
-            for valid in ["--fee", "--extra-fee"] {
+            for valid in ["--fee", "--extra-fee", "--max-fee", "--nonce"] {
                 let mut selected = args.clone();
                 selected.extend([valid, "2"]);
                 assert!(Cli::try_parse_from(selected).is_ok());
             }
+            // --max-fee is a ceiling for automatic quotes; an exact fee needs none.
+            let mut ceiling = args.clone();
+            ceiling.extend(["--extra-fee", "1", "--max-fee", "20"]);
+            assert!(Cli::try_parse_from(ceiling).is_ok());
             for invalid in [
                 vec!["--fee", "2", "--extra-fee", "1"],
-                vec!["--max-fee", "2"],
+                vec!["--fee", "2", "--max-fee", "2"],
+                vec!["--config", "network.json", "--chain-id", "00"],
                 vec!["--priority-fee", "1"],
             ] {
                 let mut selected = args.clone();
@@ -1567,6 +1997,75 @@ mod tests {
     }
 
     #[test]
+    fn consistent_inflated_fee_rate_is_refused_by_the_local_ceiling() {
+        // One endpoint answers both status and the quote, so a dishonest one can
+        // report a single inflated rate consistently. Only the ceiling stops it.
+        let rate = 1u64 << 40;
+        let mut body = TransactionBody {
+            sender: crypto::public_key(&[7; 32]).unwrap(),
+            nonce: 0,
+            anchor: [38; 32],
+            expiry_blocks: 2,
+            fee: 0u32.into(),
+            operation: Operation::TransferExact {
+                recipient: crypto::public_key(&[6; 32]).unwrap(),
+                amount: 1u32.into(),
+            },
+            data: vec![],
+        };
+        let weight = loop {
+            let weight = hashstash::codec::encode(&hashstash::types::Transaction {
+                body: body.clone(),
+                signature: [0; 64],
+            })
+            .len() as u64;
+            let minimum = (Amount::from(weight) * rate + 1023u32) / 1024u32;
+            if body.fee == minimum {
+                break weight;
+            }
+            body.fee = minimum;
+        };
+        let status = json!({"fee_policy":{"minimum_fee_rate":rate.to_string()}});
+        let quote = json!({"minimum_fee_rate":rate.to_string(),"weight":weight.to_string(),
+            "minimum_fee":body.fee.to_string(),"account_creation_fee":"0","grant_recipient_fee":"0",
+            "extra_fee":"0","fee":body.fee.to_string()});
+        let breakdown = verify_automatic_fee(&body, &quote, &status, &Amount::zero()).unwrap();
+        assert_eq!(breakdown.minimum, body.fee);
+        assert_eq!(breakdown.rate, Amount::from(rate));
+        let request = json!({"extra_fee":"0"});
+        let default = fee_ceiling(&request, None).unwrap();
+        assert_eq!(default, Some(1000u32.into()));
+        assert!(check_fee_ceiling(&body.fee, default.as_ref()).is_err());
+        let raised = fee_ceiling(&request, Some(&body.fee.to_string())).unwrap();
+        check_fee_ceiling(&body.fee, raised.as_ref()).unwrap();
+        let below = fee_ceiling(&request, Some(&(&body.fee - 1u32).to_string())).unwrap();
+        assert!(check_fee_ceiling(&body.fee, below.as_ref()).is_err());
+        // The default ceiling sits above the requested extra; exact fees need none.
+        assert_eq!(
+            fee_ceiling(&json!({"extra_fee":"5"}), None).unwrap(),
+            Some(1005u32.into())
+        );
+        assert_eq!(fee_ceiling(&json!({"fee":"5"}), None).unwrap(), None);
+        check_fee_ceiling(&(Amount::one() << 400usize), None).unwrap();
+        assert!(fee_ceiling(&json!({"fee":"5"}), Some("6")).is_err());
+        assert!(fee_ceiling(&json!({"extra_fee":"5"}), Some("4")).is_err());
+        assert!(fee_ceiling(&json!({"extra_fee":"5"}), Some("-1")).is_err());
+        // Consensus rates are u64; a larger reported rate is not a network setting.
+        let huge = (Amount::one() << 64usize).to_string();
+        let mut quote = quote;
+        quote["minimum_fee_rate"] = json!(huge);
+        assert!(
+            verify_automatic_fee(
+                &body,
+                &quote,
+                &json!({"fee_policy":{"minimum_fee_rate":huge}}),
+                &Amount::zero()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn cli_zero_fee_rate_preserves_creation_weight_and_exact_extra() {
         let sender = crypto::public_key(&[7; 32]).unwrap();
         let other = crypto::public_key(&[8; 32]).unwrap();
@@ -1731,13 +2230,13 @@ mod tests {
 
     #[test]
     fn calibrated_networks_have_timestamp_target_and_fresh_identity() {
-        let first = initial_config(InitPreset::Slow, Some("100T")).unwrap();
-        let second = initial_config(InitPreset::Slow, Some("100T")).unwrap();
+        let first = initial_config(InitPreset::Slow, Some("100T"), None).unwrap();
+        let second = initial_config(InitPreset::Slow, Some("100T"), None).unwrap();
         assert!(first.network.starts_with("hashstash-private-"));
         assert_ne!(first.chain_id(), second.chain_id());
         assert_eq!(first.initial.interval, 15);
         assert!(first.genesis_time > 1_770_000_000);
-        let ordinary = initial_config(InitPreset::Dev, None).unwrap();
+        let ordinary = initial_config(InitPreset::Dev, None, None).unwrap();
         assert_eq!(ordinary.initial.interval, 15);
     }
 
@@ -1748,8 +2247,166 @@ mod tests {
         let original = Config::devnet();
         write_new(&path, &original, false).unwrap();
         let before = fs::read(&path).unwrap();
-        let calibrated = initial_config(InitPreset::Slow, Some("100T")).unwrap();
+        let calibrated = initial_config(InitPreset::Slow, Some("100T"), None).unwrap();
         assert!(write_new(&path, &calibrated, false).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn genesis_time_is_selectable_readable_and_checked_against_the_clock() {
+        for (seconds, text) in [
+            (0, "1970-01-01 00:00:00 UTC"),
+            (951_782_400, "2000-02-29 00:00:00 UTC"),
+            (1_770_000_000, "2026-02-02 02:40:00 UTC"),
+            (4_102_444_799, "2099-12-31 23:59:59 UTC"),
+            (u64::from(u32::MAX), "2106-02-07 06:28:15 UTC"),
+        ] {
+            assert_eq!(utc_text(seconds), text);
+        }
+        let pinned = initial_config(InitPreset::Dev, None, Some(1_800_000_000)).unwrap();
+        assert_eq!(pinned.genesis_time, 1_800_000_000);
+        assert!(initial_config(InitPreset::Dev, None, Some(u32::MAX)).is_err());
+        let now = 1_800_000_000u64;
+        assert!(genesis_warnings(&pinned, now).is_empty());
+        assert!(genesis_warnings(&pinned, now - u64::from(pinned.future_seconds)).is_empty());
+        let early = genesis_warnings(&pinned, now - u64::from(pinned.future_seconds) - 1);
+        assert_eq!(early.len(), 1);
+        assert!(early[0].contains("defer block 1"), "{early:?}");
+        let stale = genesis_warnings(&Config::devnet(), CLOCK_FLOOR - 1);
+        assert!(stale.iter().any(|w| w.contains("earlier than this release")));
+    }
+
+    #[test]
+    fn stratum_password_files_follow_the_launcher_token_rule() {
+        assert_eq!(stratum_password("token\r\n").unwrap(), "token");
+        assert_eq!(stratum_password("a!~Z9").unwrap(), "a!~Z9");
+        assert_eq!(stratum_password(&"x".repeat(256)).unwrap().len(), 256);
+        for invalid in [
+            String::new(),
+            "\n".into(),
+            "\r\n\r\n".into(),
+            " ".into(),
+            "two words".into(),
+            "tab\there".into(),
+            " leading".into(),
+            "trailing ".into(),
+            "pässword".into(),
+            "line\nbreak".into(),
+            "x".repeat(257),
+        ] {
+            assert!(stratum_password(&invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn peer_identity_must_differ_from_server_wallet_accounts() {
+        let peer = crypto::public_key(&[3; 32]).unwrap();
+        let other = crypto::public_key(&[4; 32]).unwrap();
+        check_peer_identity(peer, None, None).unwrap();
+        check_peer_identity(peer, Some(other), None).unwrap();
+        check_peer_identity(peer, None, Some(other)).unwrap();
+        assert!(check_peer_identity(peer, Some(peer), None).is_err());
+        assert!(check_peer_identity(peer, None, Some(peer)).is_err());
+    }
+
+    #[test]
+    fn automatic_peer_identity_is_published_whole_and_never_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("chain.peer-key.json");
+        ensure_peer_key_file(&path).unwrap();
+        let first = fs::read(&path).unwrap();
+        hashstash::peer_auth::Policy::discovery_from_file(&path, Vec::new()).unwrap();
+        ensure_peer_key_file(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), first);
+        // Only the published identity remains; no temporary copy of its secret.
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        // An empty file left by an interrupted earlier start is not an identity.
+        fs::write(&path, b"").unwrap();
+        ensure_peer_key_file(&path).unwrap();
+        let replaced = fs::read(&path).unwrap();
+        assert!(!replaced.is_empty() && replaced != first);
+        hashstash::peer_auth::Policy::discovery_from_file(&path, Vec::new()).unwrap();
+        // Anything else is left for the operator to inspect.
+        fs::write(&path, b"{").unwrap();
+        ensure_peer_key_file(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"{");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn key_files_parse_both_formats_and_reject_mismatches() {
+        let directory = tempfile::tempdir().unwrap();
+        let secret = [19u8; 32];
+        let public = crypto::public_key(&secret).unwrap();
+        let other = crypto::public_key(&[20; 32]).unwrap();
+        let (s, p, o) = (hex::encode(secret), hex::encode(public), hex::encode(other));
+        for (name, contents, valid) in [
+            ("legacy", json!({"secret":s,"public":p}), true),
+            ("bare", json!({"secret":s}), true),
+            (
+                "export",
+                json!({"format":"hashstash-private-v1","private_key":s,"public_key":p,"name":"kept"}),
+                true,
+            ),
+            ("mismatch", json!({"secret":s,"public":o}), false),
+            ("format", json!({"format":"other","private_key":s}), false),
+            ("field", json!({"format":"hashstash-private-v1","secret":s}), false),
+            ("short", json!({"secret":hex::encode([19u8; 31])}), false),
+            ("text", json!({"secret":"zz".repeat(32)}), false),
+            ("type", json!({"secret":7}), false),
+        ] {
+            let path = directory.path().join(name);
+            fs::write(&path, serde_json::to_vec(&contents).unwrap()).unwrap();
+            match key_file(&path) {
+                Ok((parsed, key)) => {
+                    assert!(valid, "{name}");
+                    assert_eq!((*parsed, key), (secret, public));
+                }
+                Err(_) => assert!(!valid, "{name}"),
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_network_is_required_for_remote_endpoints_and_must_match() {
+        let (a, b) = ([1; 32], [2; 32]);
+        assert_eq!(pinned_network(None, a, true).unwrap(), a);
+        assert!(pinned_network(None, a, false).is_err());
+        assert_eq!(pinned_network(Some(a), a, false).unwrap(), a);
+        assert_eq!(pinned_network(Some(a), a, true).unwrap(), a);
+        assert!(pinned_network(Some(b), a, true).is_err());
+        assert!(pinned_network(Some(b), a, false).is_err());
+    }
+
+    #[test]
+    fn review_lines_show_atoms_network_and_abbreviated_data() {
+        let chain = [9; 32];
+        let recipient = crypto::public_key(&[6; 32]).unwrap();
+        let body = TransactionBody {
+            sender: crypto::public_key(&[7; 32]).unwrap(),
+            nonce: 4,
+            anchor: [38; 32],
+            expiry_blocks: 25,
+            fee: 20u32.into(),
+            operation: Operation::TransferExact {
+                recipient,
+                amount: 5u32.into(),
+            },
+            data: vec![0xab; 200],
+        };
+        let lines = review_lines(&body, Some(&chain));
+        for expected in [
+            "Fee: 20 atoms".to_owned(),
+            "Recipient receives: 5 atoms".to_owned(),
+            "Total debit: 25 atoms".to_owned(),
+            "Nonce: 4".to_owned(),
+            format!("Recipient: {}", address::encode(&recipient, &chain).unwrap()),
+            format!("Network context · unsigned: {}", hex::encode(chain)),
+            "Data bytes: 200".to_owned(),
+            format!("Data hex: {}...", "ab".repeat(64)),
+        ] {
+            assert!(lines.contains(&expected), "{expected} not in {lines:?}");
+        }
+        assert!(lines.iter().all(|line| !line.contains("HASH")));
     }
 }

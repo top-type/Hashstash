@@ -1,7 +1,7 @@
 use crate::{batch, codec, config::Config, crypto, fees, math, state::*, types::*};
 use anyhow::{Context, Result, bail, ensure};
-use num_traits::Zero;
-use std::collections::BTreeMap;
+use num_traits::{CheckedSub, Zero};
+use std::collections::{BTreeMap, btree_map::Entry};
 
 type AccountWrites = BTreeMap<PublicKey, Account>;
 
@@ -122,7 +122,7 @@ fn settle_trades(
             .collect();
         let epoch = s.epoch();
         let w = if pass {
-            s.alternative.as_mut().unwrap()
+            s.alternative.as_mut().context("missing PASS world")?
         } else {
             &mut s.world
         };
@@ -131,9 +131,15 @@ fn settle_trades(
             let f = allocations.get(&t.id).context("missing batch allocation")?;
             ensure!(f.input <= t.amount, "batch overfilled input");
             let unfilled = &t.amount - &f.input;
-            let a = accounts
-                .entry(t.sender)
-                .or_insert_with(|| w.account(&t.sender, epoch).unwrap());
+            let a = match accounts.entry(t.sender) {
+                Entry::Occupied(a) => a.into_mut(),
+                Entry::Vacant(slot) => {
+                    let a = w
+                        .account(&t.sender, epoch)
+                        .context("missing trading account")?;
+                    slot.insert(a)
+                }
+            };
             if t.is_buy {
                 a.ordinary += &unfilled;
                 a.shares += &f.output;
@@ -232,7 +238,7 @@ impl AccountChanges {
                 "common account creation or credit differs between outcomes"
             );
         }
-        Ok(result)
+        Ok(result.1)
     }
 
     fn flush(self, s: &mut State, c: &Config) -> Result<()> {
@@ -259,6 +265,9 @@ fn each_world(
     }
     Ok(())
 }
+/// Credit one world. The result also reports the prior nonce, or None for a
+/// new account, so common credits can require identical account existence
+/// and nonces in both outcomes instead of silently creating a missing one.
 fn credit_world(
     w: &mut World,
     key: &PublicKey,
@@ -266,30 +275,24 @@ fn credit_world(
     epoch: Option<u64>,
     c: &Config,
     pending: Option<&mut AccountWrites>,
-) -> Result<Amount> {
+) -> Result<(Option<u64>, Amount)> {
     ensure!(crypto::valid_key(key), "invalid recipient key");
     let existing = pending.as_ref().map_or_else(
         || w.account(key, epoch),
         |pending| pending_account(w, pending, key, epoch),
     );
-    let (mut a, net) = if let Some(a) = existing {
-        (a, n.clone())
-    } else {
-        (
-            Account {
-                epoch: epoch.unwrap_or(0),
-                ..Account::default()
-            },
-            n.clone(),
-        )
-    };
-    a.ordinary += &net;
+    let nonce = existing.as_ref().map(|a| a.nonce);
+    let mut a = existing.unwrap_or(Account {
+        epoch: epoch.unwrap_or(0),
+        ..Account::default()
+    });
+    a.ordinary += n;
     if let Some(pending) = pending {
         stage_account(pending, *key, a, c)?;
     } else {
         w.put(*key, a, c)?;
     }
-    Ok(net)
+    Ok((nonce, n.clone()))
 }
 /// Ordinary credits create the same account in each possible world.
 fn credit(s: &mut State, key: &PublicKey, n: &Amount, c: &Config) -> Result<Amount> {
@@ -302,7 +305,7 @@ fn credit(s: &mut State, key: &PublicKey, n: &Amount, c: &Config) -> Result<Amou
             "common account creation or credit differs between outcomes"
         );
     }
-    Ok(result)
+    Ok(result.1)
 }
 fn context(s: &State, decision: Option<Hash>, outcome: Option<Outcome>) -> Result<Option<Outcome>> {
     match (s.decision_id(), decision, outcome) {
@@ -311,11 +314,11 @@ fn context(s: &State, decision: Option<Hash>, outcome: Option<Outcome>) -> Resul
         _ => bail!("wrong decision context or outcome"),
     }
 }
-fn world_mut(s: &mut State, o: Option<Outcome>) -> &mut World {
+fn world_mut(s: &mut State, o: Option<Outcome>) -> Result<&mut World> {
     if o == Some(Outcome::Pass) {
-        s.alternative.as_mut().expect("checked governance context")
+        s.alternative.as_mut().context("missing PASS world")
     } else {
-        &mut s.world
+        Ok(&mut s.world)
     }
 }
 
@@ -404,9 +407,10 @@ fn transaction_inner(
             ensure!(!amount.is_zero(), "zero deposit");
             let o = context(s, *decision, *outcome)?;
             let epoch = s.epoch();
-            let w = world_mut(s, o);
+            let w = world_mut(s, o)?;
             let pending = accounts.world(o);
-            let mut a = pending_account(w, pending, &b.sender, epoch).unwrap();
+            let mut a = pending_account(w, pending, &b.sender, epoch)
+                .context("sender account does not exist")?;
             ensure!(a.ordinary >= *amount, "insufficient deposit balance");
             a.ordinary -= amount;
             stage_account(pending, b.sender, a, c)?;
@@ -427,9 +431,10 @@ fn transaction_inner(
             ensure!(!shares.is_zero(), "zero redemption");
             let o = context(s, *decision, *outcome)?;
             let epoch = s.epoch();
-            let w = world_mut(s, o);
+            let w = world_mut(s, o)?;
             let pending = accounts.world(o);
-            let mut a = pending_account(w, pending, &b.sender, epoch).unwrap();
+            let mut a = pending_account(w, pending, &b.sender, epoch)
+                .context("sender account does not exist")?;
             ensure!(a.shares >= *shares, "insufficient shares");
             a.shares -= shares;
             stage_account(pending, b.sender, a, c)?;
@@ -509,13 +514,17 @@ fn transaction_inner(
                 .supports
                 .remove(&key)
                 .ok_or_else(|| anyhow::anyhow!("no unclaimed support"))?;
-            s.auction_escrow -= &record.amount;
+            s.auction_escrow = s
+                .auction_escrow
+                .checked_sub(&record.amount)
+                .context("auction escrow underflow")?;
             accounts.credit(s, &b.sender, &record.amount, c)?;
         }
     }
     // Fees are prepaid in both worlds; unsettled trade proceeds cannot pay them.
     accounts.each(s, |w, pending, epoch| {
-        let mut a = pending_account(w, pending, &b.sender, epoch).unwrap();
+        let mut a = pending_account(w, pending, &b.sender, epoch)
+            .context("sender account does not exist")?;
         ensure!(a.ordinary >= *charged_fee, "insufficient ordinary HASH");
         a.ordinary -= charged_fee;
         w.revenue += charged_fee;
@@ -645,17 +654,16 @@ pub(crate) fn rounded_deadline(clock: u64, duration: u64, interval: u64) -> Resu
         .checked_add(elapsed)
         .context("schedule deadline overflow")
 }
-fn rest(s: &mut State, pending: Option<(Parameter, u64)>) -> Result<()> {
+/// Governed rests are bounded for the whole height range. As defence in
+/// depth, an unrepresentable deadline postpones the next auction rather than
+/// making every candidate block at this height invalid.
+fn rest(s: &mut State, pending: Option<(Parameter, u64)>) {
     s.phase = Phase::Rest(Rest {
-        until: s
-            .clock
-            .checked_add(s.frozen.rest)
-            .context("rest deadline overflow")?,
+        until: s.clock.saturating_add(s.frozen.rest),
         pending,
     });
-    Ok(())
 }
-fn timeout(s: &mut State, round: u64) -> Result<()> {
+fn timeout(s: &mut State, round: u64) {
     s.rounds.insert(
         round.to_be_bytes().to_vec(),
         RoundRecord {
@@ -664,47 +672,95 @@ fn timeout(s: &mut State, round: u64) -> Result<()> {
         },
     );
     s.ranking = crate::tree::Map::new();
-    rest(s, None)
+    rest(s, None);
+}
+/// Everything a proposal needs to open its decision in this block: an
+/// eligible action and a representable decision, rest and end height.
+fn can_open(c: &Config, s: &State, p: &Proposal) -> Result<()> {
+    let resolution = rounded_deadline(
+        s.clock,
+        s.frozen
+            .decision_blocks
+            .checked_mul(s.frozen.interval)
+            .context("decision schedule overflow")?,
+        s.frozen.interval,
+    )?;
+    rounded_deadline(resolution, s.frozen.rest, s.frozen.interval)?;
+    ensure!(
+        s.height.checked_add(s.frozen.decision_blocks).is_some(),
+        "decision height overflow"
+    );
+    eligible(c, s, p)
+}
+/// Make a proposal refundable from the next block and remove it from ranking.
+fn cancel(s: &mut State, a: &mut Auction, id: &Hash) -> Result<()> {
+    let mut cancelled = s
+        .proposals
+        .get(id)
+        .context("missing cancelled proposal")?
+        .clone();
+    cancelled.refund_height = Some(s.height + 1);
+    s.ranking.remove(&rank_key(&cancelled.support, id));
+    s.proposals.insert(id.to_vec(), cancelled);
+    if a.leader == Some(*id) {
+        a.leader = None;
+    }
+    Ok(())
 }
 fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
     let Phase::Auction(mut a) = s.phase.clone() else {
         return Ok(());
     };
     if s.height >= a.replacement_height {
-        let mut best = s.ranking.last().map(|(_, id)| *id);
-        if let (Some(inc), Some(top)) = (a.leader, best) {
-            let ip = s.proposals.get(&inc).unwrap();
-            let tp = s.proposals.get(&top).unwrap();
-            if ip.refund_height.is_none() && ip.support == tp.support {
-                best = Some(inc);
+        // A proposal that could not open now never leads. Each one is
+        // cancelled when it reaches the top, so it cannot displace an
+        // eligible leader and restart that leader's lead period.
+        let best = loop {
+            let Some(top) = s.ranking.last().map(|(_, id)| *id) else {
+                break None;
+            };
+            let mut candidate = top;
+            if let Some(inc) = a.leader
+                && inc != top
+            {
+                let ip = s.proposals.get(&inc).context("missing auction leader")?;
+                let tp = s.proposals.get(&top).context("missing ranked proposal")?;
+                if ip.refund_height.is_none() && ip.support == tp.support {
+                    candidate = inc;
+                }
             }
-        }
+            let p = s
+                .proposals
+                .get(&candidate)
+                .context("missing ranked proposal")?;
+            if can_open(c, s, &p.action).is_ok() {
+                break Some(candidate);
+            }
+            cancel(s, &mut a, &candidate)?;
+        };
         if best != a.leader {
             a.leader = best;
             a.lead_since = s.clock;
         }
     }
     s.phase = Phase::Auction(a.clone());
+    let led = s
+        .clock
+        .checked_sub(a.lead_since)
+        .context("auction lead starts in the future")?;
     if let Some(id) = a.leader
-        && s.clock - a.lead_since >= s.frozen.lead
+        && led >= s.frozen.lead
     {
-        let p = s.proposals.get(&id).unwrap().clone();
-        let schedule_valid = rounded_deadline(
-            s.clock,
-            s.frozen
-                .decision_blocks
-                .checked_mul(s.frozen.interval)
-                .context("decision schedule overflow")?,
-            s.frozen.interval,
-        )
-        .and_then(|resolution| rounded_deadline(resolution, s.frozen.rest, s.frozen.interval));
-        if schedule_valid.is_ok()
-            && s.height.checked_add(s.frozen.decision_blocks).is_some()
-            && eligible(c, s, &p.action).is_ok()
-        {
-            s.auction_escrow -= &p.support;
-            s.world.revenue += &p.support;
-            replenish_reserve(c, &mut s.world)?;
+        let p = s
+            .proposals
+            .get(&id)
+            .context("missing auction leader")?
+            .clone();
+        if can_open(c, s, &p.action).is_ok() {
+            s.auction_escrow = s
+                .auction_escrow
+                .checked_sub(&p.support)
+                .context("auction escrow underflow")?;
             s.rounds.insert(
                 a.round.to_be_bytes().to_vec(),
                 RoundRecord {
@@ -713,10 +769,12 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
                 },
             );
             s.ranking = crate::tree::Map::new();
-            let pre = s.root();
+            // Branch-stable inputs only: a same-parent sibling of this block
+            // opens the same decision, and anyone who knows the parent and the
+            // maturing leader can compute the ID before this block is found.
             let decision_id = crypto::tagged_hash(
                 "Hashstash/decision",
-                &codec::encode(&(s.chain_id, a.round, &p.action, s.height, parent_hash, pre)),
+                &codec::encode(&(s.chain_id, a.round, id, s.height, parent_hash)),
             );
             s.last_epoch = s
                 .last_epoch
@@ -736,33 +794,42 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
             let mut pass = s.world.clone();
             if let Proposal::Grant { payments } = &*d.proposal {
                 grant_reserve(c, &mut pass, &c.validate_grant(payments)?)?;
+                // FAIL sets the same reserve shortfall aside as waiting
+                // revenue. Both outcomes therefore open on identical curves,
+                // so equal trades move their prices alike in either world.
+                let shortfall = &s.world.reserve - &pass.reserve;
+                s.world.reserve -= &shortfall;
+                s.world.revenue += shortfall;
             }
+            // The winning bid becomes revenue only after the grant is
+            // reserved, so it can never fund the proposal that paid it.
+            s.world.revenue += &p.support;
+            pass.revenue += &p.support;
             s.alternative = Some(pass);
             s.phase = Phase::Governance(d);
             return Ok(());
         } else {
-            let mut cancelled = p;
-            cancelled.refund_height = Some(s.height + 1);
-            s.ranking.remove(&rank_key(&cancelled.support, &id));
-            s.proposals.insert(id.to_vec(), cancelled);
-            a.leader = None;
+            cancel(s, &mut a, &id)?;
             a.replacement_height = s.height + 1;
             s.phase = Phase::Auction(a.clone());
         }
     }
-    if s.clock - a.opened >= c.auction_timeout_for(&s.frozen)? {
-        timeout(s, a.round)?;
+    let elapsed = s
+        .clock
+        .checked_sub(a.opened)
+        .context("auction opens in the future")?;
+    if elapsed >= c.auction_timeout_for(&s.frozen)? {
+        timeout(s, a.round);
     }
     Ok(())
 }
 /// Compare actual marginal prices M/S, independently of display precision.
-/// An empty world's price is zero; equality never awards a leading block.
+/// A block in which either world holds no Stash is no observation: an empty
+/// world has no market price, so it can neither lead nor be led, whatever
+/// the margin. Equality never awards a leading block.
 pub fn pass_beats_fail(pass: &World, fail: &World, margin_bps: u64) -> bool {
-    if pass.shares.is_zero() {
+    if pass.shares.is_zero() || fail.shares.is_zero() {
         return false;
-    }
-    if fail.shares.is_zero() {
-        return !pass.curve_mass.is_zero();
     }
     &pass.curve_mass * &fail.shares * 10_000u32
         > &fail.curve_mass * &pass.shares * (Amount::from(10_000u32) + Amount::from(margin_bps))
@@ -805,8 +872,12 @@ mod margin_tests {
             &World::default(),
             u64::MAX
         ));
-        assert!(pass_beats_fail(&fail, &World::default(), u64::MAX));
-        assert!(!pass_beats_fail(&World::default(), &fail, 0));
+        // An empty world is no observation in either direction, so neither a
+        // one-atom bootstrap nor an emptied FAIL world bypasses the margin.
+        for margin in [0, u64::MAX] {
+            assert!(!pass_beats_fail(&fail, &World::default(), margin));
+            assert!(!pass_beats_fail(&World::default(), &fail, margin));
+        }
         let fail = world(
             Amount::from(10_000u32) << 400usize,
             Amount::from(1u32) << 511usize,
@@ -843,7 +914,7 @@ fn resolve(c: &Config, s: &mut State) -> Result<bool> {
     let Phase::Governance(d) = s.phase.clone() else {
         bail!("resolution outside governance");
     };
-    let pass = s.alternative.as_ref().unwrap();
+    let pass = s.alternative.as_ref().context("missing PASS world")?;
     ensure!(
         s.height.checked_sub(d.started_height) == Some(d.blocks),
         "decision has not ended"
@@ -853,13 +924,13 @@ fn resolve(c: &Config, s: &mut State) -> Result<bool> {
         Proposal::Parameter { .. } => true,
     };
     let won = funded && d.leading_blocks > d.blocks / 2;
-    let alternative = s.alternative.take().unwrap();
+    let alternative = s.alternative.take().context("missing PASS world")?;
     if won {
         s.world = alternative;
     }
     let mut pending = None;
     // Clear the conditional context before interpreting a paid recipient's settled balance.
-    rest(s, None)?;
+    rest(s, None);
     if won {
         match &*d.proposal {
             Proposal::Grant { payments } => {
@@ -875,7 +946,7 @@ fn resolve(c: &Config, s: &mut State) -> Result<bool> {
             Proposal::Parameter { parameter, new, .. } => pending = Some((*parameter, *new)),
         }
     }
-    rest(s, pending)?;
+    rest(s, pending);
     Ok(won)
 }
 
@@ -1100,7 +1171,11 @@ fn finish_block_with_fills(
         used_weight <= weight_limit,
         "block exceeds weighted capacity"
     );
-    each_world(&mut s, |w, _| replenish_reserve(c, w))?;
+    // Waiting revenue never reshapes either outcome's curve during a
+    // decision. The selected world replenishes from its resolution block.
+    if s.alternative.is_none() {
+        replenish_reserve(c, &mut s.world)?;
+    }
     auction(c, &mut s, parent_hash)?;
     if let Phase::Rest(r) = &s.phase
         && s.clock >= r.until
@@ -1589,7 +1664,12 @@ mod reserve_model_tests {
         assert_eq!(pass.quote(&c), s.world.quote(&c));
         assert_eq!(pass.accounts.root(), s.world.accounts.root());
         assert_eq!(pass.shares, s.world.shares);
-        assert!(pass.reserve < s.world.reserve);
+        // Both outcomes open on the same bent curve; FAIL keeps the reserve
+        // shortfall as waiting revenue instead of escrowing it.
+        assert!(pass.reserve < pass.curve_mass);
+        assert_eq!(pass.reserve, s.world.reserve);
+        assert_eq!(pass.curve_mass, s.world.curve_mass);
+        assert_eq!(&pass.revenue + &pass.grant_escrow, s.world.revenue);
         s.audit(&c).unwrap();
     }
     #[test]
@@ -1623,7 +1703,12 @@ mod reserve_model_tests {
             fail = advance(&c, &fail, 0, &[]);
         }
         assert!(fail.world.grant_escrow.is_zero());
-        assert_eq!(fail.world.reserve, start.world.reserve);
+        // The shortfall FAIL set aside as waiting revenue refills its reserve
+        // in the resolution block, restoring the untraded flat curve.
+        let shortfall = &start.world.curve_mass - &start.world.reserve;
+        assert!(!shortfall.is_zero());
+        assert_eq!(fail.world.reserve, start.world.curve_mass);
+        assert_eq!(fail.world.revenue, &start.world.revenue - &shortfall);
         assert_eq!(fail.world.accounts.root(), start.world.accounts.root());
         let mut pass = start;
         let tx = signed(

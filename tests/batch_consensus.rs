@@ -338,7 +338,9 @@ fn passed_price_bound_activates_after_rest_and_applies_to_the_next_block() {
             proposal: Proposal::Parameter {
                 parameter: Parameter::MaxPriceChangeBps,
                 old: 1000,
-                new: 0,
+                // Governance cannot pin prices at zero (audit F028): PASS
+                // could then never lead again to undo it.
+                new: 1,
             },
             support: 1u32.into(),
         },
@@ -370,19 +372,19 @@ fn passed_price_bound_activates_after_rest_and_applies_to_the_next_block() {
     assert_eq!(settled.height - start, 5);
     assert_eq!(settled.settings.max_price_change_bps, 1000);
     assert!(
-        matches!(&settled.phase, Phase::Rest(r) if r.pending == Some((Parameter::MaxPriceChangeBps, 0)))
+        matches!(&settled.phase, Phase::Rest(r) if r.pending == Some((Parameter::MaxPriceChangeBps, 1)))
     );
     s = settled;
-    for expected_bound in [1000, 0] {
+    for expected_bound in [1000, 1] {
         let tx = ordinary_buy(&s);
         let (next, fills) = run(&c, &s, &[tx]);
         assert!(fills[0].input_filled > Amount::zero());
         assert_eq!(next.settings.max_price_change_bps, expected_bound);
         s = next;
     }
-    assert_eq!(s.frozen.max_price_change_bps, 0);
+    assert_eq!(s.frozen.max_price_change_bps, 1);
     let tx = ordinary_buy(&s);
     let (_, fills) = run(&c, &s, &[tx]);
-    assert!(fills[0].input_filled.is_zero());
-    assert_eq!(fills[0].input_unfilled, Amount::from(100_000u32));
+    assert!(fills[0].input_filled < Amount::from(1_000u32));
+    assert!(fills[0].input_unfilled > Amount::from(99_000u32));
 }

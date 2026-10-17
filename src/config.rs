@@ -9,6 +9,14 @@ pub const MIN_GOVERNED_BLOCK_BYTES: u64 = crate::fees::ACCOUNT_WEIGHT;
 /// One spendable monetary atom represents one petahash of expected work.
 pub const WORK_PER_ATOM: u64 = 1_000_000_000_000_000;
 
+/// Longest rest or decision a governance change can select, in scheduled
+/// seconds (2^22, about 48.5 days), so a later round can revisit it.
+pub const MAX_GOVERNED_DURATION: u64 = 1 << 22;
+
+/// A decision's first observation is always a tie, so a strict majority of
+/// observations needs at least two later blocks that can reflect trades.
+pub const MIN_GOVERNED_DECISION_BLOCKS: u64 = 3;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -198,8 +206,9 @@ impl Config {
         self.auction_timeout_for(settings)?;
         Ok(())
     }
-    /// Validate a new schedule where it can actually begin, not against an
-    /// invented lifetime upper bound on the governed block interval.
+    /// Validate a schedule where it can actually begin. Genesis needs only
+    /// this; governed changes also prove their whole lifetime in
+    /// parameter_change_at.
     pub fn validate_governance_settings_at(&self, settings: &Settings, clock: u64) -> Result<()> {
         self.validate_governance_settings(settings)?;
         for duration in [
@@ -228,7 +237,86 @@ impl Config {
         self.parameter_change(settings, p, old, new)?;
         let mut changed = settings.clone();
         changed.set(p, new);
-        self.validate_governance_settings_at(&changed, clock)
+        self.validate_governance_settings_at(&changed, clock)?;
+        // Later deadlines start from later clocks. A governed schedule must
+        // stay representable through every remaining height, not only here.
+        let lifetime = changed
+            .interval
+            .checked_mul(self.max_height)
+            .context("governed schedule lifetime overflow")?;
+        let decision = changed
+            .decision_blocks
+            .checked_mul(changed.interval)
+            .context("decision schedule overflow")?;
+        [
+            lifetime,
+            self.auction_timeout_for(&changed)?,
+            decision,
+            changed.rest,
+            changed.interval,
+            changed.interval,
+        ]
+        .into_iter()
+        .try_fold(clock, u64::checked_add)
+        .context("governed schedule can overflow before the height limit")?;
+        Ok(())
+    }
+    /// Bounds on values that only governance selects. Genesis may choose any
+    /// representable value, but a passed change has no other path back, so it
+    /// must keep phases finite, difficulty stable, transactions affordable
+    /// and a later PASS result arithmetically reachable.
+    fn validate_governed_change(
+        &self,
+        changed: &Settings,
+        p: Parameter,
+        old: u64,
+        new: u64,
+    ) -> Result<()> {
+        match p {
+            // ASERT keeps its genesis half life; a longer scheduled step
+            // would demand more than a halving of the next target.
+            Parameter::Interval => ensure!(
+                new <= self.daa_half_life,
+                "governed block interval exceeds the difficulty half life"
+            ),
+            // A leader established in the first half of a round can still
+            // mature, so a later outbid cannot force a free timeout.
+            Parameter::Lead => ensure!(
+                new <= self.auction_timeout.saturating_sub(changed.interval) / 2,
+                "governed auction lead exceeds half the auction timeout"
+            ),
+            Parameter::Rest => ensure!(new <= MAX_GOVERNED_DURATION, "governed rest is too long"),
+            Parameter::DecisionBlocks => {
+                ensure!(
+                    new >= MIN_GOVERNED_DECISION_BLOCKS,
+                    "governed decision cannot reach a PASS majority"
+                );
+                let length = new.saturating_mul(changed.interval);
+                ensure!(
+                    length <= MAX_GOVERNED_DURATION,
+                    "governed decision is too long"
+                );
+            }
+            Parameter::MaxPriceChangeBps => {
+                ensure!(new > 0, "governed price bound must allow price movement")
+            }
+            // Repeated increases each need their own decision.
+            Parameter::MinimumFeeRate => ensure!(
+                new <= old.saturating_mul(2).max(1),
+                "governed fee rate can at most double"
+            ),
+            Parameter::BlockBytes | Parameter::MinerFeePercent | Parameter::PassMarginBps => {}
+        }
+        // PASS must lead the last floor(N/2)+1 observations. The earliest of
+        // them reflects ceil(N/2)-1 traded blocks, each bounded by bps.
+        let traded = changed.decision_blocks.div_ceil(2).saturating_sub(1);
+        let margin = changed.pass_margin_bps.unwrap_or(0);
+        let reach = traded.saturating_mul(changed.max_price_change_bps);
+        ensure!(
+            margin < reach,
+            "governed PASS margin cannot be reached within a decision"
+        );
+        Ok(())
     }
     pub fn validate(&self) -> Result<()> {
         let work_per_atom = self.work_per_atom()?;
@@ -336,7 +424,8 @@ impl Config {
         ensure!(new != old, "parameter must change");
         let mut changed = settings.clone();
         changed.set(p, new);
-        self.validate_governance_settings(&changed)
+        self.validate_governance_settings(&changed)?;
+        self.validate_governed_change(&changed, p, old, new)
     }
 }
 

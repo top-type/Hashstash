@@ -82,11 +82,11 @@ Miners still choose which transactions to include and can censor or delay orders
 
 ## 4 Revenue and grants
 
-Revenue is a committed hash buffer collectively governed through the proposal process. It receives the non-miner share of each complete transaction fee and all support for an auction-winning proposal.
+Revenue is a committed hash buffer collectively governed through the proposal process. It receives the non-miner share of each complete transaction fee and all support for an auction-winning proposal. The winning support joins revenue when its decision opens, after any grant has been reserved, so it never funds the proposal that paid it.
 
 ### Revenue replenishment
 
-Revenue moves into a nonflat reserve as soon as the block's revenue processing runs:
+Outside a decision, revenue moves into a nonflat reserve as soon as the block's revenue processing runs:
 
 ```text
 release = min(U, M - R)
@@ -95,7 +95,7 @@ U = U - release
 M and S remain unchanged
 ```
 
-This raises `r = R/M` toward 1 while leaving the current price `M/S` unchanged. At 1, further revenue waits. Each governance outcome processes its own state independently; the same logical revenue is never counted twice in the selected outcome.
+This raises `r = R/M` toward 1 while leaving the current price `M/S` unchanged. At 1, further revenue waits. While a decision is active neither outcome replenishes: fees and the winning support wait as revenue in each outcome, so only trades change either curve's shape during the decision. Otherwise revenue could flatten an outcome right after a small trade and freeze that price for every remaining observation. The selected outcome replenishes from its resolution block. The same logical revenue is never counted twice in the selected outcome.
 
 ### Grant funding
 
@@ -110,34 +110,51 @@ E = G
 M and S remain unchanged
 ```
 
-The reserve shortfall lowers the ratio without changing the marginal price or any account's stash quantity. Waiting revenue is spent first. FAIL has no corresponding grant debit. Recipients cannot spend escrow before resolution. If PASS wins, every listed amount is paid once in the same atomic transition; if FAIL wins, the PASS state is discarded.
+The reserve shortfall lowers the ratio without changing the marginal price or any account's stash quantity. Waiting revenue is spent first. FAIL makes no grant debit, but sets the same shortfall aside as its own waiting revenue:
 
-Eligibility requires enough available funds for the combined amount G: waiting revenue plus reserve, keeping one raw hash atom in a live Stash reserve so its curve remains valid. Registering a proposal does not reserve funding or guarantee eligibility. Revenue already inside the reserve is not counted again as waiting revenue.
+```text
+R_FAIL = R - from_reserve
+U_FAIL = U + from_reserve
+```
+
+Both outcomes therefore open with the same reserve, mass and supply. Equal trades move their prices alike, and neither curve is structurally easier to move than the other. If FAIL is selected, ordinary replenishment returns the shortfall to its reserve. Recipients cannot spend escrow before resolution. If PASS wins, every listed amount is paid once in the same atomic transition; if FAIL wins, the PASS state is discarded.
+
+Eligibility requires enough available funds for the combined amount G: waiting revenue plus reserve, keeping one raw hash atom in a live Stash reserve so its curve remains valid. Registering a proposal does not reserve funding or guarantee eligibility; a proposal that could not open its decision is cancelled when it would lead (section 5). Revenue already inside the reserve is not counted again as waiting revenue.
 
 Grants reduce withdrawal backing while preserving the price at that moment. Revenue and grants change the curve's shape rather than trading along it. Ordinary trades, revenue transfers and grants conserve existing hashes.
 
 ## 5 Proposals and auctions
 
-Anyone with a funded account can propose a grant or one permitted setting change and contribute a positive auction bid. Further Support transactions add bids to a proposal. The highest total bid must remain leader for the frozen lead period; ties and bounded cancellation rules are deterministic. A proposal ID binds the account that registered it, so a copied pending proposal becomes a separate proposal. An equal bid does not displace the current leader; otherwise the lowest proposal ID wins a tie. Proposers can grind their IDs, so this rule gives no fairness guarantee: anyone can break a tie with a one-atom Support. An auction timeout enters rest without a decision.
+Anyone with a funded account can propose a grant or one permitted setting change and contribute a positive auction bid. Further Support transactions add bids to a proposal. The highest total bid must remain leader for the frozen lead period. A proposal ID binds the account that registered it, so a copied pending proposal becomes a separate proposal.
+
+Leadership is evaluated once per block, after the block's transactions:
+
+- The incumbent keeps a tie with the highest bid. Otherwise the highest bid leads, and equal bids go to the smallest proposal ID. Proposers can grind their IDs, so this rule gives no fairness guarantee: anyone can break a tie with a one-atom Support. A change of leader restarts the lead period at the block's clock.
+- A proposal that could not open its decision in that block never leads. Examples are an unfundable grant, an invalid projected schedule and an unrepresentable end height. It is cancelled, refundable from the next block, and the evaluation continues with the next bid, so it cannot restart an eligible leader's lead period.
+- The lead test is inclusive (`clock - lead_since >= lead`) and is checked before the timeout in the same block. If a mature leader is nevertheless cancelled, the next leader is chosen in the following block.
+- An auction timeout (`clock - opened >=` the effective timeout) enters rest without a decision. Rest completion is processed after auctions, so a zero rest can open the next auction in the block that timed out or resolved the previous one.
 
 The winning proposal's full bid becomes revenue even if the later decision rejects it. Losing contributions become refundable through signed Refund transactions; they are not automatically pushed to every contributor. Refund eligibility is recorded by round and proposal. Proposals with invalid activation conditions are cancelled under the auction rules.
 
 Governance may change one of:
 
-| Setting | Permitted direct value |
-| --- | --- |
-| Block size and weight limit | At least 1,024, subject to allocation representation |
-| Minimum fee rate | Any unsigned 64-bit number of raw hash atoms per 1,024 weight, including zero |
-| Target block interval | Positive whole scheduled seconds |
-| Auction lead and rest duration | Whole scheduled seconds, including zero |
-| Decision length | Positive whole block count |
-| Maximum Stash price change per block | Any u64 basis-point value, including zero; default 1,000 (10%) |
-| Miner fee percentage | Whole percent from 0 to 100 |
-| Required PASS margin | From 0 through 2^64 − 1 basis points; one basis point is 0.01% |
+| Setting | Genesis value | Governed new value |
+| --- | --- | --- |
+| Block size and weight limit | At least 1,024, subject to allocation representation | Same |
+| Minimum fee rate | Any unsigned 64-bit number of raw hash atoms per 1,024 weight, including zero | Any decrease; an increase to at most twice the old rate, or to 1 from 0 |
+| Target block interval | Positive whole scheduled seconds | Positive and at most the ASERT half-life |
+| Auction lead | Whole scheduled seconds, including zero | At most `(auction_timeout - interval) / 2` |
+| Rest duration | Whole scheduled seconds, including zero | At most 2^22 seconds (about 48.5 days) |
+| Decision length | Positive whole block count | At least 3 blocks, lasting at most 2^22 seconds at the frozen interval |
+| Maximum Stash price change per block | Any u64 basis-point value, including zero; default 1,000 (10%) | Positive |
+| Miner fee percentage | Whole percent from 0 to 100 | Same |
+| Required PASS margin | From 0 through 2^64 − 1 basis points; one basis point is 0.01% | Reachable, as below |
 
 A proposal signs the exact old and new values, and the new value must differ. Every setting fits unsigned 64-bit representation; block capacity must also fit the host's allocation representation. The 1,024 minimum lets an otherwise empty block create its mining account. Genesis choices for timestamp-window size and ASERT half-life also retain only their required positive/representation rules; the preset values are not mandatory bounds.
 
-Scheduled time and deadlines must remain representable. The effective auction timeout is the greater of the configured timeout and `lead + interval`; all additions and rounding to future block boundaries are checked. The node checks proposed settings at submission and their projected activation, then checks again when applying them. A one-block decision resolves on the first subsequent block, before an outcome trade can affect an observation. Decision block counts and projected scheduled-time arithmetic must fit their integer representations.
+A passed setting has no way back except another decision, so a governed change may not make the next one impossible. A decision's first observation is always a tie, so fewer than three blocks can never give PASS its strict majority. Zero price movement can never produce a lead. PASS must lead the last `floor(N/2) + 1` observations; the earliest of them reflects `ceil(N/2) - 1` traded blocks, so the settings after every governed change satisfy `m < (ceil(N/2) - 1) * MaxPriceChangeBps`. The duration limits keep every phase short enough to revisit. The lead limit lets a proposal that leads in the first half of an auction still mature, so outbidding it late cannot force a timeout with every bid refunded. The interval limit keeps the difficulty schedule stable (section 9). The fee-rate limit means one decision cannot price every account out of the transaction that would revert it. Genesis may still start outside these limits; such a chain may be unable to pass later changes.
+
+Scheduled time and deadlines must remain representable. The effective auction timeout is the greater of the configured timeout and `lead + interval`; all additions and rounding to future block boundaries are checked. A governed change must also stay representable for the whole height range, not only at one clock: `clock + interval * max_height + effective_timeout + decision_blocks * interval + rest + 2 * interval` must fit u64, using the changed settings. A Propose transaction is checked at the current clock. The projected decision and rest activation boundary is checked whenever the proposal would lead or open its decision; a failure cancels it under the auction rules instead of invalidating the Propose. Activation checks the value again. A one-block genesis decision resolves on the first subsequent block, before an outcome trade can affect an observation. Decision block counts and projected scheduled-time arithmetic must fit their integer representations.
 
 The reserve ratio is state derived from R and M, not a governed fixed parameter. Issuance, proof of work, authentication, timestamp-validation policy, ASERT half-life and opening share scale remain fixed by the protocol or genesis configuration. Approved settings activate after rest, with the activating block still using its parent's settings.
 
@@ -159,9 +176,11 @@ M_PASS * S_FAIL * 10000 > M_FAIL * S_PASS * (10000 + m)
 
 The size of the lead and the block timestamp add no extra weight. Equality contributes no PASS lead. After exactly N observations, PASS wins only if `leading_blocks > N/2` and the proposal is still fully funded. This is a strict majority of all observed blocks, including ties. A change to the PASS margin is judged under the old frozen margin.
 
-Prices are compared as exact mass/supply ratios using integer cross-products. Display rounding and quote scale do not affect whether a block leads. An empty curve has zero price.
+Prices are compared as exact mass/supply ratios using integer cross-products. Display rounding and quote scale do not affect whether a block leads. A block in which either curve is empty adds no PASS lead, whatever the margin: an empty world has no market price, and its next deposit opens at the genesis rate. A one-atom bootstrap deposit therefore cannot lead an empty FAIL world.
 
-A trade affects the closing quote of its inclusion block and is first counted by the following block. Resolution happens before the final block’s user transactions, so a last-moment trade cannot alter an observation that has already settled. The opening quotes are equal when the decision merely reserves a grant, so its first observation is a tie unless another prior state difference exists. There is no price integral or magnitude-weighted average.
+A trade affects the closing quote of its inclusion block and is first counted by the following block. Resolution happens before the final block’s user transactions, so a last-moment trade cannot alter an observation that has already settled. Both outcomes open with equal quotes and identical curves, because FAIL sets aside the same reserve shortfall as PASS. The first observation is therefore a tie unless another prior state difference exists. There is no price integral or magnitude-weighted average.
+
+The two curves share integer rounding. On a nearly flat curve, rounding lets buys raise the price slightly while sells may not lower it. An equal buy in the other outcome is then the matching defence. A flat outcome cannot move at all, so a revenue-funded grant or a setting change on a flat baseline resolves FAIL.
 
 Resolution keeps the selected world’s accounts, reserve, supply, mass and revenue. A passing grant pays its escrow in full to the listed recipients once. Its account-update work was charged when the proposal was included. A passing setting change activates after rest. Reorganizations reverse a resolution together with dependent state changes. The rule measures market prices; it does not guarantee a proposal’s benefit.
 
@@ -198,13 +217,13 @@ error = (parent_timestamp - first_block_timestamp)
 ideal_target = initial_target * 2^(error / half_life)
 ```
 
-Each branch anchors ASERT at its first mined block, excluding the wait between creating the genesis configuration and starting mining. The first two blocks use the initial target. Later targets use the fixed integer ASERT approximation, canonical compact rounding and the fixed genesis target limit. An interval change affects future schedule increments without resetting that branch's anchor. Timestamp controls constrain but do not eliminate manipulation.
+Each branch anchors ASERT at its first mined block, excluding the wait between creating the genesis configuration and starting mining. The first two blocks use the initial target. Later targets use the fixed integer ASERT approximation, canonical compact rounding and the fixed genesis target limit. An interval change affects future schedule increments without resetting that branch's anchor. The half-life stays fixed, so a governed interval is at most the half-life. A block mined at the old spacing then lowers the next target by at most one halving, rather than demanding work that no miner can supply. Timestamp controls constrain but do not eliminate manipulation.
 
 ## 10 Authenticated state and execution
 
 Accounts and protocol indexes use persistent authenticated treaps. Keys determine deterministic priorities; map roots are independent of insertion order. Updates copy changed paths and share untouched immutable subtrees. Starting a decision shares a root; settlement selects one. These operations avoid scanning or rewriting every account at phase boundaries.
 
-Block execution validates its parent, encoding, target and resource limits; advances scheduled time and counts the parent’s leading-block observation; settles a due decision; reserves transaction inputs and fees; clears the included amount-only orders in each world together; pays the mining subsidy and collected miner fees; replenishes reserves from revenue; processes auctions and complete grant escrow; applies due rest activation; and verifies the resulting committed state. Activation and revenue processing are deterministic and operate independently on active outcomes. The exact ordering is defined by the maintained consensus implementation and corresponding integration tests.
+Block execution validates its parent, encoding, target and resource limits; advances scheduled time and counts the parent’s leading-block observation; settles a due decision; reserves transaction inputs and fees; clears the included amount-only orders in each world together; pays the mining subsidy and collected miner fees; replenishes the reserve from revenue outside a decision; processes auctions and complete grant escrow; applies due rest activation; and verifies the resulting committed state. Activation and revenue processing are deterministic and operate independently on active outcomes. The exact ordering is defined by the maintained consensus implementation and corresponding integration tests.
 
 The world commitment includes the account root, reserve, stash supply, curve mass, waiting revenue, grant escrow, account aggregates. The top-level commitment includes worlds, chain identity, height, clock, issuance, settings, phase, proposal/support/refund indexes. Every accepted block must reproduce its declared state root.
 

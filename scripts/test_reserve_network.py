@@ -15,9 +15,11 @@ from test_network import Audit, rpc
 
 
 def pass_leads(passed, failed, margin_bps):
-    """Compare M/S exactly; empty worlds have a zero price."""
-    pn, pd = (int(passed['curve_mass']), int(passed['shares'])) if int(passed['shares']) else (0, 1)
-    fn, fd = (int(failed['curve_mass']), int(failed['shares'])) if int(failed['shares']) else (0, 1)
+    """Compare M/S exactly; a block with an empty world adds no lead."""
+    if not int(passed['shares']) or not int(failed['shares']):
+        return False
+    pn, pd = int(passed['curve_mass']), int(passed['shares'])
+    fn, fd = int(failed['curve_mass']), int(failed['shares'])
     return pn * fd * 10000 > fn * pd * (10000 + margin_bps)
 
 
@@ -128,7 +130,8 @@ class ReserveAudit(Audit):
             assert (reserve == 0) == (shares == 0) == (mass == 0)
             capacity = int(world['revenue']) + max(0, reserve - 1)
             assert int(world['grant_capacity']) == capacity
-            if shares and int(world['revenue']):
+            # Revenue waits beside a bent curve only while a decision is open.
+            if outcome is None and shares and int(world['revenue']):
                 assert reserve == mass
         for name in ('reserve', 'shares', 'curve_mass', 'revenue', 'grant_capacity'):
             assert state[name] == governance['world'][name]

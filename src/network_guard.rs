@@ -5,8 +5,8 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -26,6 +26,12 @@ pub const INBOUND_PEER_SLOTS: usize = 16;
 pub const RESERVED_PEER_SLOTS: usize = 4;
 /// Concurrent inbound sessions from one public network group (IPv4 /16, IPv6 /32).
 pub const PEER_SLOTS_PER_GROUP: usize = 2;
+/// Public website sessions in total. A loopback reverse proxy may carry all of
+/// them; one visitor, connecting directly or named by that proxy, may hold
+/// only a browser's six parallel connections and an eighth of the work budget.
+pub const PUBLIC_WEB_SESSIONS: usize = 32;
+pub const PUBLIC_WEB_VISITOR_SESSIONS: usize = 6;
+const PUBLIC_WEB_VISITOR_WORK_SHARE: u64 = 8;
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
 pub enum Surface {
@@ -39,6 +45,9 @@ pub enum Surface {
 enum Direction {
     Inbound,
     Outbound,
+    /// A public website visitor named by the loopback reverse proxy. Its
+    /// record is separate from the proxy's own and from direct connections.
+    Forwarded,
 }
 type Key = (IpAddr, Surface, Direction);
 
@@ -211,6 +220,10 @@ pub struct NetworkGuard {
 pub struct Session {
     guard: Arc<NetworkGuard>,
     key: Key,
+    /// The public website visitor the proxy named for this session, if any.
+    visitor: OnceLock<Key>,
+    /// A quota already refused this session and accounted for it.
+    refused: AtomicBool,
     request_bucket: Mutex<Bucket>,
     reserved_frame: Mutex<u64>,
 }
@@ -218,6 +231,8 @@ impl NetworkGuard {
     /// A loopback reverse proxy represents many public visitors. Keep its
     /// aggregate quotas, but never turn one malformed visitor into an IP ban
     /// of the whole website. Direct remote clients retain normal cooldowns.
+    /// Visitors, direct or named by the proxy, also have their own smaller
+    /// session and work caps, so one cannot take the whole website.
     /// Only the separate, restricted public-web listener uses this guard.
     pub fn for_public_web() -> Self {
         Self {
@@ -242,6 +257,26 @@ impl NetworkGuard {
             policy.work_burst = policy
                 .work_burst
                 .max(self.max_peer_work.load(Ordering::Relaxed));
+        }
+        policy
+    }
+    /// The loopback reverse proxy's own record on the public-web guard.
+    fn is_proxy(&self, key: Key) -> bool {
+        self.loopback_rpc_is_proxy
+            && key.1 == Surface::Rpc
+            && key.2 == Direction::Inbound
+            && key.0.is_loopback()
+    }
+    fn key_policy(&self, key: Key) -> Policy {
+        let mut policy = self.policy(key.1);
+        if self.loopback_rpc_is_proxy && key.1 == Surface::Rpc {
+            if self.is_proxy(key) {
+                policy.connections = PUBLIC_WEB_SESSIONS;
+            } else {
+                policy.connections = PUBLIC_WEB_VISITOR_SESSIONS;
+                policy.work /= PUBLIC_WEB_VISITOR_WORK_SHARE;
+                policy.work_burst /= PUBLIC_WEB_VISITOR_WORK_SHARE;
+            }
         }
         policy
     }
@@ -295,8 +330,8 @@ impl NetworkGuard {
         }
         Ok(())
     }
-    fn penalize(&self, ip: IpAddr, surface: Surface, record: &mut Record, now: Instant) {
-        if !(self.loopback_rpc_is_proxy && surface == Surface::Rpc && ip.is_loopback()) {
+    fn penalize(&self, key: Key, record: &mut Record, now: Instant) {
+        if !self.is_proxy(key) {
             record.penalize(now);
         }
     }
@@ -315,12 +350,23 @@ impl NetworkGuard {
         direction: Direction,
         now: Instant,
     ) -> Result<Session> {
-        let ip = admission_address(ip);
-        let key = (ip, surface, direction);
+        let key = (admission_address(ip), surface, direction);
         let mut records = self
             .records
             .lock()
             .map_err(|_| anyhow!("network accounting lock poisoned"))?;
+        self.enter(&mut records, key, now)?;
+        Ok(Session {
+            guard: self.clone(),
+            key,
+            visitor: OnceLock::new(),
+            refused: AtomicBool::new(false),
+            request_bucket: Mutex::new(Bucket::new(16, now)),
+            reserved_frame: Mutex::new(0),
+        })
+    }
+    /// Admit one more connection to `key`'s record, creating it if needed.
+    fn enter(&self, records: &mut HashMap<Key, Record>, key: Key, now: Instant) -> Result<()> {
         if !records.contains_key(&key) {
             if records.len() >= MAX_TRACKED_IPS {
                 // Prefer records whose cooldown has ended, so creating new
@@ -335,27 +381,19 @@ impl NetworkGuard {
                 };
                 records.remove(&oldest);
             }
-            records.insert(key, Record::new(self.policy(surface), now));
+            records.insert(key, Record::new(self.key_policy(key), now));
         }
         let record = records.get_mut(&key).unwrap();
         ensure!(now >= record.cooldown, "temporary network cooldown");
-        ensure!(
-            record.active < self.policy(surface).connections,
-            "per-address connection limit"
-        );
-        let p = self.policy(surface);
+        let p = self.key_policy(key);
+        ensure!(record.active < p.connections, "per-address connection limit");
         if !record.requests.take(1, p.requests, p.request_burst, now) {
-            self.penalize(ip, surface, record, now);
+            self.penalize(key, record, now);
             return Err(anyhow!("connection rate limit"));
         }
         record.active += 1;
         record.last = now;
-        Ok(Session {
-            guard: self.clone(),
-            key,
-            request_bucket: Mutex::new(Bucket::new(16, now)),
-            reserved_frame: Mutex::new(0),
-        })
+        Ok(())
     }
     pub fn tracked_addresses(&self) -> usize {
         self.records.lock().map_or(0, |r| r.len())
@@ -421,43 +459,95 @@ impl Session {
             .records
             .lock()
             .map_err(|_| anyhow!("network accounting lock poisoned"))?;
-        let record = records
-            .get_mut(&self.key)
-            .expect("active sessions retain their accounting entry");
-        ensure!(now >= record.cooldown, "temporary network cooldown");
-        let p = self.guard.policy(self.key.1);
-        if !record
-            .requests
-            .take(requests, p.requests, p.request_burst, now)
-            || !record.bytes.take(bytes, p.bytes, p.byte_burst, now)
-            || !record.work.take(work, p.work, p.work_burst, now)
+        // A visitor named by the proxy pays from its own record first, so one
+        // past its share cannot spend the budget that all visitors share.
+        for key in [self.visitor.get().copied(), Some(self.key)]
+            .into_iter()
+            .flatten()
         {
-            if !penalize {
-                return Err(Busy("outgoing network budget exhausted").into());
+            let record = records
+                .get_mut(&key)
+                .expect("active sessions retain their accounting entry");
+            if now < record.cooldown {
+                self.refused.store(true, Ordering::Relaxed);
+                return Err(anyhow!("temporary network cooldown"));
             }
-            self.guard.penalize(self.key.0, self.key.1, record, now);
-            return Err(anyhow!("network rate budget exhausted"));
+            let p = self.guard.key_policy(key);
+            if !record
+                .requests
+                .take(requests, p.requests, p.request_burst, now)
+                || !record.bytes.take(bytes, p.bytes, p.byte_burst, now)
+                || !record.work.take(work, p.work, p.work_burst, now)
+            {
+                self.refused.store(true, Ordering::Relaxed);
+                if !penalize {
+                    return Err(Busy("outgoing network budget exhausted").into());
+                }
+                self.guard.penalize(key, record, now);
+                return Err(anyhow!("network rate budget exhausted"));
+            }
+            record.last = now;
         }
-        record.last = now;
         Ok(())
     }
     /// Only malformed framing/JSON and explicit resource violations trigger this.
     /// Ordinary stale transactions, unknown parents and competing forks do not.
     pub fn malformed(&self) {
+        let key = self.visitor.get().copied().unwrap_or(self.key);
         if let Ok(mut records) = self.guard.records.lock()
-            && let Some(record) = records.get_mut(&self.key)
+            && let Some(record) = records.get_mut(&key)
         {
-            self.guard
-                .penalize(self.key.0, self.key.1, record, Instant::now());
+            self.guard.penalize(key, record, Instant::now());
         }
+    }
+    /// A client broke HTTP framing or let its request deadline pass. This cools
+    /// down a remote client or a visitor the proxy named, but never local
+    /// software on loopback, and adds nothing to a refusal already accounted.
+    pub fn framing_error(&self) {
+        let key = self.visitor.get().copied().unwrap_or(self.key);
+        if !self.refused.load(Ordering::Relaxed)
+            && (key.2 == Direction::Forwarded || !key.0.is_loopback())
+        {
+            self.malformed();
+        }
+    }
+    /// Whether this session comes from the public website's loopback proxy.
+    pub fn proxied(&self) -> bool {
+        self.guard.is_proxy(self.key)
+    }
+    /// Account the rest of a proxied session to the visitor its proxy named.
+    /// That visitor's own record caps it, and the proxy's record still caps
+    /// all visitors together.
+    pub fn forwarded_for(&self, client: IpAddr) -> Result<()> {
+        ensure!(self.proxied(), "only a public website proxy names visitors");
+        let key = (admission_address(client), Surface::Rpc, Direction::Forwarded);
+        let mut records = self
+            .guard
+            .records
+            .lock()
+            .map_err(|_| anyhow!("network accounting lock poisoned"))?;
+        ensure!(self.visitor.get().is_none(), "visitor already named");
+        if let Err(error) = self.guard.enter(&mut records, key, Instant::now()) {
+            self.refused.store(true, Ordering::Relaxed);
+            return Err(error);
+        }
+        self.visitor
+            .set(key)
+            .expect("the accounting lock serializes visitor naming");
+        Ok(())
     }
 }
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Ok(mut records) = self.guard.records.lock()
-            && let Some(record) = records.get_mut(&self.key)
-        {
-            record.active = record.active.saturating_sub(1);
+        if let Ok(mut records) = self.guard.records.lock() {
+            for key in [Some(self.key), self.visitor.get().copied()]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(record) = records.get_mut(&key) {
+                    record.active = record.active.saturating_sub(1);
+                }
+            }
         }
         let held = self.reserved_frame.get_mut().map_or(0, |held| *held);
         if held > 0
@@ -946,7 +1036,8 @@ mod tests {
             assert!(session.request().is_ok());
         }
         let ip = "127.0.0.1".parse().unwrap();
-        let held: Vec<_> = (0..8)
+        // The proxy carries the whole public pool for every visitor together.
+        let held: Vec<_> = (0..PUBLIC_WEB_SESSIONS)
             .map(|_| guard.admit(ip, Surface::Rpc).unwrap())
             .collect();
         assert!(guard.admit(ip, Surface::Rpc).is_err());
@@ -962,6 +1053,109 @@ mod tests {
         let local = private.admit(ip, Surface::Rpc).unwrap();
         local.malformed();
         assert!(private.admit(ip, Surface::Rpc).is_err());
+    }
+    #[test]
+    fn proxy_named_visitors_spend_only_their_share_of_the_shared_budget() {
+        let guard = Arc::new(NetworkGuard::for_public_web());
+        let proxy: IpAddr = "127.0.0.1".parse().unwrap();
+        let visitor = |client: &str| -> Result<Session> {
+            let session = guard.admit(proxy, Surface::Rpc)?;
+            session.forwarded_for(client.parse()?)?;
+            Ok(session)
+        };
+        let share = (Surface::Rpc.policy().work_burst / PUBLIC_WEB_VISITOR_WORK_SHARE) as usize;
+        let first = visitor("192.0.2.1").unwrap();
+        assert!(first.work(share).is_ok());
+        // A second share is refused by the visitor's own record, and the
+        // refusal cools down only that visitor, never the proxy.
+        assert!(first.work(share).is_err());
+        assert!(visitor("192.0.2.1").is_err());
+        assert!(guard.admit(proxy, Surface::Rpc).is_ok());
+        // Eight full shares empty the budget all visitors share. A further
+        // visitor is then refused without a cooldown of its own.
+        let others: Vec<_> = (2..=8)
+            .map(|n| visitor(&format!("192.0.2.{n}")).unwrap())
+            .collect();
+        for other in &others {
+            assert!(other.work(share).is_ok());
+        }
+        let late = visitor("192.0.2.9").unwrap();
+        assert!(late.work(share).is_err());
+        drop(late);
+        assert!(visitor("192.0.2.9").is_ok());
+        // Unnamed proxy sessions, such as local tools, use the shared record.
+        let unnamed = guard.admit(proxy, Surface::Rpc).unwrap();
+        assert!(unnamed.work(share).is_err());
+        assert!(unnamed.request().is_ok());
+        // Only the proxy's own sessions may name a visitor.
+        let client: IpAddr = "192.0.2.20".parse().unwrap();
+        let direct = guard.admit("198.51.100.1".parse().unwrap(), Surface::Rpc);
+        assert!(direct.unwrap().forwarded_for(client).is_err());
+        let private = Arc::new(NetworkGuard::default());
+        let local = private.admit(proxy, Surface::Rpc).unwrap();
+        assert!(local.forwarded_for(client).is_err());
+    }
+    #[test]
+    fn one_public_visitor_holds_only_a_browser_worth_of_sessions() {
+        let guard = Arc::new(NetworkGuard::for_public_web());
+        let proxy: IpAddr = "127.0.0.1".parse().unwrap();
+        let name = |client: &str| -> Result<Session> {
+            let session = guard.admit(proxy, Surface::Rpc)?;
+            session.forwarded_for(client.parse()?)?;
+            Ok(session)
+        };
+        // Addresses in one global IPv6 /64 are one visitor.
+        let mut held: Vec<_> = (1..=PUBLIC_WEB_VISITOR_SESSIONS)
+            .map(|n| name(&format!("2001:db8:5::{n}")).unwrap())
+            .collect();
+        let error = name("2001:db8:5::99").err().unwrap();
+        assert_eq!(error.to_string(), "per-address connection limit");
+        assert!(name("2001:db8:6::1").is_ok());
+        held.pop();
+        assert!(name("2001:db8:5::99").is_ok());
+        // Direct remote clients have the same cap, below the public pool.
+        let remote: IpAddr = "198.51.100.2".parse().unwrap();
+        let direct: Vec<_> = (0..PUBLIC_WEB_VISITOR_SESSIONS)
+            .map(|_| guard.admit(remote, Surface::Rpc).unwrap())
+            .collect();
+        assert!(guard.admit(remote, Surface::Rpc).is_err());
+        drop(direct);
+        // Released visitor sessions also release the proxy's.
+        let more: Vec<_> = (held.len()..PUBLIC_WEB_SESSIONS)
+            .map(|_| guard.admit(proxy, Surface::Rpc).unwrap())
+            .collect();
+        assert!(guard.admit(proxy, Surface::Rpc).is_err());
+        drop((held, more));
+        assert!(guard.admit(proxy, Surface::Rpc).is_ok());
+    }
+    #[test]
+    fn framing_errors_cool_down_only_remote_clients_and_named_visitors() {
+        let guard = Arc::new(NetworkGuard::for_public_web());
+        let proxy: IpAddr = "127.0.0.1".parse().unwrap();
+        let remote: IpAddr = "198.51.100.3".parse().unwrap();
+        guard.admit(proxy, Surface::Rpc).unwrap().framing_error();
+        assert!(guard.admit(proxy, Surface::Rpc).is_ok());
+        guard.admit(remote, Surface::Rpc).unwrap().framing_error();
+        assert!(guard.admit(remote, Surface::Rpc).is_err());
+        // A loopback visitor named by the proxy has a record of its own.
+        let local_visitor = guard.admit(proxy, Surface::Rpc).unwrap();
+        local_visitor.forwarded_for(proxy).unwrap();
+        local_visitor.framing_error();
+        let later = guard.admit(proxy, Surface::Rpc).unwrap();
+        assert!(later.forwarded_for(proxy).is_err());
+        assert!(guard.admit(proxy, Surface::Rpc).is_ok());
+        // Private loopback clients are local software and keep no cooldown.
+        let private = Arc::new(NetworkGuard::default());
+        private.admit(proxy, Surface::Rpc).unwrap().framing_error();
+        assert!(private.admit(proxy, Surface::Rpc).is_ok());
+        // A refusal is accounted once, not again as a framing error.
+        let visitor = guard.admit(proxy, Surface::Rpc).unwrap();
+        let client: IpAddr = "203.0.113.9".parse().unwrap();
+        visitor.forwarded_for(client).unwrap();
+        assert!(visitor.work(1_048_576).is_err());
+        visitor.framing_error();
+        let records = guard.records.lock().unwrap();
+        assert_eq!(records[&(client, Surface::Rpc, Direction::Forwarded)].strikes, 1);
     }
     #[test]
     fn global_ipv6_hosts_are_accounted_by_slash_64_and_cooldowns_survive_churn() {

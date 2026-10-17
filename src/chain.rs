@@ -110,6 +110,9 @@ fn permanent(error: anyhow::Error) -> anyhow::Error {
 thread_local! {
     /// Fail block finishing on this thread for accepted sets longer than this.
     pub(crate) static FAIL_FINISH_ABOVE: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Run on this thread when a template build starts, before any clearing.
+    pub(crate) static TEMPLATE_BUILD_HOOK: RefCell<Option<Box<dyn FnMut()>>> =
+        const { RefCell::new(None) };
 }
 
 /// Local transaction-selection policy; these are not consensus block limits.
@@ -128,7 +131,8 @@ pub struct SelectionResult {
     /// selection did not decide those senders' left-out candidates.
     pub exhausted_senders: BTreeSet<PublicKey>,
     /// The accepted set could not be finished as a block, so only a prefix
-    /// was kept and no left-out candidate was decided.
+    /// was kept and no left-out candidate was decided. Admission selections
+    /// never finish the block and are never truncated.
     pub truncated: bool,
 }
 fn compact_size_len(n: usize) -> usize {
@@ -1653,6 +1657,45 @@ impl Chain {
         )?;
         self.template_from_execution(miner, transactions, timestamp, state.root())
     }
+    /// Capture a template for the tip's next block that is finished without
+    /// the chain (see [TemplateJob]).
+    pub fn template_job(
+        &self,
+        miner: PublicKey,
+        transactions: Vec<Transaction>,
+        timestamp: u32,
+    ) -> Result<TemplateJob> {
+        ensure!(crypto::valid_key(&miner), "invalid miner key");
+        ensure!(
+            transactions.len() <= self.config.max_signatures,
+            "signature limit exceeded"
+        );
+        let target = self.target(&self.tip_entry)?;
+        Ok(TemplateJob {
+            config: self.config.clone(),
+            parent: self.tip_state.clone(),
+            header: self.child_header(&target)?,
+            block_work: math::work(&target),
+            miner,
+            timestamp,
+            transactions,
+        })
+    }
+    /// The header fields of the tip's next block, which the tip alone decides.
+    fn child_header(&self, target: &Amount) -> Result<ChildHeader> {
+        Ok(ChildHeader {
+            previous: self.tip,
+            height: self.tip_entry.height + 1,
+            bits: math::bits_from_target(target),
+            // Header timestamps are u32: the chain cannot extend once median
+            // past time reaches u32::MAX (2106-02-07 UTC), a protocol lifetime limit.
+            earliest: self
+                .median(self.tip)?
+                .checked_add(1)
+                .context("timestamp exhausted")?,
+            block_bytes: self.tip_state.settings.block_bytes,
+        })
+    }
     fn template_from_execution(
         &self,
         miner: PublicKey,
@@ -1661,34 +1704,8 @@ impl Chain {
         state_root: Hash,
     ) -> Result<Block> {
         let target = self.target(&self.tip_entry)?;
-        // Header timestamps are u32: the chain cannot extend once median
-        // past time reaches u32::MAX (2106-02-07 UTC), a protocol lifetime limit.
-        let timestamp = timestamp.max(
-            self.median(self.tip)?
-                .checked_add(1)
-                .context("timestamp exhausted")?,
-        );
-        let mut block = Block {
-            header: Header {
-                version: codec::HEADER_VERSION,
-                previous: self.tip,
-                merkle_root: ZERO_HASH,
-                timestamp,
-                bits: math::bits_from_target(&target),
-                nonce: 0,
-            },
-            height: self.tip_entry.height + 1,
-            miner,
-            state_root,
-            extranonce: [0; 8],
-            transactions,
-        };
-        block.header.merkle_root = codec::merkle_root(&block)?;
-        ensure!(
-            codec::body_size(&block)? as u64 <= self.tip_state.settings.block_bytes,
-            "block body exceeds byte limit"
-        );
-        Ok(block)
+        self.child_header(&target)?
+            .assemble(miner, transactions, timestamp, state_root)
     }
     /// Build one intermediate state and try bounded atomic operations against it.
     /// Signature checks are cached for this invocation only. A rejected candidate
@@ -1715,6 +1732,28 @@ impl Chain {
     ) -> Result<SelectionResult> {
         self.select_executed(miner, candidates, limit, authenticated)
             .map(|(selected, _)| selected)
+    }
+    /// Mempool admission: the selection [Chain::select_authenticated] makes,
+    /// without finishing the block. Every rule that decides which candidates
+    /// a block includes runs while they are applied: signatures, size, anchor
+    /// and lifetime, fee quotes, opening-funds reservation, nonce order,
+    /// weight (with the miner-account reserve), operation validity and each
+    /// sender's attempt budget. Finishing only settles the included trades
+    /// and pays the miner. A trade's inputs and fee are reserved from
+    /// block-opening balances, so its fill never decides whether any
+    /// transaction is valid, and admission needs no batch clearing. Whenever
+    /// the block finishes, which nothing is known to prevent, the result is
+    /// exactly that selection. It is never truncated: a block that cannot be
+    /// finished is cut short when its template is built ([TemplateJob]).
+    pub fn select_admission(
+        &self,
+        miner: PublicKey,
+        candidates: &[Transaction],
+        limit: usize,
+        authenticated: &HashSet<Hash>,
+    ) -> Result<SelectionResult> {
+        self.select_open(miner, candidates, limit, authenticated)
+            .map(|(selected, _, _)| selected)
     }
     /// Selection and construction share the same parent, miner and
     /// configuration. The completed state never escapes as a reusable unchecked
@@ -1790,6 +1829,40 @@ impl Chain {
         limit: usize,
         authenticated: &HashSet<Hash>,
     ) -> Result<(SelectionResult, State)> {
+        let (mut result, execution, block_work) =
+            self.select_open(miner, candidates, limit, authenticated)?;
+        let finisher = Finisher {
+            config: &self.config,
+            parent: &self.tip_state,
+            previous: &self.tip,
+            miner: &miner,
+            block_work: &block_work,
+        };
+        let accepted = result.transactions.len();
+        let state = match finisher.finish(execution, accepted) {
+            Ok(state) => state,
+            Err(error) => {
+                let Some((length, state)) = finisher.prefix(&result.transactions) else {
+                    return Err(error);
+                };
+                eprintln!("Selection kept {length} of {accepted} transactions: {error:#}");
+                result.transactions.truncate(length);
+                // The dropped tail was never judged invalid; it stays pending.
+                result.truncated = true;
+                state
+            }
+        };
+        Ok((result, state))
+    }
+    /// The selection loop, leaving the block unfinished: the returned
+    /// execution has applied exactly the selected transactions, in order.
+    fn select_open(
+        &self,
+        miner: PublicKey,
+        candidates: &[Transaction],
+        limit: usize,
+        authenticated: &HashSet<Hash>,
+    ) -> Result<(SelectionResult, consensus::BlockExecution, Amount)> {
         ensure!(
             candidates.len() <= MAX_SELECTION_CANDIDATES,
             "selection candidate limit exceeded"
@@ -1982,74 +2055,7 @@ impl Chain {
                 }
             }
         }
-        let accepted = result.transactions.len();
-        let state = match self.finish_selected(&miner, &block_work, execution, accepted) {
-            Ok(state) => state,
-            Err(error) => {
-                let Some((length, state)) =
-                    self.finish_prefix(&miner, &block_work, &result.transactions)
-                else {
-                    return Err(error);
-                };
-                eprintln!("Selection kept {length} of {accepted} transactions: {error:#}");
-                result.transactions.truncate(length);
-                // The dropped tail was never judged invalid; it stays pending.
-                result.truncated = true;
-                state
-            }
-        };
-        Ok((result, state))
-    }
-    fn finish_selected(
-        &self,
-        miner: &PublicKey,
-        block_work: &Amount,
-        execution: consensus::BlockExecution,
-        accepted: usize,
-    ) -> Result<State> {
-        #[cfg(test)]
-        ensure!(
-            FAIL_FINISH_ABOVE.with(|limit| limit.get().is_none_or(|limit| accepted <= limit)),
-            "injected block finishing failure"
-        );
-        #[cfg(not(test))]
-        let _ = accepted;
-        consensus::finish_block(
-            &self.config,
-            &self.tip_state,
-            &self.tip,
-            miner,
-            block_work,
-            execution,
-        )
-    }
-    /// Selection is local policy: if the accepted set cannot finish as a block,
-    /// keep the longest prefix found by bisection, down to an empty block.
-    /// A chain-level failure that also rejects the empty block is returned.
-    fn finish_prefix(
-        &self,
-        miner: &PublicKey,
-        block_work: &Amount,
-        accepted: &[Transaction],
-    ) -> Option<(usize, State)> {
-        let finish = |length: usize| -> Result<State> {
-            let mut execution =
-                consensus::prepare_block(&self.config, &self.tip_state, miner, block_work)?;
-            for transaction in &accepted[..length] {
-                execution.apply_verified_transaction(&self.config, transaction)?;
-            }
-            self.finish_selected(miner, block_work, execution, length)
-        };
-        let mut best = (0, finish(0).ok()?);
-        let mut failed = accepted.len();
-        while failed - best.0 > 1 {
-            let middle = best.0 + (failed - best.0) / 2;
-            match finish(middle) {
-                Ok(state) => best = (middle, state),
-                Err(_) => failed = middle,
-            }
-        }
-        Some(best)
+        Ok((result, execution, block_work))
     }
 
     /// Test and diagnostic helper: a one-transaction template paid to the
@@ -2080,6 +2086,189 @@ impl Chain {
             }
         }
         anyhow::bail!("no valid nonce in mining attempt limit")
+    }
+}
+
+/// Finishing a child of one parent state. This is the only step of selection
+/// or template construction that clears batch trades.
+struct Finisher<'a> {
+    config: &'a Config,
+    parent: &'a State,
+    previous: &'a Hash,
+    miner: &'a PublicKey,
+    block_work: &'a Amount,
+}
+impl Finisher<'_> {
+    fn finish(&self, execution: consensus::BlockExecution, accepted: usize) -> Result<State> {
+        #[cfg(test)]
+        ensure!(
+            FAIL_FINISH_ABOVE.with(|limit| limit.get().is_none_or(|limit| accepted <= limit)),
+            "injected block finishing failure"
+        );
+        #[cfg(not(test))]
+        let _ = accepted;
+        consensus::finish_block(
+            self.config,
+            self.parent,
+            self.previous,
+            self.miner,
+            self.block_work,
+            execution,
+        )
+    }
+    /// Selection is local policy: if the accepted set cannot finish as a block,
+    /// keep the longest prefix found by bisection, down to an empty block.
+    /// A chain-level failure that also rejects the empty block is returned.
+    fn prefix(&self, accepted: &[Transaction]) -> Option<(usize, State)> {
+        let finish = |length: usize| -> Result<State> {
+            let mut execution =
+                consensus::prepare_block(self.config, self.parent, self.miner, self.block_work)?;
+            for transaction in &accepted[..length] {
+                execution.apply_verified_transaction(self.config, transaction)?;
+            }
+            self.finish(execution, length)
+        };
+        let mut best = (0, finish(0).ok()?);
+        let mut failed = accepted.len();
+        while failed - best.0 > 1 {
+            let middle = best.0 + (failed - best.0) / 2;
+            match finish(middle) {
+                Ok(state) => best = (middle, state),
+                Err(_) => failed = middle,
+            }
+        }
+        Some(best)
+    }
+}
+
+/// The header fields of the tip's next block, which the tip alone decides.
+#[derive(Clone)]
+struct ChildHeader {
+    previous: Hash,
+    height: u64,
+    bits: u32,
+    /// The least timestamp the median-past-time rule allows.
+    earliest: u32,
+    block_bytes: u64,
+}
+impl ChildHeader {
+    fn assemble(
+        &self,
+        miner: PublicKey,
+        transactions: Vec<Transaction>,
+        timestamp: u32,
+        state_root: Hash,
+    ) -> Result<Block> {
+        let mut block = Block {
+            header: Header {
+                version: codec::HEADER_VERSION,
+                previous: self.previous,
+                merkle_root: ZERO_HASH,
+                timestamp: timestamp.max(self.earliest),
+                bits: self.bits,
+                nonce: 0,
+            },
+            height: self.height,
+            miner,
+            state_root,
+            extranonce: [0; 8],
+            transactions,
+        };
+        block.header.merkle_root = codec::merkle_root(&block)?;
+        ensure!(
+            codec::body_size(&block)? as u64 <= self.block_bytes,
+            "block body exceeds byte limit"
+        );
+        Ok(block)
+    }
+}
+
+/// A template for the tip's next block, captured by [Chain::template_job]
+/// so that it can be finished without the chain. Finishing clears the
+/// included batch trades, which can take long at large magnitudes, so a node
+/// builds templates outside its chain lock. The transactions must be a
+/// selection made against this tip, such as [Chain::select_admission]
+/// returns: they are replayed in order without signature or anchor checks,
+/// as the selection's own execution applied them, and the block finishes
+/// exactly as that selection's would. Received blocks still pass the
+/// normal independent validation path.
+pub struct TemplateJob {
+    config: Config,
+    parent: Arc<State>,
+    header: ChildHeader,
+    block_work: Amount,
+    miner: PublicKey,
+    timestamp: u32,
+    transactions: Vec<Transaction>,
+}
+/// A built template, and how many of its job's transactions it kept: all of
+/// them unless the block could not be finished with them.
+#[derive(Debug)]
+pub struct TemplateBuild {
+    pub block: Block,
+    pub kept: usize,
+}
+impl TemplateJob {
+    /// The parent block the template extends.
+    pub fn previous(&self) -> Hash {
+        self.header.previous
+    }
+    pub fn build(&self) -> Result<TemplateBuild> {
+        #[cfg(test)]
+        TEMPLATE_BUILD_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+        let finisher = Finisher {
+            config: &self.config,
+            parent: &self.parent,
+            previous: &self.header.previous,
+            miner: &self.miner,
+            block_work: &self.block_work,
+        };
+        let mut execution =
+            consensus::prepare_block(&self.config, &self.parent, &self.miner, &self.block_work)?;
+        // A failed application changes nothing, so replaying a selection made
+        // against this parent reproduces its execution. Should one no longer
+        // apply, the block keeps the prefix before it.
+        let mut applied = 0;
+        for transaction in &self.transactions {
+            if execution
+                .apply_verified_transaction(&self.config, transaction)
+                .is_err()
+            {
+                break;
+            }
+            applied += 1;
+        }
+        let (kept, state) = match finisher.finish(execution, applied) {
+            Ok(state) => (applied, state),
+            Err(error) => {
+                let Some(kept) = finisher.prefix(&self.transactions[..applied]) else {
+                    return Err(error);
+                };
+                eprintln!(
+                    "Template kept {} of {} transactions: {error:#}",
+                    kept.0,
+                    self.transactions.len()
+                );
+                kept
+            }
+        };
+        if applied < self.transactions.len() && kept == applied {
+            eprintln!(
+                "Template kept {kept} of {} transactions: a selected transaction no longer applies",
+                self.transactions.len()
+            );
+        }
+        let block = self.header.assemble(
+            self.miner,
+            self.transactions[..kept].to_vec(),
+            self.timestamp,
+            state.root(),
+        )?;
+        Ok(TemplateBuild { block, kept })
     }
 }
 

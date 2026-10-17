@@ -54,6 +54,33 @@ fn signed(
         0,
     )
 }
+/// Admission selects exactly what a finished selection selects, and a
+/// template finished without the chain is the block the chain builds itself.
+fn assert_admission_matches(chain: &Chain, candidates: &[Transaction], limit: usize, time: u32) {
+    let authenticated = std::collections::HashSet::new();
+    let finished = chain
+        .select_authenticated(key(), candidates, limit, &authenticated)
+        .unwrap();
+    let admitted = chain
+        .select_admission(key(), candidates, limit, &authenticated)
+        .unwrap();
+    assert_eq!(admitted.transactions, finished.transactions);
+    assert_eq!(admitted.signatures_checked, finished.signatures_checked);
+    assert_eq!(admitted.execution_attempts, finished.execution_attempts);
+    assert_eq!(admitted.budget_exhausted, finished.budget_exhausted);
+    assert_eq!(admitted.exhausted_senders, finished.exhausted_senders);
+    assert!(!admitted.truncated && !finished.truncated);
+    let job = chain
+        .template_job(key(), admitted.transactions.clone(), time)
+        .unwrap();
+    assert_eq!(job.previous(), chain.tip_hash());
+    let built = job.build().unwrap();
+    assert_eq!(built.kept, admitted.transactions.len());
+    assert_eq!(
+        codec::encode(&built.block),
+        codec::encode(&chain.template(key(), admitted.transactions, time).unwrap())
+    );
+}
 fn self_payment(chain: &Chain, secret: &[u8; 32], nonce: u64) -> Transaction {
     signed(
         chain,
@@ -78,6 +105,7 @@ fn reversed_nonce_chain_uses_one_signature_and_operation_per_transaction() {
     let reverse: Vec<_> = ordered.iter().rev().cloned().collect();
     let time = chain.tip_block().header.timestamp + 2;
     let (chosen, selected_block) = chain.select_template(key(), &reverse, 256, time).unwrap();
+    assert_admission_matches(&chain, &reverse, 256, time);
     assert_eq!(chosen.transactions, ordered);
     assert_eq!(chosen.signatures_checked, 256);
     assert_eq!(chosen.execution_attempts, 256);
@@ -659,6 +687,7 @@ fn prepared_selection_matches_execution_through_governance_and_activation() {
         let (selected, selected_block) = chain
             .select_template(key(), &candidates, 256, timestamp)
             .unwrap();
+        assert_admission_matches(&chain, &candidates, 256, timestamp);
         assert_eq!(selected.transactions, valid);
         let expected = chain.template(key(), valid, timestamp).unwrap();
         assert_eq!(selected_block, expected);

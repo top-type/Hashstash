@@ -334,6 +334,47 @@
         node.textContent = message;
         node.classList.toggle("error", failed);
     }
+    // A submitted transaction can expire, or lose its anchor or decision in a
+    // reorganization; the node then drops it without notice. Follow each
+    // form's last submission by sender nonce until it leaves the pool.
+    const submissions = new Map;
+    function trackSubmission(form, id, sender, nonce) {
+        submissions.set(form.id, {id: id, sender: sender, nonce: BigInt(nonce), misses: 0});
+    }
+    function followSubmissions(cleared) {
+        for (const [formId, tracked] of submissions) {
+            const form = $(formId);
+            if (!form || tracked.sender !== key()) {
+                submissions.delete(formId);
+                continue;
+            }
+            const message = `Pending · ${short(tracked.id)}`;
+            const shown = form.querySelector(".form-feedback")?.textContent;
+            if (shown !== message && !(cleared && shown === "")) {
+                // A newer action on this form replaced the indicator.
+                submissions.delete(formId);
+                continue;
+            }
+            if (BigInt(state.account?.account?.nonce || "0") > tracked.nonce) {
+                submissions.delete(formId);
+                feedback(form, `Mined or replaced · ${short(tracked.id)}`);
+                continue;
+            }
+            if (state.mempool.some(tx => hex(tx.body?.sender) === tracked.sender && BigInt(tx.body.nonce) === tracked.nonce)) {
+                tracked.misses = 0;
+                shown === message || feedback(form, message);
+                continue;
+            }
+            // The snapshot lists a bounded prefix of the pool, and a tip change
+            // briefly publishes an empty pool before recovery: confirm twice.
+            if (Number(state.status?.mempool || 0) > state.mempool.length || ++tracked.misses < 2) {
+                shown === message || feedback(form, message);
+                continue;
+            }
+            submissions.delete(formId);
+            feedback(form, `No longer pending · ${short(tracked.id)} expired or was invalidated by a reorganization. Prepare it again.`, true);
+        }
+    }
     async function exactJSON(response) {
         return JSON.parse(await response.text(), (_key, value, context) => {
             if (typeof value === "number" && Number.isInteger(value) && !Number.isSafeInteger(value)) {
@@ -840,6 +881,7 @@
             if (form.id !== "mail-form" || identity === submissionIdentity(form)) {
                 form.id === "mail-form" && mail?.sent();
                 feedback(form, `Pending · ${short(id)}`);
+                trackSubmission(form, id, request.sender, nonce);
             }
             await refresh();
             return data;
@@ -1863,6 +1905,7 @@
         });
         feeQuotes.clear();
         pendingFeeRefresh.clear();
+        submissions.clear();
         feeForms.forEach(name => clearFeeAllocation($(`${name}-form`)));
         feeTimers.forEach(clearTimeout);
         feeTimers.clear();
@@ -2007,6 +2050,7 @@
                 $("quote-remaining").hidden = true;
                 feedback($("trade-form"), "");
             }
+            followSubmissions(previousDecision !== hex(activeDecision()?.id));
             networkPhaseView();
             text("reserve-ratio", `${reserveRatio(curveWorld())} reserve ratio`);
             text("header-height", commas(status.height));

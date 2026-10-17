@@ -12,8 +12,9 @@ User=hashstash
 Group=hashstash
 WorkingDirectory=/var/lib/hashstash
 ExecStart=/usr/local/libexec/hashstash/run-node.sh run
-# The node exits with status 70 when a panic poisoned its shared state, so a
-# restart revalidates history from disk instead of leaving a stuck process.
+# The node exits with status 70 when a panic poisoned its shared state or
+# stopped a long-lived service loop, so a restart revalidates history from
+# disk instead of leaving a stuck process.
 Restart=on-failure
 RestartSec=10
 # The node handles Ctrl+C/SIGINT for a graceful listener shutdown.

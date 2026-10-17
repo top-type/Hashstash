@@ -85,6 +85,9 @@ fn published(node: &Node) -> u64 {
 fn signatures() -> usize {
     POOL_SIGNATURES.with(|count| count.replace(0))
 }
+fn selections() -> usize {
+    POOL_SELECTIONS.with(|count| count.replace(0))
+}
 fn ids(transactions: &[Transaction]) -> BTreeSet<Hash> {
     transactions.iter().map(codec::transaction_id).collect()
 }
@@ -171,7 +174,7 @@ fn relay_selects_and_publishes_only_for_new_admissible_entries() {
     let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
     let start = nonce(&node, &key());
     assert!(start > 0);
-    let pooled = payment(config, state, &SECRET, start, key(), 1, 0);
+    let pooled = payment(config, state, &SECRET, start, key(), 1, 10);
     node.submit_transaction(pooled.clone()).unwrap();
     let revision = published(&node);
     // Rebuilding a template for an unchanged selection publishes nothing.
@@ -179,6 +182,7 @@ fn relay_selects_and_publishes_only_for_new_admissible_entries() {
     assert_eq!(published(&node), revision);
     let deliver = |transactions: Vec<Transaction>| {
         signatures();
+        selections();
         node.receive_peer(&PeerMessage {
             chain: config.chain_id(),
             locator: Vec::new(),
@@ -186,37 +190,112 @@ fn relay_selects_and_publishes_only_for_new_admissible_entries() {
             transactions,
         })
         .unwrap();
-        signatures()
+        assert_eq!(signatures(), 0, "selection never re-verifies an authenticated entry");
+        selections()
     };
     let mut forged = pooled.clone();
     forged.signature[0] ^= 1;
     let used = payment(config, state, &SECRET, start - 1, key(), 2, 0);
     // Valid shape, signature, anchor and nonce, but the sender cannot pay it.
     let unpayable = payment(config, state, &SECRET, start + 1, other(), 1 << 60, 0);
-    assert_eq!(deliver(vec![forged.clone(), used.clone()]), 0);
+    let underpriced = {
+        let mut body = payment(config, state, &SECRET, start + 1, other(), 1, 0).body;
+        body.fee = Amount::zero();
+        crypto::sign(&body, &SECRET).unwrap()
+    };
+    assert_eq!(
+        deliver(vec![forged.clone(), used.clone(), unpayable.clone(), underpriced.clone()]),
+        0
+    );
     assert_eq!(published(&node), revision, "refused records do not publish");
+    let tip = view.chain.tip_hash();
+    let pool_revision = snapshot(&node).pool_revision;
     {
         let rejected = node.rejected_locked();
-        let tip = view.chain.tip_hash();
-        assert!(rejected.contains(&codec::transaction_id(&forged), &[0; 32]));
-        assert!(rejected.contains(&codec::transaction_id(&used), &tip));
-        assert!(!rejected.contains(&codec::transaction_id(&used), &[0; 32]));
+        assert!(rejected.contains(&codec::transaction_id(&forged), &[0; 32], 0));
+        assert!(rejected.contains(&codec::transaction_id(&used), &tip, pool_revision + 1));
+        assert!(!rejected.contains(&codec::transaction_id(&used), &[0; 32], pool_revision));
+        assert!(rejected.contains(&codec::transaction_id(&unpayable), &tip, pool_revision + 1));
+        assert!(rejected.contains(&codec::transaction_id(&underpriced), &tip, pool_revision + 1));
     }
-    assert_eq!(
-        deliver(vec![unpayable.clone()]),
-        2,
-        "one selection over the pool and the newcomer"
+    assert!(
+        node.submit_transaction(unpayable.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("opening balance does not cover")
     );
+    // A lower bid at the pooled nonce needs a selection, then loses it.
+    let outbid = payment(config, state, &SECRET, start, other(), 1, 0);
+    assert_eq!(deliver(vec![outbid.clone()]), 1, "one selection for one new candidate");
     assert_eq!(published(&node), revision, "an unchanged selection does not publish");
     for _ in 0..3 {
         assert_eq!(
-            deliver(vec![forged.clone(), used.clone(), unpayable.clone()]),
+            deliver(vec![forged.clone(), used.clone(), unpayable.clone(), outbid.clone()]),
             0,
             "replayed refusals never reach selection"
         );
     }
     assert_eq!(published(&node), revision);
-    assert_eq!(snapshot(&node).mempool, vec![pooled]);
+    assert_eq!(snapshot(&node).mempool, vec![pooled.clone()]);
+    // A pool change ends a lost-selection refusal, never a stale-state one.
+    let other_payment = payment(config, state, &OTHER, nonce(&node, &other()), key(), 1, 0);
+    node.submit_transaction(other_payment).unwrap();
+    assert_eq!(deliver(vec![used, unpayable, outbid.clone()]), 1);
+    assert!(!ids(&snapshot(&node).mempool).contains(&codec::transaction_id(&outbid)));
+}
+
+#[test]
+fn the_opening_screen_allows_a_recipient_an_earlier_transaction_may_create() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let fresh = crypto::public_key(&[77; 32]).unwrap();
+    let creating = payment(config, state, &SECRET, nonce(&node, &key()), fresh, 10, 0);
+    let quote = fees::quote(config, state, &creating).unwrap();
+    assert!(!quote.account_creation_fee.is_zero());
+    let paying = |fee: Amount| {
+        let mut body = creating.body.clone();
+        body.fee = fee;
+        crypto::sign(&body, &SECRET).unwrap()
+    };
+    // Exactly the minimum without account creation, and one atom less.
+    let least = paying(&quote.minimum_fee - &quote.account_creation_fee);
+    let below = paying(&quote.minimum_fee - &quote.account_creation_fee - 1u32);
+    let i = node.locked().unwrap();
+    let screened = i.chain.opening_screen(node.miner, &[&creating, &least, &below]);
+    drop(i);
+    let screened = screened.unwrap();
+    assert!(screened[0].is_ok() && screened[1].is_ok());
+    assert!(screened[2].is_err());
+}
+
+#[test]
+fn a_relayed_nonce_gap_is_not_remembered_and_its_chain_is_admitted_together() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let start = nonce(&node, &key());
+    let first = payment(config, state, &SECRET, start, key(), 1, 0);
+    let second = payment(config, state, &SECRET, start + 1, key(), 1, 0);
+    let deliver = |transactions: Vec<Transaction>| {
+        selections();
+        node.receive_peer(&PeerMessage {
+            chain: config.chain_id(),
+            locator: Vec::new(),
+            blocks: Vec::new(),
+            transactions,
+        })
+        .unwrap();
+        selections()
+    };
+    // The later nonce alone cannot be selected; it costs no selection and is
+    // not remembered, because its predecessor may still arrive on this tip.
+    assert_eq!(deliver(vec![second.clone()]), 0);
+    assert!(!node.rejected_locked().entries.contains_key(&codec::transaction_id(&second)));
+    assert_eq!(deliver(vec![first.clone(), second.clone()]), 1);
+    assert_eq!(snapshot(&node).mempool, vec![first, second]);
 }
 
 #[test]
@@ -281,13 +360,16 @@ fn reorg_recovery_is_one_selection_without_rechecking_reincluded_transactions() 
     );
     node.submit_transaction(pending.clone()).unwrap();
     signatures();
+    selections();
     for block in &new_blocks {
         node.submit_block(block.clone()).unwrap();
     }
     assert_eq!(snapshot(&node).chain.tip_hash(), new.tip_hash());
-    // Re-included detached entries fail the nonce check before authentication,
-    // and recovery runs one selection: only the pending entry is verified.
-    assert_eq!(signatures(), 1);
+    // Re-included detached entries fail the nonce check before selection, and
+    // recovery runs one selection. Pending entries were authenticated when
+    // pooled and detached ones when their blocks executed: none is rechecked.
+    assert_eq!(selections(), 1);
+    assert_eq!(signatures(), 0);
     assert_eq!(snapshot(&node).mempool, vec![pending.clone()]);
     assert_eq!(node.template().unwrap().transactions, vec![pending]);
 }
@@ -369,9 +451,18 @@ fn capacity_displaced_entries_wait_in_the_backlog_for_the_next_block() {
     prepared.as_object_mut().unwrap().remove("fee_quote");
     let body = wallet::decode_unsigned(&serde_json::from_value(prepared).unwrap()).unwrap();
     assert_eq!(body.nonce, start + low.len() as u64);
+    // That nonce cannot be selected before its waiting predecessors, so it
+    // waits behind them instead of being refused.
+    let queued = crypto::sign(&body, &SECRET).unwrap();
+    node.submit_transaction(queued.clone()).unwrap();
+    assert!(pool(&node).1.contains(&queued));
     node.mine(1_000_000).unwrap();
     let (selected, backlog, _) = pool(&node);
-    assert_eq!(ids(&selected), ids(&low[kept..]), "the backlog fills the next block");
+    assert_eq!(
+        ids(&selected),
+        &ids(&low[kept..]) | &ids(&[queued]),
+        "the backlog fills the next block"
+    );
     assert!(backlog.is_empty());
 }
 
@@ -418,16 +509,68 @@ fn a_count_full_pool_still_admits_a_better_bid() {
         .collect();
     let installed = {
         let mut i = node.locked().unwrap();
-        Node::select_pool(&i.chain, node.miner, &full, &HashSet::new())
+        Node::select_pool(&i.chain, node.miner, &full, &HashSet::new(), &HashSet::new())
             .and_then(|selected| node.install_pool(&mut i, selected))
     };
     installed.unwrap();
     assert_eq!(pool(&node).0.len(), limit);
     let bid = payment(config, state, &OTHER, nonce(&node, &other()), other(), 1, 1_000);
     node.submit_transaction(bid.clone()).unwrap();
-    let pending = snapshot(&node).mempool.clone();
-    assert!(pending.contains(&bid));
-    assert_eq!(pending.len(), limit);
+    let (selected, backlog, _) = pool(&node);
+    assert!(selected.contains(&bid));
+    assert_eq!(selected.len(), limit);
+    // The backlog is bounded on its own: a count-saturated selection keeps
+    // the entry it displaced instead of dropping it.
+    assert_eq!(backlog, vec![full[limit - 1].clone()]);
+    assert_eq!(snapshot(&node).mempool.len(), limit + 1);
+}
+
+#[test]
+fn a_new_tip_is_published_once_together_with_its_recovered_pool() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let view = snapshot(&node);
+    let pending = payment(
+        view.chain.config.as_ref(),
+        view.chain.tip_state(),
+        &SECRET,
+        nonce(&node, &key()),
+        key(),
+        1,
+        0,
+    );
+    node.submit_transaction(pending.clone()).unwrap();
+    let candidate = {
+        let i = node.locked().unwrap();
+        i.chain
+            .template(node.miner, Vec::new(), Node::timestamp(&i.chain))
+    };
+    let block = Chain::mine(candidate.unwrap(), 1_000_000).unwrap();
+    let revision = published(&node);
+    assert!(node.submit_block(block.clone()).unwrap());
+    // No reader ever sees the new tip without the still-pending entry.
+    assert_eq!(published(&node), revision + 1);
+    let view = snapshot(&node);
+    assert_eq!(view.chain.tip_hash(), codec::block_hash(&block));
+    assert_eq!(view.mempool, vec![pending]);
+}
+
+#[test]
+fn a_launch_on_the_wrong_network_leaves_the_wallet_store_unchanged() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("chain.sqlite");
+    let config = configuration(16 * 1024);
+    drop(Node::open(&path, config.clone(), key()).unwrap());
+    let mut other_network = config.clone();
+    other_network.genesis_time += 1;
+    assert_ne!(other_network.chain_id(), config.chain_id());
+    let error = Node::open(&path, other_network, key()).err().unwrap();
+    assert!(error.to_string().contains("different network"), "{error:#}");
+    let recorded: String = rusqlite::Connection::open(path.with_extension("wallets.sqlite"))
+        .unwrap()
+        .query_row("SELECT chain_id FROM wallet_network", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(recorded, hex::encode(config.chain_id()));
 }
 
 #[test]
@@ -445,14 +588,25 @@ fn rejected_transaction_memory_is_bounded_and_scoped() {
     for value in 0..=MAX_REJECTED_TRANSACTIONS as u32 {
         let mut id = [0; 32];
         id[..4].copy_from_slice(&value.to_le_bytes());
-        rejected.insert(id, if value % 2 == 0 { None } else { Some([1; 32]) });
+        rejected.insert(
+            id,
+            match value % 3 {
+                0 => Refusal::Permanent,
+                1 => Refusal::Tip([1; 32]),
+                _ => Refusal::Pool([1; 32], 5),
+            },
+        );
     }
     assert_eq!(rejected.entries.len(), MAX_REJECTED_TRANSACTIONS);
-    assert!(!rejected.contains(&[0; 32], &[1; 32]), "the oldest identity is forgotten");
+    assert!(!rejected.contains(&[0; 32], &[1; 32], 5), "the oldest identity is forgotten");
     let mut id = [0; 32];
-    id[0] = 2;
-    assert!(rejected.contains(&id, &[9; 32]), "permanent refusals hold on any tip");
     id[0] = 3;
-    assert!(rejected.contains(&id, &[1; 32]));
-    assert!(!rejected.contains(&id, &[9; 32]), "other refusals end with their tip");
+    assert!(rejected.contains(&id, &[9; 32], 0), "permanent refusals hold on any tip");
+    id[0] = 4;
+    assert!(rejected.contains(&id, &[1; 32], 0));
+    assert!(!rejected.contains(&id, &[9; 32], 5), "state refusals end with their tip");
+    id[0] = 5;
+    assert!(rejected.contains(&id, &[1; 32], 5));
+    assert!(!rejected.contains(&id, &[1; 32], 6), "lost selections end with their pool");
+    assert!(!rejected.contains(&id, &[9; 32], 5));
 }

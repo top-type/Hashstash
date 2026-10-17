@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::{
     cell::{Cell, RefCell},
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -1361,7 +1361,20 @@ impl Chain {
         candidates: &[Transaction],
         limit: usize,
     ) -> Result<SelectionResult> {
-        self.select_executed(miner, candidates, limit)
+        self.select_authenticated(miner, candidates, limit, &HashSet::new())
+    }
+    /// Selection that skips only the signature check of candidates whose
+    /// transaction id is in `authenticated`. The id hashes the exact signed
+    /// bytes, signature included, so an earlier successful check by the caller
+    /// still holds; every other selection and validity rule applies unchanged.
+    pub fn select_authenticated(
+        &self,
+        miner: PublicKey,
+        candidates: &[Transaction],
+        limit: usize,
+        authenticated: &HashSet<Hash>,
+    ) -> Result<SelectionResult> {
+        self.select_executed(miner, candidates, limit, authenticated)
             .map(|(selected, _)| selected)
     }
     /// Selection and construction share the same parent, miner and
@@ -1374,7 +1387,18 @@ impl Chain {
         limit: usize,
         timestamp: u32,
     ) -> Result<(SelectionResult, Block)> {
-        let (selected, state) = self.select_executed(miner, candidates, limit)?;
+        self.select_template_authenticated(miner, candidates, limit, timestamp, &HashSet::new())
+    }
+    /// `select_template` with the signature-check skip of `select_authenticated`.
+    pub fn select_template_authenticated(
+        &self,
+        miner: PublicKey,
+        candidates: &[Transaction],
+        limit: usize,
+        timestamp: u32,
+        authenticated: &HashSet<Hash>,
+    ) -> Result<(SelectionResult, Block)> {
+        let (selected, state) = self.select_executed(miner, candidates, limit, authenticated)?;
         let block = self.template_from_execution(
             miner,
             selected.transactions.clone(),
@@ -1383,11 +1407,49 @@ impl Chain {
         )?;
         Ok((selected, block))
     }
+    /// The checks that the next block's opening alone decides, for each
+    /// transaction on its own: a fee quote, the least minimum fee it could
+    /// need in that block (an earlier transaction may still create its payment
+    /// recipient), and opening funds for its declared inputs and fee. Settings
+    /// are fixed within a block, accounts are never removed and commitments
+    /// only grow, so a transaction failing any of these is never selected on
+    /// the current tip, whatever else is pending. This costs one block
+    /// opening, without signatures or execution.
+    pub fn opening_screen(
+        &self,
+        miner: PublicKey,
+        transactions: &[&Transaction],
+    ) -> Result<Vec<Result<()>>> {
+        let target = self.target(&self.tip_entry)?;
+        let execution = consensus::prepare_block(
+            &self.config,
+            &self.tip_state,
+            &miner,
+            &math::work(&target),
+        )?;
+        Ok(transactions
+            .iter()
+            .map(|transaction| {
+                let quote = fees::quote(&self.config, &execution.state, transaction)?;
+                // Account creation adds exactly its rate to the rounded minimum.
+                ensure!(
+                    transaction.body.fee >= &quote.minimum_fee - &quote.account_creation_fee,
+                    "signed fee is below the mandatory minimum"
+                );
+                ensure!(
+                    execution.opening_funds_cover(transaction),
+                    "opening balance does not cover its inputs and fee"
+                );
+                Ok(())
+            })
+            .collect())
+    }
     fn select_executed(
         &self,
         miner: PublicKey,
         candidates: &[Transaction],
         limit: usize,
+        authenticated: &HashSet<Hash>,
     ) -> Result<(SelectionResult, State)> {
         ensure!(
             candidates.len() <= MAX_SELECTION_CANDIDATES,
@@ -1423,9 +1485,11 @@ impl Chain {
             if transaction.body.expiry_blocks == 0 || transaction.body.nonce == u64::MAX {
                 continue;
             }
-            result.signatures_checked += 1;
-            if crypto::verify(transaction).is_err() {
-                continue;
+            if !authenticated.contains(&id) {
+                result.signatures_checked += 1;
+                if crypto::verify(transaction).is_err() {
+                    continue;
+                }
             }
             let Ok(quote) = fees::quote(&self.config, &execution.state, transaction) else {
                 continue;

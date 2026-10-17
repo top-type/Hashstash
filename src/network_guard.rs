@@ -5,11 +5,18 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
+
+/// Accounting holds only token buckets and counters. A panic while it was
+/// held leaves at most one stale count, so admission keeps using it rather
+/// than refusing every later connection for the life of the process.
+fn accounting<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 pub const MAX_TRACKED_IPS: usize = 1024;
 pub const MAX_JSON_DEPTH: usize = 64;
@@ -254,10 +261,7 @@ impl NetworkGuard {
         if maximum <= previous {
             return Ok(());
         }
-        let mut records = self
-            .records
-            .lock()
-            .map_err(|_| anyhow!("network accounting lock poisoned"))?;
+        let mut records = accounting(&self.records);
         let base = Surface::Peer.policy().work_burst;
         for ((_, surface, _), record) in records.iter_mut() {
             if *surface == Surface::Peer {
@@ -282,10 +286,7 @@ impl NetworkGuard {
         if maximum <= previous {
             return Ok(());
         }
-        let mut records = self
-            .records
-            .lock()
-            .map_err(|_| anyhow!("network accounting lock poisoned"))?;
+        let mut records = accounting(&self.records);
         for ((_, surface, _), record) in records.iter_mut() {
             if *surface != Surface::Stratum {
                 let old = surface.policy().byte_burst.max(previous);
@@ -317,10 +318,7 @@ impl NetworkGuard {
     ) -> Result<Session> {
         let ip = admission_address(ip);
         let key = (ip, surface, direction);
-        let mut records = self
-            .records
-            .lock()
-            .map_err(|_| anyhow!("network accounting lock poisoned"))?;
+        let mut records = accounting(&self.records);
         if !records.contains_key(&key) {
             if records.len() >= MAX_TRACKED_IPS {
                 // Prefer records whose cooldown has ended, so creating new
@@ -358,7 +356,7 @@ impl NetworkGuard {
         })
     }
     pub fn tracked_addresses(&self) -> usize {
-        self.records.lock().map_or(0, |r| r.len())
+        accounting(&self.records).len()
     }
 }
 impl Session {
@@ -382,15 +380,8 @@ impl Session {
     /// Connections this node opened are bounded separately and never wait on
     /// inbound traffic.
     pub fn reserve_frame(&self, bytes: usize) -> Result<()> {
-        let mut held = self
-            .reserved_frame
-            .lock()
-            .map_err(|_| anyhow!("session accounting lock poisoned"))?;
-        let mut total = self
-            .guard
-            .frame_memory
-            .lock()
-            .map_err(|_| anyhow!("network accounting lock poisoned"))?;
+        let mut held = accounting(&self.reserved_frame);
+        let mut total = accounting(&self.guard.frame_memory);
         *total = total.saturating_sub(*held);
         *held = 0;
         if self.key.2 == Direction::Outbound {
@@ -407,20 +398,13 @@ impl Session {
     fn charge(&self, requests: u64, bytes: u64, work: u64, penalize: bool) -> Result<()> {
         let now = Instant::now();
         if self.key.1 == Surface::Stratum && requests > 0 {
-            let mut bucket = self
-                .request_bucket
-                .lock()
-                .map_err(|_| anyhow!("session accounting lock poisoned"))?;
+            let mut bucket = accounting(&self.request_bucket);
             ensure!(
                 bucket.take(requests, 8, 16, now),
                 "mining session request rate limit"
             );
         }
-        let mut records = self
-            .guard
-            .records
-            .lock()
-            .map_err(|_| anyhow!("network accounting lock poisoned"))?;
+        let mut records = accounting(&self.guard.records);
         let record = records
             .get_mut(&self.key)
             .expect("active sessions retain their accounting entry");
@@ -444,9 +428,7 @@ impl Session {
     /// Only malformed framing/JSON and explicit resource violations trigger this.
     /// Ordinary stale transactions, unknown parents and competing forks do not.
     pub fn malformed(&self) {
-        if let Ok(mut records) = self.guard.records.lock()
-            && let Some(record) = records.get_mut(&self.key)
-        {
+        if let Some(record) = accounting(&self.guard.records).get_mut(&self.key) {
             self.guard
                 .penalize(self.key.0, self.key.1, record, Instant::now());
         }
@@ -454,15 +436,15 @@ impl Session {
 }
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Ok(mut records) = self.guard.records.lock()
-            && let Some(record) = records.get_mut(&self.key)
-        {
+        if let Some(record) = accounting(&self.guard.records).get_mut(&self.key) {
             record.active = record.active.saturating_sub(1);
         }
-        let held = self.reserved_frame.get_mut().map_or(0, |held| *held);
-        if held > 0
-            && let Ok(mut total) = self.guard.frame_memory.lock()
-        {
+        let held = *self
+            .reserved_frame
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        if held > 0 {
+            let mut total = accounting(&self.guard.frame_memory);
             *total = total.saturating_sub(held);
         }
     }
@@ -488,7 +470,7 @@ pub struct PeerSlot {
 impl PeerSlots {
     pub fn try_acquire(self: &Arc<Self>, ip: IpAddr, protected: bool) -> Option<PeerSlot> {
         let group = network_group(ip);
-        let mut counts = self.counts.lock().ok()?;
+        let mut counts = accounting(&self.counts);
         if !protected
             && group.is_some_and(|g| {
                 counts.groups.get(&g).copied().unwrap_or(0) >= PEER_SLOTS_PER_GROUP
@@ -520,19 +502,18 @@ impl PeerSlots {
 }
 impl Drop for PeerSlot {
     fn drop(&mut self) {
-        if let Ok(mut counts) = self.slots.counts.lock() {
-            if self.reserved {
-                counts.reserved = counts.reserved.saturating_sub(1);
-            } else {
-                counts.general = counts.general.saturating_sub(1);
-            }
-            if let Some(group) = self.group
-                && let Some(count) = counts.groups.get_mut(&group)
-            {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    counts.groups.remove(&group);
-                }
+        let mut counts = accounting(&self.slots.counts);
+        if self.reserved {
+            counts.reserved = counts.reserved.saturating_sub(1);
+        } else {
+            counts.general = counts.general.saturating_sub(1);
+        }
+        if let Some(group) = self.group
+            && let Some(count) = counts.groups.get_mut(&group)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.groups.remove(&group);
             }
         }
     }
@@ -1101,6 +1082,37 @@ mod tests {
         assert_eq!(local.len(), INBOUND_PEER_SLOTS - 4);
         drop((same, local));
         assert_eq!(slots.counts.lock().unwrap().general, 2);
+    }
+    #[test]
+    fn a_panic_during_accounting_never_disables_admission() {
+        let guard = Arc::new(NetworkGuard::default());
+        let slots = Arc::new(PeerSlots::default());
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let session = guard.admit(ip, Surface::Peer).unwrap();
+        session.reserve_frame(1024).unwrap();
+        let slot = slots.try_acquire(ip, false).unwrap();
+        fn poison<T: Send>(lock: &Mutex<T>) {
+            std::thread::scope(|scope| {
+                let holder = scope.spawn(|| {
+                    let _held = lock.lock();
+                    panic!("accounting panic");
+                });
+                assert!(holder.join().is_err());
+            });
+        }
+        poison(&guard.records);
+        poison(&guard.frame_memory);
+        poison(&slots.counts);
+        assert!(guard.records.is_poisoned() && slots.counts.is_poisoned());
+        // Charges, frame reservations, releases and new admissions continue.
+        session.work(1).unwrap();
+        session.reserve_frame(2048).unwrap();
+        drop(session);
+        assert_eq!(*accounting(&guard.frame_memory), 0);
+        assert!(guard.admit(ip, Surface::Peer).is_ok());
+        drop(slot);
+        assert!(slots.try_acquire(ip, false).is_some());
+        assert_eq!(accounting(&slots.counts).general, 0);
     }
     #[test]
     fn json_preflight_rejects_excess_shape_before_decoding() {

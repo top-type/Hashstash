@@ -123,7 +123,10 @@ def main():
     assert all((len(pool) == 1 and pool[0] == valid for pool in wait_pending(1)))
     pending = all_snapshots()
     for index in range(3):
-        assert pending[index]['account'] == before[index]['account']
+        # Only the advertised next free nonce reflects the pending payment.
+        held, prior = dict(pending[index]['account']), dict(before[index]['account'])
+        assert int(held.pop('pending_nonce')) == int(prior.pop('pending_nonce')) + 1
+        assert held == prior
         assert pending[index]['governance'] == before[index]['governance']
     check('Forty-eight duplicate signed submissions across three peers remain one pending payment with no early debit')
     audit.mine()

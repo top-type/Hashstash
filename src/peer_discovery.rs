@@ -17,7 +17,12 @@ pub const MAX_SEED_RESULTS: usize = 8;
 pub const MAX_PER_SOURCE: usize = 32;
 pub const MAX_PER_GROUP: usize = 16;
 pub const MAX_PERSISTED_BYTES: usize = 128 * 1024;
+/// Learned endpoints sharing one IP address, whatever their ports.
+pub const MAX_PER_IP: usize = 2;
+/// Consecutive failures after which a never-verified learned entry is dropped.
+pub const MAX_UNVERIFIED_FAILURES: u32 = 3;
 const MAX_AGE: u64 = 7 * 24 * 3600;
+const CONFIGURED: &str = "configured";
 
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -172,7 +177,23 @@ pub struct AddressBook {
     pub options: Options,
     local: SocketAddr,
     entries: BTreeMap<SocketAddr, Entry>,
+    /// Saved verified rows dated after this host's clock. They stay on disk
+    /// and are admitted once the clock reaches them, so a clock that is
+    /// behind at startup cannot erase the persisted book.
+    dormant: Vec<Entry>,
+    /// Saved rows that looked expired at startup. A clock running fast must
+    /// not erase them either, so they stay on disk until this run verifies a
+    /// peer, which shows that the clock and network work.
+    stale: Vec<Entry>,
+    verified_this_run: bool,
+    /// The sidecar bytes last read or durably written.
+    persisted: Option<Vec<u8>>,
+    /// Unpredictable per-process order for replacement and equal-age probes.
+    salt: Hash,
+    advertised_cache: Option<(Vec<SocketAddr>, Vec<SocketAddr>)>,
     pub last_error: Option<String>,
+    /// A rejected sidecar that was moved aside at startup.
+    pub load_error: Option<String>,
 }
 impl AddressBook {
     pub fn open(
@@ -184,63 +205,147 @@ impl AddressBook {
         at: u64,
     ) -> Result<Self> {
         options.validate()?;
+        let mut salt = [0u8; 32];
+        getrandom::fill(&mut salt)
+            .map_err(|e| anyhow::anyhow!("peer discovery randomness unavailable: {e}"))?;
         let mut book = Self {
             path,
             chain,
             options,
             local: normalized(local),
             entries: BTreeMap::new(),
+            dormant: Vec::new(),
+            stale: Vec::new(),
+            verified_this_run: false,
+            persisted: None,
+            salt,
+            advertised_cache: None,
             last_error: None,
+            load_error: None,
         };
-        if let Ok(metadata) = fs::symlink_metadata(&book.path) {
-            ensure!(
-                metadata.is_file(),
-                "peer address book must be a regular file, not a symbolic link"
+        book.remove_stale_temporaries();
+        if let Err(error) = book.load(at) {
+            // The sidecar is a discovery hint with no consensus role. Keep a
+            // rejected file for inspection and continue with configured peers
+            // and seeds rather than failing every restart.
+            book.entries.clear();
+            book.dormant.clear();
+            book.stale.clear();
+            book.persisted = None;
+            let mut aside = book.path.clone().into_os_string();
+            aside.push(".invalid");
+            let aside = PathBuf::from(aside);
+            fs::rename(&book.path, &aside)
+                .with_context(|| format!("{error:#}; moving the peer address book aside failed"))?;
+            let message = format!(
+                "peer address book rejected and moved to {}: {error:#}",
+                aside.display()
             );
-            let file = fs::File::open(&book.path)?;
-            ensure!(
-                file.metadata()?.len() <= MAX_PERSISTED_BYTES as u64,
-                "peer address book exceeds byte limit"
-            );
-            let mut bytes = Vec::new();
-            file.take(MAX_PERSISTED_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)?;
-            ensure!(
-                bytes.len() <= MAX_PERSISTED_BYTES,
-                "peer address book exceeds byte limit"
-            );
-            let saved: Saved =
-                serde_json::from_slice(&bytes).context("invalid peer address book")?;
-            ensure!(
-                saved.version == 1 && saved.chain == chain,
-                "peer address book belongs to another chain or version"
-            );
-            ensure!(
-                saved.entries.len() <= MAX_BOOK,
-                "peer address book entry limit"
-            );
-            for entry in saved.entries {
-                // Persistence never bypasses filtering, source quotas or future-time checks.
-                if entry.last_success == 0
-                    || entry.last_success > at
-                    || at.saturating_sub(entry.last_success) > MAX_AGE
-                    || entry.source.len() > 64
-                {
-                    continue;
-                }
-                if book.insert(entry.address, entry.source.clone(), false, at) {
-                    let current = book.entries.get_mut(&normalized(entry.address)).unwrap();
-                    current.last_success = entry.last_success;
-                    current.added = entry.added.min(at);
-                    current.failures = entry.failures.min(16);
-                    current.next_attempt = entry.next_attempt.min(at + 60);
-                }
-            }
+            eprintln!("{message}");
+            book.load_error = Some(message);
         }
         for address in configured {
-            book.insert(*address, "configured".into(), true, at);
+            if !book.insert(*address, CONFIGURED.into(), true, at)
+                && !book.entries.contains_key(&normalized(*address))
+            {
+                book.last_error = Some(format!("configured peer {address} was not admitted"));
+            }
         }
         Ok(book)
+    }
+    fn load(&mut self, at: u64) -> Result<()> {
+        let Ok(metadata) = fs::symlink_metadata(&self.path) else {
+            return Ok(());
+        };
+        ensure!(
+            metadata.is_file(),
+            "peer address book must be a regular file, not a symbolic link"
+        );
+        let file = fs::File::open(&self.path)?;
+        ensure!(
+            file.metadata()?.len() <= MAX_PERSISTED_BYTES as u64,
+            "peer address book exceeds byte limit"
+        );
+        let mut bytes = Vec::new();
+        file.take(MAX_PERSISTED_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() <= MAX_PERSISTED_BYTES,
+            "peer address book exceeds byte limit"
+        );
+        let saved: Saved = serde_json::from_slice(&bytes).context("invalid peer address book")?;
+        ensure!(
+            saved.version == 1 && saved.chain == self.chain,
+            "peer address book belongs to another chain or version"
+        );
+        ensure!(
+            saved.entries.len() <= MAX_BOOK,
+            "peer address book entry limit"
+        );
+        for entry in saved.entries {
+            // Persistence never bypasses filtering, source quotas or time checks.
+            if entry.last_success == 0 || entry.source.len() > 64 {
+                continue;
+            }
+            if entry.last_success > at {
+                self.dormant.push(entry);
+            } else if at - entry.last_success > MAX_AGE {
+                self.stale.push(entry);
+            } else {
+                self.restore(entry, at);
+            }
+        }
+        self.persisted = Some(bytes);
+        Ok(())
+    }
+    /// Admit one saved verified row, keeping its contact history.
+    fn restore(&mut self, entry: Entry, at: u64) {
+        if at.saturating_sub(entry.last_success) > MAX_AGE {
+            return;
+        }
+        if self.insert(entry.address, entry.source.clone(), false, at) {
+            let current = self.entries.get_mut(&normalized(entry.address)).unwrap();
+            current.last_success = entry.last_success;
+            current.last_attempt = entry.last_attempt.min(at);
+            current.added = entry.added.min(at);
+            current.failures = entry.failures.min(16);
+            current.next_attempt = entry.next_attempt.min(at + 60);
+        }
+    }
+    /// Interrupted saves leave `<stem>.<32 hex>.tmp` siblings that are never read.
+    fn remove_stale_temporaries(&self) {
+        let (Some(parent), Some(stem)) = (
+            self.path.parent(),
+            self.path.file_stem().and_then(|s| s.to_str()),
+        ) else {
+            return;
+        };
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let Ok(listing) = fs::read_dir(parent) else {
+            return;
+        };
+        for item in listing.flatten() {
+            let name = item.file_name();
+            let random = name
+                .to_str()
+                .and_then(|n| n.strip_prefix(stem))
+                .and_then(|n| n.strip_prefix('.'))
+                .and_then(|n| n.strip_suffix(".tmp"));
+            if random.is_some_and(|r| r.len() == 32 && r.bytes().all(|b| b.is_ascii_hexdigit()))
+                && item.file_type().is_ok_and(|t| t.is_file())
+            {
+                let _ = fs::remove_file(item.path());
+            }
+        }
+    }
+    fn rank(&self, address: SocketAddr) -> Hash {
+        let mut bytes = self.salt.to_vec();
+        bytes.extend_from_slice(address.to_string().as_bytes());
+        crate::crypto::sha256d(&bytes)
     }
     pub fn is_self(&self, address: SocketAddr) -> bool {
         let address = normalized(address);
@@ -272,12 +377,33 @@ impl AddressBook {
                     .values()
                     .filter(|e| group(e.address) == network && !e.explicit)
                     .count()
-                    >= MAX_PER_GROUP)
+                    >= MAX_PER_GROUP
+                || self
+                    .entries
+                    .values()
+                    .filter(|e| e.address.ip() == address.ip() && !e.explicit)
+                    .count()
+                    >= MAX_PER_IP)
         {
             return false;
         }
         if self.entries.len() >= MAX_BOOK {
-            return false;
+            // Replace instead of refusing. An operator's explicit endpoint
+            // displaces any learned entry; a learned address displaces only an
+            // unverified one, failed entries first, otherwise in salted order.
+            let victim = self
+                .entries
+                .values()
+                .filter(|e| !e.explicit && !e.busy && (explicit || e.last_success == 0))
+                .max_by_key(|e| (e.last_success == 0, e.failures, self.rank(e.address)))
+                .map(|e| e.address);
+            let Some(victim) = victim else {
+                if explicit {
+                    self.last_error = Some(format!("explicit peer {address} was not admitted"));
+                }
+                return false;
+            };
+            self.entries.remove(&victim);
         }
         self.entries.insert(
             address,
@@ -320,30 +446,61 @@ impl AddressBook {
             self.learn(source, &[address], at);
         }
     }
-    pub fn advertised(&self, at: u64, random: u64) -> Vec<SocketAddr> {
-        let mut result = self
+    pub fn advertised(&mut self, at: u64, random: u64) -> Vec<SocketAddr> {
+        // Operator-configured peers are private topology and are not gossiped.
+        let mut eligible = self
             .entries
             .values()
             .filter(|e| {
                 e.last_success > 0
                     && at.saturating_sub(e.last_success) < 3600
+                    && e.source != CONFIGURED
                     && allowed(e.address, self.options.allow_private)
             })
             .map(|e| e.address)
             .collect::<Vec<_>>();
         if let Some(address) = self.options.advertise {
-            result.push(address);
+            eligible.push(address);
         }
-        result.sort();
-        result.dedup();
+        eligible.sort();
+        eligible.dedup();
+        // Every requester receives the same sample until the eligible set
+        // changes, so repeated queries cannot enumerate all recent peers.
+        if let Some((input, output)) = &self.advertised_cache
+            && *input == eligible
+        {
+            return output.clone();
+        }
+        let mut result = eligible.clone();
         if !result.is_empty() {
             let offset = (random % result.len() as u64) as usize;
             result.rotate_left(offset);
         }
         result.truncate(MAX_ADDRESSES);
+        self.advertised_cache = Some((eligible, result.clone()));
         result
     }
+    /// Whether this node synchronized successfully with a book entry at this
+    /// source IP during the last hour.
+    pub fn verified_ip(&self, ip: IpAddr, at: u64) -> bool {
+        let ip = normalized(SocketAddr::new(ip, 1)).ip();
+        self.entries.values().any(|e| {
+            e.address.ip() == ip && e.last_success > 0 && at.saturating_sub(e.last_success) < 3600
+        })
+    }
     pub fn next(&mut self, at: u64, maximum: usize) -> Vec<SocketAddr> {
+        let ready: Vec<_> = self
+            .dormant
+            .iter()
+            .filter(|e| e.last_success <= at)
+            .cloned()
+            .collect();
+        if !ready.is_empty() {
+            self.dormant.retain(|e| e.last_success > at);
+            for entry in ready {
+                self.restore(entry, at);
+            }
+        }
         self.entries.retain(|_, entry| {
             entry.explicit
                 || entry.busy
@@ -363,11 +520,13 @@ impl AddressBook {
             .values()
             .filter(|e| e.busy && e.last_success == 0)
             .count();
+        // Equal attempt times, including never-tried entries, use a salted
+        // order rather than numeric address order an advertiser could choose.
         let mut candidates = self
             .entries
             .values()
             .filter(|e| !e.busy && e.next_attempt <= at)
-            .map(|e| (e.last_attempt, e.address, e.last_success > 0))
+            .map(|e| (e.last_attempt, self.rank(e.address), e.address, e.last_success > 0))
             .collect::<Vec<_>>();
         candidates.sort();
         let mut selected = Vec::new();
@@ -381,7 +540,7 @@ impl AddressBook {
         // never queue both slots for minutes ahead of an already healthy peer.
         // Within each class oldest-attempt rotation preserves fairness.
         for phase in 0..3 {
-            for &(_, address, verified) in &candidates {
+            for &(_, _, address, verified) in &candidates {
                 if selected.len() >= maximum.min(2) {
                     break;
                 }
@@ -423,6 +582,7 @@ impl AddressBook {
             if success {
                 entry.last_success = at;
                 entry.failures = 0;
+                self.verified_this_run = true;
             } else {
                 entry.failures = entry.failures.saturating_add(1).min(16);
             }
@@ -430,6 +590,14 @@ impl AddressBook {
                 + crate::network_guard::retry_delay(entry.failures, jitter)
                     .as_secs()
                     .max(1);
+            // A learned address that never answered is dropped after a few
+            // consecutive failures instead of cycling until it expires.
+            if !entry.explicit
+                && entry.last_success == 0
+                && entry.failures >= MAX_UNVERIFIED_FAILURES
+            {
+                self.entries.remove(&address);
+            }
         }
     }
     pub fn needs_discovery(&mut self, address: SocketAddr, at: u64) -> bool {
@@ -444,23 +612,61 @@ impl AddressBook {
     pub fn entries(&self) -> impl Iterator<Item = &Entry> {
         self.entries.values()
     }
-    pub fn save(&mut self) -> Result<()> {
-        let saved = Saved {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    /// The persisted form: verified entries, then dormant rows not yet loaded.
+    fn serialized(&self) -> Result<Vec<u8>> {
+        let mut entries: Vec<Entry> = self
+            .entries
+            .values()
+            .filter(|e| e.last_success > 0)
+            .cloned()
+            .collect();
+        let stale = if self.verified_this_run {
+            &[][..]
+        } else {
+            &self.stale[..]
+        };
+        for entry in self.dormant.iter().chain(stale) {
+            if entries.len() >= MAX_BOOK {
+                break;
+            }
+            if !self.entries.contains_key(&normalized(entry.address)) {
+                entries.push(entry.clone());
+            }
+        }
+        let bytes = serde_json::to_vec(&Saved {
             version: 1,
             chain: self.chain,
-            entries: self
-                .entries
-                .values()
-                .filter(|e| e.last_success > 0)
-                .cloned()
-                .collect(),
-        };
-        let bytes = serde_json::to_vec(&saved)?;
+            entries,
+        })?;
         ensure!(
             bytes.len() <= MAX_PERSISTED_BYTES,
             "peer address book persistence limit"
         );
-        if let Ok(metadata) = fs::symlink_metadata(&self.path) {
+        Ok(bytes)
+    }
+    /// Bytes to write when they differ from the last durable copy. An
+    /// unchanged book is never rewritten or synced.
+    pub fn pending_save(&self) -> Result<Option<Vec<u8>>> {
+        let bytes = self.serialized()?;
+        Ok((self.persisted.as_deref() != Some(bytes.as_slice())).then_some(bytes))
+    }
+    pub fn mark_saved(&mut self, bytes: Vec<u8>) {
+        self.persisted = Some(bytes);
+    }
+    pub fn save(&mut self) -> Result<()> {
+        if let Some(bytes) = self.pending_save()? {
+            Self::persist(&self.path, &bytes)?;
+            self.persisted = Some(bytes);
+        }
+        Ok(())
+    }
+    /// Atomically replace the sidecar. This performs file I/O and an fsync;
+    /// callers run it without holding the discovery lock.
+    pub fn persist(path: &Path, bytes: &[u8]) -> Result<()> {
+        if let Ok(metadata) = fs::symlink_metadata(path) {
             ensure!(
                 metadata.is_file(),
                 "peer address book must be a regular file, not a symbolic link"
@@ -469,26 +675,20 @@ impl AddressBook {
         let mut random = [0u8; 16];
         getrandom::fill(&mut random)
             .map_err(|e| anyhow::anyhow!("peer persistence randomness unavailable: {e}"))?;
-        let temporary = self
-            .path
-            .with_extension(format!("{}.tmp", hex::encode(random)));
+        let temporary = path.with_extension(format!("{}.tmp", hex::encode(random)));
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&temporary)?;
-        let written = file.write_all(&bytes).and_then(|_| file.sync_all());
+        let written = file.write_all(bytes).and_then(|_| file.sync_all());
         drop(file);
         if let Err(error) = written {
             let _ = fs::remove_file(&temporary);
             return Err(error.into());
         }
-        // Unix replacement is atomic. Windows replacement can lose only the
-        // discovery-hint sidecar if interrupted; it never touches chain state.
-        #[cfg(windows)]
-        if self.path.exists() {
-            fs::remove_file(&self.path)?;
-        }
-        if let Err(error) = fs::rename(&temporary, &self.path) {
+        // Rename replaces an existing file atomically on Unix and Windows, so
+        // there is never a moment without a book.
+        if let Err(error) = fs::rename(&temporary, path) {
             let _ = fs::remove_file(&temporary);
             return Err(error.into());
         }
@@ -592,24 +792,37 @@ mod tests {
         book.add_seed("127.0.0.1:9".parse().unwrap(), "dns.example:9", 100);
         assert_eq!(book.entries().count(), n);
     }
+    fn invalid_path(path: &Path) -> PathBuf {
+        let mut aside = path.as_os_str().to_owned();
+        aside.push(".invalid");
+        PathBuf::from(aside)
+    }
     #[test]
     fn oversized_sidecars_are_rejected_before_parsing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("book");
         fs::write(&path, vec![b' '; MAX_PERSISTED_BYTES + 1]).unwrap();
-        assert!(
-            AddressBook::open(
-                path,
-                [1; 32],
-                Options {
-                    enabled: true,
-                    ..Default::default()
-                },
-                "0.0.0.0:9".parse().unwrap(),
-                &[],
-                100
-            )
-            .is_err()
+        // A rejected hint file is moved aside; startup continues with the
+        // configured peer instead of failing on every restart.
+        let configured: SocketAddr = "8.8.8.8:9".parse().unwrap();
+        let book = AddressBook::open(
+            path.clone(),
+            [1; 32],
+            Options {
+                enabled: true,
+                ..Default::default()
+            },
+            "0.0.0.0:9".parse().unwrap(),
+            &[configured],
+            100,
+        )
+        .unwrap();
+        assert!(book.load_error.as_ref().unwrap().contains("byte limit"));
+        assert_eq!(book.entries().map(|e| e.address).collect::<Vec<_>>(), [configured]);
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read(invalid_path(&path)).unwrap().len(),
+            MAX_PERSISTED_BYTES + 1
         );
     }
     #[test]
@@ -635,20 +848,27 @@ mod tests {
         let mut b = book(path.clone());
         symlink(&target, &path).unwrap();
         assert!(b.save().is_err());
+        let reopened = AddressBook::open(
+            path.clone(),
+            [1; 32],
+            Options {
+                enabled: true,
+                ..Default::default()
+            },
+            "0.0.0.0:9".parse().unwrap(),
+            &[],
+            100,
+        )
+        .unwrap();
+        assert!(reopened.load_error.is_some());
+        // Only the link itself is moved aside; its target is never touched.
         assert!(
-            AddressBook::open(
-                path,
-                [1; 32],
-                Options {
-                    enabled: true,
-                    ..Default::default()
-                },
-                "0.0.0.0:9".parse().unwrap(),
-                &[],
-                100
-            )
-            .is_err()
+            fs::symlink_metadata(invalid_path(&path))
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
+        assert!(fs::symlink_metadata(&path).is_err());
         assert_eq!(fs::read(target).unwrap(), b"preserved");
     }
     #[test]
@@ -724,9 +944,225 @@ mod tests {
         .unwrap();
         assert_eq!(loaded.entries().count(), 1);
         assert_eq!(loaded.entries().next().unwrap().address, addr);
-        assert!(
-            AddressBook::open(path, [2; 32], opts, "0.0.0.0:9".parse().unwrap(), &[], 102).is_err()
+        // An unchanged book is not rewritten.
+        assert!(loaded.pending_save().unwrap().is_none());
+        let other =
+            AddressBook::open(path.clone(), [2; 32], opts, "0.0.0.0:9".parse().unwrap(), &[], 102)
+                .unwrap();
+        assert!(other.load_error.as_ref().unwrap().contains("another chain"));
+        assert_eq!(other.entries().count(), 0);
+        assert!(invalid_path(&path).is_file());
+    }
+    #[test]
+    fn a_clock_behind_saved_contacts_keeps_them_on_disk_until_it_catches_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+        let mut original = book(path.clone());
+        let peer: SocketAddr = "8.8.8.8:9".parse().unwrap();
+        original.add_seed(peer, "dns.example:9", 1_000);
+        original.next(1_000, 2);
+        original.finished(peer, true, 1_000, 0);
+        original.save().unwrap();
+        let saved = fs::read(&path).unwrap();
+        // A host booting with its clock far behind (no RTC, before NTP).
+        let mut early = book(path.clone());
+        assert_eq!(early.entries().count(), 0);
+        assert!(early.pending_save().unwrap().is_none());
+        early.save().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), saved);
+        // Other changes are persisted together with the dormant row.
+        let learned: SocketAddr = "9.9.9.9:9".parse().unwrap();
+        early.learn("7.7.7.7:9".parse().unwrap(), &[learned], 100);
+        early.next(100, 2);
+        early.finished(learned, true, 101, 0);
+        early.save().unwrap();
+        let mut corrected = AddressBook::open(
+            path,
+            [1; 32],
+            Options {
+                enabled: true,
+                ..Default::default()
+            },
+            "0.0.0.0:9".parse().unwrap(),
+            &[],
+            500,
+        )
+        .unwrap();
+        assert_eq!(corrected.entries().count(), 1);
+        assert!(corrected.next(1_001, 0).is_empty());
+        let mut known: Vec<_> = corrected.entries().map(|e| e.address).collect();
+        known.sort();
+        assert_eq!(known, [peer, learned]);
+        assert_eq!(
+            corrected.entries().find(|e| e.address == peer).unwrap().last_success,
+            1_000
         );
+    }
+    #[test]
+    fn a_clock_ahead_keeps_apparently_expired_contacts_until_a_peer_is_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+        let mut original = book(path.clone());
+        let peer: SocketAddr = "8.8.8.8:9".parse().unwrap();
+        original.add_seed(peer, "dns.example:9", 100);
+        original.next(100, 2);
+        original.finished(peer, true, 100, 0);
+        original.save().unwrap();
+        let saved = fs::read(&path).unwrap();
+        let open = |at| {
+            AddressBook::open(
+                path.clone(),
+                [1; 32],
+                Options {
+                    enabled: true,
+                    ..Default::default()
+                },
+                "0.0.0.0:9".parse().unwrap(),
+                &[],
+                at,
+            )
+            .unwrap()
+        };
+        let ahead = 100 + MAX_AGE + 10;
+        let mut fast = open(ahead);
+        assert_eq!(fast.entries().count(), 0);
+        let learned: SocketAddr = "9.9.9.9:9".parse().unwrap();
+        fast.learn("7.7.7.7:9".parse().unwrap(), &[learned], ahead);
+        fast.save().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), saved);
+        // After the clock is corrected the saved contact still loads.
+        assert_eq!(open(200).entries().count(), 1);
+        // Once this run verifies a peer, rows that really expired are dropped.
+        fast.next(ahead, 2);
+        fast.finished(learned, true, ahead, 0);
+        fast.save().unwrap();
+        assert_eq!(
+            open(ahead).entries().map(|e| e.address).collect::<Vec<_>>(),
+            [learned]
+        );
+    }
+    #[test]
+    fn full_books_replace_learned_entries_and_always_admit_operator_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+        let mut b = book(path.clone());
+        // One IP cannot occupy more than two learned entries via its ports.
+        for port in 1..10 {
+            b.advertisement(
+                "8.8.8.8:1".parse().unwrap(),
+                SocketAddr::from(([8, 8, 8, 8], port)),
+                100,
+            );
+        }
+        assert_eq!(b.entries().count(), MAX_PER_IP);
+        for entry in b.entries.values_mut() {
+            entry.last_success = 100;
+        }
+        // Fill the book with verified learned peers across many groups.
+        let mut verified = Vec::new();
+        'fill: for source in 1..=40u8 {
+            for host in 1..=16u8 {
+                if b.entries().count() >= MAX_BOOK {
+                    break 'fill;
+                }
+                let address = SocketAddr::from(([30, source, host, 1], 9));
+                b.learn(SocketAddr::from(([20, source, 1, 1], 9)), &[address], 100);
+                if b.entries.contains_key(&address) {
+                    b.entries.get_mut(&address).unwrap().last_success = 100;
+                    verified.push(address);
+                }
+            }
+        }
+        assert_eq!(b.entries().count(), MAX_BOOK);
+        // A learned newcomer cannot displace verified peers.
+        let newcomer = "40.1.1.1:9".parse().unwrap();
+        b.learn("50.1.1.1:9".parse().unwrap(), &[newcomer], 100);
+        assert!(!b.entries.contains_key(&newcomer));
+        // An unverified entry is replaced instead of blocking new addresses.
+        let unverified = verified.pop().unwrap();
+        b.entries.get_mut(&unverified).unwrap().last_success = 0;
+        b.learn("50.1.1.1:9".parse().unwrap(), &[newcomer], 100);
+        assert!(b.entries.contains_key(&newcomer));
+        assert!(!b.entries.contains_key(&unverified));
+        b.entries.get_mut(&newcomer).unwrap().last_success = 100;
+        b.save().unwrap();
+        // Persisted verified entries never crowd out configured endpoints
+        // or numeric seeds.
+        let configured: SocketAddr = "60.1.1.1:9".parse().unwrap();
+        let mut reopened = AddressBook::open(
+            path,
+            [1; 32],
+            Options {
+                enabled: true,
+                ..Default::default()
+            },
+            "0.0.0.0:9".parse().unwrap(),
+            &[configured],
+            101,
+        )
+        .unwrap();
+        assert!(reopened.entries.get(&configured).unwrap().explicit);
+        assert!(reopened.add_seed("61.1.1.1:9".parse().unwrap(), "61.1.1.1:9", 101));
+        assert_eq!(reopened.entries().count(), MAX_BOOK);
+        assert!(reopened.last_error.is_none());
+        // A learned address that never answers is dropped after repeated failures.
+        let failing = reopened.entries().find(|e| !e.explicit).unwrap().address;
+        reopened.entries.get_mut(&failing).unwrap().last_success = 0;
+        for attempt in 0..MAX_UNVERIFIED_FAILURES {
+            assert!(reopened.entries.contains_key(&failing));
+            reopened.finished(failing, false, 200 + u64::from(attempt), 0);
+        }
+        assert!(!reopened.entries.contains_key(&failing));
+    }
+    #[test]
+    fn configured_peers_are_not_gossiped_and_samples_are_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured: SocketAddr = "8.8.8.8:9".parse().unwrap();
+        let mut b = AddressBook::open(
+            dir.path().join("book"),
+            [1; 32],
+            Options {
+                enabled: true,
+                ..Default::default()
+            },
+            "0.0.0.0:9".parse().unwrap(),
+            &[configured],
+            100,
+        )
+        .unwrap();
+        b.next(100, 1);
+        b.finished(configured, true, 100, 0);
+        assert!(b.verified_ip("8.8.8.8".parse().unwrap(), 101));
+        assert!(!b.verified_ip("8.8.4.4".parse().unwrap(), 101));
+        assert!(b.advertised(101, 0).is_empty());
+        for n in 1..=40u8 {
+            let address = SocketAddr::from(([30, n, 1, 1], 9));
+            b.learn(SocketAddr::from(([20, n, 1, 1], 9)), &[address], 100);
+            b.entries.get_mut(&address).unwrap().last_success = 100;
+        }
+        let first = b.advertised(101, 3);
+        assert_eq!(first.len(), MAX_ADDRESSES);
+        assert!(!first.contains(&configured));
+        // Repeated requests cannot page through the whole set.
+        for random in [5, 17, 29] {
+            assert_eq!(b.advertised(101, random), first);
+        }
+    }
+    #[test]
+    fn interrupted_save_temporaries_are_removed_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.peers-ab.json");
+        let stale = dir.path().join(format!("node.peers-ab.{}.tmp", "0f".repeat(16)));
+        let unrelated = dir.path().join("node.peers-ab.notes.tmp");
+        fs::write(&stale, b"partial").unwrap();
+        fs::write(&unrelated, b"kept").unwrap();
+        let mut b = book(path.clone());
+        assert!(!stale.exists());
+        assert!(unrelated.exists());
+        b.save().unwrap();
+        b.save().unwrap();
+        assert!(path.is_file());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     }
     #[test]
     fn source_host_cannot_advertise_a_victim_or_grow_existing_lifetime() {

@@ -11,11 +11,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
+    io::{Read, Write},
     net::{IpAddr, SocketAddr},
     path::Path,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -72,20 +72,30 @@ impl Identity {
         })
     }
     fn sign(&self, message: Hash) -> Result<[u8; 64]> {
-        let pair = Keypair::from_secret_key(
-            &Secp256k1::new(),
-            &SecretKey::from_byte_array(*self.secret)?,
-        );
+        // Every frame is signed: reuse one context and erase the expanded
+        // secret copies after each signature.
+        let context = signing_context();
+        let mut secret = SecretKey::from_byte_array(*self.secret)?;
+        let mut pair = Keypair::from_secret_key(context, &secret);
+        secret.non_secure_erase();
         let mut aux = Zeroizing::new([0u8; 32]);
-        getrandom::fill(aux.as_mut())
-            .map_err(|e| anyhow::anyhow!("peer randomness unavailable: {e}"))?;
-        Ok(*Secp256k1::new()
-            .sign_schnorr_with_aux_rand(&message, &pair, &aux)
-            .as_ref())
+        let signature = getrandom::fill(aux.as_mut())
+            .map_err(|e| anyhow::anyhow!("peer randomness unavailable: {e}"))
+            .map(|()| *context.sign_schnorr_with_aux_rand(&message, &pair, &aux).as_ref());
+        pair.non_secure_erase();
+        signature
     }
 }
+fn signing_context() -> &'static Secp256k1<secp256k1::All> {
+    static CONTEXT: OnceLock<Secp256k1<secp256k1::All>> = OnceLock::new();
+    CONTEXT.get_or_init(Secp256k1::new)
+}
+fn verification_context() -> &'static Secp256k1<secp256k1::VerifyOnly> {
+    static CONTEXT: OnceLock<Secp256k1<secp256k1::VerifyOnly>> = OnceLock::new();
+    CONTEXT.get_or_init(Secp256k1::verification_only)
+}
 fn verify(key: PublicKey, digest: Hash, signature: [u8; 64]) -> Result<()> {
-    Secp256k1::verification_only()
+    verification_context()
         .verify_schnorr(
             &Signature::from_byte_array(signature),
             &digest,
@@ -173,6 +183,25 @@ impl Policy {
                 .keys()
                 .any(|p| normalized(p.ip()) == normalized(ip))
     }
+    /// Addresses of explicitly pinned peers.
+    pub fn pinned_ips(&self) -> Vec<IpAddr> {
+        self.pins.keys().map(|p| normalized(p.ip())).collect()
+    }
+    /// An outgoing endpoint pinned exactly requires that key. In discovery
+    /// mode, another port on a pinned IP must prove one of that IP's keys,
+    /// matching the incoming per-IP rule; other endpoints accept any key.
+    fn outgoing_keys(&self, peer: SocketAddr) -> Result<Vec<PublicKey>> {
+        if let Some(key) = self.pins.get(&normalized_address(peer)) {
+            return Ok(vec![*key]);
+        }
+        ensure!(self.discovery, "unpinned outgoing peer");
+        Ok(self
+            .pins
+            .iter()
+            .filter(|(p, _)| normalized(p.ip()) == normalized(peer.ip()))
+            .map(|(_, key)| *key)
+            .collect())
+    }
     fn allows(&self, ip: IpAddr, key: PublicKey) -> bool {
         if key == self.identity.public || !crypto::valid_key(&key) {
             return false;
@@ -214,15 +243,28 @@ fn read_key(path: &Path) -> Result<[u8; 32]> {
         metadata.is_file() && metadata.len() <= 512,
         "invalid peer key file"
     );
+    // Read through one handle, and require that handle to be the regular file
+    // inspected above: a path swapped for a symbolic link in between fails.
+    let file = fs::File::open(path)?;
+    let opened = file.metadata()?;
+    ensure!(
+        opened.is_file() && opened.len() <= 512,
+        "invalid peer key file"
+    );
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         ensure!(
-            metadata.permissions().mode() & 0o077 == 0,
+            opened.dev() == metadata.dev() && opened.ino() == metadata.ino(),
+            "peer key file changed while it was opened"
+        );
+        ensure!(
+            opened.permissions().mode() & 0o077 == 0,
             "peer key file must be owner-only (0600)"
         );
     }
-    let bytes = Zeroizing::new(fs::read(path)?);
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(513).read_to_end(&mut bytes)?;
     ensure!(bytes.len() <= 512, "peer key file too large");
     let key: KeyFile = serde_json::from_slice(&bytes).context("invalid peer identity file")?;
     ensure!(
@@ -329,11 +371,7 @@ impl Channel {
         chain: Hash,
         admission: &Session,
     ) -> Result<Self> {
-        let expected = policy.pins.get(&normalized_address(peer));
-        ensure!(
-            expected.is_some() || policy.discovery,
-            "unpinned outgoing peer"
-        );
+        let expected = policy.outgoing_keys(peer)?;
         let nonce = random_nonce()?;
         let mut hello = Vec::with_capacity(104);
         hello.extend_from_slice(MAGIC);
@@ -350,7 +388,7 @@ impl Channel {
             &reply[..8] == MAGIC
                 && crypto::valid_key(&server)
                 && server != policy.identity.public
-                && expected.is_none_or(|key| *key == server),
+                && (expected.is_empty() || expected.contains(&server)),
             "pinned peer identity mismatch"
         );
         let transcript = transcript(
@@ -466,6 +504,7 @@ impl Channel {
             "peer frame replay or sequence mismatch"
         );
         let signature = header[12..].try_into()?;
+        admission.reserve_frame(length)?;
         let mut bytes = Vec::with_capacity(length.min(8192));
         let mut chunk = [0u8; 8192];
         while bytes.len() < length {
@@ -597,6 +636,67 @@ mod tests {
         .unwrap();
         let (a, b) = handshake_policies(a, b, [9; 32], [9; 32]).await;
         assert!(a.is_err() && b.is_err());
+    }
+    #[tokio::test]
+    async fn outgoing_pins_cover_every_port_on_a_pinned_ip() {
+        let pinned = crypto::public_key(&[83; 32]).unwrap();
+        let client = Policy::discovery(
+            [81; 32],
+            vec![PeerPin {
+                address: "127.0.0.1:1002".parse().unwrap(),
+                public_key: pinned,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            client
+                .outgoing_keys("127.0.0.1:1003".parse().unwrap())
+                .unwrap(),
+            vec![pinned]
+        );
+        assert!(
+            client
+                .outgoing_keys("127.0.0.2:1003".parse().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        for (secret, accepted) in [(82, false), (83, true)] {
+            let server = Policy::discovery([secret; 32], vec![]).unwrap();
+            let (mut a, mut b) = tokio::io::duplex(4096);
+            let client = client.clone();
+            // Each side owns its stream, so a rejected handshake closes it.
+            let left = async move {
+                Channel::connect(
+                    &mut a,
+                    &client,
+                    "127.0.0.1:1003".parse().unwrap(),
+                    [9; 32],
+                    &admission(),
+                )
+                .await
+            };
+            let right = async move {
+                Channel::accept(
+                    &mut b,
+                    &server,
+                    "127.0.0.1".parse().unwrap(),
+                    [9; 32],
+                    &admission(),
+                )
+                .await
+            };
+            let (left, right) = timeout(Duration::from_secs(2), async { tokio::join!(left, right) })
+                .await
+                .unwrap();
+            assert_eq!(left.is_ok(), accepted);
+            assert_eq!(right.is_ok(), accepted);
+        }
+        let closed = fixture(81, 82, 1002);
+        assert!(
+            closed
+                .outgoing_keys("127.0.0.1:1003".parse().unwrap())
+                .is_err()
+        );
     }
     #[tokio::test]
     async fn discovery_rejects_wrong_chain_and_self_connections() {

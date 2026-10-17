@@ -15,9 +15,10 @@ pub const MAX_TRANSACTIONS: usize = 256;
 pub const TRANSACTION_BATCH_BYTES: usize = 512 * 1024;
 pub const ACK_BYTES: usize = 9;
 pub const DISCOVERY_BYTES: usize = 8 + 1 + 32 + 32 + 1 + 32 * 18;
-/// Initial local admission allowance. Governance may increase it; this is not
-/// a block-validity limit. The four-byte peer envelope has its own wire bound.
-pub const DEFAULT_RECORD_ADMISSION_BYTES: usize = 32 * 1024 * 1024;
+/// Block bytes one synchronization frame carries. A single record of the
+/// validated capacity always fits; smaller blocks share this bounded batch.
+/// This is local transport policy, not a block-validity limit.
+pub const BLOCK_BATCH_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_WIRE_PAYLOAD_BYTES: usize = u32::MAX as usize;
 pub const SYNC_OVERHEAD_BYTES: usize = MAGIC.len() + 1 + 32 + 9 + MAX_LOCATORS * 32 + 9 + 9;
 const RECORD_OVERHEAD: usize = 1024;
@@ -81,25 +82,39 @@ impl Limits {
         Self::for_capacity(config, config.initial.block_bytes)
     }
     pub fn for_capacity(config: &Config, capacity: u64) -> Self {
+        // Admission follows the validated capacity plus record framing.
         // Saturation is intentional at the wire representation boundary;
         // oversized payloads receive a transport error, never a consensus one.
         let record_bytes = usize::try_from(capacity)
             .unwrap_or(usize::MAX)
             .saturating_add(RECORD_OVERHEAD)
-            .clamp(DEFAULT_RECORD_ADMISSION_BYTES, MAX_WIRE_PAYLOAD_BYTES);
+            .min(MAX_WIRE_PAYLOAD_BYTES);
         Self {
             block_bytes: record_bytes,
             transaction_bytes: record_bytes,
             block_transactions: config.max_signatures,
         }
     }
-    pub fn frame_bytes(self) -> usize {
+    /// Block records in one frame, including each compact record length.
+    pub fn block_batch_bytes(self) -> usize {
         self.block_bytes
+            .max(BLOCK_BATCH_BYTES)
+            .saturating_add(MAX_BLOCKS * 9)
+    }
+    pub fn frame_bytes(self) -> usize {
+        self.block_batch_bytes()
             .saturating_add((1024 * 1024).max(self.transaction_bytes.saturating_add(32 * 1024)))
             .min(MAX_WIRE_PAYLOAD_BYTES)
     }
     pub fn transaction_batch_bytes(self) -> usize {
         TRANSACTION_BATCH_BYTES.max(self.transaction_bytes.saturating_add(9))
+    }
+    /// A connection's first message is a locator request, which carries no
+    /// blocks, or a shorter address request.
+    pub fn locator_request_bytes(self) -> usize {
+        SYNC_OVERHEAD_BYTES
+            .saturating_add(self.transaction_batch_bytes())
+            .min(self.frame_bytes())
     }
 }
 
@@ -477,9 +492,24 @@ mod tests {
     fn governed_capacity_expands_admission_without_framing_overflow() {
         let config = Config::devnet();
         let old = Limits::from_config(&config);
+        // Preset admission follows the 16 KiB capacity, not a fixed 32 MiB floor.
+        assert_eq!(old.block_bytes, 16_384 + RECORD_OVERHEAD);
+        assert!(old.frame_bytes() <= 4 * 1024 * 1024);
+        assert!(old.block_batch_bytes() >= MAX_BLOCKS * (old.block_bytes + 9));
+        assert!(
+            old.locator_request_bytes()
+                >= SYNC_OVERHEAD_BYTES + TRANSACTION_BATCH_BYTES.max(old.transaction_bytes + 9)
+        );
+        assert!(old.locator_request_bytes() < old.frame_bytes());
         let larger = Limits::for_capacity(&config, 40 * 1024 * 1024 + 173);
-        assert!(larger.block_bytes > DEFAULT_RECORD_ADMISSION_BYTES);
+        assert_eq!(larger.block_bytes, 40 * 1024 * 1024 + 173 + RECORD_OVERHEAD);
         assert!(larger.frame_bytes() > old.frame_bytes());
+        assert!(
+            larger.frame_bytes()
+                >= larger.block_batch_bytes()
+                    + larger.transaction_batch_bytes()
+                    + SYNC_OVERHEAD_BYTES
+        );
         let boundary = Limits::for_capacity(&config, u64::MAX);
         assert_eq!(boundary.frame_bytes(), MAX_WIRE_PAYLOAD_BYTES);
         assert!(record_size(usize::MAX).is_err());

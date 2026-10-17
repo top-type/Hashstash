@@ -331,4 +331,27 @@ fn replaced_mail_anchor_fails_closed_and_replacement_messages_are_discovered() {
             .to_string()
             .contains("Mail scan anchor is no longer canonical")
     );
+    // The error names the newest unchanged height. Continuing after it with
+    // the replaced anchor keeps earlier discoveries and finds the replacement.
+    assert!(
+        error
+            .to_string()
+            .contains("blocks above height 2 were replaced"),
+        "{error}"
+    );
+    let resumed = read(
+        &a,
+        "explorer_mail",
+        json!({"after":format!("2:{}", i64::MAX),"anchor":old["anchor"]}),
+    );
+    assert_eq!(resumed["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(resumed["messages"][0]["txid"], replacement_id);
+    assert_eq!(resumed["anchor"], new["anchor"]);
+    // A paused scan below the replaced blocks continues without restarting.
+    let paused = read(
+        &a,
+        "explorer_mail",
+        json!({"after":"1:0","anchor":old["anchor"]}),
+    );
+    assert_eq!(paused["messages"], resumed["messages"]);
 }

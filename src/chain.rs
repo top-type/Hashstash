@@ -363,6 +363,13 @@ impl Chain {
     pub fn state_at(&self, hash: &Hash) -> Option<Arc<State>> {
         self.load_state(hash).ok()
     }
+    /// A state this chain already retains; unlike state_at, never replays history.
+    pub fn cached_state(&self, hash: &Hash) -> Option<Arc<State>> {
+        if *hash == self.tip {
+            return Some(self.tip_state.clone());
+        }
+        self.cache.borrow().states.get(hash).cloned()
+    }
     pub fn cached_state_count(&self) -> usize {
         self.cache.borrow().states.len()
     }

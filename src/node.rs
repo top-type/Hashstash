@@ -556,6 +556,8 @@ impl Node {
             Arc::downgrade(&inner),
             explorer_config,
         ));
+        // A long startup catch-up continues on the worker, not before listeners.
+        explorer.notify();
         Ok(Self {
             inner,
             explorer,

@@ -785,11 +785,13 @@ impl Node {
             "chain_stalled":at.saturating_sub(self.last_tip_change.load(Ordering::Relaxed)) >= 180}),
         )
     }
-    /// Validation may learn a larger governed capacity on any branch, including
-    /// without a tip change. Record it for transport tasks and admission.
+    /// Validation may change the greatest competitive capacity on any branch,
+    /// including without a tip change. Record it for transport tasks and
+    /// admission. It falls again when a competing branch is left behind;
+    /// callers hold the node lock, so the latest chain value wins.
     fn note_capacity(&self, chain: &Chain) -> Result<()> {
         let capacity = chain.max_known_block_bytes();
-        self.known_block_bytes.fetch_max(capacity, Ordering::AcqRel);
+        self.known_block_bytes.store(capacity, Ordering::Release);
         self.guard
             .allow_frame(admission_frame_bytes(&chain.config, capacity)?)
     }
@@ -1326,7 +1328,7 @@ impl Node {
         let mut i = self.locked()?;
         let old_tip = i.chain.tip_hash();
         let submitted = i.chain.submit_with_replay_budget(block, now(), 64);
-        // Validation can learn a larger governed capacity on any branch.
+        // Validation can change the competitive capacity on any branch.
         if let Err(error) = self.note_capacity(&i.chain) {
             eprintln!("Peer capacity allowance unchanged: {error:#}");
         }

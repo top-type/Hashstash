@@ -1201,7 +1201,8 @@ impl Node {
         Ok((selection.transactions, backlog))
     }
     /// Retained entries the selection left out only for block capacity. Unless
-    /// the selection was saturated, an entry that still fits the selected block's
+    /// the selection was saturated or truncated, or left the sender's own
+    /// candidates unattempted, an entry that still fits the selected block's
     /// bytes and weight was refused for validity: it is dropped with its sender's
     /// later nonces. Weights quoted against the parent state can only overstate
     /// in-block weights, so a fitting estimate is conservative. The best bids
@@ -1228,7 +1229,9 @@ impl Node {
         let state = chain.tip_state();
         let byte_limit = usize::try_from(state.settings.block_bytes).unwrap_or(usize::MAX);
         let limit = mempool_limit(&chain.config).min(chain.config.max_signatures);
-        let saturated = selection.budget_exhausted || selection.transactions.len() >= limit;
+        // Another sender's spent budget says nothing about this entry; only a
+        // truncated or count-full selection leaves every entry undecided.
+        let saturated = selection.truncated || selection.transactions.len() >= limit;
         let height = state.height.checked_add(1).context("candidate height overflow")?;
         let (prefix, suffix) = codec::coinbase_parts(height, &miner, &ZERO_HASH);
         let system = prefix.len() + 8 + suffix.len();
@@ -1290,6 +1293,7 @@ impl Node {
                 state.account(&sender, None).map_or(0, |account| account.nonce)
             });
             first.insert(sender, start);
+            let undecided = saturated || selection.exhausted_senders.contains(&sender);
             let mut expected = start;
             for entry in entries {
                 let nonce = entry.transaction.body.nonce;
@@ -1303,7 +1307,7 @@ impl Node {
                 let fits = used_bytes.saturating_add(compact_size_len(entry.bytes) + entry.bytes)
                     <= byte_limit
                     && used_weight.saturating_add(entry.weight) <= weight_limit;
-                if fits && !saturated && expected == start {
+                if fits && !undecided && expected == start {
                     break;
                 }
                 waiting.push(entry);
@@ -1842,7 +1846,23 @@ impl Node {
             (start + visited) % i.mempool.len()
         };
         let active = Self::locator(&i.chain);
-        let mut request_locator: Vec<Hash> = i.downloads.iter().copied().collect();
+        // A cursor into a presynced branch whose held headers now claim more
+        // work than the tip resumes at its stored root, so the peer resends
+        // the bodies; cursors the chain no longer knows are dropped.
+        let mut request_locator = Vec::new();
+        let mut cursors = std::mem::take(&mut i.downloads);
+        cursors.retain(|cursor| match i.chain.download_cursor(cursor) {
+            Ok(Some(entry)) => {
+                request_locator.push(entry);
+                true
+            }
+            Ok(None) => false,
+            Err(_) => {
+                request_locator.push(*cursor);
+                true
+            }
+        });
+        i.downloads = cursors;
         request_locator.extend(active);
         let mut seen = HashSet::new();
         request_locator.retain(|h| seen.insert(*h));
@@ -1871,7 +1891,9 @@ impl Node {
             "peer batch limit exceeded"
         );
         let config = self.read_view()?.chain.config.clone();
-        for b in &msg.blocks {
+        // The last block of a reply made only of linked known active blocks.
+        let mut shared = None;
+        for (index, b) in msg.blocks.iter().enumerate() {
             let hash = codec::block_hash(b);
             let known = {
                 let i = self.locked()?;
@@ -1879,10 +1901,15 @@ impl Node {
                     // A stored active block is never download progress: any
                     // peer could resend one without proof of work to push
                     // competing-branch cursors out.
-                    Some(height) if i.chain.hash_at_height(height) == Some(hash) => continue,
+                    Some(height) if i.chain.hash_at_height(height) == Some(hash) => {
+                        let linked = index == 0 || shared == Some(b.header.previous);
+                        shared = linked.then_some(hash);
+                        continue;
+                    }
                     known => known.is_some(),
                 }
             };
+            shared = None;
             if !known {
                 // Every valid block meets its own compact target within the
                 // genesis limit. Check that before copying or hashing a large
@@ -1893,7 +1920,13 @@ impl Node {
                     "block target exceeds the network limit"
                 );
                 math::check_pow(&b.header, &target)?;
-                self.submit_block(b.clone())?;
+                match self.submit_block(b.clone()) {
+                    Ok(_) => {}
+                    // A declined side block's header is held for presync, so
+                    // the rest of its branch is still downloaded after it.
+                    Err(error) if error.is::<crate::chain::SideBranchRefused>() => {}
+                    Err(error) => return Err(error),
+                }
             }
             let mut i = self.locked()?;
             // Replace the preceding cursor for this branch, so normal downloads
@@ -1903,6 +1936,35 @@ impl Node {
                 .retain(|h| *h != hash && *h != b.header.previous);
             i.downloads.push_front(hash);
             i.downloads.truncate(MAX_CONNECTIONS);
+        }
+        if let Some(hash) = shared {
+            // A reply wholly inside the active chain still shows where the
+            // sender's chain continues; without it a fork deeper than one
+            // batch beyond a sparse locator entry never reaches its blocks.
+            // Such a cursor replaces the reply's own starting cursor or the
+            // oldest active-chain cursor, and never a competing-branch cursor.
+            let mut i = self.locked()?;
+            let start = msg.blocks[0].header.previous;
+            if !i.downloads.contains(&hash) {
+                let chain = &i.chain;
+                let active = |h: &Hash| {
+                    chain
+                        .block_height(h)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|height| chain.hash_at_height(height) == Some(*h))
+                };
+                let mut replaced = i.downloads.iter().position(|h| *h == start);
+                if replaced.is_none() && i.downloads.len() >= MAX_CONNECTIONS {
+                    replaced = i.downloads.iter().rposition(active);
+                }
+                if let Some(position) = replaced {
+                    i.downloads.remove(position);
+                }
+                if i.downloads.len() < MAX_CONNECTIONS {
+                    i.downloads.push_back(hash);
+                }
+            }
         }
         // Admit the batch together. Revalidating every growing prefix here made
         // one ordinary full-pool relay need tens of thousands of signature checks.
@@ -3627,11 +3689,15 @@ fn accept_retry_delay(error: &std::io::Error, consecutive: u32) -> Duration {
         Duration::from_millis((10u64 << consecutive.min(7)).min(1000))
     }
 }
-/// A deferred replay is local validation progress, not a peer failure.
+/// A deferred replay or a held side-branch header is local validation
+/// progress, not a peer failure.
 fn sync_completed(result: &Result<()>) -> bool {
     match result {
         Ok(()) => true,
-        Err(error) => error.is::<crate::chain::ValidationDeferred>(),
+        Err(error) => {
+            error.is::<crate::chain::ValidationDeferred>()
+                || error.is::<crate::chain::SideBranchRefused>()
+        }
     }
 }
 async fn discovery_seed_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
@@ -8116,6 +8182,97 @@ mod peer_tests {
             Chain::mine(chain.template(miner, vec![], timestamp).unwrap(), 100_000).unwrap();
         chain.submit(block.clone(), timestamp as u64).unwrap();
         block
+    }
+    /// One-second blocks: ASERT raises each block's work above the last.
+    fn rush(chain: &mut Chain, miner: PublicKey) {
+        let timestamp = chain.tip_block().header.timestamp + 1;
+        let block =
+            Chain::mine(chain.template(miner, vec![], timestamp).unwrap(), 1_000_000).unwrap();
+        chain.submit(block, timestamp as u64).unwrap();
+    }
+    /// A node opened on a chain database populated first by `build`.
+    fn node_on(path: &Path, config: &Config, build: impl FnOnce(&mut Chain)) -> Node {
+        let mut chain = Chain::open(path, config.clone()).unwrap();
+        build(&mut chain);
+        drop(chain);
+        Node::open(path, config.clone(), crypto::public_key(&[66; 32]).unwrap()).unwrap()
+    }
+    /// Synchronize `target` from `source` until their tips agree; the number
+    /// of exchanges, each one request locator and one reply.
+    fn converge(source: &Node, target: &Node, limit: usize) -> Option<usize> {
+        for round in 1..=limit {
+            let request = target.peer_snapshot(None).unwrap();
+            let reply = source.peer_snapshot(Some(&request.locator)).unwrap();
+            target.receive_peer(&reply).unwrap();
+            if target.read_view().unwrap().chain.tip_hash()
+                == source.read_view().unwrap().chain.tip_hash()
+            {
+                return Some(round);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn deep_forks_synchronize_past_a_shared_prefix_longer_than_a_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        let mut shared = Chain::open(&dir.path().join("shared.db"), config.clone()).unwrap();
+        let prefix: Vec<Block> = (0..300)
+            .map(|_| advance(&mut shared, crypto::public_key(&[61; 32]).unwrap()))
+            .collect();
+        let branch = |name: &str, seed: u8, length: usize| {
+            node_on(&dir.path().join(name), &config, |chain| {
+                for block in &prefix {
+                    chain.submit(block.clone(), block.header.timestamp as u64).unwrap();
+                }
+                for _ in 0..length {
+                    advance(chain, crypto::public_key(&[seed; 32]).unwrap());
+                }
+            })
+        };
+        // The receiver's sparse locator matches the heavier sender's chain
+        // more than one batch below the fork, so a whole reply consists of
+        // blocks it already has. Those once ended every exchange unchanged.
+        let receiver = branch("receiver.db", 62, 80);
+        let sender = branch("sender.db", 63, 100);
+        assert!(converge(&sender, &receiver, 20).is_some());
+    }
+
+    #[test]
+    fn a_heavier_branch_is_presynced_past_a_tip_that_declines_its_first_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        // The receiver's light chain has pushed its next block's work to more
+        // than 64 times a block at the initial target.
+        let receiver = node_on(&dir.path().join("receiver.db"), &config, |chain| {
+            while math::work(&chain.next_target().unwrap()) <= Amount::from(128u32) {
+                rush(chain, crypto::public_key(&[62; 32]).unwrap());
+            }
+        });
+        let light = receiver.read_view().unwrap().chain.tip_height() as usize;
+        let work = receiver.locked().unwrap().chain.chain_work().clone();
+        let sender = node_on(&dir.path().join("sender.db"), &config, |chain| {
+            while *chain.chain_work() <= work {
+                rush(chain, crypto::public_key(&[63; 32]).unwrap());
+            }
+        });
+        // The heavier branch's first block is declined, and with it every
+        // later block used to be an unknown parent. Its headers are held
+        // instead, then its bodies are fetched again and it is adopted.
+        let first = {
+            let i = sender.locked().unwrap();
+            i.chain.hash_at_height(1).and_then(|hash| i.chain.block(&hash))
+        }
+        .unwrap();
+        let error = receiver.submit_block(first).unwrap_err();
+        assert!(error.is::<crate::chain::SideBranchRefused>(), "{error:#}");
+        assert!(converge(&sender, &receiver, 4 * light / MAX_BATCH + 8).is_some());
+        let i = receiver.locked().unwrap();
+        let held = i.chain.held_header_count();
+        let invalid = i.chain.cached_invalid_count();
+        drop(i);
+        assert_eq!((held, invalid), (0, 0));
     }
 
     #[test]

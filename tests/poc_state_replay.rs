@@ -5,9 +5,12 @@
 //!   so an ancestor costs about its depth below the tip, never the chain height.
 //!   Checkpoints are never evicted by side-branch traffic or by unrelated
 //!   reconstructions, and deferred progress survives cache churn.
-//! * A block that would not become the tip is validated and stored only while
-//!   its branch is competitive: low-work blocks are refused before any anchor
-//!   walk, state reconstruction or storage, and are never cached as invalid.
+//! * A block that would not become the tip is validated and stored only if its
+//!   branch is competitive when it arrives: low-work blocks are refused before
+//!   any anchor walk, state reconstruction or storage, and are never cached as
+//!   invalid. Their headers are held instead, so a heavier branch whose first
+//!   blocks are declined is still adopted once its held headers claim more
+//!   work than the tip.
 
 mod support;
 
@@ -312,6 +315,104 @@ fn branches_that_cannot_catch_up_are_refused() {
             assert!(chain.block(&codec::block_hash(&cheaper)).is_none());
         }
     }
+    assert_eq!(chain.cached_invalid_count(), 0);
+}
+
+#[test]
+fn a_long_light_chain_cannot_strand_a_node_off_a_heavier_branch() {
+    let directory = tempfile::tempdir().unwrap();
+    // The presets' target: every block at the initial target costs two hashes.
+    let mut config = configuration();
+    config.initial_bits = 0x207fffff;
+    config.limit_bits = config.initial_bits;
+    let mut victim = Chain::open(&directory.path().join("victim.sqlite"), config.clone()).unwrap();
+    // A node first synchronizes a light chain slightly longer than the
+    // catch-up allowance, such as one served to it during initial download.
+    for n in 0..SIDE_BRANCH_CATCH_UP_BLOCKS as u64 + 4 {
+        append(&mut victim, vec![], n);
+    }
+    // The honest chain from genesis mines one-second blocks, so ASERT raises
+    // its work per block and far fewer blocks carry more work.
+    let mut honest = Chain::open(&directory.path().join("honest.sqlite"), config).unwrap();
+    let mut blocks = Vec::new();
+    while honest.chain_work() <= victim.chain_work() {
+        let time = honest.tip_block().header.timestamp + 1;
+        let block = mine_at(&honest, vec![], time, 7);
+        assert!(honest.submit(block.clone(), time as u64).unwrap());
+        blocks.push(block);
+    }
+    assert!(blocks.len() < 1_000);
+    // Block 1 alone cannot catch up within the allowance. It used to be
+    // refused for good, leaving every later honest block an unknown parent.
+    let tip = victim.tip_hash();
+    for (index, block) in blocks.iter().enumerate() {
+        let hash = codec::block_hash(block);
+        let error = victim
+            .submit(block.clone(), block.header.timestamp as u64)
+            .unwrap_err();
+        assert!(error.is::<SideBranchRefused>(), "{error:#}");
+        assert!(victim.block(&hash).is_none());
+        assert_eq!(victim.held_header_count(), index + 1);
+        // Presync continues after each held header until the branch overtakes.
+        let cursor = victim.download_cursor(&hash).unwrap();
+        if index + 1 < blocks.len() {
+            assert_eq!(cursor, Some(hash));
+        } else {
+            assert_eq!(cursor, victim.hash_at_height(0));
+        }
+    }
+    assert_eq!(victim.tip_hash(), tip);
+    // Resent bodies bypass the admission policy and the heavier branch wins.
+    for block in &blocks {
+        victim
+            .submit(block.clone(), block.header.timestamp as u64)
+            .unwrap();
+    }
+    assert_eq!(victim.tip_hash(), honest.tip_hash());
+    assert_eq!(victim.tip_state().root(), honest.tip_state().root());
+    assert_eq!(victim.held_header_count(), 0);
+    assert_eq!(victim.cached_invalid_count(), 0);
+}
+
+#[test]
+fn a_reorganization_beneath_deferred_replay_restarts_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = configuration();
+    let mut chain = Chain::open(&directory.path().join("victim.sqlite"), config).unwrap();
+    for _ in 0..300 {
+        append(&mut chain, vec![], 0);
+    }
+    // A side block whose canonical parent at height 250 is rebuilt from the
+    // checkpoint at 240, one block per budgeted attempt.
+    let parent = fork_at(directory.path(), "side.sqlite", &chain, 250);
+    let side = mine_at(&parent, vec![], next_time(&parent), 1);
+    let time = side.header.timestamp as u64;
+    let error = chain.submit_with_replay_budget(side.clone(), time, 1).unwrap_err();
+    assert!(error.is::<ValidationDeferred>(), "{error:#}");
+    // The active chain now forks at 245, above the retained progress but
+    // below the replay's target, so the parent is on a losing branch.
+    let mut rival = fork_at(directory.path(), "rival.sqlite", &chain, 245);
+    while chain.tip_hash() != rival.tip_hash() {
+        let block = append(&mut rival, vec![], 2);
+        chain.submit(block, rival.tip_block().header.timestamp as u64).unwrap();
+    }
+    // Resuming used to replay the new branch up to height 250 and fail with
+    // an error that was neither invalidity nor deferral.
+    let mut deferred = 0;
+    loop {
+        match chain.submit_with_replay_budget(side.clone(), time, 1) {
+            Ok(best) => {
+                assert!(!best);
+                break;
+            }
+            Err(error) if error.is::<ValidationDeferred>() => {
+                deferred += 1;
+                assert!(deferred < 64, "reconstruction made no progress");
+            }
+            Err(error) => panic!("{error:#}"),
+        }
+    }
+    assert!(chain.block(&codec::block_hash(&side)).is_some());
     assert_eq!(chain.cached_invalid_count(), 0);
 }
 

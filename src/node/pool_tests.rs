@@ -431,6 +431,66 @@ fn a_count_full_pool_still_admits_a_better_bid() {
 }
 
 #[test]
+fn an_entry_that_failed_every_attempt_is_dropped_rather_than_kept_undecided() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 1024 * 1024);
+    fund_other(&node);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let start = nonce(&node, &key());
+    let honest: Vec<_> = (0..8)
+        .map(|offset| payment(config, state, &SECRET, start + offset, key(), 1, 0))
+        .collect();
+    for tx in &honest {
+        node.submit_transaction(tx.clone()).unwrap();
+    }
+    // An affordable, high-fee zero transfer that can never apply, retained
+    // in the pool as if it had become invalid after admission.
+    let failing = payment(config, state, &OTHER, nonce(&node, &other()), other(), 0, 1_000);
+    node.locked().unwrap().mempool.push(failing.clone());
+    // Reselection retries it after every acceptance until its sender's own
+    // budget is spent, which used to mark the whole selection saturated and
+    // keep it in the backlog ahead of entries that lost only to capacity.
+    let newcomer = payment(config, state, &SECRET, start + 8, key(), 1, 0);
+    node.submit_transaction(newcomer.clone()).unwrap();
+    let (selected, backlog, _) = pool(&node);
+    assert_eq!(ids(&selected), &ids(&honest) | &ids(&[newcomer]));
+    assert!(backlog.is_empty(), "a refused entry is not capacity-displaced");
+}
+
+#[test]
+fn a_selection_cut_short_by_block_finishing_keeps_its_tail_pending() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 1024 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let start = nonce(&node, &key());
+    let pending: Vec<_> = (0..6)
+        .map(|offset| payment(config, state, &SECRET, start + offset, key(), 1, 0))
+        .collect();
+    for tx in &pending[..5] {
+        node.submit_transaction(tx.clone()).unwrap();
+    }
+    // Finishing now fails for more than two transactions, so the relay's
+    // reselection keeps a finishing prefix of the accepted set.
+    crate::chain::FAIL_FINISH_ABOVE.with(|limit| limit.set(Some(2)));
+    let relayed = node.receive_peer(&PeerMessage {
+        chain: config.chain_id(),
+        locator: Vec::new(),
+        blocks: Vec::new(),
+        transactions: vec![pending[5].clone()],
+    });
+    crate::chain::FAIL_FINISH_ABOVE.with(|limit| limit.set(None));
+    relayed.unwrap();
+    let (selected, backlog, _) = pool(&node);
+    assert_eq!(ids(&selected), ids(&pending[..2]));
+    // The cut tail was never judged invalid; it used to be dropped as refused.
+    assert_eq!(ids(&backlog), ids(&pending[2..5]));
+    let block = node.mine(1_000_000).unwrap();
+    assert_eq!(ids(&block.transactions), ids(&pending[..5]));
+}
+
+#[test]
 fn a_damaged_wallet_store_stops_startup_before_history_replay() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("chain.sqlite");

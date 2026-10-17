@@ -199,6 +199,10 @@ fn persistent_failures_use_only_their_senders_budget() {
     let attacked = chain.select_transactions(key(), &combined, 4096).unwrap();
     assert_eq!(attacked.transactions, baseline.transactions);
     assert!(attacked.budget_exhausted);
+    // Every attacker candidate was tried and failed, so a node's pool counts
+    // them as refused rather than leaving them undecided in its backlog.
+    assert!(attacked.exhausted_senders.is_empty());
+    assert!(!attacked.truncated);
     // The attacker's candidates spend exactly their own allowance.
     assert_eq!(
         attacked.execution_attempts,

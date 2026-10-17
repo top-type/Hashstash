@@ -404,14 +404,22 @@ fn calibrate_initial_target(config: &mut Config, hashrate: &str) -> Result<()> {
     );
     let limit = math::target_from_bits(config.limit_bits)?;
     let bits = math::bits_from_target(&target);
+    let initial = math::target_from_bits(bits)?;
     ensure!(
-        math::target_from_bits(bits)? <= limit,
+        initial <= limit,
         "hashrate is too low for this network's proof-of-work limit"
     );
     config.initial_bits = bits;
+    // The easiest target stays within 2^CALIBRATED_LIMIT_RANGE_BITS of the
+    // calibration, so neither a stall nor a backdated first block can make
+    // blocks practically free; the shift keeps the compact form exact.
+    config.limit_bits =
+        math::bits_from_target(&limit.min(initial << CALIBRATED_LIMIT_RANGE_BITS));
     config.validate()?;
     Ok(())
 }
+/// How far below its calibrated initial difficulty a new network can ease.
+const CALIBRATED_LIMIT_RANGE_BITS: usize = 8;
 
 fn initial_config(
     preset: InitPreset,
@@ -2317,7 +2325,12 @@ mod tests {
         assert!(work >= expected);
         assert!((&work - &expected) * 10_000u32 < expected);
         assert_eq!(math::bits_from_target(&target), config.initial_bits);
+        // The easiest target is 256 times the calibrated one, not the preset limit.
+        let limit = math::target_from_bits(config.limit_bits).unwrap();
+        assert_eq!(limit, &target << 8usize);
+        assert!(limit < math::target_from_bits(Config::slow_testnet().limit_bits).unwrap());
         original["initial_bits"] = json!(config.initial_bits);
+        original["limit_bits"] = json!(config.limit_bits);
         assert_eq!(serde_json::to_value(&config).unwrap(), original);
         config.validate().unwrap();
     }

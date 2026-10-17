@@ -21,7 +21,7 @@ use num_traits::{ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
@@ -486,9 +486,7 @@ struct MiningConnection {
 }
 impl Drop for MiningConnection {
     fn drop(&mut self) {
-        if let Ok(mut runtime) = self.runtime.lock() {
-            runtime.workers.remove(&self.id);
-        }
+        self.runtime.unpoisoned().workers.remove(&self.id);
     }
 }
 
@@ -525,21 +523,44 @@ fn poisoned(lock: &str) -> ! {
     eprintln!("fatal: {lock} lock poisoned by an earlier panic; exiting for a supervised restart");
     std::process::exit(70)
 }
+/// Locks holding only counters, diagnostics, caches or the peer address book,
+/// never chain, snapshot or wallet state. A panic while one was held leaves at
+/// most a stale entry, so later work keeps using it: one failed connection
+/// never disables admission, discovery or mining for the life of the process.
+trait Unpoisoned<T> {
+    fn unpoisoned(&self) -> std::sync::MutexGuard<'_, T>;
+}
+impl<T> Unpoisoned<T> for Mutex<T> {
+    fn unpoisoned(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
-/// Recently rejected relay identities. Shape and signature failures are
-/// permanent for the exact signed bytes; other rejections hold for one tip.
+/// How long a relay refusal holds. Shape and signature failures are permanent
+/// for the exact signed bytes. Checks against chain state alone hold for one
+/// tip. A newcomer that lost its selection holds only while both the tip and
+/// the pool it lost against are unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+    Permanent,
+    Tip(Hash),
+    Pool(Hash, u64),
+}
+/// Recently rejected relay identities.
 #[derive(Default)]
 struct RejectedTransactions {
-    entries: HashMap<Hash, Option<Hash>>,
+    entries: HashMap<Hash, Refusal>,
     order: VecDeque<Hash>,
 }
 impl RejectedTransactions {
-    fn contains(&self, id: &Hash, tip: &Hash) -> bool {
-        self.entries
-            .get(id)
-            .is_some_and(|scope| scope.is_none_or(|at| at == *tip))
+    fn contains(&self, id: &Hash, tip: &Hash, pool_revision: u64) -> bool {
+        self.entries.get(id).is_some_and(|refusal| match refusal {
+            Refusal::Permanent => true,
+            Refusal::Tip(at) => at == tip,
+            Refusal::Pool(at, revision) => at == tip && *revision == pool_revision,
+        })
     }
-    fn insert(&mut self, id: Hash, scope: Option<Hash>) {
+    fn insert(&mut self, id: Hash, scope: Refusal) {
         if self.entries.insert(id, scope).is_none() {
             self.order.push_back(id);
         }
@@ -549,6 +570,19 @@ impl RejectedTransactions {
             }
         }
     }
+}
+
+/// Admissible newcomers screened before a selection.
+#[derive(Default)]
+struct Newcomers<'a> {
+    /// Worth a selection, in arrival order.
+    candidates: Vec<(Hash, &'a Transaction)>,
+    /// Candidates that rebid or extend their own sender's backlog chain.
+    waiting: HashSet<Hash>,
+    /// Refused by the next block's opening (fee or funds); final for this tip.
+    unpayable: Vec<(Hash, anyhow::Error)>,
+    /// After a missing earlier nonce, which may still arrive on this tip.
+    gapped: Vec<Hash>,
 }
 
 fn compact_size_len(n: usize) -> usize {
@@ -564,7 +598,8 @@ fn compact_size_len(n: usize) -> usize {
 mod pool_tests;
 #[cfg(test)]
 thread_local! {
-    /// Signatures checked by pool selections on this thread.
+    /// Pool selections run on this thread, and the signatures they checked.
+    static POOL_SELECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static POOL_SIGNATURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Fail the next pool recovery on this thread.
     static FAIL_RECOVERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -578,6 +613,8 @@ struct Inner {
     backlog: Vec<Transaction>,
     /// Tip the pool was last selected against; differs only after a failed recovery.
     pool_tip: Hash,
+    /// Advances with every installed change to the selection or backlog.
+    pool_revision: u64,
     template: Option<Arc<Block>>,
     // Download progress is independent of which branch currently has greatest work.
     downloads: VecDeque<Download>,
@@ -643,6 +680,7 @@ impl PublishedChain {
 struct ReadView {
     chain: PublishedChain,
     mempool: Vec<Transaction>,
+    pool_revision: u64,
     cache: Arc<TipCache>,
 }
 /// Read-only results derived from one published tip state. Views of the same
@@ -781,6 +819,7 @@ impl ReadView {
                 state: Arc::new(inner.chain.tip_state().clone()),
             },
             mempool: inner.pending().cloned().collect(),
+            pool_revision: inner.pool_revision,
             cache: Arc::default(),
         }
     }
@@ -858,7 +897,7 @@ struct SessionIds {
 struct SessionId(Arc<Mutex<SessionIds>>, u32);
 impl SessionIds {
     fn allocate(ids: &Arc<Mutex<Self>>) -> Option<SessionId> {
-        let mut state = ids.lock().ok()?;
+        let mut state = ids.unpoisoned();
         // Live IDs are bounded by the listener's connection limit.
         loop {
             let id = state.next;
@@ -871,9 +910,7 @@ impl SessionIds {
 }
 impl Drop for SessionId {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.0.lock() {
-            state.live.remove(&self.1);
-        }
+        self.0.unpoisoned().live.remove(&self.1);
     }
 }
 impl Node {
@@ -887,10 +924,14 @@ impl Node {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let wallets = WalletStore::open(path, config.chain_id())?;
+        let wallets = WalletStore::open_unrecorded(path, config.chain_id())?;
         let chain = Chain::open(path, config)?;
+        // Only a launch whose chain database accepted this network records it,
+        // so a mistaken network choice leaves the wallet store unchanged.
+        wallets.record_network()?;
         let inner = Inner {
             pool_tip: chain.tip_hash(),
+            pool_revision: 0,
             chain,
             mempool: Vec::new(),
             backlog: Vec::new(),
@@ -987,10 +1028,7 @@ impl Node {
     }
     pub fn peer_status(&self) -> Result<Value> {
         let at = now();
-        let health = self
-            .peer_health
-            .lock()
-            .map_err(|_| anyhow!("peer health lock poisoned"))?;
+        let health = self.peer_health.unpoisoned();
         let mut peers = health
             .iter()
             .map(|(address, h)| {
@@ -1003,10 +1041,7 @@ impl Node {
             })
             .collect::<Vec<_>>();
         peers.sort_by_key(|p| p["address"].as_str().unwrap_or("").to_owned());
-        let discovery = self
-            .discovery
-            .lock()
-            .map_err(|_| anyhow!("peer discovery lock poisoned"))?;
+        let discovery = self.discovery.unpoisoned();
         let discovery_status = match discovery.as_ref() {
             Some(book) => {
                 json!({"enabled":true,"known":book.entries().count(),"verified":book.entries().filter(|e|e.last_success>0).count(),"advertise":book.options.advertise,"seeds":book.options.seeds,"last_error":book.last_error,"load_error":book.load_error,"peers":book.entries().collect::<Vec<_>>()})
@@ -1014,12 +1049,7 @@ impl Node {
             None => json!({"enabled":false}),
         };
         drop(discovery);
-        let listeners = json!(
-            *self
-                .listener_health
-                .lock()
-                .map_err(|_| anyhow!("listener health lock poisoned"))?
-        );
+        let listeners = json!(*self.listener_health.unpoisoned());
         let view = self.read_view()?;
         // The tip heuristic follows the governed block interval, never below 180 s.
         let stall_after = view
@@ -1136,9 +1166,7 @@ impl Node {
     }
     fn rejected_locked(&self) -> std::sync::MutexGuard<'_, RejectedTransactions> {
         // Only a cache: a panic elsewhere cannot leave it inconsistent.
-        self.rejected
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.rejected.unpoisoned()
     }
     fn listener_error(&self, kind: i32, error: &std::io::Error, delay: Duration) {
         let name = match kind {
@@ -1147,7 +1175,8 @@ impl Node {
             2 => "stratum",
             _ => "public_web",
         };
-        if let Ok(mut health) = self.listener_health.lock() {
+        {
+            let mut health = self.listener_health.unpoisoned();
             let entry = health.entry(name).or_default();
             entry.accept_errors = entry.accept_errors.saturating_add(1);
             entry.last_error = Some(error.to_string().chars().take(256).collect());
@@ -1165,25 +1194,26 @@ impl Node {
     fn peer_class(&self, configured: &HashSet<IpAddr>, ip: IpAddr) -> PeerClass {
         if configured.contains(&network_guard::admission_address(ip)) {
             PeerClass::Operator
-        } else if self.discovery.lock().is_ok_and(|book| {
-            book.as_ref()
-                .is_some_and(|book| book.verified_ip(ip, now()))
-        }) {
+        } else if self
+            .discovery
+            .unpoisoned()
+            .as_ref()
+            .is_some_and(|book| book.verified_ip(ip, now()))
+        {
             PeerClass::Verified
         } else {
             PeerClass::General
         }
     }
     fn peer_event(&self, peer: String, result: &Result<()>) {
-        if let Ok(mut events) = self.peer_events.lock() {
-            let error = result
-                .as_ref()
-                .err()
-                .map(|e| e.to_string().chars().take(256).collect::<String>());
-            events.push_back(json!({"peer":peer,"time":now(),"ok":result.is_ok(),"error":error}));
-            while events.len() > 64 {
-                events.pop_front();
-            }
+        let error = result
+            .as_ref()
+            .err()
+            .map(|e| e.to_string().chars().take(256).collect::<String>());
+        let mut events = self.peer_events.unpoisoned();
+        events.push_back(json!({"peer":peer,"time":now(),"ok":result.is_ok(),"error":error}));
+        while events.len() > 64 {
+            events.pop_front();
         }
     }
     fn timestamp(chain: &Chain) -> u32 {
@@ -1200,10 +1230,10 @@ impl Node {
         crypto::verify(tx).context("invalid transaction signature")
     }
     /// Cheap checks against the current tip, before any signature check or
-    /// selection: size, signed anchor and lifetime, and an unused sender nonce.
-    /// New submissions also need a funded sender; recovered detached entries may
-    /// still be funded by another recovered transaction.
-    fn admissible(chain: &Chain, tx: &Transaction, require_account: bool) -> Result<()> {
+    /// selection: size, signed anchor and lifetime, a funded sender and an
+    /// unused nonce. Selection never includes a sender without an account at
+    /// the block opening, so recovered entries need a funded sender as well.
+    fn admissible(chain: &Chain, tx: &Transaction) -> Result<()> {
         let state = chain.tip_state();
         ensure!(
             codec::encode(tx).len() <= chain.config.transaction_bytes(&state.settings),
@@ -1214,28 +1244,106 @@ impl Node {
             "invalid lifetime or nonce"
         );
         chain.validate_transaction_anchor(tx)?;
-        match state.account(&tx.body.sender, None) {
-            Some(account) => ensure!(tx.body.nonce >= account.nonce, "nonce already used"),
-            None => ensure!(!require_account, "sender account does not exist"),
-        }
+        let account = state
+            .account(&tx.body.sender, None)
+            .context("sender account does not exist")?;
+        ensure!(tx.body.nonce >= account.nonce, "nonce already used");
         Ok(())
     }
     fn pool_ids(i: &Inner) -> HashSet<Hash> {
         i.pending().map(codec::transaction_id).collect()
     }
+    /// Admissible newcomers sorted by what a selection could do with them,
+    /// without running one: an entry the next block's opening refuses for its
+    /// fee or funds, or one after a missing earlier nonce of its sender, is
+    /// never selected on this tip. A candidate that rebids or extends its own
+    /// sender's backlog chain cannot be selected before that chain, so it may
+    /// wait in the backlog within the same bounds.
+    fn screen_newcomers<'a>(
+        &self,
+        i: &Inner,
+        newcomers: Vec<(Hash, &'a Transaction)>,
+    ) -> Result<Newcomers<'a>> {
+        let transactions: Vec<&Transaction> = newcomers.iter().map(|(_, tx)| *tx).collect();
+        let opening = i.chain.opening_screen(self.miner, &transactions)?;
+        let mut screened = Newcomers::default();
+        let mut nonces = BTreeMap::<PublicKey, BTreeSet<u64>>::new();
+        for tx in i.pending() {
+            nonces.entry(tx.body.sender).or_default().insert(tx.body.nonce);
+        }
+        let mut payable = Vec::new();
+        for ((id, tx), opening) in newcomers.into_iter().zip(opening) {
+            match opening {
+                Ok(()) => {
+                    nonces.entry(tx.body.sender).or_default().insert(tx.body.nonce);
+                    payable.push((id, tx));
+                }
+                Err(error) => screened.unpayable.push((id, error)),
+            }
+        }
+        // The first nonce from the account nonce up that nothing pending holds.
+        let state = i.chain.tip_state();
+        let mut reachable = BTreeMap::new();
+        for (id, tx) in payable {
+            let sender = tx.body.sender;
+            let next = *reachable.entry(sender).or_insert_with(|| {
+                let mut next = state.account(&sender, None).map_or(0, |account| account.nonce);
+                while nonces[&sender].contains(&next) {
+                    next = next.saturating_add(1);
+                }
+                next
+            });
+            if tx.body.nonce > next {
+                screened.gapped.push(id);
+            } else {
+                screened.candidates.push((id, tx));
+            }
+        }
+        let mut backlog = BTreeMap::<PublicKey, (u64, u64)>::new();
+        for tx in &i.backlog {
+            let (low, high) = backlog
+                .entry(tx.body.sender)
+                .or_insert((tx.body.nonce, tx.body.nonce));
+            *low = (*low).min(tx.body.nonce);
+            *high = (*high).max(tx.body.nonce);
+        }
+        let mut chained: Vec<_> = screened.candidates.iter().collect();
+        chained.sort_by_key(|(_, tx)| (tx.body.sender, tx.body.nonce));
+        for (id, tx) in chained {
+            if let Some((low, high)) = backlog.get_mut(&tx.body.sender)
+                && (*low..=high.saturating_add(1)).contains(&tx.body.nonce)
+            {
+                *high = (*high).max(tx.body.nonce);
+                screened.waiting.insert(*id);
+            }
+        }
+        Ok(screened)
+    }
     /// One next-block selection plus its capacity-displaced backlog. Only
     /// `retained` identities, entries already pooled or recovered from detached
-    /// blocks, may wait in the backlog; a newcomer that does not fit is refused.
+    /// blocks and newcomers waiting behind their sender's backlog chain, may
+    /// wait in the backlog; any other newcomer that does not fit is refused.
+    /// Every pool entry was authenticated when it entered the pool, and every
+    /// detached block transaction when its block executed, so only candidates
+    /// outside `authenticated` have their signatures checked.
     fn select_pool(
         chain: &Chain,
         miner: PublicKey,
         candidates: &[Transaction],
         retained: &HashSet<Hash>,
+        authenticated: &HashSet<Hash>,
     ) -> Result<(Vec<Transaction>, Vec<Transaction>)> {
-        let selection =
-            chain.select_transactions(miner, candidates, mempool_limit(&chain.config))?;
+        let selection = chain.select_authenticated(
+            miner,
+            candidates,
+            mempool_limit(&chain.config),
+            authenticated,
+        )?;
         #[cfg(test)]
-        POOL_SIGNATURES.with(|count| count.set(count.get() + selection.signatures_checked));
+        {
+            POOL_SELECTIONS.with(|count| count.set(count.get() + 1));
+            POOL_SIGNATURES.with(|count| count.set(count.get() + selection.signatures_checked));
+        }
         let backlog = Self::displaced(chain, miner, &selection, candidates, retained)?;
         Ok((selection.transactions, backlog))
     }
@@ -1245,7 +1353,8 @@ impl Node {
     /// bytes and weight was refused for validity: it is dropped with its sender's
     /// later nonces. Weights quoted against the parent state can only overstate
     /// in-block weights, so a fitting estimate is conservative. The best bids
-    /// are kept within MAX_BACKLOG entries and one block's bytes.
+    /// are kept within MAX_BACKLOG entries and one block's bytes, independent
+    /// of the selection's size: a count-saturated selection keeps its backlog.
     fn displaced(
         chain: &Chain,
         miner: PublicKey,
@@ -1303,7 +1412,7 @@ impl Node {
             let id = codec::transaction_id(transaction);
             if !retained.contains(&id)
                 || !seen.insert(id)
-                || Self::admissible(chain, transaction, false).is_err()
+                || Self::admissible(chain, transaction).is_err()
             {
                 continue;
             }
@@ -1354,12 +1463,11 @@ impl Node {
             }
         }
         waiting.sort_by(|a, b| better(a, b));
-        let room = MAX_BACKLOG.min(limit.saturating_sub(selection.transactions.len()));
         let mut bytes = 0usize;
         let mut kept = BTreeMap::<PublicKey, HashSet<u64>>::new();
         let mut backlog = Vec::new();
         for entry in waiting {
-            if backlog.len() == room {
+            if backlog.len() == MAX_BACKLOG {
                 break;
             }
             let Some(total) = bytes
@@ -1400,6 +1508,7 @@ impl Node {
             i.template = None;
         }
         if changed {
+            i.pool_revision = i.pool_revision.wrapping_add(1);
             self.publish(i)?;
         }
         Ok(changed)
@@ -1412,11 +1521,11 @@ impl Node {
         }
         let candidates: Vec<Transaction> = i
             .pending()
-            .filter(|tx| Self::admissible(&i.chain, tx, false).is_ok())
+            .filter(|tx| Self::admissible(&i.chain, tx).is_ok())
             .cloned()
             .collect();
         let retained = candidates.iter().map(codec::transaction_id).collect();
-        let pool = Self::select_pool(&i.chain, self.miner, &candidates, &retained)?;
+        let pool = Self::select_pool(&i.chain, self.miner, &candidates, &retained, &retained)?;
         self.install_pool(i, pool)?;
         Ok(())
     }
@@ -1442,15 +1551,17 @@ impl Node {
             return Ok(template.clone());
         }
         let candidates: Vec<Transaction> = i.pending().cloned().collect();
-        let (selected, block) = i.chain.select_template(
+        // Every pool entry was authenticated when it entered the pool.
+        let retained = Self::pool_ids(&i);
+        let (selected, block) = i.chain.select_template_authenticated(
             self.miner,
             &candidates,
             mempool_limit(&i.chain.config),
             Self::timestamp(&i.chain),
+            &retained,
         )?;
         // The pool normally is this selection already; publish only a change.
         if selected.transactions != i.mempool || i.pool_tip != i.chain.tip_hash() {
-            let retained = candidates.iter().map(codec::transaction_id).collect();
             let backlog = Self::displaced(&i.chain, self.miner, &selected, &candidates, &retained)?;
             self.install_pool(&mut i, (selected.transactions, backlog))?;
         }
@@ -1463,9 +1574,10 @@ impl Node {
         Self::screen_signed(&tx)
             .map_err(|error| anyhow!("transaction not valid in next block: {error:#}"))?;
         let mut i = self.locked()?;
-        self.submit_locked(&mut i, tx)
+        self.submit_locked(&mut i, tx, true)
     }
-    fn submit_locked(&self, i: &mut Inner, tx: Transaction) -> Result<Hash> {
+    /// `screened` newcomers were already authenticated by `screen_signed`.
+    fn submit_locked(&self, i: &mut Inner, tx: Transaction, screened: bool) -> Result<Hash> {
         let id = codec::transaction_id(&tx);
         if i.pending().any(|t| codec::transaction_id(t) == id) {
             return Ok(id);
@@ -1479,14 +1591,38 @@ impl Node {
                     .transaction_bytes(&i.chain.tip_state().settings),
             "transaction too large"
         );
-        Self::admissible(&i.chain, &tx, true)
+        Self::admissible(&i.chain, &tx)
             .map_err(|error| anyhow!("transaction not valid in next block: {error}"))?;
-        let retained = Self::pool_ids(i);
+        let (gapped, waits) = {
+            let mut newcomer = self.screen_newcomers(i, vec![(id, &tx)])?;
+            if let Some((_, error)) = newcomer.unpayable.pop() {
+                bail!("transaction not valid in next block: {error:#}");
+            }
+            (!newcomer.gapped.is_empty(), newcomer.waiting.contains(&id))
+        };
+        ensure!(
+            !gapped,
+            "transaction not valid in next block: an earlier nonce from this sender is not pending"
+        );
+        let mut retained = Self::pool_ids(i);
+        let mut authenticated = retained.clone();
+        if screened {
+            authenticated.insert(id);
+        }
+        if waits {
+            retained.insert(id);
+        }
         let mut candidates: Vec<Transaction> = i.pending().cloned().collect();
         candidates.push(tx);
-        let pool = Self::select_pool(&i.chain, self.miner, &candidates, &retained)?;
+        let pool = Self::select_pool(&i.chain, self.miner, &candidates, &retained, &authenticated)?;
+        let accepted = pool.0.iter().chain(&pool.1).any(|t| codec::transaction_id(t) == id);
+        if !accepted && waits {
+            bail!(
+                "block capacity exhausted: an earlier transaction from this sender is still waiting for capacity, and this one does not outbid the waiting backlog"
+            );
+        }
         ensure!(
-            pool.0.iter().any(|t| codec::transaction_id(t) == id),
+            accepted,
             "transaction not valid in next block or block capacity exhausted"
         );
         self.install_pool(i, pool)?;
@@ -1519,7 +1655,7 @@ impl Node {
                 nonce: request.nonce,
             },
         )?;
-        self.submit_locked(&mut i, crypto::sign(&body, &secret)?)
+        self.submit_locked(&mut i, crypto::sign(&body, &secret)?, false)
     }
     fn prepare_locked(
         &self,
@@ -1602,22 +1738,28 @@ impl Node {
         let changed = submitted?;
         if changed {
             i.template = None;
-            let mut pending = std::mem::take(&mut i.mempool);
-            pending.append(&mut i.backlog);
-            // Publish the newly committed tip immediately, with an empty valid pool.
-            // Recovery may need disk access and cannot roll back a committed block.
-            let recovered = (|| -> Result<()> {
-                self.publish(&i)?;
-                self.recover_pool(&mut i, old_tip, &pending)
-            })();
-            if let Err(error) = recovered {
-                // Keep every earlier entry; the next selection revalidates them.
-                eprintln!("Pending transaction recovery deferred: {error:#}");
-                i.mempool = pending;
-                i.backlog.clear();
-                i.pool_tip = old_tip;
-                if let Err(error) = self.publish(&i) {
-                    eprintln!("Pending transaction publication deferred: {error:#}");
+            let pending: Vec<Transaction> = i.pending().cloned().collect();
+            // Recovery may need disk access and cannot roll back a committed
+            // block. The new tip is published once, together with its recovered
+            // pool, so no reader sees it without the entries still pending.
+            match self.recover_pool(&mut i, old_tip, &pending) {
+                Ok(true) => {}
+                // An unchanged pool still has a new tip to publish.
+                Ok(false) => {
+                    if let Err(error) = self.publish(&i) {
+                        eprintln!("New tip publication deferred: {error:#}");
+                    }
+                }
+                Err(error) => {
+                    // Keep every earlier entry; the next selection revalidates them.
+                    eprintln!("Pending transaction recovery deferred: {error:#}");
+                    i.mempool = pending;
+                    i.backlog.clear();
+                    i.pool_tip = old_tip;
+                    i.pool_revision = i.pool_revision.wrapping_add(1);
+                    if let Err(error) = self.publish(&i) {
+                        eprintln!("Pending transaction publication deferred: {error:#}");
+                    }
                 }
             }
         }
@@ -1627,9 +1769,12 @@ impl Node {
     /// transactions from an abandoned branch or same-height fork. Only header
     /// metadata is walked to the fork point, and each detached body is loaded
     /// once, oldest first, so nonce predecessors precede their successors.
-    /// Anchor and nonce checks drop stale entries before any signature check;
-    /// examination stops after MAX_RECOVERY_EXAMINED blocks and transactions.
-    fn recover_pool(&self, i: &mut Inner, old_tip: Hash, pending: &[Transaction]) -> Result<()> {
+    /// Anchor, nonce and funded-sender checks drop stale entries before the
+    /// selection, which checks no signatures: pending entries were authenticated
+    /// when pooled and detached ones when their blocks executed. Examination
+    /// stops after MAX_RECOVERY_EXAMINED blocks and transactions. Returns
+    /// whether the installed pool changed and was therefore published.
+    fn recover_pool(&self, i: &mut Inner, old_tip: Hash, pending: &[Transaction]) -> Result<bool> {
         #[cfg(test)]
         ensure!(
             !FAIL_RECOVERY.with(|fail| fail.replace(false)),
@@ -1656,9 +1801,7 @@ impl Node {
         let mut ids = HashSet::new();
         let mut candidates = Vec::new();
         for tx in pending {
-            if ids.insert(codec::transaction_id(tx))
-                && Self::admissible(&i.chain, tx, false).is_ok()
-            {
+            if ids.insert(codec::transaction_id(tx)) && Self::admissible(&i.chain, tx).is_ok() {
                 candidates.push(tx.clone());
             }
         }
@@ -1675,9 +1818,7 @@ impl Node {
                 {
                     break 'blocks;
                 }
-                if ids.insert(codec::transaction_id(tx))
-                    && Self::admissible(&i.chain, tx, false).is_ok()
-                {
+                if ids.insert(codec::transaction_id(tx)) && Self::admissible(&i.chain, tx).is_ok() {
                     candidates.push(tx.clone());
                 }
             }
@@ -1685,9 +1826,8 @@ impl Node {
         candidates.truncate(MAX_SELECTION_CANDIDATES);
         // Each candidate was pooled or included before, so each may wait.
         let retained = candidates.iter().map(codec::transaction_id).collect();
-        let pool = Self::select_pool(&i.chain, self.miner, &candidates, &retained)?;
-        self.install_pool(i, pool)?;
-        Ok(())
+        let pool = Self::select_pool(&i.chain, self.miner, &candidates, &retained, &retained)?;
+        self.install_pool(i, pool)
     }
     /// Also used on runtime workers, so it compares with the published tip.
     /// Submitting a solved block still validates it against the chain itself.
@@ -1721,11 +1861,12 @@ impl Node {
             let i = self.locked()?;
             let candidates: Vec<Transaction> = i.pending().cloned().collect();
             i.chain
-                .select_template(
+                .select_template_authenticated(
                     recipient,
                     &candidates,
                     mempool_limit(&i.chain.config),
                     Self::timestamp(&i.chain),
+                    &Self::pool_ids(&i),
                 )?
                 .1
         };
@@ -2058,7 +2199,9 @@ impl Node {
             let rejected = self.rejected_locked();
             for tx in &msg.transactions {
                 let id = codec::transaction_id(tx);
-                if !rejected.contains(&id, &view.chain.tip_hash()) && seen.insert(id) {
+                if !rejected.contains(&id, &view.chain.tip_hash(), view.pool_revision)
+                    && seen.insert(id)
+                {
                     fresh.push((id, tx));
                 }
             }
@@ -2066,7 +2209,7 @@ impl Node {
         fresh.retain(|(id, tx)| {
             let authentic = Self::screen_signed(tx).is_ok();
             if !authentic {
-                self.rejected_locked().insert(*id, None);
+                self.rejected_locked().insert(*id, Refusal::Permanent);
             }
             authentic
         });
@@ -2075,34 +2218,56 @@ impl Node {
         }
         let mut i = self.locked()?;
         let tip = i.chain.tip_hash();
-        let retained = Self::pool_ids(&i);
-        let mut candidates: Vec<Transaction> = i.pending().cloned().collect();
-        let mut added = Vec::new();
+        let mut retained = Self::pool_ids(&i);
+        let mut newcomers = Vec::new();
         for (id, tx) in fresh {
-            if retained.contains(&id) {
+            if retained.contains(&id)
+                || self.rejected_locked().contains(&id, &tip, i.pool_revision)
+            {
                 continue;
             }
-            if Self::admissible(&i.chain, tx, true).is_err() {
-                self.rejected_locked().insert(id, Some(tip));
+            if Self::admissible(&i.chain, tx).is_err() {
+                self.rejected_locked().insert(id, Refusal::Tip(tip));
                 continue;
             }
-            candidates.push(tx.clone());
-            added.push(id);
+            newcomers.push((id, tx));
         }
-        // Reselect only for a new admissible candidate.
-        if added.is_empty() {
+        if newcomers.is_empty() {
             return Ok(());
         }
-        let pool = Self::select_pool(&i.chain, self.miner, &candidates, &retained)?;
-        let selected: HashSet<_> = pool.0.iter().map(codec::transaction_id).collect();
+        let screened = self.screen_newcomers(&i, newcomers)?;
         {
-            // A refused newcomer is not reconsidered until the tip changes.
             let mut rejected = self.rejected_locked();
-            for id in added.into_iter().filter(|id| !selected.contains(id)) {
-                rejected.insert(id, Some(tip));
+            for (id, _) in &screened.unpayable {
+                rejected.insert(*id, Refusal::Tip(tip));
             }
         }
+        // Reselect only for a new candidate that a selection could include.
+        // One after a missing earlier nonce is skipped but not remembered:
+        // its predecessor may still arrive on this tip.
+        if screened.candidates.is_empty() {
+            return Ok(());
+        }
+        let mut authenticated = retained.clone();
+        let mut candidates: Vec<Transaction> = i.pending().cloned().collect();
+        for (id, tx) in &screened.candidates {
+            authenticated.insert(*id);
+            candidates.push((*tx).clone());
+        }
+        retained.extend(&screened.waiting);
+        let pool = Self::select_pool(&i.chain, self.miner, &candidates, &retained, &authenticated)?;
+        let accepted: HashSet<_> =
+            pool.0.iter().chain(&pool.1).map(codec::transaction_id).collect();
         self.install_pool(&mut i, pool)?;
+        // A newcomer that lost this selection is reconsidered once the tip or
+        // the pool changes, for example after a competing chain is replaced.
+        let refusal = Refusal::Pool(tip, i.pool_revision);
+        let mut rejected = self.rejected_locked();
+        for (id, _) in &screened.candidates {
+            if !accepted.contains(id) {
+                rejected.insert(*id, refusal);
+            }
+        }
         Ok(())
     }
     #[cfg(test)]
@@ -2869,12 +3034,7 @@ impl Node {
                     json!({"height":block.height,"hash":hex::encode(codec::block_hash(&block)),"included":included}),
                 )
             }
-            "peers" => Ok(json!(
-                *self
-                    .peer_events
-                    .lock()
-                    .map_err(|_| anyhow!("diagnostic lock poisoned"))?
-            )),
+            "peers" => Ok(json!(*self.peer_events.unpoisoned())),
             "peerstatus" => self.peer_status(),
 
             "submittransaction" => {
@@ -2936,11 +3096,7 @@ impl Node {
     fn mining_status(&self) -> Result<Value> {
         let view = self.read_view()?;
         let chain_id = view.chain.chain_id();
-        let mut result = self
-            .mining
-            .lock()
-            .map_err(|_| anyhow!("mining statistics lock poisoned"))?
-            .value(&self.miner, &chain_id)?;
+        let mut result = self.mining.unpoisoned().value(&self.miner, &chain_id)?;
         result["target_block_seconds"] = json!(view.chain.tip_state().settings.interval);
         result["daa_half_life_seconds"] = json!(view.chain.config.daa_half_life);
         result["minimum_work"] = json!(
@@ -3479,10 +3635,9 @@ impl Drop for Server {
         for task in &self.tasks {
             task.abort();
         }
-        if let Ok(mut mining) = self.mining.lock() {
-            mining.enabled = false;
-            mining.workers.clear();
-        }
+        let mut mining = self.mining.unpoisoned();
+        mining.enabled = false;
+        mining.workers.clear();
     }
 }
 
@@ -3529,10 +3684,7 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
         "peer discovery requires explicit open authenticated transport"
     );
     {
-        let mut health = node
-            .peer_health
-            .lock()
-            .map_err(|_| anyhow!("peer health lock poisoned"))?;
+        let mut health = node.peer_health.unpoisoned();
         for peer in &options.peers {
             health.entry(*peer).or_insert_with(|| PeerHealth {
                 configured_at: now(),
@@ -3575,10 +3727,7 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
             &options.peers,
             now(),
         )?;
-        *node
-            .discovery
-            .lock()
-            .map_err(|_| anyhow!("peer discovery lock poisoned"))? = Some(book);
+        *node.discovery.unpoisoned() = Some(book);
     }
     let public_web = match options.public_web {
         Some(address) => Some(TcpListener::bind(address).await?),
@@ -3594,10 +3743,7 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
     let session_token = hex::encode(random_token);
     write_session_token(&node.session_token_path, &session_token)?;
     {
-        let mut mining = node
-            .mining
-            .lock()
-            .map_err(|_| anyhow!("mining statistics lock poisoned"))?;
+        let mut mining = node.mining.unpoisoned();
         ensure!(!mining.enabled, "this node already has a mining listener");
         *mining = MiningRuntime {
             enabled: options.stratum_enabled,
@@ -3665,7 +3811,7 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
             private_http.clone()
         };
         let protected = protected.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.push(service_task("listener", async move {
             let mut clients = tokio::task::JoinSet::new();
             let mut accept_failures = 0u32;
             loop { tokio::select! {
@@ -3723,8 +3869,8 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
         }));
     }
     if node.discovery_options.enabled {
-        tasks.push(tokio::spawn(discovery_loop(node.clone(), rx.clone())));
-        tasks.push(tokio::spawn(discovery_seed_loop(node.clone(), rx.clone())));
+        tasks.push(service_task("peer discovery", discovery_loop(node.clone(), rx.clone())));
+        tasks.push(service_task("discovery seed", discovery_seed_loop(node.clone(), rx.clone())));
     }
     for peer in options
         .peers
@@ -3733,7 +3879,7 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
     {
         let n = node.clone();
         let mut shutdown = rx.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.push(service_task("peer synchronization", async move {
             let mut failures=0u32;
             loop {
                 let result=tokio::select! { _ = shutdown.changed() => break, result=sync_peer(&n, peer) => result };
@@ -3755,6 +3901,32 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
         stop,
         tasks,
         _lease: lease,
+    })
+}
+/// Long-lived service loops (listeners, configured-peer synchronization and
+/// discovery) have no supervisor inside the process: a panic in one would
+/// leave a running node that silently stopped that service. Exit instead,
+/// like a poisoned node lock, for a supervised restart. Sessions spawned by a
+/// listener stay isolated; a panic there closes only that connection.
+fn service_task(
+    name: &'static str,
+    task: impl std::future::Future<Output = ()> + Send + 'static,
+) -> JoinHandle<()> {
+    // Stopping or dropping the server aborts the supervisor; abort the service with it.
+    struct AbortOnDrop(tokio::task::AbortHandle);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let service = tokio::spawn(task);
+    let abort = AbortOnDrop(service.abort_handle());
+    tokio::spawn(async move {
+        let _abort = abort;
+        if service.await.is_err_and(|error| error.is_panic()) {
+            eprintln!("fatal: {name} task panicked; exiting for a supervised restart");
+            std::process::exit(70);
+        }
     })
 }
 fn random_u64() -> u64 {
@@ -3814,9 +3986,7 @@ async fn discovery_seed_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
             };
             match resolved {
                 Ok(Ok(addresses)) => {
-                    if let Ok(mut guard) = node.discovery.lock()
-                        && let Some(book) = guard.as_mut()
-                    {
+                    if let Some(book) = node.discovery.unpoisoned().as_mut() {
                         for address in addresses.take(peer_discovery::MAX_SEED_RESULTS) {
                             book.add_seed(address, seed, now());
                         }
@@ -3840,9 +4010,7 @@ async fn discovery_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
     let mut saved_at = 0;
     loop {
         let candidates = {
-            let Ok(mut guard) = node.discovery.lock() else {
-                break;
-            };
+            let mut guard = node.discovery.unpoisoned();
             let Some(book) = guard.as_mut() else { break };
             book.next(now(), 2usize.saturating_sub(workers.len()))
         };
@@ -3861,10 +4029,9 @@ async fn discovery_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
                 if matches!(result, Ok(Ok(()))) {
                     let query = n
                         .discovery
-                        .lock()
-                        .ok()
-                        .and_then(|mut g| g.as_mut().map(|b| b.needs_discovery(peer, now())))
-                        .unwrap_or(false);
+                        .unpoisoned()
+                        .as_mut()
+                        .is_some_and(|b| b.needs_discovery(peer, now()));
                     if query {
                         // A separate exchange cannot change Sync/Ack semantics or
                         // cause an authenticated connection to retry unsigned.
@@ -3881,8 +4048,7 @@ async fn discovery_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
             _=shutdown.changed()=>break,
             Some(result)=workers.join_next(),if !workers.is_empty()=>{
                 if let Ok((peer,success))=result
-                    && let Ok(mut guard)=node.discovery.lock()
-                    && let Some(book)=guard.as_mut() {
+                    && let Some(book)=node.discovery.unpoisoned().as_mut() {
                     book.finished(peer,success,now(),random_u64());
                 }
             }
@@ -3900,8 +4066,7 @@ async fn discovery_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
 /// Serialize under the discovery lock only when the persisted form changed;
 /// the file write and its fsync run on a blocking worker without the lock.
 async fn persist_address_book(node: &Node) {
-    let pending = node.discovery.lock().ok().and_then(|mut guard| {
-        let book = guard.as_mut()?;
+    let pending = node.discovery.unpoisoned().as_mut().and_then(|book| {
         match book.pending_save() {
             Ok(pending) => pending.map(|bytes| (book.path().to_path_buf(), bytes)),
             Err(error) => {
@@ -3919,9 +4084,7 @@ async fn persist_address_book(node: &Node) {
     .await
     .map_err(|error| anyhow!("address book worker failed: {error}"))
     .and_then(|result| result);
-    if let Ok(mut guard) = node.discovery.lock()
-        && let Some(book) = guard.as_mut()
-    {
+    if let Some(book) = node.discovery.unpoisoned().as_mut() {
         match result {
             Ok(bytes) => {
                 book.mark_saved(bytes);
@@ -3982,10 +4145,7 @@ async fn discover_peer(node: &Node, peer: SocketAddr) -> Result<()> {
         } => {
             ensure!(remote_chain == chain, "discovery chain mismatch");
             ensure!(identity != node.discovery_id, "self discovery connection");
-            let mut guard = node
-                .discovery
-                .lock()
-                .map_err(|_| anyhow!("peer discovery lock poisoned"))?;
+            let mut guard = node.discovery.unpoisoned();
             guard
                 .as_mut()
                 .context("discovery stopped")?
@@ -4054,10 +4214,7 @@ async fn peer_session_steps(node: &Node, mut stream: TcpStream, admission: &Sess
             );
             ensure!(identity != node.discovery_id, "self discovery connection");
             let reply = {
-                let mut guard = node
-                    .discovery
-                    .lock()
-                    .map_err(|_| anyhow!("peer discovery lock poisoned"))?;
+                let mut guard = node.discovery.unpoisoned();
                 let book = guard.as_mut().context("peer discovery disabled")?;
                 if let Some(address) = advertise {
                     book.advertisement(remote, address, now());
@@ -4089,16 +4246,12 @@ async fn peer_session_steps(node: &Node, mut stream: TcpStream, admission: &Sess
     Ok(())
 }
 pub async fn sync_peer(node: &Node, peer: SocketAddr) -> Result<()> {
-    if let Ok(mut health) = node.peer_health.lock() {
-        // Only configured peers enter this bounded map; manual diagnostics cannot grow it.
-        if let Some(h) = health.get_mut(&peer) {
-            h.last_attempt = now();
-        }
+    // Only configured peers enter this bounded map; manual diagnostics cannot grow it.
+    if let Some(h) = node.peer_health.unpoisoned().get_mut(&peer) {
+        h.last_attempt = now();
     }
     let result = sync_peer_inner(node, peer).await;
-    if let Ok(mut health) = node.peer_health.lock()
-        && let Some(h) = health.get_mut(&peer)
-    {
+    if let Some(h) = node.peer_health.unpoisoned().get_mut(&peer) {
         if sync_completed(&result) {
             h.last_success = now();
             h.failures = 0;
@@ -5404,6 +5557,7 @@ mod read_admission_tests {
                 state: Arc::new(s),
             },
             mempool,
+            pool_revision: 0,
             cache: Arc::default(),
         }
     }
@@ -6371,9 +6525,7 @@ async fn new_job<W: AsyncWrite + Unpin>(
     })
     .await
     .context("mining job worker failed")??;
-    if let Ok(mut stats) = node.mining.lock()
-        && let Some(worker) = stats.workers.get_mut(&worker_id)
-    {
+    if let Some(worker) = node.mining.unpoisoned().workers.get_mut(&worker_id) {
         worker.difficulty = job.difficulty;
     }
     write_json(
@@ -6523,7 +6675,7 @@ async fn stratum_session(
                                 return Ok(json!(false));
                             }
                             let identity = u32::from_le_bytes(extra);
-                            let mut runtime = node.mining.lock().map_err(|_|anyhow!("mining statistics lock poisoned"))?;
+                            let mut runtime = node.mining.unpoisoned();
                             if runtime.workers.len() >= MAX_CONNECTIONS { at_capacity = true; bail!("mining worker capacity reached"); }
                             runtime.workers.insert(identity,MiningWorker {worker:name.to_owned(),accepted:0,rejected:0,blocks:0,difficulty,last_share:None});
                             registration = Some(MiningConnection {runtime:node.mining.clone(),id:identity});
@@ -6606,7 +6758,7 @@ async fn stratum_session(
                             } else { Ok(()) };
                             accepted.map(|()| {
                                 seen.insert(hash, submitted_parent);
-                                if let Ok(mut stats) = node.mining.lock() { stats.submission(registration.as_ref().map(|r|r.id),Some((work.as_ref(),is_block))); }
+                                node.mining.unpoisoned().submission(registration.as_ref().map(|r|r.id),Some((work.as_ref(),is_block)));
                                 refresh |= is_block;
                                 // Raise a fast reporting stream's difficulty instead of
                                 // letting it reach the session request limit. A job capped
@@ -6628,7 +6780,7 @@ async fn stratum_session(
                     };
                 }
                 let successful = result.is_ok();
-                if method=="mining.submit" && !successful && let Ok(mut stats)=node.mining.lock() { stats.submission(registration.as_ref().map(|r|r.id),None); }
+                if method=="mining.submit" && !successful { node.mining.unpoisoned().submission(registration.as_ref().map(|r|r.id),None); }
                 let denied = method=="mining.authorize" && !authorized;
                 let response = match result {
                     Ok(v) => json!({"id":id,"result":v,"error":null}),
@@ -7281,6 +7433,7 @@ mod tests {
                     state: Arc::new(s),
                 },
                 mempool: vec![],
+                pool_revision: 0,
                 cache: Arc::default(),
             },
             key,

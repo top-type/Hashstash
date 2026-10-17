@@ -114,7 +114,16 @@ fn restrict_permissions(path: &Path) -> Result<()> {
 }
 
 impl WalletStore {
+    #[cfg(test)]
     pub fn open(chain_path: &Path, chain_id: Hash) -> Result<Self> {
+        let store = Self::open_unrecorded(chain_path, chain_id)?;
+        store.record_network()?;
+        Ok(store)
+    }
+    /// Load and validate the store without recording the network opening it.
+    /// A node checks its wallets before the chain replay, and records the
+    /// network only once its chain database has accepted this configuration.
+    pub fn open_unrecorded(chain_path: &Path, chain_id: Hash) -> Result<Self> {
         let path = chain_path.with_extension("wallets.sqlite");
         ensure!(
             path != chain_path,
@@ -127,28 +136,6 @@ impl WalletStore {
             CREATE TABLE IF NOT EXISTS wallets(id TEXT PRIMARY KEY,name TEXT NOT NULL,public BLOB NOT NULL,secret BLOB);
             CREATE TABLE IF NOT EXISTS wallet_selection(singleton INTEGER PRIMARY KEY CHECK(singleton=1),active TEXT NOT NULL,revision TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS wallet_network(singleton INTEGER PRIMARY KEY CHECK(singleton=1),chain_id TEXT NOT NULL);")?;
-        // Keys are independent of chain state, but sidecar names derive from the
-        // chain path's stem: say so when another network opens this store.
-        let previous: Option<String> = connection
-            .query_row(
-                "SELECT chain_id FROM wallet_network WHERE singleton=1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if previous.as_deref() != Some(hex::encode(chain_id).as_str()) {
-            if let Some(previous) = &previous {
-                eprintln!(
-                    "Warning: wallet storage {} was last opened for chain {previous}; this network is {}. Its saved keys are shared by both networks.",
-                    path.display(),
-                    hex::encode(chain_id)
-                );
-            }
-            connection.execute(
-                "INSERT INTO wallet_network(singleton,chain_id) VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET chain_id=excluded.chain_id",
-                params![hex::encode(chain_id)],
-            )?;
-        }
         let selection: Option<(String, String)> = connection
             .query_row(
                 "SELECT active,revision FROM wallet_selection WHERE singleton=1",
@@ -225,6 +212,32 @@ impl WalletStore {
             fresh,
             chain_id,
         })
+    }
+    /// Keys are independent of chain state, but sidecar names derive from the
+    /// chain path's stem: say so when another network opens this store.
+    pub fn record_network(&self) -> Result<()> {
+        let chain_id = hex::encode(self.chain_id);
+        let previous: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT chain_id FROM wallet_network WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if previous.as_deref() != Some(chain_id.as_str()) {
+            if let Some(previous) = &previous {
+                eprintln!(
+                    "Warning: wallet storage {} was last opened for chain {previous}; this network is {chain_id}. Its saved keys are shared by both networks.",
+                    self.connection.path().unwrap_or("(unknown path)"),
+                );
+            }
+            self.connection.execute(
+                "INSERT INTO wallet_network(singleton,chain_id) VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET chain_id=excluded.chain_id",
+                params![chain_id],
+            )?;
+        }
+        Ok(())
     }
     pub fn seed_hot(&mut self, secret: [u8; 32]) -> Result<()> {
         let secret = Zeroizing::new(secret);

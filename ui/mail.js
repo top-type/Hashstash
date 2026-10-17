@@ -83,7 +83,7 @@
     }
     async function load(){
       if(!eligible()||loading||paused)return;
-      loading=true;const version=++sequence,stamp=lastWallet;let restarted=false,checkedThisPass=0;
+      loading=true;const version=++sequence,stamp=lastWallet;let restarted=false,truncated=false,checkedThisPass=0;
       if(!cacheLoaded){cacheLoaded=true;const saved=cache.read(context.chain_id,context.key);storageNote=saved.error||'';if(saved.value){cursor=saved.value.cursor;anchor=saved.value.anchor;scanned=saved.value.scanned;omitted=saved.value.omitted;restoreEntries=saved.value.entries;}}
       const current=()=>version===sequence&&stamp===lastWallet&&eligible()&&!paused;render();
       try{
@@ -92,6 +92,10 @@
           try{result=await rpc('explorer_mail',{limit:50,...(cursor?{after:cursor,anchor}:{})});}
           catch(e){
             if(!current())return;
+            // A reorganization above part of the scan keeps what was found at
+            // or below the reported fork height and continues from there once.
+            const fork=/blocks above height (\d{1,16}) were replaced/.exec(String(e.message)),forkCursor=fork&&`${fork[1]}:9223372036854775807`;
+            if(forkCursor&&!truncated&&!restarted&&cursor&&compareCursor(forkCursor,cursor)<0){const height=Number(fork[1]);truncated=true;for(const [txid,value] of opened)if(value.entry.height>height)opened.delete(txid);restoreEntries=restoreEntries.filter(entry=>entry.height<=height);cursor=forkCursor;verifiedTip='';render();continue;}
             if(String(e.message).includes('Mail scan anchor is no longer canonical')&&!restarted){resetScan();restoreEntries=[];const cleared=cache.clear(context.chain_id,context.key);storageNote=cleared.error||'';restarted=true;render();continue;}
             throw e;
           }

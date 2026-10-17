@@ -126,6 +126,20 @@ async function run(){
   eq(h.get('mail-list').children.length,0,'reorg anchor rejection clears all obsolete plaintext');eq(h.get('mail-error').textContent,'');const req=h.calls.filter(x=>x.body.method==='explorer_mail').at(-1).body.params;ok(!Object.hasOwn(req,'after'),'reorg restarts shared scan from canonical history');
  }
  {
+  // A reorganization above part of a completed scan keeps the mail at or
+  // below the fork and continues from there instead of rescanning.
+  const h=await setup(),early=await h.message();await h.publish([early]);const fork=early.height,resume=`${fork}:9223372036854775807`;
+  const late=await h.message({height:fork+1});await h.publish([late]);eq(h.get('mail-list').children.length,2,'both messages are shown before the reorganization');
+  const oldAnchor=h.currentSnapshot.status.tip,good=h.handlers.explorer_mail,before=h.calls.length;
+  h.history=h.history.filter(entry=>entry.height<=fork);h.currentSnapshot.status.tip='de'.repeat(32);
+  h.handlers.explorer_mail=p=>p.anchor===oldAnchor&&p.after!==resume?response({error:{message:`Mail scan anchor is no longer canonical; blocks above height ${fork} were replaced`}}):good(p);
+  await h.refresh();await h.drain();
+  eq(h.get('mail-list').children.length,1,'mail above the fork height is discarded');eq(h.get('mail-error').textContent,'');
+  const requests=h.calls.slice(before).filter(x=>x.body.method==='explorer_mail').map(x=>x.body.params);
+  eq(requests.at(-1).after,resume,'the scan continues from the fork height');eq(requests.at(-1).anchor,oldAnchor,'with the same anchor');
+  ok(requests.every(p=>Object.hasOwn(p,'after')),'mail at or below the fork is not rescanned');
+ }
+ {
   const h=await setup(),m=await h.message();await h.publish([m]);const good=h.handlers.explorer_mail;
   h.handlers.explorer_mail=()=>response({error:{message:'Temporarily unavailable'}});h.currentSnapshot.status.tip='dc'.repeat(32);h.currentSnapshot.status.height++;await h.refresh();await h.drain();
   eq(h.get('mail-list').children.length,0,'unverified new tip hides previously decrypted messages');ok(h.get('mail-scan-status').textContent.includes('Verification pending'));ok(h.get('mail-error').textContent.includes('Temporarily unavailable'));

@@ -310,6 +310,8 @@ pub fn generate_key_file(path: &Path) -> Result<PublicKey> {
     let mut file = options
         .open(path)
         .context("create peer identity (existing files are never overwritten)")?;
+    // Owner-only before the secret is written, on Windows too.
+    crate::local_files::restrict_to_owner(path)?;
     let key = KeyFile {
         format: KEY_FORMAT.to_owned(),
         secret: hex::encode(*identity.secret),

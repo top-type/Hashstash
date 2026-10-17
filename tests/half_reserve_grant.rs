@@ -24,7 +24,7 @@ fn signed(c: &Config, s: &State, operation: Operation) -> Transaction {
         data: Vec::new(),
     };
     for _ in 0..16 {
-        let tx = crypto::sign(&body, &SECRET).unwrap();
+        let tx = crypto::sign(&s.chain_id, &body, &SECRET).unwrap();
         let minimum = fees::quote(c, s, &tx).unwrap().minimum_fee;
         if minimum == body.fee {
             return tx;

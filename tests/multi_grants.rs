@@ -24,6 +24,7 @@ fn config() -> Config {
 }
 fn sign(s: &State, operation: Operation, offset: u64, data: Vec<u8>) -> Transaction {
     crypto::sign(
+        &s.chain_id,
         &TransactionBody {
             sender: key(181),
             nonce: s.account(&key(181), None).unwrap().nonce + offset,
@@ -111,7 +112,7 @@ fn cover_fee(c: &Config, s: &State, mut tx: Transaction) -> Transaction {
             return tx;
         }
         tx.body.fee = required;
-        tx = crypto::sign(&tx.body, &OWNER).unwrap();
+        tx = crypto::sign(&s.chain_id, &tx.body, &OWNER).unwrap();
     }
 }
 fn indexed_key(prefix: u8, index: usize) -> PublicKey {
@@ -314,7 +315,7 @@ fn settlement_leaves_transaction_capacity_and_failed_closing_block_is_atomic() {
     );
     let mut invalid = tx.clone();
     invalid.body.nonce += 1;
-    invalid = crypto::sign(&invalid.body, &OWNER).unwrap();
+    invalid = crypto::sign(&paid.chain_id, &invalid.body, &OWNER).unwrap();
     assert!(
         consensus::execute(
             &c,
@@ -492,7 +493,7 @@ fn maximum_grant_settles_once_with_full_small_block_and_large_account_tree() {
         while body_bytes(&tx) > closing.settings.block_bytes {
             tx.body.data.pop();
         }
-        tx = crypto::sign(&tx.body, &OWNER).unwrap();
+        tx = crypto::sign(&closing.chain_id, &tx.body, &OWNER).unwrap();
         assert_eq!(body_bytes(&tx), closing.settings.block_bytes);
         assert!(fees::quote(&c, &closing, &tx).unwrap().weight <= closing.settings.block_bytes);
         let started = std::time::Instant::now();
@@ -541,7 +542,7 @@ fn maximum_grant_settles_once_with_full_small_block_and_large_account_tree() {
             settled.root()
         );
         tx.body.nonce += 1;
-        tx = crypto::sign(&tx.body, &OWNER).unwrap();
+        tx = crypto::sign(&closing.chain_id, &tx.body, &OWNER).unwrap();
         assert!(
             consensus::execute(&c, &closing, &root_before, &key(181), &0u32.into(), &[tx]).is_err()
         );

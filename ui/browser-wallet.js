@@ -52,6 +52,8 @@
     const digest = noble.sha256(utf8.encode(tag));
     return noble.sha256(concat(digest, digest, data));
   }
+  // The signed chain ID is not transmitted: a signature verifies on one network only.
+  const signingMessage = (chain, body) => tagged('Hashstash/chain-bound-transaction', concat(chain, body));
   function concat(...parts) {
     const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
     let offset = 0; for (const p of parts) { out.set(p, offset); offset += p.length; } return out;
@@ -210,20 +212,21 @@
   }
   function verifyUnsigned(envelope, expected) {
     const decoded = decodeUnsigned(envelope);
-    // Network context is unsigned metadata; the selected node establishes anchor ancestry.
+    // The signature binds the selected network; the export's context must agree with it.
     if (hex(bytes32(expected?.chain_id, 'Network context')) !== envelope.chain_id) fail('Prepared transaction network context does not match the selected network.');
     const bytes = expectedBytes(expected);
     // Compare every canonical byte, including opaque data and all optional fields.
     if (hex(bytes) !== envelope.body.toLowerCase()) fail('Prepared transaction does not match the requested details.');
     return Object.freeze(decoded);
   }
-  function verifySigned(raw, expected = {}) {
+  // `expected.chain_id` names the network the signature must have been made for.
+  function verifySigned(raw, expected) {
     if (!expected || typeof expected !== 'object' || Array.isArray(expected)) fail('Invalid transaction expectations.');
-    if (Object.hasOwn(expected, 'chain_id')) fail('Signed transactions use a block anchor; network context is not a signed field.');
+    const chain = bytes32(expected.chain_id, 'Chain ID');
     const bytes = fromHex(raw, undefined, 'Signed transaction');
     if (bytes.length <= 64) fail('Invalid signed transaction.');
     const body = bytes.subarray(0, -64), decoded = decodeBody(body);
-    if (!noble.schnorr.verify(bytes.subarray(-64), tagged('Hashstash/anchor-only-transaction', body), bytes32(decoded.sender))) fail('Invalid transaction signature.');
+    if (!noble.schnorr.verify(bytes.subarray(-64), signingMessage(chain, body), bytes32(decoded.sender))) fail('Invalid transaction signature for this network.');
     const txid = hex(noble.sha256(noble.sha256(bytes)));
     for (const field of ['sender','anchor','data_hex']) {
       if (expected[field] !== undefined && expected[field] !== decoded[field]) fail('Signed transaction does not match the message.');
@@ -321,14 +324,16 @@
       return pbkdf2(password, B, length);
     } finally { B.fill(0); X.fill(0); Y.fill(0); V.fill(0); t.fill(0); }
   }
-  // hashstash-passphrase-v2: scrypt (N=2^17, r=8, p=1) salted with the tag and
-  // chain ID, then the first valid tagged secret. Each network gets its own account.
+  // hashstash-passphrase-v2: printable ASCII, scrypt (N=2^17, r=8, p=1) salted with
+  // the tag and chain ID, then the first valid tagged secret. Each network gets its
+  // own account. Other text is refused: one visible Unicode phrase has several encodings.
   function derivePrivateV2(passphrase, chainId) {
     requireSecure();
     const chain = bytes32(chainId, 'Chain ID'), phrase = passphraseBytes(passphrase);
     let stretched;
     try {
-      if (phrase.length < 16) fail('Passphrase must contain at least 16 UTF-8 bytes.');
+      if (phrase.some(b => b < 0x20 || b > 0x7e)) fail('Version 2 passphrases use printable ASCII only: letters, digits, punctuation and spaces.');
+      if (phrase.length < 16) fail('Passphrase must contain at least 16 characters.');
       stretched = scrypt(phrase, concat(utf8.encode('Hashstash/Passphrase/v2'), chain), 1 << 17, 8, 1, 32);
       return firstSecret('Hashstash/Passphrase/v2', stretched);
     } finally { phrase.fill(0); stretched?.fill(0); }
@@ -440,7 +445,7 @@
         verifyUnsigned(envelope,expected);
         const secret=secretBytes(w.private_key), aux=random(32);
         try {
-          const body=fromHex(envelope.body), signature=noble.schnorr.sign(tagged('Hashstash/anchor-only-transaction',body),secret,aux);
+          const body=fromHex(envelope.body), signature=noble.schnorr.sign(signingMessage(fromHex(chainId,32),body),secret,aux);
           const raw=concat(body,signature);
           guard(read(),expected);
           return {raw:hex(raw),transaction_id:hex(noble.sha256(noble.sha256(raw)))};

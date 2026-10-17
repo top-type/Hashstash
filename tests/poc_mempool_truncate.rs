@@ -95,7 +95,7 @@ fn unpayable(chain: &Chain, secret: &[u8; 32], nonce: u64, salt: u64) -> Transac
     );
     body.fee = Amount::from(1u32) << 500usize;
     body.expiry_blocks += salt;
-    crypto::sign(&body, secret).unwrap()
+    crypto::sign(&chain.chain_id(), &body, secret).unwrap()
 }
 
 /// Affordable and well ranked, but the zero-amount operation always fails.
@@ -112,7 +112,7 @@ fn failing(chain: &Chain, secret: &[u8; 32], nonce: u64, salt: u64) -> Transacti
     );
     body.fee = 40u32.into();
     body.expiry_blocks += salt;
-    crypto::sign(&body, secret).unwrap()
+    crypto::sign(&chain.chain_id(), &body, secret).unwrap()
 }
 
 /// Fund the attacker and return the chain with `honest` pending payments.
@@ -222,6 +222,7 @@ fn persistent_failures_use_only_their_senders_budget() {
 fn node_self_payment(c: &Config, secret: &[u8; 32], nonce: u64) -> Transaction {
     let sender = crypto::public_key(secret).unwrap();
     crypto::sign(
+        &c.chain_id(),
         &TransactionBody {
             data: Vec::new(),
             sender,

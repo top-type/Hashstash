@@ -25,6 +25,7 @@ fn config(decision_blocks: u64, lead: u64) -> Config {
 }
 fn sign(s: &State, secret: &[u8; 32], fee: u32, operation: Operation) -> Transaction {
     crypto::sign(
+        &s.chain_id,
         &TransactionBody {
             sender: key(secret),
             nonce: s.account(&key(secret), None).unwrap().nonce,
@@ -529,7 +530,7 @@ fn new_governance_records_pay_record_weight() {
     let mut cheap = tx.clone();
     cheap.body.fee = (Amount::from(bytes) * &rate + Amount::from(fees::FEE_SCALE - 1))
         / Amount::from(fees::FEE_SCALE);
-    let cheap = crypto::sign(&cheap.body, &ATTACKER).unwrap();
+    let cheap = crypto::sign(&s.chain_id, &cheap.body, &ATTACKER).unwrap();
     let rejected = consensus::execute(&c, &s, &s.root(), &key(&ATTACKER), &0u32.into(), &[cheap]);
     assert!(rejected.is_err());
     let s = step(&c, &s, &[tx]);

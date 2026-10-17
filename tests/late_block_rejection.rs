@@ -48,6 +48,7 @@ fn append(chain: &mut Chain, transactions: Vec<Transaction>) -> Block {
 
 fn transfer(chain: &Chain, recipient: PublicKey, amount: u32, nonce: u64) -> Transaction {
     crypto::sign(
+        &chain.chain_id(),
         &TransactionBody {
             data: Vec::new(),
             sender: key(&SECRET),
@@ -190,6 +191,7 @@ async fn p2p_late_transaction_failures_are_atomic_on_disk_then_valid_sync_and_re
     let before_status = target.status().unwrap();
     let before_disk = database_bytes(&target_path);
     let mut invalid_hashes = Vec::new();
+    let chain_id = source.chain_id();
 
     for case in 0..3 {
         let mut bad = valid.clone();
@@ -197,16 +199,16 @@ async fn p2p_late_transaction_failures_are_atomic_on_disk_then_valid_sync_and_re
         let expected = match case {
             0 => {
                 transaction.signature[0] ^= 1;
-                crypto::verify(transaction).unwrap_err().to_string()
+                crypto::verify(&chain_id, transaction).unwrap_err().to_string()
             }
             1 => {
                 transaction.body.nonce += 1;
-                *transaction = crypto::sign(&transaction.body, &SECRET).unwrap();
+                *transaction = crypto::sign(&chain_id, &transaction.body, &SECRET).unwrap();
                 "invalid or exhausted nonce".into()
             }
             _ => {
                 transaction.body.fee = 0u32.into();
-                *transaction = crypto::sign(&transaction.body, &SECRET).unwrap();
+                *transaction = crypto::sign(&chain_id, &transaction.body, &SECRET).unwrap();
                 "signed fee is below the mandatory minimum".into()
             }
         };

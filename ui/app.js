@@ -2946,9 +2946,10 @@
             // the transaction forms do. Another account's is not refreshed here.
             let signed = null;
             try {
-                signed = HashstashBrowserWallet.verifySigned(raw);
+                signed = HashstashBrowserWallet.verifySigned(raw, {chain_id: state.status?.chain_id});
             } catch {
-                // The node accepted bytes this page cannot decode; it reports only the ID.
+                // The node accepted bytes this page cannot decode or verify
+                // for its network; it reports only the ID.
             }
             if (signed?.txid === result.transaction_id && signed.sender === key()) {
                 feedback(form, `Pending · ${short(result.transaction_id)}`);

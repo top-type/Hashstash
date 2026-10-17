@@ -152,7 +152,7 @@ impl Explorer {
         reader.rpc_rooted(method, p, c, s, tip, root, mempool)
     }
     pub fn open(path: &Path, chain: &Chain) -> Result<Self> {
-        let db = Connection::open(path.with_extension("explorer.sqlite"))?;
+        let db = Connection::open(crate::local_files::sidecar(path, "explorer.sqlite"))?;
         db.busy_timeout(std::time::Duration::from_millis(500))?;
         db.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
@@ -1306,7 +1306,7 @@ mod page_capacity_tests {
             },
             data,
         };
-        let first = crate::crypto::sign(&body, &secret).unwrap();
+        let first = crate::crypto::sign(&s.chain_id, &body, &secret).unwrap();
         assert!(count > 31_000);
         assert!(
             codec::encode(&first).len() + count * crate::fees::ACCOUNT_WEIGHT as usize + 1024
@@ -1319,7 +1319,7 @@ mod page_capacity_tests {
         for nonce in 0..3 {
             let mut body = body.clone();
             body.nonce = nonce;
-            let transaction = crate::crypto::sign(&body, &secret).unwrap();
+            let transaction = crate::crypto::sign(&s.chain_id, &body, &secret).unwrap();
             let record = mail_value(&s, &transaction, Some(nonce + 1), Some([7; 32]), Some(0))
                 .unwrap()
                 .to_string();
@@ -1350,7 +1350,8 @@ mod page_capacity_tests {
             .unwrap();
             assert_eq!(page.len(), 1);
             let transaction =
-                crate::wallet::decode_signed(page[0]["raw"].as_str().unwrap()).unwrap();
+                crate::wallet::decode_signed(page[0]["raw"].as_str().unwrap(), &s.chain_id)
+                    .unwrap();
             assert_eq!(transaction.body.nonce, previous as u64);
             assert_eq!(
                 page[0]["txid"],
@@ -1972,6 +1973,7 @@ mod indexing_tests {
         parent.issued = 3000u32.into();
         parent.height = 1;
         let tx = crypto::sign(
+            &parent.chain_id,
             &TransactionBody {
                 sender: owner,
                 nonce: 0,
@@ -2354,8 +2356,10 @@ mod indexing_tests {
         let parent_hash = [41; 32];
         index.tip = Some(parent_hash);
         index.states = VecDeque::from([(parent_hash, parent.clone())]);
+        let chain_id = parent.chain_id;
         let make = |nonce, extra: u32| {
             crypto::sign(
+                &chain_id,
                 &TransactionBody {
                     sender: owner,
                     nonce,
@@ -2873,8 +2877,10 @@ mod chat_tests {
         let parent_hash = [42; 32];
         index.tip = Some(parent_hash);
         index.states = VecDeque::from([(parent_hash, parent.clone())]);
+        let chain_id = parent.chain_id;
         let make = |nonce, data| {
             crypto::sign(
+                &chain_id,
                 &TransactionBody {
                     sender: owner,
                     nonce,
@@ -3079,8 +3085,10 @@ mod chat_tests {
         let parent_hash = [41; 32];
         index.tip = Some(parent_hash);
         index.states = VecDeque::from([(parent_hash, parent.clone())]);
+        let chain_id = parent.chain_id;
         let make = |nonce, text: &str, amount| {
             crypto::sign(
+                &chain_id,
                 &TransactionBody {
                     sender: owner,
                     nonce,

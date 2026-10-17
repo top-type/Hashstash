@@ -134,7 +134,18 @@ fn args(items: &[&str]) -> Vec<String> {
     items.iter().map(|item| (*item).to_owned()).collect()
 }
 
+/// The network the mock endpoints report and fixtures are signed for.
+const CHAIN: [u8; 32] = [5; 32];
+
 fn signed_transfer(secret: [u8; 32], nonce: u64) -> hashstash::types::Transaction {
+    signed_transfer_for(&CHAIN, secret, nonce)
+}
+
+fn signed_transfer_for(
+    chain: &[u8; 32],
+    secret: [u8; 32],
+    nonce: u64,
+) -> hashstash::types::Transaction {
     let body = TransactionBody {
         sender: crypto::public_key(&secret).unwrap(),
         nonce,
@@ -147,7 +158,7 @@ fn signed_transfer(secret: [u8; 32], nonce: u64) -> hashstash::types::Transactio
         },
         data: Vec::new(),
     };
-    crypto::sign(&body, &secret).unwrap()
+    crypto::sign(chain, &body, &secret).unwrap()
 }
 
 #[test]
@@ -300,7 +311,7 @@ async fn pending_nonce_discovery_counts_only_signed_rows_and_is_bounded() {
     let client = RpcClient::new(&honest.url(), false).unwrap();
     assert_eq!(
         client
-            .pending_nonce(&sender, ScanBudget::DEFAULT)
+            .pending_nonce(&CHAIN, &sender, ScanBudget::DEFAULT)
             .await
             .unwrap(),
         node::PendingNonce {
@@ -320,7 +331,7 @@ async fn pending_nonce_discovery_counts_only_signed_rows_and_is_bounded() {
     assert_eq!(
         RpcClient::new(&reporting.url(), false)
             .unwrap()
-            .pending_nonce(&sender, ScanBudget::DEFAULT)
+            .pending_nonce(&CHAIN, &sender, ScanBudget::DEFAULT)
             .await
             .unwrap(),
         node::PendingNonce {
@@ -339,7 +350,7 @@ async fn pending_nonce_discovery_counts_only_signed_rows_and_is_bounded() {
     assert_eq!(
         RpcClient::new(&decimal.url(), false)
             .unwrap()
-            .pending_nonce(&sender, ScanBudget::DEFAULT)
+            .pending_nonce(&CHAIN, &sender, ScanBudget::DEFAULT)
             .await
             .unwrap()
             .nonce,
@@ -361,7 +372,7 @@ async fn pending_nonce_discovery_counts_only_signed_rows_and_is_bounded() {
         assert!(
             RpcClient::new(&behind.url(), false)
                 .unwrap()
-                .pending_nonce(&sender, ScanBudget::DEFAULT)
+                .pending_nonce(&CHAIN, &sender, ScanBudget::DEFAULT)
                 .await
                 .is_err()
         );
@@ -380,7 +391,22 @@ async fn pending_nonce_discovery_counts_only_signed_rows_and_is_bounded() {
     assert!(
         RpcClient::new(&forging.url(), false)
             .unwrap()
-            .pending_nonce(&sender, ScanBudget::DEFAULT)
+            .pending_nonce(&CHAIN, &sender, ScanBudget::DEFAULT)
+            .await
+            .is_err()
+    );
+    // Neither can a row signed for another network.
+    let foreign_row = row(&signed_transfer_for(&[6; 32], secret, 40));
+    let foreign = mock(Duration::ZERO, move |method, params| match method {
+        "account" => result(json!({"account":{"nonce":3}})),
+        "mempool" if params["offset"] == 0 => result(json!([foreign_row])),
+        _ => result(json!([])),
+    })
+    .await;
+    assert!(
+        RpcClient::new(&foreign.url(), false)
+            .unwrap()
+            .pending_nonce(&CHAIN, &sender, ScanBudget::DEFAULT)
             .await
             .is_err()
     );
@@ -398,7 +424,7 @@ async fn pending_nonce_discovery_counts_only_signed_rows_and_is_bounded() {
     };
     let error = RpcClient::new(&endless.url(), false)
         .unwrap()
-        .pending_nonce(&sender, budget)
+        .pending_nonce(&CHAIN, &sender, budget)
         .await
         .unwrap_err();
     assert!(format!("{error:#}").contains("--nonce"), "{error:#}");
@@ -416,6 +442,7 @@ async fn pending_nonce_discovery_counts_only_signed_rows_and_is_bounded() {
     let error = RpcClient::new(&slow.url(), false)
         .unwrap()
         .pending_nonce(
+            &CHAIN,
             &sender,
             ScanBudget {
                 bytes: ScanBudget::DEFAULT.bytes,
@@ -453,7 +480,7 @@ async fn a_remote_pending_nonce_above_the_account_needs_consecutive_signed_rows(
     // A bare claim plants nonce 4 with no signed transaction behind it.
     let bare = endpoint(4, Vec::new()).await;
     let error = remote(&bare)
-        .pending_nonce(&sender, ScanBudget::DEFAULT)
+        .pending_nonce(&CHAIN, &sender, ScanBudget::DEFAULT)
         .await
         .unwrap_err();
     assert!(error.to_string().contains("--nonce"), "{error}");
@@ -461,7 +488,7 @@ async fn a_remote_pending_nonce_above_the_account_needs_consecutive_signed_rows(
     let gap = endpoint(5, vec![row(&signed_transfer(secret, 4))]).await;
     assert!(
         remote(&gap)
-            .pending_nonce(&sender, ScanBudget::DEFAULT)
+            .pending_nonce(&CHAIN, &sender, ScanBudget::DEFAULT)
             .await
             .is_err()
     );
@@ -469,7 +496,7 @@ async fn a_remote_pending_nonce_above_the_account_needs_consecutive_signed_rows(
     let justified = endpoint(5, consecutive.clone()).await;
     assert_eq!(
         remote(&justified)
-            .pending_nonce(&sender, ScanBudget::DEFAULT)
+            .pending_nonce(&CHAIN, &sender, ScanBudget::DEFAULT)
             .await
             .unwrap(),
         node::PendingNonce {
@@ -482,13 +509,13 @@ async fn a_remote_pending_nonce_above_the_account_needs_consecutive_signed_rows(
     let local = endpoint(5, consecutive).await;
     let found = RpcClient::new(&local.url(), false)
         .unwrap()
-        .pending_nonce(&sender, ScanBudget::DEFAULT)
+        .pending_nonce(&CHAIN, &sender, ScanBudget::DEFAULT)
         .await
         .unwrap();
     assert_eq!((found.nonce, found.pending), (5, None));
     let current = endpoint(3, Vec::new()).await;
     let found = remote(&current)
-        .pending_nonce(&sender, ScanBudget::DEFAULT)
+        .pending_nonce(&CHAIN, &sender, ScanBudget::DEFAULT)
         .await
         .unwrap();
     assert_eq!((found.nonce, found.pending), (3, None));
@@ -668,23 +695,32 @@ async fn sign_reviews_bodies_and_unsigned_exports_on_stderr() {
     .unwrap();
     let raw_body = directory.path().join("body.json");
     std::fs::write(&raw_body, serde_json::to_vec(&body).unwrap()).unwrap();
-    for (input, network) in [(&export, true), (&raw_body, false)] {
-        let out = directory
-            .path()
-            .join(format!("signed-{network}.json"));
-        let output = cli(
-            &[
-                "sign".into(),
-                "--key".into(),
-                key.to_str().unwrap().into(),
-                "--body".into(),
-                input.to_str().unwrap().into(),
-                "--out".into(),
-                out.to_str().unwrap().into(),
-            ],
-            &[],
-        )
-        .await;
+    let sign = |input: &std::path::PathBuf, out: &std::path::PathBuf, network: Option<[u8; 32]>| {
+        let mut command: Vec<String> = vec![
+            "sign".into(),
+            "--key".into(),
+            key.to_str().unwrap().into(),
+            "--body".into(),
+            input.to_str().unwrap().into(),
+            "--out".into(),
+            out.to_str().unwrap().into(),
+        ];
+        if let Some(network) = network {
+            command.extend(["--chain-id".into(), hex::encode(network)]);
+        }
+        command
+    };
+    // The operator names the network: it is never taken from the export, and
+    // an export prepared for another network is refused.
+    for (input, network) in [(&export, None), (&raw_body, None), (&export, Some([29; 32]))] {
+        let out = directory.path().join("refused.json");
+        let output = cli(&sign(input, &out, network), &[]).await;
+        assert!(!output.status.success(), "{output:?}");
+        assert!(!out.exists());
+    }
+    for (index, input) in [&export, &raw_body].into_iter().enumerate() {
+        let out = directory.path().join(format!("signed-{index}.json"));
+        let output = cli(&sign(input, &out, Some(chain)), &[]).await;
         assert!(output.status.success(), "{output:?}");
         let review = String::from_utf8_lossy(&output.stderr);
         for expected in [
@@ -697,14 +733,13 @@ async fn sign_reviews_bodies_and_unsigned_exports_on_stderr() {
         ] {
             assert!(review.contains(expected), "{expected} missing from {review}");
         }
-        assert_eq!(
-            review.contains(&hashstash::address::encode(&recipient, &chain).unwrap()),
-            network
-        );
+        assert!(review.contains(&hashstash::address::encode(&recipient, &chain).unwrap()));
+        assert!(review.contains(&format!("Network · signed: {}", hex::encode(chain))));
         let signed: hashstash::types::Transaction =
             serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
         assert_eq!(signed.body, body);
-        crypto::verify(&signed).unwrap();
+        crypto::verify(&chain, &signed).unwrap();
+        assert!(crypto::verify(&[29; 32], &signed).is_err());
     }
 }
 
@@ -858,14 +893,15 @@ mod funded {
         let pending = node.rpc("mempool", json!({"format":"hex"})).unwrap();
         let sent: Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(sent["txid"], pending[0]["txid"]);
-        let transaction = wallet::decode_signed(pending[0]["raw"].as_str().unwrap()).unwrap();
+        let transaction =
+            wallet::decode_signed(pending[0]["raw"].as_str().unwrap(), &chain_id).unwrap();
         assert!(transaction.body.fee > 2000u32.into());
         for expected in [
             format!("Fee: {} atoms", transaction.body.fee),
             "account creation 2048 atoms".into(),
             "ceiling 100000 atoms".into(),
             "Nonce source: account nonce 0 reported by the endpoint, pending nonce 0".into(),
-            format!("Network context · unsigned: {}", hex::encode(chain_id)),
+            format!("Network · signed: {}", hex::encode(chain_id)),
         ] {
             assert!(review.contains(&expected), "{expected} missing from {review}");
         }

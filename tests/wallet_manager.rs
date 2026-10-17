@@ -283,7 +283,7 @@ async fn manager_rejects_missing_token_and_foreign_origin_without_mutation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn empty_store_stays_empty_across_restart_and_each_first_action_adds_one_wallet() {
+async fn empty_store_stays_empty_across_plain_restarts_and_each_first_action_adds_one_wallet() {
     let public = crypto::public_key(&[74; 32]).unwrap();
     let imported_secret = [75; 32];
     let imported_public = hex::encode(crypto::public_key(&imported_secret).unwrap());
@@ -301,12 +301,8 @@ async fn empty_store_stays_empty_across_restart_and_each_first_action_adds_one_w
         assert_eq!(initial["wallets"], json!([]));
         assert_eq!(initial["wallet_revision"], 0);
         server.stop().await;
-        // A saved empty selection is a real saved state, not an instruction to
-        // recreate the configured mining account on every startup.
-        let node = Node::open(&path, Config::devnet(), public)
-            .unwrap()
-            .with_wallet([74; 32])
-            .unwrap();
+        // A restart without wallet flags never recreates the mining account.
+        let node = Node::open(&path, Config::devnet(), public).unwrap();
         let server = node::serve(node, options()).await.unwrap();
         let base = format!("http://{}", server.rpc);
         let empty = session(&base).await;
@@ -334,7 +330,11 @@ async fn empty_store_stays_empty_across_restart_and_each_first_action_adds_one_w
             assert_eq!(first["public_key"], imported_public);
         }
         server.stop().await;
-        let node = Node::open(&path, Config::devnet(), public).unwrap();
+        // Once the store holds a wallet, startup flags keep its selection.
+        let node = Node::open(&path, Config::devnet(), public)
+            .unwrap()
+            .with_wallet([74; 32])
+            .unwrap();
         let server = node::serve(node, options()).await.unwrap();
         let restored = session(&format!("http://{}", server.rpc)).await;
         for field in [
@@ -346,6 +346,32 @@ async fn empty_store_stays_empty_across_restart_and_each_first_action_adds_one_w
         ] {
             assert_eq!(restored[field], first[field]);
         }
+        server.stop().await;
+    }
+}
+
+/// A first start that stopped before its flags applied, or ran without
+/// them, leaves an empty store; later startup flags still seed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_flags_seed_a_store_left_empty_by_an_earlier_start() {
+    let secret = [79; 32];
+    let public = crypto::public_key(&secret).unwrap();
+    for hot in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chain.sqlite");
+        drop(Node::open(&path, Config::devnet(), public).unwrap());
+        let node = Node::open(&path, Config::devnet(), public).unwrap();
+        let node = if hot {
+            node.with_wallet(secret).unwrap()
+        } else {
+            node.with_watch_key(public).unwrap()
+        };
+        let server = node::serve(node, options()).await.unwrap();
+        let seeded = session(&format!("http://{}", server.rpc)).await;
+        assert_eq!(seeded["wallets"].as_array().unwrap().len(), 1);
+        assert_eq!(seeded["public_key"], hex::encode(public));
+        assert_eq!(seeded["wallet_mode"], if hot { "hot" } else { "watch" });
+        assert_eq!(seeded["wallet_revision"], 1);
         server.stop().await;
     }
 }

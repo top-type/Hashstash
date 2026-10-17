@@ -170,6 +170,7 @@ fn whole_actual_fee_obeys_the_governed_split() {
         .unwrap();
         let s = consensus::execute(&c, &s, &s.root(), &producer, &(&q * 1000u32), &[]).unwrap();
         let tx = crypto::sign(
+            &s.chain_id,
             &TransactionBody {
                 sender: owner,
                 nonce: s.account(&owner, None).unwrap().nonce,

@@ -48,6 +48,7 @@ fn tx(node: &Node, c: &Config, amount: u64) -> Transaction {
         .as_u64()
         .unwrap();
     crypto::sign(
+        &c.chain_id(),
         &TransactionBody {
             sender: owner(),
             nonce,

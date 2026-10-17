@@ -22,6 +22,12 @@
     try { saved = sessionStorage.getItem(TOKEN_KEY) || ''; } catch { /* No saved session in this tab. */ }
     return /^[0-9a-f]{64}$/.test(saved) ? saved : '';
   }
+  // Warnings for attached proposal text, by the signer's Rationale verdict.
+  const RATIONALE_WARNINGS = {
+    'Matches the hash but is not publishable plain text': 'This text matches the signed description hash, but the node publishes a rationale only as plain UTF-8 text of at most 2,048 bytes without leading or trailing whitespace or control characters, so it will not be shown as the rationale.',
+    mismatch: 'This text is not the proposal’s committed description: its hash differs from the signed description hash, so it will not be published as the rationale.'
+  };
+  const reviewLimitText = () => `Unsigned transaction exceeds this signer’s ${maxReviewBytes}-byte review limit; start hashstash-cold with a larger --max-review-bytes to review it`;
   function unitText(node, text, unit, className) {
     const offset = text.lastIndexOf(unit);
     node.textContent = text.slice(0, offset);
@@ -47,6 +53,7 @@
     $('review-message').hidden = true;
     $('review-message-title').textContent = 'Public message';
     $('review-rationale-warning').hidden = true;
+    $('review-rationale-warning').textContent = '';
     $('review-message-text').textContent = '';
     lifetimeRequired = false;
     $('review-lifetime').hidden = true;
@@ -67,19 +74,21 @@
     $('network-form').hidden = !!chainId;
     $('network-change').hidden = !chainId;
     $('network-chain').value = chainId;
-    $('address').textContent = accountAddress || 'Set the network to show this account’s address.';
+    // An unsaved new key must not be funded: no address or key until backup.
+    $('address').textContent = pendingBackup ? 'Save the backup and confirm it to show this account’s address.' : accountAddress || 'Set the network to show this account’s address.';
+    $('public-key').textContent = pendingBackup ? '' : publicKey;
+    $('unsigned-panel').hidden = !!pendingBackup;
     buttons();
   }
   function buttons() {
-    // An unsaved new key must not be funded: keep its address until backup.
     $('copy-address').disabled = busy || !accountAddress || !!pendingBackup;
     $('export-public').disabled = busy || !accountAddress || watch?.format !== 'hashstash-watch-v2' || !!pendingBackup;
+    $('copy-public').disabled = busy || !publicKey || !!pendingBackup;
   }
   function showWallet(key, context, backup = null) {
     publicKey = key || '';
     pendingBackup = key ? backup : null;
     $('backup-panel').hidden = !pendingBackup;
-    $('public-key').textContent = publicKey;
     $('unlock-panel').hidden = !!key;
     $('wallet').hidden = !key;
     $('lock').hidden = !key;
@@ -97,8 +106,10 @@
     const response = await fetch(`/api/${path}`, {
       method:'POST',cache:'no-store',credentials:'same-origin',
       headers:{'Content-Type':'application/json','X-Hashstash-Cold-Token':sessionToken},
-      body:JSON.stringify(body)
+      body:typeof body === 'string' ? body : JSON.stringify(body)
     });
+    // The size limit answers before the signer does, without a JSON body.
+    if (response.status === 413) throw new Error(path === 'review' ? reviewLimitText() : 'Request is too large');
     let value;
     try { value = await response.json(); } catch { throw new Error('Signer unavailable'); }
     if (response.status === 403) throw new Error(NO_SESSION);
@@ -225,6 +236,7 @@
   $('backup-done').addEventListener('click', () => action(async () => {
     const result = await api('backup', {saved:true});
     pendingBackup = null; $('backup-panel').hidden = true; networkView(result);
+    say('Backup confirmed. The signer will not show this private key again.');
   }));
   $('lock').addEventListener('click', () => action(async () => {
     const result = await api('lock');
@@ -244,7 +256,7 @@
     const file = $('unsigned-file').files[0];
     if (!file) return;
     try {
-      if (file.size > maxReviewBytes) throw new Error(`Unsigned transaction file exceeds this signer’s ${maxReviewBytes}-byte review limit`);
+      if (file.size > maxReviewBytes) throw new Error(reviewLimitText());
       $('unsigned').value = await file.text();
     } finally { $('unsigned-file').value = ''; }
   }));
@@ -255,7 +267,10 @@
       let envelope;
       try { envelope = JSON.parse($('unsigned').value); }
       catch { await api('cancel'); throw new Error('Invalid unsigned transaction JSON'); }
-      const result = await api('review', envelope);
+      // Pasted text gets the same size check as an imported file.
+      const request = JSON.stringify(envelope);
+      if (request.length > maxReviewBytes) { await api('cancel'); throw new Error(reviewLimitText()); }
+      const result = await api('review', request);
       networkView(result);
       const fragment = document.createDocumentFragment(), technical = document.createDocumentFragment();
       let hasTechnical = false, dataBytes = '', dataHex = '';
@@ -312,6 +327,7 @@
               if (proposal) {
                 const committed = rationale === 'Matches the description hash';
                 $('review-message-title').textContent = committed ? 'Proposal rationale' : 'Attached text · not the committed rationale';
+                $('review-rationale-warning').textContent = committed ? '' : RATIONALE_WARNINGS[rationale] || RATIONALE_WARNINGS.mismatch;
                 $('review-rationale-warning').hidden = committed;
               }
               $('review-message-text').textContent = message;
@@ -376,9 +392,14 @@
     const idle = session.idle_lock_seconds;
     $('idle-lock-hint').textContent = Number.isSafeInteger(idle) && idle > 0 ? ` An open wallet locks after ${idle % 60 ? `${idle} seconds` : idle === 60 ? '1 minute' : `${idle / 60} minutes`} without use.` : '';
     if (!sessionToken) { showWallet(null, session); throw new Error(NO_SESSION); }
-    // After a reload, an unsaved generated key keeps its backup gate.
-    const pending = session.public_key && session.backup_pending === true ? (await api('backup')).backup : null;
-    showWallet(session.public_key, session, pending);
+    // A generated key's backup is shown once. After a reload it is gone, so
+    // the unconfirmed (and so unfunded) key is discarded, never re-served.
+    if (session.public_key && session.backup_pending === true) {
+      showWallet(null, await api('lock'));
+      say('The new key was discarded because its backup was not confirmed. Generate a new key and save its backup.', true);
+      return;
+    }
+    showWallet(session.public_key, session);
     if (session.idle_locked) say(IDLE_LOCKED);
   });
 })();

@@ -16,8 +16,10 @@ fn governance_snapshot_keeps_current_proposal_after_more_than_one_page_of_histor
         public,
     )
     .unwrap();
+    let chain_id = config.chain_id();
     let submit = |nonce, operation| {
         let transaction = crypto::sign(
+            &chain_id,
             &TransactionBody {
                 data: Vec::new(),
                 sender: public,

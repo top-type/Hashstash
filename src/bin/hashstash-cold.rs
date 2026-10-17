@@ -26,6 +26,9 @@ struct Options {
     /// Largest unsigned export accepted for review, in bytes.
     #[arg(long, default_value_t = hashstash::cold::DEFAULT_MAX_REVIEW_REQUEST)]
     max_review_bytes: usize,
+    /// Most grant payments one review lists.
+    #[arg(long, default_value_t = hashstash::cold::DEFAULT_MAX_REVIEW_PAYMENTS)]
+    max_review_payments: usize,
     /// Seconds without use after which an open wallet locks itself.
     #[arg(
         long,
@@ -74,7 +77,10 @@ async fn main() -> Result<()> {
         SocketAddr::from((Ipv4Addr::LOCALHOST, options.port)),
         hashstash::cold::ColdOptions {
             chain_id: chain,
-            max_review: options.max_review_bytes,
+            limits: hashstash::cold::ReviewLimits {
+                bytes: options.max_review_bytes,
+                payments: options.max_review_payments,
+            },
             token,
             idle_lock: Duration::from_secs(options.idle_lock_seconds),
         },

@@ -121,6 +121,16 @@ enum Command {
         body: PathBuf,
         #[arg(long)]
         out: PathBuf,
+        /// Genesis configuration of the network the signature is bound to.
+        #[arg(
+            long,
+            conflicts_with = "chain_id",
+            required_unless_present = "chain_id"
+        )]
+        config: Option<PathBuf>,
+        /// Chain ID of that network, instead of --config.
+        #[arg(long)]
+        chain_id: Option<String>,
     },
     /// Sign and submit any protocol operation, filling the block anchor and account nonce.
     Send {
@@ -189,10 +199,10 @@ enum Command {
         data: PathBuf,
         #[arg(long)]
         miner: String,
-        /// Seed a fresh wallet store with this private key file. Saved wallet selection is preserved.
+        /// Seed a wallet store that holds no wallets with this private key file. A store holding wallets keeps its saved selection.
         #[arg(long, conflicts_with = "watch_key")]
         wallet_key: Option<PathBuf>,
-        /// Seed a fresh wallet store with this public key. Without wallet flags the store starts empty.
+        /// Seed a wallet store that holds no wallets with this public key. Without wallet flags the store starts empty.
         #[arg(long)]
         watch_key: Option<String>,
         #[arg(long, default_value = "127.0.0.1:18480")]
@@ -627,6 +637,10 @@ fn write_new(path: &Path, value: &impl serde::Serialize, private: bool) -> Resul
             path.display()
         )
     })?;
+    if private {
+        // Owner-only before any key byte is written, on Windows too.
+        hashstash::local_files::restrict_to_owner(path)?;
+    }
     // Key files pass through this buffer; wipe it rather than freeing it intact.
     file.write_all(&Zeroizing::new(serde_json::to_vec_pretty(value)?))?;
     file.write_all(b"\n")?;
@@ -1061,9 +1075,10 @@ fn pinned_network(pin: Option<Hash>, reported: Hash, loopback: bool) -> Result<H
 const ANCHOR_ATTEMPTS: u32 = 10;
 
 /// Confirm through a second endpoint that the anchor is a canonical block of
-/// the selected network. Signatures do not name a network, so this keeps one
-/// endpoint from anchoring them on another network where the key holds value.
-/// The second endpoint is trusted for this fact alone.
+/// the selected network. Signatures commit to the selected chain ID, so a
+/// foreign anchor cannot make them valid on another network; this check
+/// catches an anchor the selected network would reject before anything is
+/// signed. The second endpoint is trusted for this fact alone.
 async fn confirm_anchor(
     client: &RpcClient,
     chain_id: &Hash,
@@ -1223,7 +1238,7 @@ async fn prepare_verified(
         Some(nonce) => NonceSource::Requested(nonce),
         None => NonceSource::Discovered(
             client
-                .pending_nonce(&sender, node::ScanBudget::DEFAULT)
+                .pending_nonce(&chain_id, &sender, node::ScanBudget::DEFAULT)
                 .await?,
         ),
     };
@@ -1393,7 +1408,7 @@ async fn send_operation(
             public == sender,
             "key file changed while preparing the transaction"
         );
-        crypto::sign(&prepared.body, &secret)?
+        crypto::sign(&prepared.chain_id, &prepared.body, &secret)?
     };
     let result = broadcast_signed(&client, &signed, &wallet::signed_hex(&signed)).await?;
     Ok(json!({"txid":result["transaction_id"]}))
@@ -1517,20 +1532,30 @@ async fn main() -> Result<()> {
                 )?
             );
         }
-        Command::Sign { key, body, out } => {
+        Command::Sign {
+            key,
+            body,
+            out,
+            config,
+            chain_id,
+        } => {
             let (secret, public) = key_file(&key)?;
-            // The strict unsigned export is accepted too, so the review shows its network.
+            // The operator names the network; the signature binds it. An
+            // unsigned export's own context must agree and is never adopted.
+            let chain_id = address_chain(config.as_deref(), chain_id.as_deref())?;
             let input = read_json(&body)?;
-            let (body, chain_id) = if input.get("format").is_some() {
+            let body = if input.get("format").is_some() {
                 let envelope: wallet::UnsignedEnvelope = serde_json::from_value(input)?;
-                (
-                    wallet::decode_unsigned(&envelope)?,
-                    Some(wallet::unsigned_chain(&envelope)?),
-                )
+                let body = wallet::decode_unsigned(&envelope)?;
+                ensure!(
+                    wallet::unsigned_chain(&envelope)? == chain_id,
+                    "unsigned export was prepared for another network"
+                );
+                body
             } else {
                 let body: TransactionBody = serde_json::from_value(input)?;
                 hashstash::wallet::validate_body(&body)?;
-                (body, None)
+                body
             };
             ensure!(
                 body.sender == public,
@@ -1544,8 +1569,8 @@ async fn main() -> Result<()> {
                     body.expiry_blocks
                 ));
             }
-            print_review("Signing transaction:", &body, chain_id.as_ref(), &notes);
-            let signed = crypto::sign(&body, &secret)?;
+            print_review("Signing transaction:", &body, Some(&chain_id), &notes);
+            let signed = crypto::sign(&chain_id, &body, &secret)?;
             write_new(&out, &signed, false)?;
             println!("Signed transaction saved in {}", out.display());
         }
@@ -1617,7 +1642,8 @@ async fn main() -> Result<()> {
                 raw.context("signed transaction missing")?
             };
             let raw = raw.trim();
-            let transaction = hashstash::wallet::decode_signed(raw)?;
+            // The endpoint verifies the signature for its own chain ID.
+            let transaction = hashstash::wallet::decode_signed_record(raw)?;
             let result = broadcast_signed(&endpoint.client()?, &transaction, raw).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
@@ -1682,7 +1708,10 @@ async fn main() -> Result<()> {
                 let key_path = match peer_key_file {
                     Some(path) => path,
                     None => {
-                        let path = data.with_extension("peer-key.json");
+                        // Earlier releases named it from the stem alone, so
+                        // net.db and net.sqlite shared one identity.
+                        hashstash::local_files::adopt_legacy_secret(&data, "peer-key.json")?;
+                        let path = hashstash::local_files::sidecar(&data, "peer-key.json");
                         ensure_peer_key_file(&path)?;
                         path
                     }
@@ -2660,7 +2689,7 @@ mod tests {
             "Total debit: 25 atoms".to_owned(),
             "Nonce: 4".to_owned(),
             format!("Recipient: {}", address::encode(&recipient, &chain).unwrap()),
-            format!("Network context · unsigned: {}", hex::encode(chain)),
+            format!("Network · signed: {}", hex::encode(chain)),
             "Data bytes: 200".to_owned(),
             format!("Data hex: {}...", "ab".repeat(64)),
         ] {

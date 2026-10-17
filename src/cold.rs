@@ -35,6 +35,27 @@ pub const DEFAULT_MAX_REVIEW_REQUEST: usize = 64 * 1024 * 1024;
 /// An open wallet locks itself after this long without an authorized request.
 pub const DEFAULT_IDLE_LOCK: Duration = Duration::from_secs(5 * 60);
 const IDLE_LOCKED: &str = "Wallet locked after a period without use; open it again";
+/// Default ceiling on the payments one grant review lists. Each is key-checked,
+/// address-encoded and shown as two fields, so bytes alone do not bound the
+/// work; `hashstash-cold --max-review-payments` raises it.
+pub const DEFAULT_MAX_REVIEW_PAYMENTS: usize = 4096;
+
+/// Local bounds on one offline review.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReviewLimits {
+    /// Bytes of one unsigned export request.
+    pub bytes: usize,
+    /// Grant payments in one reviewed transaction.
+    pub payments: usize,
+}
+impl Default for ReviewLimits {
+    fn default() -> Self {
+        Self {
+            bytes: DEFAULT_MAX_REVIEW_REQUEST,
+            payments: DEFAULT_MAX_REVIEW_PAYMENTS,
+        }
+    }
+}
 const INDEX: &str = include_str!("../cold-ui/index.html");
 const SCRIPT: &str = include_str!("../cold-ui/app.js");
 const SHARES: &str = include_str!("../ui/shares.js");
@@ -44,6 +65,8 @@ const STYLE: &str = include_str!("../cold-ui/style.css");
 struct Review {
     token: String,
     body: TransactionBody,
+    /// The selected network the review showed; the signature binds it.
+    chain_id: Hash,
     long_lifetime: bool,
 }
 
@@ -103,14 +126,16 @@ impl WalletState {
     }
     fn status(&self) -> Result<Value> {
         let public = self.public;
-        let encoded = public
+        // An unsaved generated key must not be funded: no address or
+        // watch-only export until its backup is confirmed.
+        let shown = public.filter(|_| !self.backup_pending);
+        let encoded = shown
             .as_ref()
             .zip(self.chain_id.as_ref())
             .map(|(key, chain)| address::encode(key, chain))
             .transpose()?;
-        let public = public.map(hex::encode);
         let chain = self.chain_id.map(hex::encode);
-        let watch = public.as_ref().map(|public| {
+        let watch = shown.map(hex::encode).map(|public| {
             if let (Some(address), Some(chain)) = (encoded.as_ref(), chain.as_ref()) {
                 json!({"format":"hashstash-watch-v2","public_key":public,"address":address,"chain_id":chain})
             } else {
@@ -118,7 +143,7 @@ impl WalletState {
             }
         });
         Ok(
-            json!({"public_key":public,"chain_id":chain,"address":encoded,"watch":watch,"unlocked":public.is_some(),"backup_pending":self.backup_pending,"idle_locked":self.idle_locked}),
+            json!({"public_key":public.map(hex::encode),"chain_id":chain,"address":encoded,"watch":watch,"unlocked":public.is_some(),"backup_pending":self.backup_pending,"idle_locked":self.idle_locked}),
         )
     }
 }
@@ -130,7 +155,7 @@ struct App {
     host: String,
     origin: String,
     token: String,
-    max_review: usize,
+    limits: ReviewLimits,
     idle_lock: Duration,
 }
 
@@ -139,8 +164,8 @@ struct App {
 pub struct ColdOptions {
     /// A trusted network identity from a local config or explicit argument.
     pub chain_id: Option<Hash>,
-    /// Bounds one unsigned export request, in bytes.
-    pub max_review: usize,
+    /// Bounds one unsigned export request and the grant it may list.
+    pub limits: ReviewLimits,
     /// The browser session token, 64 lowercase hexadecimal characters, or a
     /// random one. It is delivered only in the launch URL, never served.
     pub token: Option<String>,
@@ -152,7 +177,7 @@ impl Default for ColdOptions {
     fn default() -> Self {
         Self {
             chain_id: None,
-            max_review: DEFAULT_MAX_REVIEW_REQUEST,
+            limits: ReviewLimits::default(),
             token: None,
             idle_lock: DEFAULT_IDLE_LOCK,
         }
@@ -244,20 +269,20 @@ pub async fn serve(address: SocketAddr) -> Result<ColdServer> {
 
 /// Supplies a trusted chain identity from a local config or explicit argument.
 pub async fn serve_with_chain(address: SocketAddr, chain_id: Option<Hash>) -> Result<ColdServer> {
-    serve_with_limits(address, chain_id, DEFAULT_MAX_REVIEW_REQUEST).await
+    serve_with_limits(address, chain_id, ReviewLimits::default()).await
 }
 
-/// `max_review` bounds one unsigned export request, in bytes.
+/// `limits` bounds one unsigned export request and the grant it may list.
 pub async fn serve_with_limits(
     address: SocketAddr,
     chain_id: Option<Hash>,
-    max_review: usize,
+    limits: ReviewLimits,
 ) -> Result<ColdServer> {
     serve_with_options(
         address,
         ColdOptions {
             chain_id,
-            max_review,
+            limits,
             ..ColdOptions::default()
         },
     )
@@ -271,8 +296,12 @@ pub async fn serve_with_options(address: SocketAddr, options: ColdOptions) -> Re
         "cold signer requires IPv4 loopback"
     );
     ensure!(
-        options.max_review >= MAX_CONTROL_REQUEST,
+        options.limits.bytes >= MAX_CONTROL_REQUEST,
         "review limit must be at least {MAX_CONTROL_REQUEST} bytes"
+    );
+    ensure!(
+        options.limits.payments > 0,
+        "review payment limit must be positive"
     );
     ensure!(!options.idle_lock.is_zero(), "idle lock must be positive");
     let session_token = match options.token {
@@ -299,7 +328,7 @@ pub async fn serve_with_options(address: SocketAddr, options: ColdOptions) -> Re
         host: address.to_string(),
         origin: format!("http://{address}"),
         token: session_token.clone(),
-        max_review: options.max_review,
+        limits: options.limits,
         idle_lock: options.idle_lock,
     };
     // Requests apply the idle lock themselves; this also wipes a forgotten
@@ -356,7 +385,7 @@ pub async fn serve_with_options(address: SocketAddr, options: ColdOptions) -> Re
         .route("/api/lock", post(lock))
         .route(
             "/api/review",
-            post(review).layer(DefaultBodyLimit::max(options.max_review)),
+            post(review).layer(DefaultBodyLimit::max(options.limits.bytes)),
         )
         .route("/api/cancel", post(cancel))
         .route("/api/sign", post(sign))
@@ -399,7 +428,8 @@ async fn session(State(app): State<App>) -> Response {
     match status {
         Ok(Ok(mut status)) => {
             status["format"] = json!("hashstash-cold-v1");
-            status["max_review_bytes"] = json!(app.max_review);
+            status["max_review_bytes"] = json!(app.limits.bytes);
+            status["max_review_payments"] = json!(app.limits.payments);
             status["idle_lock_seconds"] = json!(app.idle_lock.as_secs());
             Json(status).into_response()
         }
@@ -510,8 +540,10 @@ async fn unlock(State(app): State<App>, bytes: Bytes) -> Response {
     .await
 }
 
-/// Creates a random key from OS randomness. The signer keeps no copy beyond
-/// this process, so its backup stays available until the operator saves it.
+/// Creates a random key from OS randomness and returns its only backup. Any
+/// local process can read the session token, so the key is never released
+/// again: until the operator confirms saving it, the signer shows no address
+/// or watch-only export and reviews nothing, and a reload must generate anew.
 async fn generate(State(app): State<App>) -> Response {
     job(app, |state| {
         state.clear_wallet();
@@ -534,22 +566,22 @@ async fn generate(State(app): State<App>) -> Response {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Backup {
-    #[serde(default)]
     saved: bool,
 }
 
-/// Returns a generated key's backup again (for example after a page reload),
-/// or with `saved` records that the operator stored it. Only while pending.
+/// Records that the operator stored a generated key's backup. It never
+/// returns the key: that left the signer once, in the /api/generate response.
 async fn backup(State(app): State<App>, bytes: Bytes) -> Response {
     job(app, move |state| {
         let request: Backup =
             serde_json::from_slice(&bytes).map_err(|_| anyhow!("Invalid backup request"))?;
         ensure!(state.backup_pending, "No unsaved generated key");
-        if request.saved {
-            state.backup_pending = false;
-            return state.status();
-        }
-        Ok(json!({"backup":state.backup()?}))
+        ensure!(
+            request.saved,
+            "The backup is shown only once, when the key is generated. Lock and generate a new key if it was not saved"
+        );
+        state.backup_pending = false;
+        state.status()
     })
     .await
 }
@@ -600,17 +632,30 @@ async fn cancel(State(app): State<App>) -> Response {
 }
 
 async fn review(State(app): State<App>, bytes: Bytes) -> Response {
+    let limits = app.limits;
     job(app, move |state| {
         state.review = None;
         let public = state.public.ok_or_else(|| anyhow!("Open a wallet first"))?;
-        // Only the operator selects the network. Export context is unsigned, so
-        // it is checked against that selection and never adopted.
+        ensure!(
+            !state.backup_pending,
+            "Save the new key's backup and confirm it before reviewing transactions"
+        );
+        // Only the operator selects the network, and the signature binds that
+        // selection. Export context is checked against it, never adopted.
         let selected = state.chain_id.ok_or_else(|| {
-            anyhow!("Select this signer's network before reviewing; export network context is unsigned")
+            anyhow!("Select this signer's network before reviewing; the signature is bound to it")
         })?;
         let envelope = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow!("Invalid unsigned transaction envelope"))?;
-        let body = wallet::decode_unsigned(&envelope)?;
+        // Count grant payments before the per-payment key checks and fields.
+        let body = wallet::decode_unsigned_shape(&envelope)?;
+        let payments = wallet::grant_payments(&body);
+        ensure!(
+            payments <= limits.payments,
+            "This grant lists {payments} payments; this signer reviews at most {}. Restart hashstash-cold with --max-review-payments to review it",
+            limits.payments
+        );
+        wallet::validate_body(&body)?;
         let chain_id = wallet::unsigned_chain(&envelope)?;
         ensure!(
             body.sender == public,
@@ -621,7 +666,7 @@ async fn review(State(app): State<App>, bytes: Bytes) -> Response {
             "Export network context differs from the selected network"
         );
         let review_token = token()?;
-        let fields: Vec<_> = wallet::review(&body, Some(&chain_id))
+        let fields: Vec<_> = wallet::review(&body, Some(&selected))
             .into_iter()
             .map(|field| json!({"label":field.label,"value":field.value}))
             .collect();
@@ -630,6 +675,7 @@ async fn review(State(app): State<App>, bytes: Bytes) -> Response {
         state.review = Some(Review {
             token: review_token.clone(),
             body,
+            chain_id: selected,
             long_lifetime,
         });
         let mut status = state.status()?;
@@ -661,8 +707,8 @@ async fn sign(State(app): State<App>, bytes: Bytes) -> Response {
             !review.long_lifetime || request.confirm_lifetime,
             "Confirm the long transaction lifetime before signing"
         );
-        let transaction = crypto::sign(&review.body, secret)?;
-        crypto::verify(&transaction)?;
+        let transaction = crypto::sign(&review.chain_id, &review.body, secret)?;
+        crypto::verify(&review.chain_id, &transaction)?;
         state.review = None;
         Ok(json!({"raw":wallet::signed_hex(&transaction),"txid":hex::encode(codec::transaction_id(&transaction))}))
     }).await

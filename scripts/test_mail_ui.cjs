@@ -23,6 +23,7 @@ async function setup(options={}){
  h.compose=async()=>{const f=h.get('mail-form');f.elements.recipient.value=addr(h.recipient);f.elements.subject.value='Fixture subject';f.elements.message.value='Secret fixture body';await f.fire('input');await h.timersDue();await wait(()=>h.get('mail-fee-quote').textContent!=='—'||!!h.get('mail-fee-error').textContent,h);assert.equal(h.get('mail-fee-error').textContent,'');return f;};
  let serial=1000;
  h.sign=(row,secret=a,fee=1)=>signMailRow(h.noble,s.status.chain_id,secret,row,fee);
+ h.signFor=(chain,row,secret=a,fee=1)=>signMailRow(h.noble,chain,secret,row,fee);
  h.message=async(overrides={},recipient=h.recipient,sender=h.sender)=>{const identity={chain_id:s.status.chain_id,sender,recipient,nonce:'0'},data=await h.mailCrypto.encrypt({subject:'Visible after authentication',body:'<script>text only</script>'},identity);
  return h.sign({sender:addr(sender),sender_public_key:sender,nonce:'0',data_hex:data,height:s.status.height+1,position:0,confirmations:1,...overrides},sender===h.sender?a:sender===h.recipient?b:c,++serial);};
  h.publish=async(messages)=>{h.history.push(...messages);s.status.height=Math.max(s.status.height+1,...messages.map(x=>x.height));s.status.tip=key(++serial);h.canonicalAnchors.add(s.status.tip);await h.refresh();await h.drain();};
@@ -41,6 +42,7 @@ async function run(){
  for(const [label,change] of [
   ['unsigned RPC row',m=>({...m,raw:undefined})],
   ['changed signature',m=>({...m,raw:m.raw.slice(0,-2)+(m.raw.endsWith('00')?'01':'00')})],
+  ['signed for another network',(m,h)=>h.signFor('fe'.repeat(32),m)],
   ['claimed sender', (m,h)=>({...m,sender_public_key:h.other,sender:addr(h.other)})],
   ['changed nonce',m=>({...m,nonce:'1'})],
   ['changed ciphertext',m=>({...m,data_hex:m.data_hex.slice(0,-2)+(m.data_hex.endsWith('00')?'01':'00')})],
@@ -57,7 +59,7 @@ async function run(){
   const data=await h.mailCrypto.encrypt({subject:'Foreign network',body:'Cannot authenticate in this network'},foreign);
   const row=await h.message({data_hex:data},h.sender,h.recipient);
   let attempts=0;const decrypt=h.decryptMail;h.decryptMail=(...args)=>{attempts++;return decrypt(...args);};
-  await h.publish([row]);eq(attempts,1,'transaction signature does not authenticate network metadata');eq(h.get('mail-list').children.length,0,'mail encryption still binds the selected network');eq(h.get('mail-error').textContent,'','unrelated encrypted context stays private');
+  await h.publish([row]);eq(attempts,1,'a signature for this network reaches decryption whatever context the ciphertext names');eq(h.get('mail-list').children.length,0,'mail encryption still binds the selected network');eq(h.get('mail-error').textContent,'','unrelated encrypted context stays private');
  }
  {
   const h=await setup();let attempts=0;h.decryptMail=async()=>{attempts++;throw Error('not mine');};

@@ -42,7 +42,7 @@ fn payment(
         },
     };
     loop {
-        let tx = crypto::sign(&body, secret).unwrap();
+        let tx = crypto::sign(&state.chain_id, &body, secret).unwrap();
         let fee = fees::quote(config, state, &tx).unwrap().minimum_fee + extra;
         if tx.body.fee == fee {
             return tx;
@@ -204,7 +204,7 @@ fn relay_selects_and_publishes_only_for_new_admissible_entries() {
     let underpriced = {
         let mut body = payment(config, state, &SECRET, start + 1, other(), 1, 0).body;
         body.fee = Amount::zero();
-        crypto::sign(&body, &SECRET).unwrap()
+        crypto::sign(&state.chain_id, &body, &SECRET).unwrap()
     };
     assert_eq!(
         deliver(vec![forged.clone(), used.clone(), unpayable.clone(), underpriced.clone()]),
@@ -260,7 +260,7 @@ fn the_opening_screen_allows_a_recipient_an_earlier_transaction_may_create() {
     let paying = |fee: Amount| {
         let mut body = creating.body.clone();
         body.fee = fee;
-        crypto::sign(&body, &SECRET).unwrap()
+        crypto::sign(&state.chain_id, &body, &SECRET).unwrap()
     };
     // Exactly the minimum without account creation, and one atom less.
     let least = paying(&quote.minimum_fee - &quote.account_creation_fee);
@@ -459,7 +459,7 @@ fn capacity_displaced_entries_wait_in_the_backlog_for_the_next_block() {
     assert_eq!(body.nonce, start + low.len() as u64);
     // That nonce cannot be selected before its waiting predecessors, so it
     // waits behind them instead of being refused.
-    let queued = crypto::sign(&body, &SECRET).unwrap();
+    let queued = crypto::sign(&state.chain_id, &body, &SECRET).unwrap();
     node.submit_transaction(queued.clone()).unwrap();
     assert!(pool(&node).1.contains(&queued));
     node.mine(1_000_000).unwrap();

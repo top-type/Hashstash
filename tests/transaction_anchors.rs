@@ -17,6 +17,7 @@ fn append(chain: &mut Chain, txs: Vec<Transaction>, salt: u64) -> Block {
 }
 fn payment(chain: &Chain, anchor: Hash, expiry_blocks: u64) -> Transaction {
     crypto::sign(
+        &chain.chain_id(),
         &TransactionBody {
             sender: owner(),
             nonce: chain.tip_state().account(&owner(), None).unwrap().nonce,
@@ -54,7 +55,7 @@ fn unchecked_candidate(chain: &Chain, tx: Transaction, salt: u64) -> Block {
     Chain::mine(block, 100_000).unwrap()
 }
 #[test]
-fn distinct_networks_cannot_replay_a_signed_anchor_without_a_chain_id_field() {
+fn distinct_networks_reject_foreign_signatures_and_foreign_anchors() {
     let d = tempfile::tempdir().unwrap();
     let config = Config::devnet();
     let mut other_config = config.clone();
@@ -73,7 +74,11 @@ fn distinct_networks_cannot_replay_a_signed_anchor_without_a_chain_id_field() {
     for anchor in [other_genesis, other.tip_hash()] {
         let tx = payment(&other, anchor, 2);
         other.validate_transaction(&tx).unwrap();
-        crypto::verify(&tx).unwrap();
+        crypto::verify(&other.chain_id(), &tx).unwrap();
+        // The signature binds the other chain ID, so this network refuses it.
+        assert!(crypto::verify(&local.chain_id(), &tx).is_err());
+        // Even signed for this network, the foreign anchor fails every gate.
+        let tx = crypto::sign(&local.chain_id(), &tx.body, &SECRET).unwrap();
         for result in [
             local.validate_transaction_anchor(&tx).map(|_| ()),
             local.validate_transaction(&tx),
@@ -109,7 +114,14 @@ fn distinct_networks_cannot_replay_a_signed_anchor_without_a_chain_id_field() {
     let node = hashstash::node::Node::open(&d.path().join("node.db"), config, owner()).unwrap();
     node.mine(100_000).unwrap();
     let status = node.status().unwrap();
-    let tx = payment(&other, other.tip_hash(), 2);
+    let foreign = payment(&other, other.tip_hash(), 2);
+    assert!(
+        node.submit_transaction(foreign.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("invalid transaction signature")
+    );
+    let tx = crypto::sign(&local.chain_id(), &foreign.body, &SECRET).unwrap();
     assert!(
         node.submit_transaction(tx.clone())
             .unwrap_err()
@@ -120,7 +132,7 @@ fn distinct_networks_cannot_replay_a_signed_anchor_without_a_chain_id_field() {
     assert_eq!(node.status().unwrap()["state_root"], status["state_root"]);
     let mut local_body = tx.body;
     local_body.anchor = hashstash::node::parse_hash(status["tip"].as_str().unwrap()).unwrap();
-    node.submit_transaction(crypto::sign(&local_body, &SECRET).unwrap())
+    node.submit_transaction(crypto::sign(&local.chain_id(), &local_body, &SECRET).unwrap())
         .unwrap();
     assert_eq!(node.status().unwrap()["mempool"], 1);
 }
@@ -225,10 +237,10 @@ fn reorg_rejects_detached_references_and_accepts_shared_and_side_branch_ancestor
     let current_nonce = main.tip_state().account(&owner(), None).unwrap().nonce;
     let mut body = shared_tx.body.clone();
     body.nonce = current_nonce;
-    let shared_tx = crypto::sign(&body, &SECRET).unwrap();
+    let shared_tx = crypto::sign(&main.chain_id(), &body, &SECRET).unwrap();
     let mut body = detached_tx.body.clone();
     body.nonce = current_nonce;
-    let detached_tx = crypto::sign(&body, &SECRET).unwrap();
+    let detached_tx = crypto::sign(&main.chain_id(), &body, &SECRET).unwrap();
     let selected = main
         .select_transactions(owner(), &[detached_tx, shared_tx.clone()], 10)
         .unwrap();

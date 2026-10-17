@@ -24,6 +24,7 @@ fn config() -> Config {
 }
 fn sign(s: &State, operation: Operation) -> Transaction {
     crypto::sign(
+        &s.chain_id,
         &TransactionBody {
             sender: owner(),
             nonce: s.account(&owner(), None).unwrap().nonce,
@@ -384,7 +385,7 @@ fn replenished_reserve_funds_repeated_grants_without_historical_spending_limits(
             },
         );
         tx.body.fee = grant.clone();
-        tx = crypto::sign(&tx.body, &SECRET).unwrap();
+        tx = crypto::sign(&s.chain_id, &tx.body, &SECRET).unwrap();
         s = step(&c, &s, 0, &[tx]);
     }
     s.audit(&c).unwrap();

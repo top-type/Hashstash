@@ -46,7 +46,7 @@ def main():
         body.setdefault('data', [])
         body_file, transaction_file = (directory / (label + '.body.json'), directory / (label + '.signed.json'))
         body_file.write_text(json.dumps(body), encoding='utf-8')
-        result = subprocess.run([manifest['executable'], 'sign', '--key', nodes[0]['key_file'], '--body', str(body_file), '--out', str(transaction_file)], capture_output=True, text=True, timeout=20, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        result = subprocess.run([manifest['executable'], 'sign', '--key', nodes[0]['key_file'], '--body', str(body_file), '--out', str(transaction_file), '--config', manifest['config']], capture_output=True, text=True, timeout=20, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         assert result.returncode == 0, 'Fixture signing failed: ' + result.stderr
         return json.loads(transaction_file.read_text(encoding='utf-8'))
 

@@ -32,7 +32,7 @@ fn envelope() -> Vec<u8> {
     hex::decode(fixture["data_hex"].as_str().unwrap()).unwrap()
 }
 fn authenticate_record(record: &Value, chain_id: Hash) -> Transaction {
-    let transaction = wallet::decode_signed(record["raw"].as_str().unwrap()).unwrap();
+    let transaction = wallet::decode_signed(record["raw"].as_str().unwrap(), &chain_id).unwrap();
     assert_eq!(record["raw"], wallet::signed_hex(&transaction));
     assert_eq!(
         record["txid"],
@@ -56,6 +56,7 @@ fn authenticate_record(record: &Value, chain_id: Hash) -> Transaction {
 }
 fn signed(c: &Config, nonce: u64, operation: Operation, data: Vec<u8>) -> Transaction {
     crypto::sign(
+        &c.chain_id(),
         &TransactionBody {
             sender: key(91),
             nonce,
@@ -311,7 +312,7 @@ fn replaced_mail_anchor_fails_closed_and_replacement_messages_are_discovered() {
     // A different signed envelope changes the txid while retaining valid v2 framing.
     let mut replacement_body = replacement.body;
     replacement_body.fee = 101u32.into();
-    let replacement = crypto::sign(&replacement_body, &[91; 32]).unwrap();
+    let replacement = crypto::sign(&c.chain_id(), &replacement_body, &[91; 32]).unwrap();
     let replacement_id = hex::encode(codec::transaction_id(&replacement));
     b.submit_transaction(replacement).unwrap();
     for _ in 0..3 {

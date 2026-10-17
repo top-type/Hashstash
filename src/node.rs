@@ -1125,7 +1125,7 @@ impl Node {
         Ok(Self {
             inner,
             explorer,
-            explorer_path: Arc::new(path.with_extension("explorer.sqlite")),
+            explorer_path: Arc::new(crate::local_files::sidecar(path, "explorer.sqlite")),
             session_token_path: Arc::new(session_token_path(path)),
             miner,
             wallets: Arc::new(Mutex::new(wallets)),
@@ -1277,7 +1277,8 @@ impl Node {
         Ok(IO_TIMEOUT + Duration::from_secs(bytes / (1024 * 1024)))
     }
 
-    /// Seed a fresh wallet store. A saved runtime selection survives startup flags.
+    /// Seed a wallet store that holds no wallets. A store holding wallets keeps
+    /// its saved selection over startup flags.
     pub fn with_wallet(mut self, secret: [u8; 32]) -> Result<Self> {
         ensure!(
             self.startup_wallet_mode.is_none(),
@@ -1287,7 +1288,8 @@ impl Node {
         self.startup_wallet_mode = Some("hot");
         Ok(self)
     }
-    /// Seed a fresh store with a watched account; preserve a saved selection.
+    /// Seed a store holding no wallets with a watched account; a store holding
+    /// wallets keeps its saved selection.
     pub fn with_watch_key(mut self, public: PublicKey) -> Result<Self> {
         ensure!(
             self.startup_wallet_mode.is_none(),
@@ -1370,14 +1372,15 @@ impl Node {
         let local = now().min(u32::MAX as u64) as u32;
         local.max(chain.tip_block().header.timestamp)
     }
-    /// Shape and authentication of the exact signed bytes; failures are permanent.
-    fn screen_signed(tx: &Transaction) -> Result<()> {
+    /// Shape and authentication of the exact signed bytes for this node's
+    /// chain ID; failures are permanent.
+    fn screen_signed(chain_id: &Hash, tx: &Transaction) -> Result<()> {
         ensure!(
             tx.body.expiry_blocks > 0,
             "transaction lifetime must be positive"
         );
         ensure!(tx.body.nonce < u64::MAX, "invalid or exhausted nonce");
-        crypto::verify(tx).context("invalid transaction signature")
+        crypto::verify(chain_id, tx).context("invalid transaction signature")
     }
     /// Cheap checks against the current tip, before any signature check or
     /// selection: size, signed anchor and lifetime, a funded sender and an
@@ -1721,7 +1724,7 @@ impl Node {
     }
     pub fn submit_transaction(&self, tx: Transaction) -> Result<Hash> {
         // Authenticate before waiting for chain state.
-        Self::screen_signed(&tx)
+        Self::screen_signed(&self.read_view()?.chain.chain_id(), &tx)
             .map_err(|error| anyhow!("transaction not valid in next block: {error:#}"))?;
         let mut i = self.locked()?;
         self.submit_locked(&mut i, tx, true)
@@ -1805,7 +1808,8 @@ impl Node {
                 nonce: request.nonce,
             },
         )?;
-        self.submit_locked(&mut i, crypto::sign(&body, &secret)?, false)
+        let chain_id = i.chain.tip_state().chain_id;
+        self.submit_locked(&mut i, crypto::sign(&chain_id, &body, &secret)?, false)
     }
     fn prepare_locked(
         &self,
@@ -2356,8 +2360,9 @@ impl Node {
                 }
             }
         }
+        let chain_id = view.chain.chain_id();
         fresh.retain(|(id, tx)| {
-            let authentic = Self::screen_signed(tx).is_ok();
+            let authentic = Self::screen_signed(&chain_id, tx).is_ok();
             if !authentic {
                 self.rejected_locked().insert(*id, Refusal::Permanent);
             }
@@ -3113,7 +3118,7 @@ impl Node {
             }
             "broadcasttransaction" => {
                 let request: BroadcastRequest = serde_json::from_value(params)?;
-                let tx = wallet::decode_signed(&request.raw)?;
+                let tx = wallet::decode_signed(&request.raw, &self.read_view()?.chain.chain_id())?;
                 Ok(json!({"transaction_id":hex::encode(self.submit_transaction(tx)?)}))
             }
             "getblock" => {
@@ -3700,26 +3705,18 @@ async fn read_peer_frame<R: AsyncBufRead + Unpin>(
 /// local account and service, so only clients able to read the node's own
 /// files can use server-wallet endpoints.
 pub fn session_token_path(database: &Path) -> PathBuf {
-    database.with_extension("session-token")
+    crate::local_files::sidecar(database, "session-token")
 }
 fn write_session_token(path: &Path, token: &str) -> Result<()> {
     // Never write through an existing file or link; create a fresh one that
-    // only the node's account can read (Windows inherits the directory ACL).
+    // only the node's account can read.
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("session token file cannot be replaced"),
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options
-        .open(path)
-        .context("session token file cannot be created")?;
-    std::io::Write::write_all(&mut file, token.as_bytes())?;
-    file.sync_all()?;
-    Ok(())
+    crate::local_files::write_private(path, token.as_bytes())
+        .context("session token file cannot be created")
 }
 
 #[derive(Clone)]
@@ -5614,6 +5611,7 @@ mod capacity_work_tests {
         )
         .unwrap();
         let transaction = crypto::sign(
+            &config.chain_id(),
             &TransactionBody {
                 sender,
                 nonce: 17,
@@ -5660,7 +5658,7 @@ mod capacity_work_tests {
             hex::encode(codec::transaction_id(&transaction))
         );
         assert_eq!(
-            wallet::decode_signed(full[0]["raw"].as_str().unwrap()).unwrap(),
+            wallet::decode_signed(full[0]["raw"].as_str().unwrap(), &config.chain_id()).unwrap(),
             transaction
         );
         assert!(
@@ -6450,13 +6448,14 @@ impl RpcClient {
     /// word, so no raw pending record of any governed size is downloaded, as is
     /// a remote one equal to the account nonce. Otherwise a remote endpoint
     /// could plant a future nonce, so the client scans its mempool: the account
-    /// nonce rises past this sender's signature-checked pending transactions
-    /// while they use consecutive nonces, as an honest pool holds them, and
-    /// must reach any reported pending nonce. An endpoint can still misreport
-    /// the account nonce or hide pending rows, so the review shows the chosen
-    /// nonce and `--nonce` overrides it.
+    /// nonce rises past this sender's pending transactions, signature-checked
+    /// for `chain_id`, while they use consecutive nonces, as an honest pool
+    /// holds them, and must reach any reported pending nonce. An endpoint can
+    /// still misreport the account nonce or hide pending rows, so the review
+    /// shows the chosen nonce and `--nonce` overrides it.
     pub async fn pending_nonce(
         &self,
+        chain_id: &Hash,
         sender: &PublicKey,
         budget: ScanBudget,
     ) -> Result<PendingNonce> {
@@ -6524,6 +6523,7 @@ impl RpcClient {
                         row.get("raw")
                             .and_then(Value::as_str)
                             .context("mempool signed transaction missing")?,
+                        chain_id,
                     )?;
                     if tx.body.sender == *sender {
                         own.insert(tx.body.nonce);
@@ -7274,7 +7274,18 @@ mod tests {
         let mut envelope = prepared.clone();
         envelope.as_object_mut().unwrap().remove("fee_quote");
         let body = wallet::decode_unsigned(&serde_json::from_value(envelope).unwrap()).unwrap();
-        let tx = crypto::sign(&body, &secret).unwrap();
+        let foreign = crypto::sign(&[0; 32], &body, &secret).unwrap();
+        assert!(
+            node.rpc(
+                "broadcasttransaction",
+                json!({"raw":wallet::signed_hex(&foreign)})
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("signature for this network"),
+            "a signature for another chain ID is rejected"
+        );
+        let tx = crypto::sign(&before.chain_id, &body, &secret).unwrap();
         let raw = wallet::signed_hex(&tx);
         node.rpc("broadcasttransaction", json!({"raw":raw}))
             .unwrap();
@@ -7826,6 +7837,7 @@ mod tests {
         let mut s = view.chain.tip_state().clone();
         let sender = crypto::public_key(&[1; 32]).unwrap();
         let transaction = crypto::sign(
+            &s.chain_id,
             &TransactionBody {
                 data: Vec::new(),
                 sender,
@@ -8006,6 +8018,7 @@ mod tests {
             outcome: Some(Outcome::Pass),
         };
         let tx = crypto::sign(
+            &state.chain_id,
             &TransactionBody {
                 data: Vec::new(),
                 sender: key,
@@ -9161,6 +9174,7 @@ mod peer_tests {
         let secp = Secp256k1::new();
         let pair = Keypair::from_secret_key(&secp, &SecretKey::from_byte_array(secret).unwrap());
         let anchor = codec::block_hash(&codec::genesis_block(&config).unwrap());
+        let chain_id = config.chain_id();
         let mut nonce = 0;
         for _ in 0..2 {
             let transactions = (0..config.max_signatures)
@@ -9178,8 +9192,7 @@ mod peer_tests {
                         data: vec![],
                     };
                     nonce += 1;
-                    let message =
-                        crypto::tagged_hash(crypto::TRANSACTION_TAG, &codec::encode(&body));
+                    let message = crypto::signing_message(&chain_id, &body);
                     Transaction {
                         signature: *secp.sign_schnorr_no_aux_rand(&message, &pair).as_ref(),
                         body,

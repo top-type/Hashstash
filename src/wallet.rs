@@ -41,15 +41,21 @@ pub fn derive_secret(passphrase: &str) -> Result<Zeroizing<[u8; 32]>> {
     anyhow::bail!("could not derive a signing key")
 }
 
-/// v2: exact UTF-8 (no trimming or normalization) stretched with scrypt, salted
-/// with the tag and the 32-byte chain ID, then the first valid secret
+/// v2: printable ASCII exactly as typed (no trimming) stretched with scrypt,
+/// salted with the tag and the 32-byte chain ID, then the first valid secret
 /// `tagged_hash(tag, stretched || counter_le32)`. A phrase opens a different
-/// account on every network, and each guess costs one scrypt run.
+/// account on every network, and each guess costs one scrypt run. Other text
+/// is refused: one visible Unicode phrase has several encodings (composed or
+/// decomposed, by keyboard and system) that would open different accounts.
 pub fn derive_secret_v2(passphrase: &str, chain_id: &Hash) -> Result<Zeroizing<[u8; 32]>> {
     ensure!(!passphrase.is_empty(), "enter a passphrase");
     ensure!(
+        passphrase.bytes().all(|b| (0x20..=0x7e).contains(&b)),
+        "v2 passphrases use printable ASCII only: letters, digits, punctuation and spaces"
+    );
+    ensure!(
         passphrase.len() >= MIN_PASSPHRASE_V2_BYTES,
-        "passphrase must contain at least {MIN_PASSPHRASE_V2_BYTES} UTF-8 bytes"
+        "passphrase must contain at least {MIN_PASSPHRASE_V2_BYTES} characters"
     );
     ensure!(
         passphrase.len() <= MAX_PASSPHRASE_BYTES,
@@ -108,7 +114,8 @@ fn rationale_check(body: &TransactionBody, description: &Hash) -> &'static str {
 #[serde(deny_unknown_fields)]
 pub struct UnsignedEnvelope {
     pub format: String,
-    /// Unsigned network context for address display; ancestry requires a node.
+    /// The network the export was prepared for, outside the body. A signer
+    /// signs for its own selected network and rejects a differing context.
     pub chain_id: String,
     pub body: String,
 }
@@ -121,7 +128,8 @@ pub fn unsigned(body: &TransactionBody, chain_id: &Hash) -> UnsignedEnvelope {
     }
 }
 
-/// Decode display context, without claiming it is authenticated by the signature.
+/// Decode the export's network context. Nothing authenticates it: compare it
+/// with the network the signer selected, which the signature then binds.
 pub fn unsigned_chain(envelope: &UnsignedEnvelope) -> Result<Hash> {
     ensure!(
         envelope.chain_id.len() == 64
@@ -165,6 +173,14 @@ fn raw_bytes(raw: &str) -> Result<Vec<u8>> {
 }
 
 pub fn decode_unsigned(envelope: &UnsignedEnvelope) -> Result<TransactionBody> {
+    let body = decode_unsigned_shape(envelope)?;
+    validate_body(&body)?;
+    Ok(body)
+}
+
+/// The canonical body of an export before `validate_body`'s per-field key
+/// checks, so a caller can bound that work first (see `grant_payments`).
+pub fn decode_unsigned_shape(envelope: &UnsignedEnvelope) -> Result<TransactionBody> {
     ensure!(
         envelope.format == UNSIGNED_FORMAT,
         "unsupported unsigned transaction format"
@@ -174,20 +190,38 @@ pub fn decode_unsigned(envelope: &UnsignedEnvelope) -> Result<TransactionBody> {
     // A canonical BIP340 signature adds exactly 64 bytes. Check the actual
     // allocation boundary; block capacity is evaluated against chain state.
     validate_unsigned_length(bytes.len())?;
-    let body: TransactionBody = codec::decode(&bytes, bytes.len())?;
-    validate_body(&body)?;
-    Ok(body)
+    codec::decode(&bytes, bytes.len())
+}
+
+/// Payments listed by a grant proposal; zero for every other operation.
+pub fn grant_payments(body: &TransactionBody) -> usize {
+    match &body.operation {
+        Operation::Propose {
+            proposal: Proposal::Grant { payments },
+            ..
+        } => payments.len(),
+        _ => 0,
+    }
 }
 
 pub fn signed_hex(transaction: &Transaction) -> String {
     hex::encode(codec::encode(transaction))
 }
 
-pub fn decode_signed(raw: &str) -> Result<Transaction> {
+/// Decode a signed record and verify its signature for the network `chain_id`.
+pub fn decode_signed(raw: &str, chain_id: &Hash) -> Result<Transaction> {
+    let transaction = decode_signed_record(raw)?;
+    crypto::verify(chain_id, &transaction)
+        .map_err(|_| anyhow::anyhow!("invalid transaction signature for this network"))?;
+    Ok(transaction)
+}
+
+/// The canonical shape of a signed record, without its signature check. A
+/// signature verifies only for one chain ID; the receiving node checks it.
+pub fn decode_signed_record(raw: &str) -> Result<Transaction> {
     let bytes = raw_bytes(raw)?;
     let transaction: Transaction = codec::decode(&bytes, bytes.len())?;
     validate_body(&transaction.body)?;
-    crypto::verify(&transaction)?;
     Ok(transaction)
 }
 
@@ -335,16 +369,14 @@ pub fn review(body: &TransactionBody, chain_id: Option<&Hash>) -> Vec<ReviewFiel
             value,
         })
     };
+    // The signing message commits to this chain ID, so no other network
+    // accepts the signature, whichever network the anchor came from.
     if let Some(chain) = chain_id {
-        add("Network context · unsigned", hex::encode(chain));
+        add("Network · signed", hex::encode(chain));
     }
     add(
         "Anchor validation",
         "Ancestry and expiry are checked by the receiving node".into(),
-    );
-    add(
-        "Network check",
-        "The signature does not name a network: it is valid only where the anchor block exists, which this review cannot verify. Use a separate key for each network that holds value".into(),
     );
     add("Sender", account(&body.sender));
     add("Nonce", body.nonce.to_string());
@@ -573,7 +605,8 @@ mod governance_review_tests {
         assert!(
             fields
                 .iter()
-                .any(|field| field.label == "Network context · unsigned")
+                .any(|field| field.label == "Network · signed"
+                    && field.value == hex::encode([42; 32]))
         );
         assert!(
             fields
@@ -587,6 +620,7 @@ mod governance_review_tests {
                 .any(|field| field.label == "Sender"
                     && field.value == hex::encode(transaction.sender))
         );
+        assert!(!without_context.iter().any(|f| f.label.starts_with("Network")));
         for malformed in [String::new(), "00".into(), "g".repeat(64), "AA".repeat(32)] {
             let mut changed = first.clone();
             changed.chain_id = malformed;
@@ -689,11 +723,10 @@ mod governance_review_tests {
     }
 
     #[test]
-    fn cold_review_flags_long_lifetimes_and_unverified_network() {
+    fn cold_review_flags_long_lifetimes_and_names_the_signed_network() {
         let mut transaction = body(Parameter::DecisionBlocks, 60, 120);
         let fields = review(&transaction, Some(&[42; 32]));
-        assert!(fields.iter().any(|f| f.label == "Network check"
-            && f.value.contains("does not name a network")));
+        assert_eq!(fields[0].label, "Network · signed");
         assert!(!fields.iter().any(|f| f.label == "Lifetime warning"));
         for (lifetime, warned) in [
             (LONG_LIFETIME_BLOCKS, false),

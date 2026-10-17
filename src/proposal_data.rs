@@ -53,7 +53,7 @@ mod tests {
             data: text.as_bytes().to_vec(),
         };
         assert_eq!(
-            from_transaction(&crypto::sign(&body, &secret).unwrap()).as_deref(),
+            from_transaction(&crypto::sign(&[0; 32], &body, &secret).unwrap()).as_deref(),
             Some(text)
         );
         let mut operation = body.operation.clone();
@@ -61,7 +61,7 @@ mod tests {
             description[0] ^= 1;
         }
         body.operation = operation;
-        assert!(from_transaction(&crypto::sign(&body, &secret).unwrap()).is_none());
+        assert!(from_transaction(&crypto::sign(&[0; 32], &body, &secret).unwrap()).is_none());
     }
 
     #[test]
@@ -69,6 +69,7 @@ mod tests {
         let secret = [22; 32];
         let parse = |text: &str, data: &[u8]| {
             let transaction = crypto::sign(
+                &[0; 32],
                 &TransactionBody {
                     sender: crypto::public_key(&secret).unwrap(),
                     nonce: 0,

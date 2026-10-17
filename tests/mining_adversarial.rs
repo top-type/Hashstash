@@ -851,7 +851,7 @@ async fn same_parent_template_churn_neither_flushes_nor_evicts_inflight_jobs() {
                 amount: 1u32.into(),
             },
         };
-        node.submit_transaction(crypto::sign(&body, &secret).unwrap())
+        node.submit_transaction(crypto::sign(&config.chain_id(), &body, &secret).unwrap())
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

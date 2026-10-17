@@ -138,8 +138,10 @@ fn zero_subsidy_charges_miner_creation_only_when_fees_pay_it() {
     c.validate().unwrap();
     let q = c.work_per_atom().unwrap();
     let funded = step(&c, &State::genesis(&c), 1, &q * 100u32, &[]);
-    let payment = |fee: u32| {
+    // Changing the configuration below changes the chain ID the payment binds.
+    let payment = |chain: &Hash, fee: u32| {
         crypto::sign(
+            chain,
             &TransactionBody {
                 sender: key(1),
                 nonce: 0,
@@ -156,7 +158,7 @@ fn zero_subsidy_charges_miner_creation_only_when_fees_pay_it() {
         )
         .unwrap()
     };
-    let free = step(&c, &funded, 2, 2u32.into(), &[payment(0)]);
+    let free = step(&c, &funded, 2, 2u32.into(), &[payment(&funded.chain_id, 0)]);
     assert_eq!(free.issued, funded.issued);
     assert!(free.account(&key(2), None).is_none());
     // A new fee recipient needs one account write in addition to the transaction.
@@ -167,13 +169,13 @@ fn zero_subsidy_charges_miner_creation_only_when_fees_pay_it() {
             &funded.root(),
             &key(2),
             &2u32.into(),
-            &[payment(1)]
+            &[payment(&funded.chain_id, 1)]
         )
         .is_err()
     );
     c.initial.block_bytes = 16_384;
     let funded = step(&c, &State::genesis(&c), 1, &q * 100u32, &[]);
-    let paid = payment(1);
+    let paid = payment(&funded.chain_id, 1);
     let next = step(&c, &funded, 2, 2u32.into(), &[paid]);
     assert_eq!(next.issued, funded.issued);
     assert_eq!(next.account(&key(2), None).unwrap().ordinary, Amount::one());

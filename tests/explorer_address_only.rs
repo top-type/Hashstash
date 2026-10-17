@@ -30,6 +30,7 @@ fn read(node: &Node, method: &str, params: Value) -> Value {
 }
 fn transaction(c: &Config, nonce: u64, data: &[u8]) -> Transaction {
     crypto::sign(
+        &c.chain_id(),
         &TransactionBody {
             sender: owner(),
             nonce,

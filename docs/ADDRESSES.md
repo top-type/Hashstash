@@ -8,7 +8,7 @@ Hashstash uses [Bech32m from BIP 350](https://bips.dev/350/). The human-readable
 
 Encoders produce lowercase. Decoders accept all-uppercase addresses too, reject mixed case, require the exact payload length and canonical zero padding, validate the curve point, and check the expected network prefix. Bech32 checksums are not accepted in place of Bech32m. Input fields may trim surrounding whitespace. Invalid input is rejected rather than corrected automatically.
 
-The checksum detects accidental changes; it does not establish who owns an address. Transactions sign an anchor block instead of repeating the chain ID; nodes check that the anchor belongs to the accepting branch. Watch-only descriptor files include the complete chain ID and validate it independently of the fingerprint.
+The checksum detects accidental changes; it does not establish who owns an address. Transaction signatures commit to the chain ID without repeating it in the transaction, so another network rejects them; nodes also check that the signed anchor block belongs to the accepting branch. Watch-only descriptor files include the complete chain ID and validate it independently of the fingerprint.
 
 A fresh network has a different chain ID and therefore different addresses, even when using the same private keys. Depositing or withdrawing Stash preserves addresses and account keys.
 
@@ -16,7 +16,7 @@ A fresh network has a different chain ID and therefore different addresses, even
 
 Use **Copy address** on Wallet or Payments. Checksummed recipients must match the connected network. Payments, encrypted Mail, grant proposals and Watch account require a checksummed address. Raw public keys remain in private backups and technical interfaces. Explicit imports of public-key descriptor files are converted into addresses for the connected chain.
 
-The offline signer obtains its network from a local configuration, a pasted chain ID, or the public descriptor exported under Explorer → Network → Identity. No node connection is needed. Its transaction review derives sender and recipient keys from the actual signed body and formats their addresses with the selected network context. The export carries that context separately; an offline signer cannot verify anchor ancestry from it. Selecting another network invalidates any previous review.
+The offline signer obtains its network from a local configuration, a pasted chain ID, or the public descriptor exported under Explorer → Network → Identity. No node connection is needed. Its transaction review derives sender and recipient keys from the actual signed body and formats their addresses with the selected network, which the signature then binds. The export carries its own network context separately; it must match the selection and is never adopted. An offline signer cannot verify anchor ancestry. Selecting another network invalidates any previous review.
 
 ## Command line
 

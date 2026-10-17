@@ -10,6 +10,9 @@ use hashstash::{
 use serde_json::json;
 use std::collections::BTreeMap;
 
+/// The network these offline records are signed for.
+const CHAIN: [u8; 32] = [39; 32];
+
 fn body(operation: Operation) -> TransactionBody {
     TransactionBody {
         data: Vec::new(),
@@ -133,9 +136,9 @@ fn offline_review_discloses_exact_fee_for_every_operation() {
             assert_eq!(review["Recipient receives · HASH"], "101");
             assert_eq!(review["Total debit · HASH"], "201");
         }
-        let signed = crypto::sign(&tx, &[19; 32]).unwrap();
+        let signed = crypto::sign(&CHAIN, &tx, &[19; 32]).unwrap();
         assert_eq!(
-            wallet::decode_signed(&wallet::signed_hex(&signed)).unwrap(),
+            wallet::decode_signed(&wallet::signed_hex(&signed), &CHAIN).unwrap(),
             signed
         );
     }
@@ -231,7 +234,7 @@ fn offline_exports_reject_invalid_values_and_removed_operation_tags() {
 
 #[test]
 fn signatures_bind_exact_fee_direct_data_and_operation() {
-    let original = crypto::sign(&body(transfer()), &[19; 32]).unwrap();
+    let original = crypto::sign(&CHAIN, &body(transfer()), &[19; 32]).unwrap();
     let mut cap = original.clone();
     cap.body.fee += 1u32;
     let mut data = original.clone();
@@ -243,9 +246,10 @@ fn signatures_bind_exact_fee_direct_data_and_operation() {
     }
     payload.body.operation = changed;
     for changed in [cap, data, payload] {
-        assert!(wallet::decode_signed(&wallet::signed_hex(&changed)).is_err());
+        assert!(wallet::decode_signed(&wallet::signed_hex(&changed), &CHAIN).is_err());
     }
-    assert!(wallet::decode_signed(&wallet::signed_hex(&original)).is_ok());
+    assert!(wallet::decode_signed(&wallet::signed_hex(&original), &CHAIN).is_ok());
+    assert!(wallet::decode_signed(&wallet::signed_hex(&original), &[40; 32]).is_err());
 }
 
 async fn cli(arguments: Vec<String>) -> std::process::Output {
@@ -499,8 +503,8 @@ async fn real_cli_watch_only_prepare_offline_sign_broadcast_and_hot_send_use_exa
     let body_path = directory.path().join("body.json");
     let signed_path = directory.path().join("signed.json");
     std::fs::write(&body_path, serde_json::to_vec(&prepared).unwrap()).unwrap();
-    successful(
-        cli(vec![
+    let sign = |chain: Option<String>| {
+        let mut arguments: Vec<String> = vec![
             "sign".into(),
             "--key".into(),
             key.clone(),
@@ -508,9 +512,15 @@ async fn real_cli_watch_only_prepare_offline_sign_broadcast_and_hot_send_use_exa
             body_path.to_str().unwrap().into(),
             "--out".into(),
             signed_path.to_str().unwrap().into(),
-        ])
-        .await,
-    );
+        ];
+        if let Some(chain) = chain {
+            arguments.extend(["--chain-id".into(), chain]);
+        }
+        cli(arguments)
+    };
+    // The signature binds a network, so the signer must be told which one.
+    assert!(!sign(None).await.status.success());
+    successful(sign(Some(hex::encode(wallet::unsigned_chain(&envelope).unwrap()))).await);
     let signed: hashstash::types::Transaction =
         serde_json::from_slice(&std::fs::read(signed_path).unwrap()).unwrap();
     assert_eq!(signed.body, prepared);
@@ -588,6 +598,7 @@ async fn cli_finds_pending_nonce_beyond_legacy_mempool_size() {
     config.genesis_time = node::now().saturating_sub(3600) as u32;
     config.initial_bits = 0x1f7fffff;
     config.limit_bits = config.initial_bits;
+    let chain_id = config.chain_id();
     let node = Node::open(&directory.path().join("chain.sqlite"), config, sender).unwrap();
     for _ in 0..3 {
         node.mine(1_000_000).unwrap();
@@ -607,7 +618,7 @@ async fn cli_finds_pending_nonce_beyond_legacy_mempool_size() {
             expiry_blocks: 100,
             operation: operation.clone(),
         };
-        node.submit_transaction(crypto::sign(&body, &secret).unwrap())
+        node.submit_transaction(crypto::sign(&chain_id, &body, &secret).unwrap())
             .unwrap();
         assert!(
             setup_started.elapsed() < std::time::Duration::from_secs(120),

@@ -36,11 +36,16 @@ fn prepare(node: &Node, sender: PublicKey, operation: Operation) -> TransactionB
         .unwrap()
 }
 
+/// The network the node reports, which offline signatures must bind.
+fn chain_id(node: &Node) -> Hash {
+    node::parse_hash(node.status().unwrap()["chain_id"].as_str().unwrap()).unwrap()
+}
+
 fn cold_submit(node: &Node, secret: &[u8; 32], operation: Operation) -> Transaction {
     let body = prepare(node, crypto::public_key(secret).unwrap(), operation);
-    let tx = crypto::sign(&body, secret).unwrap();
+    let tx = crypto::sign(&chain_id(node), &body, secret).unwrap();
     let raw = wallet::signed_hex(&tx);
-    assert_eq!(wallet::decode_signed(&raw).unwrap(), tx);
+    assert_eq!(wallet::decode_signed(&raw, &chain_id(node)).unwrap(), tx);
     let result = node
         .rpc("broadcasttransaction", json!({"raw":raw}))
         .unwrap();
@@ -156,7 +161,7 @@ async fn watch_only_http_exports_and_broadcasts_but_never_signs() {
     let body = wallet::decode_unsigned(&serde_json::from_value(package).unwrap()).unwrap();
     assert_eq!(body.sender, watched);
     assert_eq!(body.expiry_blocks, 7);
-    let signed = crypto::sign(&body, &secret).unwrap();
+    let signed = crypto::sign(&chain_id(&node), &body, &secret).unwrap();
     let response = node::call_rpc(
         &format!("{base}/rpc"),
         "broadcasttransaction",
@@ -196,7 +201,7 @@ async fn watch_only_http_exports_and_broadcasts_but_never_signs() {
         },
         support: large,
     };
-    let raw = wallet::signed_hex(&crypto::sign(&large_body, &secret).unwrap());
+    let raw = wallet::signed_hex(&crypto::sign(&chain_id(&node), &large_body, &secret).unwrap());
     assert!(raw.len() > 1024);
     let rejected = client
         .post(format!("{base}/rpc"))
@@ -381,11 +386,14 @@ fn raw_broadcast_rejects_wrong_network_expiry_signature_and_encoding() {
     }
     let baseline = node.status().unwrap();
     let body = prepare(&node, sender, donation());
-    let signed = crypto::sign(&body, &secret).unwrap();
+    let chain = chain_id(&node);
+    let signed = crypto::sign(&chain, &body, &secret).unwrap();
     let mut other_network = body.clone();
     let mut foreign_config = Config::devnet();
     foreign_config.network.push_str("-foreign");
     other_network.anchor = codec::block_hash(&codec::genesis_block(&foreign_config).unwrap());
+    // Unchanged bytes signed for the foreign network's chain ID.
+    let foreign_signature = crypto::sign(&foreign_config.chain_id(), &body, &secret).unwrap();
     let mut expired = body.clone();
     expired.anchor = codec::block_hash(&codec::genesis_block(&Config::devnet()).unwrap());
     expired.expiry_blocks = 1;
@@ -394,8 +402,9 @@ fn raw_broadcast_rejects_wrong_network_expiry_signature_and_encoding() {
     let mut appended = wallet::signed_hex(&signed);
     appended.push_str("00");
     for raw in [
-        wallet::signed_hex(&crypto::sign(&other_network, &secret).unwrap()),
-        wallet::signed_hex(&crypto::sign(&expired, &secret).unwrap()),
+        wallet::signed_hex(&crypto::sign(&chain, &other_network, &secret).unwrap()),
+        wallet::signed_hex(&foreign_signature),
+        wallet::signed_hex(&crypto::sign(&chain, &expired, &secret).unwrap()),
         wallet::signed_hex(&altered),
         appended,
         "g0".into(),
@@ -451,7 +460,7 @@ fn exact_transfer_quotes_and_offline_signatures_keep_recipient_credit_exact() {
     assert!(
         node.rpc(
             "broadcasttransaction",
-            json!({"raw":wallet::signed_hex(&crypto::sign(&underpaid,&secret).unwrap())})
+            json!({"raw":wallet::signed_hex(&crypto::sign(&chain_id(&node),&underpaid,&secret).unwrap())})
         )
         .is_err()
     );

@@ -46,7 +46,7 @@ fn sign(
         data,
     };
     for _ in 0..16 {
-        let tx = crypto::sign(&body, secret).unwrap();
+        let tx = crypto::sign(&s.chain_id, &body, secret).unwrap();
         let quote = fees::quote(&Config::testnet(), s, &tx).unwrap();
         let exact = (quote.minimum_fee + extra).min(cap.into());
         if body.fee == exact {

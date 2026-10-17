@@ -78,8 +78,8 @@ fn quotes_charge_for_all_data_and_offline_exports_sign_the_quoted_bytes() {
     let body = unsigned(package);
     assert_eq!(body.data, data);
     assert_eq!(body.operation.clone(), operation());
-    let tx = crypto::sign(&body, &SECRET).unwrap();
-    let plain = crypto::sign(&plain, &SECRET).unwrap();
+    let tx = crypto::sign(&config().chain_id(), &body, &SECRET).unwrap();
+    let plain = crypto::sign(&config().chain_id(), &plain, &SECRET).unwrap();
     assert_eq!(
         codec::encode(&tx).len() - codec::encode(&plain).len(),
         data.len() + 2
@@ -91,7 +91,7 @@ fn quotes_charge_for_all_data_and_offline_exports_sign_the_quoted_bytes() {
         weight.div_ceil(fees::FEE_SCALE).to_string()
     );
     let raw = wallet::signed_hex(&tx);
-    assert_eq!(wallet::decode_signed(&raw).unwrap(), tx);
+    assert_eq!(wallet::decode_signed(&raw, &config().chain_id()).unwrap(), tx);
     assert_eq!(
         node.status().unwrap(),
         before,
@@ -240,7 +240,7 @@ async fn hot_wallet_data_reaches_peer_mempool_mined_block_and_reopened_database(
     let transaction: Transaction =
         serde_json::from_value(json!({"body":pool[0]["body"],"signature":pool[0]["signature"]}))
             .unwrap();
-    crypto::verify(&transaction).unwrap();
+    crypto::verify(&config.chain_id(), &transaction).unwrap();
     assert_eq!(transaction.body.data, data);
     assert_eq!(
         accepted["transaction_id"],

@@ -26,6 +26,7 @@ fn step(c: &Config, s: &State, subsidy: u64, txs: &[Transaction]) -> State {
 fn sign(s: &State, secret: &[u8; 32], operation: Operation) -> Transaction {
     let sender = key(secret);
     crypto::sign(
+        &s.chain_id,
         &TransactionBody {
             sender,
             nonce: s.account(&sender, None).unwrap().nonce,

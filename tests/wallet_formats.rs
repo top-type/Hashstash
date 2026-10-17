@@ -1,11 +1,19 @@
 //! Offline export boundaries, exact review fields, and independently calculated keys.
 use hashstash::{
     address, codec, crypto,
-    types::{Amount, Operation, Outcome, Parameter, Proposal, TransactionBody},
+    types::{Amount, Operation, Outcome, Parameter, Proposal, Transaction, TransactionBody},
     wallet::{self, UnsignedEnvelope},
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+
+/// The network these offline records are reviewed and signed for.
+const CHAIN: [u8; 32] = [39; 32];
+
+/// Signed records verify only for the network they were signed for.
+fn decode_signed(raw: &str) -> anyhow::Result<Transaction> {
+    wallet::decode_signed(raw, &CHAIN)
+}
 
 fn body(operation: Operation) -> TransactionBody {
     TransactionBody {
@@ -37,7 +45,7 @@ fn fields(body: &TransactionBody) -> BTreeMap<String, String> {
 
 fn expected(action: &str, entries: &[(&str, String)]) -> BTreeMap<String, String> {
     let mut result = BTreeMap::from([
-        ("Network context · unsigned".into(), hex::encode([39; 32])),
+        ("Network · signed".into(), hex::encode([39; 32])),
         (
             "Anchor validation".into(),
             "Ancestry and expiry are checked by the receiving node".into(),
@@ -45,10 +53,6 @@ fn expected(action: &str, entries: &[(&str, String)]) -> BTreeMap<String, String
         (
             "Sender".into(),
             address::encode(&crypto::public_key(&[19; 32]).unwrap(), &[39; 32]).unwrap(),
-        ),
-        (
-            "Network check".into(),
-            "The signature does not name a network: it is valid only where the anchor block exists, which this review cannot verify. Use a separate key for each network that holds value".into(),
         ),
         ("Nonce".into(), (u64::MAX - 1).to_string()),
         ("Anchor block".into(), hex::encode([38; 32])),
@@ -93,8 +97,8 @@ fn exact_transfer_review_and_signature_preserve_recipient_amount_and_fee() {
     assert_eq!(review["Fee · HASH"], "6");
     assert!(!review.contains_key("Minimum received · HASH"));
     assert!(!review.contains_key("Gross payment · HASH"));
-    let tx = crypto::sign(&b, &[19; 32]).unwrap();
-    assert_eq!(wallet::decode_signed(&wallet::signed_hex(&tx)).unwrap(), tx);
+    let tx = crypto::sign(&CHAIN, &b, &[19; 32]).unwrap();
+    assert_eq!(decode_signed(&wallet::signed_hex(&tx)).unwrap(), tx);
     for changed in [
         Operation::TransferExact {
             recipient,
@@ -107,7 +111,7 @@ fn exact_transfer_review_and_signature_preserve_recipient_amount_and_fee() {
     ] {
         let mut changed_tx = tx.clone();
         changed_tx.body.operation = changed;
-        assert!(wallet::decode_signed(&wallet::signed_hex(&changed_tx)).is_err());
+        assert!(decode_signed(&wallet::signed_hex(&changed_tx)).is_err());
     }
     // Reviews use exact integers even if the conservative maximum spans the
     // largest individually accepted fields.
@@ -170,16 +174,35 @@ fn independent_v2_passphrase_vectors_are_stretched_and_network_specific() {
         assert_eq!(hex::encode(*secret), vector["secret"]);
         let public = crypto::public_key(&secret).unwrap();
         assert_eq!(hex::encode(public), vector["public_key"]);
-        assert!(distinct.insert(public), "network, whitespace or Unicode form ignored");
+        assert!(distinct.insert(public), "network or whitespace ignored");
         // Never the legacy key for the same phrase.
         assert_ne!(*wallet::derive_secret(phrase).unwrap(), *secret);
     }
-    assert_eq!(distinct.len(), 6);
+    assert_eq!(distinct.len(), 3);
     let chain = [39; 32];
+    // One visible phrase can be typed as composed or decomposed Unicode, which
+    // would open different accounts; v2 refuses anything but printable ASCII.
+    let rejected = document["rejected"].as_array().unwrap();
+    assert_eq!(rejected.len(), 4);
+    for vector in rejected {
+        let phrase = vector["passphrase"].as_str().unwrap();
+        assert_eq!(hex::encode(phrase.as_bytes()), vector["utf8_hex"]);
+        assert!(phrase.len() >= wallet::MIN_PASSPHRASE_V2_BYTES);
+        let error = wallet::derive_secret_v2(phrase, &chain).unwrap_err();
+        assert!(error.to_string().contains("printable ASCII"), "{error}");
+        // Legacy v1 restores such phrases exactly as before.
+        wallet::derive_secret(phrase).unwrap();
+    }
     assert!(wallet::derive_secret_v2("", &chain).is_err());
     assert!(wallet::derive_secret_v2(&"a".repeat(wallet::MIN_PASSPHRASE_V2_BYTES - 1), &chain).is_err());
-    assert!(wallet::derive_secret_v2(&"é".repeat(7), &chain).is_err());
-    assert!(wallet::derive_secret_v2(&"é".repeat(8), &chain).is_ok());
+    assert!(wallet::derive_secret_v2(&"é".repeat(8), &chain).is_err());
+    for byte in [0x1f, 0x7f, 0x80] {
+        let mut phrase = "a".repeat(wallet::MIN_PASSPHRASE_V2_BYTES).into_bytes();
+        phrase[3] = byte;
+        let phrase = String::from_utf8_lossy(&phrase).into_owned();
+        assert!(wallet::derive_secret_v2(&phrase, &chain).is_err(), "byte {byte:#x}");
+    }
+    assert!(wallet::derive_secret_v2(&"~ !".repeat(6), &chain).is_ok());
     assert!(
         wallet::derive_secret_v2(&"a".repeat(wallet::MAX_PASSPHRASE_BYTES + 1), &chain).is_err()
     );
@@ -425,15 +448,16 @@ fn every_operation_roundtrips_and_reviews_every_signed_field_exactly() {
                 .iter()
                 .all(|field| field["value"].is_string())
         );
-        let signed = crypto::sign(&body, &[19; 32]).unwrap();
+        let signed = crypto::sign(&CHAIN, &body, &[19; 32]).unwrap();
         let raw = wallet::signed_hex(&signed);
-        let decoded = wallet::decode_signed(&raw).unwrap();
+        let decoded = decode_signed(&raw).unwrap();
         assert_eq!(decoded, signed);
+        assert!(wallet::decode_signed(&raw, &[40; 32]).is_err(), "another network accepted it");
         assert_eq!(
             codec::transaction_id(&decoded),
             codec::transaction_id(&signed)
         );
-        assert!(crypto::sign(&body, &[20; 32]).is_err());
+        assert!(crypto::sign(&CHAIN, &body, &[20; 32]).is_err());
         // Mutate every byte of the signed body across all operation variants.
         // Each changed record must fail parsing, canonicality, or authorization.
         let encoded = codec::encode(&signed);
@@ -441,7 +465,7 @@ fn every_operation_roundtrips_and_reviews_every_signed_field_exactly() {
             let mut changed = encoded.clone();
             changed[offset] ^= 1;
             assert!(
-                wallet::decode_signed(&hex::encode(changed)).is_err(),
+                decode_signed(&hex::encode(changed)).is_err(),
                 "accepted modified body byte {offset}: {:?}",
                 body.operation
             );
@@ -463,8 +487,8 @@ fn fee_share_exports_reject_invalid_or_unchanged_percentages() {
             support: 1u32.into(),
         });
         assert!(wallet::decode_unsigned(&wallet::unsigned(&invalid, &[39; 32])).is_err());
-        let transaction = crypto::sign(&invalid, &[19; 32]).unwrap();
-        assert!(wallet::decode_signed(&wallet::signed_hex(&transaction)).is_err());
+        let transaction = crypto::sign(&CHAIN, &invalid, &[19; 32]).unwrap();
+        assert!(decode_signed(&wallet::signed_hex(&transaction)).is_err());
     }
 }
 
@@ -479,7 +503,7 @@ fn ordinary() -> TransactionBody {
 
 #[test]
 fn signed_exports_reject_modified_fields_and_signatures() {
-    let original = crypto::sign(&ordinary(), &[19; 32]).unwrap();
+    let original = crypto::sign(&CHAIN, &ordinary(), &[19; 32]).unwrap();
     let mut changed = Vec::new();
     let mut tx = original.clone();
     tx.body.sender = crypto::public_key(&[20; 32]).unwrap();
@@ -518,10 +542,10 @@ fn signed_exports_reject_modified_fields_and_signatures() {
     tx.signature[31] ^= 1;
     changed.push(tx);
     let bytes = codec::encode(&original);
-    assert!(wallet::decode_signed(&hex::encode(&bytes[..bytes.len() - 1])).is_err());
-    assert!(wallet::decode_signed(&(hex::encode(&bytes) + "00")).is_err());
+    assert!(decode_signed(&hex::encode(&bytes[..bytes.len() - 1])).is_err());
+    assert!(decode_signed(&(hex::encode(&bytes) + "00")).is_err());
     for transaction in changed {
-        assert!(wallet::decode_signed(&wallet::signed_hex(&transaction)).is_err());
+        assert!(decode_signed(&wallet::signed_hex(&transaction)).is_err());
     }
     let conditional = body(Operation::Redeem {
         shares: 17u32.into(),
@@ -529,13 +553,13 @@ fn signed_exports_reject_modified_fields_and_signatures() {
         decision: Some([7; 32]),
         outcome: Some(Outcome::Pass),
     });
-    let mut signed = crypto::sign(&conditional, &[19; 32]).unwrap();
+    let mut signed = crypto::sign(&CHAIN, &conditional, &[19; 32]).unwrap();
     let mut operation = signed.body.operation.clone();
     if let Operation::Redeem { outcome, .. } = &mut operation {
         *outcome = Some(Outcome::Fail)
     }
     signed.body.operation = operation;
-    assert!(wallet::decode_signed(&wallet::signed_hex(&signed)).is_err());
+    assert!(decode_signed(&wallet::signed_hex(&signed)).is_err());
 }
 
 #[test]
@@ -591,9 +615,9 @@ fn malformed_envelopes_and_noncanonical_bytes_are_rejected() {
             body: invalid.clone(),
         };
         assert!(wallet::decode_unsigned(&changed).is_err());
-        assert!(wallet::decode_signed(&invalid).is_err());
+        assert!(decode_signed(&invalid).is_err());
     }
-    let signed = crypto::sign(&body, &[19; 32]).unwrap();
+    let signed = crypto::sign(&CHAIN, &body, &[19; 32]).unwrap();
     let bytes = codec::encode(&signed);
     let signature_offset = codec::encode(&body).len();
     assert_eq!(bytes.len() - signature_offset, 64);
@@ -607,7 +631,7 @@ fn malformed_envelopes_and_noncanonical_bytes_are_rejected() {
         bytes[..bytes.len() - 1].to_vec(),
         [bytes, vec![0]].concat(),
     ] {
-        assert!(wallet::decode_signed(&hex::encode(malformed)).is_err());
+        assert!(decode_signed(&hex::encode(malformed)).is_err());
     }
 }
 
@@ -709,13 +733,13 @@ fn offline_wallet_round_trips_transactions_larger_than_the_initial_block() {
         wallet::decode_unsigned(&wallet::unsigned(&largest, &[39; 32])).unwrap(),
         largest
     );
-    let signed = crypto::sign(&largest, &[19; 32]).unwrap();
+    let signed = crypto::sign(&CHAIN, &largest, &[19; 32]).unwrap();
     assert_eq!(
         codec::encode(&signed).len(),
         codec::encode(&largest).len() + 64
     );
     assert_eq!(
-        wallet::decode_signed(&wallet::signed_hex(&signed)).unwrap(),
+        decode_signed(&wallet::signed_hex(&signed)).unwrap(),
         signed
     );
 }

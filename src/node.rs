@@ -889,9 +889,11 @@ impl Node {
         Ok((selection.transactions, backlog))
     }
     /// Retained entries the selection left out only for block capacity. Unless
-    /// the selection was saturated, an entry that still fits the selected block
-    /// was refused for validity: it is dropped with its sender's later nonces.
-    /// The best bids are kept within MAX_BACKLOG entries and one block's bytes.
+    /// the selection was saturated, an entry that still fits the selected block's
+    /// bytes and weight was refused for validity: it is dropped with its sender's
+    /// later nonces. Weights quoted against the parent state can only overstate
+    /// in-block weights, so a fitting estimate is conservative. The best bids
+    /// are kept within MAX_BACKLOG entries and one block's bytes.
     fn displaced(
         chain: &Chain,
         miner: PublicKey,
@@ -919,15 +921,25 @@ impl Node {
         let (prefix, suffix) = codec::coinbase_parts(height, &miner, &ZERO_HASH);
         let system = prefix.len() + 8 + suffix.len();
         // The selection's own body accounting, counting one further record.
-        let mut used = compact_size_len(selection.transactions.len() + 2)
+        let mut used_bytes = compact_size_len(selection.transactions.len() + 2)
             + compact_size_len(system)
             + system
             + 32;
+        // Weighted capacity equals block bytes; a missing miner account may
+        // reserve one account weight.
+        let weight_limit = state.settings.block_bytes;
+        let mut used_weight = if state.account(&miner, None).is_none() {
+            fees::ACCOUNT_WEIGHT
+        } else {
+            0
+        };
         let mut next = BTreeMap::new();
         let mut seen = HashSet::new();
         for tx in &selection.transactions {
             let bytes = codec::encode(tx).len();
-            used = used.saturating_add(compact_size_len(bytes) + bytes);
+            used_bytes = used_bytes.saturating_add(compact_size_len(bytes) + bytes);
+            let weight = fees::quote(&chain.config, state, tx).map_or(u64::MAX, |quote| quote.weight);
+            used_weight = used_weight.saturating_add(weight);
             seen.insert(codec::transaction_id(tx));
             let nonce = next.entry(tx.body.sender).or_insert(0);
             *nonce = tx.body.nonce.saturating_add(1).max(*nonce);
@@ -976,8 +988,9 @@ impl Node {
                 if nonce > expected {
                     break;
                 }
-                let fits = used.saturating_add(compact_size_len(entry.bytes) + entry.bytes)
-                    <= byte_limit;
+                let fits = used_bytes.saturating_add(compact_size_len(entry.bytes) + entry.bytes)
+                    <= byte_limit
+                    && used_weight.saturating_add(entry.weight) <= weight_limit;
                 if fits && !saturated && expected == start {
                     break;
                 }

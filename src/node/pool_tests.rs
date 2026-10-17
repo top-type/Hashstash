@@ -73,6 +73,12 @@ fn nonce(node: &Node, account: &PublicKey) -> u64 {
         .unwrap()
         .nonce
 }
+/// Copy the pool out. Tests never panic while holding the node lock: a
+/// poisoned node lock ends the whole process.
+fn pool(node: &Node) -> (Vec<Transaction>, Vec<Transaction>, Hash) {
+    let i = node.locked().unwrap();
+    (i.mempool.clone(), i.backlog.clone(), i.pool_tip)
+}
 fn published(node: &Node) -> u64 {
     *node.work_updates.borrow()
 }
@@ -301,14 +307,12 @@ fn a_failed_recovery_still_reports_the_block_and_keeps_pending_entries() {
         0,
     );
     node.submit_transaction(pending.clone()).unwrap();
-    let block = {
+    let candidate = {
         let i = node.locked().unwrap();
-        let candidate = i
-            .chain
+        i.chain
             .template(node.miner, Vec::new(), Node::timestamp(&i.chain))
-            .unwrap();
-        Chain::mine(candidate, 1_000_000).unwrap()
     };
+    let block = Chain::mine(candidate.unwrap(), 1_000_000).unwrap();
     FAIL_RECOVERY.with(|fail| fail.set(true));
     assert!(
         node.submit_block(block.clone()).unwrap(),
@@ -317,10 +321,10 @@ fn a_failed_recovery_still_reports_the_block_and_keeps_pending_entries() {
     let tip = codec::block_hash(&block);
     assert_eq!(snapshot(&node).chain.tip_hash(), tip);
     assert_eq!(snapshot(&node).mempool, vec![pending.clone()]);
-    assert_ne!(node.locked().unwrap().pool_tip, tip);
+    assert_ne!(pool(&node).2, tip);
     // The next selection revalidates the kept entries for the new tip.
     assert_eq!(node.template().unwrap().transactions, vec![pending]);
-    assert_eq!(node.locked().unwrap().pool_tip, tip);
+    assert_eq!(pool(&node).2, tip);
 }
 
 #[test]
@@ -340,7 +344,7 @@ fn capacity_displaced_entries_wait_in_the_backlog_for_the_next_block() {
         low.push(tx);
     }
     assert!(low.len() > 20, "a block holds many payments");
-    assert!(node.locked().unwrap().backlog.is_empty());
+    assert!(pool(&node).1.is_empty());
     let other_start = nonce(&node, &other());
     let high: Vec<_> = (0..4)
         .map(|offset| payment(config, state, &OTHER, other_start + offset, other(), 1, 1_000))
@@ -348,10 +352,7 @@ fn capacity_displaced_entries_wait_in_the_backlog_for_the_next_block() {
     for tx in &high {
         node.submit_transaction(tx.clone()).unwrap();
     }
-    let (selected, backlog) = {
-        let i = node.locked().unwrap();
-        (i.mempool.clone(), i.backlog.clone())
-    };
+    let (selected, backlog, _) = pool(&node);
     assert!(ids(&high).is_subset(&ids(&selected)));
     assert!(!backlog.is_empty(), "outbid entries wait instead of vanishing");
     // Every displaced entry is a suffix of the low-fee nonce chain.
@@ -369,9 +370,38 @@ fn capacity_displaced_entries_wait_in_the_backlog_for_the_next_block() {
     let body = wallet::decode_unsigned(&serde_json::from_value(prepared).unwrap()).unwrap();
     assert_eq!(body.nonce, start + low.len() as u64);
     node.mine(1_000_000).unwrap();
-    let i = node.locked().unwrap();
-    assert_eq!(ids(&i.mempool), ids(&low[kept..]), "the backlog fills the next block");
-    assert!(i.backlog.is_empty());
+    let (selected, backlog, _) = pool(&node);
+    assert_eq!(ids(&selected), ids(&low[kept..]), "the backlog fills the next block");
+    assert!(backlog.is_empty());
+}
+
+#[test]
+fn weight_displaced_account_creations_also_wait_in_the_backlog() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    fund_other(&node);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let fresh = |seed: u8| crypto::public_key(&[seed; 32]).unwrap();
+    let start = nonce(&node, &key());
+    // Each payment creates an account, so weight binds long before bytes.
+    let mut low = Vec::new();
+    loop {
+        let recipient = fresh(100 + low.len() as u8);
+        let tx = payment(config, state, &SECRET, start + low.len() as u64, recipient, 10, 0);
+        if node.submit_transaction(tx.clone()).is_err() {
+            break;
+        }
+        low.push(tx);
+    }
+    assert!((2..40).contains(&low.len()), "{}", low.len());
+    let other_start = nonce(&node, &other());
+    let high = payment(config, state, &OTHER, other_start, fresh(99), 10, 1_000);
+    node.submit_transaction(high.clone()).unwrap();
+    let (selected, backlog, _) = pool(&node);
+    assert!(selected.contains(&high));
+    assert!(!backlog.is_empty(), "a weight-displaced creation is kept");
+    assert_eq!(&ids(&selected) | &ids(&backlog), &ids(&low) | &ids(&[high]));
 }
 
 #[test]
@@ -383,15 +413,16 @@ fn a_count_full_pool_still_admits_a_better_bid() {
     let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
     let limit = mempool_limit(config).min(config.max_signatures);
     let start = nonce(&node, &key());
-    let pool: Vec<_> = (0..limit as u64)
+    let full: Vec<_> = (0..limit as u64)
         .map(|offset| payment(config, state, &SECRET, start + offset, key(), 1, 0))
         .collect();
-    {
+    let installed = {
         let mut i = node.locked().unwrap();
-        let selected = Node::select_pool(&i.chain, node.miner, &pool, &HashSet::new()).unwrap();
-        assert_eq!(selected.0.len(), limit);
-        node.install_pool(&mut i, selected).unwrap();
-    }
+        Node::select_pool(&i.chain, node.miner, &full, &HashSet::new())
+            .and_then(|selected| node.install_pool(&mut i, selected))
+    };
+    installed.unwrap();
+    assert_eq!(pool(&node).0.len(), limit);
     let bid = payment(config, state, &OTHER, nonce(&node, &other()), other(), 1, 1_000);
     node.submit_transaction(bid.clone()).unwrap();
     let pending = snapshot(&node).mempool.clone();

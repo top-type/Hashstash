@@ -1616,6 +1616,32 @@ impl Node {
                 // two alternative futures. All fields share this published tip.
                 snapshot["payment_available_hash"] =
                     snapshot["account"]["payment_available_hash"].clone();
+                // The mempool page above is capped. Give the selected sender
+                // its own pending rows and its next nonce over the whole pool,
+                // as prepare_locked computes it, so a wallet cannot predict a
+                // stale nonce when its transactions sit past that page.
+                if let Some(key) = key {
+                    let sender = parse_account(key, &chain_id)?;
+                    let own: Vec<Transaction> = i
+                        .mempool
+                        .iter()
+                        .filter(|tx| tx.body.sender == sender)
+                        .cloned()
+                        .collect();
+                    let confirmed = i
+                        .chain
+                        .tip_state()
+                        .account(&sender, None)
+                        .map(|a| a.nonce);
+                    let nonce = own
+                        .iter()
+                        .map(|tx| tx.body.nonce.saturating_add(1))
+                        .chain(confirmed)
+                        .max();
+                    snapshot["pending_nonce"] =
+                        nonce.map_or(Value::Null, |n| json!(n.to_string()));
+                    snapshot["sender_mempool"] = mempool_page(&own, 0, 128, true)?;
+                }
                 if let Some(keys) = keys {
                     let s = i.chain.tip_state();
                     // Only read holdings from the same immutable view. Unlike

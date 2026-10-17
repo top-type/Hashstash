@@ -15,6 +15,8 @@
         balances: null,
         proposals: [],
         mempool: [],
+        senderMempool: null,
+        pendingNonce: null,
         ready: false,
         contextEpoch: 0,
         refreshing: false,
@@ -820,14 +822,11 @@
         if (state.submitting) throw new Error("Wait for the current submission to finish.");
         if (state.managing) throw new Error("Wait for the wallet change to finish.");
         if (form.id === "send-form" && operation.TransferExact && (!state.sendQuote || state.sendQuote.identity !== sendIdentity())) throw new Error("Wait for a current payment quote.");
-        let feeFields;
-        {
-            const quote = feeQuotes.get(form.id);
-            if (!quote || quote.identity !== feeIdentity(form)) throw new Error("Wait for the current fee quote.");
-            feeFields = {
-                fee: quote.fee
-            };
-        }
+        const feeQuote = feeQuotes.get(form.id);
+        if (!feeQuote || feeQuote.identity !== feeIdentity(form)) throw new Error("Wait for the current fee quote.");
+        const feeFields = {
+            fee: feeQuote.fee
+        };
         checkOutcomeFunds(operation, feeFields.fee);
         const expiry = transactionExpiry(form);
         if (!expiry) throw new Error("Transaction expiry must be greater than zero.");
@@ -865,6 +864,7 @@
             if (identity !== submissionIdentity(form)) throw new Error("Details or connection changed. Prepare the transaction again.");
             if (typeof envelope?.body !== "string" || envelope.body.length / 2 + 64 > transactionByteLimit()) throw new Error("Transaction exceeds the block capacity.");
             HashstashBrowserWallet.verifyUnsigned(envelope, expected);
+            checkPreparedWeight(envelope.body, feeQuote, operation);
             if (identity !== submissionIdentity(form)) throw new Error("Details or connection changed. Review again.");
             if (!hot) {
                 $("unsigned-output").value = JSON.stringify({
@@ -899,9 +899,16 @@
             form.id === "send-form" && sendSoon();
         }
     }
+    // The snapshot's global mempool page is capped at 128 rows. The node also
+    // reports the selected sender's own pending rows and its next nonce over
+    // the whole pool, the value preparetransaction requires.
+    function ownPending() {
+        return Array.isArray(state.senderMempool) ? state.senderMempool : state.mempool.filter(tx => hex(tx.body?.sender) === key());
+    }
     function nextNonce() {
         let nonce = BigInt(state.account?.account?.nonce || "0");
-        for (const transaction of state.mempool) hex(transaction.body?.sender) === key() && BigInt(transaction.body.nonce) >= nonce && (nonce = BigInt(transaction.body.nonce) + 1n);
+        /^\d{1,20}$/.test(String(state.pendingNonce ?? "")) && BigInt(state.pendingNonce) > nonce && (nonce = BigInt(state.pendingNonce));
+        for (const transaction of ownPending()) hex(transaction.body?.sender) === key() && BigInt(transaction.body.nonce) >= nonce && (nonce = BigInt(transaction.body.nonce) + 1n);
         return nonce;
     }
     function submissionIdentity(form) {
@@ -949,6 +956,8 @@
         checkQuoteSnapshot(result);
         if (result.anchor !== state.status.tip || String(result.anchor_height) !== String(state.status.height) || String(result.expiry_blocks) !== String(transactionExpiry(form)) || BigInt(result.expiry_height) !== BigInt(state.status.height) + BigInt(transactionExpiry(form))) throw new Error("Fee quote does not match the transaction lifetime.");
         if (result.sender_public_key !== key() || result.sender !== address() || result.extra_fee !== extra) throw new Error("Fee quote does not match this account.");
+        // The nonce's encoded length is part of the weight the fee pays for.
+        if (result.nonce !== void 0 && String(result.nonce) !== nextNonce().toString()) throw new Error("Fee quote does not match the transaction number.");
         {
             const data = transactionData(form).data_hex || "";
             if (result.data_hex !== data || result.data_bytes !== data.length / 2) throw new Error("Fee quote does not match the transaction data.");
@@ -969,6 +978,16 @@
             if (miner !== fee * BigInt(percent) / 100n || miner + revenue !== fee) throw new Error("Invalid fee allocation totals.");
         }
         return result;
+    }
+    function checkPreparedWeight(body, quote, operation) {
+        // The quoted weight, and so the minimum fee, came from the node.
+        // Re-derive it from the exact prepared bytes: the body plus a 64-byte
+        // signature, 1,024 per grant recipient and, only for a payment that
+        // creates its recipient's account, another 1,024.
+        const base = BigInt(body.length / 2 + 64), recipients = BigInt(operation?.Propose?.proposal?.Grant?.payments?.length || 0);
+        const extra = BigInt(quote?.weight ?? -1) - base - recipients * 1024n, creation = BigInt(quote?.account_creation_fee ?? 0) !== 0n;
+        const creates = !!operation?.TransferExact && extra === 1024n && (creation || BigInt(quote?.minimum_fee_rate ?? 1) === 0n);
+        if (!(extra === 0n && !creation || creates)) throw new Error("The quoted fee weight does not match the prepared transaction.");
     }
     function clearFeeAllocation(form) {
         const node = $(form.id.replace("-form", "-fee-allocation"));
@@ -1031,7 +1050,8 @@
                 ...transactionData(form),
                 extra_fee: extra,
                 anchor: state.status.tip,
-                expiry_blocks: jsonInteger(transactionExpiry(form))
+                expiry_blocks: jsonInteger(transactionExpiry(form)),
+                nonce: jsonInteger(nextNonce())
             });
             if (!current()) return;
             checkFeeQuote(result, extra, form, operation);
@@ -1219,7 +1239,7 @@
     }
     function renderActivity() {
         const list = $("activity-list");
-        const rows = state.mempool.filter(tx => hex(tx.body.sender) === key());
+        const rows = ownPending().filter(tx => hex(tx.body?.sender) === key());
         $("activity-panel").hidden = !key() || rows.length === 0;
         text("activity-count", `${state.mempool.length} pending`);
         if (!renderChanged(list, [ state.session?.address_hrp, rows.slice(0, 5) ])) return;
@@ -1996,6 +2016,7 @@
         state.proposals = [];
         renderDecisionMessage();
         state.mempool = [];
+        state.senderMempool = state.pendingNonce = null;
         document.querySelectorAll("form").forEach(form => {
             // Public Explorer searches are independent of the selected wallet.
             if (!form.querySelector(".form-feedback")) return;
@@ -2104,6 +2125,8 @@
             state.status = status;
             state.gov = gov;
             state.mempool = mempool;
+            state.senderMempool = key() && Array.isArray(snapshot.sender_mempool) ? snapshot.sender_mempool : null;
+            state.pendingNonce = key() ? snapshot.pending_nonce ?? null : null;
             state.account = account;
             state.proposals = proposals;
             state.pass = pass;
@@ -2324,7 +2347,8 @@
                     ...transactionData(form),
                     extra_fee: extra,
                     anchor: state.status.tip,
-                    expiry_blocks: jsonInteger(transactionExpiry($("send-form")))
+                    expiry_blocks: jsonInteger(transactionExpiry($("send-form"))),
+                    nonce: jsonInteger(nextNonce())
                 });
                 if (version !== sendVersion || identity !== sendIdentity() || !state.ready) return;
                 checkFeeQuote(result, extra, form);
@@ -2986,7 +3010,8 @@
                         ...transactionData($("trade-form")),
                         extra_fee: extra,
                         anchor: state.status.tip,
-                        expiry_blocks: jsonInteger(transactionExpiry($("trade-form")))
+                        expiry_blocks: jsonInteger(transactionExpiry($("trade-form"))),
+                        nonce: jsonInteger(nextNonce())
                     });
                     if (identity !== tradeIdentity() || snapshot !== state.status?.state_root || !state.ready) return;
                     checkFeeQuote(fee, extra, $("trade-form"));

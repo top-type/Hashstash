@@ -10,8 +10,13 @@ use num_traits::Zero;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// One world's account records. Only [`World::put`] writes them, so the
-/// committed cash and share aggregates cannot drift from the records.
+/// One world's account records. No code outside this module can insert or
+/// remove a record: [`World::put`] is the only per-key writer, and it updates
+/// `account_cash` and `account_shares` with each record. The `World` fields
+/// themselves stay public, because tests build worlds field by field, so code
+/// that assigns a whole map or an aggregate must keep the others consistent.
+/// `World::validate` checks conservation against the aggregates only;
+/// `State::audit` recounts them from the records.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Accounts(Map<Account>);
@@ -160,9 +165,10 @@ pub struct Decision {
     pub epoch: u64,
     pub round: u64,
     pub proposal_id: Hash,
-    /// Shared with the winning proposal record. A grant can list as many
-    /// payments as governed capacity admits; state clones must not copy them.
-    /// The encoding is that of the plain proposal.
+    /// The winning action, shared with its `actions` entry. A grant can list
+    /// as many payments as governed capacity admits; state clones must not
+    /// copy them. The encoding is that of the plain proposal, but the state
+    /// root commits the action only through `actions` (see `PhaseCommitment`).
     pub proposal: Arc<Proposal>,
     pub started: u64,
     pub started_height: u64,
@@ -180,6 +186,43 @@ pub enum Phase {
     Governance(Decision),
     Rest(Rest),
 }
+/// The phase as the state root commits it: the same tags and fields, except
+/// that a decision omits its copy of the proposal. That action is committed
+/// once, as the `actions` entry under `proposal_id`, so computing a root never
+/// re-encodes a grant.
+#[derive(Serialize)]
+enum PhaseCommitment<'a> {
+    Auction(&'a Auction),
+    Governance {
+        id: Hash,
+        epoch: u64,
+        round: u64,
+        proposal_id: Hash,
+        started: u64,
+        started_height: u64,
+        blocks: u64,
+        leading_blocks: u64,
+    },
+    Rest(&'a Rest),
+}
+impl<'a> From<&'a Phase> for PhaseCommitment<'a> {
+    fn from(phase: &'a Phase) -> Self {
+        match phase {
+            Phase::Auction(a) => Self::Auction(a),
+            Phase::Governance(d) => Self::Governance {
+                id: d.id,
+                epoch: d.epoch,
+                round: d.round,
+                proposal_id: d.proposal_id,
+                started: d.started,
+                started_height: d.started_height,
+                blocks: d.blocks,
+                leading_blocks: d.leading_blocks,
+            },
+            Phase::Rest(r) => Self::Rest(r),
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RoundStatus {
     Open,
@@ -191,14 +234,15 @@ pub struct RoundRecord {
     pub status: RoundStatus,
     pub refund_height: u64,
 }
+/// A registered proposal's auction standing. Its action is the `actions`
+/// entry under the same ID, so updating support or cancelling re-encodes only
+/// this small record, however many payments the grant lists.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProposalRecord {
     pub round: u64,
     /// The registering sender, bound into the proposal ID.
     pub proposer: PublicKey,
     pub description: Hash,
-    /// Immutable after registration and shared by record updates.
-    pub action: Arc<Proposal>,
     #[serde(with = "amount")]
     pub support: Amount,
     pub refund_height: Option<u64>,
@@ -225,6 +269,9 @@ pub struct State {
     pub alternative: Option<World>,
     pub phase: Phase,
     pub proposals: Map<ProposalRecord>,
+    /// Each registered proposal's action, keyed like `proposals`. Written once,
+    /// at registration, and never updated.
+    pub actions: Map<Proposal>,
     pub supports: Map<SupportRecord>,
     pub rounds: Map<RoundRecord>,
     pub ranking: Map<Hash>,
@@ -268,6 +315,7 @@ impl State {
             alternative: None,
             phase,
             proposals: Map::new(),
+            actions: Map::new(),
             supports: Map::new(),
             rounds,
             ranking: Map::new(),
@@ -336,10 +384,11 @@ impl State {
                     &self.frozen,
                     self.world.root(),
                     self.alternative.as_ref().map(World::root),
-                    &self.phase,
+                    PhaseCommitment::from(&self.phase),
                 ),
                 (
                     self.proposals.root(),
+                    self.actions.root(),
                     self.supports.root(),
                     self.rounds.root(),
                     self.ranking.root(),
@@ -426,6 +475,7 @@ impl State {
                     && self.last_round == 0
                     && self.last_epoch == 0
                     && self.proposals.is_empty()
+                    && self.actions.is_empty()
                     && self.supports.is_empty()
                     && self.ranking.is_empty()
                     && self.auction_escrow.is_zero(),
@@ -499,8 +549,16 @@ impl State {
             escrow == self.auction_escrow,
             "auction support escrow mismatch"
         );
+        ensure!(
+            self.actions.len() == self.proposals.len(),
+            "proposal action count mismatch"
+        );
         for (key, proposal) in self.proposals.iter() {
-            if let Proposal::Grant { payments } = &*proposal.action {
+            let action = self
+                .actions
+                .get(key)
+                .ok_or_else(|| anyhow::anyhow!("missing proposal action"))?;
+            if let Proposal::Grant { payments } = action {
                 c.validate_grant(payments)?;
             }
             let id: Hash = key.try_into()?;
@@ -510,7 +568,7 @@ impl State {
                     proposal.round,
                     &proposal.proposer,
                     &proposal.description,
-                    &proposal.action
+                    action
                 ),
                 "proposal key mismatch"
             );
@@ -651,7 +709,7 @@ impl State {
                     .get(&d.proposal_id)
                     .ok_or_else(|| anyhow::anyhow!("missing decision proposal"))?;
                 ensure!(
-                    p.round == d.round && p.action == d.proposal,
+                    p.round == d.round && self.actions.get(&d.proposal_id) == Some(&*d.proposal),
                     "decision proposal mismatch"
                 );
                 ensure!(
@@ -733,77 +791,107 @@ mod tests {
         }
     }
 
-    fn record(proposer: PublicKey, action: Arc<Proposal>) -> ProposalRecord {
+    fn record(proposer: PublicKey) -> ProposalRecord {
         ProposalRecord {
             round: 0,
             proposer,
             description: [4; 32],
-            action,
             support: 1u32.into(),
             refund_height: None,
         }
     }
 
-    #[test]
-    fn state_clones_share_governed_proposals_without_changing_encodings() {
+    /// A decision on a registered 40-payment grant, sharing its action.
+    fn governed() -> (State, Hash) {
         let mut s = State::genesis(&Config::devnet());
-        let action = Arc::new(grant(40));
+        let action = grant(40);
         let id = proposal_id(&s.chain_id, 0, &[3; 32], &[4; 32], &action);
-        s.proposals
-            .insert(id.to_vec(), record([3; 32], action.clone()));
+        s.proposals.insert(id.to_vec(), record([3; 32]));
+        s.actions.insert(id.to_vec(), action);
         s.phase = Phase::Governance(Decision {
             id: [5; 32],
             epoch: 1,
             round: 0,
             proposal_id: id,
-            proposal: action.clone(),
+            proposal: s.actions.get_shared(&id).unwrap().clone(),
             started: 0,
             started_height: 0,
             blocks: 1,
             leading_blocks: 0,
         });
+        (s, id)
+    }
+
+    #[test]
+    fn state_clones_share_governed_proposals_without_changing_encodings() {
+        let (s, id) = governed();
         let mut copy = s.clone();
-        copy.proposals
-            .insert([9; 32].to_vec(), record([6; 32], Arc::new(grant(1))));
+        // A path-copying insert leaves the registered action shared.
+        copy.actions.insert([9; 32].to_vec(), grant(1));
         let (Phase::Governance(a), Phase::Governance(b)) = (&s.phase, &copy.phase) else {
             unreachable!()
         };
         assert!(Arc::ptr_eq(&a.proposal, &b.proposal));
-        assert!(Arc::ptr_eq(&a.proposal, &copy.proposals.get(&id).unwrap().action));
+        assert!(Arc::ptr_eq(&a.proposal, copy.actions.get_shared(&id).unwrap()));
         let plain = (
             a.id,
             a.epoch,
             a.round,
             a.proposal_id,
-            &*action,
+            &grant(40),
             a.started,
             a.started_height,
             a.blocks,
             a.leading_blocks,
         );
         assert_eq!(codec::encode(a), codec::encode(&plain));
-        #[derive(Serialize)]
-        struct PlainRecord<'a> {
-            round: u64,
-            proposer: PublicKey,
-            description: Hash,
-            action: &'a Proposal,
-            #[serde(with = "amount")]
-            support: Amount,
-            refund_height: Option<u64>,
+    }
+
+    #[test]
+    fn the_state_root_commits_actions_once_and_never_in_the_phase() {
+        // Auction and rest commitments are the phase encoding itself.
+        for phase in [
+            Phase::Auction(Auction {
+                round: 2,
+                opened: 30,
+                leader: Some([7; 32]),
+                lead_since: 45,
+                replacement_height: 4,
+            }),
+            Phase::Rest(Rest {
+                until: 90,
+                pending: Some((Parameter::Lead, 30)),
+            }),
+        ] {
+            assert_eq!(
+                codec::encode(&PhaseCommitment::from(&phase)),
+                codec::encode(&phase)
+            );
         }
-        let plain = PlainRecord {
-            round: 0,
-            proposer: [3; 32],
-            description: [4; 32],
-            action: &action,
-            support: 1u32.into(),
-            refund_height: None,
+        // A decision commits its tag and every field but its proposal copy.
+        let (s, id) = governed();
+        let Phase::Governance(d) = &s.phase else {
+            unreachable!()
         };
-        assert_eq!(
-            codec::encode(&record([3; 32], action.clone())),
-            codec::encode(&plain)
+        let committed = (
+            1u32,
+            d.id,
+            d.epoch,
+            d.round,
+            d.proposal_id,
+            d.started,
+            d.started_height,
+            d.blocks,
+            d.leading_blocks,
         );
+        assert_eq!(
+            codec::encode(&PhaseCommitment::from(&s.phase)),
+            codec::encode(&committed)
+        );
+        // The action is committed through the actions map instead.
+        let mut other = s.clone();
+        other.actions.insert(id.to_vec(), grant(39));
+        assert_ne!(other.root(), s.root());
     }
 
     #[test]

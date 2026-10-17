@@ -223,11 +223,11 @@ Header timestamps are u32 seconds. Once median past time reaches u32::MAX (2106-
 
 ## 10 Authenticated state and execution
 
-Accounts and protocol indexes use persistent authenticated treaps. Keys determine deterministic priorities; map roots are independent of insertion order. Updates copy changed paths and share untouched immutable subtrees. Starting a decision shares a root; settlement selects one. These operations avoid scanning or rewriting every account at phase boundaries.
+Accounts and protocol indexes use persistent authenticated treaps. Keys determine deterministic priorities; map roots are independent of insertion order. Updates copy changed paths and share untouched immutable subtrees. Starting a decision shares a root; settlement selects one. These operations avoid scanning or rewriting every account at phase boundaries. A path copy is short only for keys that are not ground: priorities are public, so chosen account keys can build one arbitrarily deep, permanent path, and every update on it costs time linear in its depth ([consensus format](CONSENSUS.md#accounts-reserve-and-governance)). Proposal actions are stored once at registration, apart from their mutable records, so supporting or cancelling a proposal never re-encodes its grant.
 
 Block execution validates its parent, encoding, target and resource limits; advances scheduled time and counts the parent’s leading-block observation; settles a due decision; reserves transaction inputs and fees; clears the included amount-only orders in each world together; pays the mining subsidy and collected miner fees; replenishes the reserve from revenue outside a decision; processes auctions and complete grant escrow; applies due rest activation; and verifies the resulting committed state. Activation and revenue processing are deterministic and operate independently on active outcomes. The exact ordering is defined by the maintained consensus implementation and corresponding integration tests.
 
-The world commitment includes the account root, reserve, stash supply, curve mass, waiting revenue, grant escrow, account aggregates. The top-level commitment includes worlds, chain identity, height, clock, issuance, settings, phase, proposal/support/refund indexes. Every accepted block must reproduce its declared state root.
+The world commitment includes the account root, reserve, stash supply, curve mass, waiting revenue, grant escrow, account aggregates. The top-level commitment includes worlds, chain identity, height, clock, issuance, settings, phase, proposal/action/support/refund indexes. A decision's action is committed through the action index alone. Every accepted block must reproduce its declared state root.
 
 ## 11 Conservation and bounds
 

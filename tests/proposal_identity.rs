@@ -81,7 +81,7 @@ fn copied_propose_registers_separately_from_the_original() {
         let id = state::proposal_id(&s.chain_id, round, &sender, &description, &proposal);
         let record = next.proposals.get(&id).unwrap();
         assert_eq!(record.proposer, sender);
-        assert_eq!(*record.action, proposal);
+        assert_eq!(next.actions.get(&id), Some(&proposal));
     }
     // One sender still registers a given proposal once; more bids use Support.
     let again = sign(&next, &HONEST, propose(), Vec::new());

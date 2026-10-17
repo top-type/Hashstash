@@ -1097,7 +1097,10 @@ async fn generated_keys_are_random_return_one_backup_and_sign() {
         .unwrap();
     let sender = crypto::public_key(&secret).unwrap();
     assert_eq!(second["public_key"], hex::encode(sender));
-    assert_eq!(second["watch"]["format"], "hashstash-watch-v2");
+    // An unconfirmed key cannot be funded or used: no address, watch-only
+    // export or review until its backup is confirmed.
+    assert!(second["address"].is_null());
+    assert!(second["watch"].is_null());
     let session: Value = signer
         .client
         .get(format!("{}/api/session", signer.base))
@@ -1110,25 +1113,30 @@ async fn generated_keys_are_random_return_one_backup_and_sign() {
     assert!(session.get("backup").is_none(), "status never carries the private key");
     assert_eq!(session["public_key"], hex::encode(sender));
     assert_eq!(session["backup_pending"], true);
-    // Until the operator saves it (for example after a page reload), the backup
-    // can be fetched again; afterwards the signer no longer releases the key.
-    assert_eq!(signer.ok("backup", json!({})).await["backup"], *backup);
+    assert!(session["address"].is_null() && session["watch"].is_null());
+    let expected = body(sender, payment());
+    let envelope = serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap();
+    let refused = signer.post("review", envelope.clone()).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert!(refused.text().await.unwrap().contains("backup"));
+    // Any local process can read the session token, so the backup is never
+    // served again: /api/backup only records the operator's confirmation.
+    for request in [json!({}), json!({"saved":false}), json!({"saved":true,"x":1})] {
+        let response = signer.post("backup", request).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!response.text().await.unwrap().contains(&hex::encode(secret)));
+    }
     let saved = signer.ok("backup", json!({"saved":true})).await;
+    assert!(saved.get("backup").is_none());
     assert_eq!(saved["backup_pending"], false);
     assert_eq!(saved["public_key"], hex::encode(sender));
-    for request in [json!({}), json!({"saved":true}), json!({"saved":true,"x":1})] {
-        assert_eq!(
-            signer.post("backup", request).await.status(),
-            StatusCode::BAD_REQUEST
-        );
-    }
-    let expected = body(sender, payment());
-    let review = signer
-        .ok(
-            "review",
-            serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap(),
-        )
-        .await;
+    assert_eq!(saved["address"], address::encode(&sender, &[9; 32]).unwrap());
+    assert_eq!(saved["watch"]["format"], "hashstash-watch-v2");
+    assert_eq!(
+        signer.post("backup", json!({"saved":true})).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    let review = signer.ok("review", envelope).await;
     let signed = signer
         .ok("sign", json!({"review_token":review["review_token"]}))
         .await;
@@ -1147,9 +1155,9 @@ async fn generated_keys_are_random_return_one_backup_and_sign() {
     signer.ok("generate", json!({})).await;
     signer.ok("lock", json!({})).await;
     assert_eq!(
-        signer.post("backup", json!({})).await.status(),
+        signer.post("backup", json!({"saved":true})).await.status(),
         StatusCode::BAD_REQUEST,
-        "locking discards the pending key and its backup"
+        "locking discards the pending key"
     );
     signer.server.stop().await;
 }
@@ -1209,9 +1217,16 @@ async fn long_lifetimes_need_explicit_confirmation_before_signing() {
 #[tokio::test]
 async fn review_requests_have_a_finite_configurable_limit() {
     let limit = 2 * cold::MAX_CONTROL_REQUEST;
-    let server = cold::serve_with_limits("127.0.0.1:0".parse().unwrap(), Some([9; 32]), limit)
-        .await
-        .unwrap();
+    let server = cold::serve_with_limits(
+        "127.0.0.1:0".parse().unwrap(),
+        Some([9; 32]),
+        cold::ReviewLimits {
+            bytes: limit,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     let base = format!("http://{}", server.address);
     let client = Client::new();
     let session: Value = client
@@ -1249,15 +1264,22 @@ async fn review_requests_have_a_finite_configurable_limit() {
             .status(),
         StatusCode::PAYLOAD_TOO_LARGE
     );
-    assert!(
-        cold::serve_with_limits(
-            "127.0.0.1:0".parse().unwrap(),
-            None,
-            cold::MAX_CONTROL_REQUEST - 1
-        )
-        .await
-        .is_err()
-    );
+    for limits in [
+        cold::ReviewLimits {
+            bytes: cold::MAX_CONTROL_REQUEST - 1,
+            ..Default::default()
+        },
+        cold::ReviewLimits {
+            payments: 0,
+            ..Default::default()
+        },
+    ] {
+        assert!(
+            cold::serve_with_limits("127.0.0.1:0".parse().unwrap(), None, limits)
+                .await
+                .is_err()
+        );
+    }
     let default = Signer::start().await;
     let session: Value = default
         .client
@@ -1269,7 +1291,93 @@ async fn review_requests_have_a_finite_configurable_limit() {
         .await
         .unwrap();
     assert_eq!(session["max_review_bytes"], cold::DEFAULT_MAX_REVIEW_REQUEST);
+    assert_eq!(
+        session["max_review_payments"],
+        cold::DEFAULT_MAX_REVIEW_PAYMENTS
+    );
     default.server.stop().await;
+    signer.server.stop().await;
+}
+
+/// Bytes alone do not bound a grant review: each payment is key-checked and
+/// listed. A grant over the payment limit is refused before that work.
+#[tokio::test]
+async fn grant_reviews_have_a_configurable_payment_limit() {
+    let limit = 3;
+    let server = cold::serve_with_limits(
+        "127.0.0.1:0".parse().unwrap(),
+        Some([9; 32]),
+        cold::ReviewLimits {
+            payments: limit,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let base = format!("http://{}", server.address);
+    let client = Client::new();
+    let session: Value = client
+        .get(format!("{base}/api/session"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session["max_review_payments"], limit);
+    let signer = Signer {
+        server,
+        client,
+        base,
+        token: session["token"].as_str().unwrap().into(),
+    };
+    let sender = signer.unlock(PHRASE).await;
+    let grant = |count: u8| {
+        let mut payments: Vec<_> = (1..=count)
+            .map(|n| hashstash::types::GrantPayment {
+                recipient: crypto::public_key(&[n; 32]).unwrap(),
+                amount: 1u32.into(),
+            })
+            .collect();
+        payments.sort_by_key(|p| p.recipient);
+        let body = body(
+            sender,
+            Operation::Propose {
+                round: 3,
+                description: [3; 32],
+                proposal: Proposal::Grant { payments },
+                support: 1u32.into(),
+            },
+        );
+        serde_json::to_value(wallet::unsigned(&body, &[9; 32])).unwrap()
+    };
+    let reviewed = signer.ok("review", grant(3)).await;
+    let fields = reviewed["fields"].as_array().unwrap();
+    assert!(fields.iter().any(|f| f["label"] == "Recipient 3"));
+    let refused = signer.post("review", grant(4)).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let message = refused.text().await.unwrap();
+    assert!(
+        message.contains("4 payments") && message.contains("--max-review-payments"),
+        "{message}"
+    );
+    // The refusal also revokes the earlier approval.
+    assert_eq!(
+        signer
+            .post("sign", json!({"review_token":reviewed["review_token"]}))
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    // An invalid payment beyond the limit is never key-checked: the count fails first.
+    let mut invalid = grant(4);
+    let mut bytes = hex::decode(invalid["body"].as_str().unwrap()).unwrap();
+    let last = crypto::public_key(&[4; 32]).unwrap();
+    let at = bytes.windows(32).position(|w| w == last).unwrap();
+    bytes[at..at + 32].copy_from_slice(&[255; 32]);
+    invalid["body"] = json!(hex::encode(bytes));
+    let refused = signer.post("review", invalid).await;
+    assert!(refused.text().await.unwrap().contains("4 payments"));
     signer.server.stop().await;
 }
 

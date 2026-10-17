@@ -32,8 +32,9 @@ async function harness(initialChain = null, maxReview = undefined, server = {}) 
   // reviews never adopt the export's unsigned network context.
   let serverPublic = server.public ?? null, serverChain = initialChain, derivedFor = null, backupPending = !!server.backupPending;
   const backup = {format:'hashstash-private-v1',private_key:privateKey,public_key:publicKey};
-  const status = () => ({public_key:serverPublic,chain_id:serverChain,address:serverPublic && serverChain ? addressFor(serverChain) : null,backup_pending:backupPending,
-    watch:!serverPublic ? null : serverChain ? {format:'hashstash-watch-v2',public_key:serverPublic,chain_id:serverChain,address:addressFor(serverChain)} : {format:'hashstash-watch-v1',public_key:serverPublic}});
+  // An unconfirmed generated key has no address or watch-only export.
+  const status = () => ({public_key:serverPublic,chain_id:serverChain,address:serverPublic && serverChain && !backupPending ? addressFor(serverChain) : null,backup_pending:backupPending,
+    watch:!serverPublic || backupPending ? null : serverChain ? {format:'hashstash-watch-v2',public_key:serverPublic,chain_id:serverChain,address:addressFor(serverChain)} : {format:'hashstash-watch-v1',public_key:serverPublic}});
   const refuse = error => ({ok:false,json:async()=>({error})});
   const context = {
     HashstashShares:shares,
@@ -45,6 +46,7 @@ async function harness(initialChain = null, maxReview = undefined, server = {}) 
     async fetch(url,options={}) {
       const body = options.body ? JSON.parse(options.body) : null;
       calls.push({url,body,options});
+      if(url==='/api/review' && review.tooLarge) return {ok:false,status:413,json:async()=>{throw new SyntaxError('plain-text 413');}};
       if(url==='/api/review' && review.error) return refuse(review.error);
       if(url==='/api/unlock') {
         if(body.scheme==='hashstash-passphrase-v2') { if(!serverChain) return refuse('Select the network first'); derivedFor=serverChain; }
@@ -55,12 +57,15 @@ async function harness(initialChain = null, maxReview = undefined, server = {}) 
       if(url==='/api/import'||url==='/api/generate') derivedFor=null;
       if(['/api/unlock','/api/import','/api/lock','/api/generate'].includes(url)) backupPending=url==='/api/generate';
       if(url==='/api/lock') serverPublic=null;
+      // The signer returns a generated key's backup only from /api/generate.
       if(url==='/api/backup') {
         if(!backupPending) return refuse('No unsaved generated key');
-        if(body.saved) backupPending=false; else return {ok:true,json:async()=>({backup})};
+        if(body?.saved!==true) return refuse('The backup is shown only once, when the key is generated');
+        backupPending=false;
       }
       if(url==='/api/network') { if(derivedFor&&derivedFor!==body.chain_id) serverPublic=derivedFor=null; serverChain=body.chain_id; }
       if(url==='/api/review') {
+        if (backupPending) return refuse('Save the new key’s backup and confirm it before reviewing transactions');
         if (!serverChain) return refuse('Select this signer’s network before reviewing; the signature is bound to it');
         if (body?.format!=='hashstash-unsigned-anchor'||!/^[0-9a-f]{64}$/.test(body.chain_id||'')||serverChain!==body.chain_id)return refuse('Unsigned network context does not match the selected network');
       }
@@ -150,10 +155,13 @@ async function run() {
     assert.equal(h.get('private-key').required,false);checks++;
     await h.get('unlock-form').fire('submit');
     assert.ok(h.calls.some(call=>call.url==='/api/generate'));checks++;
-    assert.equal(h.get('public-key').textContent,publicKey);checks++;
     assert.equal(h.get('backup-panel').hidden,false);checks++;
-    assert.equal(h.get('copy-address').disabled,true);checks++;
-    assert.equal(h.get('export-public').disabled,true);checks++;
+    // Nothing that identifies the account is shown or copyable before backup.
+    assert.equal(h.get('public-key').textContent,'');checks++;
+    assert.match(h.get('address').textContent,/Save the backup/);checks++;
+    assert.ok(!h.get('address').textContent.includes(addressFor(chainA)));checks++;
+    for(const id of ['copy-address','export-public','copy-public']){assert.equal(h.get(id).disabled,true,`${id} waits for the backup`);checks++;}
+    assert.equal(h.get('unsigned-panel').hidden,true,'no review before the backup is confirmed');checks++;
     await h.get('download-backup').fire('click');
     assert.deepEqual(JSON.parse(await h.downloads[0].blob.text()),{format:'hashstash-private-v1',private_key:privateKey,public_key:publicKey});checks++;
     assert.equal(h.downloads[0].name,'hashstash-private-key.json');checks++;
@@ -162,6 +170,11 @@ async function run() {
     assert.equal(h.get('backup-panel').hidden,true);checks++;
     assert.equal(h.get('export-public').disabled,false);checks++;
     assert.equal(h.get('copy-address').disabled,false);checks++;
+    assert.equal(h.get('copy-public').disabled,false);checks++;
+    assert.equal(h.get('address').textContent,addressFor(chainA));checks++;
+    assert.equal(h.get('public-key').textContent,publicKey);checks++;
+    assert.equal(h.get('unsigned-panel').hidden,false);checks++;
+    assert.match(h.get('message').textContent,/will not show this private key again/);checks++;
     await h.get('lock').fire('click');
     h.get('import-method').value='generate';await h.get('import-method').fire('change');await h.get('unlock-form').fire('submit');
     assert.equal(h.get('backup-panel').hidden,false);checks++;
@@ -170,13 +183,16 @@ async function run() {
     await h.get('download-backup').fire('click');assert.equal(h.downloads.length,1);checks++;
   }
   {
-    // Reloading the page keeps an unsaved generated key behind its backup gate.
+    // A reload never refetches the backup: the unconfirmed key is discarded.
     const h=await harness(chainA,undefined,{public:publicKey,backupPending:true});
-    assert.deepEqual(h.calls.find(call=>call.url==='/api/backup').body,{},'the reloaded page refetches the pending backup');checks++;
-    assert.equal(h.get('backup-panel').hidden,false);checks++;
-    assert.equal(h.get('export-public').disabled,true);checks++;
+    assert.equal(h.calls.some(call=>call.url==='/api/backup'),false,'the backup is never requested again');checks++;
+    assert.ok(h.calls.some(call=>call.url==='/api/lock'));checks++;
+    assert.equal(h.get('wallet').hidden,true);checks++;
+    assert.equal(h.get('unlock-panel').hidden,false);checks++;
+    assert.equal(h.get('backup-panel').hidden,true);checks++;
+    assert.match(h.get('message').textContent,/discarded.*Generate a new key/);checks++;
     await h.get('download-backup').fire('click');
-    assert.equal(JSON.parse(await h.downloads[0].blob.text()).private_key,privateKey);checks++;
+    assert.equal(h.downloads.length,0);checks++;
     const saved=await harness(chainA,undefined,{public:publicKey});
     assert.equal(saved.calls.some(call=>call.url==='/api/backup'),false);checks++;
     assert.equal(saved.get('backup-panel').hidden,true);checks++;
@@ -599,6 +615,21 @@ async function run() {
     assert.match(h.get('message').textContent,new RegExp(`${maximum}-byte review limit`));checks++;
   }
   {
+    // Pasted text meets the same limit, and the plain-text 413 names it too.
+    const h=await harness(chainA,1024);h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
+    const small=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'}),large=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'ab'.repeat(1024)});
+    h.get('unsigned').value=large;await h.get('review-form').fire('submit');
+    assert.equal(h.calls.some(call=>call.url==='/api/review'),false,'an oversized paste is never posted');checks++;
+    assert.match(h.get('message').textContent,/1024-byte review limit.*--max-review-bytes/);checks++;
+    h.review.tooLarge=true;h.get('unsigned').value=small;await h.get('review-form').fire('submit');
+    assert.equal(h.calls.filter(call=>call.url==='/api/review').length,1);checks++;
+    assert.match(h.get('message').textContent,/review limit.*--max-review-bytes/);checks++;
+    assert.ok(!h.get('message').textContent.includes('Signer unavailable'));checks++;
+    assert.equal(h.get('review-panel').hidden,true);checks++;
+    h.review.tooLarge=false;await h.get('review-form').fire('submit');
+    assert.equal(h.get('review-panel').hidden,false);checks++;
+  }
+  {
     // Long lifetimes need an explicit acknowledgement before the sign request.
     const h=await harness(chainA);h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
     h.review.confirmLifetime=true;
@@ -623,10 +654,10 @@ async function run() {
     await h.get('review-form').fire('submit');
     assert.equal(h.get('review-lifetime').hidden,true);checks++;
   }
-  for (const [rationale,title,warning] of [
-    ['Matches the description hash','Proposal rationale',true],
-    ['Does not match the description hash','Attached text · not the committed rationale',false],
-    ['Matches the hash but is not publishable plain text','Attached text · not the committed rationale',false],
+  for (const [rationale,title,warning,reason] of [
+    ['Matches the description hash','Proposal rationale',true,/^$/],
+    ['Does not match the description hash','Attached text · not the committed rationale',false,/hash differs from the signed description hash/],
+    ['Matches the hash but is not publishable plain text','Attached text · not the committed rationale',false,/^This text matches the signed description hash, but .*leading or trailing whitespace/],
   ]) {
     // Proposal text counts as the rationale only when its hash is the signed commitment.
     const h=await harness(chainA);h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
@@ -637,6 +668,9 @@ async function run() {
     assert.equal(h.get('review-message').hidden,false);checks++;
     assert.equal(h.get('review-message-title').textContent,title);checks++;
     assert.equal(h.get('review-rationale-warning').hidden,warning);checks++;
+    // The warning states the actual reason: a matching hash never reads as "differs".
+    assert.match(h.get('review-rationale-warning').textContent,reason);checks++;
+    assert.equal(/differs/.test(h.get('review-rationale-warning').textContent),rationale==='Does not match the description hash');checks++;
     assert.ok(h.get('review-fields').textContent.includes(rationale));checks++;
     h.review.fields=[{label:'Action',value:'Transfer'},{label:'Data bytes',value:String(bytes.length)},{label:'Data hex',value:bytes.toString('hex')}];
     await h.get('review-form').fire('submit');

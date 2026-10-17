@@ -33,7 +33,7 @@
     <div id="wallet" hidden>
       <section id="backup-panel" class="panel" hidden>
         <h2>Back up this new key</h2>
-        <p class="hint warning">This private key exists only in this running signer. Save the backup file to offline storage before exporting the watch-only account; anyone with the file can spend from the account.</p>
+        <p class="hint warning">This private key exists only in this running signer, and its backup is offered only this once: reloading or closing this page discards the key. Save the file to offline storage, then confirm. Until then the address, watch-only export and signing stay unavailable. Anyone with the file can spend from the account.</p>
         <div class="actions"><button id="download-backup">Download private key backup</button><button id="backup-done" class="secondary">I saved the backup</button></div>
       </section>
       <section class="panel address-panel">
@@ -41,7 +41,7 @@
         <div class="actions"><button id="copy-address" class="secondary" disabled>Copy address</button><button id="export-public" class="secondary" disabled>Export watch-only account</button></div>
         <details><summary>Public key</summary><code id="public-key" class="public-key"></code><button id="copy-public" class="secondary">Copy public key</button></details>
       </section>
-      <section class="panel">
+      <section id="unsigned-panel" class="panel">
         <h2>Unsigned transaction</h2>
         <form id="review-form">
           <label class="file-label">Import file<input id="unsigned-file" type="file" accept=".json,application/json"></label>
@@ -51,7 +51,7 @@
       </section>
       <section id="review-panel" class="panel" hidden>
         <h2>Review transaction</h2><dl id="review-fields"></dl>
-        <section id="review-message" hidden><h3 id="review-message-title">Public message</h3><p class="hint warning" id="review-rationale-warning" hidden>This text is not the proposal’s committed description: its hash differs from the signed description hash, so it will not be published as the rationale.</p><pre id="review-message-text" class="review-message-text"></pre></section>
+        <section id="review-message" hidden><h3 id="review-message-title">Public message</h3><p class="hint warning" id="review-rationale-warning" hidden></p><pre id="review-message-text" class="review-message-text"></pre></section>
         <details id="review-data" hidden><summary id="review-data-summary">Data</summary><code id="review-data-hex" class="public-key"></code></details>
         <p class="hint">The signature commits to the selected network’s chain ID, so no other network accepts it. Anchor ancestry and expiry are checked by the receiving node.</p><p class="hint">Balances and prices are not checked offline. Stash orders can fill partially or remain unfilled; unused input stays in your balance.</p><p class="hint" id="review-fee-help" hidden>The fee shown is the exact amount you authorize. It is paid if the transaction is included. This offline signer cannot check the current minimum fee or miner/revenue split; those follow the chain settings at inclusion.</p>
         <div id="review-lifetime" hidden><p class="hint warning">This transaction stays valid far longer than the default. Whoever holds the signed result can broadcast it at any time before it expires or the nonce is used.</p><label class="check"><input id="lifetime-confirm" type="checkbox"><span id="lifetime-confirm-text">I accept this lifetime</span></label></div>

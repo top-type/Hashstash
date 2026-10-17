@@ -25,6 +25,9 @@ struct Options {
     /// Largest unsigned export accepted for review, in bytes.
     #[arg(long, default_value_t = hashstash::cold::DEFAULT_MAX_REVIEW_REQUEST)]
     max_review_bytes: usize,
+    /// Most grant payments one review lists.
+    #[arg(long, default_value_t = hashstash::cold::DEFAULT_MAX_REVIEW_PAYMENTS)]
+    max_review_payments: usize,
 }
 
 #[tokio::main]
@@ -56,7 +59,10 @@ async fn main() -> Result<()> {
     let server = hashstash::cold::serve_with_limits(
         SocketAddr::from((Ipv4Addr::LOCALHOST, options.port)),
         chain,
-        options.max_review_bytes,
+        hashstash::cold::ReviewLimits {
+            bytes: options.max_review_bytes,
+            payments: options.max_review_payments,
+        },
     )
     .await?;
     println!("Hashstash cold signer: http://{}/", server.address);

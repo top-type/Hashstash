@@ -167,6 +167,14 @@ fn raw_bytes(raw: &str) -> Result<Vec<u8>> {
 }
 
 pub fn decode_unsigned(envelope: &UnsignedEnvelope) -> Result<TransactionBody> {
+    let body = decode_unsigned_shape(envelope)?;
+    validate_body(&body)?;
+    Ok(body)
+}
+
+/// The canonical body of an export before `validate_body`'s per-field key
+/// checks, so a caller can bound that work first (see `grant_payments`).
+pub fn decode_unsigned_shape(envelope: &UnsignedEnvelope) -> Result<TransactionBody> {
     ensure!(
         envelope.format == UNSIGNED_FORMAT,
         "unsupported unsigned transaction format"
@@ -176,9 +184,18 @@ pub fn decode_unsigned(envelope: &UnsignedEnvelope) -> Result<TransactionBody> {
     // A canonical BIP340 signature adds exactly 64 bytes. Check the actual
     // allocation boundary; block capacity is evaluated against chain state.
     validate_unsigned_length(bytes.len())?;
-    let body: TransactionBody = codec::decode(&bytes, bytes.len())?;
-    validate_body(&body)?;
-    Ok(body)
+    codec::decode(&bytes, bytes.len())
+}
+
+/// Payments listed by a grant proposal; zero for every other operation.
+pub fn grant_payments(body: &TransactionBody) -> usize {
+    match &body.operation {
+        Operation::Propose {
+            proposal: Proposal::Grant { payments },
+            ..
+        } => payments.len(),
+        _ => 0,
+    }
 }
 
 pub fn signed_hex(transaction: &Transaction) -> String {

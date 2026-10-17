@@ -12,9 +12,11 @@ use std::sync::OnceLock;
 // errors in the directed bounds far below one output atom even after the largest
 // supported exponent. These are consensus constants, not machine precision.
 const CURVE_BITS: usize = 2048;
-const LOG_TERMS: usize = CURVE_BITS.div_ceil(3);
 const EXP_TERMS: usize = 512;
 const EXP_SQUARES: usize = 10;
+// Batch clearing sizes its logarithm precision to its inputs in steps of this
+// many fractional bits, never above CURVE_BITS.
+const PRECISION_STEP: usize = 64;
 
 #[derive(Clone)]
 struct Bounds {
@@ -31,43 +33,60 @@ fn ceil_div(n: &Amount, d: &Amount) -> Amount {
     }
 }
 
+/// Exactly ceil_div(n, 2^bits), without a long division.
+fn ceil_shift(n: &Amount, bits: usize) -> Amount {
+    let floor = n >> bits;
+    if n.trailing_zeros().is_some_and(|zeros| zeros < bits as u64) {
+        floor + 1u32
+    } else {
+        floor
+    }
+}
+
 fn curve_scale() -> Amount {
     Amount::one() << CURVE_BITS
 }
 
 // ln(x) = 2 * atanh((x-1)/(x+1)). The supplied z is in [0,1/3].
 // After N terms the omitted tail is at most
-// 9 / (4(2N+1)3^(2N+1)). Since 9>8 and 3N>=CURVE_BITS,
+// 9 / (4(2N+1)3^(2N+1)). Since 9>8 and 3N>=bits,
 // one fixed-point unit bounds this tail. Each arithmetic operation below also
 // rounds outwards, so the returned interval encloses the exact logarithm.
-fn log_atanh(z_numerator: &Amount, z_denominator: &Amount) -> Bounds {
+fn log_atanh(z_numerator: &Amount, z_denominator: &Amount, bits: usize) -> Bounds {
     if z_numerator.is_zero() {
         return Bounds {
             low: Amount::zero(),
             high: Amount::zero(),
         };
     }
-    let scale = curve_scale();
-    let numerator = z_numerator << CURVE_BITS;
+    let terms = bits.div_ceil(3);
+    let numerator = z_numerator << bits;
     let z = Bounds {
         low: &numerator / z_denominator,
         high: ceil_div(&numerator, z_denominator),
     };
     let square = Bounds {
-        low: (&z.low * &z.low) >> CURVE_BITS,
-        high: ceil_div(&(&z.high * &z.high), &scale),
+        low: (&z.low * &z.low) >> bits,
+        high: ceil_shift(&(&z.high * &z.high), bits),
     };
     let mut power = z;
     let mut sum = Bounds {
         low: Amount::zero(),
         high: Amount::zero(),
     };
-    for index in 0..LOG_TERMS {
+    for index in 0..terms {
+        if power.low.is_zero() && power.high.is_one() {
+            // A fixed point: 0 < square.high <= 2^bits keeps the upper power at
+            // one unit, so each remaining term adds exactly zero below and one
+            // unit above. Adding them directly gives the identical bounds.
+            sum.high += terms - index;
+            break;
+        }
         let divisor = Amount::from(2 * index + 1);
         sum.low += &power.low / &divisor;
         sum.high += ceil_div(&power.high, &divisor);
-        power.low = (&power.low * &square.low) >> CURVE_BITS;
-        power.high = ceil_div(&(&power.high * &square.high), &scale);
+        power.low = (&power.low * &square.low) >> bits;
+        power.high = ceil_shift(&(&power.high * &square.high), bits);
     }
     Bounds {
         low: sum.low << 1usize,
@@ -75,13 +94,17 @@ fn log_atanh(z_numerator: &Amount, z_denominator: &Amount) -> Bounds {
     }
 }
 
-fn log_two() -> &'static Bounds {
-    static VALUE: OnceLock<Bounds> = OnceLock::new();
-    VALUE.get_or_init(|| log_atanh(&Amount::one(), &Amount::from(3u32)))
+fn log_two(bits: usize) -> &'static Bounds {
+    const LEVELS: usize = CURVE_BITS / PRECISION_STEP + 1;
+    static VALUES: [OnceLock<Bounds>; LEVELS] = [const { OnceLock::new() }; LEVELS];
+    assert!(bits % PRECISION_STEP == 0 && bits <= CURVE_BITS);
+    VALUES[bits / PRECISION_STEP]
+        .get_or_init(|| log_atanh(&Amount::one(), &Amount::from(3u32), bits))
 }
 
-/// Enclose ln(numerator/denominator), with numerator >= denominator > 0.
-fn log_ratio(numerator: &Amount, denominator: &Amount) -> Bounds {
+/// Enclose ln(numerator/denominator), with numerator >= denominator > 0, in
+/// units of 2^-bits. The bounds depend only on the rational value.
+fn log_ratio(numerator: &Amount, denominator: &Amount, bits: usize) -> Bounds {
     assert!(!denominator.is_zero() && numerator >= denominator);
     let mut shift = (numerator.bits() - denominator.bits()) as usize;
     let mut normalized_denominator = denominator << shift;
@@ -92,10 +115,11 @@ fn log_ratio(numerator: &Amount, denominator: &Amount) -> Bounds {
     let mut result = log_atanh(
         &(numerator - &normalized_denominator),
         &(numerator + &normalized_denominator),
+        bits,
     );
     if shift != 0 {
-        result.low += &log_two().low * shift;
-        result.high += &log_two().high * shift;
+        result.low += &log_two(bits).low * shift;
+        result.high += &log_two(bits).high * shift;
     }
     result
 }
@@ -117,10 +141,9 @@ fn exp_bounds(value: &Bounds) -> Result<Bounds> {
         value.high <= &scale * 512u32,
         "curve exponential outside bounded range"
     );
-    let divisor = Amount::one() << EXP_SQUARES;
     let x = Bounds {
         low: &value.low >> EXP_SQUARES,
-        high: ceil_div(&value.high, &divisor),
+        high: ceil_shift(&value.high, EXP_SQUARES),
     };
     let mut sum = Bounds {
         low: scale.clone(),
@@ -137,7 +160,7 @@ fn exp_bounds(value: &Bounds) -> Result<Bounds> {
     sum.high += 1u32;
     for _ in 0..EXP_SQUARES {
         sum.low = (&sum.low * &sum.low) >> CURVE_BITS;
-        sum.high = ceil_div(&(&sum.high * &sum.high), &scale);
+        sum.high = ceil_shift(&(&sum.high * &sum.high), CURVE_BITS);
     }
     Ok(sum)
 }
@@ -155,7 +178,9 @@ fn check_dynamic_curve(reserve: &Amount, supply: &Amount, mass: &Amount) -> Resu
 }
 
 // An exact fast path covers common rational curves and their perfect-power
-// boundaries. Eight bounds intermediate integer powers below 8192 bits.
+// boundaries. The direct quotes below use unscaled operands of at most 512 bits,
+// so their eighth powers and products stay below 8192 bits. Batch clearing
+// compares scaled operands instead; see compare_curve_powers.
 pub(crate) fn small_ratio(reserve: &Amount, mass: &Amount) -> Option<(u32, u32)> {
     let mut a = reserve.clone();
     let mut b = mass.clone();
@@ -169,49 +194,81 @@ pub(crate) fn small_ratio(reserve: &Amount, mass: &Amount) -> Option<(u32, u32)>
     (denominator <= 8).then_some((numerator, denominator))
 }
 
-/// Compare `reserve * ln(a/b)` with `mass * ln(c/d)` without floating point.
-/// The rational ratios must be at least one. `None` means the proven directed
-/// intervals overlap; callers must retain both sides of their root bracket.
-pub(crate) fn compare_curve_logs(
-    reserve: &Amount,
-    mass: &Amount,
+/// Fractional bits of the directed logarithms used to clear a batch whose
+/// widest input has `input_bits` bits. On its 2^(2*input_bits+32) price grid a
+/// comparison at precision P stays undecided only within roughly
+/// 2^(4*input_bits+52-P) grid units of the root, so 4*input_bits+128 bits keep
+/// that band far below one unit. Rounded up to whole steps and never above the
+/// 2048-bit precision of the direct quotes.
+pub(crate) fn clearing_precision(input_bits: u64) -> usize {
+    let wanted = usize::try_from(input_bits)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(4)
+        .saturating_add(128);
+    wanted
+        .div_ceil(PRECISION_STEP)
+        .saturating_mul(PRECISION_STEP)
+        .min(CURVE_BITS)
+}
+
+/// Directed bounds on ln(numerator/denominator) at a fixed precision.
+pub(crate) struct CurveLog {
+    bounds: Bounds,
+    bits: usize,
+}
+
+/// Enclose ln(numerator/denominator), with numerator >= denominator > 0. The
+/// precision must come from clearing_precision. The bounds depend only on the
+/// rational value, so equal ratios may share one evaluation.
+pub(crate) fn curve_log(numerator: &Amount, denominator: &Amount, bits: usize) -> CurveLog {
+    CurveLog {
+        bounds: log_ratio(numerator, denominator, bits),
+        bits,
+    }
+}
+
+/// Exact comparison of `u * ln(a/b)` with `v * ln(c/d)` for a reduced curve
+/// ratio u/v with v <= 8, as `a^u * d^v` against `b^u * c^v`. With operands of
+/// at most w bits, the products have at most (u+v)*w <= 15*w bits; batch
+/// clearing's scaled operands have w of about 3*input_bits+36 here.
+pub(crate) fn compare_curve_powers(
+    (u, v): (u32, u32),
     a: &Amount,
     b: &Amount,
     c: &Amount,
     d: &Amount,
-) -> Option<Ordering> {
+) -> Ordering {
     assert!(!b.is_zero() && !d.is_zero() && a >= b && c >= d);
-    if let Some((u, v)) = small_ratio(reserve, mass) {
-        return Some((a.pow(u) * d.pow(v)).cmp(&(b.pow(u) * c.pow(v))));
-    }
-    curve_log_evaluation(reserve, mass, a, b, c, d).0
+    (a.pow(u) * d.pow(v)).cmp(&(b.pow(u) * c.pow(v)))
 }
 
+/// Compare `reserve * ln(a/b)` with `mass * ln(c/d)` from directed bounds of
+/// the two logarithms, without floating point. `None` means the proven
+/// intervals overlap; callers must retain both sides of their root bracket.
 /// The midpoint proposes a safeguarded root-search step. Only the separately
 /// returned directed comparison can establish a root bracket or an output.
 pub(crate) fn curve_log_evaluation(
     reserve: &Amount,
     mass: &Amount,
-    a: &Amount,
-    b: &Amount,
-    c: &Amount,
-    d: &Amount,
+    left: &CurveLog,
+    right: &CurveLog,
 ) -> (Option<Ordering>, num_bigint::BigInt, Amount) {
     use num_bigint::BigInt;
-    let left = log_ratio(a, b);
-    let right = log_ratio(c, d);
-    let lower = BigInt::from(left.low * reserve) - BigInt::from(right.high * mass);
-    let upper = BigInt::from(left.high * reserve) - BigInt::from(right.low * mass);
+    assert_eq!(left.bits, right.bits, "curve logarithm precision mismatch");
+    let (left, right, bits) = (&left.bounds, &right.bounds, left.bits);
+    let lower = BigInt::from(&left.low * reserve) - BigInt::from(&right.high * mass);
+    let upper = BigInt::from(&left.high * reserve) - BigInt::from(&right.low * mass);
     let comparison = if upper < BigInt::zero() {
         Some(Ordering::Less)
     } else if lower > BigInt::zero() {
         Some(Ordering::Greater)
-    } else if a == b && c == d {
+    } else if left.high.is_zero() && right.high.is_zero() {
+        // Only a ratio of exactly one has a zero upper logarithm bound.
         Some(Ordering::Equal)
     } else {
         None
     };
-    (comparison, (lower + upper) / 2u32, curve_scale())
+    (comparison, (lower + upper) / 2u32, Amount::one() << bits)
 }
 
 /// Conservative new total stash supply for a deposit. The instantaneous curve
@@ -237,7 +294,11 @@ pub fn dynamic_deposit_total(
     } else if let Some((u, v)) = small_ratio(reserve, mass) {
         deposit_total(reserve, supply, deposit, u, v)
     } else {
-        let exponent = scale_bounds(log_ratio(&next_reserve, reserve), reserve, mass);
+        let exponent = scale_bounds(
+            log_ratio(&next_reserve, reserve, CURVE_BITS),
+            reserve,
+            mass,
+        );
         let factor = exp_bounds(&exponent)?;
         ((supply * factor.low) >> CURVE_BITS).max(supply.clone())
     };
@@ -268,10 +329,14 @@ pub fn dynamic_remaining_reserve(
     if let Some((u, v)) = small_ratio(reserve, mass) {
         return Ok(remaining_reserve(reserve, supply, burn, u, v));
     }
-    let exponent = scale_bounds(log_ratio(supply, &remaining_supply), mass, reserve);
+    let exponent = scale_bounds(
+        log_ratio(supply, &remaining_supply, CURVE_BITS),
+        mass,
+        reserve,
+    );
     // For any positive remaining stash, the exact retained reserve is positive.
     // Above this threshold it is below one atom; avoid evaluating huge powers.
-    if exponent.low >= &log_two().high * 512u32 {
+    if exponent.low >= &log_two(CURVE_BITS).high * 512u32 {
         return Ok(Amount::one());
     }
     let factor = exp_bounds(&exponent)?;
@@ -302,7 +367,7 @@ pub fn dynamic_withdrawal_shares(
         return withdrawal_shares(reserve, supply, target, u, v);
     }
     let retained = reserve - target;
-    let exponent = scale_bounds(log_ratio(reserve, &retained), reserve, mass);
+    let exponent = scale_bounds(log_ratio(reserve, &retained, CURVE_BITS), reserve, mass);
     let factor = exp_bounds(&exponent)?;
     let remaining_supply = (supply << CURVE_BITS) / factor.high;
     let estimate = supply - remaining_supply;
@@ -329,6 +394,20 @@ pub fn dynamic_withdrawal_shares(
     Ok(high)
 }
 
+/// The consensus mass rule shared by batch clearing and the checked helpers
+/// below: scale mass with reserve, rounding down when the reserve grows and up
+/// when it shrinks, so reversing a trade cannot benefit from a curve shape
+/// caused only by rounding. Range checks are the caller's; batch clearing keeps
+/// oversized intermediate results so that it can refund them.
+pub(crate) fn scaled_mass(reserve: &Amount, mass: &Amount, next_reserve: &Amount) -> Amount {
+    assert!(!reserve.is_zero());
+    if next_reserve >= reserve {
+        mass * next_reserve / reserve
+    } else {
+        ceil_div(&(mass * next_reserve), reserve)
+    }
+}
+
 /// Scale mass after a buy, rounding down so reversing that buy cannot benefit
 /// from a steeper curve caused only by rounding. Arguments: old R, old M, new R.
 pub fn deposit_mass(reserve: &Amount, mass: &Amount, next_reserve: &Amount) -> Result<Amount> {
@@ -340,7 +419,7 @@ pub fn deposit_mass(reserve: &Amount, mass: &Amount, next_reserve: &Amount) -> R
         reserve.bits() <= 512 && mass.bits() <= 512 && next_reserve.bits() <= 512,
         "deposit mass outside supported range"
     );
-    let result = mass * next_reserve / reserve;
+    let result = scaled_mass(reserve, mass, next_reserve);
     ensure!(result.bits() <= 512, "deposit mass exceeds supported range");
     Ok(result)
 }
@@ -356,7 +435,7 @@ pub fn remaining_mass(reserve: &Amount, mass: &Amount, next_reserve: &Amount) ->
         reserve.bits() <= 512 && mass.bits() <= 512 && next_reserve.bits() <= 512,
         "remaining mass outside supported range"
     );
-    Ok(ceil_div(&(mass * next_reserve), reserve))
+    Ok(scaled_mass(reserve, mass, next_reserve))
 }
 
 pub fn target_from_bits(bits: u32) -> Result<Amount> {
@@ -408,6 +487,9 @@ pub fn work(target: &Amount) -> Amount {
 
 /// Convert this block's exact expected work into whole monetary atoms.
 /// Any fractional atom is discarded; it is never carried into another block.
+/// When block work is only a few multiples of `work_per_atom`, this discards a
+/// large share of work-implied issuance and makes reward per hash a sawtooth;
+/// genesis calibration should keep expected block work far above one atom.
 pub fn issuance(block_work: &Amount, work_per_atom: &Amount) -> Result<Amount> {
     ensure!(!work_per_atom.is_zero(), "zero work denomination");
     Ok(block_work / work_per_atom)
@@ -561,6 +643,64 @@ mod tests {
                 assert!(!target.is_zero() && target <= limit);
             }
         }
+    }
+    #[test]
+    fn logarithm_shortcuts_match_the_full_series() {
+        // The original evaluation: every term, with long-division ceilings.
+        fn full_series(z_numerator: &Amount, z_denominator: &Amount, bits: usize) -> Bounds {
+            if z_numerator.is_zero() {
+                return Bounds {
+                    low: Amount::zero(),
+                    high: Amount::zero(),
+                };
+            }
+            let scale = Amount::one() << bits;
+            let numerator = z_numerator << bits;
+            let z = Bounds {
+                low: &numerator / z_denominator,
+                high: ceil_div(&numerator, z_denominator),
+            };
+            let square = Bounds {
+                low: (&z.low * &z.low) >> bits,
+                high: ceil_div(&(&z.high * &z.high), &scale),
+            };
+            let mut power = z;
+            let mut sum = Bounds {
+                low: Amount::zero(),
+                high: Amount::zero(),
+            };
+            for index in 0..bits.div_ceil(3) {
+                let divisor = Amount::from(2 * index + 1);
+                sum.low += &power.low / &divisor;
+                sum.high += ceil_div(&power.high, &divisor);
+                power.low = (&power.low * &square.low) >> bits;
+                power.high = ceil_div(&(&power.high * &square.high), &scale);
+            }
+            Bounds {
+                low: sum.low << 1usize,
+                high: (sum.high << 1usize) + 1u32,
+            }
+        }
+        for n in [0u64, 1, 2, 3, 5, 1 << 20, (1 << 63) + 1] {
+            for bits in [0, 1, 63, 64, 65, 300] {
+                let n = Amount::from(n) << 7usize;
+                assert_eq!(ceil_shift(&n, bits), ceil_div(&n, &(Amount::one() << bits)));
+            }
+        }
+        let zs = [(1u32, 3u32), (1, 1_000), (1, 7), (2, 7), (999, 3_000), (1, u32::MAX)];
+        for bits in [192, 448, 1088, CURVE_BITS] {
+            for (n, d) in zs {
+                let (n, d) = (Amount::from(n), Amount::from(d));
+                let fast = log_atanh(&n, &d, bits);
+                let slow = full_series(&n, &d, bits);
+                assert_eq!((fast.low, fast.high), (slow.low, slow.high), "{n}/{d} at {bits}");
+            }
+        }
+        assert_eq!(clearing_precision(1), 192);
+        assert_eq!(clearing_precision(64), 384);
+        assert_eq!(clearing_precision(237), 1088);
+        assert_eq!(clearing_precision(480), CURVE_BITS);
+        assert_eq!(clearing_precision(u64::MAX), CURVE_BITS);
     }
     #[test]
     fn curve_inequalities_and_no_profitable_round_trip() {

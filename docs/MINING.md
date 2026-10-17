@@ -8,7 +8,7 @@ hashstash run --config network.json --data chain.sqlite --miner '<address>' --rp
 
 Optional `--stratum-password-file PATH` requires its password at authorization. Restrict file access and never put credentials into a public endpoint. `--no-stratum` runs a validating/relaying node without a mining listener. Keep private RPC loopback-only. The public browser page exposes mining status under Explorer → Network, without administrative controls.
 
-For a fresh network, `init --preset slow --hashrate 100T` calibrates initial work to estimated hashrate. The resulting configuration fixes a new chain identity; do not edit the genesis of a running chain. ASIC work on an extremely easy development target can overwhelm a small node. The three presets alone do not establish production safety.
+For a fresh network, `init --preset slow --hashrate 100T` calibrates initial work to estimated hashrate. Each block issues only whole atoms of one petahash of expected work, so 100 TH/s at 15-second blocks (about 1.5 PH per block) discards a third of work-implied issuance. Reward per hash then jumps at each whole petahash, a weak incentive to nudge timestamps toward work just above a multiple. About 7 PH/s or more at 15 seconds keeps the loss below 1%. The resulting configuration fixes a new chain identity; do not edit the genesis of a running chain. ASIC work on an extremely easy development target can overwhelm a small node. The three presets alone do not establish production safety.
 
 ## Reporting shares and block rewards
 

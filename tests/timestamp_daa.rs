@@ -120,6 +120,41 @@ fn delayed_first_mining_anchors_asert_without_advancing_economic_time() {
 }
 
 #[test]
+fn backdated_first_block_cannot_pull_the_pre_mining_wait_into_asert() {
+    let d = tempfile::tempdir().unwrap();
+    let c = config();
+    let wait = 24 * 60 * 60;
+    let mut honest = Chain::open(&d.path().join("honest.sqlite"), c.clone()).unwrap();
+    let mut backdated = Chain::open(&d.path().join("backdated.sqlite"), c.clone()).unwrap();
+    let initial = math::target_from_bits(c.initial_bits).unwrap();
+    append(&mut honest, wait, vec![]);
+    append(&mut honest, 15, vec![]);
+    // The first miner stamps block 1 just after genesis although mining began
+    // a day later; block 2 carries real time.
+    let first = append(&mut backdated, 1, vec![]);
+    let second = append(&mut backdated, wait - 1 + 15, vec![]);
+    assert_eq!(first.header.bits, c.initial_bits);
+    assert_eq!(second.header.bits, c.initial_bits);
+    // Block 3 still uses the initial target instead of one 2^96 times easier.
+    assert_eq!(backdated.next_target().unwrap(), initial);
+    assert_eq!(honest.next_target().unwrap(), initial);
+    for seconds in [15, 5, 30, 15] {
+        let normal = append(&mut honest, seconds, vec![]);
+        let late = append(&mut backdated, seconds, vec![]);
+        assert_eq!(late.header.bits, normal.header.bits);
+    }
+    // A slow second block is not stall credit either; it only moves the anchor.
+    let mut slow = Chain::open(&d.path().join("slow.sqlite"), c.clone()).unwrap();
+    append(&mut slow, 15, vec![]);
+    append(&mut slow, 600, vec![]);
+    assert_eq!(slow.next_target().unwrap(), initial);
+    let mut fast = Chain::open(&d.path().join("fast.sqlite"), c).unwrap();
+    append(&mut fast, 15, vec![]);
+    append(&mut fast, 5, vec![]);
+    assert!(fast.next_target().unwrap() < initial);
+}
+
+#[test]
 fn competing_first_blocks_keep_branch_anchors_across_reorg_and_reopen() {
     let d = tempfile::tempdir().unwrap();
     let c = config();

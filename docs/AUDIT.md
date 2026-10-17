@@ -10,7 +10,7 @@ The flat baseline deliberately permits equal-price outcomes that resolve FAIL. B
 
 Authenticated peers prove possession of transport keys and protect message integrity. They cannot prevent all partitions, compromised peers, eclipse attacks or distributed resource attacks. Discovery can find peers, but a public key alone does not establish an independent or trustworthy operator. Account state, retained history and restart replay still grow.
 
-Difficulty adjustment anchors each branch at its first mined block, so waiting before mining starts does not lower the initial difficulty. Pauses after mining begins do affect ASERT's elapsed time. Timestamp checks constrain the inputs but do not eliminate manipulation. Nodes must execute the same consensus rules as well as share the same genesis configuration.
+Difficulty adjustment anchors each branch at its first mined blocks, so waiting before mining starts does not lower the initial difficulty. The anchor is bounded below by the second block's timestamp less one interval: backdating only the first block cannot convert the wait into ASERT error, although a miner of both first blocks still can. Pauses after mining begins do affect ASERT's elapsed time. Timestamp checks constrain the inputs but do not eliminate manipulation. Nodes must execute the same consensus rules as well as share the same genesis configuration.
 
 Browser wallets trust the serving origin; stored keys are unencrypted. Public transaction actions and senders remain visible. Mail verifies the publishing transaction signature locally before decrypting contents; inclusion and confirmation counts still depend on the connected node. It does not hide the ledger, and static-key compromise can expose historical mail.
 

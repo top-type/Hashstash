@@ -13,13 +13,22 @@ const original=[...values.values()][0];ok(!original.includes('DO NOT STORE'));ok
 const result=cache.read(chain,wallet);eq(result.value.cursor,state().cursor);eq(result.value.entries.length,1);eq(Object.keys(result.value.entries[0]).sort(),['height','position','raw','txid']);
 eq(cache.read(chain,other),{value:null},'wallets have separate scan checkpoints');eq(cache.read(other,wallet),{value:null},'chains have separate scan checkpoints');
 eq(cache.write(chain,other,state()),{saved:true});eq(values.size,2);
-eq(cache.write(chain,wallet,state(256)),{saved:true},'bounded ciphertext inbox persists');const full=values.get([...values.keys()][0]);
-const limit=cache.write(chain,wallet,state(257));eq(limit.saved,false);ok(limit.error.includes('last complete checkpoint'));eq(values.get([...values.keys()][0]),full,'capacity limit preserves the complete prior checkpoint');
+eq(cache.write(chain,wallet,state(256)),{saved:true},'bounded ciphertext inbox persists');eq(cache.read(chain,wallet).value.omitted,0);
+// More opened mail than the cache holds must not freeze the checkpoint: anyone
+// can send an address 257 messages. The oldest are left out and counted.
+eq(cache.write(chain,wallet,{...state(257),cursor:'2:0',scanned:900}),{saved:true},'a full cache still advances its checkpoint');
+{const saved=cache.read(chain,wallet).value;eq(saved.cursor,'2:0');eq(saved.scanned,900);eq(saved.entries.length,256);eq(saved.omitted,1,'the evicted message is counted');eq(saved.entries.some(e=>e.position===0),false,'the oldest message is the one left out');ok(saved.entries.some(e=>e.position===256),'the newest message is kept');}
+eq(cache.write(chain,wallet,{...state(257),omitted:3}),{saved:true});eq(cache.read(chain,wallet).value.omitted,4,'earlier omissions accumulate');
+{const big=n=>({...row(n),height:1+n,raw:'cd'.repeat(5000)}),entries=Array.from({length:250},(_,n)=>big(n));
+ eq(cache.write(chain,wallet,{cursor:'999:0',anchor,scanned:250,entries}),{saved:true},'the byte bound also evicts instead of failing');
+ const text=values.get([...values.keys()][0]),saved=cache.read(chain,wallet).value;ok(text.length<=2*1024*1024);ok(saved.entries.length<250&&saved.entries.length>150);eq(saved.omitted+saved.entries.length,250);eq(Math.min(...saved.entries.map(e=>e.height)),251-saved.entries.length,'only the newest rows are kept');}
+eq(cache.write(chain,wallet,{...state(),entries:[{...row(),raw:'ff'.repeat(1024*1024+1)}]}),{saved:true},'one carrier too large to cache does not freeze the checkpoint');eq(cache.read(chain,wallet).value.entries.length,0);eq(cache.read(chain,wallet).value.omitted,1);
+eq(cache.write(chain,wallet,state(256)),{saved:true});const full=values.get([...values.keys()][0]);
 denied=true;eq(cache.write(chain,wallet,{...state(),cursor:'2:1'}).saved,false);eq(values.get([...values.keys()][0]),full,'storage failure never writes cursor separately');denied=false;
+values.set([...values.keys()][0],JSON.stringify({...JSON.parse(full),omitted:-1}));eq(cache.read(chain,wallet).value,null,'a negative omission count is invalid');values.set([...values.keys()][0],full);
 eq(cache.write(chain,wallet,{...state(),cursor:'0:1'}).saved,false,'entries beyond checkpoint are invalid');eq(cache.write(chain,wallet,{...state(),entries:[row(),row()]}).saved,false,'duplicate rows are invalid');
 eq(cache.write(chain,wallet,{...state(),entries:[{...row(),height:-1}]}).saved,false);eq(cache.write(chain,wallet,{...state(),anchor:'bad'}).saved,false);
 eq(cache.write(chain,wallet,{...state(),entries:[{...row(),raw:undefined}]}).saved,false,'unsigned records cannot enter the signed cache');
-eq(cache.write(chain,wallet,{...state(),entries:[{...row(),raw:'ff'.repeat(1024*1024+1)}]}).saved,false,'oversized carrier preserves the previous complete checkpoint');
 eq(cache.clear(chain,wallet),{cleared:true});eq(cache.read(chain,wallet),{value:null});eq(cache.read(chain,other).value.entries.length,1,'clearing one cache preserves another wallet');
 const brokenKey=[...values.keys()][0];values.set(brokenKey,'{bad json');ok(cache.read(chain,other).error.includes('beginning'),'malformed local data starts full history scan');
 values.set(brokenKey,JSON.stringify({...state(),version:999}));eq(cache.read(chain,other).value,null,'unknown schema is never reused');

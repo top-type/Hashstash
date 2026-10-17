@@ -87,14 +87,26 @@ async function run(){
   const requests=h.calls.filter(x=>x.body.method==='explorer_mail');ok(requests.every(x=>Object.keys(x.body.params).every(k=>['limit','after','anchor'].includes(k))),'shared mail requests contain no recipient or account');ok(requests.at(-1).body.params.after,'later polls use committed scan cursor');eq(requests.at(-1).body.params.anchor,h.currentSnapshot.status.tip);
  }
  {
+  const h=await setup(),incoming=await h.message({},h.sender,h.recipient);h.decryptMail=async()=>({recipient:h.sender,subject:'Invoice ‮fdp.exe',body:'Pay ⁧reversed⁩ now'});
+  await h.publish([incoming]);const node=name=>walk(h.get('mail-list')).find(n=>n.className===name);
+  eq(node('mail-subject').textContent,'Invoice \\u202efdp.exe','bidi overrides in a subject are visible escapes');eq(node('mail-body').textContent,'Pay \\u2067reversed\\u2069 now','bidi isolates in a body are visible escapes');
+ }
+ {
   const h=await setup(),outgoing=await h.message();await h.publish([outgoing]);eq(h.get('mail-list').children.length,1);ok(h.get('mail-list').textContent.includes('Sent'));ok(h.get('mail-list').textContent.includes(addr(h.recipient)),'recipient displayed only after authenticated decryption');
   const rawCalls=JSON.stringify(h.calls.filter(x=>x.body.method==='explorer_mail'));ok(!rawCalls.includes(h.recipient));ok(!h.calls.some(x=>x.body.method==='explorer_account'&&JSON.stringify(x.body.params).includes(h.recipient)),'rendering mail never reverse-queries a recipient');
  }
  {
   const h=await setup(),template=await h.message();let tried=0;
   h.decryptMail=async()=>{tried++;if(tried<251)throw Error('Authentication failed');return {recipient:h.recipient,subject:'After 250 unrelated envelopes',body:'Found without a cutoff'};};
-  const batch=Array.from({length:251},(_,i)=>h.sign({...template,position:i},a,5000+i));
-  await h.publish(batch);eq(tried,100,'automatic history discovery stops after its bounded budget');ok(h.get('mail-scan-status').textContent.includes('Paused'));await h.get('mail-more').click();await h.drain();eq(tried,200,'each explicit continuation has a fresh bounded budget');await h.get('mail-more').click();await h.drain();eq(tried,251,'explicit continuation reaches all history without a cutoff');eq(h.get('mail-list').children.length,1);ok(h.get('mail-list').textContent.includes('After 250'));ok(h.get('mail-scan-status').textContent.includes('251 checked'));
+  const batch=Array.from({length:251},(_,i)=>h.sign({...template,position:i},a,5000+i)),s=h.currentSnapshot;
+  // Publish without draining: the scan rests on a real timer between budgets.
+  h.history.push(...batch);s.status.height=Math.max(...batch.map(x=>x.height));s.status.tip=key(7777);await h.refresh();
+  const resting=()=>[...h.timers.values()].some(timer=>timer.delay===250);
+  await wait(()=>tried===100&&resting(),h);await settle();
+  eq(tried,100,'each slice of history discovery is bounded');ok(h.get('mail-scan-status').textContent.startsWith('Scanning'),'the scan rests instead of stopping');eq(h.get('mail-more').textContent,'Pause scan');eq(h.get('mail-more').hidden,false);
+  await h.timersDue(250);await wait(()=>tried===200&&resting(),h);await settle();eq(tried,200,'it continues on its own with a fresh bounded budget');
+  await h.get('mail-more').click();ok(h.get('mail-scan-status').textContent.includes('Paused'),'the user can still pause');await h.timersDue(250);await settle();eq(tried,200,'a paused scan does not resume when its rest ends');
+  await h.get('mail-more').click();await h.drain();eq(tried,251,'continuing reaches all history without a cutoff');eq(h.get('mail-list').children.length,1);ok(h.get('mail-list').textContent.includes('After 250'));ok(h.get('mail-scan-status').textContent.includes('251 checked'));
   eq(h.calls.filter(x=>x.body.method==='explorer_mail').length,7,'initial empty scan plus six bounded pages');
  }
  {
@@ -159,6 +171,14 @@ async function run(){
  {
   const h=await setup(),m=await h.message();await h.publish([m]);
   const restored=await setup({savedMail:h.savedMail,initialSnapshot:h.currentSnapshot,history:[],invalidAnchor:true});eq(restored.get('mail-list').children.length,0,'persisted reorged history is cleared before any cached plaintext is rendered');eq(restored.calls.filter(x=>x.body.method==='explorer_mail').length,2,'stale persisted anchor triggers canonical full scan');
+ }
+ {
+  const h=await setup(),m=await h.message();await h.publish([m]);
+  const saved=[...h.savedMail.entries()].find(([k])=>k.startsWith('hashstash-mail-scan-3:'));h.savedMail.set(saved[0],JSON.stringify({...JSON.parse(saved[1]),omitted:2}));
+  const restored=await setup({savedMail:h.savedMail,initialSnapshot:h.currentSnapshot,history:h.history});
+  eq(restored.get('mail-list').children.length,1,'cached messages still restore');ok(restored.get('mail-scan-status').textContent.includes('2 earlier messages are not kept in this browser'),'messages evicted from a full cache are reported');
+  eq(JSON.parse(restored.savedMail.get(saved[0])).omitted,2,'the count survives later checkpoints');
+  await restored.get('mail-clear-cache').click();await restored.get('mail-more').click();await restored.drain();ok(!restored.get('mail-scan-status').textContent.includes('not kept'),'a rescan from the beginning shows them again');
  }
  {
   const h=await setup(),m=await h.message();await h.publish([m]);const count=h.calls.filter(x=>x.body.method==='explorer_mail').length;await h.get('mail-clear-cache').click();eq(h.get('mail-list').children.length,0,'clear cache immediately removes plaintext');eq([...h.savedMail.keys()].filter(k=>k.startsWith('hashstash-mail-scan-3:')).length,0);eq(h.calls.filter(x=>x.body.method==='explorer_mail').length,count,'clearing cache does not silently download history again');ok(h.get('mail-scan-status').textContent.includes('cache cleared'));await h.get('mail-more').click();await h.drain();eq(h.get('mail-list').children.length,1,'explicit continue rediscovers cleared history');

@@ -115,6 +115,34 @@ async function run() {
   assert.match(h.get('proposal-list').children[0].textContent, /Current auction leader.*Support/); checks++;
   assert.match(h.get('proposal-list').children[1].textContent, /Removed from auction.*Check refund/); checks++;
   assert.doesNotMatch(h.get('proposal-list').children[1].textContent, /Support ↗/); checks++;
+  assert.match(h.get('gov-title').textContent, new RegExp(`Leader ${proposal.slice(0, 10)}…${proposal.slice(-6)}`), 'the hero shows a 64-bit proposal label'); checks++;
+  assert.ok(h.get('proposal-list').children[0].textContent.includes(`${proposal.slice(0, 10)}…${proposal.slice(-6)}`), 'cards show a 64-bit proposal label'); checks++;
+
+  // A pasted Support ID is resolved and its action shown before anything is signed.
+  {
+    const { addr, settle } = require('./test_wallet_ui.cjs');
+    const form = h.get('support-form'), preview = h.get('support-proposal-preview'), field = form.elements.proposal;
+    const enter = async value => { field.value = value; await field.fire('input'); await settle(); };
+    assert.equal(preview.hidden, true, 'no preview before an ID is entered'); checks++;
+    await enter('aa'.repeat(32));
+    assert.equal(preview.hidden, false); checks++;
+    assert.match(preview.textContent, /not an active proposal in the current auction round/, 'an unknown ID is refused'); checks++;
+    form.elements.amount.value = '1'; await form.fire('input'); await h.timersDue(); await settle();
+    assert.match(h.get('support-fee-error').textContent, /not an active proposal/, 'an unknown ID cannot be quoted or signed'); checks++;
+    await enter(other);
+    assert.match(preview.textContent, /not an active proposal/, 'a proposal removed from the auction is refused'); checks++;
+    await enter(proposal.toUpperCase());
+    assert.ok(preview.textContent.includes(addr(key)), 'the full grant recipient address is shown'); checks++;
+    assert.ok(preview.textContent.includes('0.01 hash'), 'the exact grant amount is shown'); checks++;
+    assert.ok(preview.textContent.includes(`${proposal.slice(0, 10)}…${proposal.slice(-6)}`)); checks++;
+    await enter(''); assert.equal(preview.hidden, true); checks++;
+    await h.get('proposal-list').children[0].children[1].children[1].click(); await settle();
+    assert.equal(field.value, proposal, 'the card button fills the full ID'); checks++;
+    assert.ok(preview.textContent.includes(addr(key)), 'and shows the action it backs'); checks++;
+    s.proposals[0].proposal.action = { Parameter: { parameter: 'MinimumFeeRate', old: 1, new: 5 } }; await h.refresh();
+    assert.match(preview.textContent, /Minimum fee rate: 0\.001 hash \/ 1,024 weight → 0\.005 hash \/ 1,024 weight/, 'parameter changes show old and new values'); checks++;
+    s.proposals[0].proposal.action = decision.proposal; await h.refresh();
+  }
   assert.equal(h.wallet.length, 0, 'read-only UI checks never broadcast'); checks++;
   console.log(`governance view: ${checks} checks passed`);
 }

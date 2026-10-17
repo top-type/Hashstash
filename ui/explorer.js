@@ -4,6 +4,15 @@
   const integer = value => /^(0|[1-9][0-9]*)$/.test(String(value ?? ''));
   const grouped = value => integer(value) ? String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ',') : '—';
   const short = value => typeof value === 'string' && value.length > 24 ? `${value.slice(0, 12)}…${value.slice(-8)}` : String(value ?? '—');
+  // Every address on a network shares its HRP and separator, so a hex-style
+  // head would show only that constant prefix. Show key data and the checksum.
+  const shortAddress = value => {
+    const start = value.lastIndexOf('1') + 1;
+    return start > 0 && value.length - start > 16 ? `hsh…${value.slice(start, start + 10)}…${value.slice(-6)}` : short(value);
+  };
+  // Explicit embeddings, overrides and isolates could reorder user-authored
+  // text on screen. Show them as visible escapes.
+  const visibleControls = text => String(text).replace(/[‪-‮⁦-⁩]/g, c => `\\u${c.charCodeAt(0).toString(16)}`);
   const labels = { Transfer: 'Transfer', TransferExact: 'Transfer', Deposit: 'Stash deposit', Redeem: 'Stash withdrawal', Propose: 'Proposal', Support: 'Proposal backing', Refund: 'Auction refund', transfer: 'Transfer', deposit: 'Stash deposit', redeem: 'Stash withdrawal', propose: 'Proposal', support: 'Proposal backing', refund: 'Auction refund', mining_reward: 'Mining reward', governance_grant: 'Governance grant' };
   const effects = { conditional: 'Unresolved', survived: 'Applied', discarded: 'Discarded', orphaned: 'Orphaned', pending: 'Pending', common: 'Both outcomes' };
   function operationOf(tx) { const op = tx.operation; return op && typeof op === 'object' && Object.keys(op).length === 1 ? Object.values(op)[0] || {} : op || {}; }
@@ -24,9 +33,9 @@
     function link(parent, kind, value, label = short(value), className = 'explorer-link') {
       if (kind === 'account' && (Array.isArray(value) || validHash(value))) {
         const key = Array.isArray(value) ? value.map(v => v.toString(16).padStart(2, '0')).join('') : value;
-        try { const address = root.HashstashAddress.encode(key, `hsh${context.chain_id.slice(0, 16)}`); if (label === short(value)) label = short(address); value = address; }
+        try { const address = root.HashstashAddress.encode(key, `hsh${context.chain_id.slice(0, 16)}`); if (label === short(value)) label = shortAddress(address); value = address; }
         catch { return add(parent, 'span', '', '—'); }
-      }
+      } else if (kind === 'account' && typeof value === 'string' && label === short(value)) label = shortAddress(value);
       if (value === null || value === undefined || value === '') return add(parent, 'span', '', '—');
       const result = add(parent, 'a', className, label); result.href = href(kind, value); result.title = String(value);
       return result;
@@ -168,8 +177,10 @@
       const field = details(parent, `Data · ${grouped(raw.length / 2)} bytes`); add(field, 'pre', 'explorer-raw', raw.toLowerCase());
       try {
         const bytes = Uint8Array.from(raw.match(/../g), v => parseInt(v, 16));
-        const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-        const text = decoded.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+        // ignoreBOM keeps a leading byte-order mark in the text instead of dropping it.
+        const decoded = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+        // Exact inspection also reveals invisible marks, zero-width characters and the BOM.
+        const text = decoded.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g, c => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
         const plain = details(field, 'UTF-8 text'); add(plain, 'pre', 'explorer-raw explorer-data-text', text);
       } catch { /* Binary data remains available as exact hexadecimal bytes. */ }
     }
@@ -290,7 +301,7 @@
             record(section, [['Change', `${grouped(parameter.old)}${unit} → ${grouped(parameter.new)}${unit}`]]);
           }
           const explanation = root.HashstashProposalData?.verifiedText(proposal.description_text, proposal.description);
-          add(section, 'p', 'proposal-detail', explanation || 'No verified explanation published.');
+          add(section, 'p', 'proposal-detail', explanation ? visibleControls(explanation) : 'No verified explanation published.');
           if (proposal.description) { const description = details(section, 'Description commitment'); add(description, 'code', 'explorer-full', proposal.description); }
         }
       }

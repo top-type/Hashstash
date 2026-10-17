@@ -83,7 +83,8 @@ async function run() {
   }
   for(const action of ['support','refund','propose']) {
     const h=await setup(),form=h.get(action+'-form');attach(h,form);
-    if(action==='support') {form.elements.proposal.value='77'.repeat(32);form.elements.amount.value=amounts.exactInput('10');}
+    // Support resolves its ID against the current round before quoting or signing.
+    if(action==='support') {h.currentSnapshot.proposals=[{id:'77'.repeat(32),proposal:{round:0,action:{Grant:{payments:[{recipient:'34'.repeat(32),amount:'10'}]}},description:'00'.repeat(32),support:'1',refund_height:null}}];await h.refresh();form.elements.proposal.value='77'.repeat(32);form.elements.amount.value=amounts.exactInput('10');}
     if(action==='refund') {form.elements.proposal.value='77'.repeat(32);form.elements.round.value='0';}
     if(action==='propose') {h.grantRow().recipient.value=addr('34'.repeat(32));h.grantRow().amount.value=amounts.exactInput('10');form.elements.support.value=amounts.exactInput('1');form.elements.description.value='Unrelated stale public draft';}
     const kind={support:'Support',refund:'Refund',propose:'Propose'}[action],tx=await expectEncrypted(h,form,kind);

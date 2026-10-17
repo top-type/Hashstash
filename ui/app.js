@@ -244,6 +244,17 @@
         const full = address(value), start = full.lastIndexOf("1") + 1;
         return full ? `hsh…${full.slice(start, start + 10)}…${full.slice(-6)}` : "—";
     }
+    function proposalShort(value) {
+        // Proposers choose a free description commitment, so a 48-bit label
+        // could be ground to match another proposal. Show 64 bits.
+        const s = hex(value);
+        return s ? `${s.slice(0, 10)}…${s.slice(-6)}` : "—";
+    }
+    function visibleControls(value) {
+        // Explicit bidi embeddings, overrides and isolates in user-authored
+        // text are shown as escapes so it cannot display out of signed order.
+        return String(value).replace(/[‪-‮⁦-⁩]/g, c => `\\u${c.charCodeAt(0).toString(16)}`);
+    }
     function commas(value) {
         return String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
     }
@@ -1199,7 +1210,7 @@
                 Support: "Proposal support",
                 Refund: "Auction refund"
             }[kind] || kind);
-            append(copy, "small", "", `${short(address(tx.body.sender))} · nonce ${tx.body.nonce}${operation.outcome ? ` · ${operation.outcome.toUpperCase()}` : ""}`);
+            append(copy, "small", "", `${shortAddress(tx.body.sender)} · nonce ${tx.body.nonce}${operation.outcome ? ` · ${operation.outcome.toUpperCase()}` : ""}`);
             const val = append(row, "div", "activity-value");
             appendAmount(val, "span", "", operation.shares ? `${HashstashShares.formatAmount(operation.shares)} stash` : hashAmount(operation.amount || operation.support || "0"));
             append(val, "small", "", "pending");
@@ -1533,10 +1544,10 @@
         }
         if (name === "Auction") {
             text("gov-round", `Round ${phase.round}`);
-            text("gov-title", phase.leader ? `Leader ${short(phase.leader)}` : "Auction open");
+            text("gov-title", phase.leader ? `Leader ${proposalShort(phase.leader)}` : "Auction open");
             text("gov-subtitle", phase.leader ? "The leading proposal advances after its required lead." : "Choose the next proposal.");
             text("overview-governance-title", "Auction open");
-            text("overview-governance-text", phase.leader ? `Leader ${short(phase.leader)}` : "No leader");
+            text("overview-governance-text", phase.leader ? `Leader ${proposalShort(phase.leader)}` : "No leader");
         } else if (active) {
             text("gov-round", `Round ${decision.round}`);
             text("gov-title", grant ? "Recipients" : proposalTitle(decision.proposal));
@@ -1586,6 +1597,7 @@
         parameterPreview();
         renderProposals();
         renderDecisionMessage();
+        supportPreview();
     }
     function proposalTitle(action) {
         if (action.Grant) return action.Grant.payments.map(payment => `${shortAddress(payment.recipient)} · ${hashAmount(payment.amount)}`).join(" / ");
@@ -1598,7 +1610,7 @@
     function renderDecisionMessage() {
         const id = hex(activeDecision()?.proposal_id), node = $("gov-decision-message");
         const message = state.ready && id ? proposalExplanations.get(`${state.status.chain_id}:${id}`) || "" : "";
-        text("gov-decision-message", message);
+        text("gov-decision-message", visibleControls(message));
         node.hidden = !message;
     }
     function savedDescription(hashValue, shared) {
@@ -1663,12 +1675,12 @@
             if (description) {
                 const explanation = append(main, "details", "proposal-explanation");
                 append(explanation, "summary", "", "Explanation");
-                append(explanation, "p", "proposal-detail", description);
+                append(explanation, "p", "proposal-detail", visibleControls(description));
             }
             const winner = name === "Governance" && record.id === leader;
             const cancelled = p.refund_height !== null && p.refund_height !== void 0;
             const status = winner ? "In decision · bid becomes revenue" : name !== "Auction" || cancelled ? name === "Governance" ? "Not selected · backing may be refundable" : cancelled ? "Removed from auction" : "Past proposal" : record.id === leader ? "Current auction leader" : "In auction";
-            append(main, "p", "proposal-detail", `Round ${p.round} · ${short(record.id)} · ${status}`);
+            append(main, "p", "proposal-detail", `Round ${p.round} · ${proposalShort(record.id)} · ${status}`);
             const side = append(row, "div", "proposal-side"), support = append(side, "div", "proposal-support");
             appendAmount(support, "strong", "", hashAmount(p.support));
             append(support, "small", "", "backing");
@@ -1691,7 +1703,7 @@
                         block: "center"
                     });
                     (isSupport ? form.elements.amount : form.elements.proposal).focus();
-                    isSupport || checkSupport(form);
+                    isSupport ? supportPreview() : checkSupport(form);
                     feeSoon(form);
                 });
             }
@@ -1710,6 +1722,59 @@
             feedback(form, `${formatExactHash(String(data.amount))} of your support. ${data.refundable ? "Available for refund." : "Not currently refundable."}`);
         } catch (error) {
             feedback(form, error.message, true);
+        }
+    }
+    // Support is signed for a pasted 64-hex ID. Resolve it to the proposal it
+    // backs before signing and show that action, so an ID passed around
+    // elsewhere cannot silently back something else.
+    const supportLookups = new Map;
+    let supportPreviewVersion = 0;
+    async function supportProposal(value) {
+        const auction = state.gov?.phase?.Auction;
+        if (!auction) throw new Error("There is no open auction.");
+        const id = hex(hexBytes(value, "Proposal ID")).toLowerCase();
+        const local = state.proposals.find(record => record.id === id);
+        let proposal = local?.proposal;
+        // The snapshot lists at most 128 proposals per round; look up the rest.
+        if (!local && state.proposals.length >= 128) {
+            const chain = state.status.chain_id, cache = `${chain}:${state.status.tip}:${id}`;
+            if (!supportLookups.has(cache)) {
+                supportLookups.size > 50 && supportLookups.clear();
+                supportLookups.set(cache, rpc("explorer_governance", {
+                    proposal: id,
+                    limit: 1
+                }).then(result => result.chain_id === chain && result.proposals?.find(item => item.id === id) || null).catch(() => null));
+            }
+            const found = await supportLookups.get(cache);
+            found && (proposal = {round: found.round, action: found.action});
+        }
+        if (!proposal?.action || String(proposal.round) !== String(auction.round) || proposal.refund_height !== null && proposal.refund_height !== void 0) throw new Error("This ID is not an active proposal in the current auction round.");
+        return {id, action: proposal.action};
+    }
+    async function supportPreview() {
+        const version = ++supportPreviewVersion, node = $("support-proposal-preview"), raw = $("support-form").elements.proposal.value.trim();
+        const shown = !!raw && state.ready;
+        let target = null, message = "";
+        if (shown) try {
+            target = await supportProposal(raw);
+        } catch (error) {
+            message = error.message;
+        }
+        // Polling re-resolves the ID; leave an unchanged preview in place.
+        if (version !== supportPreviewVersion || !renderChanged(node, [ shown, target, message, state.session?.address_hrp ])) return;
+        node.replaceChildren();
+        node.hidden = !shown;
+        if (!shown) return;
+        node.classList.toggle("error", !target);
+        if (!target) {
+            append(node, "p", "field-help", message);
+            return;
+        }
+        append(node, "p", "field-help", `Backs proposal ${proposalShort(target.id)}:`);
+        if (target.action.Grant) renderGrantPayments(node, target.action.Grant);
+        else {
+            const p = target.action.Parameter, setting = settings[p?.parameter];
+            append(node, "p", "proposal-title", setting ? `${setting[1]}: ${settingValue(setting[0], p.old, setting[2], true)} → ${settingValue(setting[0], p.new, setting[2], true)}` : "Unknown action");
         }
     }
     function parameterPreview() {
@@ -2737,17 +2802,19 @@
             }
         };
     });
-    bindForm("support-form", v => {
+    bindForm("support-form", async v => {
         const auction = state.gov?.phase?.Auction;
         if (!auction) throw new Error("There is no open auction.");
+        const target = await supportProposal(v.proposal);
         return {
             Support: {
                 round: auction.round,
-                proposal: hexBytes(v.proposal, "Proposal ID"),
+                proposal: hexBytes(target.id, "Proposal ID"),
                 amount: integer(v.amount)
             }
         };
     });
+    $("support-form").elements.proposal.addEventListener("input", supportPreview);
     bindForm("refund-form", v => ({
         Refund: {
             round: safeInteger(v.round, "Auction round"),

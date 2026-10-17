@@ -55,6 +55,14 @@ async function run() {
   assert.equal(h.calls.some(c => c.params.key || c.params.sender), false, 'Explorer does not require a selected wallet'); checks++;
   assert.ok(links(h).some(n => n.href === '#explorer?block=12')); checks++;
   assert.ok(links(h).some(n => n.href === '#explorer?before_height=12')); checks++;
+  {
+    // Table addresses spend no characters on the HRP that every address shares.
+    const start = address.lastIndexOf('1') + 1, label = `hsh…${address.slice(start, start + 10)}…${address.slice(-6)}`;
+    const miner = links(h).find(n => n.href === `#explorer?account=${encodeURIComponent(address)}`);
+    assert.equal(miner.textContent, label, 'miner addresses show key data and checksum'); checks++;
+    assert.equal(miner.title, address, 'the full address remains available'); checks++;
+    assert.ok(!miner.textContent.includes(address.slice(0, 12)), 'the constant network prefix is not the label'); checks++;
+  }
 
   await h.navigate('#explorer?block=12');
   assert.match(h.content.textContent, /Confirmed/); checks++;
@@ -228,6 +236,24 @@ async function run() {
   h.replies.explorer_governance.proposals=[{id:proposal,round:0,action:{Parameter:{parameter:'DecisionBlocks',old:600,new:1200}},support:'1'}];
   await h.navigate('#explorer?governance='+proposal);
   assert.ok(h.content.textContent.includes('600 blocks → 1,200 blocks'),'decision length proposals label their consensus unit');checks++;
+  {
+    // Explanations cannot reorder themselves with bidi controls.
+    global.HashstashProposalData={verifiedText:text=>text};
+    h.replies.explorer_governance.proposals[0].description_text='Pay ‮0001‬ hashes';
+    await h.navigate('#explorer?view=governance&governance='+proposal);await h.navigate('#explorer?governance='+proposal);
+    assert.ok(walk(h.content).some(n=>n.className==='proposal-detail'&&n.textContent==='Pay \\u202e0001\\u202c hashes'),'bidi overrides in explanations are visible escapes');checks++;
+    delete global.HashstashProposalData;
+    const start=address.lastIndexOf('1')+1,label=`hsh…${address.slice(start,start+10)}…${address.slice(-6)}`;
+    h.replies.explorer_governance={...h.replies.explorer_governance,proposals:[{id:proposal,round:0,description:'f'.repeat(64),action:{Grant:{payments:[{recipient:Array(32).fill(18),amount:'1000'}]}},support:'100',created_height:5}],contributions:[{txid,height:5,sender:address,amount:'100'}]};
+    await h.navigate('#explorer?view=governance');await h.navigate('#explorer?governance='+proposal);
+    const accounts=links(h).filter(n=>n.href===`#explorer?account=${encodeURIComponent(address)}`);
+    assert.ok(accounts.length>=2,'grant recipient and backing sender link to the account');checks++;
+    assert.ok(accounts.every(n=>n.textContent===label),'grant recipients and backers use address-aware labels');checks++;
+    // The exact UTF-8 view also reveals zero-width marks and the BOM.
+    h.replies.explorer_transaction={...ctx,transaction:{...tx,data_hex:Buffer.from('﻿a​b⁦c').toString('hex')}};
+    await h.navigate('#explorer?tx='+txid);
+    assert.ok(walk(h.content).some(n=>n.tagName==='pre'&&n.textContent==='\\ufeffa\\u200bb\\u2066c'),'invisible characters are escaped in the raw text view');checks++;
+  }
   console.log(`Explorer UI: ${checks} behavior assertions passed.`);
 }
 run().catch(error => { console.error(error); process.exitCode = 1; });

@@ -18,6 +18,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     path::Path,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 // A pagination target, never a record or consensus validity limit. All sections
@@ -30,10 +31,15 @@ const PAGE_BYTES: usize = 32 * 1024 * 1024;
 const CHECKPOINTS: usize = 128;
 /// Detached blocks walked to relate an orphaned mail anchor to the canonical chain.
 const ANCHOR_DEPTH: usize = 128;
-/// No response can carry a larger record, and SQLite refuses values above
-/// about 1e9 bytes; a larger projection omits its bulky signed detail instead
-/// of stalling the index on a consensus-valid block.
-const RECORD_BYTES: usize = crate::node::MAX_RESPONSE_FRAME;
+/// Every governed capacity allows responses of at least MAX_RESPONSE_FRAME, so
+/// a stored record kept below it, with room for the response envelope, stays
+/// deliverable alone even after capacity is lowered; it is also far below
+/// SQLite's 1e9-byte row limit. A larger projection omits its bulky signed
+/// detail instead of stalling the index on a consensus-valid block.
+const RECORD_BYTES: usize = crate::node::MAX_RESPONSE_FRAME - 64 * 1024;
+/// A failed update that may be deterministic is retried on a notification
+/// this long after it failed, or as soon as the canonical tip changes.
+const RETRY_FAILED: Duration = Duration::from_secs(60);
 const TABLES: [&str; 8] = [
     "explorer_blocks",
     "explorer_transactions",
@@ -55,7 +61,7 @@ pub const METHODS: &[&str] = &[
     "explorer_chat",
     "explorer_mail",
 ];
-const SCHEMA: &str = "petahash-atoms-raw-data-ordered-events";
+const SCHEMA: &str = "petahash-atoms-separate-data-ordered-events";
 pub const MAX_PAGE: u64 = 50;
 
 pub struct Explorer {
@@ -67,10 +73,11 @@ pub struct Explorer {
     /// Contiguous canonical checkpoints ending at or below `tip`. Blocks above
     /// the newest one are already indexed and replay without rewriting rows.
     states: VecDeque<(Hash, Arc<State>)>,
-    /// The last captured update and chain tip. A failed update is retried only
-    /// after the canonical tip changes, not on every worker notification.
+    /// The last captured update and chain tip. A failed update is retried
+    /// after the canonical tip changes or its retry time passes, not on every
+    /// worker notification.
     attempt: Option<(Hash, Hash)>,
-    failed: Option<(Hash, Hash)>,
+    failed: Option<((Hash, Hash), Instant)>,
 }
 /// One already validated canonical block, or retained rollback checkpoints.
 /// Capturing this performs no state replay and no derived-index writes under
@@ -172,14 +179,15 @@ impl Explorer {
             .optional()?;
         if saved.as_deref() != Some(identity.as_str()) || version.as_deref() != Some(SCHEMA) {
             db.execute_batch("DROP TABLE IF EXISTS explorer_mail; DROP TABLE IF EXISTS explorer_names; DROP TABLE IF EXISTS explorer_name_attempts;")?;
-            db.execute_batch("DROP TABLE IF EXISTS explorer_chat;DROP TABLE IF EXISTS explorer_blocks;DROP TABLE IF EXISTS explorer_transactions;DROP TABLE IF EXISTS explorer_events;DROP TABLE IF EXISTS explorer_proposals;DROP TABLE IF EXISTS explorer_contributions;DROP TABLE IF EXISTS explorer_decisions;DELETE FROM explorer_meta;")?;
+            db.execute_batch("DROP TABLE IF EXISTS explorer_chat;DROP TABLE IF EXISTS explorer_blocks;DROP TABLE IF EXISTS explorer_transactions;DROP TABLE IF EXISTS explorer_transaction_data;DROP TABLE IF EXISTS explorer_events;DROP TABLE IF EXISTS explorer_proposals;DROP TABLE IF EXISTS explorer_contributions;DROP TABLE IF EXISTS explorer_decisions;DELETE FROM explorer_meta;")?;
             db.execute("INSERT INTO explorer_meta VALUES('chain',?1)", [identity])?;
             db.execute("INSERT INTO explorer_meta VALUES('schema',?1)", [SCHEMA])?;
         }
         db.execute_batch("CREATE TABLE IF NOT EXISTS explorer_mail(txid TEXT NOT NULL,block_hash TEXT NOT NULL,height INTEGER NOT NULL,position INTEGER NOT NULL,record TEXT NOT NULL,canonical INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(txid,block_hash));CREATE INDEX IF NOT EXISTS explorer_mail_page ON explorer_mail(height,position) WHERE canonical=1;
             CREATE TABLE IF NOT EXISTS explorer_chat(txid TEXT NOT NULL,block_hash TEXT NOT NULL,height INTEGER NOT NULL,position INTEGER NOT NULL,record TEXT NOT NULL,canonical INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(txid,block_hash));CREATE INDEX IF NOT EXISTS explorer_chat_page ON explorer_chat(height DESC,position DESC) WHERE canonical=1;CREATE TABLE IF NOT EXISTS explorer_blocks(hash TEXT PRIMARY KEY,height INTEGER NOT NULL,canonical INTEGER NOT NULL,record TEXT NOT NULL);
             CREATE UNIQUE INDEX IF NOT EXISTS explorer_height ON explorer_blocks(height) WHERE canonical=1;
-            CREATE TABLE IF NOT EXISTS explorer_transactions(txid TEXT NOT NULL,block_hash TEXT NOT NULL,height INTEGER NOT NULL,position INTEGER NOT NULL,record TEXT NOT NULL,data BLOB NOT NULL,canonical INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(txid,block_hash));
+            CREATE TABLE IF NOT EXISTS explorer_transactions(txid TEXT NOT NULL,block_hash TEXT NOT NULL,height INTEGER NOT NULL,position INTEGER NOT NULL,record TEXT NOT NULL,canonical INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(txid,block_hash));
+            CREATE TABLE IF NOT EXISTS explorer_transaction_data(txid TEXT NOT NULL,block_hash TEXT NOT NULL,data BLOB NOT NULL,PRIMARY KEY(txid,block_hash));
             CREATE INDEX IF NOT EXISTS explorer_tx_page ON explorer_transactions(height DESC,position DESC);
             CREATE INDEX IF NOT EXISTS explorer_tx_block ON explorer_transactions(block_hash,position);
             CREATE TABLE IF NOT EXISTS explorer_events(address TEXT NOT NULL,block_hash TEXT NOT NULL,height INTEGER NOT NULL,position INTEGER NOT NULL,record TEXT NOT NULL,canonical INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(address,block_hash,position));
@@ -222,17 +230,21 @@ impl Explorer {
             return Ok(None);
         }
         let update = self.next_update(chain)?;
-        let attempt = (update.target(), chain.tip_hash());
-        // A deterministic failure is not re-executed for every mempool or
-        // template notification; the next canonical tip retries it.
-        if self.failed == Some(attempt) {
-            return Ok(None);
+        if let Some(update) = &update {
+            self.attempt = Some((update.target(), chain.tip_hash()));
         }
-        self.attempt = Some(attempt);
-        Ok(Some(update))
+        Ok(update)
     }
 
-    fn next_update(&self, chain: &Chain) -> Result<Update> {
+    /// A failed update's target is skipped, before any block is loaded under
+    /// the node lock, until the canonical tip changes or RETRY_FAILED passes.
+    fn backed_off(&self, target: Hash, chain: &Chain) -> bool {
+        self.failed.is_some_and(|(attempt, retry)| {
+            attempt == (target, chain.tip_hash()) && Instant::now() < retry
+        })
+    }
+
+    fn next_update(&self, chain: &Chain) -> Result<Option<Update>> {
         let (tip, state) = self
             .states
             .back()
@@ -244,7 +256,10 @@ impl Explorer {
                 .rev()
                 .find(|(hash, state)| chain.hash_at_height(state.height) == Some(*hash))
             {
-                return Ok(Update::Rollback(*hash, state.clone()));
+                if self.backed_off(*hash, chain) {
+                    return Ok(None);
+                }
+                return Ok(Some(Update::Rollback(*hash, state.clone())));
             }
             // A reorg deeper than every checkpoint keeps the rows below the
             // common ancestor and replays from the nearest state the chain
@@ -255,16 +270,25 @@ impl Explorer {
             let hash = chain
                 .hash_at_height(height)
                 .context("missing common ancestor")?;
-            return Ok(Update::Rebuild(height, hash, checkpoints(chain, height)?));
+            if self.backed_off(hash, chain) {
+                return Ok(None);
+            }
+            return Ok(Some(Update::Rebuild(height, hash, checkpoints(chain, height)?)));
         }
         let replay = state.height < self.height;
         if replay && chain.hash_at_height(self.height) != self.tip {
             // The indexed tip was detached above the newest checkpoint.
-            return Ok(Update::Rollback(*tip, state.clone()));
+            if self.backed_off(*tip, chain) {
+                return Ok(None);
+            }
+            return Ok(Some(Update::Rollback(*tip, state.clone())));
         }
         let hash = chain
             .hash_at_height(state.height + 1)
             .context("missing canonical successor")?;
+        if self.backed_off(hash, chain) {
+            return Ok(None);
+        }
         let block = Box::new(if hash == chain.tip_hash() {
             chain.tip_block().clone()
         } else {
@@ -272,17 +296,24 @@ impl Explorer {
                 .block(&hash)
                 .context("missing stored canonical block")?
         });
-        Ok(if replay {
+        Ok(Some(if replay {
             Update::Replay(block)
         } else {
             Update::Advance(block)
-        })
+        }))
     }
 
     pub(crate) fn apply_update(&mut self, c: &Config, update: Update) -> Result<()> {
         let attempt = self.attempt.take();
         let result = self.apply(c, update);
-        self.failed = if result.is_err() { attempt } else { None };
+        // Lock contention is retried on the next notification; any other
+        // failure may be deterministic and waits for a new tip or the delay.
+        self.failed = match (&result, attempt) {
+            (Err(error), Some(attempt)) if !contended(error) => {
+                Some((attempt, Instant::now() + RETRY_FAILED))
+            }
+            _ => None,
+        };
         result
     }
 
@@ -470,7 +501,7 @@ impl Explorer {
                 let (h, n) = cursor_named(&p, "cursor", s.height, c)?;
                 // Message text is read from the stored transaction data rather
                 // than from a second, JSON-escaped copy in the chat projection.
-                let mut statement = db.prepare("SELECT t.record,t.height,t.position,x.data FROM explorer_chat t JOIN explorer_blocks b ON b.hash=t.block_hash JOIN explorer_transactions x ON x.txid=t.txid AND x.block_hash=t.block_hash WHERE t.canonical=1 AND b.canonical=1 AND (t.height<?1 OR (t.height=?1 AND t.position<?2)) ORDER BY t.height DESC,t.position DESC LIMIT ?3")?;
+                let mut statement = db.prepare("SELECT t.record,t.height,t.position,x.data FROM explorer_chat t JOIN explorer_blocks b ON b.hash=t.block_hash JOIN explorer_transaction_data x ON x.txid=t.txid AND x.block_hash=t.block_hash WHERE t.canonical=1 AND b.canonical=1 AND (t.height<?1 OR (t.height=?1 AND t.position<?2)) ORDER BY t.height DESC,t.position DESC LIMIT ?3")?;
                 let (items, next) = paged(
                     &mut statement,
                     params![h, n, limit],
@@ -608,7 +639,7 @@ impl Explorer {
             "explorer_transaction" => {
                 fields(&p, &["txid", "limit"])?;
                 let id = hex::encode(parse_hash(string(&p, "txid")?)?);
-                let row:Option<(String,Vec<u8>,bool)>=db.query_row("SELECT t.record,t.data,b.canonical FROM explorer_transactions t JOIN explorer_blocks b ON b.hash=t.block_hash WHERE t.txid=?1 ORDER BY b.canonical DESC,t.height DESC LIMIT 1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+                let row:Option<(String,Vec<u8>,bool)>=db.query_row("SELECT t.record,d.data,b.canonical FROM explorer_transactions t JOIN explorer_blocks b ON b.hash=t.block_hash JOIN explorer_transaction_data d ON d.txid=t.txid AND d.block_hash=t.block_hash WHERE t.txid=?1 ORDER BY b.canonical DESC,t.height DESC LIMIT 1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
 
                 let value = if let Some((record, data, true)) = row.as_ref() {
                     let mut value: Value = serde_json::from_str(record)?;
@@ -1151,6 +1182,20 @@ fn set_tip(db: &rusqlite::Transaction<'_>, hash: &Hash) -> Result<()> {
     )?;
     Ok(())
 }
+/// Another connection held the index lock past the busy timeout: transient.
+fn contended(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(rusqlite::Error::sqlite_error_code)
+            .is_some_and(|code| {
+                matches!(
+                    code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                )
+            })
+    })
+}
 /// The newest indexed canonical height whose block is still canonical.
 fn common_ancestor(db: &Connection, chain: &Chain) -> Result<Option<u64>> {
     let last: Option<u64> = db
@@ -1177,7 +1222,9 @@ fn common_ancestor(db: &Connection, chain: &Chain) -> Result<Option<u64>> {
     Ok(common)
 }
 /// Contiguous canonical states at or below `height` that the chain already
-/// retains (oldest first), else genesis. This never replays history.
+/// retains (oldest first). With none in that window, the chain's nearest
+/// active-chain checkpoint below it (two per doubling of depth), else genesis.
+/// This never replays history.
 fn checkpoints(chain: &Chain, height: u64) -> Result<VecDeque<(Hash, Arc<State>)>> {
     let mut states = VecDeque::new();
     for h in (height.saturating_sub(CHECKPOINTS as u64 - 1)..=height).rev() {
@@ -1196,8 +1243,13 @@ fn checkpoints(chain: &Chain, height: u64) -> Result<VecDeque<(Hash, Arc<State>)
         }
     }
     if states.is_empty() {
-        let hash = chain.hash_at_height(0).context("missing genesis")?;
-        states.push_back((hash, Arc::new(State::genesis(&chain.config))));
+        match chain.checkpoint_at_or_below(height) {
+            Some(checkpoint) => states.push_back(checkpoint),
+            None => {
+                let hash = chain.hash_at_height(0).context("missing genesis")?;
+                states.push_back((hash, Arc::new(State::genesis(&chain.config))));
+            }
+        }
     }
     Ok(states)
 }
@@ -1250,6 +1302,15 @@ mod page_capacity_tests {
             json!({"txid":"01","fee":"3","operation_omitted":true})
         );
         assert!(record_text(&value, "operation", 8).is_none());
+        // Mail keeps the signed transaction its clients verify and drops only
+        // the decoded copy of its operation.
+        let mail = json!({"txid":"01","raw":"ab".repeat(64),"operation":value["operation"]});
+        let full = serde_json::to_string(&mail).unwrap();
+        let reduced = record_text(&mail, "operation", full.len() - 1).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&reduced).unwrap(),
+            json!({"txid":"01","raw":"ab".repeat(64),"operation_omitted":true})
+        );
     }
 
     #[test]
@@ -1582,9 +1643,11 @@ fn index_block(
         let paid = quote.fee;
         transaction_fees += &paid;
         let mut value = tx_value(c, opening, t, Some(b.height), Some(hash), Some(paid))?;
+        let mut role = "sender";
         // A refund credits the whole unclaimed support, which its signed
         // operation does not state; no earlier transaction in a block can
-        // change that record, so read it from the block's opening state.
+        // change that record, so read it from the block's opening state. The
+        // signer's event is then a credit, recorded with the recipient role.
         if let Operation::Refund { round, proposal } = &t.body.operation
             && let Some(support) = opening.supports.get(&crate::state::support_key(
                 *round,
@@ -1594,6 +1657,7 @@ fn index_block(
         {
             value["amount"] = json!(support.amount.to_str_radix(10));
             value["asset"] = json!("hash");
+            role = "recipient";
         }
         let transaction_id = codec::transaction_id(t);
         let fill = if matches!(
@@ -1613,11 +1677,13 @@ fn index_block(
         }
         let id = hex::encode(transaction_id);
         let operation = t.body.operation.clone();
-        // Raw bytes, never a hex copy: every derived value stays no larger than
-        // the stored block, below SQLite's maximum value length.
+        // Raw bytes, never a hex copy, in a row of their own: SQLite limits a
+        // whole row, and this one stays smaller than the chain's row for the
+        // stored block, while the bounded record never shares it.
         let record = record_text(&value, "operation", RECORD_BYTES)
             .context("oversized explorer transaction record")?;
-        db.execute("INSERT OR REPLACE INTO explorer_transactions(txid,block_hash,height,position,record,data) VALUES(?1,?2,?3,?4,?5,?6)",params![id,hash_text,b.height,position as u64,record,t.body.data])?;
+        db.execute("INSERT OR REPLACE INTO explorer_transactions(txid,block_hash,height,position,record) VALUES(?1,?2,?3,?4,?5)",params![id,hash_text,b.height,position as u64,record])?;
+        db.execute("INSERT OR REPLACE INTO explorer_transaction_data(txid,block_hash,data) VALUES(?1,?2,?3)",params![id,hash_text,t.body.data])?;
         if let Some(mut message) = chat_value(
             opening,
             t,
@@ -1631,8 +1697,10 @@ fn index_block(
             }
             db.execute("INSERT OR REPLACE INTO explorer_chat(txid,block_hash,height,position,record) VALUES(?1,?2,?3,?4,?5)", params![id,hash_text,b.height,position as u64,serde_json::to_string(&message)?])?;
         }
-        // Mail needs its complete signed record; one no response could carry
-        // is undeliverable and is not listed.
+        // Mail needs its complete signed `raw` transaction; clients verify the
+        // decoded operation against it, so an oversized record drops that copy.
+        // One whose signed transaction alone exceeds the bound is not listed:
+        // a listed record must stay deliverable, or every scan would stop on it.
         if let Some(record) = mail_value(
             opening,
             t,
@@ -1640,11 +1708,11 @@ fn index_block(
             Some(hash),
             Some(position as u64),
         )
-        .and_then(|message| bounded_json(&message, RECORD_BYTES))
+        .and_then(|message| record_text(&message, "operation", RECORD_BYTES))
         {
             db.execute("INSERT OR REPLACE INTO explorer_mail(txid,block_hash,height,position,record) VALUES(?1,?2,?3,?4,?5)",params![id,hash_text,b.height,position as u64,record])?;
         }
-        let mut event = json!({"height":b.height,"block_hash":hash_text,"txid":id,"kind":kind(&operation),"role":"sender","fee":value["fee"],"amount":value.get("amount"),"asset":value.get("asset"),"recipient":value.get("recipient")});
+        let mut event = json!({"height":b.height,"block_hash":hash_text,"txid":id,"kind":kind(&operation),"role":role,"fee":value["fee"],"amount":value.get("amount"),"asset":value.get("asset"),"recipient":value.get("recipient")});
         conditional_fields(opening, &operation, &mut event);
         if let Some(fill) = fill {
             attach_fill(&mut event, fill);
@@ -2168,7 +2236,7 @@ mod indexing_tests {
         for position in [4096, 4097] {
             let record = json!({"height":0,"position":position,"status":"confirmed"});
             db.execute(
-                "INSERT INTO explorer_transactions(txid,block_hash,height,position,record,data) VALUES(?1,?2,0,?3,?4,'')",
+                "INSERT INTO explorer_transactions(txid,block_hash,height,position,record) VALUES(?1,?2,0,?3,?4)",
                 params![format!("{position:064x}"),hash,position,record.to_string()],
             ).unwrap();
         }
@@ -2280,6 +2348,7 @@ mod indexing_tests {
             "explorer_meta",
             "explorer_blocks",
             "explorer_transactions",
+            "explorer_transaction_data",
             "explorer_events",
             "explorer_proposals",
             "explorer_contributions",
@@ -2626,17 +2695,73 @@ mod worker_tests {
         let mut chain = Chain::open(&path, c.clone()).unwrap();
         let mut index = Explorer::open(&path, &chain).unwrap();
         extend(&mut chain, 0);
-        let writer = Connection::open(path.with_extension("explorer.sqlite")).unwrap();
-        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        // A refused row stands in for a block this index cannot store.
+        let refuse =
+            |index: &Explorer, sql: &str| index.db.as_ref().unwrap().execute_batch(sql).unwrap();
+        refuse(
+            &index,
+            "CREATE TEMP TRIGGER refuse BEFORE INSERT ON explorer_blocks BEGIN SELECT RAISE(ABORT,'refused'); END;",
+        );
         let update = index.capture(&chain).unwrap().unwrap();
         assert!(index.apply_update(&c, update).is_err());
-        writer.execute_batch("ROLLBACK").unwrap();
-        // Mempool and template notifications for the same tip do not
-        // re-execute the failed block.
+        // Mempool and template notifications for the same tip neither load
+        // nor re-execute the failed block until its retry time.
         assert!(index.capture(&chain).unwrap().is_none());
+        index.failed.as_mut().unwrap().1 = Instant::now();
+        let update = index.capture(&chain).unwrap().unwrap();
+        assert!(matches!(update, Update::Advance(_)));
+        assert!(index.apply_update(&c, update).is_err());
+        assert!(index.capture(&chain).unwrap().is_none());
+        refuse(&index, "DROP TRIGGER refuse");
         extend(&mut chain, 1);
         assert_eq!(drain(&mut index, &chain), ["advance", "advance"]);
         assert_eq!(index.tip, Some(chain.tip_hash()));
+        // Lock contention is transient: the next notification retries it.
+        extend(&mut chain, 2);
+        let writer = Connection::open(path.with_extension("explorer.sqlite")).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let update = index.capture(&chain).unwrap().unwrap();
+        let error = index.apply_update(&c, update).unwrap_err();
+        assert!(contended(&error), "{error:#}");
+        writer.execute_batch("ROLLBACK").unwrap();
+        assert!(index.failed.is_none());
+        assert_eq!(drain(&mut index, &chain), ["advance"]);
+        assert_eq!(index.tip, Some(chain.tip_hash()));
+    }
+
+    #[test]
+    fn far_behind_index_resumes_from_the_nearest_chain_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Config::devnet();
+        let path = dir.path().join("far-behind.sqlite");
+        let mut chain = Chain::open(&path, c.clone()).unwrap();
+        for salt in 0..700 {
+            extend(&mut chain, salt);
+        }
+        let mut index = Explorer::open(&path, &chain).unwrap();
+        drain(&mut index, &chain);
+        assert_eq!(index.tip, chain.hash_at_height(700));
+        drop(index);
+        for salt in 700..1800 {
+            extend(&mut chain, salt);
+        }
+        // 1,100 blocks behind, no state within 128 blocks of the indexed tip
+        // is retained, but the chain keeps sparse checkpoints far below it.
+        assert!((573..=700).all(|height| {
+            chain
+                .cached_state(&chain.hash_at_height(height).unwrap())
+                .is_none()
+        }));
+        let mut index = Explorer::open(&path, &chain).unwrap();
+        assert_eq!(index.tip, chain.hash_at_height(700));
+        let (hash, state) = index.states.back().unwrap();
+        assert_eq!((Some(*hash), state.height), (chain.hash_at_height(512), 512));
+        let kinds = drain(&mut index, &chain);
+        assert_eq!(kinds[..188], ["replay"; 188]);
+        assert!(kinds[188..].iter().all(|kind| *kind == "advance"));
+        assert_eq!(kinds.len(), 1288);
+        assert_eq!(index.tip, Some(chain.tip_hash()));
+        assert_eq!(canonical_blocks(&index), 1801);
     }
 
     #[test]
@@ -3106,12 +3231,21 @@ mod chat_tests {
         let db = index.db.as_ref().unwrap();
         let (kind, length): (String, usize) = db
             .query_row(
-                "SELECT typeof(data),length(data) FROM explorer_transactions WHERE txid=?1",
+                "SELECT typeof(data),length(data) FROM explorer_transaction_data WHERE txid=?1",
                 [hex::encode(codec::transaction_id(&first))],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!((kind.as_str(), length), ("blob", first.body.data.len()));
+        // Data never shares a row with the bounded transaction record.
+        let shared: u64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('explorer_transactions') WHERE name='data'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared, 0);
         let stored: String = db
             .query_row(
                 "SELECT record FROM explorer_chat WHERE txid=?1",

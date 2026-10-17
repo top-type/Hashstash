@@ -198,6 +198,19 @@ async function run() {
     c.currentSnapshot.account.account.nonce=0;await c.refresh();await c.refresh();
     assert.match(f.querySelector().textContent,/^Mined or replaced · /,'a settled submission is no longer followed');checks++;
   }
+  // A busy pool truncates the global page; the sender's own complete page
+  // still shows whether its submission is pending.
+  {
+    const c=await setup();c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();
+    const f=await fill(c,alice);await f.requestSubmit();
+    assert.equal(broadcasts(c).length,1,f.querySelector().textContent);checks++;
+    const own={body:{sender:bob,nonce:0,operation:{TransferExact:{recipient:alice,amount:'100'}}}};
+    c.currentSnapshot.mempool=[];c.currentSnapshot.status.mempool=500;c.currentSnapshot.sender_mempool=[own];c.currentSnapshot.pending_nonce='1';
+    await c.refresh();await c.refresh();
+    assert.match(f.querySelector().textContent,/^Pending · /,'the sender page shows the submission pending');checks++;
+    c.currentSnapshot.sender_mempool=[];c.currentSnapshot.pending_nonce='0';await c.refresh();await c.refresh();
+    assert.match(f.querySelector().textContent,/^No longer pending · /,'a complete sender page detects a dropped submission');checks++;
+  }
   console.log(`Browser wallet UI: ${checks} integration assertions passed.`);
 }
 run().catch(error=>{console.error(error);process.exitCode=1;});

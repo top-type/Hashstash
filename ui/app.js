@@ -373,14 +373,16 @@
                 feedback(form, `Mined or replaced · ${short(tracked.id)}`);
                 continue;
             }
-            if (state.mempool.some(tx => hex(tx.body?.sender) === tracked.sender && BigInt(tx.body.nonce) === tracked.nonce)) {
+            if (ownPending().some(tx => hex(tx.body?.sender) === tracked.sender && BigInt(tx.body.nonce) === tracked.nonce)) {
                 tracked.misses = 0;
                 shown === message || feedback(form, message);
                 continue;
             }
-            // The snapshot lists a bounded prefix of the pool, and a tip change
-            // briefly publishes an empty pool before recovery: confirm twice.
-            if (Number(state.status?.mempool || 0) > state.mempool.length || ++tracked.misses < 2) {
+            // The snapshot lists bounded prefixes of the pool and of this
+            // sender's rows, and a tip change briefly publishes an empty pool
+            // before recovery: confirm twice.
+            const truncated = Array.isArray(state.senderMempool) ? state.senderMempool.length >= 128 : Number(state.status?.mempool || 0) > state.mempool.length;
+            if (truncated || ++tracked.misses < 2) {
                 shown === message || feedback(form, message);
                 continue;
             }

@@ -121,11 +121,14 @@ impl Signer {
             .unwrap();
         assert_eq!(session["unlocked"], false);
         assert!(session["public_key"].is_null());
+        // Loopback is shared by every local account: the token is handed
+        // only to whoever started the signer, never over HTTP.
+        assert!(session.get("token").is_none());
         Self {
+            token: server.token().into(),
             server,
             client,
             base,
-            token: session["token"].as_str().unwrap().into(),
         }
     }
 
@@ -1175,10 +1178,10 @@ async fn review_requests_have_a_finite_configurable_limit() {
         .unwrap();
     assert_eq!(session["max_review_bytes"], limit);
     let signer = Signer {
+        token: server.token().into(),
         server,
         client,
         base,
-        token: session["token"].as_str().unwrap().into(),
     };
     let sender = signer.unlock(PHRASE).await;
     let mut expected = body(sender, payment());
@@ -1220,6 +1223,10 @@ async fn review_requests_have_a_finite_configurable_limit() {
         .await
         .unwrap();
     assert_eq!(session["max_review_bytes"], cold::DEFAULT_MAX_REVIEW_REQUEST);
+    assert_eq!(
+        session["idle_lock_seconds"],
+        cold::DEFAULT_IDLE_LOCK.as_secs()
+    );
     default.server.stop().await;
     signer.server.stop().await;
 }
@@ -1261,5 +1268,103 @@ async fn proposal_review_reports_whether_text_matches_the_signed_description() {
                 .any(|f| f["label"] == "Rationale" && f["value"] == verdict)
         );
     }
+    signer.server.stop().await;
+}
+
+#[tokio::test]
+async fn session_token_reaches_only_the_launcher_and_idle_wallets_lock() {
+    use std::time::Duration;
+    // Another local account can reach loopback and send any header, so the
+    // session endpoint and page never carry the token; the launch URL does.
+    let chosen = "5a".repeat(32);
+    let options = |token: Option<String>, idle_lock| cold::ColdOptions {
+        chain_id: Some([9; 32]),
+        token,
+        idle_lock,
+        ..cold::ColdOptions::default()
+    };
+    let loopback = || "127.0.0.1:0".parse().unwrap();
+    for bad in ["5A".repeat(32), "5a".repeat(31), "zz".repeat(32)] {
+        let refused = cold::serve_with_options(loopback(), options(Some(bad), cold::DEFAULT_IDLE_LOCK));
+        assert!(refused.await.is_err());
+    }
+    assert!(
+        cold::serve_with_options(loopback(), options(None, Duration::ZERO))
+            .await
+            .is_err()
+    );
+    let idle = Duration::from_millis(800);
+    let server = cold::serve_with_options(loopback(), options(Some(chosen.clone()), idle))
+        .await
+        .unwrap();
+    let base = format!("http://{}", server.address);
+    assert_eq!(server.token(), chosen);
+    assert_eq!(server.launch_url(), format!("{base}/#token={chosen}"));
+    let client = Client::new();
+    for path in ["/", "/app.js", "/api/session"] {
+        let text = client
+            .get(format!("{base}{path}"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(!text.contains(&chosen), "{path}");
+    }
+    let signer = Signer {
+        token: server.token().into(),
+        server,
+        client,
+        base,
+    };
+    let sender = signer.unlock(PHRASE).await;
+    let envelope =
+        serde_json::to_value(wallet::unsigned(&body(sender, payment()), &[9; 32])).unwrap();
+    let reviewed = signer.ok("review", envelope.clone()).await;
+    // Left unused, the open wallet and its review lock themselves.
+    tokio::time::sleep(idle * 3).await;
+    let refused = signer
+        .post("sign", json!({"review_token":reviewed["review_token"]}))
+        .await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let text = refused.text().await.unwrap();
+    assert!(text.contains("locked after a period without use"), "{text}");
+    let session: Value = signer
+        .client
+        .get(format!("{}/api/session", signer.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session["unlocked"], false);
+    assert_eq!(session["idle_locked"], true);
+    // Opening a wallet clears the notice, and use keeps it open.
+    signer.unlock(PHRASE).await;
+    for _ in 0..3 {
+        tokio::time::sleep(idle / 4).await;
+        signer.ok("review", envelope.clone()).await;
+    }
+    // Locking by hand clears the notice; a request then needs a wallet.
+    signer.ok("lock", json!({})).await;
+    let text = signer
+        .post("review", envelope.clone())
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(text.contains("Open a wallet first"), "{text}");
+    // The signer also wipes a forgotten key while no request arrives at all.
+    signer.unlock(PHRASE).await;
+    tokio::time::sleep(idle * 3).await;
+    let text = signer
+        .post("review", envelope)
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(text.contains("locked after a period without use"), "{text}");
     signer.server.stop().await;
 }

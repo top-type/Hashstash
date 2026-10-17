@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tokio::{
     net::TcpListener,
@@ -31,6 +32,9 @@ pub const MAX_CONTROL_REQUEST: usize = 128 * 1024;
 /// Default ceiling for one unsigned export. Governance can raise block capacity
 /// past it; `hashstash-cold --max-review-bytes` raises this local limit.
 pub const DEFAULT_MAX_REVIEW_REQUEST: usize = 64 * 1024 * 1024;
+/// An open wallet locks itself after this long without an authorized request.
+pub const DEFAULT_IDLE_LOCK: Duration = Duration::from_secs(5 * 60);
+const IDLE_LOCKED: &str = "Wallet locked after a period without use; open it again";
 const INDEX: &str = include_str!("../cold-ui/index.html");
 const SCRIPT: &str = include_str!("../cold-ui/app.js");
 const SHARES: &str = include_str!("../ui/shares.js");
@@ -54,6 +58,10 @@ struct WalletState {
     backup_pending: bool,
     review: Option<Review>,
     chain_id: Option<Hash>,
+    /// The last authorized request that left a wallet open.
+    last_used: Option<Instant>,
+    /// The idle lock closed the wallet, and none has been opened since.
+    idle_locked: bool,
 }
 
 impl WalletState {
@@ -63,6 +71,21 @@ impl WalletState {
         self.derived_for = None;
         self.backup_pending = false;
         self.review = None;
+        self.last_used = None;
+        self.idle_locked = false;
+    }
+    /// Locks a wallet left unused for `idle`, returning whether it did.
+    fn expire(&mut self, idle: Duration) -> bool {
+        let expired =
+            self.secret.is_some() && self.last_used.is_none_or(|used| used.elapsed() >= idle);
+        if expired {
+            self.clear_wallet();
+            self.idle_locked = true;
+        }
+        expired
+    }
+    fn touch(&mut self) {
+        self.last_used = self.secret.is_some().then(Instant::now);
     }
     fn load(&mut self, secret: Zeroizing<[u8; 32]>, derived_for: Option<Hash>) -> Result<()> {
         self.public = Some(crypto::public_key(&secret)?);
@@ -98,7 +121,7 @@ impl WalletState {
             }
         });
         Ok(
-            json!({"public_key":public,"chain_id":chain,"address":encoded,"watch":watch,"unlocked":public.is_some(),"backup_pending":self.backup_pending}),
+            json!({"public_key":public,"chain_id":chain,"address":encoded,"watch":watch,"unlocked":public.is_some(),"backup_pending":self.backup_pending,"idle_locked":self.idle_locked}),
         )
     }
 }
@@ -111,20 +134,59 @@ struct App {
     origin: String,
     token: String,
     max_review: usize,
+    idle_lock: Duration,
+}
+
+/// Signer settings beyond its listening address.
+#[derive(Clone)]
+pub struct ColdOptions {
+    /// A trusted network identity from a local config or explicit argument.
+    pub chain_id: Option<Hash>,
+    /// Bounds one unsigned export request, in bytes.
+    pub max_review: usize,
+    /// The browser session token, 64 lowercase hexadecimal characters, or a
+    /// random one. It is delivered only in the launch URL, never served.
+    pub token: Option<String>,
+    /// An open wallet locks after this long without an authorized request.
+    pub idle_lock: Duration,
+}
+
+impl Default for ColdOptions {
+    fn default() -> Self {
+        Self {
+            chain_id: None,
+            max_review: DEFAULT_MAX_REVIEW_REQUEST,
+            token: None,
+            idle_lock: DEFAULT_IDLE_LOCK,
+        }
+    }
 }
 
 pub struct ColdServer {
     pub address: SocketAddr,
+    token: String,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
+    sweeper: JoinHandle<()>,
 }
 
 impl ColdServer {
+    /// The browser session token. Loopback is shared by every local account
+    /// and service, so only whoever started the signer receives it.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+    /// The interface with its session token in the URL fragment, which the
+    /// browser never sends; the page then removes it from the address bar.
+    pub fn launch_url(&self) -> String {
+        format!("http://{}/#token={}", self.address, self.token)
+    }
     pub async fn stop(mut self) {
         if let Some(stop) = self.shutdown.take() {
             let _ = stop.send(());
         }
         let _ = self.task.await;
+        self.sweeper.abort();
     }
 }
 
@@ -194,26 +256,69 @@ pub async fn serve_with_limits(
     chain_id: Option<Hash>,
     max_review: usize,
 ) -> Result<ColdServer> {
+    serve_with_options(
+        address,
+        ColdOptions {
+            chain_id,
+            max_review,
+            ..ColdOptions::default()
+        },
+    )
+    .await
+}
+
+pub async fn serve_with_options(address: SocketAddr, options: ColdOptions) -> Result<ColdServer> {
     ensure!(
         address.ip().is_loopback() && address.is_ipv4(),
         "cold signer requires IPv4 loopback"
     );
     ensure!(
-        max_review >= MAX_CONTROL_REQUEST,
+        options.max_review >= MAX_CONTROL_REQUEST,
         "review limit must be at least {MAX_CONTROL_REQUEST} bytes"
     );
+    ensure!(!options.idle_lock.is_zero(), "idle lock must be positive");
+    let session_token = match options.token {
+        Some(chosen) => {
+            ensure!(
+                chosen.len() == 64 && chosen.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "session token must be 64 lowercase hexadecimal characters"
+            );
+            chosen
+        }
+        None => token()?,
+    };
     let listener = TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
     let app = App {
         wallet: Arc::new(Mutex::new(WalletState {
-            chain_id,
+            chain_id: options.chain_id,
             ..WalletState::default()
         })),
         jobs: Arc::new(Semaphore::new(1)),
         host: address.to_string(),
         origin: format!("http://{address}"),
-        token: token()?,
-        max_review,
+        token: session_token.clone(),
+        max_review: options.max_review,
+        idle_lock: options.idle_lock,
+    };
+    // Requests apply the idle lock themselves; this also wipes a forgotten
+    // key while nobody uses the signer.
+    let sweeper = {
+        let wallet = Arc::downgrade(&app.wallet);
+        let idle = app.idle_lock;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(idle.min(Duration::from_secs(1)));
+            loop {
+                tick.tick().await;
+                let Some(wallet) = wallet.upgrade() else {
+                    break;
+                };
+                // A busy signer is in use; its next request checks again.
+                if let Ok(mut state) = wallet.try_lock() {
+                    state.expire(idle);
+                }
+            }
+        })
     };
     let routes = Router::new()
         .route(
@@ -250,7 +355,7 @@ pub async fn serve_with_limits(
         .route("/api/lock", post(lock))
         .route(
             "/api/review",
-            post(review).layer(DefaultBodyLimit::max(max_review)),
+            post(review).layer(DefaultBodyLimit::max(options.max_review)),
         )
         .route("/api/cancel", post(cancel))
         .route("/api/sign", post(sign))
@@ -270,24 +375,31 @@ pub async fn serve_with_limits(
     });
     Ok(ColdServer {
         address,
+        token: session_token,
         shutdown: Some(shutdown),
         task,
+        sweeper,
     })
 }
 
+/// Status only. Loopback is shared by every local account and service, so
+/// the session token is never served here; the page reads its launch URL.
 async fn session(State(app): State<App>) -> Response {
     // A long review holds the wallet lock; wait for it off the async workers.
     let wallet = app.wallet.clone();
+    let idle = app.idle_lock;
     let status = tokio::task::spawn_blocking(move || {
-        let state = wallet.lock().map_err(|_| anyhow!("Signer unavailable"))?;
+        let mut state = wallet.lock().map_err(|_| anyhow!("Signer unavailable"))?;
+        // Reading status never extends an idle wallet's lifetime.
+        state.expire(idle);
         state.status()
     })
     .await;
     match status {
         Ok(Ok(mut status)) => {
             status["format"] = json!("hashstash-cold-v1");
-            status["token"] = json!(app.token);
             status["max_review_bytes"] = json!(app.max_review);
+            status["idle_lock_seconds"] = json!(app.idle_lock.as_secs());
             Json(status).into_response()
         }
         Ok(Err(problem)) => error(StatusCode::INTERNAL_SERVER_ERROR, &problem.to_string()),
@@ -342,7 +454,16 @@ where
             .wallet
             .lock()
             .map_err(|_| anyhow!("Signer unavailable"))?;
-        work(&mut state)
+        // An idle wallet locks before any request can use it. A request that
+        // needed it then says why, whichever check locked it.
+        state.expire(app.idle_lock);
+        let result = work(&mut state);
+        let idle_locked = state.idle_locked;
+        state.touch();
+        match result {
+            Err(_) if idle_locked => Err(anyhow!(IDLE_LOCKED)),
+            other => other,
+        }
     })
     .await
     {

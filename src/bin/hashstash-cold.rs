@@ -4,6 +4,7 @@ use hashstash::{config::Config, types::Hash};
 use std::{
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
+    time::Duration,
 };
 
 #[derive(Parser)]
@@ -25,7 +26,18 @@ struct Options {
     /// Largest unsigned export accepted for review, in bytes.
     #[arg(long, default_value_t = hashstash::cold::DEFAULT_MAX_REVIEW_REQUEST)]
     max_review_bytes: usize,
+    /// Seconds without use after which an open wallet locks itself.
+    #[arg(
+        long,
+        default_value_t = hashstash::cold::DEFAULT_IDLE_LOCK.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    idle_lock_seconds: u64,
 }
+
+/// A launcher that opens the browser itself may choose the session token.
+/// The environment, unlike the command line, is readable only by this account.
+const TOKEN_VARIABLE: &str = "HASHSTASH_COLD_TOKEN";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -53,13 +65,24 @@ async fn main() -> Result<()> {
         None
     };
     let configured = chain.is_some();
-    let server = hashstash::cold::serve_with_limits(
+    let token = match std::env::var(TOKEN_VARIABLE) {
+        Ok(token) => Some(token),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(error).context(TOKEN_VARIABLE),
+    };
+    let server = hashstash::cold::serve_with_options(
         SocketAddr::from((Ipv4Addr::LOCALHOST, options.port)),
-        chain,
-        options.max_review_bytes,
+        hashstash::cold::ColdOptions {
+            chain_id: chain,
+            max_review: options.max_review_bytes,
+            token,
+            idle_lock: Duration::from_secs(options.idle_lock_seconds),
+        },
     )
     .await?;
-    println!("Hashstash cold signer: http://{}/", server.address);
+    // The session token is never served over loopback; only this launch URL
+    // carries it to the browser.
+    println!("Hashstash cold signer: {}", server.launch_url());
     if !configured {
         println!("No network configured: select it in the signer before reviewing transactions.");
     }

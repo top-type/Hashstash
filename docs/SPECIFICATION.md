@@ -196,7 +196,9 @@ error = (parent_timestamp - first_block_timestamp)
 ideal_target = initial_target * 2^(error / half_life)
 ```
 
-Each branch anchors ASERT at its first mined block, excluding the wait between creating the genesis configuration and starting mining. The first two blocks use the initial target. Later targets use the fixed integer ASERT approximation, canonical compact rounding and the fixed genesis target limit. An interval change affects future schedule increments without resetting that branch's anchor. Timestamp controls constrain but do not eliminate manipulation.
+Each branch anchors ASERT at its first mined blocks, excluding the wait between creating the genesis configuration and starting mining. The anchor timestamp is the later of the first block's timestamp and the second block's timestamp less one target interval, so backdating the first block alone cannot turn that wait into timestamp error; a miner producing both of the first two blocks still can. The first two blocks use the initial target, and the third never starts easier than it. Later targets use the fixed integer ASERT approximation, canonical compact rounding and the fixed genesis target limit. An interval change affects future schedule increments without resetting that branch's anchor. Timestamp controls constrain but do not eliminate manipulation.
+
+Header timestamps are u32 seconds. Once median past time reaches u32::MAX (2106-02-07 06:28:15 UTC) no timestamp can exceed it and the chain cannot be extended; this is a protocol lifetime limit that only a new header format could lift.
 
 ## 10 Authenticated state and execution
 

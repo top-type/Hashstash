@@ -34,6 +34,9 @@ pub const SIDE_BRANCH_CATCH_UP_BLOCKS: u32 = 4096;
 pub const CAPACITY_BRANCH_MARGIN_BLOCKS: u32 = 6;
 pub const CAPACITY_BRANCH_WORK_RATIO: u32 = 4;
 const MAX_CAPACITY_BRANCHES: usize = 256;
+/// Blocks replayed per committed batch of the startup index rebuild. Unit tests
+/// use small batches so reopening their short chains crosses batch boundaries.
+const INDEX_REBUILD_BATCH: u64 = if cfg!(test) { 7 } else { 4096 };
 const INVALID_BLOCK_TTL: Duration = Duration::from_secs(60);
 #[derive(Debug)]
 struct PermanentBlockError(String);
@@ -227,7 +230,8 @@ impl Chain {
         }
         let db = Connection::open(path)?;
         db.busy_timeout(Duration::from_secs(2))?;
-        // The journal limit returns WAL space after the startup index rebuild.
+        // The journal limit returns WAL space after checkpoints of the batched
+        // startup index rebuild instead of keeping the log at its peak size.
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_size_limit=67108864; CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value BLOB NOT NULL); CREATE TABLE IF NOT EXISTS blocks(seq INTEGER PRIMARY KEY AUTOINCREMENT, hash BLOB NOT NULL UNIQUE, bytes BLOB NOT NULL, accepted_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS rejected_blocks(hash BLOB PRIMARY KEY, bytes BLOB NOT NULL, accepted_at INTEGER NOT NULL, reason TEXT NOT NULL);")?;
         // Derived indexes are rebuilt from independently validated block bodies on every open.
         // SQLite bounds its page cache; canonical and losing-branch metadata stay on disk.
@@ -304,6 +308,7 @@ impl Chain {
         };
         // Replay one bounded record at a time instead of buffering the entire database.
         let mut sequence = 0i64;
+        let mut replayed = 0u64;
         loop {
             let row: Option<(i64, Vec<u8>, Vec<u8>, u64)> = chain.db.query_row(
                 "SELECT seq,hash,bytes,accepted_at FROM blocks WHERE seq>?1 ORDER BY seq LIMIT 1",
@@ -340,6 +345,13 @@ impl Chain {
                 Self::write_canonical(&chain.db, hash, entry.height)?;
             }
             chain.record(hash, block, Arc::new(entry), state, best);
+            replayed += 1;
+            // Derived indexes are rebuilt from scratch on every open, so an
+            // interrupted rebuild loses nothing; committing in batches keeps the
+            // write-ahead log, and the free space it needs, bounded.
+            if replayed % INDEX_REBUILD_BATCH == 0 {
+                chain.db.execute_batch("COMMIT; BEGIN IMMEDIATE;")?;
+            }
         }
         let saved_tip: Option<Vec<u8>> = chain
             .db
@@ -812,14 +824,23 @@ impl Chain {
             }
             if self.canonical_hash(entry.height)? == Some(cursor) {
                 // The branch meets the active chain: continue by height from the
-                // nearest checkpoint, at most about this depth below the tip.
-                let (height, base) = self
+                // nearest checkpoint, at most about this depth below the tip, or
+                // from progress an earlier deferred replay left in the cache.
+                let (mut height, mut base) = self
                     .checkpoints
                     .borrow()
                     .range(..=entry.height)
                     .next_back()
                     .map(|(height, (hash, state))| (*height, (*hash, state.clone())))
                     .context("genesis checkpoint absent")?;
+                for retained in (height + 1..entry.height).rev() {
+                    if let Some(hash) = self.canonical_hash(retained)?
+                        && let Some(state) = self.cached_state(&hash)
+                    {
+                        (height, base) = (retained, (hash, state));
+                        break;
+                    }
+                }
                 replay.base = Some(base);
                 replay.canonical = (height + 1, entry.height);
                 replay.walk = None;

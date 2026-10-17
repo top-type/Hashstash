@@ -2,6 +2,9 @@
 (() => {
   const $ = id => document.getElementById(id);
   let sessionToken = '', publicKey = '', chainId = '', accountAddress = '', reviewToken = '', watch = null, busy = false, privateExpectedPublic = '';
+  // A generated key's only backup, held until the operator confirms saving it.
+  let pendingBackup = null, lifetimeRequired = false, maxReviewBytes = 64 * 1024 * 1024;
+  const PASSPHRASE_V1 = 'hashstash-passphrase-v1', PASSPHRASE_V2 = 'hashstash-passphrase-v2';
   const say = (message = '', isError = false) => { $('message').textContent = message; $('message').classList.toggle('error', isError); };
   function unitText(node, text, unit, className) {
     const offset = text.lastIndexOf(unit);
@@ -26,7 +29,13 @@
     $('review-data-summary').textContent = 'Data';
     $('review-data-hex').textContent = '';
     $('review-message').hidden = true;
+    $('review-message-title').textContent = 'Public message';
+    $('review-rationale-warning').hidden = true;
     $('review-message-text').textContent = '';
+    lifetimeRequired = false;
+    $('review-lifetime').hidden = true;
+    $('lifetime-confirm').checked = false;
+    $('lifetime-confirm-text').textContent = 'I accept this lifetime';
     $('review-bytes').hidden = true;
     $('review-bytes').open = false;
     $('review-body-hex').textContent = '';
@@ -46,16 +55,20 @@
     buttons();
   }
   function buttons() {
-    $('copy-address').disabled = busy || !accountAddress;
-    $('export-public').disabled = busy || !accountAddress || watch?.format !== 'hashstash-watch-v2';
+    // An unsaved new key must not be funded: keep its address until backup.
+    $('copy-address').disabled = busy || !accountAddress || !!pendingBackup;
+    $('export-public').disabled = busy || !accountAddress || watch?.format !== 'hashstash-watch-v2' || !!pendingBackup;
   }
-  function showWallet(key, context) {
+  function showWallet(key, context, backup = null) {
     publicKey = key || '';
+    pendingBackup = key ? backup : null;
+    $('backup-panel').hidden = !pendingBackup;
     $('public-key').textContent = publicKey;
     $('unlock-panel').hidden = !!key;
     $('wallet').hidden = !key;
     $('lock').hidden = !key;
     $('passphrase').value = '';
+    $('legacy-confirm').checked = false;
     $('private-key').value = '';
     $('private-file').value = '';
     privateExpectedPublic = '';
@@ -101,7 +114,12 @@
     const selected = String(value || '').trim();
     clearReview();
     if (!/^[a-f0-9]{64}$/i.test(selected)) throw new Error('Chain ID must contain 64 hexadecimal characters');
-    networkView(await api('network', {chain_id:selected}));
+    const result = await api('network', {chain_id:selected});
+    if (publicKey && !result.public_key) {
+      // The signer locks a v2 passphrase account when another network is selected.
+      showWallet(null, result);
+      say('Wallet locked: a v2 passphrase account belongs to the network it was opened for.');
+    } else networkView(result);
   }
   $('network-change').addEventListener('click', () => action(async () => {
     clearReview(); await api('cancel'); $('network-form').hidden = false;
@@ -124,10 +142,11 @@
     } finally { $('network-file').value = ''; }
   }));
   $('import-method').addEventListener('change', () => {
-    const privateMode = $('import-method').value === 'private';
-    $('phrase-fields').hidden = privateMode; $('private-fields').hidden = !privateMode;
-    $('passphrase').required = !privateMode; $('private-key').required = privateMode;
-    $('passphrase').value = ''; $('private-key').value = ''; $('private-file').value = '';
+    const method = $('import-method').value, privateMode = method === 'private', phraseMode = method === 'passphrase' || method === 'legacy';
+    $('phrase-fields').hidden = !phraseMode; $('private-fields').hidden = !privateMode; $('generate-fields').hidden = method !== 'generate';
+    $('v2-hint').hidden = method !== 'passphrase'; $('legacy-fields').hidden = method !== 'legacy';
+    $('passphrase').required = phraseMode; $('private-key').required = privateMode;
+    $('passphrase').value = ''; $('private-key').value = ''; $('private-file').value = ''; $('legacy-confirm').checked = false;
     privateExpectedPublic = ''; say();
   });
   $('private-key').addEventListener('input', () => { privateExpectedPublic = ''; });
@@ -153,8 +172,18 @@
   $('unlock-form').addEventListener('submit', event => {
     event.preventDefault();
     action(async () => {
-      const privateMode = $('import-method').value === 'private';
-      const credentials = privateMode ? {private_key:$('private-key').value} : {passphrase:$('passphrase').value};
+      const method = $('import-method').value;
+      if (method === 'generate') {
+        showWallet(null);
+        const result = await api('generate');
+        showWallet(result.public_key, result, result.backup || null);
+        say('New key created. Download its backup before using this account.');
+        return;
+      }
+      const privateMode = method === 'private';
+      if (method === 'legacy' && !$('legacy-confirm').checked) throw new Error('Confirm that you are restoring an existing v1 account');
+      if (method === 'passphrase' && !chainId) throw new Error('Set the network first: a v2 passphrase account belongs to one network');
+      const credentials = privateMode ? {private_key:$('private-key').value} : {passphrase:$('passphrase').value,scheme:method === 'legacy' ? PASSPHRASE_V1 : PASSPHRASE_V2};
       const expected = privateExpectedPublic;
       showWallet(null);
       const result = await api(privateMode ? 'import' : 'unlock', credentials);
@@ -162,11 +191,20 @@
       showWallet(result.public_key, result);
     });
   });
+  $('download-backup').addEventListener('click', () => {
+    if (!pendingBackup) return;
+    download('hashstash-private-key.json', JSON.stringify(pendingBackup,null,2)+'\n','application/json');
+  });
+  $('backup-done').addEventListener('click', () => action(async () => {
+    const result = await api('backup', {saved:true});
+    pendingBackup = null; $('backup-panel').hidden = true; networkView(result);
+  }));
   $('lock').addEventListener('click', () => action(async () => {
     const result = await api('lock');
     showWallet(null, result);
     say('Wallet locked');
   }));
+  $('lifetime-confirm').addEventListener('change', () => say());
   $('unsigned').addEventListener('input', () => {
     const hadReview = !!reviewToken;
     clearReview();
@@ -178,7 +216,10 @@
     await api('cancel');
     const file = $('unsigned-file').files[0];
     if (!file) return;
-    $('unsigned').value = await file.text();
+    try {
+      if (file.size > maxReviewBytes) throw new Error(`Unsigned transaction file exceeds this signer’s ${maxReviewBytes}-byte review limit`);
+      $('unsigned').value = await file.text();
+    } finally { $('unsigned-file').value = ''; }
   }));
   $('review-form').addEventListener('submit', event => {
     event.preventDefault();
@@ -191,6 +232,8 @@
       networkView(result);
       const fragment = document.createDocumentFragment(), technical = document.createDocumentFragment();
       let hasTechnical = false, dataBytes = '', dataHex = '';
+      const proposal = result.fields.some(field => field.label === 'Action' && field.value === 'Propose');
+      const rationale = result.fields.find(field => field.label === 'Rationale')?.value;
       for (const field of result.fields) {
         if (field.label === 'Data bytes') { dataBytes = field.value; continue; }
         if (field.label === 'Data hex') { dataHex = field.value; continue; }
@@ -238,6 +281,12 @@
             for (let i = 0; i < bytes.length; i++) bytes[i] = Number.parseInt(dataHex.slice(i * 2, i * 2 + 2), 16);
             const message = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
             if (message.trim() && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/.test(message)) {
+              // Proposal text is the rationale only when it matches the signed description hash.
+              if (proposal) {
+                const committed = rationale === 'Matches the description hash';
+                $('review-message-title').textContent = committed ? 'Proposal rationale' : 'Attached text · not the committed rationale';
+                $('review-rationale-warning').hidden = committed;
+              }
               $('review-message-text').textContent = message;
               $('review-message').hidden = false;
             }
@@ -252,10 +301,18 @@
         $('review-body-hex').textContent = result.body;
         $('review-bytes').hidden = false;
       }
+      const longLifetime = result.confirm_lifetime === true;
+      const lifetime = result.fields.find(field => field.label === 'Valid for · blocks')?.value || '';
+      if (longLifetime && !/^[1-9][0-9]*$/.test(lifetime)) throw new Error('Invalid transaction lifetime');
       $('review-fee-help').hidden = !result.fields.some(field => field.label === 'Fee · HASH');
       $('review-fields').replaceChildren(fragment);
       $('review-technical-fields').replaceChildren(technical);
       $('review-details').hidden = !hasTechnical;
+      lifetimeRequired = longLifetime;
+      if (longLifetime) {
+        $('lifetime-confirm-text').textContent = `I accept that this signature stays valid for ${lifetime} blocks`;
+        $('review-lifetime').hidden = false;
+      }
       reviewToken = result.review_token;
       $('review-panel').hidden = false;
       $('review-panel').scrollIntoView({behavior:'smooth',block:'start'});
@@ -263,9 +320,10 @@
   });
   $('sign').addEventListener('click', () => action(async () => {
     if (!reviewToken) throw new Error('Review the transaction first');
-    const pending = reviewToken;
+    if (lifetimeRequired && !$('lifetime-confirm').checked) throw new Error('Confirm the long transaction lifetime before signing');
+    const pending = reviewToken, request = lifetimeRequired ? {review_token:pending,confirm_lifetime:true} : {review_token:pending};
     clearReview();
-    const result = await api('sign', {review_token:pending});
+    const result = await api('sign', request);
     $('raw').value = result.raw;
     $('txid').textContent = result.txid;
     $('signed-panel').hidden = false;
@@ -287,6 +345,9 @@
     if (!response.ok) throw new Error('Signer unavailable');
     const session = await response.json();
     sessionToken = session.token;
-    showWallet(session.public_key, session);
+    if (Number.isSafeInteger(session.max_review_bytes) && session.max_review_bytes > 0) maxReviewBytes = session.max_review_bytes;
+    // After a reload, an unsaved generated key keeps its backup gate.
+    const pending = session.public_key && session.backup_pending === true ? (await api('backup')).backup : null;
+    showWallet(session.public_key, session, pending);
   });
 })();

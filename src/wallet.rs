@@ -6,11 +6,23 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 pub const UNSIGNED_FORMAT: &str = "hashstash-unsigned-anchor";
+/// Legacy brain-wallet derivation, kept only to restore existing accounts.
 pub const PASSPHRASE_SCHEME: &str = "hashstash-passphrase-v1";
+/// Stretched, network-salted derivation for passphrase accounts.
+pub const PASSPHRASE_V2_SCHEME: &str = "hashstash-passphrase-v2";
+pub const PASSPHRASE_V2_TAG: &str = "Hashstash/Passphrase/v2";
+/// scrypt cost of v2: N = 2^17, r = 8, p = 1 (128 MiB per derivation).
+pub const PASSPHRASE_V2_LOG_N: u8 = 17;
+pub const PASSPHRASE_V2_R: u32 = 8;
+pub const PASSPHRASE_V2_P: u32 = 1;
+pub const MIN_PASSPHRASE_V2_BYTES: usize = 16;
 pub const MAX_PASSPHRASE_BYTES: usize = 4096;
+/// Offline lifetimes above this need an explicit confirmation in the cold signer.
+pub const LONG_LIFETIME_BLOCKS: u64 = 1_000;
 
-/// Exact UTF-8, followed by a little-endian u32 retry counter, starting at zero.
-/// No trimming, normalization, password stretching, or strength rules.
+/// Legacy v1: exact UTF-8, followed by a little-endian u32 retry counter,
+/// starting at zero. One unsalted SHA-256 per guess, identical on every
+/// network: restore existing accounts only and create new keys another way.
 pub fn derive_secret(passphrase: &str) -> Result<Zeroizing<[u8; 32]>> {
     ensure!(!passphrase.is_empty(), "enter a passphrase");
     ensure!(
@@ -27,6 +39,69 @@ pub fn derive_secret(passphrase: &str) -> Result<Zeroizing<[u8; 32]>> {
         }
     }
     anyhow::bail!("could not derive a signing key")
+}
+
+/// v2: exact UTF-8 (no trimming or normalization) stretched with scrypt, salted
+/// with the tag and the 32-byte chain ID, then the first valid secret
+/// `tagged_hash(tag, stretched || counter_le32)`. A phrase opens a different
+/// account on every network, and each guess costs one scrypt run.
+pub fn derive_secret_v2(passphrase: &str, chain_id: &Hash) -> Result<Zeroizing<[u8; 32]>> {
+    ensure!(!passphrase.is_empty(), "enter a passphrase");
+    ensure!(
+        passphrase.len() >= MIN_PASSPHRASE_V2_BYTES,
+        "passphrase must contain at least {MIN_PASSPHRASE_V2_BYTES} UTF-8 bytes"
+    );
+    ensure!(
+        passphrase.len() <= MAX_PASSPHRASE_BYTES,
+        "passphrase input is too large"
+    );
+    let salt = [PASSPHRASE_V2_TAG.as_bytes(), chain_id.as_slice()].concat();
+    let mut input = Zeroizing::new([0u8; 36]);
+    crypto::scrypt(
+        passphrase.as_bytes(),
+        &salt,
+        PASSPHRASE_V2_LOG_N,
+        PASSPHRASE_V2_R,
+        PASSPHRASE_V2_P,
+        &mut input[..32],
+    )?;
+    for counter in 0..=u32::MAX {
+        input[32..].copy_from_slice(&counter.to_le_bytes());
+        let candidate = Zeroizing::new(crypto::tagged_hash(PASSPHRASE_V2_TAG, input.as_slice()));
+        if crypto::public_key(&candidate).is_ok() {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("could not derive a signing key")
+}
+
+/// A signature that stays valid long after review lets its holder choose when
+/// to broadcast it.
+pub fn long_lifetime(body: &TransactionBody) -> bool {
+    body.expiry_blocks > LONG_LIFETIME_BLOCKS
+}
+
+/// Whether a proposal's attached data is the rationale its signed description
+/// hash commits to, using the publication rule applied by the node.
+fn rationale_check(body: &TransactionBody, description: &Hash) -> &'static str {
+    use sha2::{Digest, Sha256};
+    if body.data.is_empty() {
+        return "No attached text";
+    }
+    if <[u8; 32]>::from(Sha256::digest(&body.data)) != *description {
+        return "Does not match the description hash";
+    }
+    let published = body.data.len() <= crate::proposal_data::MAX_TEXT_BYTES
+        && crate::proposal_data::from_transaction(&Transaction {
+            body: body.clone(),
+            signature: [0; 64],
+        })
+        .is_some();
+    if published {
+        "Matches the description hash"
+    } else {
+        "Matches the hash but is not publishable plain text"
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,10 +342,33 @@ pub fn review(body: &TransactionBody, chain_id: Option<&Hash>) -> Vec<ReviewFiel
         "Anchor validation",
         "Ancestry and expiry are checked by the receiving node".into(),
     );
+    add(
+        "Network check",
+        "The signature does not name a network: it is valid only where the anchor block exists, which this review cannot verify. Use a separate key for each network that holds value".into(),
+    );
     add("Sender", account(&body.sender));
     add("Nonce", body.nonce.to_string());
     add("Anchor block", hex::encode(body.anchor));
     add("Valid for · blocks", body.expiry_blocks.to_string());
+    if long_lifetime(body) {
+        let trade = matches!(
+            body.operation,
+            Operation::Deposit { .. } | Operation::Redeem { .. }
+        );
+        add(
+            "Lifetime warning",
+            format!(
+                "Valid for {} blocks, far beyond the {}-block default. Until it expires or this nonce is used, whoever holds the signed transaction can broadcast it at a time of their choosing{}",
+                body.expiry_blocks,
+                default_expiry_blocks(&body.operation),
+                if trade {
+                    ", and the order fills at that block's price"
+                } else {
+                    ""
+                }
+            ),
+        );
+    }
     add("Fee · HASH", body.fee.to_str_radix(10));
     let operation = &body.operation;
     match &operation {
@@ -329,6 +427,7 @@ pub fn review(body: &TransactionBody, chain_id: Option<&Hash>) -> Vec<ReviewFiel
             add("Action", "Propose".into());
             add("Auction round", round.to_string());
             add("Description hash", hex::encode(description));
+            add("Rationale", rationale_check(body, description).into());
             add("Support · HASH", support.to_str_radix(10));
             match proposal {
                 Proposal::Grant { payments } => {
@@ -587,6 +686,72 @@ mod governance_review_tests {
                 transaction
             );
         }
+    }
+
+    #[test]
+    fn cold_review_flags_long_lifetimes_and_unverified_network() {
+        let mut transaction = body(Parameter::DecisionBlocks, 60, 120);
+        let fields = review(&transaction, Some(&[42; 32]));
+        assert!(fields.iter().any(|f| f.label == "Network check"
+            && f.value.contains("does not name a network")));
+        assert!(!fields.iter().any(|f| f.label == "Lifetime warning"));
+        for (lifetime, warned) in [
+            (LONG_LIFETIME_BLOCKS, false),
+            (LONG_LIFETIME_BLOCKS + 1, true),
+            (u64::MAX, true),
+        ] {
+            transaction.expiry_blocks = lifetime;
+            assert_eq!(long_lifetime(&transaction), warned);
+            let fields = review(&transaction, Some(&[42; 32]));
+            let warning = fields.iter().find(|f| f.label == "Lifetime warning");
+            assert_eq!(warning.is_some(), warned, "lifetime {lifetime}");
+            if let Some(warning) = warning {
+                assert!(warning.value.contains(&lifetime.to_string()));
+                assert!(!warning.value.contains("price"));
+            }
+        }
+        transaction.operation = Operation::Deposit {
+            amount: 100u32.into(),
+            decision: None,
+            outcome: None,
+        };
+        let fields = review(&transaction, Some(&[42; 32]));
+        assert!(fields.iter().any(|f| f.label == "Lifetime warning"
+            && f.value.contains("fills at that block's price")));
+    }
+
+    #[test]
+    fn cold_review_checks_proposal_text_against_its_signed_commitment() {
+        use sha2::{Digest, Sha256};
+        let text = "Fund the shared explorer";
+        let mut transaction = body(Parameter::DecisionBlocks, 60, 120);
+        let check = |transaction: &TransactionBody| {
+            review(transaction, Some(&[42; 32]))
+                .into_iter()
+                .find(|f| f.label == "Rationale")
+                .unwrap()
+                .value
+        };
+        assert_eq!(check(&transaction), "No attached text");
+        transaction.data = text.as_bytes().to_vec();
+        assert_eq!(check(&transaction), "Does not match the description hash");
+        let Operation::Propose { description, .. } = &mut transaction.operation else {
+            unreachable!()
+        };
+        *description = Sha256::digest(text.as_bytes()).into();
+        assert_eq!(check(&transaction), "Matches the description hash");
+        // Same publication rule as the node: matching bytes that are not plain
+        // trimmed text are never shown as the rationale.
+        let padded = format!(" {text}");
+        transaction.data = padded.as_bytes().to_vec();
+        let Operation::Propose { description, .. } = &mut transaction.operation else {
+            unreachable!()
+        };
+        *description = Sha256::digest(padded.as_bytes()).into();
+        assert_eq!(
+            check(&transaction),
+            "Matches the hash but is not publishable plain text"
+        );
     }
 
     fn body(parameter: Parameter, old: u64, new: u64) -> TransactionBody {

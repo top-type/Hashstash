@@ -190,7 +190,8 @@ def main():
             code, result = request(cold_base, '/api/' + action, value, cold_session['token'])
             assert code == 200, (code, result)
             return result
-        assert cold('unlock', {'passphrase': offline['passphrase']})['public_key'] == offline['public_key']
+        cold('network', {'chain_id': unsigned['chain_id']})
+        assert cold('unlock', {'passphrase': offline['passphrase'], 'scheme': 'hashstash-passphrase-v1'})['public_key'] == offline['public_key']
         review = cold('review', unsigned)
         signed = cold('sign', {'review_token': review['review_token']})
         broadcast = rpc(base, 'broadcasttransaction', {'raw': signed['raw']})

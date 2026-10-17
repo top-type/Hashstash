@@ -1,0 +1,63 @@
+{
+  "scheme": "hashstash-passphrase-v2",
+  "tag": "Hashstash/Passphrase/v2",
+  "kdf": {"name": "scrypt", "log_n": 17, "r": 8, "p": 1, "dk_len": 32, "salt": "UTF-8 tag || 32-byte chain ID"},
+  "minimum_bytes": 16,
+  "source": "Independent Node.js crypto.scryptSync, SHA256 and secp256k1 ECDH (OpenSSL); public test secrets only, never fund these accounts.",
+  "vectors": [
+    {
+      "passphrase": "hashstash v2 test vector",
+      "utf8_hex": "686173687374617368207632207465737420766563746f72",
+      "chain_id": "2727272727272727272727272727272727272727272727272727272727272727",
+      "stretched": "f091d301bdc4ce4c21d58d7a5321792c999cd4730d42225b8486af5fb0e3ac3c",
+      "counter": 0,
+      "secret": "c91adffe9222ff3cfb0537181cb093c29d780e5fb92644f2c7237121dc156cae",
+      "public_key": "d74661e532aa4a197f0bc9695e47e29ba3beba703a3cb172f953d450bbdd6d93"
+    },
+    {
+      "passphrase": "hashstash v2 test vector",
+      "utf8_hex": "686173687374617368207632207465737420766563746f72",
+      "chain_id": "2828282828282828282828282828282828282828282828282828282828282828",
+      "stretched": "6d6dcb561c4ad61d9143c8425a3fdb4586e7905167fb5b86a858a1fca9468dc8",
+      "counter": 0,
+      "secret": "a3668ffa70b9af287486b916bd26aea933c752842dbafb008f76df39a6c94c48",
+      "public_key": "840108b820e38d5b641b158085b596932d1c047d3df228fd73ecfffb59359af0"
+    },
+    {
+      "passphrase": " hashstash v2 test vector",
+      "utf8_hex": "20686173687374617368207632207465737420766563746f72",
+      "chain_id": "2727272727272727272727272727272727272727272727272727272727272727",
+      "stretched": "1d459267a02e9c3067b2794d2f2f0de344ac112f8cdb7ff251066f5d8f181616",
+      "counter": 0,
+      "secret": "2b1cc58c43b497d39a6b902b78ec165962a4b34d067168a40f468c6e6482072b",
+      "public_key": "0836b979d898ccfb752a62abc4a7395814df1696664259507102514eb71c81e3"
+    },
+    {
+      "passphrase": "café crème brûlée",
+      "utf8_hex": "636166c3a9206372c3a86d65206272c3bb6cc3a965",
+      "chain_id": "2727272727272727272727272727272727272727272727272727272727272727",
+      "stretched": "422f20bd2490758f7ed368c8566601da15522e56bef5e9bcb77e30601c1a4c66",
+      "counter": 0,
+      "secret": "1a8aa89aec0fa31bf16b7c7a8cba259871f407706ff5ad58a941077c16349994",
+      "public_key": "95470db8ed82e3faf05c4fef25036469001443423fbb444572da884d507775b3"
+    },
+    {
+      "passphrase": "café crème brûlée",
+      "utf8_hex": "63616665cc8120637265cc806d6520627275cc826c65cc8165",
+      "chain_id": "2727272727272727272727272727272727272727272727272727272727272727",
+      "stretched": "4a4bc4d04731a5ad3dfe75220e999cef4958da8674044ef43289a44e2cfaa68a",
+      "counter": 0,
+      "secret": "d6e5484a984d569071041fd8d5a46ba77d91c1a97ae179f113c7a652fc87599b",
+      "public_key": "1c9852dac3ef6af209011c3318c949c95d12825475be733468e98f16ca83c2c4"
+    },
+    {
+      "passphrase": "หิมะ 🔑 sixteen+ bytes",
+      "utf8_hex": "e0b8abe0b8b4e0b8a1e0b8b020f09f9491207369787465656e2b206279746573",
+      "chain_id": "2727272727272727272727272727272727272727272727272727272727272727",
+      "stretched": "d2b2cfb2a8f842291cb4ca4e2484fb06e8f8cd5cf55b8dc96a872ff061569336",
+      "counter": 0,
+      "secret": "32e0c9aa2414d7dc1f722811b8d13da2e3dd50356f1cca799f04d6f8fa535a2e",
+      "public_key": "7c2af9340b26b6aab921ae17497537e49f33dbf227b609e194106a996e3994b3"
+    }
+  ]
+}

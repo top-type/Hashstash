@@ -22,6 +22,9 @@ struct Options {
     /// Full 32-byte network identity, written as 64 hexadecimal characters.
     #[arg(long)]
     chain_id: Option<String>,
+    /// Largest unsigned export accepted for review, in bytes.
+    #[arg(long, default_value_t = hashstash::cold::DEFAULT_MAX_REVIEW_REQUEST)]
+    max_review_bytes: usize,
 }
 
 #[tokio::main]
@@ -49,12 +52,17 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let server = hashstash::cold::serve_with_chain(
+    let configured = chain.is_some();
+    let server = hashstash::cold::serve_with_limits(
         SocketAddr::from((Ipv4Addr::LOCALHOST, options.port)),
         chain,
+        options.max_review_bytes,
     )
     .await?;
     println!("Hashstash cold signer: http://{}/", server.address);
+    if !configured {
+        println!("No network configured: select it in the signer before reviewing transactions.");
+    }
     tokio::signal::ctrl_c().await?;
     server.stop().await;
     Ok(())

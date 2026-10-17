@@ -46,12 +46,32 @@ fn expected(action: &str, entries: &[(&str, String)]) -> BTreeMap<String, String
             "Sender".into(),
             address::encode(&crypto::public_key(&[19; 32]).unwrap(), &[39; 32]).unwrap(),
         ),
+        (
+            "Network check".into(),
+            "The signature does not name a network: it is valid only where the anchor block exists, which this review cannot verify. Use a separate key for each network that holds value".into(),
+        ),
         ("Nonce".into(), (u64::MAX - 1).to_string()),
         ("Anchor block".into(), hex::encode([38; 32])),
         ("Valid for · blocks".into(), u64::MAX.to_string()),
+        // Every fixture uses the largest lifetime, which always needs a warning.
+        (
+            "Lifetime warning".into(),
+            format!(
+                "Valid for {} blocks, far beyond the 2-block default. Until it expires or this nonce is used, whoever holds the signed transaction can broadcast it at a time of their choosing{}",
+                u64::MAX,
+                if matches!(action, "Deposit" | "Redeem") {
+                    ", and the order fills at that block's price"
+                } else {
+                    ""
+                }
+            ),
+        ),
         ("Fee · HASH".into(), maximum_amount().to_string()),
         ("Action".into(), action.into()),
     ]);
+    if action == "Propose" {
+        result.insert("Rationale".into(), "No attached text".into());
+    }
     result.extend(entries.iter().map(|(k, v)| (k.to_string(), v.clone())));
     result
 }
@@ -123,6 +143,46 @@ fn independent_passphrase_vectors_preserve_utf8_and_whitespace() {
         );
     }
     assert_eq!(distinct.len(), 8);
+}
+
+#[test]
+fn independent_v2_passphrase_vectors_are_stretched_and_network_specific() {
+    let document: Value = serde_json::from_str(include_str!("data/passphrase-v2.json")).unwrap();
+    assert_eq!(document["scheme"], wallet::PASSPHRASE_V2_SCHEME);
+    assert_eq!(document["tag"], wallet::PASSPHRASE_V2_TAG);
+    assert_eq!(document["kdf"]["log_n"], wallet::PASSPHRASE_V2_LOG_N);
+    assert_eq!(document["kdf"]["r"], wallet::PASSPHRASE_V2_R);
+    assert_eq!(document["kdf"]["p"], wallet::PASSPHRASE_V2_P);
+    assert_eq!(document["minimum_bytes"], wallet::MIN_PASSPHRASE_V2_BYTES);
+    let mut distinct = std::collections::BTreeSet::new();
+    for vector in document["vectors"].as_array().unwrap() {
+        let phrase = vector["passphrase"].as_str().unwrap();
+        assert_eq!(hex::encode(phrase.as_bytes()), vector["utf8_hex"]);
+        let chain: [u8; 32] = hex::decode(vector["chain_id"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mut stretched = [0u8; 32];
+        let salt = [wallet::PASSPHRASE_V2_TAG.as_bytes(), chain.as_slice()].concat();
+        crypto::scrypt(phrase.as_bytes(), &salt, 17, 8, 1, &mut stretched).unwrap();
+        assert_eq!(hex::encode(stretched), vector["stretched"]);
+        let secret = wallet::derive_secret_v2(phrase, &chain).unwrap();
+        assert_eq!(hex::encode(*secret), vector["secret"]);
+        let public = crypto::public_key(&secret).unwrap();
+        assert_eq!(hex::encode(public), vector["public_key"]);
+        assert!(distinct.insert(public), "network, whitespace or Unicode form ignored");
+        // Never the legacy key for the same phrase.
+        assert_ne!(*wallet::derive_secret(phrase).unwrap(), *secret);
+    }
+    assert_eq!(distinct.len(), 6);
+    let chain = [39; 32];
+    assert!(wallet::derive_secret_v2("", &chain).is_err());
+    assert!(wallet::derive_secret_v2(&"a".repeat(wallet::MIN_PASSPHRASE_V2_BYTES - 1), &chain).is_err());
+    assert!(wallet::derive_secret_v2(&"é".repeat(7), &chain).is_err());
+    assert!(wallet::derive_secret_v2(&"é".repeat(8), &chain).is_ok());
+    assert!(
+        wallet::derive_secret_v2(&"a".repeat(wallet::MAX_PASSPHRASE_BYTES + 1), &chain).is_err()
+    );
 }
 
 #[test]

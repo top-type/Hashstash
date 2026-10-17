@@ -1,7 +1,7 @@
 //! Standalone, local-only transaction review and signing. No node or peer client.
 use crate::{
     address, codec, crypto,
-    types::{Hash, TransactionBody},
+    types::{Hash, PublicKey, TransactionBody},
     wallet,
 };
 use anyhow::{Result, anyhow, ensure};
@@ -28,6 +28,9 @@ use tokio::{
 use zeroize::{Zeroize, Zeroizing};
 
 pub const MAX_CONTROL_REQUEST: usize = 128 * 1024;
+/// Default ceiling for one unsigned export. Governance can raise block capacity
+/// past it; `hashstash-cold --max-review-bytes` raises this local limit.
+pub const DEFAULT_MAX_REVIEW_REQUEST: usize = 64 * 1024 * 1024;
 const INDEX: &str = include_str!("../cold-ui/index.html");
 const SCRIPT: &str = include_str!("../cold-ui/app.js");
 const SHARES: &str = include_str!("../ui/shares.js");
@@ -37,11 +40,18 @@ const STYLE: &str = include_str!("../cold-ui/style.css");
 struct Review {
     token: String,
     body: TransactionBody,
+    long_lifetime: bool,
 }
 
 #[derive(Default)]
 struct WalletState {
     secret: Option<Zeroizing<[u8; 32]>>,
+    /// Derived once when a key is loaded, so status needs no further key copies.
+    public: Option<PublicKey>,
+    /// The network salting a v2 passphrase key; selecting another network locks it.
+    derived_for: Option<Hash>,
+    /// A generated key whose backup the operator has not yet confirmed saving.
+    backup_pending: bool,
     review: Option<Review>,
     chain_id: Option<Hash>,
 }
@@ -49,14 +59,30 @@ struct WalletState {
 impl WalletState {
     fn clear_wallet(&mut self) {
         self.secret = None;
+        self.public = None;
+        self.derived_for = None;
+        self.backup_pending = false;
         self.review = None;
     }
-    fn status(&self) -> Result<Value> {
-        let public = self
+    fn load(&mut self, secret: Zeroizing<[u8; 32]>, derived_for: Option<Hash>) -> Result<()> {
+        self.public = Some(crypto::public_key(&secret)?);
+        self.secret = Some(secret);
+        self.derived_for = derived_for;
+        self.backup_pending = false;
+        Ok(())
+    }
+    fn backup(&self) -> Result<Value> {
+        let secret = self
             .secret
             .as_ref()
-            .map(|secret| crypto::public_key(secret))
-            .transpose()?;
+            .ok_or_else(|| anyhow!("Open a wallet first"))?;
+        let private_key = Zeroizing::new(hex::encode(secret.as_slice()));
+        Ok(
+            json!({"format":"hashstash-private-v1","private_key":private_key.as_str(),"public_key":self.public.map(hex::encode)}),
+        )
+    }
+    fn status(&self) -> Result<Value> {
+        let public = self.public;
         let encoded = public
             .as_ref()
             .zip(self.chain_id.as_ref())
@@ -72,7 +98,7 @@ impl WalletState {
             }
         });
         Ok(
-            json!({"public_key":public,"chain_id":chain,"address":encoded,"watch":watch,"unlocked":public.is_some()}),
+            json!({"public_key":public,"chain_id":chain,"address":encoded,"watch":watch,"unlocked":public.is_some(),"backup_pending":self.backup_pending}),
         )
     }
 }
@@ -84,6 +110,7 @@ struct App {
     host: String,
     origin: String,
     token: String,
+    max_review: usize,
 }
 
 pub struct ColdServer {
@@ -158,9 +185,22 @@ pub async fn serve(address: SocketAddr) -> Result<ColdServer> {
 
 /// Supplies a trusted chain identity from a local config or explicit argument.
 pub async fn serve_with_chain(address: SocketAddr, chain_id: Option<Hash>) -> Result<ColdServer> {
+    serve_with_limits(address, chain_id, DEFAULT_MAX_REVIEW_REQUEST).await
+}
+
+/// `max_review` bounds one unsigned export request, in bytes.
+pub async fn serve_with_limits(
+    address: SocketAddr,
+    chain_id: Option<Hash>,
+    max_review: usize,
+) -> Result<ColdServer> {
     ensure!(
         address.ip().is_loopback() && address.is_ipv4(),
         "cold signer requires IPv4 loopback"
+    );
+    ensure!(
+        max_review >= MAX_CONTROL_REQUEST,
+        "review limit must be at least {MAX_CONTROL_REQUEST} bytes"
     );
     let listener = TcpListener::bind(address).await?;
     let address = listener.local_addr()?;
@@ -173,6 +213,7 @@ pub async fn serve_with_chain(address: SocketAddr, chain_id: Option<Hash>) -> Re
         host: address.to_string(),
         origin: format!("http://{address}"),
         token: token()?,
+        max_review,
     };
     let routes = Router::new()
         .route(
@@ -203,11 +244,13 @@ pub async fn serve_with_chain(address: SocketAddr, chain_id: Option<Hash>) -> Re
         .route("/api/session", get(session))
         .route("/api/network", post(network))
         .route("/api/unlock", post(unlock))
+        .route("/api/generate", post(generate))
+        .route("/api/backup", post(backup))
         .route("/api/import", post(import))
         .route("/api/lock", post(lock))
         .route(
             "/api/review",
-            post(review).layer(DefaultBodyLimit::disable()),
+            post(review).layer(DefaultBodyLimit::max(max_review)),
         )
         .route("/api/cancel", post(cancel))
         .route("/api/sign", post(sign))
@@ -233,16 +276,22 @@ pub async fn serve_with_chain(address: SocketAddr, chain_id: Option<Hash>) -> Re
 }
 
 async fn session(State(app): State<App>) -> Response {
-    let Ok(state) = app.wallet.lock() else {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, "Signer unavailable");
-    };
-    match state.status() {
-        Ok(mut status) => {
+    // A long review holds the wallet lock; wait for it off the async workers.
+    let wallet = app.wallet.clone();
+    let status = tokio::task::spawn_blocking(move || {
+        let state = wallet.lock().map_err(|_| anyhow!("Signer unavailable"))?;
+        state.status()
+    })
+    .await;
+    match status {
+        Ok(Ok(mut status)) => {
             status["format"] = json!("hashstash-cold-v1");
             status["token"] = json!(app.token);
+            status["max_review_bytes"] = json!(app.max_review);
             Json(status).into_response()
         }
-        Err(problem) => error(StatusCode::INTERNAL_SERVER_ERROR, &problem.to_string()),
+        Ok(Err(problem)) => error(StatusCode::INTERNAL_SERVER_ERROR, &problem.to_string()),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Signer unavailable"),
     }
 }
 
@@ -264,10 +313,20 @@ async fn network(State(app): State<App>, bytes: Bytes) -> Response {
         let mut chain = [0; 32];
         hex::decode_to_slice(request.chain_id, &mut chain)
             .map_err(|_| anyhow!("Invalid chain ID"))?;
+        // A v2 passphrase account exists only on the network that salted it.
+        if state.derived_for.is_some_and(|salt| salt != chain) {
+            state.clear_wallet();
+        }
         state.chain_id = Some(chain);
         state.status()
     })
     .await
+}
+
+/// Request bodies carrying secrets are reused in place when unshared, so the
+/// wiped buffer is the one that held the request.
+fn secret_body(bytes: Bytes) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(Vec::from(bytes))
 }
 
 async fn job<F>(app: App, work: F) -> Response
@@ -297,20 +356,78 @@ where
 #[serde(deny_unknown_fields)]
 struct Unlock {
     passphrase: String,
+    /// Required: v2 for passphrase accounts, v1 only to restore legacy ones.
+    scheme: Option<String>,
 }
 
 async fn unlock(State(app): State<App>, bytes: Bytes) -> Response {
-    let bytes = Zeroizing::new(bytes.to_vec());
+    let bytes = secret_body(bytes);
     job(app, move |state| {
         // A new import always invalidates the old wallet and pending review.
         state.clear_wallet();
         let mut request: Unlock =
             serde_json::from_slice(&bytes).map_err(|_| anyhow!("Invalid passphrase request"))?;
-        let derived = wallet::derive_secret(&request.passphrase);
+        let derived = match request.scheme.as_deref() {
+            Some(wallet::PASSPHRASE_V2_SCHEME) => match state.chain_id {
+                Some(chain) => wallet::derive_secret_v2(&request.passphrase, &chain)
+                    .map(|key| (key, Some(chain))),
+                None => Err(anyhow!(
+                    "Select the network first: v2 passphrase accounts belong to one network"
+                )),
+            },
+            Some(wallet::PASSPHRASE_SCHEME) => {
+                wallet::derive_secret(&request.passphrase).map(|key| (key, None))
+            }
+            _ => Err(anyhow!("Choose a passphrase scheme")),
+        };
         request.passphrase.zeroize();
-        let secret = derived?;
-        state.secret = Some(secret);
+        let (secret, derived_for) = derived?;
+        state.load(secret, derived_for)?;
         state.status()
+    })
+    .await
+}
+
+/// Creates a random key from OS randomness. The signer keeps no copy beyond
+/// this process, so its backup stays available until the operator saves it.
+async fn generate(State(app): State<App>) -> Response {
+    job(app, |state| {
+        state.clear_wallet();
+        let secret = loop {
+            let mut secret = Zeroizing::new([0u8; 32]);
+            getrandom::fill(secret.as_mut()).map_err(|e| anyhow!("OS randomness: {e}"))?;
+            if crypto::public_key(&secret).is_ok() {
+                break secret;
+            }
+        };
+        state.load(secret, None)?;
+        state.backup_pending = true;
+        let mut status = state.status()?;
+        status["backup"] = state.backup()?;
+        Ok(status)
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Backup {
+    #[serde(default)]
+    saved: bool,
+}
+
+/// Returns a generated key's backup again (for example after a page reload),
+/// or with `saved` records that the operator stored it. Only while pending.
+async fn backup(State(app): State<App>, bytes: Bytes) -> Response {
+    job(app, move |state| {
+        let request: Backup =
+            serde_json::from_slice(&bytes).map_err(|_| anyhow!("Invalid backup request"))?;
+        ensure!(state.backup_pending, "No unsaved generated key");
+        if request.saved {
+            state.backup_pending = false;
+            return state.status();
+        }
+        Ok(json!({"backup":state.backup()?}))
     })
     .await
 }
@@ -322,7 +439,7 @@ struct Import {
 }
 
 async fn import(State(app): State<App>, bytes: Bytes) -> Response {
-    let bytes = Zeroizing::new(bytes.to_vec());
+    let bytes = secret_body(bytes);
     job(app, move |state| {
         state.clear_wallet();
         let request: Import =
@@ -336,8 +453,7 @@ async fn import(State(app): State<App>, bytes: Bytes) -> Response {
         let mut secret = Zeroizing::new([0u8; 32]);
         hex::decode_to_slice(text, secret.as_mut())
             .map_err(|_| anyhow!("Invalid private key hexadecimal encoding"))?;
-        crypto::public_key(&secret)?;
-        state.secret = Some(secret);
+        state.load(secret, None)?;
         state.status()
     })
     .await
@@ -364,37 +480,41 @@ async fn cancel(State(app): State<App>) -> Response {
 async fn review(State(app): State<App>, bytes: Bytes) -> Response {
     job(app, move |state| {
         state.review = None;
-        let secret = state
-            .secret
-            .as_ref()
-            .ok_or_else(|| anyhow!("Open a wallet first"))?;
+        let public = state.public.ok_or_else(|| anyhow!("Open a wallet first"))?;
+        // Only the operator selects the network. Export context is unsigned, so
+        // it is checked against that selection and never adopted.
+        let selected = state.chain_id.ok_or_else(|| {
+            anyhow!("Select this signer's network before reviewing; export network context is unsigned")
+        })?;
         let envelope = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow!("Invalid unsigned transaction envelope"))?;
         let body = wallet::decode_unsigned(&envelope)?;
         let chain_id = wallet::unsigned_chain(&envelope)?;
         ensure!(
-            body.sender == crypto::public_key(secret)?,
+            body.sender == public,
             "Transaction sender does not match this wallet"
         );
         ensure!(
-            state.chain_id.is_none_or(|chain| chain == chain_id),
+            chain_id == selected,
             "Export network context differs from the selected network"
         );
-        state.chain_id = Some(chain_id);
         let review_token = token()?;
         let fields: Vec<_> = wallet::review(&body, Some(&chain_id))
             .into_iter()
             .map(|field| json!({"label":field.label,"value":field.value}))
             .collect();
         let body_hex = hex::encode(codec::encode(&body));
+        let long_lifetime = wallet::long_lifetime(&body);
         state.review = Some(Review {
             token: review_token.clone(),
             body,
+            long_lifetime,
         });
         let mut status = state.status()?;
         status["review_token"] = json!(review_token);
         status["fields"] = json!(fields);
         status["body"] = json!(body_hex);
+        status["confirm_lifetime"] = json!(long_lifetime);
         Ok(status)
     })
     .await
@@ -404,6 +524,9 @@ async fn review(State(app): State<App>, bytes: Bytes) -> Response {
 #[serde(deny_unknown_fields)]
 struct Sign {
     review_token: String,
+    /// Required for lifetimes above `wallet::LONG_LIFETIME_BLOCKS`.
+    #[serde(default)]
+    confirm_lifetime: bool,
 }
 
 async fn sign(State(app): State<App>, bytes: Bytes) -> Response {
@@ -412,6 +535,10 @@ async fn sign(State(app): State<App>, bytes: Bytes) -> Response {
         let secret = state.secret.as_ref().ok_or_else(|| anyhow!("Open a wallet first"))?;
         let review = state.review.as_ref().ok_or_else(|| anyhow!("Review the transaction first"))?;
         ensure!(review.token == request.review_token, "Review changed; review the transaction again");
+        ensure!(
+            !review.long_lifetime || request.confirm_lifetime,
+            "Confirm the long transaction lifetime before signing"
+        );
         let transaction = crypto::sign(&review.body, secret)?;
         crypto::verify(&transaction)?;
         state.review = None;

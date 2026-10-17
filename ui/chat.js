@@ -26,7 +26,7 @@
   // Explicit embeddings, overrides and isolates can make a message display in
   // a different order from its signed text. Show them as visible escapes, as
   // the explorer's raw data view does.
-  const visibleControls = text => text.replace(/[‪-‮⁦-⁩]/gu, c => `\\u${c.charCodeAt(0).toString(16)}`);
+  const visibleControls = text => text.replace(/[\u202a-\u202e\u2066-\u2069]/gu, c => `\\u${c.charCodeAt(0).toString(16)}`);
   const unsigned = value => /^(0|[1-9]\d{0,19})$/.test(String(value)) && BigInt(value) <= 18446744073709551615n;
   const chronological = (left, right) => {
     for (const field of ['height', 'position']) {

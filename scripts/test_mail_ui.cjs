@@ -87,7 +87,7 @@ async function run(){
   const requests=h.calls.filter(x=>x.body.method==='explorer_mail');ok(requests.every(x=>Object.keys(x.body.params).every(k=>['limit','after','anchor'].includes(k))),'shared mail requests contain no recipient or account');ok(requests.at(-1).body.params.after,'later polls use committed scan cursor');eq(requests.at(-1).body.params.anchor,h.currentSnapshot.status.tip);
  }
  {
-  const h=await setup(),incoming=await h.message({},h.sender,h.recipient);h.decryptMail=async()=>({recipient:h.sender,subject:'Invoice ‮fdp.exe',body:'Pay ⁧reversed⁩ now'});
+  const h=await setup(),incoming=await h.message({},h.sender,h.recipient);h.decryptMail=async()=>({recipient:h.sender,subject:'Invoice \u202efdp.exe',body:'Pay \u2067reversed\u2069 now'});
   await h.publish([incoming]);const node=name=>walk(h.get('mail-list')).find(n=>n.className===name);
   eq(node('mail-subject').textContent,'Invoice \\u202efdp.exe','bidi overrides in a subject are visible escapes');eq(node('mail-body').textContent,'Pay \\u2067reversed\\u2069 now','bidi isolates in a body are visible escapes');
  }

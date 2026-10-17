@@ -12,7 +12,7 @@
   };
   // Explicit embeddings, overrides and isolates could reorder user-authored
   // text on screen. Show them as visible escapes.
-  const visibleControls = text => String(text).replace(/[‪-‮⁦-⁩]/g, c => `\\u${c.charCodeAt(0).toString(16)}`);
+  const visibleControls = text => String(text).replace(/[\u202a-\u202e\u2066-\u2069]/g, c => `\\u${c.charCodeAt(0).toString(16)}`);
   const labels = { Transfer: 'Transfer', TransferExact: 'Transfer', Deposit: 'Stash deposit', Redeem: 'Stash withdrawal', Propose: 'Proposal', Support: 'Proposal backing', Refund: 'Auction refund', transfer: 'Transfer', deposit: 'Stash deposit', redeem: 'Stash withdrawal', propose: 'Proposal', support: 'Proposal backing', refund: 'Auction refund', mining_reward: 'Mining reward', governance_grant: 'Governance grant' };
   const effects = { conditional: 'Unresolved', survived: 'Applied', discarded: 'Discarded', orphaned: 'Orphaned', pending: 'Pending', common: 'Both outcomes' };
   function operationOf(tx) { const op = tx.operation; return op && typeof op === 'object' && Object.keys(op).length === 1 ? Object.values(op)[0] || {} : op || {}; }

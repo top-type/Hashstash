@@ -1,7 +1,7 @@
 (function(root,factory){'use strict';const api=factory(root);if(typeof module==='object'&&module.exports)module.exports=api;else root.HashstashMail=api;})(globalThis,function(root){
   'use strict';const validId=v=>typeof v==='string'&&/^[0-9a-f]{64}$/.test(v),validCursor=v=>typeof v==='string'&&/^\d{1,20}:\d{1,20}$/.test(v);
   const compareCursor=(a,b)=>{const x=a.split(':').map(BigInt),y=b.split(':').map(BigInt);return x[0]===y[0]?(x[1]>y[1]?1:x[1]<y[1]?-1:0):x[0]>y[0]?1:-1;};
-  const visibleControls=text=>text.replace(/[‪-‮⁦-⁩]/g,c=>`\\u${c.charCodeAt(0).toString(16)}`);
+  const visibleControls=text=>text.replace(/[\u202a-\u202e\u2066-\u2069]/g,c=>`\\u${c.charCodeAt(0).toString(16)}`);
   // One localStorage write commits the ciphertext rows and their scan cursor
   // together. Persist no decrypted content or secret keys. When the opened
   // messages exceed the cache bounds, the oldest are left out of the saved

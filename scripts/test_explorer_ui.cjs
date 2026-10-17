@@ -239,7 +239,7 @@ async function run() {
   {
     // Explanations cannot reorder themselves with bidi controls.
     global.HashstashProposalData={verifiedText:text=>text};
-    h.replies.explorer_governance.proposals[0].description_text='Pay ‮0001‬ hashes';
+    h.replies.explorer_governance.proposals[0].description_text='Pay \u202e0001\u202c hashes';
     await h.navigate('#explorer?view=governance&governance='+proposal);await h.navigate('#explorer?governance='+proposal);
     assert.ok(walk(h.content).some(n=>n.className==='proposal-detail'&&n.textContent==='Pay \\u202e0001\\u202c hashes'),'bidi overrides in explanations are visible escapes');checks++;
     delete global.HashstashProposalData;
@@ -250,7 +250,7 @@ async function run() {
     assert.ok(accounts.length>=2,'grant recipient and backing sender link to the account');checks++;
     assert.ok(accounts.every(n=>n.textContent===label),'grant recipients and backers use address-aware labels');checks++;
     // The exact UTF-8 view also reveals zero-width marks and the BOM.
-    h.replies.explorer_transaction={...ctx,transaction:{...tx,data_hex:Buffer.from('﻿a​b⁦c').toString('hex')}};
+    h.replies.explorer_transaction={...ctx,transaction:{...tx,data_hex:Buffer.from('\ufeffa\u200bb\u2066c').toString('hex')}};
     await h.navigate('#explorer?tx='+txid);
     assert.ok(walk(h.content).some(n=>n.tagName==='pre'&&n.textContent==='\\ufeffa\\u200bb\\u2066c'),'invisible characters are escaped in the raw text view');checks++;
   }

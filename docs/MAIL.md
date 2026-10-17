@@ -28,7 +28,7 @@ The pinned Noble secp256k1 implementation handles curve operations; Web Crypto s
 
 Each message generates a fresh ephemeral scalar, random 32-byte content key and three random 12-byte GCM nonces. Canonical encrypted JSON is ordered recipient, subject, body. A two-byte big-endian JSON byte length precedes the JSON, with zero padding to exactly 1,152 bytes. AES-GCM adds a 128-bit authentication tag, producing 1,168 ciphertext bytes.
 
-Subject is 1-96 UTF-8 bytes and body 1-768. Both need non-whitespace content. Newline/tab are accepted; malformed Unicode and other controls are rejected. JSON escaping must also fit the padded bound. The inbox renders decrypted text as plain text and shows explicit bidi embeddings, overrides and isolates (U+202A–U+202E, U+2066–U+2069) as visible `‮`-style escapes, so a subject or body cannot display in a different order from its encrypted bytes.
+Subject is 1-96 UTF-8 bytes and body 1-768. Both need non-whitespace content. Newline/tab are accepted; malformed Unicode and other controls are rejected. JSON escaping must also fit the padded bound. The inbox renders decrypted text as plain text and shows explicit bidi embeddings, overrides and isolates (U+202A–U+202E, U+2066–U+2069) as visible `\u202e`-style escapes, so a subject or body cannot display in a different order from its encrypted bytes.
 
 Common authenticated data concatenates UTF-8 `Hashstash/Mail/v2\0`, chain ID, sender public key, eight-byte little-endian transaction nonce and ephemeral public key. All public keys and the chain ID occupy 32 bytes. The intended recipient is absent. Browser nonces use canonical unsigned-64-bit decimal strings; nonce changes invalidate prepared ciphertext and fee quotes.
 

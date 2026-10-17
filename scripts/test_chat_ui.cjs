@@ -35,8 +35,8 @@ async function run() {
     const {isBlank}=require('../ui/chat.js');let mismatches=0;
     for(let point=0;point<=0x10ffff;point++){if(point>=0xd800&&point<=0xdfff)continue;if(isBlank(String.fromCodePoint(point))!==ranges.some(([low,high])=>point>=low&&point<=high))mismatches++;}
     equal(mismatches,0,'every code point is blank in the browser exactly when it is blank in src/chat.rs');
-    for(const text of ['﻿',' ﻿\n','​','⁠️','\u{e0020}','ㅤ'])ok(isBlank(text),JSON.stringify(text));
-    for(const text of ['a﻿b','⠀','👨‍👩'])ok(!isBlank(text),JSON.stringify(text));
+    for(const text of ['\ufeff',' \ufeff\n','\u200b','\u2060\ufe0f','\u{e0020}','\u3164'])ok(isBlank(text),JSON.stringify(text));
+    for(const text of ['a\ufeffb','\u2800','👨\u200d👩'])ok(!isBlank(text),JSON.stringify(text));
   }
   {
     const h=await setup({empty:true});
@@ -190,12 +190,12 @@ async function run() {
   {
     const h=await setup();h.feed.items=[h.message({text:'é'.repeat(16384)})];await h.feedRefresh();equal(h.get('chat-messages').children.length,1,'historical plaintext remains readable even above the current governed block capacity');
     h.feed.items=[h.message({text:'a'.repeat(32*1024*1024+1)})];await h.feedRefresh();equal(h.get('chat-messages').children.length,1,'historical messages above32MiB remain readable');
-    for(const invalid of [{text:' '},{text:'﻿'},{text:' ﻿\n'},{text:'​'},{text:'a\u0000b'},{text:'a\u0085b'},{text:'\ud800'},{sender:'<script>'},{amount:'-1'},{amount:'0',asset:'bitcoin'},{amount:null,asset:'hash'},{position:null},{position:'18446744073709551616'}, {kind:'<script>'}, {txid:'<script>'}]){
+    for(const invalid of [{text:' '},{text:'\ufeff'},{text:' \ufeff\n'},{text:'\u200b'},{text:'a\u0000b'},{text:'a\u0085b'},{text:'\ud800'},{sender:'<script>'},{amount:'-1'},{amount:'0',asset:'bitcoin'},{amount:null,asset:'hash'},{position:null},{position:'18446744073709551616'}, {kind:'<script>'}, {txid:'<script>'}]){
       h.feed.items=[h.message({txid:hash(1),height:18,text:'Before'}),h.message({txid:hash(2),...invalid}),h.message({txid:hash(3),height:20,text:'After'})];await h.feedRefresh();
       equal(h.get('chat-messages').children.map(row=>row.dataset.txid),[hash(1),hash(3)],`a malformed record is skipped without hiding its page: ${JSON.stringify(invalid)}`);
       ok(h.get('chat-status').textContent.includes('1 message could not be displayed.'),'malformed message metadata is reported, not rendered');
     }
-    h.feed.items=[h.message({txid:hash(1)})];h.feed.pending=[h.message({txid:hash(2),height:null,position:null,status:'pending',confirmations:0,text:'﻿'}),h.message({txid:hash(3),height:null,position:null,status:'pending',confirmations:0,text:'Waiting'})];await h.feedRefresh();
+    h.feed.items=[h.message({txid:hash(1)})];h.feed.pending=[h.message({txid:hash(2),height:null,position:null,status:'pending',confirmations:0,text:'\ufeff'}),h.message({txid:hash(3),height:null,position:null,status:'pending',confirmations:0,text:'Waiting'})];await h.feedRefresh();
     equal(h.get('chat-pending').children.map(row=>row.dataset.txid),[hash(3)],'a blank pending record does not hide other pending messages');equal(h.get('chat-messages').children.length,1);
     ok(h.get('chat-status').textContent.includes('1 message could not be displayed.'));
     h.feed.pending=[];await h.feedRefresh();ok(!h.get('chat-status').textContent.includes('could not be displayed'),'a clean refresh clears the skipped-record note');
@@ -218,7 +218,7 @@ async function run() {
   }
   {
     const h=await setup({empty:true}),full=addr(sender),start=full.lastIndexOf('1')+1;
-    h.feed.items=[h.message({txid:hash(1),text:'Pay 01‮987‬ now'}),h.message({txid:hash(2),text:'Automated Demo · Mara — ⁧reversed⁩'})];await h.feedRefresh();
+    h.feed.items=[h.message({txid:hash(1),text:'Pay 01\u202e987\u202c now'}),h.message({txid:hash(2),text:'Automated Demo · Mara — \u2067reversed\u2069'})];await h.feedRefresh();
     const rows=h.get('chat-messages').children,account=row=>walk(row).find(node=>node.href?.startsWith('#explorer?account='));
     const label=`hsh…${full.slice(start,start+10)}…${full.slice(-6)}`;
     equal(account(rows[0]).textContent,label,'the sender label shows key data and the checksum, not the network prefix');
@@ -226,7 +226,7 @@ async function run() {
     equal(walk(rows[0]).find(node=>node.className==='chat-message-text').textContent,'Pay 01\\u202e987\\u202c now','bidi overrides are shown as visible escapes');
     equal(walk(rows[1]).find(node=>node.className==='chat-message-text').textContent,'Mara — \\u2067reversed\\u2069','isolates are shown as visible escapes');
     ok(walk(rows[1]).find(node=>node.href?.startsWith('#explorer?tx=')).title.endsWith('\\u2067reversed\\u2069'),'the original-message tooltip is escaped too');
-    equal(h.feed.items[0].text,'Pay 01‮987‬ now','display escaping never rewrites the source record');
+    equal(h.feed.items[0].text,'Pay 01\u202e987\u202c now','display escaping never rewrites the source record');
     await walk(rows[0]).find(node=>node.tagName==='BUTTON'&&node.textContent==='Mute').click();
     const muted=walk(h.get('chat-muted-list')).find(node=>node.href?.startsWith('#explorer?account='));
     equal(muted.textContent,label,'muted senders use the same distinguishing label');equal(muted.title,full);

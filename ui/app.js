@@ -255,7 +255,7 @@
     function visibleControls(value) {
         // Explicit bidi embeddings, overrides and isolates in user-authored
         // text are shown as escapes so it cannot display out of signed order.
-        return String(value).replace(/[‪-‮⁦-⁩]/g, c => `\\u${c.charCodeAt(0).toString(16)}`);
+        return String(value).replace(/[\u202a-\u202e\u2066-\u2069]/g, c => `\\u${c.charCodeAt(0).toString(16)}`);
     }
     function commas(value) {
         return String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ",");

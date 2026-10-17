@@ -8,10 +8,23 @@ use crate::{
 use anyhow::{Result, ensure};
 use num_traits::Zero;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+/// One world's account records. Only [`World::put`] writes them, so the
+/// committed cash and share aggregates cannot drift from the records.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Accounts(Map<Account>);
+impl std::ops::Deref for Accounts {
+    type Target = Map<Account>;
+    fn deref(&self) -> &Map<Account> {
+        &self.0
+    }
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct World {
-    pub accounts: Map<Account>,
+    pub accounts: Accounts,
     #[serde(with = "amount")]
     pub reserve: Amount,
     #[serde(with = "amount")]
@@ -51,7 +64,7 @@ impl World {
         }
         self.account_cash += &a.ordinary;
         self.account_shares += &a.shares;
-        self.accounts.insert(key.to_vec(), a);
+        self.accounts.0.insert(key.to_vec(), a);
         Ok(())
     }
     pub fn quote(&self, c: &Config) -> Amount {
@@ -147,7 +160,10 @@ pub struct Decision {
     pub epoch: u64,
     pub round: u64,
     pub proposal_id: Hash,
-    pub proposal: Proposal,
+    /// Shared with the winning proposal record. A grant can list as many
+    /// payments as governed capacity admits; state clones must not copy them.
+    /// The encoding is that of the plain proposal.
+    pub proposal: Arc<Proposal>,
     pub started: u64,
     pub started_height: u64,
     pub blocks: u64,
@@ -178,8 +194,11 @@ pub struct RoundRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProposalRecord {
     pub round: u64,
+    /// The registering sender, bound into the proposal ID.
+    pub proposer: PublicKey,
     pub description: Hash,
-    pub action: Proposal,
+    /// Immutable after registration and shared by record updates.
+    pub action: Arc<Proposal>,
     #[serde(with = "amount")]
     pub support: Amount,
     pub refund_height: Option<u64>,
@@ -387,7 +406,7 @@ impl State {
                     parameter,
                     old,
                     new,
-                } = d.proposal
+                } = *d.proposal
                 {
                     c.parameter_change_at(&self.frozen, parameter, old, new, activation)?;
                 }
@@ -481,7 +500,7 @@ impl State {
             "auction support escrow mismatch"
         );
         for (key, proposal) in self.proposals.iter() {
-            if let Proposal::Grant { payments } = &proposal.action {
+            if let Proposal::Grant { payments } = &*proposal.action {
                 c.validate_grant(payments)?;
             }
             let id: Hash = key.try_into()?;
@@ -489,10 +508,15 @@ impl State {
                 id == proposal_id(
                     &self.chain_id,
                     proposal.round,
+                    &proposal.proposer,
                     &proposal.description,
                     &proposal.action
                 ),
                 "proposal key mismatch"
+            );
+            ensure!(
+                self.world.accounts.get(&proposal.proposer).is_some(),
+                "missing proposer account"
             );
             ensure!(!proposal.support.is_zero(), "empty proposal support");
             c.check_amount(&proposal.support)?;
@@ -635,7 +659,7 @@ impl State {
                     "decision round winner mismatch"
                 );
                 let pass = self.alternative.as_ref().unwrap();
-                match &d.proposal {
+                match &*d.proposal {
                     Proposal::Grant { payments } => {
                         ensure!(
                             pass.grant_escrow == c.validate_grant(payments)?,
@@ -668,10 +692,18 @@ impl State {
         Ok(())
     }
 }
-pub fn proposal_id(chain: &Hash, round: u64, description: &Hash, proposal: &Proposal) -> Hash {
+/// The registering sender is bound into the ID, so copying a pending Propose
+/// creates a separate proposal instead of displacing the original.
+pub fn proposal_id(
+    chain: &Hash,
+    round: u64,
+    proposer: &PublicKey,
+    description: &Hash,
+    proposal: &Proposal,
+) -> Hash {
     crypto::tagged_hash(
         "Hashstash/proposal",
-        &codec::encode(&(chain, round, description, proposal)),
+        &codec::encode(&(chain, round, proposer, description, proposal)),
     )
 }
 pub fn support_key(round: u64, id: &Hash, sender: &PublicKey) -> Vec<u8> {
@@ -684,4 +716,102 @@ pub fn rank_key(amount: &Amount, id: &Hash) -> Vec<u8> {
     key[64 - bytes.len()..].copy_from_slice(&bytes);
     key.extend(id.iter().map(|x| !x));
     key
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grant(payments: u8) -> Proposal {
+        Proposal::Grant {
+            payments: (1..=payments)
+                .map(|i| GrantPayment {
+                    recipient: [i; 32],
+                    amount: 1u32.into(),
+                })
+                .collect(),
+        }
+    }
+
+    fn record(proposer: PublicKey, action: Arc<Proposal>) -> ProposalRecord {
+        ProposalRecord {
+            round: 0,
+            proposer,
+            description: [4; 32],
+            action,
+            support: 1u32.into(),
+            refund_height: None,
+        }
+    }
+
+    #[test]
+    fn state_clones_share_governed_proposals_without_changing_encodings() {
+        let mut s = State::genesis(&Config::devnet());
+        let action = Arc::new(grant(40));
+        let id = proposal_id(&s.chain_id, 0, &[3; 32], &[4; 32], &action);
+        s.proposals
+            .insert(id.to_vec(), record([3; 32], action.clone()));
+        s.phase = Phase::Governance(Decision {
+            id: [5; 32],
+            epoch: 1,
+            round: 0,
+            proposal_id: id,
+            proposal: action.clone(),
+            started: 0,
+            started_height: 0,
+            blocks: 1,
+            leading_blocks: 0,
+        });
+        let mut copy = s.clone();
+        copy.proposals
+            .insert([9; 32].to_vec(), record([6; 32], Arc::new(grant(1))));
+        let (Phase::Governance(a), Phase::Governance(b)) = (&s.phase, &copy.phase) else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(&a.proposal, &b.proposal));
+        assert!(Arc::ptr_eq(&a.proposal, &copy.proposals.get(&id).unwrap().action));
+        let plain = (
+            a.id,
+            a.epoch,
+            a.round,
+            a.proposal_id,
+            &*action,
+            a.started,
+            a.started_height,
+            a.blocks,
+            a.leading_blocks,
+        );
+        assert_eq!(codec::encode(a), codec::encode(&plain));
+        #[derive(Serialize)]
+        struct PlainRecord<'a> {
+            round: u64,
+            proposer: PublicKey,
+            description: Hash,
+            action: &'a Proposal,
+            #[serde(with = "amount")]
+            support: Amount,
+            refund_height: Option<u64>,
+        }
+        let plain = PlainRecord {
+            round: 0,
+            proposer: [3; 32],
+            description: [4; 32],
+            action: &action,
+            support: 1u32.into(),
+            refund_height: None,
+        };
+        assert_eq!(
+            codec::encode(&record([3; 32], action.clone())),
+            codec::encode(&plain)
+        );
+    }
+
+    #[test]
+    fn proposal_ids_bind_the_registering_sender() {
+        let chain = Config::devnet().chain_id();
+        let action = grant(2);
+        let first = proposal_id(&chain, 7, &[1; 32], &[4; 32], &action);
+        assert_ne!(first, proposal_id(&chain, 7, &[2; 32], &[4; 32], &action));
+        assert_eq!(first, proposal_id(&chain, 7, &[1; 32], &[4; 32], &action));
+    }
 }

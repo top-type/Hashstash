@@ -460,7 +460,7 @@ fn transaction_inner(
                     new,
                 } => c.parameter_change_at(&s.frozen, *parameter, *old, *new, s.clock)?,
             }
-            let id = proposal_id(&s.chain_id, *round, description, proposal);
+            let id = proposal_id(&s.chain_id, *round, &b.sender, description, proposal);
             ensure!(
                 s.proposals.get(&id).is_none(),
                 "proposal already registered"
@@ -469,8 +469,9 @@ fn transaction_inner(
                 id.to_vec(),
                 ProposalRecord {
                     round: *round,
+                    proposer: b.sender,
                     description: *description,
-                    action: proposal.clone(),
+                    action: proposal.clone().into(),
                     support: Amount::zero(),
                     refund_height: None,
                 },
@@ -733,7 +734,7 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
                 leading_blocks: 0,
             };
             let mut pass = s.world.clone();
-            if let Proposal::Grant { payments } = &d.proposal {
+            if let Proposal::Grant { payments } = &*d.proposal {
                 grant_reserve(c, &mut pass, &c.validate_grant(payments)?)?;
             }
             s.alternative = Some(pass);
@@ -847,7 +848,7 @@ fn resolve(c: &Config, s: &mut State) -> Result<bool> {
         s.height.checked_sub(d.started_height) == Some(d.blocks),
         "decision has not ended"
     );
-    let funded = match &d.proposal {
+    let funded = match &*d.proposal {
         Proposal::Grant { payments } => pass.grant_escrow == c.validate_grant(payments)?,
         Proposal::Parameter { .. } => true,
     };
@@ -860,10 +861,10 @@ fn resolve(c: &Config, s: &mut State) -> Result<bool> {
     // Clear the conditional context before interpreting a paid recipient's settled balance.
     rest(s, None)?;
     if won {
-        match d.proposal {
+        match &*d.proposal {
             Proposal::Grant { payments } => {
                 ensure!(
-                    s.world.grant_escrow == c.validate_grant(&payments)?,
+                    s.world.grant_escrow == c.validate_grant(payments)?,
                     "grant escrow mismatch"
                 );
                 s.world.grant_escrow = Amount::zero();
@@ -871,7 +872,7 @@ fn resolve(c: &Config, s: &mut State) -> Result<bool> {
                     credit(s, &payment.recipient, &payment.amount, c)?;
                 }
             }
-            Proposal::Parameter { parameter, new, .. } => pending = Some((parameter, new)),
+            Proposal::Parameter { parameter, new, .. } => pending = Some((*parameter, *new)),
         }
     }
     rest(s, pending)?;

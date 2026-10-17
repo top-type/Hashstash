@@ -272,7 +272,7 @@ fn governance_evidence_contributions_same_height_proposals_and_reorg() {
     ];
     let ids = actions
         .iter()
-        .map(|p| state::proposal_id(&c.chain_id(), round, &[7; 32], p))
+        .map(|p| state::proposal_id(&c.chain_id(), round, &owner(), &[7; 32], p))
         .collect::<Vec<_>>();
     for (i, p) in actions.into_iter().enumerate() {
         a.submit_transaction(tx(

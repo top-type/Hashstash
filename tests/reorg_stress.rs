@@ -227,7 +227,7 @@ fn replay_and_reopen(d: TempDir, chain: Chain) {
 fn propose(chain: &mut Chain, proposal: Proposal, tag: u8, support: u32) -> (u64, Hash) {
     until(chain, "auction", 0);
     let round = chain.tip_state().auction_round().unwrap();
-    let id = state::proposal_id(&chain.chain_id(), round, &[tag; 32], &proposal);
+    let id = state::proposal_id(&chain.chain_id(), round, &key(&MINER), &[tag; 32], &proposal);
     let tx = sign(
         chain,
         &MINER,

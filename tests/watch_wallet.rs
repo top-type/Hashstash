@@ -270,7 +270,8 @@ fn every_operation_uses_the_offline_route_including_governance() {
         new: config.initial.interval * 2,
     };
     let chain_id = node::parse_hash(node.status().unwrap()["chain_id"].as_str().unwrap()).unwrap();
-    let second_id = state::proposal_id(&chain_id, round, &[2; 32], &second);
+    let proposer = crypto::public_key(&secret).unwrap();
+    let second_id = state::proposal_id(&chain_id, round, &proposer, &[2; 32], &second);
     for (description, proposal, support) in [(1, first, 3u32), (2, second, 1u32)] {
         cold_submit(
             &node,

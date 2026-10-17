@@ -386,7 +386,8 @@ fn active_decision_audit_checks_the_pending_value_at_its_activation_clock() {
         parameter: Parameter::DecisionBlocks,
         old: s.settings.decision_blocks,
         new: u64::MAX - d.started,
-    };
+    }
+    .into();
     // The proposed duration fits at decision opening but not at activation.
     assert!(opened.validate(&c).is_err());
 }

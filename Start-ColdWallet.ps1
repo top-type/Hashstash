@@ -50,7 +50,7 @@ $signerToken = -join ($tokenBytes | ForEach-Object { $_.ToString('x2') })
 $env:HASHSTASH_COLD_TOKEN = $signerToken
 try {
     $signerProcess = Start-Process -FilePath $signerPath -ArgumentList $quotedArguments -WindowStyle Hidden -PassThru
-} finally { Remove-Item -LiteralPath Env:HASHSTASH_COLD_TOKEN -ErrorAction SilentlyContinue }
+} finally { Remove-Item Env:\HASHSTASH_COLD_TOKEN -ErrorAction SilentlyContinue }
 $signerUrl = "http://127.0.0.1:$Port/"
 $launchUrl = $signerUrl + '#token=' + $signerToken
 $signerReady = $false

@@ -74,15 +74,12 @@ impl WalletState {
         self.last_used = None;
         self.idle_locked = false;
     }
-    /// Locks a wallet left unused for `idle`, returning whether it did.
-    fn expire(&mut self, idle: Duration) -> bool {
-        let expired =
-            self.secret.is_some() && self.last_used.is_none_or(|used| used.elapsed() >= idle);
-        if expired {
+    /// Locks a wallet left unused for `idle`.
+    fn expire(&mut self, idle: Duration) {
+        if self.secret.is_some() && self.last_used.is_none_or(|used| used.elapsed() >= idle) {
             self.clear_wallet();
             self.idle_locked = true;
         }
-        expired
     }
     fn touch(&mut self) {
         self.last_used = self.secret.is_some().then(Instant::now);
@@ -267,6 +264,7 @@ pub async fn serve_with_limits(
     .await
 }
 
+/// Starts one loopback listener with explicit settings.
 pub async fn serve_with_options(address: SocketAddr, options: ColdOptions) -> Result<ColdServer> {
     ensure!(
         address.ip().is_loopback() && address.is_ipv4(),
@@ -280,7 +278,10 @@ pub async fn serve_with_options(address: SocketAddr, options: ColdOptions) -> Re
     let session_token = match options.token {
         Some(chosen) => {
             ensure!(
-                chosen.len() == 64 && chosen.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                chosen.len() == 64
+                    && chosen
+                        .bytes()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
                 "session token must be 64 lowercase hexadecimal characters"
             );
             chosen

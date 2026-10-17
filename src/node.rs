@@ -630,6 +630,7 @@ struct ReadView {
 #[derive(Default)]
 struct TipCache {
     root: std::sync::OnceLock<Hash>,
+    /// The bounded governance summary; a complete large grant is never kept.
     governance: std::sync::OnceLock<Value>,
     proposals: std::sync::OnceLock<ProposalIndex>,
 }

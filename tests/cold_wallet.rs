@@ -1285,7 +1285,8 @@ async fn session_token_reaches_only_the_launcher_and_idle_wallets_lock() {
     };
     let loopback = || "127.0.0.1:0".parse().unwrap();
     for bad in ["5A".repeat(32), "5a".repeat(31), "zz".repeat(32)] {
-        let refused = cold::serve_with_options(loopback(), options(Some(bad), cold::DEFAULT_IDLE_LOCK));
+        let refused =
+            cold::serve_with_options(loopback(), options(Some(bad), cold::DEFAULT_IDLE_LOCK));
         assert!(refused.await.is_err());
     }
     assert!(

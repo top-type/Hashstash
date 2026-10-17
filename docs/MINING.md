@@ -6,7 +6,7 @@ Hashstash exposes optional Stratum V1 for SHA256d ASICs. Mining configuration be
 hashstash run --config network.json --data chain.sqlite --miner '<address>' --rpc 127.0.0.1:18480 --p2p 0.0.0.0:18481 --stratum 0.0.0.0:18482 --stratum-share-difficulty 65536 --stratum-advertise stratum+tcp://example.net:18482
 ```
 
-Optional `--stratum-password-file PATH` requires its password at authorization. Restrict file access and never put credentials into a public endpoint. `--no-stratum` runs a validating/relaying node without a mining listener. Keep private RPC loopback-only. The public browser page exposes mining status under Explorer → Network, without administrative controls.
+Optional `--stratum-password-file PATH` requires its password at authorization. The file holds one printable ASCII token of at most 256 characters; trailing line endings are ignored and an empty file is refused. Restrict file access and never put credentials into a public endpoint. `--no-stratum` runs a validating/relaying node without a mining listener. Keep private RPC loopback-only. The public browser page exposes mining status under Explorer → Network, without administrative controls.
 
 For a fresh network, `init --preset slow --hashrate 100T` calibrates initial work to estimated hashrate. The resulting configuration fixes a new chain identity; do not edit the genesis of a running chain. ASIC work on an extremely easy development target can overwhelm a small node. The three presets alone do not establish production safety.
 

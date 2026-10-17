@@ -223,13 +223,23 @@ fn aggregate_grant_cannot_exceed_funds_by_splitting_payments() {
 }
 
 #[test]
-fn multi_recipient_grant_can_spend_more_than_half_the_reserve() {
+fn multi_recipient_grant_can_spend_half_the_reserve_and_no_more() {
+    // Audit F010: both outcomes open on the drawn curve, so one grant may
+    // draw at most half of the reserve. A larger draw used to be eligible,
+    // up to all but one atom, and could leave both outcomes untradeable.
     let c = config();
-    let entries = payments(&[300_000, 300_000]);
-    let opening = active(&c, entries.clone());
+    let start = funded(&c);
+    let proposal = propose(&start, payments(&[300_000, 300_000]));
+    let s = step(&c, &start, key(181), 0, &[cover_fee(&c, &start, proposal)]);
+    assert!(s.decision_id().is_none());
+    assert!(s.proposals.iter().all(|(_, p)| p.refund_height.is_some()));
+    let entries = payments(&[250_000, 250_000]);
+    let opening = activate(&c, start, entries.clone());
     let escrow = &opening.alternative.as_ref().unwrap().grant_escrow;
-    assert_eq!(escrow, &Amount::from(600_000u32));
-    assert!(escrow * 2u32 > opening.world.reserve);
+    assert_eq!(escrow, &Amount::from(500_000u32));
+    for world in [&opening.world, opening.alternative.as_ref().unwrap()] {
+        assert!(&world.reserve * 2u32 >= world.curve_mass);
+    }
     let closing = before_resolution(&c, opening, true);
     let settled = step(&c, &closing, key(181), 0, &[]);
     for payment in entries {

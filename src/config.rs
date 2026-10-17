@@ -226,6 +226,8 @@ impl Config {
         }
         Ok(())
     }
+    /// Validate a governed change where it takes effect: at `clock` and
+    /// `height`, the change's activation block or a block checking it early.
     pub fn parameter_change_at(
         &self,
         settings: &Settings,
@@ -233,6 +235,7 @@ impl Config {
         old: u64,
         new: u64,
         clock: u64,
+        height: u64,
     ) -> Result<()> {
         self.parameter_change(settings, p, old, new)?;
         let mut changed = settings.clone();
@@ -240,26 +243,25 @@ impl Config {
         self.validate_governance_settings_at(&changed, clock)?;
         // Later deadlines start from later clocks. A governed schedule must
         // stay representable through every remaining height, not only here.
-        let lifetime = changed
-            .interval
-            .checked_mul(self.max_height)
-            .context("governed schedule lifetime overflow")?;
-        let decision = changed
-            .decision_blocks
-            .checked_mul(changed.interval)
-            .context("decision schedule overflow")?;
-        [
-            lifetime,
-            self.auction_timeout_for(&changed)?,
-            decision,
-            changed.rest,
-            changed.interval,
-            changed.interval,
-        ]
-        .into_iter()
-        .try_fold(clock, u64::checked_add)
-        .context("governed schedule can overflow before the height limit")?;
+        // A chain whose clock range already ends before its height limit may
+        // still make changes that do not reach further than its current one.
+        let end = self.schedule_end(&changed, clock, height)?;
+        ensure!(
+            end <= Amount::from(u64::MAX) || end <= self.schedule_end(settings, clock, height)?,
+            "governed schedule can overflow before the height limit"
+        );
         Ok(())
+    }
+    /// The clock after every remaining block at this interval, plus the
+    /// longest deadline and block rounding a final block could compute.
+    fn schedule_end(&self, settings: &Settings, clock: u64, height: u64) -> Result<Amount> {
+        let interval = Amount::from(settings.interval);
+        Ok(Amount::from(clock)
+            + &interval * self.max_height.saturating_sub(height)
+            + self.auction_timeout_for(settings)?
+            + &interval * settings.decision_blocks
+            + settings.rest
+            + interval * 2u32)
     }
     /// Bounds on values that only governance selects. Genesis may choose any
     /// representable value, but a passed change has no other path back, so it
@@ -272,17 +274,33 @@ impl Config {
         old: u64,
         new: u64,
     ) -> Result<()> {
+        // A leader established in the first half of a round can still
+        // mature before the configured timeout.
+        let lead_limit = self.auction_timeout.saturating_sub(changed.interval) / 2;
+        let decision_length = changed.decision_blocks.saturating_mul(changed.interval);
         match p {
             // ASERT keeps its genesis half life; a longer scheduled step
             // would demand more than a halving of the next target.
-            Parameter::Interval => ensure!(
-                new <= self.daa_half_life,
-                "governed block interval exceeds the difficulty half life"
-            ),
-            // A leader established in the first half of a round can still
-            // mature, so a later outbid cannot force a free timeout.
+            Parameter::Interval => {
+                ensure!(
+                    new <= self.daa_half_life,
+                    "governed block interval exceeds the difficulty half life"
+                );
+                // A longer interval also lengthens every decision and leaves
+                // less of the auction for a lead; a shorter one only helps.
+                if new > old {
+                    ensure!(
+                        changed.lead <= lead_limit,
+                        "governed block interval leaves too little auction for the lead"
+                    );
+                    ensure!(
+                        decision_length <= MAX_GOVERNED_DURATION,
+                        "governed block interval makes the decision too long"
+                    );
+                }
+            }
             Parameter::Lead => ensure!(
-                new <= self.auction_timeout.saturating_sub(changed.interval) / 2,
+                new <= lead_limit,
                 "governed auction lead exceeds half the auction timeout"
             ),
             Parameter::Rest => ensure!(new <= MAX_GOVERNED_DURATION, "governed rest is too long"),
@@ -291,9 +309,8 @@ impl Config {
                     new >= MIN_GOVERNED_DECISION_BLOCKS,
                     "governed decision cannot reach a PASS majority"
                 );
-                let length = new.saturating_mul(changed.interval);
                 ensure!(
-                    length <= MAX_GOVERNED_DURATION,
+                    decision_length <= MAX_GOVERNED_DURATION,
                     "governed decision is too long"
                 );
             }

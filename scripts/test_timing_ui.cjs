@@ -35,7 +35,7 @@ async function run() {
   await h.refresh();
   equal(h.get('gov-countdown').textContent, '2 blocks');
   match(h.get('network-phase').title, /^2 blocks at the 30s target/);
-  equal(h.get('gov-subtitle').textContent, 'The leading proposal advances after its required lead.');
+  equal(h.get('gov-subtitle').textContent, 'The leading proposal advances after its required lead or at the auction timeout.');
   // The timeout leaves at least one full observation beyond the required lead.
   s.config.auction_timeout = 20; s.status.settings.lead = s.governance.frozen.lead = 61;
   s.governance.phase.Auction.leader = null;

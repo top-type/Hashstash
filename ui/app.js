@@ -475,12 +475,13 @@
         if (name === "Auction") {
             const timeout = remaining(BigInt(phase.opened) + auctionTimeout());
             const lead = phase.leader ? remaining(BigInt(phase.lead_since) + BigInt(state.gov.frozen.lead)) : null;
-            // A completed eligible lead is checked before timeout in the same block.
+            // A leader opens its decision when its lead completes or, at the
+            // latest, at the timeout; only an auction without one times out.
             const wins = lead !== null && blocks(lead) <= blocks(timeout);
             seconds = wins ? lead : timeout;
             total = wins ? BigInt(state.gov.frozen.lead) : auctionTimeout();
-            end = wins ? "decision" : "auction timeout";
-            summaryEnd = wins ? "to decision" : "to timeout";
+            end = lead !== null ? "decision" : "auction timeout";
+            summaryEnd = lead !== null ? "to decision" : "to timeout";
         } else if (name === "Governance") {
             const totalBlocks = BigInt(phase.blocks), elapsed = BigInt(state.status.height) - BigInt(phase.started_height);
             const completedBlocks = elapsed < 0n ? 0n : elapsed > totalBlocks ? totalBlocks : elapsed;
@@ -1649,7 +1650,7 @@
         if (name === "Auction") {
             text("gov-round", `Round ${phase.round}`);
             text("gov-title", phase.leader ? `Leader ${proposalShort(phase.leader)}` : "Auction open");
-            text("gov-subtitle", phase.leader ? "The leading proposal advances after its required lead." : "Choose the next proposal.");
+            text("gov-subtitle", phase.leader ? "The leading proposal advances after its required lead or at the auction timeout." : "Choose the next proposal.");
             text("overview-governance-title", "Auction open");
             text("overview-governance-text", phase.leader ? `Leader ${proposalShort(phase.leader)}` : "No leader");
         } else if (active) {
@@ -1960,7 +1961,7 @@
         text("guide-fees", `Transaction weight determines the minimum fee. Governance sets its rate and the miner's share. The entire fee, including any extra, currently goes ${s.settings.miner_fee_percent}% to the miner and ${100 - Number(s.settings.miner_fee_percent)}% to revenue.`);
         text("guide-proposals", "A proposal requests a grant or sets a new value for one network setting. Decision length uses blocks. Auction lead, rest and target interval use whole seconds. The miner’s fee share uses whole percentages from 0 to 100; PASS margin and the price-change limit use 0.01% steps. Block capacity uses weight; the minimum fee rate uses raw hashes per 1,024 weight.");
         text("guide-revenue-flow", "Revenue fills the gap between reserve and curve mass. This raises the reserve ratio toward 100%, making the curve flatter while keeping its current price and stash supply unchanged. Once the gap is filled, further revenue waits outside the reserve.");
-        text("guide-grant-flow", "At the start of a grant decision, PASS sets aside the proposed payments from waiting revenue, then reserve. Drawing from reserve lowers its ratio and makes the curve steeper, while the current price and stash supply stay unchanged. If PASS wins, the recipients receive those payments. If FAIL wins, its reserve and balances continue.");
+        text("guide-grant-flow", "At the start of a grant decision, PASS sets aside the proposed payments from waiting revenue, then at most half of the reserve. FAIL moves the same reserve amount to its waiting revenue. Both curves become equally steeper, while the current price and stash supply stay unchanged. If PASS wins, the recipients receive those payments. If FAIL wins, revenue refills its reserve as far as the curve allows; FAIL sales during the decision paid the steeper curve's lower price and can leave part of that amount as revenue.");
         text("network-height", commas(s.height));
         number("network-issued", s.issued);
         text("network-clock", protocolDuration(s.clock));
@@ -2962,7 +2963,7 @@
             const quote = await rpc("grant_quote", {
                 amount: amount
             });
-            if (!quote.feasible) throw new Error("Grant exceeds the available revenue and withdrawable reserve.");
+            if (!quote.feasible) throw new Error("Grant exceeds the available revenue and half of the reserve.");
             proposal = {
                 Grant: {
                     payments

@@ -28,7 +28,7 @@ class CampaignPlanTests(unittest.TestCase):
         self.snapshot['balances'] = {key: {'account': dict(ordinary='1000000', shares='1000000000')}
                                      for group in REGISTRY.values() for key in group}
         self.snapshot['campaign'] = dict(checked=True, completed=False, settlement_pending=False)
-        self.snapshot['governance']['world'].update(reserve='9000000', curve_mass='9000000', shares='9000000000', revenue='100', grant_capacity='9000100')
+        self.snapshot['governance']['world'].update(reserve='9000000', curve_mass='9000000', shares='9000000000', revenue='100', grant_capacity='4500100')
         self.phase('auction')
 
     def live(self, region='sgp'):
@@ -79,7 +79,8 @@ class CampaignPlanTests(unittest.TestCase):
         a = self.choose()
         self.assertEqual((a['kind'], a['sender_index']), ('propose_grant', 0))
         self.assertEqual(a['recipient'], REGISTRY['fra'][0])
-        self.assertEqual(int(a['grant_amount_raw']), 100 + int(a['amount_raw']) + 4500000 + int(a['quoted_fee_raw']))
+        # Waiting revenue and half the reserve; the bid cannot fund the grant.
+        self.assertEqual(int(a['grant_amount_raw']), 100 + 4500000)
         self.assertEqual(a['campaign_reserve_draw_raw'], '4500000')
         self.assertNotIn('data_hex', a)
         self.policy['pending_actions'] = [a]

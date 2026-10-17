@@ -643,29 +643,23 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
                 return None
             world = snapshot["governance"]["world"]
             support = max(1, spendable(0) * 200 // 10000)
-            requested = _number(world.get("revenue")) + support + _number(world["reserve"]) // 2
-            destination = registry_keys[CAMPAIGN_RECIPIENT][0]
-            description = hashlib.sha256(proposal_description(region, round_id, profile_name).encode()).hexdigest()
-            operation = {"Propose": {"round": round_id, "description": _bytes(description),
-                "proposal": {"Grant": {"payments": [{"recipient": _bytes(destination), "amount": str(requested)}]}},
-                "support": str(support)}}
-            # Account for the entire exact fee conservatively as waiting revenue.
-            action = emit(0, operation, "propose_grant", support, debit=support, round=round_id,
-                          description=description, recipient=destination, grant_amount_raw=str(requested))
-            if not action:
-                return None
-            fee_allowance = int(action["quoted_fee_raw"])
-            requested += fee_allowance
+            # Waiting revenue plus half the reserve is the whole grant capacity:
+            # the support becomes revenue only after the grant is reserved, and
+            # the proposal's own fee can only add revenue before it opens.
+            requested = _number(world.get("revenue")) + _number(world["reserve"]) // 2
             if requested > _number(world.get("grant_capacity")):
                 return None
             quote = _read(rpc, "grant_quote", {"amount": str(requested)})
             if not isinstance(quote, dict) or quote.get("feasible") is not True:
                 return None
-            operation["Propose"]["proposal"]["Grant"]["payments"][0]["amount"] = str(requested)
-            action = emit(0, operation, "propose_grant", support, debit=support, round=round_id,
-                          description=description, recipient=destination, grant_amount_raw=str(requested),
-                          campaign_reserve_draw_raw=str(_number(world["reserve"]) // 2))
-            return action if action and int(action["quoted_fee_raw"]) <= fee_allowance else None
+            destination = registry_keys[CAMPAIGN_RECIPIENT][0]
+            description = hashlib.sha256(proposal_description(region, round_id, profile_name).encode()).hexdigest()
+            operation = {"Propose": {"round": round_id, "description": _bytes(description),
+                "proposal": {"Grant": {"payments": [{"recipient": _bytes(destination), "amount": str(requested)}]}},
+                "support": str(support)}}
+            return emit(0, operation, "propose_grant", support, debit=support, round=round_id,
+                        description=description, recipient=destination, grant_amount_raw=str(requested),
+                        campaign_reserve_draw_raw=str(_number(world["reserve"]) // 2))
         return None
 
     # Recover only support proven refundable by the node, once per support key.
@@ -757,14 +751,15 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
                                                   _bounded_bps(personas[index], "grant_request_bps", 100, 500)))
                              if substantive else grant)
                 if native:
-                    # Half the current reserve is a strategy target, not an
-                    # eligibility cap. Support enters waiting revenue first.
-                    requested = (_number(world.get("revenue")) + support
-                                 + _number(world.get("reserve")) // 2)
+                    # Half the current reserve is both the strategy target and
+                    # the most one grant may draw. A grant spends waiting
+                    # revenue first; the winning support becomes revenue only
+                    # after the grant is reserved, so it does not fund it.
+                    requested = _number(world.get("revenue")) + _number(world.get("reserve")) // 2
                     if (_number(world.get("reserve")) == 0 or _number(world.get("curve_mass")) == 0
-                            or requested > capacity or requested <= _number(world.get("revenue")) + support):
+                            or requested > capacity or requested <= _number(world.get("revenue"))):
                         # Do not clip the experiment to fee dust or a grant
-                        # entirely covered by waiting revenue/support.
+                        # entirely covered by waiting revenue.
                         continue
                 if not requested:
                     continue
@@ -774,26 +769,12 @@ def plan(snapshot, accounts, registry, policy, now, rpc):
                 operation = {"Propose": {"round": round_id, "description": _bytes(description),
                              "proposal": {"Grant": {"payments": [{"recipient": _bytes(destination), "amount": str(requested)}]}},
                              "support": str(support)}}
+                # The proposal's own fee only adds waiting revenue before the
+                # decision opens, so a target within the current capacity stays
+                # fundable unless sales lower the reserve first.
                 action = emit(index, operation, "propose_grant", support, debit=support,
                               round=round_id, description=description, grant_amount_raw=str(requested),
                               recipient=destination, data_hex=proposal_data)
-                if native and action:
-                    # The proposal fee also adds waiting revenue. Include its
-                    # entire exact quote conservatively, then quote the final
-                    # immutable amount again; never shrink the reserve target.
-                    fee_allowance = int(action["quoted_fee_raw"])
-                    funded_target = requested + fee_allowance
-                    if funded_target > capacity:
-                        continue
-                    funding = _read(rpc, "grant_quote", {"amount": str(funded_target)})
-                    if not isinstance(funding, dict) or funding.get("feasible") is not True:
-                        continue
-                    operation["Propose"]["proposal"]["Grant"]["payments"][0]["amount"] = str(funded_target)
-                    action = emit(index, operation, "propose_grant", support, debit=support,
-                                  round=round_id, description=description, grant_amount_raw=str(funded_target),
-                                  recipient=destination, data_hex=proposal_data)
-                    if action and int(action["quoted_fee_raw"]) > fee_allowance:
-                        continue
                 if action:
                     return action
         if not completed_or_reserved("support", round=round_id):

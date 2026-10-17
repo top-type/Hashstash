@@ -5,8 +5,8 @@ use crate::{
     tree::Map,
     types::*,
 };
-use anyhow::{Result, ensure};
-use num_traits::Zero;
+use anyhow::{Context, Result, ensure};
+use num_traits::{CheckedSub, Zero};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -59,8 +59,17 @@ impl World {
     pub fn put(&mut self, key: PublicKey, a: Account, c: &Config) -> Result<()> {
         Self::validate_account_update(&a, c)?;
         if let Some(old) = self.account(&key, None) {
-            self.account_cash -= &old.ordinary;
-            self.account_shares -= &old.shares;
+            // A broken aggregate rejects the block instead of aborting.
+            let cash = self
+                .account_cash
+                .checked_sub(&old.ordinary)
+                .context("account cash aggregate underflow")?;
+            let shares = self
+                .account_shares
+                .checked_sub(&old.shares)
+                .context("account share aggregate underflow")?;
+            self.account_cash = cash;
+            self.account_shares = shares;
         }
         self.account_cash += &a.ordinary;
         self.account_shares += &a.shares;
@@ -152,6 +161,10 @@ pub struct Auction {
     pub leader: Option<Hash>,
     pub lead_since: u64,
     pub replacement_height: u64,
+    /// Leaders that lost the lead to a strictly higher bid, oldest first,
+    /// with the lead start each held. One of them resumes that lead start
+    /// when it leads again because every later leader was cancelled.
+    pub displaced: Vec<(Hash, u64)>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -250,6 +263,7 @@ impl State {
                 leader: None,
                 lead_since: 0,
                 replacement_height: 0,
+                displaced: Vec::new(),
             })
         } else {
             Phase::Rest(Rest {
@@ -371,12 +385,15 @@ impl State {
                 .ok_or_else(|| anyhow::anyhow!("expired pending rest"))?;
             let activation =
                 crate::consensus::rounded_deadline(self.clock, remaining, self.frozen.interval)?;
+            let height =
+                crate::consensus::activation_height(self.height, 0, remaining, self.frozen.interval);
             c.parameter_change_at(
                 &self.frozen,
                 parameter,
                 self.frozen.get(parameter),
                 new,
                 activation,
+                height,
             )?;
         }
         match &self.phase {
@@ -408,7 +425,13 @@ impl State {
                     new,
                 } = *d.proposal
                 {
-                    c.parameter_change_at(&self.frozen, parameter, old, new, activation)?;
+                    let height = crate::consensus::activation_height(
+                        d.started_height,
+                        d.blocks,
+                        self.frozen.rest,
+                        self.frozen.interval,
+                    );
+                    c.parameter_change_at(&self.frozen, parameter, old, new, activation, height)?;
                 }
             }
             Phase::Rest(_) => {}
@@ -605,6 +628,24 @@ impl State {
                     a.replacement_height <= self.height.saturating_add(1),
                     "invalid auction replacement height"
                 );
+                // Recorded lead starts are distinct proposals of this round
+                // in the order they were displaced.
+                let mut since = a.opened;
+                let mut seen = std::collections::BTreeSet::new();
+                for (id, start) in &a.displaced {
+                    let p = self
+                        .proposals
+                        .get(id)
+                        .ok_or_else(|| anyhow::anyhow!("missing displaced auction leader"))?;
+                    ensure!(
+                        p.round == a.round
+                            && since <= *start
+                            && *start <= a.lead_since
+                            && seen.insert(*id),
+                        "displaced auction leader mismatch"
+                    );
+                    since = *start;
+                }
                 if let Some(id) = a.leader {
                     let p = self
                         .proposals
@@ -804,6 +845,29 @@ mod tests {
             codec::encode(&record([3; 32], action.clone())),
             codec::encode(&plain)
         );
+    }
+
+    #[test]
+    fn broken_account_aggregates_are_errors_without_mutation() {
+        // Audit F160: these subtractions used to panic and abort the node.
+        let c = Config::devnet();
+        let key = [7; 32];
+        let mut w = World::default();
+        let account = Account {
+            ordinary: 5u32.into(),
+            shares: 3u32.into(),
+            ..Account::default()
+        };
+        w.put(key, account, &c).unwrap();
+        for (cash, shares, error) in [(4u32, 3u32, "cash"), (5, 2, "share")] {
+            let mut broken = w.clone();
+            broken.account_cash = cash.into();
+            broken.account_shares = shares.into();
+            let before = broken.root();
+            let result = broken.put(key, Account::default(), &c);
+            assert!(result.unwrap_err().to_string().contains(error));
+            assert_eq!(broken.root(), before);
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@ use hashstash::{
     codec,
     config::Config,
     consensus, crypto,
-    state::{Phase, State, proposal_id},
+    state::{Phase, RoundStatus, State, proposal_id},
     types::*,
 };
 use num_traits::Zero;
@@ -115,6 +115,31 @@ fn leader(s: &State) -> (Option<Hash>, u64) {
     };
     (a.leader, a.lead_since)
 }
+fn stash(s: &State, secret: &[u8; 32], operation: Operation) -> Transaction {
+    sign(s, secret, 4, operation)
+}
+fn grant(amount: Amount) -> Proposal {
+    Proposal::Grant {
+        payments: vec![GrantPayment {
+            recipient: key(&ATTACKER),
+            amount,
+        }],
+    }
+}
+/// Round zero with the attacker holding Stash on a flat reserve.
+fn staked(c: &Config) -> State {
+    let s = funded(c);
+    let deposit = stash(
+        &s,
+        &ATTACKER,
+        Operation::Deposit {
+            amount: 1_000_000u32.into(),
+            decision: None,
+            outcome: None,
+        },
+    );
+    step(c, &s, &[deposit])
+}
 
 /// Audit F010. A flat FAIL world could not move while a grant's one-atom
 /// overdraft bent PASS, and block revenue then flattened PASS right after a
@@ -217,6 +242,44 @@ fn reserve_overdraft_grant_opens_symmetric_curves_and_equal_defence_ties() {
     assert!(s.account(&key(&ATTACKER), None).unwrap().ordinary < &paid_before + &grant);
     assert!(s.world.grant_escrow.is_zero());
     assert_eq!(s.world.reserve, s.world.curve_mass);
+}
+
+/// Audit F010 follow-up. Both outcomes open on the drawn curve, and the
+/// largest grant once left one reserve atom in each: every buy was throttled
+/// to nothing and sales paid nothing until resolution. A grant now draws at
+/// most half of the reserve, so both outcomes stay tradeable.
+#[test]
+fn the_largest_grant_leaves_both_outcomes_tradeable() {
+    let c = config(4, 0);
+    let mut s = staked(&c);
+    let reserve = s.world.reserve.clone();
+    let capacity = consensus::grant_capacity(&s.world);
+    let (tx, id) = propose(&s, &ATTACKER, 81, grant(capacity), 1);
+    s = step(&c, &s, &[tx]);
+    assert!(matches!(&s.phase, Phase::Governance(d) if d.proposal_id == id));
+    let pass = s.alternative.as_ref().unwrap();
+    assert_eq!(pass.reserve, s.world.reserve);
+    assert!(&pass.reserve * 2u32 >= reserve);
+    for outcome in [Outcome::Fail, Outcome::Pass] {
+        let buyer = s.account(&key(&DEFENDER), Some(outcome)).unwrap();
+        let seller = s.account(&key(&ATTACKER), Some(outcome)).unwrap();
+        let buy = trade(&s, &DEFENDER, 10_000, outcome);
+        let sale = stash(
+            &s,
+            &ATTACKER,
+            Operation::Redeem {
+                shares: 1_000u32.into(),
+                decision: s.decision_id(),
+                outcome: Some(outcome),
+            },
+        );
+        // The seller does not mine, so its cash rises only from the sale.
+        s = step_by(&c, &s, &key(&DEFENDER), 0, &[buy, sale]);
+        let bought = s.account(&key(&DEFENDER), Some(outcome)).unwrap();
+        let sold = s.account(&key(&ATTACKER), Some(outcome)).unwrap();
+        assert!(bought.shares > buyer.shares, "{outcome:?} buy filled");
+        assert!(sold.ordinary + 4u32 > seller.ordinary, "{outcome:?} sale paid");
+    }
 }
 
 /// Audit F014. With no Stash outstanding when a decision opened, a one-atom
@@ -322,6 +385,130 @@ fn ineligible_top_proposal_is_cancelled_without_resetting_the_leader() {
     };
     assert_eq!(d.proposal_id, honest_id);
     assert_eq!(d.started, since + lead);
+}
+
+/// Audit F016 follow-up. Grants sized at the current capacity outbid the
+/// honest leader while eligible. A Redeem then lowers capacity, so both are
+/// cancelled in one block and fully refunded. Their interruption used to
+/// restart the honest lead period; the honest leader now resumes its own.
+#[test]
+fn leaders_cancelled_after_a_capacity_drop_do_not_restart_the_lead_they_took() {
+    let lead = 4 * Config::testnet().initial.interval;
+    let c = config(4, lead);
+    let mut s = staked(&c);
+    let (honest, honest_id) = propose(&s, &DEFENDER, 51, miner_fee(40), 1);
+    s = step(&c, &s, &[honest]);
+    let (_, since) = leader(&s);
+    let capacity = consensus::grant_capacity(&s.world);
+    let (first, first_id) = propose(&s, &ATTACKER, 52, grant(&capacity - 1u32), 2);
+    s = step(&c, &s, &[first]);
+    assert_eq!(leader(&s), (Some(first_id), s.clock));
+    let (second, second_id) = propose(&s, &ATTACKER, 53, grant(capacity), 3);
+    s = step(&c, &s, &[second]);
+    assert_eq!(leader(&s), (Some(second_id), s.clock));
+    let Phase::Auction(a) = &s.phase else {
+        unreachable!()
+    };
+    assert_eq!(a.displaced.len(), 2);
+
+    // A small sale lowers the capacity below both grants.
+    let sale = stash(
+        &s,
+        &ATTACKER,
+        Operation::Redeem {
+            shares: 1_000u32.into(),
+            decision: None,
+            outcome: None,
+        },
+    );
+    s = step(&c, &s, &[sale]);
+    for id in [first_id, second_id] {
+        assert_eq!(s.proposals.get(&id).unwrap().refund_height, Some(s.height + 1));
+    }
+    assert_eq!(leader(&s), (Some(honest_id), since));
+    while s.decision_id().is_none() {
+        s = step(&c, &s, &[]);
+    }
+    let Phase::Governance(d) = &s.phase else {
+        unreachable!()
+    };
+    assert_eq!(d.proposal_id, honest_id);
+    assert_eq!(d.started, since + lead);
+}
+
+/// A strictly higher bid that is not cancelled still restarts the lead, and
+/// the proposal it displaced keeps only its own earlier start on record.
+#[test]
+fn a_cancelled_leader_hands_the_lead_back_but_a_live_outbid_does_not() {
+    let lead = 4 * Config::testnet().initial.interval;
+    let c = config(4, lead);
+    let mut s = staked(&c);
+    let (honest, honest_id) = propose(&s, &DEFENDER, 61, miner_fee(40), 1);
+    s = step(&c, &s, &[honest]);
+    let (_, since) = leader(&s);
+    let (rival, rival_id) = propose(&s, &DEFENDER, 62, miner_fee(30), 2);
+    s = step(&c, &s, &[rival]);
+    let rival_since = s.clock;
+    let capacity = consensus::grant_capacity(&s.world);
+    let (griefer, griefer_id) = propose(&s, &ATTACKER, 63, grant(capacity), 3);
+    s = step(&c, &s, &[griefer]);
+    assert_eq!(leader(&s).0, Some(griefer_id));
+    let sale = stash(
+        &s,
+        &ATTACKER,
+        Operation::Redeem {
+            shares: 1_000u32.into(),
+            decision: None,
+            outcome: None,
+        },
+    );
+    s = step(&c, &s, &[sale]);
+    // The rival's live outbid of the honest proposal still counts.
+    assert_eq!(leader(&s), (Some(rival_id), rival_since));
+    let Phase::Auction(a) = &s.phase else {
+        unreachable!()
+    };
+    assert_eq!(a.displaced, vec![(honest_id, since)]);
+}
+
+/// A bid that leads at the timeout opens its decision even before its own
+/// lead matures. Outbidding every leader just before it matures, from fresh
+/// proposals, used to end the round in a timeout with every bid refunded.
+#[test]
+fn the_leader_at_the_auction_timeout_wins_instead_of_a_refunded_timeout() {
+    let interval = Config::testnet().initial.interval;
+    let lead = 4 * interval;
+    let c = config(4, lead);
+    let mut s = funded(&c);
+    let (honest, honest_id) = propose(&s, &DEFENDER, 71, miner_fee(40), 1);
+    s = step(&c, &s, &[honest]);
+    let (mut support, mut last, mut last_since) = (1, honest_id, leader(&s).1);
+    while s.decision_id().is_none() {
+        assert!(matches!(s.phase, Phase::Auction(_)), "the round timed out");
+        if s.clock + interval - last_since < lead {
+            s = step(&c, &s, &[]);
+            continue;
+        }
+        // Outbid the leader in the block where it would have matured.
+        support += 1;
+        let (tx, id) = propose(&s, &ATTACKER, 71 + support as u8, miner_fee(30), support);
+        s = step(&c, &s, &[tx]);
+        if s.decision_id().is_none() {
+            assert_eq!(leader(&s), (Some(id), s.clock));
+        }
+        (last, last_since) = (id, s.clock);
+    }
+    let Phase::Governance(d) = &s.phase else {
+        unreachable!()
+    };
+    assert_eq!(d.proposal_id, last);
+    assert_ne!(last, honest_id);
+    assert_eq!(d.started, c.auction_timeout);
+    assert!(d.started - last_since < lead);
+    assert!(matches!(
+        s.rounds.get(&0u64.to_be_bytes()).unwrap().status,
+        RoundStatus::Won(id) if id == last
+    ));
 }
 
 /// Audit F109: ties keep the incumbent, otherwise the smallest proposal ID

@@ -692,15 +692,16 @@ class PlannerTest(unittest.TestCase):
         self.substantive()
         self.policy.update(profile=planner.NATIVE_PROFILE, consumptive_budget_remaining_raw="0")
 
-    def test_native_grant_uses_revenue_support_and_half_reserve_without_demo_caps(self):
+    def test_native_grant_uses_revenue_and_half_reserve_without_demo_caps(self):
         self.native()
         self.phase("auction")
+        # Capacity is waiting revenue plus half the reserve; the winning
+        # support is credited only after the grant is reserved.
         self.snapshot["governance"]["world"].update(reserve=str(10**18), revenue=str(2 * 10**17),
-                                                     grant_capacity=str(12 * 10**17))
+                                                     grant_capacity=str(7 * 10**17))
         action = self.choose()
         self.assertEqual(action["kind"], "propose_grant")
-        support = int(action["operation"]["Propose"]["support"])
-        self.assertEqual(int(action["grant_amount_raw"]), 7 * 10**17 + support + int(action['quoted_fee_raw']))
+        self.assertEqual(int(action["grant_amount_raw"]), 7 * 10**17)
         self.assertNotIn("data_hex", action)
         text = planner.proposal_description("fra", 0, planner.NATIVE_PROFILE).encode()
         self.assertEqual(hashlib.sha256(text).digest(), bytes(action["operation"]["Propose"]["description"]))
@@ -717,13 +718,13 @@ class PlannerTest(unittest.TestCase):
         self.native()
         self.phase("auction")
         self.snapshot["governance"]["world"].update(reserve=str(10**18), revenue="0",
-                                                     grant_capacity=str(12 * 10**17))
+                                                     grant_capacity=str(5 * 10**17))
         action = self.choose()
         self.assertEqual(action["kind"], "propose_grant")
         self.assertNotIn("data_hex", action)
         quotes = [params for method, params in self.calls
                   if method == "fee_quote" and "Propose" in params["operation"]]
-        self.assertEqual(len(quotes), 2)
+        self.assertEqual(len(quotes), 1)
         self.assertTrue(all("data_hex" not in quote for quote in quotes))
         self.assertEqual(action, self.choose())
 
@@ -872,7 +873,8 @@ class PlannerTest(unittest.TestCase):
     def test_native_does_not_clip_half_reserve_target_to_zero_draw_after_fee(self):
         self.native()
         self.phase('auction')
-        self.snapshot['governance']['world'].update(reserve='100', curve_mass='100', shares='100', revenue='3', grant_capacity='83')
+        # One atom short of revenue plus half the reserve: never clip the target.
+        self.snapshot['governance']['world'].update(reserve='100', curve_mass='100', shares='100', revenue='3', grant_capacity='52')
         self.accounts[0]['account'].update(ordinary='3954', shares='0')
         self.accounts[1]['pending'] = self.accounts[2]['pending'] = True
         self.assertNotEqual((self.choose() or {}).get('kind'), 'propose_grant')

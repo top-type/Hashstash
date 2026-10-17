@@ -484,7 +484,8 @@ fn the_leader_at_the_auction_timeout_wins_instead_of_a_refunded_timeout() {
     s = step(&c, &s, &[honest]);
     let (mut support, mut last, mut last_since) = (1, honest_id, leader(&s).1);
     while s.decision_id().is_none() {
-        assert!(matches!(s.phase, Phase::Auction(_)), "the round timed out");
+        // With zero rest a timeout would open round 1 in the same block.
+        assert_eq!(s.auction_round(), Some(0), "the round timed out");
         if s.clock + interval - last_since < lead {
             s = step(&c, &s, &[]);
             continue;

@@ -24,11 +24,11 @@ The curve starts at a fixed exchange rate. When governance draws a grant from th
 
 Transaction fees are divided between the block's miner and network revenue. Winning proposal bids also become revenue. Revenue replenishes a reserve that has funded grants, gradually returning its curve to a fixed exchange rate. Once that reserve is replenished, further revenue waits in a separate balance.
 
-A grant proposes payments to specified accounts. It uses waiting revenue first, then draws any shortfall from the reserve, subject to the network's funding rules. Recipients receive the payments if the proposal passes.
+A grant proposes payments to specified accounts. It uses waiting revenue first, then draws any shortfall from the reserve, at most half of the reserve per grant. Recipients receive the payments if the proposal passes.
 
 ### Governance compares two possible outcomes
 
-A proposal can request a grant or change one network setting. An auction selects which proposal goes to a decision: the proposal with the highest total bid must hold the lead for the required period. The winning bids become revenue. Contributors to losing proposals can reclaim their bids.
+A proposal can request a grant or change one network setting. An auction selects which proposal goes to a decision: the proposal with the highest total bid must hold the lead for the required period, or lead when the auction times out. The winning bids become revenue. Contributors to losing proposals can reclaim their bids.
 
 During the decision, the chain maintains two versions of its balances and reserve:
 

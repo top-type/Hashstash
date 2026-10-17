@@ -22,7 +22,10 @@ function prepare(chain, p) {
 }
 function fee(h,p) {
   const {chain_id,tip,state_root,height}=h.currentSnapshot.status, priority=p.extra_fee||'0';
-  const paid=1n+BigInt(priority),miner=paid/2n;return {miner_fee_percent:50,miner_fee:String(miner),revenue_fee:String(paid-miner),chain_id,tip,state_root,height,sender:addr(p.sender),sender_public_key:p.sender,fee:String(1n+BigInt(priority)),minimum_fee:'1',account_creation_fee:'0',grant_recipient_fee:'0',extra_fee:priority,weight:'512',minimum_fee_rate:'1',pending:false,nonce:0,anchor:tip,anchor_height:height,expiry_blocks:p.expiry_blocks??2,expiry_height:String(BigInt(height)+BigInt(p.expiry_blocks??2)),operation:p.operation,data_hex:p.data_hex||'',data_bytes:(p.data_hex||'').length/2};
+  const paid=1n+BigInt(priority),miner=paid/2n,nonce=p.nonce??0,expiry=p.expiry_blocks??2;
+  // Like the node, weigh the exact body this quote describes plus its 64-byte signature.
+  const weight=Buffer.from(prepare(chain_id,{...p,fee:String(paid),nonce,anchor:p.anchor??tip,expiry_blocks:expiry}).body,'hex').length+64;
+  return {miner_fee_percent:50,miner_fee:String(miner),revenue_fee:String(paid-miner),chain_id,tip,state_root,height,sender:addr(p.sender),sender_public_key:p.sender,fee:String(1n+BigInt(priority)),minimum_fee:'1',account_creation_fee:'0',grant_recipient_fee:'0',extra_fee:priority,weight:String(weight),minimum_fee_rate:'1',pending:false,nonce,anchor:tip,anchor_height:height,expiry_blocks:expiry,expiry_height:String(BigInt(height)+BigInt(expiry)),operation:p.operation,data_hex:p.data_hex||'',data_bytes:(p.data_hex||'').length/2};
 }
 async function setup(options={}) {
   const h=await harness({realWallet:true,publicWeb:true,...options});
@@ -33,7 +36,7 @@ async function setup(options={}) {
   h.currentSnapshot.status.fee_policy={minimum_fee_rate:'1',fee_scale:1024,account_weight:1024};
 
   h.handlers.fee_quote=p=>response({result:fee(h,p)});
-  h.handlers.transfer_quote=p=>{const f=fee(h,p);return response({result:{...f,recipient:addr(p.recipient),public_key:p.recipient,amount:p.amount,recipient_receives:p.amount,total_debit:String(BigInt(p.amount)+BigInt(f.fee))}});};
+  h.handlers.transfer_quote=p=>{const f=fee(h,{...p,operation:{TransferExact:{recipient:p.recipient,amount:p.amount}}});return response({result:{...f,recipient:addr(p.recipient),public_key:p.recipient,amount:p.amount,recipient_receives:p.amount,total_debit:String(BigInt(p.amount)+BigInt(f.fee))}});};
   h.handlers.preparetransaction=p=>response({result:{...prepare(h.currentSnapshot.status.chain_id,p),fee_quote:fee(h,p)}});
   h.handlers.broadcasttransaction=p=>response({result:{transaction_id:sha(sha(Buffer.from(p.raw,'hex'))).toString('hex')}});
   await h.refresh(); return h;

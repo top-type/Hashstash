@@ -1,10 +1,14 @@
 (function(root,factory){'use strict';const api=factory(root);if(typeof module==='object'&&module.exports)module.exports=api;else root.HashstashMail=api;})(globalThis,function(root){
   'use strict';const validId=v=>typeof v==='string'&&/^[0-9a-f]{64}$/.test(v),validCursor=v=>typeof v==='string'&&/^\d{1,20}:\d{1,20}$/.test(v);
   const compareCursor=(a,b)=>{const x=a.split(':').map(BigInt),y=b.split(':').map(BigInt);return x[0]===y[0]?(x[1]>y[1]?1:x[1]<y[1]?-1:0):x[0]>y[0]?1:-1;};
+  const visibleControls=text=>text.replace(/[\u202a-\u202e\u2066-\u2069]/g,c=>`\\u${c.charCodeAt(0).toString(16)}`);
   // One localStorage write commits the ciphertext rows and their scan cursor
-  // together. Persist no decrypted content or secret keys. A full cache keeps
-  // its previous complete checkpoint rather than discarding older messages.
-  const CACHE_PREFIX='hashstash-mail-scan-3:',CACHE_LIMIT=256,CACHE_BYTES=2*1024*1024,SCAN_BUDGET=100;
+  // together. Persist no decrypted content or secret keys. When the opened
+  // messages exceed the cache bounds, the oldest are left out of the saved
+  // copy and counted, so the checkpoint still advances; anyone can send an
+  // address enough mail to fill it. A rescan from the beginning shows them.
+  // Discovery rests briefly after each budget of candidates, then continues.
+  const CACHE_PREFIX='hashstash-mail-scan-3:',CACHE_LIMIT=256,CACHE_BYTES=2*1024*1024,SCAN_BUDGET=100,SCAN_REST_MS=250;
   function cacheEntry(entry){
     const position=entry.position??entry.tx_position??0;
     if(!validId(entry.txid)||!Number.isSafeInteger(entry.height)||entry.height<0||!Number.isSafeInteger(position)||position<0||typeof entry.raw!=='string'||entry.raw.length>CACHE_BYTES||!/^(?:[0-9a-f]{2})+$/.test(entry.raw))throw Error('Invalid cached mail.');
@@ -16,9 +20,19 @@
     let storage;try{storage=Object.hasOwn(options,'storage')?options.storage:root.localStorage;}catch(_){}
     const cacheKey=(chain,key)=>{if(!validId(chain)||!validId(key))throw Error('Invalid mail cache identity.');return CACHE_PREFIX+chain+':'+key;};
     const validate=value=>{
-      if(!value||value.version!==3||!validCursor(value.cursor)||!validId(value.anchor)||!Number.isSafeInteger(value.scanned)||value.scanned<0||!Array.isArray(value.entries)||value.entries.length>CACHE_LIMIT)throw Error('Invalid cached mail.');
+      const omitted=value?.omitted??0;
+      if(!value||value.version!==3||!validCursor(value.cursor)||!validId(value.anchor)||!Number.isSafeInteger(value.scanned)||value.scanned<0||!Number.isSafeInteger(omitted)||omitted<0||!Array.isArray(value.entries)||value.entries.length>CACHE_LIMIT)throw Error('Invalid cached mail.');
       const entries=value.entries.map(cacheEntry);if(new Set(entries.map(e=>e.txid)).size!==entries.length||entries.some(e=>compareCursor(`${e.height}:${e.position}`,value.cursor)>0))throw Error('Invalid cached mail.');
-      return {version:3,cursor:value.cursor,anchor:value.anchor,scanned:value.scanned,entries};
+      return {version:3,cursor:value.cursor,anchor:value.anchor,scanned:value.scanned,omitted,entries};
+    };
+    // Keep the newest entries that fit the count and byte bounds. A signed
+    // carrier too large to cache on its own is left out, not a reason to stop.
+    const bounded=value=>{
+      const all=Array.isArray(value?.entries)?value.entries:[],entries=all.filter(e=>!(typeof e?.raw==='string'&&e.raw.length>CACHE_BYTES)).map(cacheEntry);
+      entries.sort((a,b)=>compareCursor(`${b.height}:${b.position}`,`${a.height}:${a.position}`));
+      let bytes=JSON.stringify({...value,version:3,omitted:Number.MAX_SAFE_INTEGER,entries:[]}).length;const kept=[];
+      for(const entry of entries){if(kept.length>=CACHE_LIMIT)break;const size=JSON.stringify(entry).length+1;if(bytes+size>CACHE_BYTES)continue;bytes+=size;kept.push(entry);}
+      return {...value,version:3,omitted:(value?.omitted??0)+all.length-kept.length,entries:kept.reverse()};
     };
     return Object.freeze({
       read(chain,key){
@@ -26,21 +40,21 @@
         catch(_){return {value:null,error:'Local mail cache is unavailable or invalid; scanning from the beginning for this visit.'};}
       },
       write(chain,key,value){
-        try{if(!storage)throw Error();const encoded=JSON.stringify(validate({...value,version:3}));if(encoded.length>CACHE_BYTES)throw Error();storage.setItem(cacheKey(chain,key),encoded);return {saved:true};}
+        try{if(!storage)throw Error();const checked=validate(bounded(value)),encoded=JSON.stringify(checked);if(encoded.length>CACHE_BYTES)throw Error();storage.setItem(cacheKey(chain,key),encoded);return {saved:true};}
         catch(_){return {saved:false,error:'Local mail storage is full or unavailable. Later progress is kept only for this visit; the last complete checkpoint is preserved.'};}
       },
       clear(chain,key){try{if(!storage||typeof storage.removeItem!=='function')throw Error();storage.removeItem(cacheKey(chain,key));return {cleared:true};}catch(_){return {cleared:false,error:'This browser could not clear its local mail cache.'};}}
     });
   }
   function create({rpc,getIdentity,recipientKey,decrypt,verifySigned,encodeAddress,onDraftChange=()=>{},document=root.document,location=root.location,cache=createCache()}){
-    const $=id=>document.getElementById(id),form=$('mail-form');let context={},sequence=0,prepared=null,preparing=null,checkedTip='',verifiedTip='',cursor=null,anchor=null,opened=new Map(),lastWallet='',loading=false,paused=false,scanned=0,visibleCount=50,rendered='',cacheLoaded=false,restoreEntries=[],storageNote='';
+    const $=id=>document.getElementById(id),form=$('mail-form');let context={},sequence=0,prepared=null,preparing=null,checkedTip='',verifiedTip='',cursor=null,anchor=null,opened=new Map(),lastWallet='',loading=false,paused=false,scanned=0,visibleCount=50,rendered='',cacheLoaded=false,restoreEntries=[],storageNote='',omitted=0;
     const active=()=>location.hash.split('?')[0]==='#mail',eligible=()=>active()&&context.ready&&context.available&&context.key&&context.can_decrypt;
     const add=(p,t,c,text)=>{const n=document.createElement(t);n.className=c;if(text!==undefined)n.textContent=text;p.appendChild(n);return n;};
     const identity=()=>getIdentity(),yieldTask=()=>new Promise(resolve=>root.setTimeout(resolve,0));
     const draftId=()=>JSON.stringify([identity(),form.elements.recipient.value,recipientKey(form.elements.recipient.value),form.elements.subject.value,form.elements.message.value]);
     function invalidate(){prepared=null;preparing=null;}
     function error(message){$('mail-error').textContent=message;$('mail-error').hidden=!message;}
-    function resetScan(){opened.clear();cursor=null;anchor=null;checkedTip='';verifiedTip='';scanned=0;visibleCount=50;rendered='';$('mail-list').replaceChildren();error('');}
+    function resetScan(){opened.clear();cursor=null;anchor=null;checkedTip='';verifiedTip='';scanned=0;omitted=0;visibleCount=50;rendered='';$('mail-list').replaceChildren();error('');}
     function blank(){invalidate();resetScan();paused=false;cacheLoaded=false;restoreEntries=[];storageNote='';}
     function render(){
       const verified=verifiedTip===context.tip;
@@ -48,6 +62,7 @@
       $('mail-empty').textContent=!context.key?'Select a wallet.':!context.can_decrypt?'Watch-only · import the private key to read mail.':!context.available?'Mail unavailable.':loading?'Checking messages…':paused?'Scan paused.':!verified&&checkedTip?'Verifying latest blocks…':'No messages found.';
       $('mail-scan-status').textContent=context.key&&context.can_decrypt?(loading?`Scanning · ${scanned} checked · ${opened.size} found`:paused?`Paused · ${scanned} checked`:!verified&&checkedTip?'Verification pending':verified?`${scanned} checked · ${opened.size} found`:''):'';
       if(context.key&&context.can_decrypt&&storageNote)$('mail-scan-status').textContent+=' · '+storageNote;
+      if(context.key&&context.can_decrypt&&omitted)$('mail-scan-status').textContent+=` · ${omitted} earlier message${omitted===1?' is':'s are'} not kept in this browser; clear the saved scan to show ${omitted===1?'it':'them'} again`;
       $('mail-more').hidden=!context.can_decrypt||!context.key||(!loading&&!paused);$('mail-more').textContent=paused?'Continue scan':'Pause scan';
       $('mail-show-more').hidden=!verified||opened.size<=visibleCount;
       if($('mail-clear-cache'))$('mail-clear-cache').disabled=!context.key||!context.can_decrypt;
@@ -61,13 +76,15 @@
         add(heading,'strong','',outgoing?'Sent':'Received');const link=add(heading,'a','small-link',`Block ${entry.height}`);link.href='#explorer?tx='+entry.txid;
         const peerLine=add(row,'p','mail-peer');add(peerLine,'span','',outgoing?'To: ':'From: ');add(peerLine,'span','',peer);
         const confirmations=Number.isSafeInteger(context.height)?Math.max(0,context.height-entry.height+1):entry.confirmations??0;add(row,'p','field-help',`${confirmations} confirmations`);
-        const copy=add(row,'div','mail-content');add(copy,'h3','mail-subject',clear.subject);add(copy,'p','mail-body',clear.body);
+        // Explicit bidi embeddings, overrides and isolates are shown as escapes
+        // so decrypted text cannot display in a different order from its bytes.
+        const copy=add(row,'div','mail-content');add(copy,'h3','mail-subject',visibleControls(clear.subject));add(copy,'p','mail-body',visibleControls(clear.body));
       }
     }
     async function load(){
       if(!eligible()||loading||paused)return;
       loading=true;const version=++sequence,stamp=lastWallet;let restarted=false,checkedThisPass=0;
-      if(!cacheLoaded){cacheLoaded=true;const saved=cache.read(context.chain_id,context.key);storageNote=saved.error||'';if(saved.value){cursor=saved.value.cursor;anchor=saved.value.anchor;scanned=saved.value.scanned;restoreEntries=saved.value.entries;}}
+      if(!cacheLoaded){cacheLoaded=true;const saved=cache.read(context.chain_id,context.key);storageNote=saved.error||'';if(saved.value){cursor=saved.value.cursor;anchor=saved.value.anchor;scanned=saved.value.scanned;omitted=saved.value.omitted;restoreEntries=saved.value.entries;}}
       const current=()=>version===sequence&&stamp===lastWallet&&eligible()&&!paused;render();
       try{
         do{
@@ -121,9 +138,11 @@
           // page is retried rather than silently skipping its remaining mail.
           for(const value of found)opened.set(value.entry.txid,value);
           restoreEntries=[];verifiedTip=result.tip;scanned+=result.messages.length;checkedThisPass+=result.messages.length;cursor=result.scan_cursor;anchor=result.anchor;error('');
-          const saved=cache.write(context.chain_id,context.key,{cursor,anchor,scanned,entries:[...opened.values()].map(v=>v.entry)});storageNote=saved.error||'';
+          const saved=cache.write(context.chain_id,context.key,{cursor,anchor,scanned,omitted,entries:[...opened.values()].map(v=>v.entry)});storageNote=saved.error||'';
           if(result.next_cursor==null){checkedTip=context.tip;break;}
-          if(checkedThisPass>=SCAN_BUDGET){paused=true;render();break;}
+          // Rest after each budget instead of waiting for a click, so a long
+          // history (or envelope spam) costs time, not repeated user action.
+          if(checkedThisPass>=SCAN_BUDGET){render();await new Promise(resolve=>root.setTimeout(resolve,SCAN_REST_MS));if(!current())return;checkedThisPass=0;continue;}
           render();await yieldTask();
         }while(current());
       }catch(e){if(current()){checkedTip=context.tip;verifiedTip='';error(e.message);}}

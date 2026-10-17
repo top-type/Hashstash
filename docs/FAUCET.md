@@ -84,9 +84,16 @@ direct its mining payout to that node's faucet account through node configuratio
 To show **Get test hashes** in Wallet, the website must serve
 `/faucet-config.json` with `{"url":"https://FAUCET_HOST","chain_id":"NETWORK_CHAIN_ID"}`.
 The URL is the HTTPS origin without `/faucet`; the wallet app adds the API paths.
-Use `Cache-Control: no-store`. If the faucet uses another origin, add that exact
-origin to the website's `connect-src` policy. Without a matching descriptor the
-wallet hides the optional faucet controls.
+Use `Cache-Control: no-store`. The same-origin `/faucet/` route below works with
+the node's built-in policy. The node sends a fixed Content-Security-Policy with
+`connect-src 'self'`, and a second CSP header added by a proxy can only narrow
+it. To use a faucet on another origin, the proxy must replace the node's header
+(for example nginx `proxy_hide_header Content-Security-Policy;`) with a complete
+copy of the node's policy that differs only by adding that exact origin to
+`connect-src`. Keep every other directive, including `script-src 'self'`. Without
+a matching descriptor the wallet hides the optional faucet controls. The wallet
+queries faucet status, which names the selected address, only while Wallet is
+open, so another view never reports an address to the faucet operator.
 
 For example, the proxy can preserve its external Host and set:
 

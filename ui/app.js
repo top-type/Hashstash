@@ -15,6 +15,8 @@
         balances: null,
         proposals: [],
         mempool: [],
+        senderMempool: null,
+        pendingNonce: null,
         ready: false,
         contextEpoch: 0,
         refreshing: false,
@@ -244,6 +246,17 @@
         const full = address(value), start = full.lastIndexOf("1") + 1;
         return full ? `hsh…${full.slice(start, start + 10)}…${full.slice(-6)}` : "—";
     }
+    function proposalShort(value) {
+        // Proposers choose a free description commitment, so a 48-bit label
+        // could be ground to match another proposal. Show 64 bits.
+        const s = hex(value);
+        return s ? `${s.slice(0, 10)}…${s.slice(-6)}` : "—";
+    }
+    function visibleControls(value) {
+        // Explicit bidi embeddings, overrides and isolates in user-authored
+        // text are shown as escapes so it cannot display out of signed order.
+        return String(value).replace(/[\u202a-\u202e\u2066-\u2069]/g, c => `\\u${c.charCodeAt(0).toString(16)}`);
+    }
     function commas(value) {
         return String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
     }
@@ -375,8 +388,26 @@
             feedback(form, `No longer pending · ${short(tracked.id)} expired or was invalidated by a reorganization. Prepare it again.`, true);
         }
     }
+    // Node JSON carries u64 values (settings, proposal parameters, lifetimes)
+    // that can exceed 2^53. Engines without JSON.parse source-text access get
+    // those integer literals quoted first, so each arrives as the same exact
+    // decimal string the source-text path returns instead of failing the
+    // whole response.
+    const jsonSourceText = (() => {
+        try {
+            let source = null;
+            JSON.parse("1", (_key, value, context) => (source = context?.source, value));
+            return source === "1";
+        } catch {
+            return false;
+        }
+    })();
+    function quoteUnsafeIntegers(source) {
+        return source.replace(/"(?:[^"\\]|\\.)*"|(?<![\d.eE+-])-?\d{16,}(?![\d.eE])/g, token => token[0] === '"' || Number.isSafeInteger(Number(token)) ? token : `"${token}"`);
+    }
     async function exactJSON(response) {
-        return JSON.parse(await response.text(), (_key, value, context) => {
+        const source = await response.text();
+        return JSON.parse(jsonSourceText ? source : quoteUnsafeIntegers(source), (_key, value, context) => {
             if (typeof value === "number" && Number.isInteger(value) && !Number.isSafeInteger(value)) {
                 if (!context?.source || !/^-?\d+$/.test(context.source)) throw new Error("This browser cannot safely read a large numeric field from the node.");
                 return context.source;
@@ -408,6 +439,21 @@
     }
     function activeDecision() {
         return state.gov?.phase?.Governance || null;
+    }
+    // The block after the decision's last tip resolves it in prepare_block,
+    // before any of its transactions, so a conditional trade prepared now can
+    // never be included. This is the same height test consensus applies.
+    const tradingClosedMessage = "Trading is closed: the decision resolves at the start of the next block, before its transactions.";
+    function decisionClosing() {
+        const decision = activeDecision();
+        return !!decision && !!state.status && BigInt(state.status.height) - BigInt(decision.started_height) + 1n >= BigInt(decision.blocks);
+    }
+    // consensus::pass_beats_fail: one block's exact PASS/FAIL comparison.
+    function passBeatsFail(pass, fail, marginBps) {
+        const passShares = BigInt(pass.shares), failShares = BigInt(fail.shares);
+        if (passShares === 0n) return false;
+        if (failShares === 0n) return BigInt(pass.curve_mass) !== 0n;
+        return BigInt(pass.curve_mass) * failShares * 10000n > BigInt(fail.curve_mass) * passShares * (10000n + BigInt(marginBps));
     }
     function phaseName() {
         return state.gov ? Object.keys(state.gov.phase)[0] : "Auction";
@@ -636,7 +682,7 @@
         $("export-private").disabled = !managerEnabled || !state.session?.wallet_enabled;
         for (const id of [ "copy-key", "copy-receive-key" ]) $(id).disabled = !key();
         $("export-network").disabled = !state.ready;
-        $("trade-submit").disabled = !enabled || !state.quoteOutput || state.quoteOutput.identity !== tradeIdentity();
+        $("trade-submit").disabled = !enabled || decisionClosing() || !state.quoteOutput || state.quoteOutput.identity !== tradeIdentity();
         $("send-submit").disabled = !enabled || !state.sendQuote || state.sendQuote.identity !== sendIdentity();
         document.querySelectorAll(".wallet-action").forEach(button => {
             const form = button.closest("form");
@@ -701,7 +747,10 @@
         }
     }
     async function refreshFaucet(force = false) {
-        if (!state.ready || faucet.checking) return;
+        // The faucet may be a separately operated origin, and its status query
+        // names the selected address. Ask only while Wallet, where the faucet
+        // control lives, is open.
+        if (!state.ready || faucet.checking || location.hash.split("?")[0] !== "#wallet") return;
         const chain = state.status.chain_id, claimKey = faucetKey(), sequence = faucet.sequence;
         const identity = walletIdentity();
         const current = () => state.ready && chain === state.status?.chain_id && identity === walletIdentity() && sequence === faucet.sequence;
@@ -814,14 +863,11 @@
         if (state.submitting) throw new Error("Wait for the current submission to finish.");
         if (state.managing) throw new Error("Wait for the wallet change to finish.");
         if (form.id === "send-form" && operation.TransferExact && (!state.sendQuote || state.sendQuote.identity !== sendIdentity())) throw new Error("Wait for a current payment quote.");
-        let feeFields;
-        {
-            const quote = feeQuotes.get(form.id);
-            if (!quote || quote.identity !== feeIdentity(form)) throw new Error("Wait for the current fee quote.");
-            feeFields = {
-                fee: quote.fee
-            };
-        }
+        const feeQuote = feeQuotes.get(form.id);
+        if (!feeQuote || feeQuote.identity !== feeIdentity(form)) throw new Error("Wait for the current fee quote.");
+        const feeFields = {
+            fee: feeQuote.fee
+        };
         checkOutcomeFunds(operation, feeFields.fee);
         const expiry = transactionExpiry(form);
         if (!expiry) throw new Error("Transaction expiry must be greater than zero.");
@@ -859,6 +905,7 @@
             if (identity !== submissionIdentity(form)) throw new Error("Details or connection changed. Prepare the transaction again.");
             if (typeof envelope?.body !== "string" || envelope.body.length / 2 + 64 > transactionByteLimit()) throw new Error("Transaction exceeds the block capacity.");
             HashstashBrowserWallet.verifyUnsigned(envelope, expected);
+            checkPreparedWeight(envelope.body, feeQuote, operation);
             if (identity !== submissionIdentity(form)) throw new Error("Details or connection changed. Review again.");
             if (!hot) {
                 $("unsigned-output").value = JSON.stringify({
@@ -868,6 +915,7 @@
                 }, null, 2);
                 $("unsigned-dialog").showModal();
                 feedback(form, "Unsigned transaction prepared.");
+                form.id === "propose-form" && rememberDescription(operation);
                 return envelope;
             }
             const signed = await browserWallet.signUnsigned(envelope, expected);
@@ -877,6 +925,7 @@
             });
             const id = data.transaction_id;
             if (!id || id !== signed.transaction_id) throw new Error("The node returned an unexpected transaction ID.");
+            form.id === "propose-form" && rememberDescription(operation);
             toast("Transaction submitted.");
             if (form.id !== "mail-form" || identity === submissionIdentity(form)) {
                 form.id === "mail-form" && mail?.sent();
@@ -892,9 +941,16 @@
             form.id === "send-form" && sendSoon();
         }
     }
+    // The snapshot's global mempool page is capped at 128 rows. The node also
+    // reports the selected sender's own pending rows and its next nonce over
+    // the whole pool, the value preparetransaction requires.
+    function ownPending() {
+        return Array.isArray(state.senderMempool) ? state.senderMempool : state.mempool.filter(tx => hex(tx.body?.sender) === key());
+    }
     function nextNonce() {
         let nonce = BigInt(state.account?.account?.nonce || "0");
-        for (const transaction of state.mempool) hex(transaction.body?.sender) === key() && BigInt(transaction.body.nonce) >= nonce && (nonce = BigInt(transaction.body.nonce) + 1n);
+        /^\d{1,20}$/.test(String(state.pendingNonce ?? "")) && BigInt(state.pendingNonce) > nonce && (nonce = BigInt(state.pendingNonce));
+        for (const transaction of ownPending()) hex(transaction.body?.sender) === key() && BigInt(transaction.body.nonce) >= nonce && (nonce = BigInt(transaction.body.nonce) + 1n);
         return nonce;
     }
     function submissionIdentity(form) {
@@ -942,6 +998,8 @@
         checkQuoteSnapshot(result);
         if (result.anchor !== state.status.tip || String(result.anchor_height) !== String(state.status.height) || String(result.expiry_blocks) !== String(transactionExpiry(form)) || BigInt(result.expiry_height) !== BigInt(state.status.height) + BigInt(transactionExpiry(form))) throw new Error("Fee quote does not match the transaction lifetime.");
         if (result.sender_public_key !== key() || result.sender !== address() || result.extra_fee !== extra) throw new Error("Fee quote does not match this account.");
+        // The nonce's encoded length is part of the weight the fee pays for.
+        if (result.nonce !== void 0 && String(result.nonce) !== nextNonce().toString()) throw new Error("Fee quote does not match the transaction number.");
         {
             const data = transactionData(form).data_hex || "";
             if (result.data_hex !== data || result.data_bytes !== data.length / 2) throw new Error("Fee quote does not match the transaction data.");
@@ -962,6 +1020,16 @@
             if (miner !== fee * BigInt(percent) / 100n || miner + revenue !== fee) throw new Error("Invalid fee allocation totals.");
         }
         return result;
+    }
+    function checkPreparedWeight(body, quote, operation) {
+        // The quoted weight, and so the minimum fee, came from the node.
+        // Re-derive it from the exact prepared bytes: the body plus a 64-byte
+        // signature, 1,024 per grant recipient and, only for a payment that
+        // creates its recipient's account, another 1,024.
+        const base = BigInt(body.length / 2 + 64), recipients = BigInt(operation?.Propose?.proposal?.Grant?.payments?.length || 0);
+        const extra = BigInt(quote?.weight ?? -1) - base - recipients * 1024n, creation = BigInt(quote?.account_creation_fee ?? 0) !== 0n;
+        const creates = !!operation?.TransferExact && extra === 1024n && (creation || BigInt(quote?.minimum_fee_rate ?? 1) === 0n);
+        if (!(extra === 0n && !creation || creates)) throw new Error("The quoted fee weight does not match the prepared transaction.");
     }
     function clearFeeAllocation(form) {
         const node = $(form.id.replace("-form", "-fee-allocation"));
@@ -1024,7 +1092,8 @@
                 ...transactionData(form),
                 extra_fee: extra,
                 anchor: state.status.tip,
-                expiry_blocks: jsonInteger(transactionExpiry(form))
+                expiry_blocks: jsonInteger(transactionExpiry(form)),
+                nonce: jsonInteger(nextNonce())
             });
             if (!current()) return;
             checkFeeQuote(result, extra, form, operation);
@@ -1113,6 +1182,7 @@
         chat?.route();
         mail?.route();
         refreshExplanations();
+        refreshFaucet();
     }
     function accountView() {
         const a = state.ready ? snapshotAccount(state.account) : void 0;
@@ -1211,7 +1281,7 @@
     }
     function renderActivity() {
         const list = $("activity-list");
-        const rows = state.mempool.filter(tx => hex(tx.body.sender) === key());
+        const rows = ownPending().filter(tx => hex(tx.body?.sender) === key());
         $("activity-panel").hidden = !key() || rows.length === 0;
         text("activity-count", `${state.mempool.length} pending`);
         if (!renderChanged(list, [ state.session?.address_hrp, rows.slice(0, 5) ])) return;
@@ -1241,7 +1311,7 @@
                 Support: "Proposal support",
                 Refund: "Auction refund"
             }[kind] || kind);
-            append(copy, "small", "", `${short(address(tx.body.sender))} · nonce ${tx.body.nonce}${operation.outcome ? ` · ${operation.outcome.toUpperCase()}` : ""}`);
+            append(copy, "small", "", `${shortAddress(tx.body.sender)} · nonce ${tx.body.nonce}${operation.outcome ? ` · ${operation.outcome.toUpperCase()}` : ""}`);
             const val = append(row, "div", "activity-value");
             appendAmount(val, "span", "", operation.shares ? `${HashstashShares.formatAmount(operation.shares)} stash` : hashAmount(operation.amount || operation.support || "0"));
             append(val, "small", "", "pending");
@@ -1531,7 +1601,7 @@
         $("governance-market-details").hidden = !active;
         $("governance-details").hidden = !active && !(name === "Auction" && phase.leader);
         $("stash-context-notice").hidden = !active;
-        text("stash-context-notice", "Fees require hashes in both outcomes.");
+        text("stash-context-notice", decisionClosing() ? tradingClosedMessage : "Fees require hashes in both outcomes.");
         $("gov-result").hidden = !active;
         if (!active) {
             text("gov-result-status", "");
@@ -1575,10 +1645,10 @@
         }
         if (name === "Auction") {
             text("gov-round", `Round ${phase.round}`);
-            text("gov-title", phase.leader ? `Leader ${short(phase.leader)}` : "Auction open");
+            text("gov-title", phase.leader ? `Leader ${proposalShort(phase.leader)}` : "Auction open");
             text("gov-subtitle", phase.leader ? "The leading proposal advances after its required lead." : "Choose the next proposal.");
             text("overview-governance-title", "Auction open");
-            text("overview-governance-text", phase.leader ? `Leader ${short(phase.leader)}` : "No leader");
+            text("overview-governance-text", phase.leader ? `Leader ${proposalShort(phase.leader)}` : "No leader");
         } else if (active) {
             text("gov-round", `Round ${decision.round}`);
             text("gov-title", grant ? "Recipients" : proposalTitle(decision.proposal));
@@ -1598,15 +1668,20 @@
                 if (!hasStash) $(`${id}-price`).title = "No outstanding stash. Its price is zero until a deposit starts the reserve.";
             }
             const funded = !grant || BigInt(gov.pass.grant_escrow) === BigInt(grantTotal(grant.payments));
-            const passLeads = leading * 2n > observed && funded;
-            text("gov-result-status", observed ? passLeads ? "PASS leads" : "FAIL leads" : "Pending");
-            text("gov-result-detail", `${commas(leading)} of ${blockCount(observed)} counted for PASS. ${blockCount(total - observed)} remain.${funded ? "" : " Funding is incomplete."}`);
-            $("gov-result").dataset.outcome = observed ? passLeads ? "pass" : "fail" : "";
-            $("gov-result").title = `${blockCount(observed)} observed. ${criterion} The result is not final until resolution.`;
+            // At the last tip the next block adds one observation from this
+            // tip's closing prices and then resolves before its transactions,
+            // so the outcome is already fixed. Show it as consensus will decide it.
+            const final = decisionClosing();
+            const finalLeading = leading + (passBeatsFail(gov.pass, gov.world, margin) ? 1n : 0n);
+            const passLeads = final ? funded && finalLeading > total / 2n : leading * 2n > observed && funded;
+            text("gov-result-status", final ? passLeads ? "PASS decided" : "FAIL decided" : observed ? passLeads ? "PASS leads" : "FAIL leads" : "Pending");
+            text("gov-result-detail", final ? `${commas(finalLeading)} of ${blockCount(total)} count for PASS, including this block's closing prices. The decision resolves at the start of the next block, before its transactions.${funded ? "" : " Funding is incomplete."}` : `${commas(leading)} of ${blockCount(observed)} counted for PASS. ${blockCount(total - observed)} remain.${funded ? "" : " Funding is incomplete."}`);
+            $("gov-result").dataset.outcome = final || observed ? passLeads ? "pass" : "fail" : "";
+            $("gov-result").title = final ? `The result is fixed: no transaction can change it before resolution. ${criterion}` : `${blockCount(observed)} observed. ${criterion} The result is not final until resolution.`;
             for (const side of ["pass", "fail"]) {
-                const isLeading = !!observed && (side === "pass" ? passLeads : !passLeads);
+                const isLeading = (final || !!observed) && (side === "pass" ? passLeads : !passLeads);
                 $(`${side}-outcome-leader`).hidden = true;
-                $(`${side}-outcome-card`).title = isLeading ? `${side.toUpperCase()} leads. Decision pending.` : "";
+                $(`${side}-outcome-card`).title = isLeading ? final ? `${side.toUpperCase()} is decided. Resolution follows in the next block.` : `${side.toUpperCase()} leads. Decision pending.` : "";
                 $(`${side}-outcome-card`).classList.toggle("is-leading", isLeading);
             }
             number("pass-reserve", gov.pass.reserve);
@@ -1628,6 +1703,7 @@
         parameterPreview();
         renderProposals();
         renderDecisionMessage();
+        supportPreview();
     }
     function proposalTitle(action) {
         if (action.Grant) return action.Grant.payments.map(payment => `${shortAddress(payment.recipient)} · ${hashAmount(payment.amount)}`).join(" / ");
@@ -1640,17 +1716,32 @@
     function renderDecisionMessage() {
         const id = hex(activeDecision()?.proposal_id), node = $("gov-decision-message");
         const message = state.ready && id ? proposalExplanations.get(`${state.status.chain_id}:${id}`) || "" : "";
-        text("gov-decision-message", message);
+        text("gov-decision-message", visibleControls(message));
         node.hidden = !message;
     }
+    // Descriptions are published on chain. This session's own submissions are
+    // remembered in memory until the explorer has them; drafts are never stored.
+    const submittedDescriptions = new Map;
+    function rememberDescription(operation) {
+        const form = $("propose-form");
+        if (!operation?.Propose || form.elements.data_format?.value === "private") return;
+        submittedDescriptions.delete(hex(operation.Propose.description));
+        submittedDescriptions.set(hex(operation.Propose.description), form.elements.description.value.trim());
+        submittedDescriptions.size > 32 && submittedDescriptions.delete(submittedDescriptions.keys().next().value);
+    }
     function savedDescription(hashValue, shared) {
-        let local = "";
-        try {
-            local = localStorage.getItem(`hashstash-description-${hex(hashValue)}`) || "";
-        } catch {/* Legacy local cache is optional. */}
+        const local = submittedDescriptions.get(hex(hashValue)) || "";
         if (typeof HashstashProposalData === "object") return HashstashProposalData.verifiedText(shared, hex(hashValue)) || HashstashProposalData.verifiedText(local, hex(hashValue));
         return local;
     }
+    // Earlier versions wrote every intermediate draft of a description to
+    // localStorage under its own key. Remove that retired cache.
+    try {
+        for (let index = localStorage.length - 1; index >= 0; index--) {
+            const name = localStorage.key(index);
+            typeof name === "string" && name.startsWith("hashstash-description-") && localStorage.removeItem(name);
+        }
+    } catch {/* Cleanup of the retired draft cache is optional. */}
     function refreshExplanations() {
         if (typeof HashstashProposalData !== "object" || !state.ready || location.hash.split("?")[0] !== "#governance") return;
         const chain = state.status.chain_id;
@@ -1705,12 +1796,12 @@
             if (description) {
                 const explanation = append(main, "details", "proposal-explanation");
                 append(explanation, "summary", "", "Explanation");
-                append(explanation, "p", "proposal-detail", description);
+                append(explanation, "p", "proposal-detail", visibleControls(description));
             }
             const winner = name === "Governance" && record.id === leader;
             const cancelled = p.refund_height !== null && p.refund_height !== void 0;
             const status = winner ? "In decision · bid becomes revenue" : name !== "Auction" || cancelled ? name === "Governance" ? "Not selected · backing may be refundable" : cancelled ? "Removed from auction" : "Past proposal" : record.id === leader ? "Current auction leader" : "In auction";
-            append(main, "p", "proposal-detail", `Round ${p.round} · ${short(record.id)} · ${status}`);
+            append(main, "p", "proposal-detail", `Round ${p.round} · ${proposalShort(record.id)} · ${status}`);
             const side = append(row, "div", "proposal-side"), support = append(side, "div", "proposal-support");
             appendAmount(support, "strong", "", hashAmount(p.support));
             append(support, "small", "", "backing");
@@ -1733,7 +1824,7 @@
                         block: "center"
                     });
                     (isSupport ? form.elements.amount : form.elements.proposal).focus();
-                    isSupport || checkSupport(form);
+                    isSupport ? supportPreview() : checkSupport(form);
                     feeSoon(form);
                 });
             }
@@ -1752,6 +1843,59 @@
             feedback(form, `${formatExactHash(String(data.amount))} of your support. ${data.status === "converted_to_revenue" ? "This proposal won its round; its support became revenue and is never refundable." : data.refundable ? "Available for refund." : data.status === "none" ? "Nothing to refund." : "Not currently refundable."}`);
         } catch (error) {
             feedback(form, error.message, true);
+        }
+    }
+    // Support is signed for a pasted 64-hex ID. Resolve it to the proposal it
+    // backs before signing and show that action, so an ID passed around
+    // elsewhere cannot silently back something else.
+    const supportLookups = new Map;
+    let supportPreviewVersion = 0;
+    async function supportProposal(value) {
+        const auction = state.gov?.phase?.Auction;
+        if (!auction) throw new Error("There is no open auction.");
+        const id = hex(hexBytes(value, "Proposal ID")).toLowerCase();
+        const local = state.proposals.find(record => record.id === id);
+        let proposal = local?.proposal;
+        // The snapshot lists at most 128 proposals per round; look up the rest.
+        if (!local && state.proposals.length >= 128) {
+            const chain = state.status.chain_id, cache = `${chain}:${state.status.tip}:${id}`;
+            if (!supportLookups.has(cache)) {
+                supportLookups.size > 50 && supportLookups.clear();
+                supportLookups.set(cache, rpc("explorer_governance", {
+                    proposal: id,
+                    limit: 1
+                }).then(result => result.chain_id === chain && result.proposals?.find(item => item.id === id) || null).catch(() => null));
+            }
+            const found = await supportLookups.get(cache);
+            found && (proposal = {round: found.round, action: found.action});
+        }
+        if (!proposal?.action || String(proposal.round) !== String(auction.round) || proposal.refund_height !== null && proposal.refund_height !== void 0) throw new Error("This ID is not an active proposal in the current auction round.");
+        return {id, action: proposal.action};
+    }
+    async function supportPreview() {
+        const version = ++supportPreviewVersion, node = $("support-proposal-preview"), raw = $("support-form").elements.proposal.value.trim();
+        const shown = !!raw && state.ready;
+        let target = null, message = "";
+        if (shown) try {
+            target = await supportProposal(raw);
+        } catch (error) {
+            message = error.message;
+        }
+        // Polling re-resolves the ID; leave an unchanged preview in place.
+        if (version !== supportPreviewVersion || !renderChanged(node, [ shown, target, message, state.session?.address_hrp ])) return;
+        node.replaceChildren();
+        node.hidden = !shown;
+        if (!shown) return;
+        node.classList.toggle("error", !target);
+        if (!target) {
+            append(node, "p", "field-help", message);
+            return;
+        }
+        append(node, "p", "field-help", `Backs proposal ${proposalShort(target.id)}:`);
+        if (target.action.Grant) renderGrantPayments(node, target.action.Grant);
+        else {
+            const p = target.action.Parameter, setting = settings[p?.parameter];
+            append(node, "p", "proposal-title", setting ? `${setting[1]}: ${settingValue(setting[0], p.old, setting[2], true)} → ${settingValue(setting[0], p.new, setting[2], true)}` : "Unknown action");
         }
     }
     function parameterPreview() {
@@ -1915,6 +2059,7 @@
         state.proposals = [];
         renderDecisionMessage();
         state.mempool = [];
+        state.senderMempool = state.pendingNonce = null;
         document.querySelectorAll("form").forEach(form => {
             // Public Explorer searches are independent of the selected wallet.
             if (!form.querySelector(".form-feedback")) return;
@@ -2023,6 +2168,8 @@
             state.status = status;
             state.gov = gov;
             state.mempool = mempool;
+            state.senderMempool = key() && Array.isArray(snapshot.sender_mempool) ? snapshot.sender_mempool : null;
+            state.pendingNonce = key() ? snapshot.pending_nonce ?? null : null;
             state.account = account;
             state.proposals = proposals;
             state.pass = pass;
@@ -2159,6 +2306,7 @@
         }
         try {
             const kind = state.trade, amount = kind === "deposit" ? integer(raw) : stashInteger(raw), outcome = $("trade-outcome").value;
+            if (decisionClosing()) throw new Error(tradingClosedMessage);
             const result = await rpc("stash_quote", {
                 key: key(),
                 kind: kind,
@@ -2243,7 +2391,8 @@
                     ...transactionData(form),
                     extra_fee: extra,
                     anchor: state.status.tip,
-                    expiry_blocks: jsonInteger(transactionExpiry($("send-form")))
+                    expiry_blocks: jsonInteger(transactionExpiry($("send-form"))),
+                    nonce: jsonInteger(nextNonce())
                 });
                 if (version !== sendVersion || identity !== sendIdentity() || !state.ready) return;
                 checkFeeQuote(result, extra, form);
@@ -2741,6 +2890,7 @@
     $("unsigned-download").addEventListener("click", () => downloadText("hashstash-unsigned.json", $("unsigned-output").value));
     bindForm("trade-form", v => {
         const amount = state.trade === "deposit" ? integer(v.amount) : stashInteger(v.amount), ctx = context(v.outcome), quote = state.quoteOutput;
+        if (decisionClosing()) throw new Error(tradingClosedMessage);
         if (activeDecision() && !v.outcome) throw new Error("Choose PASS or FAIL while governance is active.");
         if (!quote || quote.identity !== tradeIdentity()) throw new Error("Wait for a current quote.");
         if (hex(quote.decision) !== hex(ctx.decision)) throw new Error("Decision changed. Refresh and submit again.");
@@ -2781,17 +2931,19 @@
             }
         };
     });
-    bindForm("support-form", v => {
+    bindForm("support-form", async v => {
         const auction = state.gov?.phase?.Auction;
         if (!auction) throw new Error("There is no open auction.");
+        const target = await supportProposal(v.proposal);
         return {
             Support: {
                 round: auction.round,
-                proposal: hexBytes(v.proposal, "Proposal ID"),
+                proposal: hexBytes(target.id, "Proposal ID"),
                 amount: integer(v.amount)
             }
         };
     });
+    $("support-form").elements.proposal.addEventListener("input", supportPreview);
     bindForm("refund-form", v => ({
         Refund: {
             round: safeInteger(v.round, "Auction round"),
@@ -2828,9 +2980,6 @@
         const encrypted = $("propose-form").elements.data_format?.value === "private";
         const descriptionBytes = encrypted ? new Uint8Array(transactionData($("propose-form")).data_hex.match(/../g).map(value => parseInt(value,16))) : (new TextEncoder).encode(v.description.trim());
         const description = new Uint8Array(await crypto.subtle.digest("SHA-256", descriptionBytes));
-        if (!encrypted) try {
-            localStorage.setItem(`hashstash-description-${hex(Array.from(description))}`, v.description.trim());
-        } catch {/* Local descriptions are optional. */}
         return {
             Propose: {
                 round: auction.round,
@@ -2872,6 +3021,10 @@
     $("trade-max").addEventListener("click", async () => {
         const outcome = $("trade-outcome").value, selected = outcome === "Pass" ? state.pass : outcome === "Fail" ? state.fail : state.account;
         if (!state.ready || !selected?.account) return;
+        if (decisionClosing()) {
+            feedback($("trade-form"), tradingClosedMessage, true);
+            return;
+        }
         state.tradeAll = state.trade === "redeem";
         let value = BigInt(state.tradeAll ? selected.account.shares : outcome ? outcomeCash(selected) : selected.account.ordinary);
         if (state.trade === "deposit") {
@@ -2901,7 +3054,8 @@
                         ...transactionData($("trade-form")),
                         extra_fee: extra,
                         anchor: state.status.tip,
-                        expiry_blocks: jsonInteger(transactionExpiry($("trade-form")))
+                        expiry_blocks: jsonInteger(transactionExpiry($("trade-form"))),
+                        nonce: jsonInteger(nextNonce())
                     });
                     if (identity !== tradeIdentity() || snapshot !== state.status?.state_root || !state.ready) return;
                     checkFeeQuote(fee, extra, $("trade-form"));

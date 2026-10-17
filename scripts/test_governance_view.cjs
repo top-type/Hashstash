@@ -75,6 +75,39 @@ async function run() {
   assert.match(h.get('gov-grant-progress').title, /Set aside on PASS/); checks++;
   assert.equal(h.get('pass-ratio').textContent, '20%'); checks++;
   assert.equal(h.get('fail-ratio').textContent, '20%'); checks++;
+
+  // At the last tip the next block adds one observation from these closing
+  // prices and resolves before its transactions: the result is already fixed.
+  const status = () => h.get('gov-result-status').textContent;
+  decision.started_height = s.status.height - 15; decision.leading_blocks = 8; await h.refresh();
+  assert.equal(status(), 'PASS decided', 'PASS leads at the closing prices, so it reaches 9 of 16'); checks++;
+  assert.match(h.get('gov-result-detail').textContent, /9 of 16 blocks count for PASS.*resolves at the start of the next block/); checks++;
+  assert.match(h.get('gov-result').title, /result is fixed/); checks++;
+  s.governance.pass.curve_mass = '5000'; await h.refresh();
+  assert.equal(status(), 'FAIL decided', 'equal closing prices add no PASS block, so 8 of 16 already means FAIL even though 8 of 15 leads'); checks++;
+  decision.blocks = 15; decision.started_height = s.status.height - 14; decision.leading_blocks = 7; s.governance.pass.curve_mass = '10000'; await h.refresh();
+  assert.equal(status(), 'PASS decided', 'the mirror case: 7 of 14 trails, but the closing block makes 8 of 15'); checks++;
+  s.governance.pass.grant_escrow = '9'; await h.refresh();
+  assert.equal(status(), 'FAIL decided', 'an underfunded grant cannot be decided for PASS'); checks++;
+  s.governance.pass.grant_escrow = '10';
+  {
+    // No conditional trade can be included once the next block resolves the decision.
+    const { settle } = require('./test_wallet_ui.cjs');
+    await h.refresh(); await h.navigate('#stash');
+    assert.equal(h.get('stash-context-notice').textContent, 'Trading is closed: the decision resolves at the start of the next block, before its transactions.'); checks++;
+    const quotes = () => h.calls.filter(call => call.body.method === 'stash_quote').length, before = quotes();
+    h.get('trade-amount').value = '1'; await h.get('trade-amount').fire('input'); await h.timersDue(); await settle();
+    assert.equal(quotes(), before, 'no quote is requested for a trade that cannot be included'); checks++;
+    assert.equal(h.get('trade-quote').textContent, 'Quote unavailable'); checks++;
+    assert.match(h.get('quote-height').textContent, /Trading is closed/); checks++;
+    assert.equal(h.get('trade-submit').disabled, true); checks++;
+    decision.started_height = s.status.height - 13; await h.refresh(); await h.timersDue(); await settle();
+    assert.equal(h.get('stash-context-notice').textContent, 'Fees require hashes in both outcomes.', 'one block earlier, trading is open'); checks++;
+    assert.ok(quotes() > before, 'and quotes are requested again'); checks++;
+    assert.equal(status(), 'PASS leads', 'before the last tip the running count is shown'); checks++;
+    h.get('trade-amount').value = ''; await h.get('trade-amount').fire('input'); await h.timersDue(); await h.navigate('#governance');
+  }
+  decision.blocks = 16;
   decision.started_height = s.status.height; decision.leading_blocks = 0; await h.refresh();
   assert.equal(h.get('gov-result-status').textContent, 'Pending'); checks++;
   assert.equal(h.get('pass-leading-blocks').textContent, '0'); checks++;
@@ -115,6 +148,34 @@ async function run() {
   assert.match(h.get('proposal-list').children[0].textContent, /Current auction leader.*Support/); checks++;
   assert.match(h.get('proposal-list').children[1].textContent, /Removed from auction.*Check refund/); checks++;
   assert.doesNotMatch(h.get('proposal-list').children[1].textContent, /Support ↗/); checks++;
+  assert.match(h.get('gov-title').textContent, new RegExp(`Leader ${proposal.slice(0, 10)}…${proposal.slice(-6)}`), 'the hero shows a 64-bit proposal label'); checks++;
+  assert.ok(h.get('proposal-list').children[0].textContent.includes(`${proposal.slice(0, 10)}…${proposal.slice(-6)}`), 'cards show a 64-bit proposal label'); checks++;
+
+  // A pasted Support ID is resolved and its action shown before anything is signed.
+  {
+    const { addr, settle } = require('./test_wallet_ui.cjs');
+    const form = h.get('support-form'), preview = h.get('support-proposal-preview'), field = form.elements.proposal;
+    const enter = async value => { field.value = value; await field.fire('input'); await settle(); };
+    assert.equal(preview.hidden, true, 'no preview before an ID is entered'); checks++;
+    await enter('aa'.repeat(32));
+    assert.equal(preview.hidden, false); checks++;
+    assert.match(preview.textContent, /not an active proposal in the current auction round/, 'an unknown ID is refused'); checks++;
+    form.elements.amount.value = '1'; await form.fire('input'); await h.timersDue(); await settle();
+    assert.match(h.get('support-fee-error').textContent, /not an active proposal/, 'an unknown ID cannot be quoted or signed'); checks++;
+    await enter(other);
+    assert.match(preview.textContent, /not an active proposal/, 'a proposal removed from the auction is refused'); checks++;
+    await enter(proposal.toUpperCase());
+    assert.ok(preview.textContent.includes(addr(key)), 'the full grant recipient address is shown'); checks++;
+    assert.ok(preview.textContent.includes('0.01 hash'), 'the exact grant amount is shown'); checks++;
+    assert.ok(preview.textContent.includes(`${proposal.slice(0, 10)}…${proposal.slice(-6)}`)); checks++;
+    await enter(''); assert.equal(preview.hidden, true); checks++;
+    await h.get('proposal-list').children[0].children[1].children[1].click(); await settle();
+    assert.equal(field.value, proposal, 'the card button fills the full ID'); checks++;
+    assert.ok(preview.textContent.includes(addr(key)), 'and shows the action it backs'); checks++;
+    s.proposals[0].proposal.action = { Parameter: { parameter: 'MinimumFeeRate', old: 1, new: 5 } }; await h.refresh();
+    assert.match(preview.textContent, /Minimum fee rate: 0\.001 hash \/ 1,024 weight → 0\.005 hash \/ 1,024 weight/, 'parameter changes show old and new values'); checks++;
+    s.proposals[0].proposal.action = decision.proposal; await h.refresh();
+  }
   assert.equal(h.wallet.length, 0, 'read-only UI checks never broadcast'); checks++;
   console.log(`governance view: ${checks} checks passed`);
 }

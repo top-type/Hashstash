@@ -434,9 +434,11 @@ async function harness(options = {}) {
 
   };
 
-  h.fee = (params={}) => {
+  // size is the signed transaction's byte length; the default matches the
+  // default 448-byte prepared body plus its signature.
+  h.fee = (params={}, size=512n) => {
     const {chain_id,tip,state_root,height,settings}=h.currentSnapshot.status;
-    const rate=BigInt(settings.minimum_fee_rate),recipients=BigInt(params.operation?.Propose?.proposal?.Grant?.payments?.length||0),weight=512n+1024n*recipients,base=(rate*weight+1023n)/1024n,paid=params.fee===undefined?base+BigInt(params.extra_fee||'0'):BigInt(params.fee),priority=String(paid-base),data=params.data_hex||'',percent=settings.miner_fee_percent,miner=paid*BigInt(percent)/100n;
+    const rate=BigInt(settings.minimum_fee_rate),recipients=BigInt(params.operation?.Propose?.proposal?.Grant?.payments?.length||0),weight=BigInt(size)+1024n*recipients,base=(rate*weight+1023n)/1024n,paid=params.fee===undefined?base+BigInt(params.extra_fee||'0'):BigInt(params.fee),priority=String(paid-base),data=params.data_hex||'',percent=settings.miner_fee_percent,miner=paid*BigInt(percent)/100n;
     return {chain_id,tip,state_root,height,anchor:tip,anchor_height:height,expiry_blocks:params.expiry_blocks??2,expiry_height:String(BigInt(height)+BigInt(params.expiry_blocks??2)),sender:addr(params.sender),sender_public_key:params.sender,fee:String(paid),minimum_fee:String(base),account_creation_fee:'0',grant_recipient_fee:String(rate*recipients),extra_fee:priority,weight:String(weight),minimum_fee_rate:String(rate),miner_fee_percent:percent,miner_fee:String(miner),revenue_fee:String(paid-miner),data_hex:data,data_bytes:data.length/2};
   };
   h.transferQuote = (params={},overrides={}) => {
@@ -567,7 +569,8 @@ async function harness(options = {}) {
 
       if (method === 'mine') return response({ result: {} });
 
-      if (method === 'preparetransaction') return response({result:{format:'hashstash-unsigned-anchor',chain_id:h.currentSnapshot.status.chain_id,body:'abcdef'}});
+      // 448 body bytes plus a 64-byte signature match the fixture's 512 base quote weight.
+      if (method === 'preparetransaction') return response({result:{format:'hashstash-unsigned-anchor',chain_id:h.currentSnapshot.status.chain_id,body:'ab'.repeat(448)}});
       if (method === 'broadcasttransaction') return response({result:{transaction_id:'d'.repeat(64)}});
 
       throw new Error(`Unexpected RPC ${method}`);
@@ -589,7 +592,10 @@ async function harness(options = {}) {
     context.addEventListener = (name,callback)=>windowEvents.set(name,callback);
     context.removeEventListener = (name,callback)=>{if(windowEvents.get(name)===callback)windowEvents.delete(name);};
   }
+  if (options.localStorage) context.localStorage = options.localStorage;
   vm.createContext(context);
+  // Model an engine without JSON.parse source-text access: revivers receive no context.
+  if (options.noJsonSource) vm.runInContext('{const parse=JSON.parse;JSON.parse=(text,reviver)=>parse(text,typeof reviver==="function"?function(key,value){return reviver.call(this,key,value);}:reviver);}', context);
   if (options.realWallet) {
     for (const name of ['vendor/noble.js','browser-wallet.js']) vm.runInContext(fs.readFileSync(path.join(__dirname,'../ui',name),'utf8'),context,{filename:name});
     h.browserApi=context.HashstashBrowserWallet; h.noble=context.HashstashNoble;
@@ -692,6 +698,11 @@ async function run() {
  eq(h.get('connection-label').textContent,'Connected');
  eq(h.get('proposal-parameter').options.map(o=>o.value),['BlockBytes','Interval','Lead','Rest','DecisionBlocks','MinerFeePercent','PassMarginBps','MinimumFeeRate','MaxPriceChangeBps']);
  ok(!/legacy-fee|guide-clockfree-mining|UncleFinder|DifficultyFloor/.test(html));
+ {
+  const field=/<input\b[^>]*id="import-private-key"[^>]*>/.exec(html)?.[0]||'';
+  ok(field&&!/type="password"/.test(field)&&/class="secret-input"/.test(field)&&/data-1p-ignore/.test(field)&&/data-lpignore="true"/.test(field),'the spending key field is not a password field that browsers offer to save and sync');
+  ok(!html.includes('covers the chain identity')&&html.includes('The chain ID is not a signed field'),'the guide does not claim the signature covers the chain ID');
+ }
  eq(h.get('network-phase-label').textContent,'Auction');
  eq(h.get('sidebar-height-value').textContent,'20');
  eq(h.get('sidebar-height').href,'#explorer?block=20');
@@ -777,12 +788,53 @@ async function run() {
   eq(personal.wallet.length,0,'reading and switching personal activity cannot sign or submit');
  }
  {
+  // The quoted weight sets the minimum fee. The wallet re-derives it from the
+  // exact prepared bytes before signing, so an inflated quote cannot overcharge.
+  const send=async(fixture,overrides={})=>{
+   const quote=fixture.transferQuote;fixture.transferQuote=(p,o)=>{const q=quote(p,o),weight=BigInt(overrides.weight??q.weight),rate=BigInt(q.minimum_fee_rate),minimum=(rate*weight+1023n)/1024n,fee=minimum+BigInt(q.extra_fee),miner=fee*BigInt(q.miner_fee_percent)/100n;return {...q,account_creation_fee:'0',...overrides,weight:String(weight),minimum_fee:String(minimum),fee:String(fee),miner_fee:String(miner),revenue_fee:String(fee-miner),total_debit:String(BigInt(p.amount)+fee)};};
+   const form=fixture.get('send-form'),before=fixture.wallet.length;form.elements.recipient.value=addr(recipient);form.elements.amount.value=amounts.exactInput('1');await form.fire('input');await fixture.timersDue();await form.requestSubmit();fixture.transferQuote=quote;
+   return {signed:fixture.wallet.length>before,feedback:form.feedback.textContent,nonce:fixture.calls.filter(c=>c.body.method==='transfer_quote').at(-1)?.body.params.nonce};
+  };
+  const exact=await send(await harness());eq(exact.signed,true,exact.feedback);eq(exact.nonce,0,'quotes weigh the same nonce the transaction will carry');
+  const inflated=await send(await harness(),{weight:'4096'});eq(inflated.signed,false,'an inflated weight is refused before signing');ok(inflated.feedback.includes('quoted fee weight does not match'),inflated.feedback);
+  const creation=await send(await harness(),{weight:'1536',account_creation_fee:'1'});eq(creation.signed,true,'a payment that creates its recipient may add 1,024 weight: '+creation.feedback);
+  const unexplained=await send(await harness(),{weight:'1536'});eq(unexplained.signed,false,'extra weight needs an account-creation charge');
+  const free=await harness();free.currentSnapshot.status.settings.minimum_fee_rate=0;await free.refresh();const zero=await send(free,{weight:'1536'});eq(zero.signed,true,'at a zero rate account creation has no charge to show: '+zero.feedback);
+ }
+ {
+  // Under congestion a user's pending send can sit past the 128-row global
+  // mempool page. The node reports that sender's own rows and next nonce.
+  const busy=await harness(),state=busy.currentSnapshot;
+  state.mempool=Array.from({length:128},(_,n)=>({body:{sender:recipient,nonce:n,operation:{TransferExact:{recipient:publicKey,amount:'1'}}}}));state.status.mempool=129;
+  const own={body:{sender:publicKey,nonce:0,operation:{TransferExact:{recipient,amount:'200'}}}};
+  busy.handlers.snapshot=p=>response({result:{...busy.snapshotResult(p),sender_mempool:[own],pending_nonce:'1'}});await busy.refresh();
+  eq(busy.get('activity-panel').hidden,false,'a pending send past the global page is still shown');ok(busy.get('activity-list').textContent.includes(amounts.formatHash('200')));
+  const form=busy.get('send-form');form.elements.recipient.value=addr(recipient);form.elements.amount.value=amounts.exactInput('1');await form.fire('input');await busy.timersDue();await form.requestSubmit();
+  eq(busy.wallet.length,1,form.feedback.textContent);eq(busy.calls.filter(c=>c.body.method==='preparetransaction').at(-1).body.params.nonce,1,'the wallet requests the node’s pending nonce, not the stale confirmed one');
+  busy.handlers.snapshot=p=>response({result:{...busy.snapshotResult(p),sender_mempool:[],pending_nonce:'0'}});await busy.refresh();
+  eq(busy.get('activity-panel').hidden,true,'the sender rows replace the page filter, including when empty');
+ }
+ {
   const fixture=await harness();
   eq(fixture.get('test-work-notice').hidden,true,'normal mining has no simulated-issuance notice');
   fixture.currentSnapshot.config.test_work=true;await fixture.refresh();
   eq(fixture.get('test-work-notice').hidden,false,'fixture mining is clearly identified');
   fixture.currentSnapshot.config.test_work=false;await fixture.refresh();
   eq(fixture.get('test-work-notice').hidden,true,'normal network removes the fixture notice');
+ }
+ {
+  // An on-chain u64 above 2^53 (here a proposed DecisionBlocks value) must not
+  // take the wallet offline in a browser without JSON.parse source-text access.
+  const big='1152921504606846976',legacy=await harness({noJsonSource:true}),state=legacy.currentSnapshot;
+  const raw=(data)=>({ok:true,status:200,text:async()=>JSON.stringify(data).replace('"__BIG__"',big).replace('"__NEG__"','-'+big)});
+  state.proposals=[{id:'ab'.repeat(32),proposal:{round:0,action:{Parameter:{parameter:'DecisionBlocks',old:16,new:'__BIG__'}},description:'00'.repeat(32),support:'1',refund_height:null,offset:'__NEG__',note:'"9007199254740993" stays text',small:9007199254740991,ratio:232.83}}];
+  legacy.handlers.snapshot=p=>raw({result:legacy.snapshotResult(p)});await legacy.refresh();await legacy.navigate('#governance');
+  eq(legacy.get('connection-label').textContent,'Connected',legacy.get('global-alert').textContent);eq(legacy.get('global-alert').hidden,true);
+  ok(legacy.get('proposal-list').textContent.includes('1,152,921,504,606,846,976 blocks'),'the large value is shown exactly');
+  const parsed=[];legacy.handlers.snapshot=p=>{const reply=raw({result:legacy.snapshotResult(p)});return {...reply,text:async()=>{const text=await reply.text();parsed.push(text);return text;}};};await legacy.refresh();
+  ok(parsed.length===1&&parsed[0].includes(`"new":${big}`),'the node sent a bare integer literal');
+  const modern=await harness();modern.currentSnapshot.proposals=state.proposals;modern.handlers.snapshot=p=>raw({result:modern.snapshotResult(p)});await modern.refresh();await modern.navigate('#governance');
+  eq(modern.get('connection-label').textContent,'Connected');eq(modern.get('proposal-list').textContent,legacy.get('proposal-list').textContent,'both parsing paths produce the same view');
  }
  console.log(`Wallet UI: ${checks} current-protocol assertions passed.`);
 }

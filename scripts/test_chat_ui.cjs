@@ -26,7 +26,18 @@ async function run() {
   for(const removed of ['chat-form','chat-submit','chat-amount','chat-text','chat-reply-cancel'])ok(!html.includes(`id="${removed}"`));
   ok(view.indexOf('id="chat-more"')<view.indexOf('id="chat-messages"'),'load older is above chronological messages');
   ok(view.indexOf('id="chat-pending-section"')>view.indexOf('id="chat-messages"'),'pending is separate from confirmed ordering');
-  equal(Object.keys(require('../ui/chat.js')),['create'],'no message wrapper encoder or posting minimum remains in the feed');
+  equal(Object.keys(require('../ui/chat.js')),['create','isBlank'],'no message wrapper encoder or posting minimum remains in the feed');
+  {
+    // The browser's blank-text rule is a literal copy of the node's table.
+    const rust=fs.readFileSync(path.join(__dirname,'../src/chat.rs'),'utf8'),start=rust.indexOf('pub const BLANK'),table=rust.slice(start,rust.indexOf('];',start));
+    const ranges=[...table.matchAll(/\(0x([0-9A-F]+),\s*0x([0-9A-F]+)\)/g)].map(match=>[parseInt(match[1],16),parseInt(match[2],16)]);
+    ok(ranges.length>20,'the Rust blank table was found');
+    const {isBlank}=require('../ui/chat.js');let mismatches=0;
+    for(let point=0;point<=0x10ffff;point++){if(point>=0xd800&&point<=0xdfff)continue;if(isBlank(String.fromCodePoint(point))!==ranges.some(([low,high])=>point>=low&&point<=high))mismatches++;}
+    equal(mismatches,0,'every code point is blank in the browser exactly when it is blank in src/chat.rs');
+    for(const text of ['\ufeff',' \ufeff\n','\u200b','\u2060\ufe0f','\u{e0020}','\u3164'])ok(isBlank(text),JSON.stringify(text));
+    for(const text of ['a\ufeffb','\u2800','👨\u200d👩'])ok(!isBlank(text),JSON.stringify(text));
+  }
   {
     const h=await setup({empty:true});
     equal(h.get('chat-nav').hidden,false);equal(h.get('chat-enabled').hidden,false);
@@ -179,9 +190,15 @@ async function run() {
   {
     const h=await setup();h.feed.items=[h.message({text:'é'.repeat(16384)})];await h.feedRefresh();equal(h.get('chat-messages').children.length,1,'historical plaintext remains readable even above the current governed block capacity');
     h.feed.items=[h.message({text:'a'.repeat(32*1024*1024+1)})];await h.feedRefresh();equal(h.get('chat-messages').children.length,1,'historical messages above32MiB remain readable');
-    for(const invalid of [{text:' '},{text:'a\u0000b'},{text:'a\u0085b'},{text:'\ud800'},{sender:'<script>'},{amount:'-1'},{amount:'0',asset:'bitcoin'},{amount:null,asset:'hash'},{position:null},{position:'18446744073709551616'}, {kind:'<script>'}]){
-      h.feed.items=[h.message(invalid)];await h.feedRefresh();ok(h.get('chat-status').textContent.includes('Messages unavailable'),'malformed message metadata is rejected');
+    for(const invalid of [{text:' '},{text:'\ufeff'},{text:' \ufeff\n'},{text:'\u200b'},{text:'a\u0000b'},{text:'a\u0085b'},{text:'\ud800'},{sender:'<script>'},{amount:'-1'},{amount:'0',asset:'bitcoin'},{amount:null,asset:'hash'},{position:null},{position:'18446744073709551616'}, {kind:'<script>'}, {txid:'<script>'}]){
+      h.feed.items=[h.message({txid:hash(1),height:18,text:'Before'}),h.message({txid:hash(2),...invalid}),h.message({txid:hash(3),height:20,text:'After'})];await h.feedRefresh();
+      equal(h.get('chat-messages').children.map(row=>row.dataset.txid),[hash(1),hash(3)],`a malformed record is skipped without hiding its page: ${JSON.stringify(invalid)}`);
+      ok(h.get('chat-status').textContent.includes('1 message could not be displayed.'),'malformed message metadata is reported, not rendered');
     }
+    h.feed.items=[h.message({txid:hash(1)})];h.feed.pending=[h.message({txid:hash(2),height:null,position:null,status:'pending',confirmations:0,text:'\ufeff'}),h.message({txid:hash(3),height:null,position:null,status:'pending',confirmations:0,text:'Waiting'})];await h.feedRefresh();
+    equal(h.get('chat-pending').children.map(row=>row.dataset.txid),[hash(3)],'a blank pending record does not hide other pending messages');equal(h.get('chat-messages').children.length,1);
+    ok(h.get('chat-status').textContent.includes('1 message could not be displayed.'));
+    h.feed.pending=[];await h.feedRefresh();ok(!h.get('chat-status').textContent.includes('could not be displayed'),'a clean refresh clears the skipped-record note');
     h.feed.items=Array.from({length:21},(_,n)=>h.message({txid:hash(n)}));await h.feedRefresh();ok(h.get('chat-status').textContent.includes('Messages unavailable'),'oversized pages are rejected');
     h.feed.items=[];h.feed.next_cursor='x'.repeat(257);await h.feedRefresh();ok(h.get('chat-status').textContent.includes('Messages unavailable'),'oversized cursors are rejected');
   }
@@ -194,10 +211,25 @@ async function run() {
     h.currentSnapshot.status.tip=hash(99);h.feed.tip=hash(99);h.handlers.explorer_chat=()=>response({result:h.feed});await h.refresh();held.resolve(response({result:old}));await settle();equal(h.get('chat-messages').children.length,0,'a late old-tip response cannot restore removed messages');
   }
   {
-    const h=await setup();h.feed.items=[h.message({sender:'<script>'})];await h.feedRefresh();equal(h.get('chat-messages').children.length,0);ok(h.get('chat-status').textContent.includes('Messages unavailable'));
+    const h=await setup();h.feed.items=Array.from({length:21},(_,n)=>h.message({txid:hash(n)}));await h.feedRefresh();equal(h.get('chat-messages').children.length,0);ok(h.get('chat-status').textContent.includes('Messages unavailable'));
     const error=h.get('chat-status').textContent;await h.refresh();equal(h.get('chat-status').textContent,error,'ordinary refresh preserves the feed error until recovery');
     h.feed.items=[];h.feed.ready=false;await h.feedRefresh();equal(h.get('chat-status').textContent,'Indexing messages…');await h.refresh();equal(h.get('chat-status').textContent,'Indexing messages…');
     h.feed.ready=true;await h.feedRefresh();equal(h.get('chat-status').hidden,true,'successful reindexing clears the status');
+  }
+  {
+    const h=await setup({empty:true}),full=addr(sender),start=full.lastIndexOf('1')+1;
+    h.feed.items=[h.message({txid:hash(1),text:'Pay 01\u202e987\u202c now'}),h.message({txid:hash(2),text:'Automated Demo · Mara — \u2067reversed\u2069'})];await h.feedRefresh();
+    const rows=h.get('chat-messages').children,account=row=>walk(row).find(node=>node.href?.startsWith('#explorer?account='));
+    const label=`hsh…${full.slice(start,start+10)}…${full.slice(-6)}`;
+    equal(account(rows[0]).textContent,label,'the sender label shows key data and the checksum, not the network prefix');
+    ok(!account(rows[0]).textContent.startsWith(full.slice(0,8)),'the constant network prefix is not spent on the label');
+    equal(walk(rows[0]).find(node=>node.className==='chat-message-text').textContent,'Pay 01\\u202e987\\u202c now','bidi overrides are shown as visible escapes');
+    equal(walk(rows[1]).find(node=>node.className==='chat-message-text').textContent,'Mara — \\u2067reversed\\u2069','isolates are shown as visible escapes');
+    ok(walk(rows[1]).find(node=>node.href?.startsWith('#explorer?tx=')).title.endsWith('\\u2067reversed\\u2069'),'the original-message tooltip is escaped too');
+    equal(h.feed.items[0].text,'Pay 01\u202e987\u202c now','display escaping never rewrites the source record');
+    await walk(rows[0]).find(node=>node.tagName==='BUTTON'&&node.textContent==='Mute').click();
+    const muted=walk(h.get('chat-muted-list')).find(node=>node.href?.startsWith('#explorer?account='));
+    equal(muted.textContent,label,'muted senders use the same distinguishing label');equal(muted.title,full);
   }
   console.log(`Chat UI: ${checks} behavior assertions passed.`);
 }

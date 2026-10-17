@@ -114,6 +114,7 @@ fn restrict_permissions(path: &Path) -> Result<()> {
 }
 
 impl WalletStore {
+    #[cfg(test)]
     pub fn open(chain_path: &Path, chain_id: Hash) -> Result<Self> {
         let store = Self::open_unrecorded(chain_path, chain_id)?;
         store.record_network()?;

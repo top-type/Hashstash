@@ -3,8 +3,10 @@
 Hashstash exposes optional Stratum V1 for SHA256d ASICs. Mining configuration belongs to the node operator. Wallet selection and the public UI cannot change the payout identity or start software mining. A Stratum username is only a worker label: every accepted block pays the node's configured public key or address. Pool share accounting and multi-user payouts are not implemented.
 
 ```sh
-hashstash run --config network.json --data chain.sqlite --miner '<address>' --rpc 127.0.0.1:18480 --p2p 0.0.0.0:18481 --stratum 0.0.0.0:18482 --stratum-share-difficulty 65536 --stratum-advertise stratum+tcp://example.net:18482
+hashstash run --config network.json --data chain.sqlite --miner '<address>' --rpc 127.0.0.1:18480 --p2p 0.0.0.0:18481 --stratum 0.0.0.0:18482 --stratum-share-difficulty 65536 --stratum-advertise example.net:18482 --stratum-password-file mining-password
 ```
+
+`--stratum-advertise` takes a bare reachable `HOST:PORT`; the interface adds the `stratum+tcp://` scheme, and startup rejects a value containing one. Use a password file whenever Stratum binds a non-loopback address.
 
 Optional `--stratum-password-file PATH` requires its password at authorization. Restrict file access and never put credentials into a public endpoint. `--no-stratum` runs a validating/relaying node without a mining listener. Keep private RPC loopback-only. The public browser page exposes mining status under Explorer → Network, without administrative controls.
 

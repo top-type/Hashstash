@@ -21,13 +21,21 @@
     <section id="unlock-panel" class="panel">
       <h2>Create or import</h2>
       <form id="unlock-form" autocomplete="off">
-        <label>Open with<select id="import-method"><option value="private">Private key</option><option value="passphrase">Passphrase</option></select></label>
-        <div id="phrase-fields" hidden><label>Passphrase<input id="passphrase" type="password" autocomplete="off" spellcheck="false" autocapitalize="off"></label><p class="hint">Use the exact original passphrase. A private key is not a passphrase: entering it here derives a different account. Spaces and capitalization count.</p></div>
+        <label>Open with<select id="import-method"><option value="private">Private key</option><option value="generate">New random key</option><option value="passphrase">Passphrase · this network</option><option value="legacy">Legacy v1 passphrase · restore only</option></select></label>
+        <div id="generate-fields" hidden><p class="hint">Creates a new account from this computer’s secure randomness. The signer then shows a backup file: save it offline before funding the account, because the key exists only in this running signer until you do.</p></div>
+        <div id="phrase-fields" hidden><label>Passphrase<input id="passphrase" type="password" autocomplete="off" spellcheck="false" autocapitalize="off"></label><p class="hint" id="phrase-hint">Use the exact original passphrase. A private key is not a passphrase: entering it here derives a different account. Spaces and capitalization count.</p>
+          <p class="hint" id="v2-hint">Version 2 stretches the passphrase with scrypt and salts it with the selected network, so set the network first; the same phrase opens a different account on every network. Use at least 16 bytes. A new random key is stronger than any memorable phrase.</p>
+          <div id="legacy-fields" hidden><p class="hint warning">Legacy v1 is a fast, unsalted brain-wallet derivation shared by every network: anyone can test guesses against public accounts. Use it only to restore an account first created this way, then move its funds to a new random key.</p><label class="check"><input id="legacy-confirm" type="checkbox">I am restoring an existing v1 account</label></div></div>
         <div id="private-fields"><label>Private key<input id="private-key" type="password" autocomplete="off" spellcheck="false" autocapitalize="off" required></label><p class="hint">Restore an existing account with its 64-character hexadecimal private key or backup file. The public key stays the same; the address also depends on the selected network.</p><label>Or import backup<input id="private-file" type="file" accept=".json,.txt,application/json"></label></div>
         <button type="submit">Open wallet</button>
       </form>
     </section>
     <div id="wallet" hidden>
+      <section id="backup-panel" class="panel" hidden>
+        <h2>Back up this new key</h2>
+        <p class="hint warning">This private key exists only in this running signer. Save the backup file to offline storage before exporting the watch-only account; anyone with the file can spend from the account.</p>
+        <div class="actions"><button id="download-backup">Download private key backup</button><button id="backup-done" class="secondary">I saved the backup</button></div>
+      </section>
       <section class="panel address-panel">
         <h2>Address</h2><code id="address" class="public-key"></code>
         <div class="actions"><button id="copy-address" class="secondary" disabled>Copy address</button><button id="export-public" class="secondary" disabled>Export watch-only account</button></div>
@@ -43,9 +51,10 @@
       </section>
       <section id="review-panel" class="panel" hidden>
         <h2>Review transaction</h2><dl id="review-fields"></dl>
-        <section id="review-message" hidden><h3>Public message</h3><pre id="review-message-text" class="review-message-text"></pre></section>
+        <section id="review-message" hidden><h3 id="review-message-title">Public message</h3><p class="hint warning" id="review-rationale-warning" hidden>This text is not the proposal’s committed description: its hash differs from the signed description hash, so it will not be published as the rationale.</p><pre id="review-message-text" class="review-message-text"></pre></section>
         <details id="review-data" hidden><summary id="review-data-summary">Data</summary><code id="review-data-hex" class="public-key"></code></details>
-        <p class="hint">Network context is not signed. Anchor ancestry and expiry are checked by the receiving node.</p><p class="hint">Balances and prices are not checked offline. Stash orders can fill partially or remain unfilled; unused input stays in your balance.</p><p class="hint" id="review-fee-help" hidden>The fee shown is the exact amount you authorize. It is paid if the transaction is included. This offline signer cannot check the current minimum fee or miner/revenue split; those follow the chain settings at inclusion.</p>
+        <p class="hint">Network context is not signed. Anchor ancestry and expiry are checked by the receiving node. The signature is valid only on the network containing its anchor block; if this key holds funds on another network, use a separate key there.</p><p class="hint">Balances and prices are not checked offline. Stash orders can fill partially or remain unfilled; unused input stays in your balance.</p><p class="hint" id="review-fee-help" hidden>The fee shown is the exact amount you authorize. It is paid if the transaction is included. This offline signer cannot check the current minimum fee or miner/revenue split; those follow the chain settings at inclusion.</p>
+        <div id="review-lifetime" hidden><p class="hint warning">This transaction stays valid far longer than the default. Whoever holds the signed result can broadcast it at any time before it expires or the nonce is used.</p><label class="check"><input id="lifetime-confirm" type="checkbox"><span id="lifetime-confirm-text">I accept this lifetime</span></label></div>
         <details id="review-details" hidden><summary>Transaction details</summary><dl id="review-technical-fields"></dl></details>
         <details id="review-bytes" hidden><summary>Signing bytes · hex</summary><code id="review-body-hex" class="public-key"></code></details>
         <button id="sign">Sign transaction</button>

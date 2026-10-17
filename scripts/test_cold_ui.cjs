@@ -22,15 +22,19 @@ class Element {
   append(...children) { this.children.push(...children); }
   scrollIntoView() {}
 }
-async function harness(initialChain = null) {
+async function harness(initialChain = null, maxReview = undefined, server = {}) {
   const elements = new Map([...html.matchAll(/id="([^"]+)"/g)].map(match=>[match[1],new Element()]));
   const get = id => { assert.ok(elements.has(id),`Missing DOM element ${id}`);return elements.get(id); };
   get('import-method').value='passphrase';
   const calls = [], copied = [], downloads = [], blobs = new Map();
-  const review = {fields:null,error:null,body:'abcdef'};
-  let serverPublic = null, serverChain = initialChain;
-  const status = () => ({public_key:serverPublic,chain_id:serverChain,address:serverPublic && serverChain ? addressFor(serverChain) : null,
+  const review = {fields:null,error:null,body:'abcdef',confirmLifetime:false,maxReview};
+  // Mirrors the signer: v2 keys need and belong to the selected network, and
+  // reviews never adopt the export's unsigned network context.
+  let serverPublic = server.public ?? null, serverChain = initialChain, derivedFor = null, backupPending = !!server.backupPending;
+  const backup = {format:'hashstash-private-v1',private_key:privateKey,public_key:publicKey};
+  const status = () => ({public_key:serverPublic,chain_id:serverChain,address:serverPublic && serverChain ? addressFor(serverChain) : null,backup_pending:backupPending,
     watch:!serverPublic ? null : serverChain ? {format:'hashstash-watch-v2',public_key:serverPublic,chain_id:serverChain,address:addressFor(serverChain)} : {format:'hashstash-watch-v1',public_key:serverPublic}});
+  const refuse = error => ({ok:false,json:async()=>({error})});
   const context = {
     HashstashShares:shares,
     HashstashAmounts:amounts,
@@ -41,17 +45,30 @@ async function harness(initialChain = null) {
     async fetch(url,options={}) {
       const body = options.body ? JSON.parse(options.body) : null;
       calls.push({url,body,options});
-      if(url==='/api/review' && review.error) return {ok:false,json:async()=>({error:review.error})};
-      if(url==='/api/unlock'||url==='/api/import') serverPublic=publicKey;
-      if(url==='/api/lock') serverPublic=null;
-      if(url==='/api/network') serverChain=body.chain_id;
-      if(url==='/api/review') {
-        if (body?.format!=='hashstash-unsigned-anchor'||!/^[0-9a-f]{64}$/.test(body.chain_id||'')||(serverChain&&serverChain!==body.chain_id))return {ok:false,json:async()=>({error:'Unsigned network context does not match the selected network'})};
-        if (!serverChain) serverChain=body.chain_id;
+      if(url==='/api/review' && review.error) return refuse(review.error);
+      if(url==='/api/unlock') {
+        if(body.scheme==='hashstash-passphrase-v2') { if(!serverChain) return refuse('Select the network first'); derivedFor=serverChain; }
+        else if(body.scheme==='hashstash-passphrase-v1') derivedFor=null;
+        else return refuse('Choose a passphrase scheme');
       }
-      const data = url === '/api/session' ? {token:'token',...status()} :
-        ['/api/unlock','/api/import','/api/network','/api/lock'].includes(url) ? status() :
-        url === '/api/review' ? {...status(),review_token:'review-token',body:review.body,fields:review.fields || [{label:'Sender',value:addressFor(serverChain)}]} :
+      if(url==='/api/unlock'||url==='/api/import'||url==='/api/generate') serverPublic=publicKey;
+      if(url==='/api/import'||url==='/api/generate') derivedFor=null;
+      if(['/api/unlock','/api/import','/api/lock','/api/generate'].includes(url)) backupPending=url==='/api/generate';
+      if(url==='/api/lock') serverPublic=null;
+      if(url==='/api/backup') {
+        if(!backupPending) return refuse('No unsaved generated key');
+        if(body.saved) backupPending=false; else return {ok:true,json:async()=>({backup})};
+      }
+      if(url==='/api/network') { if(derivedFor&&derivedFor!==body.chain_id) serverPublic=derivedFor=null; serverChain=body.chain_id; }
+      if(url==='/api/review') {
+        if (!serverChain) return refuse('Select this signer’s network before reviewing; export network context is unsigned');
+        if (body?.format!=='hashstash-unsigned-anchor'||!/^[0-9a-f]{64}$/.test(body.chain_id||'')||serverChain!==body.chain_id)return refuse('Unsigned network context does not match the selected network');
+      }
+      if(url==='/api/sign' && review.confirmLifetime && body.confirm_lifetime!==true) return refuse('Confirm the long transaction lifetime before signing');
+      const data = url === '/api/session' ? {token:'token',max_review_bytes:review.maxReview,...status()} :
+        ['/api/unlock','/api/import','/api/network','/api/lock','/api/backup'].includes(url) ? status() :
+        url === '/api/generate' ? {...status(),backup} :
+        url === '/api/review' ? {...status(),review_token:'review-token',body:review.body,confirm_lifetime:review.confirmLifetime,fields:review.fields || [{label:'Sender',value:addressFor(serverChain)}]} :
         url === '/api/sign' ? {raw:'abcdef',txid:'12'.repeat(32)} : {};
       return {ok:true,json:async()=>data};
     }
@@ -65,12 +82,17 @@ async function run() {
     const h=await harness();
     assert.equal(h.get('copy-address').disabled,true);checks++;
     assert.equal(h.get('export-public').disabled,true);checks++;
-    h.get('passphrase').value=' Exact 雪 ';
+    h.get('passphrase').value=' Exact 雪 passphrase ';
     await h.get('unlock-form').fire('submit');
-    assert.equal(h.calls.find(call=>call.url==='/api/unlock').body.passphrase,' Exact 雪 ');checks++;
+    assert.equal(h.calls.some(call=>call.url==='/api/unlock'),false,'a v2 passphrase needs the network that salts it');checks++;
+    assert.match(h.get('message').textContent,/Set the network first/);checks++;
+    h.get('network-chain').value=chainA;await h.get('network-form').fire('submit');
+    h.get('passphrase').value=' Exact 雪 passphrase ';
+    await h.get('unlock-form').fire('submit');
+    assert.deepEqual(h.calls.find(call=>call.url==='/api/unlock').body,{passphrase:' Exact 雪 passphrase ',scheme:'hashstash-passphrase-v2'});checks++;
     assert.equal(h.get('passphrase').value,'');checks++;
     assert.equal(h.get('public-key').textContent,publicKey);checks++;
-    assert.equal(h.get('export-public').disabled,true);checks++;
+    assert.equal(h.get('export-public').disabled,false);checks++;
     h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
     await h.get('review-form').fire('submit');
     assert.equal(h.get('review-panel').hidden,false);checks++;
@@ -79,13 +101,92 @@ async function run() {
     await h.get('sign').fire('click');
     assert.deepEqual(h.calls.find(call=>call.url==='/api/sign').body,{review_token:'review-token'});checks++;
     assert.equal(h.get('raw').value,'abcdef');checks++;
-    await h.get('lock').fire('click');
+    // Another network locks the v2 account instead of showing it with a foreign address.
+    await h.get('network-change').fire('click');
+    h.get('network-chain').value=chainB;await h.get('network-form').fire('submit');
     assert.equal(h.get('wallet').hidden,true);checks++;
-    assert.equal(h.get('raw').value,'');checks++;
+    assert.equal(h.get('unlock-panel').hidden,false);checks++;
+    assert.match(h.get('message').textContent,/belongs to the network/);checks++;
+    assert.equal(h.get('network-current').textContent,chainB);checks++;
   }
   {
+    // Without a selected network the signer refuses review; export context is never adopted.
+    const h=await harness();
+    h.get('import-method').value='private';await h.get('import-method').fire('change');
+    h.get('private-key').value=privateKey;await h.get('unlock-form').fire('submit');
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
+    await h.get('review-form').fire('submit');
+    assert.equal(h.get('review-panel').hidden,true);checks++;
+    assert.match(h.get('message').textContent,/Select this signer’s network/);checks++;
+    assert.equal(h.get('network-current').textContent,'Not set');checks++;
+    await h.get('sign').fire('click');assert.equal(h.calls.filter(call=>call.url==='/api/sign').length,0);checks++;
+  }
+  {
+    // Legacy v1 restores only after an explicit acknowledgement.
+    const h=await harness();
+    h.get('import-method').value='legacy';await h.get('import-method').fire('change');
+    assert.equal(h.get('legacy-fields').hidden,false);checks++;
+    assert.equal(h.get('v2-hint').hidden,true);checks++;
+    assert.equal(h.get('passphrase').required,true);checks++;
+    h.get('passphrase').value='old phrase';await h.get('unlock-form').fire('submit');
+    assert.equal(h.calls.some(call=>call.url==='/api/unlock'),false);checks++;
+    assert.match(h.get('message').textContent,/existing v1 account/);checks++;
+    h.get('legacy-confirm').checked=true;await h.get('unlock-form').fire('submit');
+    assert.deepEqual(h.calls.find(call=>call.url==='/api/unlock').body,{passphrase:'old phrase',scheme:'hashstash-passphrase-v1'});checks++;
+    assert.equal(h.get('public-key').textContent,publicKey);checks++;
+    assert.equal(h.get('legacy-confirm').checked,false,'acknowledgement is per restore');checks++;
+    for(const [method,visible] of [['passphrase','v2-hint'],['generate','generate-fields'],['private','private-fields']]) {
+      await h.get('lock').fire('click');
+      h.get('import-method').value=method;await h.get('import-method').fire('change');
+      assert.equal(h.get(visible).hidden,false);checks++;
+      assert.equal(h.get('legacy-fields').hidden,true);checks++;
+    }
+  }
+  {
+    // A generated key is withheld from funding until its only backup is saved.
     const h=await harness(chainA);
-    h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
+    h.get('import-method').value='generate';await h.get('import-method').fire('change');
+    assert.equal(h.get('passphrase').required,false);checks++;
+    assert.equal(h.get('private-key').required,false);checks++;
+    await h.get('unlock-form').fire('submit');
+    assert.ok(h.calls.some(call=>call.url==='/api/generate'));checks++;
+    assert.equal(h.get('public-key').textContent,publicKey);checks++;
+    assert.equal(h.get('backup-panel').hidden,false);checks++;
+    assert.equal(h.get('copy-address').disabled,true);checks++;
+    assert.equal(h.get('export-public').disabled,true);checks++;
+    await h.get('download-backup').fire('click');
+    assert.deepEqual(JSON.parse(await h.downloads[0].blob.text()),{format:'hashstash-private-v1',private_key:privateKey,public_key:publicKey});checks++;
+    assert.equal(h.downloads[0].name,'hashstash-private-key.json');checks++;
+    await h.get('backup-done').fire('click');
+    assert.deepEqual(h.calls.find(call=>call.url==='/api/backup').body,{saved:true},'the signer records the saved backup');checks++;
+    assert.equal(h.get('backup-panel').hidden,true);checks++;
+    assert.equal(h.get('export-public').disabled,false);checks++;
+    assert.equal(h.get('copy-address').disabled,false);checks++;
+    await h.get('lock').fire('click');
+    h.get('import-method').value='generate';await h.get('import-method').fire('change');await h.get('unlock-form').fire('submit');
+    assert.equal(h.get('backup-panel').hidden,false);checks++;
+    await h.get('lock').fire('click');
+    assert.equal(h.get('backup-panel').hidden,true,'locking discards the unsaved backup view');checks++;
+    await h.get('download-backup').fire('click');assert.equal(h.downloads.length,1);checks++;
+  }
+  {
+    // Reloading the page keeps an unsaved generated key behind its backup gate.
+    const h=await harness(chainA,undefined,{public:publicKey,backupPending:true});
+    assert.deepEqual(h.calls.find(call=>call.url==='/api/backup').body,{},'the reloaded page refetches the pending backup');checks++;
+    assert.equal(h.get('backup-panel').hidden,false);checks++;
+    assert.equal(h.get('export-public').disabled,true);checks++;
+    await h.get('download-backup').fire('click');
+    assert.equal(JSON.parse(await h.downloads[0].blob.text()).private_key,privateKey);checks++;
+    const saved=await harness(chainA,undefined,{public:publicKey});
+    assert.equal(saved.calls.some(call=>call.url==='/api/backup'),false);checks++;
+    assert.equal(saved.get('backup-panel').hidden,true);checks++;
+    assert.equal(saved.get('export-public').disabled,false);checks++;
+  }
+  {
+    // Imported keys are network-independent and survive a network change.
+    const h=await harness(chainA);
+    h.get('import-method').value='private';await h.get('import-method').fire('change');
+    h.get('private-key').value=privateKey;await h.get('unlock-form').fire('submit');
     assert.equal(h.get('network-form').hidden,true);checks++;
     assert.equal(h.get('address').textContent,addressFor(chainA));checks++;
     assert.equal(h.get('copy-address').disabled,false);checks++;
@@ -480,19 +581,74 @@ async function run() {
     assert.equal(h.get('review-data-hex').textContent,data);checks++;
     assert.equal(h.get('review-message').hidden,true,'encrypted mail envelope never becomes a public-message preview');checks++;
   }
-  {
-    const h=await harness(chainA),source=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'ab'.repeat(256*1024)});
+  for (const limit of [undefined, 96*1024*1024]) {
+    // Unsigned imports may exceed the 128 KiB control limit, up to the signer's
+    // finite (configurable) review limit; larger files are never read.
+    const h=await harness(chainA,limit),maximum=limit||64*1024*1024,source=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'ab'.repeat(256*1024)});
     h.get('unsigned-file').files=[{size:source.length,text:async()=>source}];
     await h.get('unsigned-file').fire('change');
-    assert.equal(h.get('unsigned').value,source,'unsigned imports may exceed the former128KiB file ceiling');checks++;
-    let read=false;h.get('unsigned-file').files=[{size:2*32*1024*1024+128*1024+1,text:async()=>{read=true;return source;}}];
+    assert.equal(h.get('unsigned').value,source,'unsigned imports may exceed the former 128KiB file ceiling');checks++;
+    assert.equal(h.get('unsigned-file').value,'');checks++;
+    let read=false;h.get('unsigned').value='';h.get('unsigned-file').files=[{size:maximum,text:async()=>{read=true;return source;}}];
     await h.get('unsigned-file').fire('change');
-    assert.equal(read,true,'unsigned imports have no fixed32MiB policy ceiling');checks++;
-    assert.equal(h.get('unsigned').value,source);checks++;
+    assert.equal(read,true,'a file at the limit is accepted');checks++;
+    read=false;h.get('unsigned').value='';h.get('unsigned-file').files=[{size:maximum+1,text:async()=>{read=true;return source;}}];
+    await h.get('unsigned-file').fire('change');
+    assert.equal(read,false,'a file over the review limit is never read');checks++;
+    assert.equal(h.get('unsigned').value,'');checks++;
+    assert.match(h.get('message').textContent,new RegExp(`${maximum}-byte review limit`));checks++;
+  }
+  {
+    // Long lifetimes need an explicit acknowledgement before the sign request.
+    const h=await harness(chainA);h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
+    h.review.confirmLifetime=true;
+    h.review.fields=[{label:'Valid for · blocks',value:'18446744073709551615'},{label:'Lifetime warning',value:'Valid for 18446744073709551615 blocks'}];
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
+    await h.get('review-form').fire('submit');
+    assert.equal(h.get('review-lifetime').hidden,false);checks++;
+    assert.equal(h.get('lifetime-confirm-text').textContent,'I accept that this signature stays valid for 18446744073709551615 blocks');checks++;
+    await h.get('sign').fire('click');
+    assert.equal(h.calls.filter(call=>call.url==='/api/sign').length,0,'unconfirmed long lifetime sends no sign request');checks++;
+    assert.match(h.get('message').textContent,/Confirm the long transaction lifetime/);checks++;
+    assert.equal(h.get('review-panel').hidden,false,'the review stays available for confirmation');checks++;
+    h.get('lifetime-confirm').checked=true;await h.get('sign').fire('click');
+    assert.deepEqual(h.calls.find(call=>call.url==='/api/sign').body,{review_token:'review-token',confirm_lifetime:true});checks++;
+    assert.equal(h.get('raw').value,'abcdef');checks++;
+    assert.equal(h.get('review-lifetime').hidden,true);checks++;
+    assert.equal(h.get('lifetime-confirm').checked,false);checks++;
+    h.review.fields=[{label:'Valid for · blocks',value:'bad'}];
+    await h.get('review-form').fire('submit');
+    assert.equal(h.get('review-panel').hidden,true,'a malformed lifetime cannot be acknowledged');checks++;
+    h.review.confirmLifetime=false;h.review.fields=[{label:'Valid for · blocks',value:'2'}];
+    await h.get('review-form').fire('submit');
+    assert.equal(h.get('review-lifetime').hidden,true);checks++;
+  }
+  for (const [rationale,title,warning] of [
+    ['Matches the description hash','Proposal rationale',true],
+    ['Does not match the description hash','Attached text · not the committed rationale',false],
+    ['Matches the hash but is not publishable plain text','Attached text · not the committed rationale',false],
+  ]) {
+    // Proposal text counts as the rationale only when its hash is the signed commitment.
+    const h=await harness(chainA);h.get('passphrase').value='test';await h.get('unlock-form').fire('submit');
+    const bytes=Buffer.from('Fund the shared explorer');
+    h.review.fields=[{label:'Action',value:'Propose'},{label:'Description hash',value:'00'.repeat(32)},{label:'Rationale',value:rationale},{label:'Data bytes',value:String(bytes.length)},{label:'Data hex',value:bytes.toString('hex')}];
+    h.get('unsigned').value=JSON.stringify({format:'hashstash-unsigned-anchor',chain_id:chainA,body:'abcdef'});
+    await h.get('review-form').fire('submit');
+    assert.equal(h.get('review-message').hidden,false);checks++;
+    assert.equal(h.get('review-message-title').textContent,title);checks++;
+    assert.equal(h.get('review-rationale-warning').hidden,warning);checks++;
+    assert.ok(h.get('review-fields').textContent.includes(rationale));checks++;
+    h.review.fields=[{label:'Action',value:'Transfer'},{label:'Data bytes',value:String(bytes.length)},{label:'Data hex',value:bytes.toString('hex')}];
+    await h.get('review-form').fire('submit');
+    assert.equal(h.get('review-message-title').textContent,'Public message','ordinary data keeps the public-message label');checks++;
+    assert.equal(h.get('review-rationale-warning').hidden,true);checks++;
   }
   assert.ok(html.includes('Anchor ancestry and expiry are checked by the receiving node.'));checks++;
   assert.ok(html.includes('Network context is not signed.'));checks++;
+  assert.ok(html.includes('use a separate key there'));checks++;
   assert.match(html, /id="import-method"><option value="private">Private key/);checks++;
+  assert.match(html, /<option value="legacy">Legacy v1 passphrase · restore only<\/option>/);checks++;
+  assert.ok(html.includes('unsalted brain-wallet derivation'));checks++;
   assert.ok(html.includes('entering it here derives a different account'));checks++;
   console.log(`Cold UI: ${checks} behavior assertions passed.`);
 }

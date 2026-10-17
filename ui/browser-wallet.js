@@ -237,15 +237,101 @@
   }
   function secretBytes(privateHex) { const bytes = fromHex(privateHex,32,'Private key'); if (!noble.validSecret(bytes)) fail('Invalid private key.'); return bytes; }
   function publicKey(privateHex) { requireSecure(); const secret = secretBytes(privateHex); try { return hex(noble.schnorr.getPublicKey(secret)); } finally { secret.fill(0); } }
-  function derivePrivate(passphrase) {
-    requireSecure();
+  function passphraseBytes(passphrase) {
     if (typeof passphrase !== 'string' || !passphrase.length) fail('Enter a passphrase.');
     // Rust strings cannot contain lone UTF-16 surrogates; reject rather than silently replacing.
     if (typeof passphrase.isWellFormed === 'function' ? !passphrase.isWellFormed() : /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(passphrase)) fail('Passphrase contains invalid Unicode.');
-    const phrase = utf8.encode(passphrase); if (phrase.length > 4096) fail('Passphrase is too long.');
-    const input = concat(phrase,new Uint8Array(4)); phrase.fill(0);
-    try { for (let counter=0;counter<=0xffffffff;counter++) { new DataView(input.buffer).setUint32(input.length-4,counter,true); const secret=tagged('Hashstash/Passphrase/v1',input); if (noble.validSecret(secret)) { const out=hex(secret); secret.fill(0); return out; } secret.fill(0); } } finally { input.fill(0); }
+    const phrase = utf8.encode(passphrase); if (phrase.length > 4096) { phrase.fill(0); fail('Passphrase is too long.'); }
+    return phrase;
+  }
+  // First valid secp256k1 secret of tagged(tag, seed || counter_le32), as in Rust.
+  function firstSecret(tag, seed) {
+    const input = concat(seed,new Uint8Array(4));
+    try { for (let counter=0;counter<=0xffffffff;counter++) { new DataView(input.buffer).setUint32(input.length-4,counter,true); const secret=tagged(tag,input); if (noble.validSecret(secret)) { const out=hex(secret); secret.fill(0); return out; } secret.fill(0); } } finally { input.fill(0); }
     fail('Could not derive private key.');
+  }
+  // Legacy hashstash-passphrase-v1: one unsalted SHA256 per guess. Restore only.
+  function derivePrivate(passphrase) {
+    requireSecure();
+    const phrase = passphraseBytes(passphrase);
+    try { return firstSecret('Hashstash/Passphrase/v1',phrase); } finally { phrase.fill(0); }
+  }
+  // HMAC-SHA256 and one-iteration PBKDF2-HMAC-SHA256, the only form scrypt uses.
+  function hmac(key, ...parts) {
+    const block = new Uint8Array(64), pad = new Uint8Array(64);
+    block.set(key.length > 64 ? noble.sha256(key) : key);
+    let inner;
+    try {
+      for (let i = 0; i < 64; i++) pad[i] = block[i] ^ 0x36;
+      inner = noble.sha256(concat(pad, ...parts));
+      for (let i = 0; i < 64; i++) pad[i] = block[i] ^ 0x5c;
+      return noble.sha256(concat(pad, inner));
+    } finally { block.fill(0); pad.fill(0); inner?.fill(0); }
+  }
+  function pbkdf2(password, salt, length) {
+    const out = new Uint8Array(length), index = new Uint8Array(4);
+    for (let block = 1, offset = 0; offset < length; block++, offset += 32) {
+      new DataView(index.buffer).setUint32(0, block, false);
+      const t = hmac(password, salt, index); out.set(t.subarray(0, Math.min(32, length - offset)), offset); t.fill(0);
+    }
+    return out;
+  }
+  // RFC 7914 Salsa20/8 core on 16 little-endian words, in place.
+  function salsa8(b) {
+    let x0=b[0],x1=b[1],x2=b[2],x3=b[3],x4=b[4],x5=b[5],x6=b[6],x7=b[7],x8=b[8],x9=b[9],x10=b[10],x11=b[11],x12=b[12],x13=b[13],x14=b[14],x15=b[15],u;
+    for (let i = 0; i < 8; i += 2) {
+      u=(x0+x12)|0;x4^=(u<<7)|(u>>>25);u=(x4+x0)|0;x8^=(u<<9)|(u>>>23);u=(x8+x4)|0;x12^=(u<<13)|(u>>>19);u=(x12+x8)|0;x0^=(u<<18)|(u>>>14);
+      u=(x5+x1)|0;x9^=(u<<7)|(u>>>25);u=(x9+x5)|0;x13^=(u<<9)|(u>>>23);u=(x13+x9)|0;x1^=(u<<13)|(u>>>19);u=(x1+x13)|0;x5^=(u<<18)|(u>>>14);
+      u=(x10+x6)|0;x14^=(u<<7)|(u>>>25);u=(x14+x10)|0;x2^=(u<<9)|(u>>>23);u=(x2+x14)|0;x6^=(u<<13)|(u>>>19);u=(x6+x2)|0;x10^=(u<<18)|(u>>>14);
+      u=(x15+x11)|0;x3^=(u<<7)|(u>>>25);u=(x3+x15)|0;x7^=(u<<9)|(u>>>23);u=(x7+x3)|0;x11^=(u<<13)|(u>>>19);u=(x11+x7)|0;x15^=(u<<18)|(u>>>14);
+      u=(x0+x3)|0;x1^=(u<<7)|(u>>>25);u=(x1+x0)|0;x2^=(u<<9)|(u>>>23);u=(x2+x1)|0;x3^=(u<<13)|(u>>>19);u=(x3+x2)|0;x0^=(u<<18)|(u>>>14);
+      u=(x5+x4)|0;x6^=(u<<7)|(u>>>25);u=(x6+x5)|0;x7^=(u<<9)|(u>>>23);u=(x7+x6)|0;x4^=(u<<13)|(u>>>19);u=(x4+x7)|0;x5^=(u<<18)|(u>>>14);
+      u=(x10+x9)|0;x11^=(u<<7)|(u>>>25);u=(x11+x10)|0;x8^=(u<<9)|(u>>>23);u=(x8+x11)|0;x9^=(u<<13)|(u>>>19);u=(x9+x8)|0;x10^=(u<<18)|(u>>>14);
+      u=(x15+x14)|0;x12^=(u<<7)|(u>>>25);u=(x12+x15)|0;x13^=(u<<9)|(u>>>23);u=(x13+x12)|0;x14^=(u<<13)|(u>>>19);u=(x14+x13)|0;x15^=(u<<18)|(u>>>14);
+    }
+    b[0]+=x0;b[1]+=x1;b[2]+=x2;b[3]+=x3;b[4]+=x4;b[5]+=x5;b[6]+=x6;b[7]+=x7;b[8]+=x8;b[9]+=x9;b[10]+=x10;b[11]+=x11;b[12]+=x12;b[13]+=x13;b[14]+=x14;b[15]+=x15;
+  }
+  function blockMix(input, output, r, t) {
+    t.set(input.subarray((2 * r - 1) * 16, 2 * r * 16));
+    for (let i = 0; i < 2 * r; i++) {
+      for (let k = 0; k < 16; k++) t[k] ^= input[i * 16 + k];
+      salsa8(t); output.set(t, (i & 1 ? r + (i >> 1) : i >> 1) * 16);
+    }
+  }
+  // scrypt (RFC 7914); N is a power of two. Words convert from bytes explicitly,
+  // so the result does not depend on platform endianness.
+  function scrypt(password, salt, N, r, p, length) {
+    const words = 32 * r, B = pbkdf2(password, salt, p * 128 * r);
+    const X = new Uint32Array(words), Y = new Uint32Array(words), V = new Uint32Array(words * N), t = new Uint32Array(16);
+    try {
+      for (let block = 0; block < p; block++) {
+        const base = block * 128 * r;
+        for (let k = 0; k < words; k++) { const o = base + 4 * k; X[k] = B[o] | (B[o + 1] << 8) | (B[o + 2] << 16) | (B[o + 3] << 24); }
+        for (let i = 0; i < N; i += 2) { V.set(X, i * words); blockMix(X, Y, r, t); V.set(Y, (i + 1) * words); blockMix(Y, X, r, t); }
+        for (let i = 0; i < N; i += 2) {
+          let j = (X[(2 * r - 1) * 16] & (N - 1)) * words;
+          for (let k = 0; k < words; k++) X[k] ^= V[j + k];
+          blockMix(X, Y, r, t);
+          j = (Y[(2 * r - 1) * 16] & (N - 1)) * words;
+          for (let k = 0; k < words; k++) Y[k] ^= V[j + k];
+          blockMix(Y, X, r, t);
+        }
+        for (let k = 0; k < words; k++) { const o = base + 4 * k, w = X[k]; B[o] = w; B[o + 1] = w >>> 8; B[o + 2] = w >>> 16; B[o + 3] = w >>> 24; }
+      }
+      return pbkdf2(password, B, length);
+    } finally { B.fill(0); X.fill(0); Y.fill(0); V.fill(0); t.fill(0); }
+  }
+  // hashstash-passphrase-v2: scrypt (N=2^17, r=8, p=1) salted with the tag and
+  // chain ID, then the first valid tagged secret. Each network gets its own account.
+  function derivePrivateV2(passphrase, chainId) {
+    requireSecure();
+    const chain = bytes32(chainId, 'Chain ID'), phrase = passphraseBytes(passphrase);
+    let stretched;
+    try {
+      if (phrase.length < 16) fail('Passphrase must contain at least 16 UTF-8 bytes.');
+      stretched = scrypt(phrase, concat(utf8.encode('Hashstash/Passphrase/v2'), chain), 1 << 17, 8, 1, 32);
+      return firstSecret('Hashstash/Passphrase/v2', stretched);
+    } finally { phrase.fill(0); stretched?.fill(0); }
   }
   function requireSecure() {
     const l = root.location, local = l && ['localhost','127.0.0.1','[::1]','::1'].includes(l.hostname);
@@ -326,7 +412,11 @@
       destroy() { root.removeEventListener?.('storage',onStorage); callbacks.clear(); invalidateMetadata(); },
       async create(expected) { let secret; do { secret=random(32); } while(!noble.validSecret(secret)); try { return await add(hex(noble.schnorr.getPublicKey(secret)),hex(secret),expected); } finally { secret.fill(0); } },
       importPrivate(privateHex,expected) { const key=publicKey(privateHex); return add(key,privateHex.toLowerCase(),expected); },
-      importPassphrase(passphrase,expected) { const secret=derivePrivate(passphrase); return add(publicKey(secret),secret,expected); },
+      // The scheme is explicit: v2 for passphrase accounts, v1 only to restore legacy ones.
+      importPassphrase(passphrase,scheme,expected) {
+        const secret=scheme==='hashstash-passphrase-v2' ? derivePrivateV2(passphrase,chainId) : scheme==='hashstash-passphrase-v1' ? derivePrivate(passphrase) : fail('Choose a passphrase scheme.');
+        return add(publicKey(secret),secret,expected);
+      },
       watch(value,expected) { const key=typeof value==='string' && value.length===78 ? addresses.decode(value,hrp) : hex(publicBytes(value)); publicBytes(key); return add(key,null,expected); },
       select(id,expected) { return change(data=>{if(!data.wallets.some(w=>w.id===id)) fail('Wallet not found.'); data.selected=id;},expected); },
       exportPrivate(id,expected) { return locked(()=>{const data=read();guard(data,expected);const w=data.wallets.find(w=>w.id===id);if(!w?.private_key)fail('This wallet has no private key.');return w.private_key;}); },
@@ -358,5 +448,5 @@
       }
     });
   }
-  return Object.freeze({createStore,publicKey,derivePrivate,decodeUnsigned,verifyUnsigned,verifySigned});
+  return Object.freeze({createStore,publicKey,derivePrivate,derivePrivateV2,decodeUnsigned,verifyUnsigned,verifySigned});
 });

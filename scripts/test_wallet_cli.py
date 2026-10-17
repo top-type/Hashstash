@@ -155,9 +155,11 @@ def main():
             code, result = request(cold_base, '/api/' + action, value or {}, token)
             assert code == expected, (action, code, result)
             return result
-        assert cold('unlock', {'passphrase': other['passphrase']})['public_key'] == other['public_key']
+        # The signer reviews only for an operator-selected network; these are legacy v1 fixtures.
+        cold('network', {'chain_id': envelope['chain_id']})
+        assert cold('unlock', {'passphrase': other['passphrase'], 'scheme': 'hashstash-passphrase-v1'})['public_key'] == other['public_key']
         cold('review', envelope, expected=400)
-        assert cold('unlock', {'passphrase': vector['passphrase']})['public_key'] == vector['public_key']
+        assert cold('unlock', {'passphrase': vector['passphrase'], 'scheme': 'hashstash-passphrase-v1'})['public_key'] == vector['public_key']
         check('Published passphrase restores its exact public key; another account cannot review its transaction')
         review = cold('review', envelope)
         displayed = {field['label']: field['value'] for field in review['fields']}
@@ -295,7 +297,7 @@ def main():
         _, restarted = request(cold_base, '/api/session')
         assert restarted['unlocked'] is False and restarted['token'] != old_token
         token = restarted['token']
-        assert cold('unlock', {'passphrase': vector['passphrase']})['public_key'] == vector['public_key']
+        assert cold('unlock', {'passphrase': vector['passphrase'], 'scheme': 'hashstash-passphrase-v1'})['public_key'] == vector['public_key']
         cold('lock')
         cold('review', fresh, expected=400)
         check('Signer restart clears keys; the same passphrase restores the same account; locking disables review')

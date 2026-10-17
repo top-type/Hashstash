@@ -90,6 +90,29 @@ pub(crate) struct WalletStore {
     fresh: bool,
     chain_id: Hash,
 }
+/// Hot secrets are stored unencrypted, so the database is owner-only on Unix.
+/// SQLite gives its rollback journal the database file's mode. Windows files
+/// inherit the containing folder's ACL.
+fn restrict_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("cannot open wallet storage {}", path.display()))?;
+        if std::fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("cannot restrict wallet storage {}", path.display()))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 impl WalletStore {
     pub fn open(chain_path: &Path, chain_id: Hash) -> Result<Self> {
         let path = chain_path.with_extension("wallets.sqlite");
@@ -97,11 +120,35 @@ impl WalletStore {
             path != chain_path,
             "chain database path conflicts with wallet storage"
         );
-        let mut connection = Connection::open(path)?;
+        restrict_permissions(&path)?;
+        let mut connection = Connection::open(&path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.execute_batch("PRAGMA synchronous=FULL;
+        connection.execute_batch("PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;
             CREATE TABLE IF NOT EXISTS wallets(id TEXT PRIMARY KEY,name TEXT NOT NULL,public BLOB NOT NULL,secret BLOB);
-            CREATE TABLE IF NOT EXISTS wallet_selection(singleton INTEGER PRIMARY KEY CHECK(singleton=1),active TEXT NOT NULL,revision TEXT NOT NULL);")?;
+            CREATE TABLE IF NOT EXISTS wallet_selection(singleton INTEGER PRIMARY KEY CHECK(singleton=1),active TEXT NOT NULL,revision TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS wallet_network(singleton INTEGER PRIMARY KEY CHECK(singleton=1),chain_id TEXT NOT NULL);")?;
+        // Keys are independent of chain state, but sidecar names derive from the
+        // chain path's stem: say so when another network opens this store.
+        let previous: Option<String> = connection
+            .query_row(
+                "SELECT chain_id FROM wallet_network WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if previous.as_deref() != Some(hex::encode(chain_id).as_str()) {
+            if let Some(previous) = &previous {
+                eprintln!(
+                    "Warning: wallet storage {} was last opened for chain {previous}; this network is {}. Its saved keys are shared by both networks.",
+                    path.display(),
+                    hex::encode(chain_id)
+                );
+            }
+            connection.execute(
+                "INSERT INTO wallet_network(singleton,chain_id) VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET chain_id=excluded.chain_id",
+                params![hex::encode(chain_id)],
+            )?;
+        }
         let selection: Option<(String, String)> = connection
             .query_row(
                 "SELECT active,revision FROM wallet_selection WHERE singleton=1",
@@ -146,11 +193,9 @@ impl WalletStore {
                     .get::<_, Option<Vec<u8>>>(3)?
                     .map(|bytes| {
                         let bytes = Zeroizing::new(bytes);
-                        let key: [u8; 32] = bytes
-                            .as_slice()
-                            .try_into()
-                            .map_err(|_| anyhow!("invalid saved private key"))?;
-                        let key = Zeroizing::new(key);
+                        ensure!(bytes.len() == 32, "invalid saved private key");
+                        let mut key = Zeroizing::new([0u8; 32]);
+                        key.copy_from_slice(&bytes);
                         ensure!(
                             crypto::public_key(&key)? == public,
                             "saved public/private key mismatch"
@@ -190,6 +235,8 @@ impl WalletStore {
                 public,
                 secret: Some(secret),
             })?;
+        } else if let Some(warning) = self.unapplied_seed("--wallet-key", "hot", &public) {
+            eprintln!("{warning}");
         }
         self.fresh = false;
         Ok(())
@@ -202,9 +249,32 @@ impl WalletStore {
                 public,
                 secret: None,
             })?;
+        } else if let Some(warning) = self.unapplied_seed("--watch-key", "watch", &public) {
+            eprintln!("{warning}");
         }
         self.fresh = false;
         Ok(())
+    }
+    /// A saved selection, even an empty one, survives startup flags. Report it
+    /// whenever that selection is not the requested wallet.
+    fn unapplied_seed(&self, flag: &str, mode: &str, public: &PublicKey) -> Option<String> {
+        if self.active == format!("{mode}:{}", hex::encode(public)) {
+            return None;
+        }
+        let saved = self.entries.get(&self.active).map_or_else(
+            || "no wallet selected".to_owned(),
+            |entry| {
+                format!(
+                    "{} wallet {}",
+                    entry.mode(),
+                    address::encode(&entry.public, &self.chain_id)
+                        .expect("stored public key is validated")
+                )
+            },
+        );
+        Some(format!(
+            "Warning: {flag} was not applied: this node's wallet storage keeps its saved selection ({saved}). Import or select the account through the private Wallet tools instead."
+        ))
     }
     pub fn status(&self) -> Value {
         let Some(entry) = self.entries.get(&self.active) else {
@@ -272,13 +342,8 @@ impl WalletStore {
                     private_key.len() == 64,
                     "private key must contain 64 hex characters"
                 );
-                let bytes = Zeroizing::new(hex::decode(private_key)?);
-                let secret = Zeroizing::new(
-                    bytes
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| anyhow!("invalid private key length"))?,
-                );
+                let mut secret = Zeroizing::new([0u8; 32]);
+                hex::decode_to_slice(private_key, secret.as_mut())?;
                 let public = crypto::public_key(&secret)?;
                 let name = check_name(name)?;
                 if let Some(expected) = public_key {
@@ -320,6 +385,7 @@ impl WalletStore {
                     .secret
                     .as_ref()
                     .context("watch-only wallets have no private key")?;
+                // The exported hex leaves through the response; it is not wiped.
                 return Ok(
                     json!({"format":"hashstash-private-v1","private_key":hex::encode(secret.as_slice()),"public_key":hex::encode(entry.public)}),
                 );
@@ -486,5 +552,51 @@ mod tests {
         );
         assert_eq!(duplicate, saved);
         assert_eq!(duplicate["wallets"][0]["name"], "Existing custom label");
+    }
+
+    #[test]
+    fn ignored_startup_wallets_are_reported_unless_already_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chain.sqlite");
+        let public = crypto::public_key(&[3; 32]).unwrap();
+        drop(WalletStore::open(&path, [1; 32]).unwrap());
+        let mut empty = WalletStore::open(&path, [1; 32]).unwrap();
+        let warning = empty.unapplied_seed("--wallet-key", "hot", &public).unwrap();
+        assert!(warning.contains("--wallet-key was not applied") && warning.contains("no wallet selected"));
+        empty.seed_hot([3; 32]).unwrap();
+        assert!(empty.entries.is_empty());
+        manage(&mut empty, json!({"action":"import","private_key":hex::encode([3;32])}));
+        assert!(empty.unapplied_seed("--wallet-key", "hot", &public).is_none());
+        let watch = empty.unapplied_seed("--watch-key", "watch", &public).unwrap();
+        assert!(watch.contains("hot wallet hsh"), "{watch}");
+    }
+
+    #[test]
+    fn stored_hot_keys_are_owner_only_and_record_their_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chain.sqlite");
+        let wallets = path.with_extension("wallets.sqlite");
+        let mut store = WalletStore::open(&path, [1; 32]).unwrap();
+        manage(&mut store, json!({"action":"create"}));
+        drop(store);
+        let network = |store: &WalletStore| -> String {
+            store
+                .connection
+                .query_row("SELECT chain_id FROM wallet_network", [], |r| r.get(0))
+                .unwrap()
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = || std::fs::metadata(&wallets).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(), 0o600);
+            std::fs::set_permissions(&wallets, std::fs::Permissions::from_mode(0o644)).unwrap();
+            drop(WalletStore::open(&path, [1; 32]).unwrap());
+            assert_eq!(mode(), 0o600, "existing permissive storage is tightened");
+        }
+        assert!(wallets.exists());
+        let reopened = WalletStore::open(&path, [2; 32]).unwrap();
+        assert_eq!(network(&reopened), hex::encode([2; 32]));
+        assert_eq!(reopened.entries.len(), 1, "keys remain shared across networks");
     }
 }

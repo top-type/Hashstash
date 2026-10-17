@@ -20,5 +20,7 @@ They never enter node requests. Browser storage is not a backup: export the
 private key before clearing site data, changing profiles or moving endpoints.
 This hot wallet trusts the served page code and other code executing on the same
 origin; HTTPS protects delivery in transit, not a compromised host. Watch-only
-and offline signing remain available. No password stretching or strength rule is
-applied to a user-chosen passphrase.
+and offline signing remain available. Passphrase import names its scheme:
+`hashstash-passphrase-v2` stretches the phrase with scrypt (implemented in
+`browser-wallet.js` on this SHA256) salted by the chain ID; the unstretched
+`hashstash-passphrase-v1` remains for restoring legacy accounts only.

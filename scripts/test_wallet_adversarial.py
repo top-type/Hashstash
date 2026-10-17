@@ -76,7 +76,9 @@ def main():
         config = directory / 'network.json'
         config.write_text(json.dumps(configuration))
         base = start(node, ['run', '--config', config, '--data', directory / 'chain.sqlite', '--miner', primary['public_key'], '--watch-key', primary['public_key'], '--rpc', f'127.0.0.1:{args.base_port}', '--p2p', f'127.0.0.1:{args.base_port + 1}', '--stratum', f'127.0.0.1:{args.base_port + 2}'], 'node', 'RPC: (http://127\\.0\\.0\\.1:\\d+)/rpc')
-        cold_base = start(signer, ['--port', args.base_port + 3, '--config', config], 'cold', 'cold signer: (http://127\\.0\\.0\\.1:\\d+)/')
+        # Above the 64 MiB default, so the configurable review limit is exercised below.
+        review_limit = 2 * 32 * 1024 * 1024 + 128 * 1024
+        cold_base = start(signer, ['--port', args.base_port + 3, '--config', config, '--max-review-bytes', review_limit + 64 * 1024], 'cold', 'cold signer: (http://127\\.0\\.0\\.1:\\d+)/')
         status = rpc(base, 'status')
         assert status['time_unit'] == 'seconds'
         check('Adversarial wallet fixture uses canonical-only mining and immediate reserve-grant funding consensus')
@@ -113,7 +115,7 @@ def main():
             review = cold('review', envelope)
             return cold('sign', {'review_token': review['review_token']})
         rpc(base, 'mine', {'count': 12})
-        cold('unlock', {'passphrase': primary['passphrase']})
+        cold('unlock', {'passphrase': primary['passphrase'], 'scheme': 'hashstash-passphrase-v1'})
         original = prepare()
         body = bytes.fromhex(original['body'])
         _, fee_length_offset = read_uint(body, 32)
@@ -193,10 +195,10 @@ def main():
         assert request(cold_base, '/api/session')[1]['public_key'] == primary['public_key']
         assert raw_cold('unlock', ' ' * (128 * 1024 + 1))[0] == 413
         assert raw_cold('review', ' ' * (128 * 1024 + 1))[0] == 400
-        review_limit = 2 * 32 * 1024 * 1024 + 128 * 1024
         assert raw_cold('review', ' ' * (review_limit + 1))[0] == 400
         assert raw_cold('review', ' ' * (review_limit + 1) + json.dumps(original))[0] == 200
-        check('Valid review envelopes are not rejected by the removed fixed transaction body limit')
+        assert raw_cold('review', ' ' * (review_limit + 64 * 1024 + 1))[0] == 413
+        check('Review envelopes are bounded only by the signer\'s configurable review limit')
         assert request(cold_base, '/api/session')[1]['unlocked'] is True
         check('Cross-origin, wrong token/host, and oversized control inputs leave the signer available and wallet unchanged')
         signed = sign(original)
@@ -242,7 +244,7 @@ def main():
         cold('import', {'private_key': '00'}, expected=400)
         assert request(cold_base, '/api/session')[1]['unlocked'] is False
         cold('sign', {'review_token': prior['review_token']}, expected=400)
-        cold('unlock', {'passphrase': primary['passphrase']})
+        cold('unlock', {'passphrase': primary['passphrase'], 'scheme': 'hashstash-passphrase-v1'})
         restored = sign(prepare())
         rpc(base, 'broadcasttransaction', {'raw': restored['raw']})
         rpc(base, 'mine', {'count': 1})

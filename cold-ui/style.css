@@ -43,6 +43,9 @@ input:focus,textarea:focus,select:focus { border-color:var(--focus); outline:1px
 ::selection { background:#22547a; color:#fff; }
 .public-key { display:block; margin:7px 0 18px; font:13px/1.75 var(--mono); overflow-wrap:anywhere; color:var(--text); }
 .hint { color:var(--muted); font-size:12px; line-height:1.65; margin:0 0 20px; }
+.hint.warning { color:var(--accent); }
+.check { display:flex; align-items:center; gap:10px; color:var(--text); }
+.check input { width:auto; min-height:0; margin:0; flex:none; }
 dl { margin:0 0 20px; display:grid; grid-template-columns:160px minmax(0,1fr); column-gap:20px; }
 dt,dd { min-width:0; padding:12px 0; border-bottom:1px solid var(--line); margin:0; }
 dt { color:var(--muted); font-size:12px; overflow-wrap:anywhere; }

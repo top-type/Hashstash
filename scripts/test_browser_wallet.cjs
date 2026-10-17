@@ -79,6 +79,36 @@ async function run() {
   }
   for(const row of JSON.parse(fs.readFileSync(path.join(root,'tests/data/passphrase-v1.json'),'utf8')).vectors) {equal(b.api.derivePrivate(row.passphrase),row.secret);equal(b.api.publicKey(row.secret),row.public_key);}
   throws(()=>b.api.derivePrivate(''),/passphrase/i);throws(()=>b.api.derivePrivate('\ud800'),/Unicode/);throws(()=>b.api.derivePrivate('é'.repeat(2049)),/long/);equal(b.api.derivePrivate('é'.repeat(2048)).length,64);
+  // v2 shares vectors with Rust; each is also rederived with Node's own OpenSSL
+  // scrypt, so neither implementation supplies its own expected result.
+  {
+    const v2=JSON.parse(fs.readFileSync(path.join(root,'tests/data/passphrase-v2.json'),'utf8'));
+    equal(v2.scheme,'hashstash-passphrase-v2');equal(JSON.stringify(v2.kdf),JSON.stringify({name:'scrypt',log_n:17,r:8,p:1,dk_len:32,salt:'UTF-8 tag || 32-byte chain ID'}));
+    const {scryptSync}=require('node:crypto'),seen=new Set();
+    for(const row of v2.vectors) {
+      equal(Buffer.from(row.passphrase,'utf8').toString('hex'),row.utf8_hex);
+      const stretched=scryptSync(Buffer.from(row.passphrase,'utf8'),Buffer.concat([Buffer.from(v2.tag),Buffer.from(row.chain_id,'hex')]),32,{N:1<<17,r:8,p:1,maxmem:256*1024*1024});
+      equal(stretched.toString('hex'),row.stretched);
+      const tag=createHash('sha256').update(v2.tag).digest(),counter=Buffer.alloc(4);counter.writeUInt32LE(row.counter);
+      equal(createHash('sha256').update(Buffer.concat([tag,tag,stretched,counter])).digest('hex'),row.secret);
+      equal(b.api.derivePrivateV2(row.passphrase,row.chain_id),row.secret);equal(b.api.publicKey(row.secret),row.public_key);
+      ok(row.secret!==b.api.derivePrivate(row.passphrase));seen.add(row.public_key);
+    }
+    equal(seen.size,v2.vectors.length);
+    throws(()=>b.api.derivePrivateV2('','27'.repeat(32)),/passphrase/i);throws(()=>b.api.derivePrivateV2('a'.repeat(15),'27'.repeat(32)),/16 UTF-8 bytes/);
+    throws(()=>b.api.derivePrivateV2('é'.repeat(7),'27'.repeat(32)),/16 UTF-8 bytes/);throws(()=>b.api.derivePrivateV2('\ud800'.repeat(16),'27'.repeat(32)),/Unicode/);
+    throws(()=>b.api.derivePrivateV2('a'.repeat(4097),'27'.repeat(32)),/long/);throws(()=>b.api.derivePrivateV2(v2.vectors[0].passphrase,'27'),/Chain ID/);
+    throws(()=>browser(profile(),'public.example','http:').api.derivePrivateV2(v2.vectors[0].passphrase,'27'.repeat(32)),/HTTPS/);
+    const row=v2.vectors[0],passStore=b.api.createStore(row.chain_id);
+    await rejects(async()=>passStore.importPassphrase(row.passphrase),/scheme/);
+    await rejects(async()=>passStore.importPassphrase(row.passphrase,{wallet_revision:'0'}),/scheme/);
+    equal((await passStore.importPassphrase(row.passphrase,'hashstash-passphrase-v2')).public_key,row.public_key);
+    const legacy=b.api.publicKey(b.api.derivePrivate(row.passphrase));
+    equal((await passStore.importPassphrase(row.passphrase,'hashstash-passphrase-v1')).public_key,legacy);
+    passStore.destroy();
+    const otherNetwork=b.api.createStore(v2.vectors[1].chain_id);
+    equal((await otherNetwork.importPassphrase(row.passphrase,'hashstash-passphrase-v2')).public_key,v2.vectors[1].public_key);otherNetwork.destroy();
+  }
   throws(()=>b.api.publicKey('00'.repeat(32)),/private/i);throws(()=>b.api.publicKey('ff'.repeat(32)),/private/i);
   throws(()=>browser(profile(),'public.example','http:').api.createStore('27'.repeat(32)),/HTTPS/);
   throws(()=>browser(profile(),'public.example','http:').api.publicKey('13'.repeat(32)),/HTTPS/);

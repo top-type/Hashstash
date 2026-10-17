@@ -100,8 +100,9 @@ struct Signer {
 }
 
 impl Signer {
+    /// Reviews need an operator-selected network; fixtures use [9; 32].
     async fn start() -> Self {
-        Self::with_chain(None).await
+        Self::with_chain(Some([9; 32])).await
     }
 
     async fn with_chain(chain: Option<Hash>) -> Self {
@@ -149,8 +150,14 @@ impl Signer {
             .unwrap()
     }
 
+    /// Restores a legacy v1 passphrase account; cheap for review fixtures.
     async fn unlock(&self, phrase: &str) -> PublicKey {
-        let value = self.ok("unlock", json!({"passphrase":phrase})).await;
+        let value = self
+            .ok(
+                "unlock",
+                json!({"passphrase":phrase,"scheme":wallet::PASSPHRASE_SCHEME}),
+            )
+            .await;
         assert_eq!(
             value["watch"]["format"],
             if value["chain_id"].is_null() {
@@ -255,15 +262,31 @@ async fn configured_network_formats_addresses_and_rejects_mismatched_export_cont
 
 #[tokio::test]
 async fn network_changes_invalidate_review_and_persist_across_key_changes() {
-    let signer = Signer::start().await;
+    let signer = Signer::with_chain(None).await;
     let sender = signer.unlock(PHRASE).await;
     let expected = body(sender, payment());
-    let review = signer
-        .ok(
-            "review",
-            serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap(),
-        )
+    let envelope = serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap();
+    // Unsigned export context is never adopted as the signer's network.
+    let refused = signer.post("review", envelope.clone()).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        refused.text().await.unwrap().contains("Select this signer's network"),
+        "review without a selected network must explain the requirement"
+    );
+    let session: Value = signer
+        .client
+        .get(format!("{}/api/session", signer.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(session["chain_id"].is_null());
+    signer
+        .ok("network", json!({"chain_id":hex::encode([9;32])}))
         .await;
+    let review = signer.ok("review", envelope).await;
     assert_eq!(review["chain_id"], hex::encode([9; 32]));
     assert_eq!(review["watch"]["format"], "hashstash-watch-v2");
     let other_chain = [10; 32];
@@ -326,7 +349,8 @@ fn body(sender: PublicKey, operation: Operation) -> TransactionBody {
         sender,
         nonce: 9_007_199_254_740_993,
         anchor: [0; 32],
-        expiry_blocks: 9_007_199_254_740_999,
+        // The longest lifetime signable without an extra confirmation.
+        expiry_blocks: wallet::LONG_LIFETIME_BLOCKS,
         fee: (Amount::from(1u32) << 128usize) + 17u32,
         operation,
     }
@@ -740,7 +764,10 @@ async fn edits_failed_reviews_lock_and_import_invalidate_old_signatures() {
     let review = signer.ok("review", envelope).await;
     assert_eq!(
         signer
-            .post("unlock", json!({"passphrase":""}))
+            .post(
+                "unlock",
+                json!({"passphrase":"","scheme":wallet::PASSPHRASE_SCHEME})
+            )
             .await
             .status(),
         StatusCode::BAD_REQUEST
@@ -758,7 +785,7 @@ async fn edits_failed_reviews_lock_and_import_invalidate_old_signatures() {
 #[tokio::test]
 async fn actual_cold_http_signing_round_trip_broadcasts_and_mines() {
     use hashstash::{config::Config, node::Node};
-    let signer = Signer::start().await;
+    let signer = Signer::with_chain(Some(Config::devnet().chain_id())).await;
     let sender = signer.unlock(PHRASE).await;
     let directory = tempfile::tempdir().unwrap();
     let node = Node::open(
@@ -912,6 +939,326 @@ async fn malformed_operations_cannot_be_approved_offline() {
                 .status(),
             StatusCode::BAD_REQUEST,
             "invalid review must revoke the previous approval"
+        );
+    }
+    signer.server.stop().await;
+}
+
+fn v2_vector(index: usize) -> (String, Hash, String) {
+    let document: Value = serde_json::from_str(include_str!("data/passphrase-v2.json")).unwrap();
+    let vector = &document["vectors"][index];
+    (
+        vector["passphrase"].as_str().unwrap().into(),
+        hex::decode(vector["chain_id"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        vector["public_key"].as_str().unwrap().into(),
+    )
+}
+
+#[tokio::test]
+async fn passphrases_need_an_explicit_scheme_and_v2_belongs_to_the_selected_network() {
+    let (phrase, chain, public) = v2_vector(0);
+    let signer = Signer::with_chain(None).await;
+    for request in [
+        json!({"passphrase":phrase}),
+        json!({"passphrase":phrase,"scheme":"hashstash-passphrase-v3"}),
+        json!({"passphrase":phrase,"scheme":wallet::PASSPHRASE_V2_SCHEME}),
+    ] {
+        assert_eq!(
+            signer.post("unlock", request).await.status(),
+            StatusCode::BAD_REQUEST,
+            "no legacy default, unknown scheme, or v2 without a network"
+        );
+    }
+    signer
+        .ok("network", json!({"chain_id":hex::encode(chain)}))
+        .await;
+    assert_eq!(
+        signer
+            .post(
+                "unlock",
+                json!({"passphrase":"fifteen bytes!!","scheme":wallet::PASSPHRASE_V2_SCHEME})
+            )
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let opened = signer
+        .ok(
+            "unlock",
+            json!({"passphrase":phrase,"scheme":wallet::PASSPHRASE_V2_SCHEME}),
+        )
+        .await;
+    assert_eq!(opened["public_key"], public);
+    let legacy = crypto::public_key(&wallet::derive_secret(&phrase).unwrap()).unwrap();
+    assert_ne!(opened["public_key"], hex::encode(legacy));
+    let sender: PublicKey = hex::decode(&public).unwrap().try_into().unwrap();
+    let review = signer
+        .ok(
+            "review",
+            serde_json::to_value(wallet::unsigned(&body(sender, payment()), &chain)).unwrap(),
+        )
+        .await;
+    // Re-selecting the same network keeps the key; another network locks it.
+    let same = signer
+        .ok("network", json!({"chain_id":hex::encode(chain)}))
+        .await;
+    assert_eq!(same["public_key"], public);
+    let other = signer
+        .ok("network", json!({"chain_id":hex::encode([40;32])}))
+        .await;
+    assert_eq!(other["unlocked"], false);
+    assert!(other["public_key"].is_null());
+    assert_eq!(
+        signer
+            .post("sign", json!({"review_token":review["review_token"]}))
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    // Legacy v1 still restores its exact account and survives network changes.
+    let restored = signer
+        .ok(
+            "unlock",
+            json!({"passphrase":phrase,"scheme":wallet::PASSPHRASE_SCHEME}),
+        )
+        .await;
+    assert_eq!(restored["public_key"], hex::encode(legacy));
+    let moved = signer
+        .ok("network", json!({"chain_id":hex::encode(chain)}))
+        .await;
+    assert_eq!(moved["public_key"], hex::encode(legacy));
+    signer.server.stop().await;
+}
+
+#[tokio::test]
+async fn generated_keys_are_random_return_one_backup_and_sign() {
+    let signer = Signer::start().await;
+    let first = signer.ok("generate", json!({})).await;
+    let second = signer.ok("generate", json!({})).await;
+    assert_ne!(first["public_key"], second["public_key"]);
+    let backup = &second["backup"];
+    assert_eq!(backup["format"], "hashstash-private-v1");
+    assert_eq!(backup["public_key"], second["public_key"]);
+    let secret: [u8; 32] = hex::decode(backup["private_key"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let sender = crypto::public_key(&secret).unwrap();
+    assert_eq!(second["public_key"], hex::encode(sender));
+    assert_eq!(second["watch"]["format"], "hashstash-watch-v2");
+    let session: Value = signer
+        .client
+        .get(format!("{}/api/session", signer.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(session.get("backup").is_none(), "status never carries the private key");
+    assert_eq!(session["public_key"], hex::encode(sender));
+    assert_eq!(session["backup_pending"], true);
+    // Until the operator saves it (for example after a page reload), the backup
+    // can be fetched again; afterwards the signer no longer releases the key.
+    assert_eq!(signer.ok("backup", json!({})).await["backup"], *backup);
+    let saved = signer.ok("backup", json!({"saved":true})).await;
+    assert_eq!(saved["backup_pending"], false);
+    assert_eq!(saved["public_key"], hex::encode(sender));
+    for request in [json!({}), json!({"saved":true}), json!({"saved":true,"x":1})] {
+        assert_eq!(
+            signer.post("backup", request).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let expected = body(sender, payment());
+    let review = signer
+        .ok(
+            "review",
+            serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap(),
+        )
+        .await;
+    let signed = signer
+        .ok("sign", json!({"review_token":review["review_token"]}))
+        .await;
+    assert_eq!(
+        wallet::decode_signed(signed["raw"].as_str().unwrap())
+            .unwrap()
+            .body,
+        expected
+    );
+    // The restored backup is the same account.
+    let restored = signer
+        .ok("import", json!({"private_key":backup["private_key"]}))
+        .await;
+    assert_eq!(restored["public_key"], hex::encode(sender));
+    assert_eq!(restored["backup_pending"], false);
+    signer.ok("generate", json!({})).await;
+    signer.ok("lock", json!({})).await;
+    assert_eq!(
+        signer.post("backup", json!({})).await.status(),
+        StatusCode::BAD_REQUEST,
+        "locking discards the pending key and its backup"
+    );
+    signer.server.stop().await;
+}
+
+#[tokio::test]
+async fn long_lifetimes_need_explicit_confirmation_before_signing() {
+    let signer = Signer::start().await;
+    let sender = signer.unlock(PHRASE).await;
+    let mut expected = body(sender, payment());
+    let short = signer
+        .ok(
+            "review",
+            serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap(),
+        )
+        .await;
+    assert_eq!(short["confirm_lifetime"], false);
+    assert!(
+        !short["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["label"] == "Lifetime warning")
+    );
+    for lifetime in [wallet::LONG_LIFETIME_BLOCKS + 1, u64::MAX] {
+        expected.expiry_blocks = lifetime;
+        let review = signer
+            .ok(
+                "review",
+                serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap(),
+            )
+            .await;
+        assert_eq!(review["confirm_lifetime"], true);
+        assert!(review["fields"].as_array().unwrap().iter().any(|f| {
+            f["label"] == "Lifetime warning" && f["value"].as_str().unwrap().contains(&lifetime.to_string())
+        }));
+        for unconfirmed in [
+            json!({"review_token":review["review_token"]}),
+            json!({"review_token":review["review_token"],"confirm_lifetime":false}),
+        ] {
+            let refused = signer.post("sign", unconfirmed).await;
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+            assert!(refused.text().await.unwrap().contains("Confirm the long"));
+        }
+        // A refused confirmation keeps the review, so the operator can confirm it.
+        let signed = signer
+            .ok(
+                "sign",
+                json!({"review_token":review["review_token"],"confirm_lifetime":true}),
+            )
+            .await;
+        let transaction = wallet::decode_signed(signed["raw"].as_str().unwrap()).unwrap();
+        assert_eq!(transaction.body.expiry_blocks, lifetime);
+    }
+    signer.server.stop().await;
+}
+
+#[tokio::test]
+async fn review_requests_have_a_finite_configurable_limit() {
+    let limit = 2 * cold::MAX_CONTROL_REQUEST;
+    let server = cold::serve_with_limits("127.0.0.1:0".parse().unwrap(), Some([9; 32]), limit)
+        .await
+        .unwrap();
+    let base = format!("http://{}", server.address);
+    let client = Client::new();
+    let session: Value = client
+        .get(format!("{base}/api/session"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session["max_review_bytes"], limit);
+    let signer = Signer {
+        server,
+        client,
+        base,
+        token: session["token"].as_str().unwrap().into(),
+    };
+    let sender = signer.unlock(PHRASE).await;
+    let mut expected = body(sender, payment());
+    expected.data = vec![7; cold::MAX_CONTROL_REQUEST / 2];
+    signer
+        .ok(
+            "review",
+            serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap(),
+        )
+        .await;
+    expected.data = vec![7; limit];
+    assert_eq!(
+        signer
+            .post(
+                "review",
+                serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap()
+            )
+            .await
+            .status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert!(
+        cold::serve_with_limits(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            cold::MAX_CONTROL_REQUEST - 1
+        )
+        .await
+        .is_err()
+    );
+    let default = Signer::start().await;
+    let session: Value = default
+        .client
+        .get(format!("{}/api/session", default.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session["max_review_bytes"], cold::DEFAULT_MAX_REVIEW_REQUEST);
+    default.server.stop().await;
+    signer.server.stop().await;
+}
+
+#[tokio::test]
+async fn proposal_review_reports_whether_text_matches_the_signed_description() {
+    use sha2::{Digest, Sha256};
+    let signer = Signer::start().await;
+    let sender = signer.unlock(PHRASE).await;
+    let text = "Pay the shared explorer host";
+    let proposal = |description: Hash| Operation::Propose {
+        round: 3,
+        description,
+        proposal: Proposal::Grant {
+            payments: vec![hashstash::types::GrantPayment {
+                recipient: crypto::public_key(&[30; 32]).unwrap(),
+                amount: 5u32.into(),
+            }],
+        },
+        support: 1u32.into(),
+    };
+    for (description, verdict) in [
+        (Sha256::digest(text.as_bytes()).into(), "Matches the description hash"),
+        ([3; 32], "Does not match the description hash"),
+    ] {
+        let mut expected = body(sender, proposal(description));
+        expected.data = text.as_bytes().to_vec();
+        let review = signer
+            .ok(
+                "review",
+                serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap(),
+            )
+            .await;
+        assert!(
+            review["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["label"] == "Rationale" && f["value"] == verdict)
         );
     }
     signer.server.stop().await;

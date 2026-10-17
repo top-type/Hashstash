@@ -27,7 +27,9 @@
 //!   (b) curved world, K small deposits + redeems: one cheap price search;
 //!   (c) curved ~2^511 world, one deposit breaking the default price bound;
 //!   (d) curved 2^256 world, a single near-(2^512-1) deposit (the quote RPC);
-//!   (e) curved ~2^511 world, a wide mixed batch breaking the bound.
+//!   (e) curved ~2^511 world, a wide mixed batch breaking the bound;
+//!   (f) flat world at price 3/2 and a zero bound: inexact sales are reduced
+//!       while exact buys fill, still without curve evaluation.
 //!
 //! Run: `cargo test --release --test poc_batch_cost -- --nocapture`
 
@@ -150,4 +152,17 @@ fn batch_clearing_work_is_bounded_on_curved_worlds() {
         .map(|n| order(1_000 + n, &reserve / (n + 5)))
         .collect();
     measured("(e) curved ~2^511, wide mixed batch", &w, &buys, &sells, cap, 600);
+
+    // (f) Odd sales raise a flat price of 3/2, so even a zero bound searches
+    // the sale budget; buys of multiples of 3 are exact and fill in full.
+    let reserve = pow2(256) * 3u32;
+    let w = world(reserve.clone(), pow2(257), reserve);
+    let buys: Vec<Order> = (0..16).map(|n| order(n, (3 * (n + 1)).into())).collect();
+    let sells: Vec<Order> = (0..16).map(|n| order(100 + n, (2 * n + 1).into())).collect();
+    let label = "(f) flat 3/2, inexact sales at a zero bound";
+    assert_eq!(measured(label, &w, &buys, &sells, 0, 0), 0);
+    let (r, _) =
+        batch::clear_with_work(&Config::devnet(), &w, &buys, &sells, 0, batch::CLEARING_WORK)
+            .unwrap();
+    assert!(r.buys.iter().zip(&buys).all(|(f, o)| f.input == o.amount));
 }

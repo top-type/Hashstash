@@ -107,7 +107,7 @@ fn settle_trades(
                 amount: t.amount.clone(),
             })
             .collect();
-        let clearing = batch::clear(
+        let clearing = batch::clear_memoized(
             c,
             initial,
             &buys,

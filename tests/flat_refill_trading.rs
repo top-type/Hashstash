@@ -3,7 +3,9 @@
 //! reduced-price lots of R/gcd(R,S) cash or S/gcd(R,S) Stash then reached the
 //! whole reserve or supply, so ordinary deposits and redemptions filled zero
 //! while still paying fees. Flat orders now pay the least input for their
-//! rounded-down output and stay tradeable at any reduced price.
+//! rounded-down output and stay tradeable at any reduced price. Sales then
+//! raise such a price too, so a bound the sales alone break reduces the sales,
+//! not every order.
 use hashstash::{
     batch::{self, Clearing, Order},
     config::Config,
@@ -133,6 +135,102 @@ fn zero_price_bound_on_a_drifted_flat_world_moves_nothing() {
     assert_eq!(&r.curve_mass * &w.shares, &w.curve_mass * &r.shares);
     for (fill, o) in r.buys.iter().zip(&buys).chain(r.sells.iter().zip(&sells)) {
         assert!(fill.input <= o.amount);
+    }
+}
+
+/// Small deterministic xorshift generator; no external randomness.
+struct Rng(u64);
+impl Rng {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % n
+    }
+}
+
+fn bounded(w: &World, r: &Clearing, bps: u64) {
+    let after = &r.curve_mass * &w.shares * 10_000u32;
+    assert!(after <= &w.curve_mass * &r.shares * (Amount::from(bps) + 10_000u32));
+}
+
+/// At a flat price whose reduced numerator and denominator both differ from
+/// one, a sale also raises the price. Reducing only the buys could then never
+/// meet a small upper bound, so every order, exact buys included, filled zero.
+#[test]
+fn inexact_sale_cannot_refuse_exact_buys_at_a_small_bound() {
+    let c = Config::devnet();
+    // Price 3/2: buys of a multiple of 3 hash and sales of an even amount of
+    // Stash are exact. Selling 1 or 3 Stash raises the price by about 17 bps.
+    let w = flat(&300u32.into(), &200u32.into());
+    let buys = [order(1, 30), order(2, 3)];
+    let sells = [order(3, 1), order(4, 3)];
+    for bps in [0, 1, 10] {
+        let r = batch::clear(&c, &w, &buys, &sells, bps).unwrap();
+        conserved(&w, &r);
+        bounded(&w, &r, bps);
+        assert_eq!(r.curve_mass, r.reserve);
+        for (fill, (input, output)) in r.buys.iter().zip([(30u32, 20u32), (3, 2)]) {
+            assert_eq!(fill.input, Amount::from(input), "bps {bps}");
+            assert_eq!(fill.output, Amount::from(output), "bps {bps}");
+        }
+        for (fill, o) in r.sells.iter().zip(&sells) {
+            assert!(fill.input <= o.amount);
+        }
+    }
+    // The mirror case already reduced the inexact buys and kept exact sales.
+    let r = batch::clear(&c, &w, &[order(1, 2)], &[order(3, 2), order(4, 4)], 0).unwrap();
+    assert_eq!(r.buys[0].output, Amount::zero());
+    let paid: Amount = r.sells.iter().map(|f| &f.output).sum();
+    assert_eq!(paid, Amount::from(9u32));
+}
+
+/// On random small flat worlds at non-unit prices and small bounds, an exact
+/// side moves no price, so it fills completely whatever the other side's
+/// rounding does. With neither side exact both may be reduced together. Every
+/// result stays within the bound and conserves.
+#[test]
+fn exact_side_fills_whatever_the_other_sides_rounding_on_flat_worlds() {
+    let c = Config::devnet();
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    for _ in 0..600 {
+        let (u, v) = (2 + rng.below(9), 2 + rng.below(9));
+        if gcd(u.into(), v.into()) != Amount::one() {
+            continue;
+        }
+        let k = 1 + rng.below(400);
+        let w = flat(&(u * k).into(), &(v * k).into());
+        let bps = rng.below(60);
+        // 0: exact buys, 1: exact sales, 2: neither side exact.
+        let exact = rng.below(3);
+        let (mut buys, mut sells) = (Vec::new(), Vec::new());
+        let mut offered = 0;
+        for n in 0..1 + rng.below(4) as u8 {
+            let any = 1 + rng.below(6 * u.max(v));
+            buys.push(order(n, if exact == 0 { u * (1 + rng.below(6)) } else { any }));
+        }
+        for n in 0..1 + rng.below(4) as u8 {
+            let any = 1 + rng.below(6 * u.max(v));
+            let amount = if exact == 1 { v * (1 + rng.below(6)) } else { any };
+            if offered + amount < v * k {
+                offered += amount;
+                sells.push(order(100 + n, amount));
+            }
+        }
+        let r = batch::clear(&c, &w, &buys, &sells, bps).unwrap();
+        conserved(&w, &r);
+        bounded(&w, &r, bps);
+        assert_eq!(r.curve_mass, r.reserve);
+        assert!(&r.curve_mass * &w.shares >= &w.curve_mass * &r.shares);
+        let (side, fills, scale) = match exact {
+            0 => (&buys, &r.buys, (&w.shares, &w.curve_mass)),
+            1 => (&sells, &r.sells, (&w.curve_mass, &w.shares)),
+            _ => continue,
+        };
+        for (fill, o) in fills.iter().zip(side) {
+            assert_eq!(fill.input, o.amount, "R={} S={} bps={bps}", w.reserve, w.shares);
+            assert_eq!(fill.output, &o.amount * scale.0 / scale.1);
+        }
     }
 }
 

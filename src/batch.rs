@@ -2,7 +2,7 @@
 //! they never select a price, a fill fraction, or a rounding beneficiary.
 use crate::{
     config::Config,
-    math,
+    crypto, math,
     state::World,
     types::{Amount, Hash},
 };
@@ -12,7 +12,8 @@ use num_traits::{One, Zero};
 use std::{
     cell::{Cell, OnceCell, RefCell},
     cmp::Ordering,
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
+    sync::{Mutex, PoisonError},
 };
 
 /// Curve evaluations (each a pair of directed logarithms, or one exact power
@@ -24,6 +25,19 @@ pub const CLEARING_WORK: u64 = 1024;
 const NEWTON_PROBES: usize = 64;
 /// A budget search wider than one atom stops within this relative precision.
 const BUDGET_PRECISION_BITS: usize = 64;
+/// Most recent consensus clearings that spent curve work, kept by
+/// [clear_memoized]. The fill bound caps the memory held and leaves room for
+/// both worlds of a block at the signature limit.
+const MEMO_ENTRIES: usize = 16;
+const MEMO_FILLS: usize = 16_384;
+
+/// [clear] is a pure function of the configuration, the opening curve, the
+/// ordered orders and the bound, so block execution memoizes its results by a
+/// hash of all of them. A reselection whose included orders and opening curve
+/// did not change, such as one for an unrelated transaction or a future nonce,
+/// reuses the clearing instead of repeating its curve work. Results never
+/// depend on what the memo holds.
+static MEMO: Mutex<VecDeque<(Hash, Clearing)>> = Mutex::new(VecDeque::new());
 
 /// Deterministic count of the curve evaluations spent by one clearing, and the
 /// last price it found as (units, scale): candidates of one clearing have
@@ -45,6 +59,14 @@ impl Work {
     fn exhausted(&self) -> bool {
         self.used.get() >= self.limit
     }
+}
+
+/// The inputs a bound-constrained budget search reduces.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Buys,
+    Sells,
+    Both,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -425,18 +447,20 @@ fn within_range(c: &Config, result: &Clearing) -> bool {
         && result.shares.bits() <= c.share_bits
 }
 
-/// Signed relative distance from the active constraints. This only chooses a
-/// search probe; every retained result still passes the exact inequalities.
+/// Signed relative distance from the active constraints: the upper price bound
+/// when `upward`, otherwise the lower one, and the numeric range. This only
+/// chooses a search probe; every retained result still passes the exact
+/// inequalities.
 fn constraint_gap(
     c: &Config,
     w: &World,
     result: &Clearing,
     bps: u64,
-    reduce_buys: bool,
+    upward: bool,
 ) -> (BigInt, Amount) {
     let max_money = (Amount::one() << c.money_bits as usize) - 1u32;
     let max_shares = (Amount::one() << c.share_bits as usize) - 1u32;
-    let (numerator, denominator) = if reduce_buys {
+    let (numerator, denominator) = if upward {
         if result.shares.is_zero() {
             (Amount::zero(), Amount::one())
         } else {
@@ -583,6 +607,91 @@ pub fn clear(
     Ok(clear_with_work(c, w, buys, sells, max_price_change_bps, CLEARING_WORK)?.0)
 }
 
+/// [clear] through the memo of recent results. Block execution uses it for
+/// selection, templates and validation; one-order estimates use [clear], so
+/// they cannot displace the clearings that reselection reuses.
+pub fn clear_memoized(
+    c: &Config,
+    w: &World,
+    buys: &[Order],
+    sells: &[Order],
+    max_price_change_bps: u64,
+) -> Result<Clearing> {
+    let key = memo_key(c, w, buys, sells, max_price_change_bps);
+    if let Some(result) = memo_hit(&key) {
+        return Ok(result);
+    }
+    let (result, work) = clear_with_work(c, w, buys, sells, max_price_change_bps, CLEARING_WORK)?;
+    let fills = result.buys.len() + result.sells.len();
+    // Clearing without curve work is as cheap as hashing its inputs.
+    if work > 0 && fills <= MEMO_FILLS {
+        let mut memo = MEMO.lock().unwrap_or_else(PoisonError::into_inner);
+        // Another thread may have cleared the same inputs meanwhile.
+        memo.retain(|(k, _)| *k != key);
+        memo.push_front((key, result.clone()));
+        let mut held = 0;
+        let kept = memo
+            .iter()
+            .take(MEMO_ENTRIES)
+            .take_while(|(_, r)| {
+                held += r.buys.len() + r.sells.len();
+                held <= MEMO_FILLS
+            })
+            .count();
+        memo.truncate(kept);
+    }
+    Ok(result)
+}
+
+/// Test and diagnostic helper: the result [clear_memoized] holds for these
+/// inputs, if any. It does not change the memo.
+#[doc(hidden)]
+pub fn memo_peek(
+    c: &Config,
+    w: &World,
+    buys: &[Order],
+    sells: &[Order],
+    max_price_change_bps: u64,
+) -> Option<Clearing> {
+    let key = memo_key(c, w, buys, sells, max_price_change_bps);
+    let memo = MEMO.lock().unwrap_or_else(PoisonError::into_inner);
+    memo.iter().find(|(k, _)| *k == key).map(|(_, r)| r.clone())
+}
+
+/// A hit moves to the front, so alternating worlds and repeated reselections
+/// keep their entries.
+fn memo_hit(key: &Hash) -> Option<Clearing> {
+    let mut memo = MEMO.lock().unwrap_or_else(PoisonError::into_inner);
+    let index = memo.iter().position(|(k, _)| k == key)?;
+    let entry = memo.remove(index)?;
+    let result = entry.1.clone();
+    memo.push_front(entry);
+    Some(result)
+}
+
+/// Every input of [clear], length-prefixed: the whole encoded configuration,
+/// the opening curve, the bound, and each side's orders in their given order.
+fn memo_key(c: &Config, w: &World, buys: &[Order], sells: &[Order], bps: u64) -> Hash {
+    fn put(bytes: &mut Vec<u8>, data: &[u8]) {
+        bytes.extend_from_slice(&(data.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(data);
+    }
+    let mut bytes = Vec::new();
+    put(&mut bytes, &c.consensus_bytes());
+    for n in [&w.reserve, &w.shares, &w.curve_mass] {
+        put(&mut bytes, &n.to_bytes_be());
+    }
+    bytes.extend_from_slice(&bps.to_be_bytes());
+    for side in [buys, sells] {
+        bytes.extend_from_slice(&(side.len() as u64).to_be_bytes());
+        for o in side {
+            bytes.extend_from_slice(&o.id);
+            put(&mut bytes, &o.amount.to_bytes_be());
+        }
+    }
+    crypto::tagged_hash("Hashstash/clearing-memo", &bytes)
+}
+
 /// [clear] with an explicit curve-evaluation limit, also returning the work
 /// spent. Consensus always uses [CLEARING_WORK]; other limits exercise the
 /// deterministic fallback.
@@ -656,24 +765,56 @@ fn clear_metered(
         if within_range(c, &full) && within_upper(w, &full, bps) && within_lower(w, &full, bps) {
             full
         } else {
-            let reduce_buys = !within_upper(w, &full, bps) || !within_range(c, &full);
-            let mut low = Amount::zero();
-            let mut high = if reduce_buys {
-                cash.clone()
+            let upward = !within_upper(w, &full, bps) || !within_range(c, &full);
+            // Buys raise the price and the reserve; sales lower the price. On a
+            // flat world a sale raises the price as well whenever its output is
+            // inexact, and nothing lowers it. There, when removing all of the
+            // usual side's input still breaks the bound, the other side is
+            // reduced while the first keeps its full input, and when that fails
+            // too, both sides by the same fraction. The chosen side then starts
+            // from a passing candidate, so one side's rounding cannot refuse
+            // every order of the other. A curved sale raises the price only
+            // through rounding, and searching the opposite side there would
+            // spend curve work on candidates its own movement then refuses.
+            let usual = if upward { Side::Buys } else { Side::Sells };
+            let other = if upward { Side::Sells } else { Side::Buys };
+            let families: &[Side] = if w.reserve == w.curve_mass {
+                &[other, Side::Both]
             } else {
-                sold.clone()
+                &[]
             };
-            let mut best = empty(w, buys, sells);
-            let evaluate = |budget: &Amount| {
-                if reduce_buys {
-                    candidate(w, buys, sells, budget, &sold, &cash, &sold, work)
-                } else {
-                    candidate(w, buys, sells, &cash, budget, &cash, &sold, work)
+            let evaluate = |side: Side, budget: &Amount| match side {
+                Side::Buys => candidate(w, buys, sells, budget, &sold, &cash, &sold, work),
+                Side::Sells => candidate(w, buys, sells, &cash, budget, &cash, &sold, work),
+                Side::Both => {
+                    let sale = if cash.is_zero() {
+                        Amount::zero()
+                    } else {
+                        &sold * budget / &cash
+                    };
+                    candidate(w, buys, sells, budget, &sale, &cash, &sold, work)
                 }
             };
-            let initial = evaluate(&low)?;
-            let (mut low_gap, mut low_divisor) = constraint_gap(c, w, &initial, bps, reduce_buys);
-            let (mut high_gap, mut high_divisor) = constraint_gap(c, w, &full, bps, reduce_buys);
+            let mut side = usual;
+            let mut initial = evaluate(side, &Amount::zero())?;
+            let (mut low_gap, mut low_divisor) = constraint_gap(c, w, &initial, bps, upward);
+            // The opening curve itself meets every bound, so Both always starts.
+            for &next in families {
+                if low_gap <= BigInt::zero() {
+                    break;
+                }
+                side = next;
+                initial = evaluate(side, &Amount::zero())?;
+                (low_gap, low_divisor) = constraint_gap(c, w, &initial, bps, upward);
+            }
+            let mut low = Amount::zero();
+            let mut high = if side == Side::Sells {
+                sold.clone()
+            } else {
+                cash.clone()
+            };
+            let mut best = empty(w, buys, sells);
+            let (mut high_gap, mut high_divisor) = constraint_gap(c, w, &full, bps, upward);
             if low_gap <= BigInt::zero()
                 && within_upper(w, &initial, bps)
                 && within_lower(w, &initial, bps)
@@ -712,8 +853,8 @@ fn clear_metered(
                     // zero, so bisect geometrically from one atom.
                     bisect(&low.clone().max(Amount::one()), &high).max(&low + 1u32)
                 };
-                let next = evaluate(&mid)?;
-                let (gap, divisor) = constraint_gap(c, w, &next, bps, reduce_buys);
+                let next = evaluate(side, &mid)?;
+                let (gap, divisor) = constraint_gap(c, w, &next, bps, upward);
                 let passed = gap <= BigInt::zero();
                 let (old, old_divisor) = if passed {
                     (&low_gap, &low_divisor)

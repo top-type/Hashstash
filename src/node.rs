@@ -268,20 +268,18 @@ fn pending_row<'a>(body: &TransactionBody, operation: &'a Operation) -> PendingR
 }
 
 /// Pre-charged projection work for mempool rows: one unit per row and grant
-/// payment, plus one per 32 data bytes (JSON numbers) for full JSON rows; hex
-/// rows cost one unit per KiB of hexadecimal output.
+/// payment (at most SUMMARY_GRANT_PAYMENTS for snapshot summaries), plus one
+/// per 32 data bytes (JSON numbers) for full JSON rows; hex rows cost one unit
+/// per KiB of hexadecimal output.
 fn mempool_work(pool: &[Transaction], offset: usize, limit: usize, format: &str) -> usize {
     pool.iter()
         .skip(offset)
         .take(limit)
         .map(|transaction| {
-            let payments = match &transaction.body.operation {
-                Operation::Propose { proposal, .. } => grant_payments(proposal),
-                _ => 0,
-            };
+            let payments = pending_payments(&transaction.body.operation);
             let data = transaction.body.data.len();
             1 + match format {
-                "summary" => payments,
+                "summary" => payments.min(SUMMARY_GRANT_PAYMENTS),
                 "hex" => (payments * 34 + data) / 512,
                 _ => payments + data / RESPONSE_VALUES_PER_WORK,
             }
@@ -289,21 +287,33 @@ fn mempool_work(pool: &[Transaction], offset: usize, limit: usize, format: &str)
         .fold(0, usize::saturating_add)
 }
 
+fn pending_payments(operation: &Operation) -> usize {
+    match operation {
+        Operation::Propose { proposal, .. } => grant_payments(proposal),
+        _ => 0,
+    }
+}
+
 fn mempool_page(pool: &[Transaction], offset: usize, limit: usize, summary: bool) -> Result<Value> {
     let mut page = JsonPage::new();
     for transaction in pool.iter().skip(offset).take(limit) {
         let accepted = if summary {
             let body = &transaction.body;
-            // Summaries never fail on one huge pending grant; a bounded
-            // display copy keeps snapshots and wallets available.
-            page.push_summarized(&pending_row(body, &body.operation), || {
+            // Summaries never fail on one huge pending grant, and stay bounded
+            // like the snapshot's proposal rows; full rows are in `mempool`.
+            let summarize = || -> Result<Value> {
                 let (operation, payment_count) = truncated_operation(&body.operation);
                 Ok(serde_json::to_value(Truncated {
                     row: pending_row(body, &operation),
                     truncated: true,
                     payment_count,
                 })?)
-            })?
+            };
+            if pending_payments(&body.operation) > SUMMARY_GRANT_PAYMENTS {
+                page.push(&summarize()?)?
+            } else {
+                page.push_summarized(&pending_row(body, &body.operation), summarize)?
+            }
         } else {
             page.push(&RawMempoolRow {
                 transaction,
@@ -5438,7 +5448,24 @@ mod read_admission_tests {
         assert_eq!(explorer_state_work("explorer_governance", &s), 4096);
         assert_eq!(explorer_state_work("explorer_blocks", &s), 0);
         assert_eq!(explorer_state_work("explorer_governance", &curved()), 0);
-        let view = view(s, vec![]);
+        let pending = Transaction {
+            body: TransactionBody {
+                sender: key(),
+                nonce: 0,
+                fee: 1u32.into(),
+                anchor: [9; 32],
+                expiry_blocks: 10,
+                operation: Operation::Propose {
+                    round: 0,
+                    description: [0; 32],
+                    proposal: grant(300),
+                    support: 1u32.into(),
+                },
+                data: Vec::new(),
+            },
+            signature: [0; 64],
+        };
+        let view = view(s, vec![pending]);
         let error = Node::read_rpc_metered(&view, "governance", json!({}), Some(&drained()))
             .unwrap_err();
         assert!(error.to_string().contains("budget"), "{error}");
@@ -5478,9 +5505,21 @@ mod read_admission_tests {
                 .len(),
             SUMMARY_GRANT_PAYMENTS
         );
-        // A direct proposals page keeps the complete grant.
+        // So is a pending grant above the summary size, however small.
+        let pending = &snapshot["mempool"][0];
+        assert_eq!(pending["truncated"], true);
+        assert_eq!(pending["payment_count"], 300);
+        // A direct proposals or mempool page keeps the complete grant.
         let page = Node::read_rpc(&view, "proposals", json!({"round":0})).unwrap();
         assert!(page[0].get("truncated").is_none());
+        let pool = Node::read_rpc(&view, "mempool", json!({})).unwrap();
+        assert_eq!(
+            pool[0]["body"]["operation"]["Propose"]["proposal"]["Grant"]["payments"]
+                .as_array()
+                .unwrap()
+                .len(),
+            300
+        );
         // Each is charged for what it projects: a budget below one complete
         // grant still serves the bounded snapshot.
         let budget = || {

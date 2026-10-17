@@ -116,7 +116,14 @@ Use `public-web.nginx.template` with `PUBLIC_HOST` replaced by the server's DNS 
 
 Prefer a DNS name. Browsers honour the template's Strict-Transport-Security header only for DNS names; RFC 6797 has them ignore it for IP-address hosts, and an IP address cannot be preloaded. On an IP-literal site, every visit that starts at `http://` can be intercepted by an on-path attacker who suppresses the port-80 redirect and serves a look-alike wallet; existing HTTPS-origin wallets stay unreadable to it, but keys created or imported there are exposed. Publish and bookmark the `https://` address, and tell users never to create or import a wallet on a page reached through `http://`.
 
-Every public visitor reaches the node from the proxy's loopback address, so all visitors share one admission record and work budget (see [network controls](../../docs/NETWORK-HARDENING.md)). The template therefore limits each client address to 2 JSON-RPC requests per second with a burst of 20, so roughly 10 to 15 addresses are needed to exhaust the shared transaction-preparation, broadcast and explorer budget. Raising that rate lets a few clients deny those calls to every visitor; enough addresses can always exhaust a shared quota.
+Every public visitor reaches the node from the proxy's loopback address, so all visitors share one admission record and a work budget of 131,072 units per second (see [network controls](../../docs/NETWORK-HARDENING.md)). The template therefore limits each client address to 2 JSON-RPC requests per second with a burst of 20. Request prices differ widely:
+
+- A wallet's snapshot poll usually costs a few hundred units, plus 512 for each account valuation on a curved Stash. It summarizes large grants, so it stays bounded even during a large-grant decision.
+- A transaction preparation or broadcast costs about 4,350 units. An explorer account, transaction, chat or mail page costs 4,160.
+- After a grant draws on the reserve, the Stash curve is no longer flat. A large `quote` then costs up to 512 units per bit of the world's account cash, about 20,000 units at 40 bits.
+- During a decision on a grant with N payments, `governance`, `proposals` and `explorer_governance` cost about N units each.
+
+At 2 requests per second, any of these exhausts the shared budget for every visitor: about 16 addresses sending explorer or preparation requests, 3 sending large quotes on a curved Stash, or one reading a 63,000-payment decision. Raising the rate lets fewer clients deny those calls, and enough addresses can always exhaust a shared quota. Watch for `rate budget` errors, especially during large-grant decisions, and lower the rate or add capacity as needed.
 
 For a DNS name, issue an ordinary certificate through the same webroot, for example `certbot certonly --webroot --webroot-path /var/www/hashstash-acme -d PUBLIC_HOST --cert-name PUBLIC_HOST`. Let’s Encrypt supports IP address certificates with its short-lived profile. Certbot 5.4 or later supports obtaining them through an HTTP webroot challenge. After registering the certificate account and accepting its subscriber agreement, issuance for an IP address uses:
 

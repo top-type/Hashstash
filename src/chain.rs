@@ -454,6 +454,11 @@ impl Chain {
     pub fn block_parent(&self, hash: &Hash) -> Result<Option<Hash>> {
         Ok(self.load_entry(hash)?.map(|entry| entry.header.previous))
     }
+    /// Greatest governed block capacity on a locally validated block's branch
+    /// through its post-state, from header metadata.
+    pub fn block_capacity(&self, hash: &Hash) -> Result<Option<u64>> {
+        Ok(self.load_entry(hash)?.map(|entry| entry.capacity))
+    }
 
     /// Check the signed preparation reference against the next block on this
     /// tip, returning its fixed, derived expiry height. Membership in this

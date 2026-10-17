@@ -179,12 +179,15 @@ fn relay_selects_and_publishes_only_for_new_admissible_entries() {
     assert_eq!(published(&node), revision);
     let deliver = |transactions: Vec<Transaction>| {
         signatures();
-        node.receive_peer(&PeerMessage {
-            chain: config.chain_id(),
-            locator: Vec::new(),
-            blocks: Vec::new(),
-            transactions,
-        })
+        node.receive_peer(
+            &PeerMessage {
+                chain: config.chain_id(),
+                locator: Vec::new(),
+                blocks: Vec::new(),
+                transactions,
+            },
+            "127.0.0.1".parse().unwrap(),
+        )
         .unwrap();
         signatures()
     };

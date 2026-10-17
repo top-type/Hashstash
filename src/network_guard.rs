@@ -3,7 +3,7 @@ use anyhow::{Result, anyhow, ensure};
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -20,11 +20,13 @@ pub const PEER_WORK_PER_SECOND: u64 = 16_384;
 /// Buffered incoming peer frame bytes across all inbound sessions. The budget
 /// grows to at least two of the largest validated frames.
 pub const PEER_FRAME_MEMORY: u64 = 64 * 1024 * 1024;
-/// Inbound peer sessions open to any source, plus slots that only configured,
-/// pinned or recently verified peers may use when the general slots are full.
+/// Inbound peer sessions open to any source. When they are full, configured
+/// or pinned peers have their own reserved slots, and discovery peers verified
+/// in the last hour have separate ones that remain subject to group caps.
 pub const INBOUND_PEER_SLOTS: usize = 16;
 pub const RESERVED_PEER_SLOTS: usize = 4;
-/// Concurrent inbound sessions from one public network group (IPv4 /16, IPv6 /32).
+pub const VERIFIED_PEER_SLOTS: usize = 4;
+/// Concurrent inbound sessions from one network group (IPv4 /16, IPv6 /32).
 pub const PEER_SLOTS_PER_GROUP: usize = 2;
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
@@ -44,7 +46,7 @@ type Key = (IpAddr, Surface, Direction);
 
 /// Local capacity was unavailable. This is never evidence of peer misbehavior.
 #[derive(Debug)]
-pub struct Busy(&'static str);
+pub struct Busy(pub &'static str);
 impl std::fmt::Display for Busy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
@@ -52,15 +54,37 @@ impl std::fmt::Display for Busy {
 }
 impl std::error::Error for Busy {}
 
-fn public(ip: IpAddr) -> bool {
-    crate::peer_discovery::public_address(SocketAddr::new(ip, 1))
+/// Loopback, link-local, unique-local, private and shared (CGNAT) sources
+/// belong to networks the operator controls.
+fn local_source(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => {
+            let [a, b, _, _] = v.octets();
+            v.is_loopback()
+                || v.is_unspecified()
+                || v.is_private()
+                || v.is_link_local()
+                || (a == 100 && (64..=127).contains(&b))
+        }
+        IpAddr::V6(v) => {
+            let first = v.segments()[0];
+            v.is_loopback()
+                || v.is_unspecified()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+        }
+    }
 }
-/// Admission identity. IPv4-mapped addresses share the IPv4 record, and a
-/// global IPv6 host is accounted by its /64 because it normally controls one.
+/// Admission identity. IPv4-mapped addresses share the IPv4 record, a 6to4
+/// source is accounted by the /48 its IPv4 host controls, and another global
+/// IPv6 host by its /64 because it normally controls one.
 pub fn admission_address(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v) => match v.to_ipv4_mapped() {
             Some(v4) => IpAddr::V4(v4),
+            None if v.segments()[0] == 0x2002 => {
+                IpAddr::V6(Ipv6Addr::from(u128::from(v) & !(u128::MAX >> 48)))
+            }
             None if (v.segments()[0] & 0xe000) == 0x2000 => {
                 IpAddr::V6(Ipv6Addr::from(u128::from(v) & !u128::from(u64::MAX)))
             }
@@ -69,12 +93,13 @@ pub fn admission_address(ip: IpAddr) -> IpAddr {
         _ => ip,
     }
 }
-/// Inbound slot diversity group: IPv4 /16 or IPv6 /32 for public addresses.
-/// Loopback and private addresses are operator-controlled and keep per-address
-/// accounting only.
+/// Inbound diversity group: IPv4 /16 or IPv6 /32, with a 6to4 source grouped
+/// with the IPv4 /16 it embeds. Only sources on local networks keep
+/// per-address accounting alone; routable special ranges such as Teredo are
+/// grouped conservatively by /32.
 pub fn network_group(ip: IpAddr) -> Option<IpAddr> {
     let ip = admission_address(ip);
-    if !public(ip) {
+    if local_source(ip) {
         return None;
     }
     Some(match ip {
@@ -82,8 +107,16 @@ pub fn network_group(ip: IpAddr) -> Option<IpAddr> {
             let [a, b, _, _] = v.octets();
             IpAddr::V4(Ipv4Addr::new(a, b, 0, 0))
         }
+        IpAddr::V6(v) if v.segments()[0] == 0x2002 => {
+            let [a, b] = v.segments()[1].to_be_bytes();
+            IpAddr::V4(Ipv4Addr::new(a, b, 0, 0))
+        }
         IpAddr::V6(v) => IpAddr::V6(Ipv6Addr::from(u128::from(v) & !(u128::MAX >> 32))),
     })
+}
+/// Who delivered peer data: a network group, or the address on a local network.
+pub fn peer_source(ip: IpAddr) -> IpAddr {
+    network_group(ip).unwrap_or_else(|| admission_address(ip))
 }
 
 #[derive(Clone, Copy)]
@@ -200,17 +233,29 @@ impl Record {
         self.cooldown = now + Duration::from_millis((250u64 << (self.strikes - 1)).min(16_000));
     }
 }
+/// Incoming frame bytes buffered by inbound sessions.
+#[derive(Default)]
+struct FrameMemory {
+    total: u64,
+    /// Held by sessions other than configured or pinned peers.
+    shared: u64,
+    /// Shared bytes held by each network group.
+    groups: HashMap<IpAddr, u64>,
+}
 #[derive(Default)]
 pub struct NetworkGuard {
     max_frame_bytes: AtomicU64,
     max_peer_work: AtomicU64,
     loopback_rpc_is_proxy: bool,
     records: Mutex<HashMap<Key, Record>>,
-    frame_memory: Mutex<u64>,
+    frame_memory: Mutex<FrameMemory>,
 }
 pub struct Session {
     guard: Arc<NetworkGuard>,
     key: Key,
+    group: Option<IpAddr>,
+    /// A configured or pinned peer, which may use the whole frame budget.
+    operator: bool,
     request_bucket: Mutex<Bucket>,
     reserved_frame: Mutex<u64>,
 }
@@ -267,12 +312,15 @@ impl NetworkGuard {
         }
         Ok(())
     }
-    fn frame_memory_limit(&self) -> u64 {
-        PEER_FRAME_MEMORY.max(
-            self.max_frame_bytes
-                .load(Ordering::Relaxed)
-                .saturating_mul(2),
-        )
+    /// The node-wide frame budget; the part that sessions other than
+    /// configured or pinned peers may share, which leaves one largest frame
+    /// to those peers; and one network group's limit within that share.
+    fn frame_memory_limits(&self) -> (u64, u64, u64) {
+        let frame = self.max_frame_bytes.load(Ordering::Relaxed);
+        let total = PEER_FRAME_MEMORY.max(frame.saturating_mul(2));
+        let shared = total.saturating_sub(frame);
+        let groups = (INBOUND_PEER_SLOTS / PEER_SLOTS_PER_GROUP) as u64;
+        (total, shared, frame.max(shared / groups))
     }
     /// A validated historical capacity increase extends the one-frame burst.
     /// Throughput, connection, request and work quotas remain local policy.
@@ -353,12 +401,18 @@ impl NetworkGuard {
         Ok(Session {
             guard: self.clone(),
             key,
+            group: network_group(ip),
+            operator: false,
             request_bucket: Mutex::new(Bucket::new(16, now)),
             reserved_frame: Mutex::new(0),
         })
     }
     pub fn tracked_addresses(&self) -> usize {
         self.records.lock().map_or(0, |r| r.len())
+    }
+    #[cfg(test)]
+    pub fn frame_memory_in_use(&self) -> u64 {
+        self.frame_memory.lock().map_or(0, |memory| memory.total)
     }
 }
 impl Session {
@@ -376,33 +430,87 @@ impl Session {
     pub fn outgoing(&self, bytes: usize, work: usize) -> Result<()> {
         self.charge(0, bytes as u64, work as u64, false)
     }
-    /// Reserve node-wide memory for one complete incoming frame before its
-    /// body is read. The reservation covers decoding and processing of that
-    /// message and is released by the session's next frame or its close.
-    /// Connections this node opened are bounded separately and never wait on
-    /// inbound traffic.
-    pub fn reserve_frame(&self, bytes: usize) -> Result<()> {
+    /// Mark a configured or pinned peer's session. It may use the frame
+    /// memory that other inbound sessions must leave free.
+    pub fn operator(mut self) -> Self {
+        self.operator = true;
+        self
+    }
+    /// Release the previous frame's memory before another frame is read.
+    pub fn begin_frame(&self) -> Result<()> {
         let mut held = self
             .reserved_frame
             .lock()
             .map_err(|_| anyhow!("session accounting lock poisoned"))?;
-        let mut total = self
+        let mut memory = self
             .guard
             .frame_memory
             .lock()
             .map_err(|_| anyhow!("network accounting lock poisoned"))?;
-        *total = total.saturating_sub(*held);
-        *held = 0;
+        self.release_frame(&mut memory, std::mem::take(&mut *held));
+        Ok(())
+    }
+    /// Reserve node-wide memory for the next bytes of the current frame before
+    /// they are read, so buffered memory is always paid for with bytes
+    /// actually sent. A configured or pinned peer can always buffer one
+    /// largest frame; other sessions share the rest, at most one largest frame
+    /// or an equal share of the general slots per network group. The
+    /// reservation also covers decoding and processing of that message and is
+    /// released by the session's next frame or its close. Connections this
+    /// node opened are bounded separately and never wait on inbound traffic.
+    pub fn reserve_frame(&self, bytes: usize) -> Result<()> {
         if self.key.2 == Direction::Outbound {
             return Ok(());
         }
+        let mut held = self
+            .reserved_frame
+            .lock()
+            .map_err(|_| anyhow!("session accounting lock poisoned"))?;
+        let mut memory = self
+            .guard
+            .frame_memory
+            .lock()
+            .map_err(|_| anyhow!("network accounting lock poisoned"))?;
         let bytes = bytes as u64;
-        if total.saturating_add(bytes) > self.guard.frame_memory_limit() {
+        let (total, shared, group) = self.guard.frame_memory_limits();
+        let group_fits = self.group.is_none_or(|g| {
+            memory
+                .groups
+                .get(&g)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(bytes)
+                <= group
+        });
+        let fits = memory.total.saturating_add(bytes) <= total
+            && (self.operator || (memory.shared.saturating_add(bytes) <= shared && group_fits));
+        if !fits {
             return Err(Busy("peer frame memory budget exhausted").into());
         }
-        *total += bytes;
-        *held = bytes;
+        memory.total += bytes;
+        if !self.operator {
+            memory.shared += bytes;
+            if let Some(g) = self.group {
+                *memory.groups.entry(g).or_default() += bytes;
+            }
+        }
+        *held += bytes;
         Ok(())
+    }
+    fn release_frame(&self, memory: &mut FrameMemory, held: u64) {
+        memory.total = memory.total.saturating_sub(held);
+        if self.operator {
+            return;
+        }
+        memory.shared = memory.shared.saturating_sub(held);
+        if let Some(g) = self.group
+            && let Some(count) = memory.groups.get_mut(&g)
+        {
+            *count = count.saturating_sub(held);
+            if *count == 0 {
+                memory.groups.remove(&g);
+            }
+        }
     }
     fn charge(&self, requests: u64, bytes: u64, work: u64, penalize: bool) -> Result<()> {
         let now = Instant::now();
@@ -461,21 +569,35 @@ impl Drop for Session {
         }
         let held = self.reserved_frame.get_mut().map_or(0, |held| *held);
         if held > 0
-            && let Ok(mut total) = self.guard.frame_memory.lock()
+            && let Ok(mut memory) = self.guard.frame_memory.lock()
         {
-            *total = total.saturating_sub(held);
+            self.release_frame(&mut memory, held);
         }
     }
 }
 
+/// How much an inbound source is trusted for capacity, least first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerClass {
+    General,
+    /// A discovery peer this node synchronized with during the last hour.
+    /// Any remote can arrange that, so its network group stays capped.
+    Verified,
+    /// A configured or pinned peer address the operator chose.
+    Operator,
+}
 #[derive(Default)]
 struct SlotCounts {
     general: usize,
-    reserved: usize,
-    groups: HashMap<IpAddr, usize>,
+    verified: usize,
+    operator: usize,
+    /// Sessions per network group, and how many of them use verified slots.
+    groups: HashMap<IpAddr, (usize, usize)>,
 }
-/// Inbound peer session capacity. Public network groups have a concurrency
-/// cap, and protected peers keep reserved capacity while general slots are full.
+/// Inbound peer session capacity. Network groups have a concurrency cap.
+/// While the general slots are full, configured and pinned peers keep slots
+/// no other source can use, and recently verified discovery peers keep
+/// separate slots, at most one per network group.
 #[derive(Default)]
 pub struct PeerSlots {
     counts: Mutex<SlotCounts>,
@@ -483,54 +605,67 @@ pub struct PeerSlots {
 pub struct PeerSlot {
     slots: Arc<PeerSlots>,
     group: Option<IpAddr>,
-    reserved: bool,
+    pool: PeerClass,
 }
 impl PeerSlots {
-    pub fn try_acquire(self: &Arc<Self>, ip: IpAddr, protected: bool) -> Option<PeerSlot> {
-        let group = network_group(ip);
+    pub fn try_acquire(self: &Arc<Self>, ip: IpAddr, class: PeerClass) -> Option<PeerSlot> {
+        // Only an operator-chosen address is exempt from network diversity.
+        let group = (class != PeerClass::Operator)
+            .then(|| network_group(ip))
+            .flatten();
         let mut counts = self.counts.lock().ok()?;
-        if !protected
-            && group.is_some_and(|g| {
-                counts.groups.get(&g).copied().unwrap_or(0) >= PEER_SLOTS_PER_GROUP
-            })
-        {
+        let (sessions, verified) = group
+            .and_then(|g| counts.groups.get(&g).copied())
+            .unwrap_or_default();
+        if sessions >= PEER_SLOTS_PER_GROUP {
             return None;
         }
-        let reserved = if counts.general < INBOUND_PEER_SLOTS {
-            false
-        } else if protected && counts.reserved < RESERVED_PEER_SLOTS {
-            true
+        let pool = if counts.general < INBOUND_PEER_SLOTS {
+            PeerClass::General
+        } else if class == PeerClass::Verified
+            && counts.verified < VERIFIED_PEER_SLOTS
+            && verified == 0
+        {
+            PeerClass::Verified
+        } else if class == PeerClass::Operator && counts.operator < RESERVED_PEER_SLOTS {
+            PeerClass::Operator
         } else {
             return None;
         };
-        if reserved {
-            counts.reserved += 1;
-        } else {
-            counts.general += 1;
+        match pool {
+            PeerClass::General => counts.general += 1,
+            PeerClass::Verified => counts.verified += 1,
+            PeerClass::Operator => counts.operator += 1,
         }
         if let Some(group) = group {
-            *counts.groups.entry(group).or_default() += 1;
+            let entry = counts.groups.entry(group).or_default();
+            entry.0 += 1;
+            entry.1 += usize::from(pool == PeerClass::Verified);
         }
         Some(PeerSlot {
             slots: self.clone(),
             group,
-            reserved,
+            pool,
         })
     }
 }
 impl Drop for PeerSlot {
     fn drop(&mut self) {
         if let Ok(mut counts) = self.slots.counts.lock() {
-            if self.reserved {
-                counts.reserved = counts.reserved.saturating_sub(1);
-            } else {
-                counts.general = counts.general.saturating_sub(1);
-            }
+            let count = match self.pool {
+                PeerClass::General => &mut counts.general,
+                PeerClass::Verified => &mut counts.verified,
+                PeerClass::Operator => &mut counts.operator,
+            };
+            *count = count.saturating_sub(1);
             if let Some(group) = self.group
-                && let Some(count) = counts.groups.get_mut(&group)
+                && let Some(entry) = counts.groups.get_mut(&group)
             {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
+                entry.0 = entry.0.saturating_sub(1);
+                entry.1 = entry
+                    .1
+                    .saturating_sub(usize::from(self.pool == PeerClass::Verified));
+                if entry.0 == 0 {
                     counts.groups.remove(&group);
                 }
             }
@@ -1011,8 +1146,43 @@ mod tests {
             network_group("8.8.1.1".parse().unwrap()),
             network_group("8.9.1.1".parse().unwrap())
         );
-        assert_eq!(network_group("127.0.0.1".parse().unwrap()), None);
-        assert_eq!(network_group("10.1.2.3".parse().unwrap()), None);
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        for local in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "100.64.1.1",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+        ] {
+            assert_eq!(network_group(ip(local)), None, "{local}");
+        }
+        // Routable special ranges are grouped too: a 6to4 source with the
+        // IPv4 /16 it embeds, and is accounted by its /48; Teredo and other
+        // ranges conservatively by /32.
+        assert_eq!(
+            network_group(ip("2002:808:101::1")),
+            network_group(ip("8.8.200.1"))
+        );
+        assert_eq!(
+            admission_address(ip("2002:808:101:ffff::1")),
+            admission_address(ip("2002:808:101:1::2"))
+        );
+        assert_ne!(
+            admission_address(ip("2002:808:101::1")),
+            admission_address(ip("2002:808:102::1"))
+        );
+        assert_eq!(
+            network_group(ip("2001:0:4136:e378::1")),
+            network_group(ip("2001:0:5ef5:79fd::1"))
+        );
+        assert!(network_group(ip("2001:0:4136:e378::1")).is_some());
+        assert!(network_group(ip("192.0.2.1")).is_some());
+        assert_eq!(peer_source(ip("10.1.2.3")), ip("10.1.2.3"));
+        assert_eq!(peer_source(ip("8.8.1.1")), ip("8.8.0.0"));
     }
     #[test]
     fn outbound_accounting_is_separate_and_own_replies_never_penalize() {
@@ -1041,29 +1211,56 @@ mod tests {
         assert_eq!(guard.policy(Surface::Rpc).work_burst, 1_048_576);
     }
     #[test]
-    fn inbound_frame_memory_is_bounded_and_released() {
-        let guard = Arc::new(NetworkGuard::default());
-        let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        let half = (PEER_FRAME_MEMORY / 2) as usize;
-        let first = guard.admit(ip, Surface::Peer).unwrap();
-        let second = guard.admit(ip, Surface::Peer).unwrap();
-        let third = guard.admit(ip, Surface::Peer).unwrap();
-        first.reserve_frame(half).unwrap();
-        second.reserve_frame(half).unwrap();
-        assert!(third.reserve_frame(1).unwrap_err().is::<Busy>());
-        // A session's next frame replaces its previous reservation.
-        first.reserve_frame(half).unwrap();
-        first.reserve_frame(1).unwrap();
-        third.reserve_frame(half - 1).unwrap();
-        drop(second);
-        third.reserve_frame(half).unwrap();
-        let outbound = guard.admit_outbound(ip, Surface::Peer).unwrap();
+    fn inbound_frame_memory_is_paid_for_and_keeps_an_operator_share() {
+        const MIB: usize = 1024 * 1024;
+        // Frames of up to 16 MiB: a 64 MiB budget, 48 MiB of it shared, and
+        // at most one such frame per network group.
+        let guard = Arc::new(NetworkGuard::with_frame_limit(16 * MIB));
+        let public = |a: u8, b: u8| IpAddr::from([8, a, b, 1]);
+        let first = guard.admit(public(1, 1), Surface::Peer).unwrap();
+        first.begin_frame().unwrap();
+        for _ in 0..16 {
+            first.reserve_frame(MIB).unwrap();
+        }
+        let neighbour = guard.admit(public(1, 2), Surface::Peer).unwrap();
+        assert!(neighbour.reserve_frame(1).unwrap_err().is::<Busy>());
+        // Sessions in other groups that stall after one frame's bytes fill
+        // the shared part; nobody else in it can buffer more.
+        let stalled: Vec<_> = (2..=3)
+            .map(|a| {
+                let session = guard.admit(public(a, 1), Surface::Peer).unwrap();
+                session.reserve_frame(16 * MIB).unwrap();
+                session
+            })
+            .collect();
+        let general = guard.admit(public(9, 1), Surface::Peer).unwrap();
+        assert!(general.reserve_frame(1).unwrap_err().is::<Busy>());
+        // A configured peer can still buffer one largest frame, even from a
+        // group that already holds its own.
+        let configured = guard.admit(public(1, 3), Surface::Peer).unwrap().operator();
+        configured.reserve_frame(16 * MIB).unwrap();
+        assert!(configured.reserve_frame(1).unwrap_err().is::<Busy>());
+        // A session's next frame releases its previous reservation.
+        first.begin_frame().unwrap();
+        neighbour.reserve_frame(16 * MIB).unwrap();
+        let outbound = guard.admit_outbound(public(9, 2), Surface::Peer).unwrap();
         outbound.reserve_frame(usize::MAX).unwrap();
-        drop((first, third));
-        assert_eq!(*guard.frame_memory.lock().unwrap(), 0);
-        let larger = Arc::new(NetworkGuard::with_frame_limit(100 * 1024 * 1024));
-        let session = larger.admit(ip, Surface::Peer).unwrap();
-        assert!(session.reserve_frame(200 * 1024 * 1024).is_ok());
+        drop((first, neighbour, stalled, configured, outbound));
+        general.reserve_frame(16 * MIB).unwrap();
+        drop(general);
+        let memory = guard.frame_memory.lock().unwrap();
+        assert_eq!(
+            (memory.total, memory.shared, memory.groups.len()),
+            (0, 0, 0)
+        );
+        drop(memory);
+        // Without a larger validated frame the 64 MiB baseline is shared.
+        let local = Arc::new(NetworkGuard::default());
+        let session = local
+            .admit("127.0.0.1".parse().unwrap(), Surface::Peer)
+            .unwrap();
+        session.reserve_frame(PEER_FRAME_MEMORY as usize).unwrap();
+        assert!(session.reserve_frame(1).unwrap_err().is::<Busy>());
     }
     #[test]
     fn inbound_peer_slots_require_network_diversity_and_keep_reserved_capacity() {
@@ -1071,36 +1268,78 @@ mod tests {
         let public = |a: u8, b: u8, c: u8| IpAddr::from([8, a, b, c]);
         // Two addresses in one public /16 hold at most two sessions.
         let same: Vec<_> = (1..=4)
-            .filter_map(|n| slots.try_acquire(public(1, n, 1), false))
+            .filter_map(|n| slots.try_acquire(public(1, n, 1), PeerClass::General))
             .collect();
         assert_eq!(same.len(), 2);
         let ipv6 = |n: u16| IpAddr::from([0x2001, 0x4860, n, 0, 0, 0, 0, 1]);
         let v6: Vec<_> = (1..=3)
-            .filter_map(|n| slots.try_acquire(ipv6(n), false))
+            .filter_map(|n| slots.try_acquire(ipv6(n), PeerClass::General))
             .collect();
         assert_eq!(v6.len(), 2);
         // Filling the general slots needs many distinct groups.
         let mut held = Vec::new();
         for group in 2..=7 {
             for host in 1..=2 {
-                held.push(slots.try_acquire(public(group, host, 1), false).unwrap());
+                held.push(
+                    slots
+                        .try_acquire(public(group, host, 1), PeerClass::General)
+                        .unwrap(),
+                );
             }
         }
-        assert!(slots.try_acquire(public(30, 1, 1), false).is_none());
-        // A configured or verified peer still connects, without a group cap.
-        let protected: Vec<_> = (1..=RESERVED_PEER_SLOTS)
-            .map(|n| slots.try_acquire(public(1, 9, n as u8), true).unwrap())
+        assert!(
+            slots
+                .try_acquire(public(30, 1, 1), PeerClass::General)
+                .is_none()
+        );
+        // Recently verified discovery peers remain group-capped and take at
+        // most one verified slot per group, so verified addresses in one /16
+        // gain nothing, and verified peers never use configured capacity.
+        let verified: Vec<_> = (1..=8)
+            .filter_map(|n| slots.try_acquire(public(30, n, 1), PeerClass::Verified))
             .collect();
-        assert!(slots.try_acquire(public(40, 1, 1), true).is_none());
-        drop(protected);
+        assert_eq!(verified.len(), 1);
+        assert!(
+            slots
+                .try_acquire(public(1, 7, 1), PeerClass::Verified)
+                .is_none()
+        );
+        let verified: Vec<_> = (31..=40)
+            .filter_map(|group| slots.try_acquire(public(group, 1, 1), PeerClass::Verified))
+            .chain(verified)
+            .collect();
+        assert_eq!(verified.len(), VERIFIED_PEER_SLOTS);
+        // A configured or pinned peer still connects, without a group cap.
+        let protected: Vec<_> = (1..=RESERVED_PEER_SLOTS)
+            .map(|n| {
+                slots
+                    .try_acquire(public(1, 9, n as u8), PeerClass::Operator)
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            slots
+                .try_acquire(public(40, 1, 1), PeerClass::Operator)
+                .is_none()
+        );
+        drop((protected, verified));
         drop(held);
         // Loopback and private sources keep per-address accounting only.
         let local: Vec<_> = (0..INBOUND_PEER_SLOTS - 4)
-            .map(|_| slots.try_acquire("127.0.0.1".parse().unwrap(), false).unwrap())
+            .map(|_| {
+                slots
+                    .try_acquire("127.0.0.1".parse().unwrap(), PeerClass::General)
+                    .unwrap()
+            })
             .collect();
         assert_eq!(local.len(), INBOUND_PEER_SLOTS - 4);
         drop((same, local));
-        assert_eq!(slots.counts.lock().unwrap().general, 2);
+        let counts = slots.counts.lock().unwrap();
+        assert_eq!(
+            (counts.general, counts.verified, counts.operator),
+            (2, 0, 0)
+        );
+        assert_eq!(counts.groups.len(), 1);
     }
     #[test]
     fn json_preflight_rejects_excess_shape_before_decoding() {

@@ -23,6 +23,8 @@ pub const MAX_PER_IP: usize = 2;
 pub const MAX_UNVERIFIED_FAILURES: u32 = 3;
 const MAX_AGE: u64 = 7 * 24 * 3600;
 const CONFIGURED: &str = "configured";
+/// How long every requester receives the same address sample.
+const ADVERTISED_SAMPLE_SECONDS: u64 = 6 * 3600;
 
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -158,6 +160,9 @@ pub struct Entry {
     pub next_attempt: u64,
     #[serde(skip)]
     pub explicit: bool,
+    /// Configured for this run; such peers are never advertised.
+    #[serde(skip)]
+    pub configured: bool,
     #[serde(skip)]
     pub busy: bool,
     #[serde(skip)]
@@ -169,6 +174,13 @@ struct Saved {
     version: u8,
     chain: Hash,
     entries: Vec<Entry>,
+}
+/// The address sample every requester receives, and the recent peers it
+/// was drawn from.
+struct Sample {
+    at: u64,
+    eligible: Vec<SocketAddr>,
+    addresses: Vec<SocketAddr>,
 }
 
 pub struct AddressBook {
@@ -190,7 +202,7 @@ pub struct AddressBook {
     persisted: Option<Vec<u8>>,
     /// Unpredictable per-process order for replacement and equal-age probes.
     salt: Hash,
-    advertised_cache: Option<(Vec<SocketAddr>, Vec<SocketAddr>)>,
+    advertised_cache: Option<Sample>,
     pub last_error: Option<String>,
     /// A rejected sidecar that was moved aside at startup.
     pub load_error: Option<String>,
@@ -245,10 +257,13 @@ impl AddressBook {
             book.load_error = Some(message);
         }
         for address in configured {
-            if !book.insert(*address, CONFIGURED.into(), true, at)
-                && !book.entries.contains_key(&normalized(*address))
-            {
-                book.last_error = Some(format!("configured peer {address} was not admitted"));
+            book.insert(*address, CONFIGURED.into(), true, at);
+            // The flag also covers an entry first learned from gossip.
+            match book.entries.get_mut(&normalized(*address)) {
+                Some(entry) => entry.configured = true,
+                None => {
+                    book.last_error = Some(format!("configured peer {address} was not admitted"))
+                }
             }
         }
         Ok(book)
@@ -416,6 +431,7 @@ impl AddressBook {
                 failures: 0,
                 next_attempt: 0,
                 explicit,
+                configured: false,
                 busy: false,
                 last_discovery: 0,
             },
@@ -448,37 +464,54 @@ impl AddressBook {
     }
     pub fn advertised(&mut self, at: u64, random: u64) -> Vec<SocketAddr> {
         // Operator-configured peers are private topology and are not gossiped.
-        let mut eligible = self
+        let own = self.options.advertise.map(normalized);
+        let eligible = self
             .entries
             .values()
             .filter(|e| {
                 e.last_success > 0
                     && at.saturating_sub(e.last_success) < 3600
+                    && !e.configured
                     && e.source != CONFIGURED
+                    && Some(e.address) != own
                     && allowed(e.address, self.options.allow_private)
             })
             .map(|e| e.address)
             .collect::<Vec<_>>();
-        if let Some(address) = self.options.advertise {
-            eligible.push(address);
+        // Every requester receives the same random sample for a fixed
+        // interval, whatever peers are verified meanwhile, so repeated or
+        // provoked queries cannot enumerate recent peers. A sample that
+        // already lists every eligible peer hides nothing and follows changes.
+        let reuse = self.advertised_cache.as_ref().is_some_and(|cached| {
+            at.saturating_sub(cached.at) < ADVERTISED_SAMPLE_SECONDS
+                && (cached.addresses.len() >= MAX_ADDRESSES || cached.eligible == eligible)
+        });
+        if !reuse {
+            let mut ranked: Vec<_> = eligible
+                .iter()
+                .map(|address| {
+                    let mut bytes = self.rank(*address).to_vec();
+                    bytes.extend_from_slice(&random.to_le_bytes());
+                    (crate::crypto::sha256d(&bytes), *address)
+                })
+                .collect();
+            ranked.sort();
+            let mut addresses: Vec<_> = own.into_iter().collect();
+            addresses.extend(
+                ranked
+                    .into_iter()
+                    .map(|(_, address)| address)
+                    .take(MAX_ADDRESSES - addresses.len()),
+            );
+            self.advertised_cache = Some(Sample {
+                at,
+                eligible,
+                addresses,
+            });
         }
-        eligible.sort();
-        eligible.dedup();
-        // Every requester receives the same sample until the eligible set
-        // changes, so repeated queries cannot enumerate all recent peers.
-        if let Some((input, output)) = &self.advertised_cache
-            && *input == eligible
-        {
-            return output.clone();
-        }
-        let mut result = eligible.clone();
-        if !result.is_empty() {
-            let offset = (random % result.len() as u64) as usize;
-            result.rotate_left(offset);
-        }
-        result.truncate(MAX_ADDRESSES);
-        self.advertised_cache = Some((eligible, result.clone()));
-        result
+        self.advertised_cache
+            .as_ref()
+            .map_or_else(Vec::new, |cached| cached.addresses.clone())
     }
     /// Whether this node synchronized successfully with a book entry at this
     /// source IP during the last hour.
@@ -1143,10 +1176,46 @@ mod tests {
         let first = b.advertised(101, 3);
         assert_eq!(first.len(), MAX_ADDRESSES);
         assert!(!first.contains(&configured));
-        // Repeated requests cannot page through the whole set.
-        for random in [5, 17, 29] {
-            assert_eq!(b.advertised(101, random), first);
+        // Repeated requests cannot page through the whole set, even when a
+        // requester gets more of its own addresses verified meanwhile.
+        for (n, random) in [5, 17, 29].into_iter().enumerate() {
+            let address = SocketAddr::from(([31, n as u8, 1, 1], 9));
+            b.learn(SocketAddr::from(([21, n as u8, 1, 1], 9)), &[address], 102);
+            b.entries.get_mut(&address).unwrap().last_success = 102;
+            assert_eq!(b.advertised(102, random), first);
         }
+        // The sample is redrawn only after a fixed interval.
+        let later = 101 + ADVERTISED_SAMPLE_SECONDS;
+        for entry in b.entries.values_mut() {
+            entry.last_success = later;
+        }
+        let redrawn = b.advertised(later, 7);
+        assert_eq!(redrawn.len(), MAX_ADDRESSES);
+        assert_ne!(redrawn, first);
+        assert!(!redrawn.contains(&configured));
+        // A configured peer stays private even when its saved entry was
+        // learned from gossip.
+        let path = dir.path().join("learned");
+        let mut saved = book(path.clone());
+        let learned: SocketAddr = "9.9.9.9:9".parse().unwrap();
+        saved.learn("7.7.7.7:9".parse().unwrap(), &[learned], 100);
+        saved.finished(learned, true, 100, 0);
+        assert_eq!(saved.advertised(100, 0), [learned]);
+        saved.save().unwrap();
+        let mut reopened = AddressBook::open(
+            path,
+            [1; 32],
+            Options {
+                enabled: true,
+                ..Default::default()
+            },
+            "0.0.0.0:9".parse().unwrap(),
+            &[learned],
+            101,
+        )
+        .unwrap();
+        assert_ne!(reopened.entries[&learned].source, CONFIGURED);
+        assert!(reopened.advertised(101, 0).is_empty());
     }
     #[test]
     fn interrupted_save_temporaries_are_removed_on_open() {

@@ -99,8 +99,12 @@ async function run() {
       ok(row.secret!==b.api.derivePrivate(row.passphrase));seen.add(row.public_key);
     }
     equal(seen.size,v2.vectors.length);
-    throws(()=>b.api.derivePrivateV2('','27'.repeat(32)),/passphrase/i);throws(()=>b.api.derivePrivateV2('a'.repeat(15),'27'.repeat(32)),/16 UTF-8 bytes/);
-    throws(()=>b.api.derivePrivateV2('é'.repeat(7),'27'.repeat(32)),/16 UTF-8 bytes/);throws(()=>b.api.derivePrivateV2('\ud800'.repeat(16),'27'.repeat(32)),/Unicode/);
+    // Composed and decomposed forms of one phrase would open different accounts.
+    equal(v2.rejected.length,4);
+    for(const row of v2.rejected){equal(Buffer.from(row.passphrase,'utf8').toString('hex'),row.utf8_hex);throws(()=>b.api.derivePrivateV2(row.passphrase,'27'.repeat(32)),/printable ASCII/);equal(b.api.derivePrivate(row.passphrase).length,64);}
+    throws(()=>b.api.derivePrivateV2('','27'.repeat(32)),/passphrase/i);throws(()=>b.api.derivePrivateV2('a'.repeat(15),'27'.repeat(32)),/16 characters/);
+    throws(()=>b.api.derivePrivateV2('é'.repeat(8),'27'.repeat(32)),/printable ASCII/);throws(()=>b.api.derivePrivateV2('\ud800'.repeat(16),'27'.repeat(32)),/Unicode/);
+    for(const unit of ['\x1f','\x7f','\x80'])throws(()=>b.api.derivePrivateV2('a'.repeat(3)+unit+'a'.repeat(12),'27'.repeat(32)),/printable ASCII/);
     throws(()=>b.api.derivePrivateV2('a'.repeat(4097),'27'.repeat(32)),/long/);throws(()=>b.api.derivePrivateV2(v2.vectors[0].passphrase,'27'),/Chain ID/);
     throws(()=>browser(profile(),'public.example','http:').api.derivePrivateV2(v2.vectors[0].passphrase,'27'.repeat(32)),/HTTPS/);
     const row=v2.vectors[0],passStore=b.api.createStore(row.chain_id);

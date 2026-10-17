@@ -174,16 +174,35 @@ fn independent_v2_passphrase_vectors_are_stretched_and_network_specific() {
         assert_eq!(hex::encode(*secret), vector["secret"]);
         let public = crypto::public_key(&secret).unwrap();
         assert_eq!(hex::encode(public), vector["public_key"]);
-        assert!(distinct.insert(public), "network, whitespace or Unicode form ignored");
+        assert!(distinct.insert(public), "network or whitespace ignored");
         // Never the legacy key for the same phrase.
         assert_ne!(*wallet::derive_secret(phrase).unwrap(), *secret);
     }
-    assert_eq!(distinct.len(), 6);
+    assert_eq!(distinct.len(), 3);
     let chain = [39; 32];
+    // One visible phrase can be typed as composed or decomposed Unicode, which
+    // would open different accounts; v2 refuses anything but printable ASCII.
+    let rejected = document["rejected"].as_array().unwrap();
+    assert_eq!(rejected.len(), 4);
+    for vector in rejected {
+        let phrase = vector["passphrase"].as_str().unwrap();
+        assert_eq!(hex::encode(phrase.as_bytes()), vector["utf8_hex"]);
+        assert!(phrase.len() >= wallet::MIN_PASSPHRASE_V2_BYTES);
+        let error = wallet::derive_secret_v2(phrase, &chain).unwrap_err();
+        assert!(error.to_string().contains("printable ASCII"), "{error}");
+        // Legacy v1 restores such phrases exactly as before.
+        wallet::derive_secret(phrase).unwrap();
+    }
     assert!(wallet::derive_secret_v2("", &chain).is_err());
     assert!(wallet::derive_secret_v2(&"a".repeat(wallet::MIN_PASSPHRASE_V2_BYTES - 1), &chain).is_err());
-    assert!(wallet::derive_secret_v2(&"é".repeat(7), &chain).is_err());
-    assert!(wallet::derive_secret_v2(&"é".repeat(8), &chain).is_ok());
+    assert!(wallet::derive_secret_v2(&"é".repeat(8), &chain).is_err());
+    for byte in [0x1f, 0x7f, 0x80] {
+        let mut phrase = "a".repeat(wallet::MIN_PASSPHRASE_V2_BYTES).into_bytes();
+        phrase[3] = byte;
+        let phrase = String::from_utf8_lossy(&phrase).into_owned();
+        assert!(wallet::derive_secret_v2(&phrase, &chain).is_err(), "byte {byte:#x}");
+    }
+    assert!(wallet::derive_secret_v2(&"~ !".repeat(6), &chain).is_ok());
     assert!(
         wallet::derive_secret_v2(&"a".repeat(wallet::MAX_PASSPHRASE_BYTES + 1), &chain).is_err()
     );

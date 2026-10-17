@@ -41,15 +41,21 @@ pub fn derive_secret(passphrase: &str) -> Result<Zeroizing<[u8; 32]>> {
     anyhow::bail!("could not derive a signing key")
 }
 
-/// v2: exact UTF-8 (no trimming or normalization) stretched with scrypt, salted
-/// with the tag and the 32-byte chain ID, then the first valid secret
+/// v2: printable ASCII exactly as typed (no trimming) stretched with scrypt,
+/// salted with the tag and the 32-byte chain ID, then the first valid secret
 /// `tagged_hash(tag, stretched || counter_le32)`. A phrase opens a different
-/// account on every network, and each guess costs one scrypt run.
+/// account on every network, and each guess costs one scrypt run. Other text
+/// is refused: one visible Unicode phrase has several encodings (composed or
+/// decomposed, by keyboard and system) that would open different accounts.
 pub fn derive_secret_v2(passphrase: &str, chain_id: &Hash) -> Result<Zeroizing<[u8; 32]>> {
     ensure!(!passphrase.is_empty(), "enter a passphrase");
     ensure!(
+        passphrase.bytes().all(|b| (0x20..=0x7e).contains(&b)),
+        "v2 passphrases use printable ASCII only: letters, digits, punctuation and spaces"
+    );
+    ensure!(
         passphrase.len() >= MIN_PASSPHRASE_V2_BYTES,
-        "passphrase must contain at least {MIN_PASSPHRASE_V2_BYTES} UTF-8 bytes"
+        "passphrase must contain at least {MIN_PASSPHRASE_V2_BYTES} characters"
     );
     ensure!(
         passphrase.len() <= MAX_PASSPHRASE_BYTES,

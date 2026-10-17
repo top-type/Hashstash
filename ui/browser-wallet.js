@@ -324,14 +324,16 @@
       return pbkdf2(password, B, length);
     } finally { B.fill(0); X.fill(0); Y.fill(0); V.fill(0); t.fill(0); }
   }
-  // hashstash-passphrase-v2: scrypt (N=2^17, r=8, p=1) salted with the tag and
-  // chain ID, then the first valid tagged secret. Each network gets its own account.
+  // hashstash-passphrase-v2: printable ASCII, scrypt (N=2^17, r=8, p=1) salted with
+  // the tag and chain ID, then the first valid tagged secret. Each network gets its
+  // own account. Other text is refused: one visible Unicode phrase has several encodings.
   function derivePrivateV2(passphrase, chainId) {
     requireSecure();
     const chain = bytes32(chainId, 'Chain ID'), phrase = passphraseBytes(passphrase);
     let stretched;
     try {
-      if (phrase.length < 16) fail('Passphrase must contain at least 16 UTF-8 bytes.');
+      if (phrase.some(b => b < 0x20 || b > 0x7e)) fail('Version 2 passphrases use printable ASCII only: letters, digits, punctuation and spaces.');
+      if (phrase.length < 16) fail('Passphrase must contain at least 16 characters.');
       stretched = scrypt(phrase, concat(utf8.encode('Hashstash/Passphrase/v2'), chain), 1 << 17, 8, 1, 32);
       return firstSecret('Hashstash/Passphrase/v2', stretched);
     } finally { phrase.fill(0); stretched?.fill(0); }

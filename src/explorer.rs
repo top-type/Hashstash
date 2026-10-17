@@ -20,9 +20,30 @@ use std::{
     sync::Arc,
 };
 
-// A pagination target, never a record or consensus validity limit. A single
-// larger record is returned alone so cursors cannot hide valid history.
+// A pagination target, never a record or consensus validity limit. All sections
+// of one response, pending records included, share this record-text allowance
+// and the JSON-value limit. A section's first record is returned even when
+// larger, so cursors cannot hide valid history.
 const PAGE_BYTES: usize = 32 * 1024 * 1024;
+/// Immutable execution checkpoints kept for shallow reorganizations; also the
+/// longest catch-up that startup finishes before returning.
+const CHECKPOINTS: usize = 128;
+/// Detached blocks walked to relate an orphaned mail anchor to the canonical chain.
+const ANCHOR_DEPTH: usize = 128;
+/// No response can carry a larger record, and SQLite refuses values above
+/// about 1e9 bytes; a larger projection omits its bulky signed detail instead
+/// of stalling the index on a consensus-valid block.
+const RECORD_BYTES: usize = crate::node::MAX_RESPONSE_FRAME;
+const TABLES: [&str; 8] = [
+    "explorer_blocks",
+    "explorer_transactions",
+    "explorer_events",
+    "explorer_proposals",
+    "explorer_contributions",
+    "explorer_decisions",
+    "explorer_chat",
+    "explorer_mail",
+];
 
 pub const METHODS: &[&str] = &[
     "explorer_blocks",
@@ -34,28 +55,54 @@ pub const METHODS: &[&str] = &[
     "explorer_chat",
     "explorer_mail",
 ];
-const SCHEMA: &str = "petahash-atoms-anchor-only-batch";
+const SCHEMA: &str = "petahash-atoms-raw-data-ordered-events";
 pub const MAX_PAGE: u64 = 50;
 
 pub struct Explorer {
     db: Option<Connection>,
     tip: Option<Hash>,
+    /// Height of `tip`, the newest block whose rows are indexed as canonical.
+    height: u64,
     ready: bool,
+    /// Contiguous canonical checkpoints ending at or below `tip`. Blocks above
+    /// the newest one are already indexed and replay without rewriting rows.
     states: VecDeque<(Hash, Arc<State>)>,
+    /// The last captured update and chain tip. A failed update is retried only
+    /// after the canonical tip changes, not on every worker notification.
+    attempt: Option<(Hash, Hash)>,
+    failed: Option<(Hash, Hash)>,
 }
-/// One already validated canonical block, or a cached rollback anchor. Capturing
-/// this performs no state replay and no derived-index writes under the node lock.
+/// One already validated canonical block, or retained rollback checkpoints.
+/// Capturing this performs no state replay and no derived-index writes under
+/// the node lock.
 pub(crate) enum Update {
     Advance(Box<Block>),
+    /// An already indexed canonical block, executed only to rebuild checkpoints.
+    Replay(Box<Block>),
+    /// Detach rows above this retained checkpoint.
     Rollback(Hash, Arc<State>),
+    /// Detach rows above the common ancestor (height, hash) and resume from
+    /// the retained canonical checkpoints at or below it.
+    Rebuild(u64, Hash, VecDeque<(Hash, Arc<State>)>),
+}
+impl Update {
+    fn target(&self) -> Hash {
+        match self {
+            Self::Advance(block) | Self::Replay(block) => codec::block_hash(block),
+            Self::Rollback(hash, _) | Self::Rebuild(_, hash, _) => *hash,
+        }
+    }
 }
 impl Explorer {
     pub fn unavailable() -> Self {
         Self {
             db: None,
             tip: None,
+            height: 0,
             ready: false,
             states: VecDeque::new(),
+            attempt: None,
+            failed: None,
         }
     }
     pub fn read(
@@ -93,8 +140,11 @@ impl Explorer {
         let reader = Self {
             db: Some(db),
             tip: Some(parse_hash(&indexed)?),
+            height: 0,
             ready: true,
             states: VecDeque::new(),
+            attempt: None,
+            failed: None,
         };
         reader.rpc(method, p, c, s, tip, mempool)
     }
@@ -129,7 +179,7 @@ impl Explorer {
         db.execute_batch("CREATE TABLE IF NOT EXISTS explorer_mail(txid TEXT NOT NULL,block_hash TEXT NOT NULL,height INTEGER NOT NULL,position INTEGER NOT NULL,record TEXT NOT NULL,canonical INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(txid,block_hash));CREATE INDEX IF NOT EXISTS explorer_mail_page ON explorer_mail(height,position) WHERE canonical=1;
             CREATE TABLE IF NOT EXISTS explorer_chat(txid TEXT NOT NULL,block_hash TEXT NOT NULL,height INTEGER NOT NULL,position INTEGER NOT NULL,record TEXT NOT NULL,canonical INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(txid,block_hash));CREATE INDEX IF NOT EXISTS explorer_chat_page ON explorer_chat(height DESC,position DESC) WHERE canonical=1;CREATE TABLE IF NOT EXISTS explorer_blocks(hash TEXT PRIMARY KEY,height INTEGER NOT NULL,canonical INTEGER NOT NULL,record TEXT NOT NULL);
             CREATE UNIQUE INDEX IF NOT EXISTS explorer_height ON explorer_blocks(height) WHERE canonical=1;
-            CREATE TABLE IF NOT EXISTS explorer_transactions(txid TEXT NOT NULL,block_hash TEXT NOT NULL,height INTEGER NOT NULL,position INTEGER NOT NULL,record TEXT NOT NULL,data TEXT NOT NULL,canonical INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(txid,block_hash));
+            CREATE TABLE IF NOT EXISTS explorer_transactions(txid TEXT NOT NULL,block_hash TEXT NOT NULL,height INTEGER NOT NULL,position INTEGER NOT NULL,record TEXT NOT NULL,data BLOB NOT NULL,canonical INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(txid,block_hash));
             CREATE INDEX IF NOT EXISTS explorer_tx_page ON explorer_transactions(height DESC,position DESC);
             CREATE INDEX IF NOT EXISTS explorer_tx_block ON explorer_transactions(block_hash,position);
             CREATE TABLE IF NOT EXISTS explorer_events(address TEXT NOT NULL,block_hash TEXT NOT NULL,height INTEGER NOT NULL,position INTEGER NOT NULL,record TEXT NOT NULL,canonical INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(address,block_hash,position));
@@ -143,6 +193,7 @@ impl Explorer {
             CREATE INDEX IF NOT EXISTS explorer_decision_proposal ON explorer_decisions(proposal,height DESC);
             CREATE INDEX IF NOT EXISTS explorer_current_tx ON explorer_transactions(height DESC,position DESC) WHERE canonical=1;
             CREATE INDEX IF NOT EXISTS explorer_current_event ON explorer_events(address,height DESC,position DESC) WHERE canonical=1;
+            CREATE INDEX IF NOT EXISTS explorer_current_event_height ON explorer_events(height) WHERE canonical=1;
             CREATE INDEX IF NOT EXISTS explorer_current_proposal ON explorer_proposals(height DESC,position DESC) WHERE canonical=1;
             CREATE INDEX IF NOT EXISTS explorer_current_contribution ON explorer_contributions(proposal,height DESC,position DESC) WHERE canonical=1;
             CREATE INDEX IF NOT EXISTS explorer_current_contribution_page ON explorer_contributions(height DESC,position DESC) WHERE canonical=1;
@@ -156,20 +207,32 @@ impl Explorer {
         let mut index = Self {
             db: Some(db),
             tip: tip.and_then(|v| parse_hash(&v).ok()),
+            height: 0,
             ready: false,
             states: VecDeque::new(),
+            attempt: None,
+            failed: None,
         };
         index.sync(chain)?;
-        index
-            .states
-            .push_back((chain.tip_hash(), Arc::new(chain.tip_state().clone())));
         Ok(index)
     }
 
-    pub(crate) fn capture(&self, chain: &Chain) -> Result<Option<Update>> {
+    pub(crate) fn capture(&mut self, chain: &Chain) -> Result<Option<Update>> {
         if self.db.is_none() || self.tip == Some(chain.tip_hash()) {
             return Ok(None);
         }
+        let update = self.next_update(chain)?;
+        let attempt = (update.target(), chain.tip_hash());
+        // A deterministic failure is not re-executed for every mempool or
+        // template notification; the next canonical tip retries it.
+        if self.failed == Some(attempt) {
+            return Ok(None);
+        }
+        self.attempt = Some(attempt);
+        Ok(Some(update))
+    }
+
+    fn next_update(&self, chain: &Chain) -> Result<Update> {
         let (tip, state) = self
             .states
             .back()
@@ -181,54 +244,58 @@ impl Explorer {
                 .rev()
                 .find(|(hash, state)| chain.hash_at_height(state.height) == Some(*hash))
             {
-                return Ok(Some(Update::Rollback(*hash, state.clone())));
+                return Ok(Update::Rollback(*hash, state.clone()));
             }
-            // A deep reorg replays from genesis on the worker, never through the
+            // A reorg deeper than every checkpoint keeps the rows below the
+            // common ancestor and replays from the nearest state the chain
+            // already retains (or genesis) on the worker, never through the
             // node's cache/state_at path while holding its mutation lock.
-            return Ok(Some(Update::Rollback(
-                chain.hash_at_height(0).context("missing genesis")?,
-                Arc::new(State::genesis(&chain.config)),
-            )));
+            let db = self.db.as_ref().context("explorer index unavailable")?;
+            let height = common_ancestor(db, chain)?.context("missing common genesis")?;
+            let hash = chain
+                .hash_at_height(height)
+                .context("missing common ancestor")?;
+            return Ok(Update::Rebuild(height, hash, checkpoints(chain, height)?));
+        }
+        let replay = state.height < self.height;
+        if replay && chain.hash_at_height(self.height) != self.tip {
+            // The indexed tip was detached above the newest checkpoint.
+            return Ok(Update::Rollback(*tip, state.clone()));
         }
         let hash = chain
             .hash_at_height(state.height + 1)
             .context("missing canonical successor")?;
-        let block = if hash == chain.tip_hash() {
+        let block = Box::new(if hash == chain.tip_hash() {
             chain.tip_block().clone()
         } else {
             chain
                 .block(&hash)
                 .context("missing stored canonical block")?
-        };
-        Ok(Some(Update::Advance(Box::new(block))))
+        });
+        Ok(if replay {
+            Update::Replay(block)
+        } else {
+            Update::Advance(block)
+        })
     }
 
     pub(crate) fn apply_update(&mut self, c: &Config, update: Update) -> Result<()> {
+        let attempt = self.attempt.take();
+        let result = self.apply(c, update);
+        self.failed = if result.is_err() { attempt } else { None };
+        result
+    }
+
+    fn apply(&mut self, c: &Config, update: Update) -> Result<()> {
         let db = self.db.as_mut().context("explorer index unavailable")?;
         match update {
             Update::Rollback(hash, state) => {
                 let transaction = db.transaction()?;
-                for table in [
-                    "explorer_blocks",
-                    "explorer_transactions",
-                    "explorer_events",
-                    "explorer_proposals",
-                    "explorer_contributions",
-                    "explorer_decisions",
-                    "explorer_chat",
-                    "explorer_mail",
-                ] {
-                    transaction.execute(
-                        &format!("UPDATE {table} SET canonical=0 WHERE canonical=1 AND height>?1"),
-                        [state.height],
-                    )?;
-                }
-                transaction.execute(
-                    "INSERT OR REPLACE INTO explorer_meta VALUES('tip',?1)",
-                    [hex::encode(hash)],
-                )?;
+                detach(&transaction, Some(state.height))?;
+                set_tip(&transaction, &hash)?;
                 transaction.commit()?;
                 self.tip = Some(hash);
+                self.height = state.height;
                 while self
                     .states
                     .back()
@@ -238,122 +305,115 @@ impl Explorer {
                 }
                 self.states.push_back((hash, state));
             }
+            Update::Rebuild(height, hash, states) => {
+                ensure!(
+                    states.back().is_some_and(|(_, state)| state.height <= height),
+                    "explorer checkpoint above common ancestor"
+                );
+                let transaction = db.transaction()?;
+                detach(&transaction, Some(height))?;
+                set_tip(&transaction, &hash)?;
+                transaction.commit()?;
+                self.tip = Some(hash);
+                self.height = height;
+                self.states = states;
+            }
+            Update::Replay(block) => {
+                let (tip, parent) = self
+                    .states
+                    .back()
+                    .context("missing explorer checkpoint state")?;
+                ensure!(
+                    block.header.previous == *tip
+                        && block.height == parent.height + 1
+                        && block.height <= self.height,
+                    "explorer replay successor mismatch"
+                );
+                let work = math::work(&math::target_from_bits(block.header.bits)?);
+                let post = consensus::execute(
+                    c,
+                    parent,
+                    &block.header.previous,
+                    &block.miner,
+                    &work,
+                    &block.transactions,
+                )?;
+                ensure!(
+                    post.root() == block.state_root,
+                    "explorer replay commitment mismatch"
+                );
+                self.checkpoint(codec::block_hash(&block), Arc::new(post));
+            }
             Update::Advance(block) => {
                 let (tip, parent) = self
                     .states
                     .back()
                     .context("missing explorer checkpoint state")?;
                 ensure!(
-                    block.header.previous == *tip && block.height == parent.height + 1,
+                    block.header.previous == *tip
+                        && block.height == parent.height + 1
+                        && self.tip == Some(*tip),
                     "explorer successor mismatch"
                 );
                 let transaction = db.transaction()?;
                 let post = Arc::new(index_block(&transaction, c, &block, Some(parent))?);
                 let hash = codec::block_hash(&block);
-                transaction.execute(
-                    "INSERT OR REPLACE INTO explorer_meta VALUES('tip',?1)",
-                    [hex::encode(hash)],
-                )?;
+                set_tip(&transaction, &hash)?;
                 transaction.commit()?;
                 self.tip = Some(hash);
-                self.states.push_back((hash, post));
-                while self.states.len() > 128 {
-                    self.states.pop_front();
-                }
+                self.height = block.height;
+                self.checkpoint(hash, post);
             }
         }
         Ok(())
     }
 
+    fn checkpoint(&mut self, hash: Hash, state: Arc<State>) {
+        self.states.push_back((hash, state));
+        while self.states.len() > CHECKPOINTS {
+            self.states.pop_front();
+        }
+    }
+
+    /// Detach rows above the common ancestor and resume from retained states.
+    /// A short catch-up finishes here; a longer one (first start, rebuild or a
+    /// lagging index) continues on the background worker, committing each
+    /// block, so startup never waits on a full replay for a derived index.
     pub fn sync(&mut self, chain: &Chain) -> Result<()> {
         if self.ready && self.tip == Some(chain.tip_hash()) {
             return Ok(());
         }
         self.ready = false;
         let db = self.db.as_mut().context("explorer index unavailable")?;
-        let last:Option<(u64,String)>=db.query_row("SELECT height,hash FROM explorer_blocks WHERE canonical=1 ORDER BY height DESC LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-        let mut common = last.map(|(h, _)| h.min(chain.tip_height()));
-        while let Some(h) = common {
-            let stored: Option<String> = db
-                .query_row(
-                    "SELECT hash FROM explorer_blocks WHERE canonical=1 AND height=?1",
-                    [h],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if stored == chain.hash_at_height(h).map(hex::encode) {
-                break;
-            }
-            common = h.checked_sub(1);
-        }
-        let mut parent = common
-            .map(|height| {
-                let hash = chain
-                    .hash_at_height(height)
-                    .context("missing common ancestor")?;
-                chain
-                    .state_at(&hash)
-                    .context("missing common ancestor state")
-            })
-            .transpose()?;
-        let transaction = db.transaction()?;
-        match common {
-            Some(h) => {
-                transaction.execute(
-                    "UPDATE explorer_blocks SET canonical=0 WHERE canonical=1 AND height>?1",
-                    [h],
-                )?;
-            }
+        let height = match common_ancestor(db, chain)? {
+            Some(height) => height,
             None => {
-                transaction.execute(
-                    "UPDATE explorer_blocks SET canonical=0 WHERE canonical=1",
-                    [],
-                )?;
+                let genesis = chain
+                    .block(&chain.hash_at_height(0).context("missing genesis")?)
+                    .context("missing genesis block")?;
+                let transaction = db.transaction()?;
+                detach(&transaction, None)?;
+                index_block(&transaction, &chain.config, &genesis, None)?;
+                set_tip(&transaction, &codec::block_hash(&genesis))?;
+                transaction.commit()?;
+                0
             }
-        }
-        for table in [
-            "explorer_transactions",
-            "explorer_events",
-            "explorer_proposals",
-            "explorer_contributions",
-            "explorer_decisions",
-            "explorer_chat",
-            "explorer_mail",
-        ] {
-            match common {
-                Some(h) => {
-                    transaction.execute(
-                        &format!("UPDATE {table} SET canonical=0 WHERE canonical=1 AND height>?1"),
-                        [h],
-                    )?;
-                }
-                None => {
-                    transaction.execute(
-                        &format!("UPDATE {table} SET canonical=0 WHERE canonical=1"),
-                        [],
-                    )?;
-                }
-            }
-        }
-        for height in common.map_or(0, |h| h + 1)..=chain.tip_height() {
-            let hash = chain
-                .hash_at_height(height)
-                .context("missing canonical height")?;
-            let block = chain.block(&hash).context("missing canonical block")?;
-            parent = Some(Arc::new(index_block(
-                &transaction,
-                &chain.config,
-                &block,
-                parent.as_deref(),
-            )?));
-        }
-        transaction.execute(
-            "INSERT OR REPLACE INTO explorer_meta VALUES('tip',?1)",
-            [hex::encode(chain.tip_hash())],
+        };
+        let hash = chain
+            .hash_at_height(height)
+            .context("missing common ancestor")?;
+        self.attempt = None;
+        self.apply(
+            &chain.config,
+            Update::Rebuild(height, hash, checkpoints(chain, height)?),
         )?;
-        transaction.commit()?;
-        self.tip = Some(chain.tip_hash());
         self.ready = true;
+        let start = self.states.back().map_or(0, |(_, state)| state.height);
+        if chain.tip_height().saturating_sub(start) <= CHECKPOINTS as u64 {
+            while let Some(update) = self.capture(chain)? {
+                self.apply_update(&chain.config, update)?;
+            }
+        }
         Ok(())
     }
 
@@ -378,15 +438,21 @@ impl Explorer {
             limit(&p)?
         };
         let mut result = json!({"chain_id":hex::encode(s.chain_id),"tip":hex::encode(tip),"height":s.height,"state_root":hex::encode(s.root())});
+        let mut budget = Budget::new();
         match method {
             "explorer_mail" => {
                 fields(&p, &["limit", "after", "anchor"])?;
                 let anchor = scan_anchor(db, &p, "after", "Mail")?;
-                let (h, n) = scan_after(&p, anchor)?;
+                let (h, n) = scan_after(&p, anchor, "Mail", c)?;
                 let mut statement=db.prepare("SELECT t.record,t.height,t.position FROM explorer_mail t JOIN explorer_blocks b ON b.hash=t.block_hash WHERE t.canonical=1 AND b.canonical=1 AND (t.height>?1 OR(t.height=?1 AND t.position>?2)) ORDER BY t.height,t.position LIMIT ?3")?;
-                let (items, next) =
-                    paged_more(&mut statement, params![h, n, limit + 1], limit, s.height)?;
-                result["messages"] = json!(items);
+                let (items, next) = paged_more(
+                    &mut statement,
+                    params![h, n, limit + 1],
+                    limit,
+                    s.height,
+                    &mut budget,
+                )?;
+                result["messages"] = Value::from(items);
                 result["has_more"] = json!(!next.is_null());
                 result["scan_cursor"] = if next.is_null() {
                     json!(format!("{}:{}", s.height, i64::MAX))
@@ -401,19 +467,27 @@ impl Explorer {
             }
             "explorer_chat" => {
                 fields(&p, &["limit", "cursor"])?;
-                let (h, n) = cursor_named(&p, "cursor", s.height)?;
-                let mut statement = db.prepare("SELECT t.record,t.height,t.position FROM explorer_chat t JOIN explorer_blocks b ON b.hash=t.block_hash WHERE t.canonical=1 AND b.canonical=1 AND (t.height<?1 OR (t.height=?1 AND t.position<?2)) ORDER BY t.height DESC,t.position DESC LIMIT ?3")?;
-                let (items, next) = paged(&mut statement, params![h, n, limit], limit, s.height)?;
-                result["items"] = json!(items);
+                let (h, n) = cursor_named(&p, "cursor", s.height, c)?;
+                // Message text is read from the stored transaction data rather
+                // than from a second, JSON-escaped copy in the chat projection.
+                let mut statement = db.prepare("SELECT t.record,t.height,t.position,x.data FROM explorer_chat t JOIN explorer_blocks b ON b.hash=t.block_hash JOIN explorer_transactions x ON x.txid=t.txid AND x.block_hash=t.block_hash WHERE t.canonical=1 AND b.canonical=1 AND (t.height<?1 OR (t.height=?1 AND t.position<?2)) ORDER BY t.height DESC,t.position DESC LIMIT ?3")?;
+                let (items, next) = paged(
+                    &mut statement,
+                    params![h, n, limit],
+                    limit,
+                    s.height,
+                    &mut budget,
+                )?;
+                result["items"] = Value::from(items);
                 result["next_cursor"] = next;
-                result["pending"] = json!(
+                result["pending"] = pending(
                     mempool
                         .iter()
                         .rev()
-                        .filter_map(|t| chat_value(s, t, None, None, None))
-                        .take(limit as usize)
-                        .collect::<Vec<_>>()
-                );
+                        .filter_map(|t| chat_value(s, t, None, None, None).map(Ok))
+                        .take(limit as usize),
+                    &mut budget,
+                )?;
                 result["available"] = json!(true);
                 result["ready"] = json!(true);
                 result["indexed_height"] = json!(s.height);
@@ -424,35 +498,39 @@ impl Explorer {
                 let before =
                     height_parameter(&p, "before_height")?.unwrap_or(s.height.saturating_add(1));
                 let mut statement=db.prepare("SELECT record FROM explorer_blocks WHERE canonical=1 AND height<?1 ORDER BY height DESC LIMIT ?2")?;
-                let blocks = statement
-                    .query_map(params![before, limit], |r| r.get::<_, String>(0))?
-                    .map(|r| Ok(serde_json::from_str::<Value>(&r?)?))
-                    .collect::<Result<Vec<_>>>()?;
+                let (blocks, truncated) =
+                    records(&mut statement, params![before, limit], &mut budget)?;
                 result["next_before_height"] = blocks
                     .last()
-                    .filter(|_| blocks.len() == limit as usize)
+                    .filter(|_| truncated || blocks.len() == limit as usize)
                     .map(|b| b["height"].clone())
                     .unwrap_or(Value::Null);
-                result["blocks"] = json!(blocks);
+                result["blocks"] = Value::from(blocks);
             }
             "explorer_transactions" => {
                 fields(&p, &["limit", "before"])?;
-                let (h, n) = cursor(&p, s.height)?;
+                let (h, n) = cursor(&p, s.height, c)?;
                 let mut statement=db.prepare("SELECT t.record,t.height,t.position FROM explorer_transactions t JOIN explorer_blocks b ON b.hash=t.block_hash WHERE t.canonical=1 AND b.canonical=1 AND (t.height<?1 OR (t.height=?1 AND t.position<?2)) ORDER BY t.height DESC,t.position DESC LIMIT ?3")?;
-                let (items, next) = paged(&mut statement, params![h, n, limit], limit, s.height)?;
+                let (items, next) = paged(
+                    &mut statement,
+                    params![h, n, limit],
+                    limit,
+                    s.height,
+                    &mut budget,
+                )?;
                 let mut items = items;
                 for value in &mut items {
                     settlement(db, value)?;
                 }
-                result["transactions"] = json!(items);
+                result["transactions"] = Value::from(items);
                 result["next_cursor"] = next;
-                result["pending"] = json!(
+                result["pending"] = pending(
                     mempool
                         .iter()
                         .take(limit as usize)
-                        .map(|t| tx_value(c, s, t, None, None, None))
-                        .collect::<Result<Vec<_>>>()?
-                );
+                        .map(|t| tx_value(c, s, t, None, None, None)),
+                    &mut budget,
+                )?;
             }
             "explorer_block" => {
                 fields(&p, &["height", "hash", "limit", "tx_offset"])?;
@@ -481,6 +559,7 @@ impl Explorer {
                     .optional()?;
                 if let Some((record, canonical)) = record {
                     let mut block: Value = serde_json::from_str(&record)?;
+                    budget.admit(record.len(), &block, true);
                     block["status"] = json!(if canonical { "confirmed" } else { "orphaned" });
                     block["confirmations"] = json!(if canonical {
                         s.height
@@ -503,6 +582,7 @@ impl Explorer {
                         params![hash, offset, limit],
                         limit,
                         s.height,
+                        &mut budget,
                     )?;
                     if !canonical {
                         for t in &mut transactions {
@@ -520,7 +600,7 @@ impl Explorer {
                             Value::Null
                         };
                     result["block"] = block;
-                    result["transactions"] = json!(transactions);
+                    result["transactions"] = Value::from(transactions);
                 } else {
                     bail!("unknown block");
                 }
@@ -528,11 +608,11 @@ impl Explorer {
             "explorer_transaction" => {
                 fields(&p, &["txid", "limit"])?;
                 let id = hex::encode(parse_hash(string(&p, "txid")?)?);
-                let row:Option<(String,String,bool)>=db.query_row("SELECT t.record,t.data,b.canonical FROM explorer_transactions t JOIN explorer_blocks b ON b.hash=t.block_hash WHERE t.txid=?1 ORDER BY b.canonical DESC,t.height DESC LIMIT 1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+                let row:Option<(String,Vec<u8>,bool)>=db.query_row("SELECT t.record,t.data,b.canonical FROM explorer_transactions t JOIN explorer_blocks b ON b.hash=t.block_hash WHERE t.txid=?1 ORDER BY b.canonical DESC,t.height DESC LIMIT 1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
 
                 let value = if let Some((record, data, true)) = row.as_ref() {
                     let mut value: Value = serde_json::from_str(record)?;
-                    value["data_hex"] = json!(data);
+                    value["data_hex"] = json!(hex::encode(data));
                     value["data_truncated"] = json!(false);
                     confirmations(&mut value, s.height);
                     value
@@ -546,7 +626,7 @@ impl Explorer {
                     value
                 } else if let Some((record, data, _)) = row {
                     let mut value: Value = serde_json::from_str(&record)?;
-                    value["data_hex"] = json!(data);
+                    value["data_hex"] = json!(hex::encode(data));
                     value["data_truncated"] = json!(false);
                     value["status"] = json!("orphaned");
                     value["confirmations"] = json!(0);
@@ -629,23 +709,24 @@ impl Explorer {
                     params![encoded, h, n, limit],
                     limit,
                     s.height,
+                    &mut budget,
                 )?;
                 let mut items = items;
                 for value in &mut items {
                     settlement(db, value)?;
                 }
-                result["history"] = json!(items);
+                result["history"] = Value::from(items);
                 result["next_cursor"] = next;
-                result["pending"] = json!(
+                result["pending"] = pending(
                     mempool
                         .iter()
                         .filter(
                             |t| t.body.sender == key || recipient(&t.body.operation) == Some(key)
                         )
                         .take(limit as usize)
-                        .map(|t| tx_value(c, s, t, None, None, None))
-                        .collect::<Result<Vec<_>>>()?
-                );
+                        .map(|t| tx_value(c, s, t, None, None, None)),
+                    &mut budget,
+                )?;
             }
             "explorer_governance" => {
                 fields(
@@ -663,12 +744,12 @@ impl Explorer {
                     .map(|v| parse_hash(v.as_str().context("proposal ID must be text")?))
                     .transpose()?;
                 let proposal_text = proposal.map(hex::encode).unwrap_or_default();
-                let (h, n) = cursor(&p, s.height)?;
+                let (h, n) = cursor(&p, s.height, c)?;
                 let before =
                     height_parameter(&p, "before_height")?.unwrap_or(s.height.saturating_add(1));
                 result["phase"] = json!(s.phase_name());
                 result["current"] = serde_json::to_value(&s.phase)?;
-                let (ph, pn) = cursor_named(&p, "proposal_before", s.height)?;
+                let (ph, pn) = cursor_named(&p, "proposal_before", s.height, c)?;
                 let proposal_filter = if proposal.is_some() {
                     "p.id=?1"
                 } else {
@@ -680,6 +761,7 @@ impl Explorer {
                     params![proposal_text, ph, pn, limit],
                     limit,
                     s.height,
+                    &mut budget,
                 )?;
                 for p in &mut proposals {
                     let id = parse_hash(p["id"].as_str().context("indexed proposal ID")?)?;
@@ -689,38 +771,40 @@ impl Explorer {
                     }
                 }
                 result["proposal_next_cursor"] = proposal_next;
-                result["proposals"] = json!(proposals);
+                result["proposals"] = Value::from(proposals);
                 let decision_filter = if proposal.is_some() {
                     "(d.proposal=?1 OR d.id=?1)"
                 } else {
                     "?1=''"
                 };
-                let mut statement=db.prepare(&format!("SELECT d.record FROM explorer_decisions d JOIN explorer_blocks b ON b.hash=d.block_hash WHERE d.canonical=1 AND b.canonical=1 AND {decision_filter} AND d.height<?2 ORDER BY d.height DESC LIMIT ?3"))?;
-                let mut decisions = statement
-                    .query_map(params![proposal_text, before, limit], |r| {
-                        r.get::<_, String>(0)
-                    })?
-                    .map(|r| Ok(serde_json::from_str::<Value>(&r?)?))
-                    .collect::<Result<Vec<_>>>()?;
                 // The live decision appears only on the first page. With a
                 // one-row page its cursor still permits reaching older results.
+                let mut decisions = Vec::new();
                 if !p.as_object().unwrap().contains_key("before_height")
                     && let Phase::Governance(d) = &s.phase
                     && proposal.is_none_or(|p| p == d.proposal_id || p == d.id)
                 {
-                    decisions.insert(0, decision_record(c, s, None)?);
-                    decisions.truncate(limit as usize);
+                    let live = decision_record(c, s, None)?;
+                    budget.admit(json_bytes(&live), &live, true);
+                    decisions.push(live);
                 }
+                let mut statement=db.prepare(&format!("SELECT d.record FROM explorer_decisions d JOIN explorer_blocks b ON b.hash=d.block_hash WHERE d.canonical=1 AND b.canonical=1 AND {decision_filter} AND d.height<?2 ORDER BY d.height DESC LIMIT ?3"))?;
+                let (older, truncated) = records(
+                    &mut statement,
+                    params![proposal_text, before, limit - decisions.len() as u64],
+                    &mut budget,
+                )?;
+                decisions.extend(older);
                 result["next_before_height"] = decisions
                     .last()
-                    .filter(|_| decisions.len() == limit as usize)
+                    .filter(|_| truncated || decisions.len() == limit as usize)
                     .map(|d| {
                         d["ended_height"]
                             .as_u64()
                             .map_or(json!(s.height.saturating_add(1)), |height| json!(height))
                     })
                     .unwrap_or(Value::Null);
-                result["decisions"] = json!(decisions);
+                result["decisions"] = Value::from(decisions);
                 let contribution_filter = if proposal.is_some() {
                     "e.proposal=?1"
                 } else {
@@ -732,8 +816,9 @@ impl Explorer {
                     params![proposal_text, h, n, limit],
                     limit,
                     s.height,
+                    &mut budget,
                 )?;
-                result["contributions"] = json!(items);
+                result["contributions"] = Value::from(items);
                 result["next_cursor"] = next;
             }
             _ => bail!("unknown explorer method"),
@@ -783,11 +868,15 @@ fn fields(p: &Value, allowed: &[&str]) -> Result<()> {
     );
     Ok(())
 }
-fn cursor(p: &Value, height: u64) -> Result<(u64, u64)> {
-    cursor_named(p, "before", height)
+fn cursor(p: &Value, height: u64, c: &Config) -> Result<(u64, u64)> {
+    cursor_named(p, "before", height, c)
 }
-fn cursor_named(p: &Value, name: &str, height: u64) -> Result<(u64, u64)> {
-    cursor_with_position_limit(p, name, height, 100_000)
+fn cursor_named(p: &Value, name: &str, height: u64, c: &Config) -> Result<(u64, u64)> {
+    cursor_with_position_limit(p, name, height, position_limit(c))
+}
+/// A block holds at most max_signatures transactions; SQLite stores positions as i64.
+fn position_limit(c: &Config) -> u64 {
+    (c.max_signatures as u64).min(i64::MAX as u64)
 }
 fn cursor_with_position_limit(
     p: &Value,
@@ -810,9 +899,16 @@ fn cursor_with_position_limit(
         }
     }
 }
-/// Continuations carry the previous canonical tip so a reorganization cannot
-/// silently hide replacement messages below an already consumed cursor.
-fn scan_anchor(db: &Connection, p: &Value, cursor: &str, label: &str) -> Result<Option<u64>> {
+/// Continuations carry an anchor block from the previous page so a
+/// reorganization cannot silently hide replacement messages below an already
+/// consumed cursor. A cursor remains valid while every block at or below it is
+/// unchanged: returns that unchanged height, and whether the anchor was replaced.
+fn scan_anchor(
+    db: &Connection,
+    p: &Value,
+    cursor: &str,
+    label: &str,
+) -> Result<Option<(u64, bool)>> {
     ensure!(
         p.get(cursor).is_some() == p.get("anchor").is_some(),
         "{cursor} and anchor must be supplied together"
@@ -820,21 +916,36 @@ fn scan_anchor(db: &Connection, p: &Value, cursor: &str, label: &str) -> Result<
     let Some(_) = p.get("anchor") else {
         return Ok(None);
     };
-    let hash = hex::encode(parse_hash(string(p, "anchor")?)?);
-    let height: Option<u64> = db
-        .query_row(
-            "SELECT height FROM explorer_blocks WHERE hash=?1 AND canonical=1",
-            [hash],
-            |r| r.get(0),
-        )
-        .optional()?;
-    ensure!(
-        height.is_some(),
-        "{label} scan anchor is no longer canonical"
-    );
-    Ok(height)
+    let mut hash = hex::encode(parse_hash(string(p, "anchor")?)?);
+    // Detached records keep their parent, so a shallow replacement relates the
+    // anchor to its newest canonical ancestor without restarting discovery.
+    for depth in 0..=ANCHOR_DEPTH {
+        let row: Option<(u64, bool, Option<String>)> = db
+            .query_row(
+                "SELECT height,canonical,json_extract(record,'$.previous') FROM explorer_blocks WHERE hash=?1",
+                [&hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((height, canonical, previous)) = row else {
+            break;
+        };
+        if canonical {
+            return Ok(Some((height, depth > 0)));
+        }
+        let Some(previous) = previous else {
+            break;
+        };
+        hash = previous;
+    }
+    bail!("{label} scan anchor is no longer canonical")
 }
-fn scan_after(p: &Value, anchor_height: Option<u64>) -> Result<(i64, i64)> {
+fn scan_after(
+    p: &Value,
+    anchor: Option<(u64, bool)>,
+    label: &str,
+    c: &Config,
+) -> Result<(i64, i64)> {
     let Some(value) = p.get("after") else {
         return Ok((-1, -1));
     };
@@ -846,10 +957,17 @@ fn scan_after(p: &Value, anchor_height: Option<u64>) -> Result<(i64, i64)> {
         "invalid cursor"
     );
     let (h, n) = (h.parse::<u64>()?, n.parse::<u64>()?);
+    let (unchanged, replaced) = anchor.context("missing scan anchor")?;
+    // Report where the replaced history begins: a client may keep what it
+    // found at or below that height and continue after it with this anchor.
     ensure!(
-        h <= anchor_height.context("missing scan anchor")?
+        !replaced || h <= unchanged,
+        "{label} scan anchor is no longer canonical; blocks above height {unchanged} were replaced"
+    );
+    ensure!(
+        h <= unchanged
             && h <= u32::MAX as u64
-            && (n <= 100_000 || n == i64::MAX as u64),
+            && (n <= position_limit(c) || n == i64::MAX as u64),
         "invalid cursor bounds"
     );
     Ok((h as i64, n as i64))
@@ -859,21 +977,110 @@ fn confirmations(v: &mut Value, tip: u64) {
         v["confirmations"] = json!(tip.saturating_sub(h) + 1);
     }
 }
+
+/// One allowance shared by every section of a response, pending records
+/// included: record text bytes and parsed JSON values, like node JSON pages.
+struct Budget {
+    bytes: usize,
+    values: usize,
+}
+impl Budget {
+    fn new() -> Self {
+        Self::with_bytes(PAGE_BYTES)
+    }
+    fn with_bytes(bytes: usize) -> Self {
+        Self {
+            bytes,
+            values: crate::network_guard::MAX_JSON_VALUES,
+        }
+    }
+    fn fits(&self, bytes: usize) -> bool {
+        bytes <= self.bytes
+    }
+    /// Charge one record. A section's first record is always admitted, so a
+    /// large record is returned alone rather than hidden behind its cursor.
+    fn admit(&mut self, bytes: usize, value: &Value, first: bool) -> bool {
+        let values = json_values(value);
+        if !first && (bytes > self.bytes || values > self.values) {
+            return false;
+        }
+        self.bytes = self.bytes.saturating_sub(bytes);
+        self.values = self.values.saturating_sub(values);
+        true
+    }
+}
+fn json_values(value: &Value) -> usize {
+    1 + match value {
+        Value::Array(items) => items.iter().map(json_values).sum(),
+        Value::Object(fields) => fields.values().map(json_values).sum(),
+        _ => 0,
+    }
+}
+fn json_bytes(value: &Value) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+            self.0 += input.len();
+            Ok(input.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+/// Pending records have no cursor; the shared budget may shorten the list.
+fn pending(values: impl Iterator<Item = Result<Value>>, budget: &mut Budget) -> Result<Value> {
+    let mut items = Vec::new();
+    for value in values {
+        let value = value?;
+        if !budget.admit(json_bytes(&value), &value, items.is_empty()) {
+            break;
+        }
+        items.push(value);
+    }
+    Ok(Value::from(items))
+}
+/// Fixed-shape records paged by height; also reports whether the budget ended the page.
+fn records<P: rusqlite::Params>(
+    statement: &mut rusqlite::Statement<'_>,
+    p: P,
+    budget: &mut Budget,
+) -> Result<(Vec<Value>, bool)> {
+    let mut rows = statement.query(p)?;
+    let mut items = Vec::new();
+    while let Some(row) = rows.next()? {
+        let record: String = row.get(0)?;
+        if !items.is_empty() && !budget.fits(record.len()) {
+            return Ok((items, true));
+        }
+        let value: Value = serde_json::from_str(&record)?;
+        if !budget.admit(record.len(), &value, items.is_empty()) {
+            return Ok((items, true));
+        }
+        items.push(value);
+    }
+    Ok((items, false))
+}
 fn paged<P: rusqlite::Params>(
     statement: &mut rusqlite::Statement<'_>,
     p: P,
     limit: u64,
     tip: u64,
+    budget: &mut Budget,
 ) -> Result<(Vec<Value>, Value)> {
-    paged_with_budget(statement, p, limit, tip, false, PAGE_BYTES)
+    paged_with_budget(statement, p, limit, tip, false, budget)
 }
 fn paged_more<P: rusqlite::Params>(
     statement: &mut rusqlite::Statement<'_>,
     p: P,
     limit: u64,
     tip: u64,
+    budget: &mut Budget,
 ) -> Result<(Vec<Value>, Value)> {
-    paged_with_budget(statement, p, limit, tip, true, PAGE_BYTES)
+    paged_with_budget(statement, p, limit, tip, true, budget)
 }
 
 fn paged_with_budget<P: rusqlite::Params>(
@@ -882,26 +1089,34 @@ fn paged_with_budget<P: rusqlite::Params>(
     limit: u64,
     tip: u64,
     has_lookahead: bool,
-    byte_budget: usize,
+    budget: &mut Budget,
 ) -> Result<(Vec<Value>, Value)> {
+    // Chat rows select their transaction data as a fourth column: the text.
+    let text = statement.column_count() > 3;
     let mut rows = statement.query(p)?;
     let mut items = Vec::new();
     let mut last = None;
-    let mut bytes = 0usize;
     while let Some(row) = rows.next()? {
         if items.len() == limit as usize {
             return Ok((items, json!(last)));
         }
         let record: String = row.get(0)?;
+        let data: Option<Vec<u8>> = text.then(|| row.get(3)).transpose()?;
+        let bytes = record.len() + data.as_ref().map_or(0, Vec::len);
         // A single record can expand in JSON. Return it alone rather than
         // silently skipping it; the HTTP response envelope stays bounded too.
-        if !items.is_empty() && bytes.saturating_add(record.len()) > byte_budget {
+        if !items.is_empty() && !budget.fits(bytes) {
             return Ok((items, json!(last)));
         }
-        bytes = bytes.saturating_add(record.len());
         let (h, n): (u64, u64) = (row.get(1)?, row.get(2)?);
         let mut value: Value = serde_json::from_str(&record)?;
+        if let Some(data) = data {
+            value["text"] = json!(String::from_utf8(data).context("invalid indexed text")?);
+        }
         confirmations(&mut value, tip);
+        if !budget.admit(bytes, &value, items.is_empty()) {
+            return Ok((items, json!(last)));
+        }
         items.push(value);
         last = Some(format!("{h}:{n}"));
     }
@@ -911,6 +1126,80 @@ fn paged_with_budget<P: rusqlite::Params>(
         Value::Null
     };
     Ok((items, next))
+}
+
+/// Mark indexed rows above `height`, or every row, as detached.
+fn detach(db: &rusqlite::Transaction<'_>, height: Option<u64>) -> Result<()> {
+    for table in TABLES {
+        match height {
+            Some(h) => db.execute(
+                &format!("UPDATE {table} SET canonical=0 WHERE canonical=1 AND height>?1"),
+                [h],
+            )?,
+            None => db.execute(
+                &format!("UPDATE {table} SET canonical=0 WHERE canonical=1"),
+                [],
+            )?,
+        };
+    }
+    Ok(())
+}
+fn set_tip(db: &rusqlite::Transaction<'_>, hash: &Hash) -> Result<()> {
+    db.execute(
+        "INSERT OR REPLACE INTO explorer_meta VALUES('tip',?1)",
+        [hex::encode(hash)],
+    )?;
+    Ok(())
+}
+/// The newest indexed canonical height whose block is still canonical.
+fn common_ancestor(db: &Connection, chain: &Chain) -> Result<Option<u64>> {
+    let last: Option<u64> = db
+        .query_row(
+            "SELECT height FROM explorer_blocks WHERE canonical=1 ORDER BY height DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let mut common = last.map(|h| h.min(chain.tip_height()));
+    while let Some(h) = common {
+        let stored: Option<String> = db
+            .query_row(
+                "SELECT hash FROM explorer_blocks WHERE canonical=1 AND height=?1",
+                [h],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if stored == chain.hash_at_height(h).map(hex::encode) {
+            break;
+        }
+        common = h.checked_sub(1);
+    }
+    Ok(common)
+}
+/// Contiguous canonical states at or below `height` that the chain already
+/// retains (oldest first), else genesis. This never replays history.
+fn checkpoints(chain: &Chain, height: u64) -> Result<VecDeque<(Hash, Arc<State>)>> {
+    let mut states = VecDeque::new();
+    for h in (height.saturating_sub(CHECKPOINTS as u64 - 1)..=height).rev() {
+        let hash = chain
+            .hash_at_height(h)
+            .context("missing canonical height")?;
+        let state = if h == 0 {
+            Some(Arc::new(State::genesis(&chain.config)))
+        } else {
+            chain.cached_state(&hash)
+        };
+        match state {
+            Some(state) => states.push_front((hash, state)),
+            None if states.is_empty() => {}
+            None => break,
+        }
+    }
+    if states.is_empty() {
+        let hash = chain.hash_at_height(0).context("missing genesis")?;
+        states.push_back((hash, Arc::new(State::genesis(&chain.config))));
+    }
+    Ok(states)
 }
 
 #[cfg(test)]
@@ -928,16 +1217,39 @@ mod page_capacity_tests {
                 .unwrap();
         }
         let mut query = db.prepare("SELECT record,height,position FROM items WHERE height<?1 ORDER BY height DESC LIMIT 50").unwrap();
-        let (first, cursor) = paged_with_budget(&mut query, [4], 50, 3, false, 100).unwrap();
+        let (first, cursor) =
+            paged_with_budget(&mut query, [4], 50, 3, false, &mut Budget::with_bytes(100))
+                .unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0]["height"], 3);
         assert_eq!(cursor, "3:0");
-        let (second, cursor) = paged_with_budget(&mut query, [3], 50, 3, true, 100).unwrap();
+        let (second, cursor) =
+            paged_with_budget(&mut query, [3], 50, 3, true, &mut Budget::with_bytes(100))
+                .unwrap();
         assert_eq!(second[0]["height"], 2);
         assert_eq!(cursor, "2:0");
-        let (last, cursor) = paged_with_budget(&mut query, [2], 50, 3, true, 100).unwrap();
+        let (last, cursor) =
+            paged_with_budget(&mut query, [2], 50, 3, true, &mut Budget::with_bytes(100))
+                .unwrap();
         assert_eq!(last[0]["height"], 1);
         assert!(cursor.is_null());
+    }
+
+    #[test]
+    fn oversized_records_omit_bulky_detail_instead_of_failing_storage() {
+        let value = json!({"txid":"01","fee":"3","operation":{"Grant":vec![[7u8; 32]; 64]}});
+        let full = serde_json::to_string(&value).unwrap();
+        assert_eq!(
+            record_text(&value, "operation", full.len()),
+            Some(full.clone())
+        );
+        assert!(bounded_json(&value, full.len() - 1).is_none());
+        let reduced = record_text(&value, "operation", full.len() - 1).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&reduced).unwrap(),
+            json!({"txid":"01","fee":"3","operation_omitted":true})
+        );
+        assert!(record_text(&value, "operation", 8).is_none());
     }
 
     #[test]
@@ -1009,8 +1321,15 @@ mod page_capacity_tests {
         // A shortened page budget exercises overflow with real, complete signed
         // grant carriers, without constructing multiple maximum-size pages.
         for previous in 0..3 {
-            let (page, cursor) =
-                paged_with_budget(&mut query, [previous], 50, 3, true, largest).unwrap();
+            let (page, cursor) = paged_with_budget(
+                &mut query,
+                [previous],
+                50,
+                3,
+                true,
+                &mut Budget::with_bytes(largest),
+            )
+            .unwrap();
             assert_eq!(page.len(), 1);
             let transaction =
                 crate::wallet::decode_signed(page[0]["raw"].as_str().unwrap()).unwrap();
@@ -1110,7 +1429,7 @@ fn tx_value(
         v["amount"] = json!(amount.to_str_radix(10));
         v["asset"] = json!(asset);
     }
-    conditional_fields(&operation, &mut v);
+    conditional_fields(s, &operation, &mut v);
     // A pending minimum is a quote for the current tip, not a recorded charge.
     if height.is_none() {
         v["fee_estimated"] = json!(true);
@@ -1118,7 +1437,10 @@ fn tx_value(
     Ok(v)
 }
 
-fn conditional_fields(operation: &Operation, value: &mut Value) {
+/// Trades name their own decision and outcome. Any other operation executed
+/// while a decision is live applies to both outcomes; it names that decision
+/// with no outcome, and its settlement effect is `common`.
+fn conditional_fields(s: &State, operation: &Operation, value: &mut Value) {
     let (decision, outcome) = match operation {
         Operation::Deposit {
             decision, outcome, ..
@@ -1126,7 +1448,10 @@ fn conditional_fields(operation: &Operation, value: &mut Value) {
         | Operation::Redeem {
             decision, outcome, ..
         } => (*decision, *outcome),
-        _ => return,
+        _ => match s.decision_id() {
+            Some(decision) => (Some(decision), None),
+            None => return,
+        },
     };
     value["decision"] = json!(decision.map(hex::encode));
     value["outcome"] = json!(outcome.map(|o| match o {
@@ -1219,6 +1544,34 @@ fn index_block(
         .into_iter()
         .map(|fill| (fill.transaction_id, fill))
         .collect();
+    // A decision resolves, paying any passed grant, before the block's
+    // transactions run; the miner is credited after them. Event positions
+    // follow that order, so payouts take the lowest ordinals of the block.
+    let mut first = 0;
+    if let Some(parent) = parent
+        && let Phase::Governance(d) = &parent.phase
+        && post.decision_id() != Some(d.id)
+    {
+        let record = decision_record(c, parent, Some(b.height))?;
+        if record["outcome"] == "pass"
+            && let Proposal::Grant { payments } = &*d.proposal
+        {
+            for (index, payment) in payments.iter().enumerate() {
+                let event = json!({"height":b.height,"block_hash":hash_text,"kind":"governance_grant","amount":payment.amount.to_str_radix(10),"asset":"hash","decision":hex::encode(d.id),"proposal":hex::encode(d.proposal_id),"outcome":"pass","payout_index":index});
+                event_row(
+                    db,
+                    &payment.recipient,
+                    &post.chain_id,
+                    &hash_text,
+                    b.height,
+                    index as u64,
+                    &event,
+                )?;
+            }
+            first = payments.len() as u64;
+        }
+        db.execute("INSERT OR REPLACE INTO explorer_decisions(id,proposal,block_hash,height,record) VALUES(?1,?2,?3,?4,?5)",params![hex::encode(d.id),hex::encode(d.proposal_id),hash_text,b.height,serde_json::to_string(&record)?])?;
+    }
     for (position, t) in b.transactions.iter().enumerate() {
         let opening = fee_state.as_mut().context("genesis has transactions")?;
         let quote = fees::quote(c, opening, t)?;
@@ -1229,6 +1582,19 @@ fn index_block(
         let paid = quote.fee;
         transaction_fees += &paid;
         let mut value = tx_value(c, opening, t, Some(b.height), Some(hash), Some(paid))?;
+        // A refund credits the whole unclaimed support, which its signed
+        // operation does not state; no earlier transaction in a block can
+        // change that record, so read it from the block's opening state.
+        if let Operation::Refund { round, proposal } = &t.body.operation
+            && let Some(support) = opening.supports.get(&crate::state::support_key(
+                *round,
+                proposal,
+                &t.body.sender,
+            ))
+        {
+            value["amount"] = json!(support.amount.to_str_radix(10));
+            value["asset"] = json!("hash");
+        }
         let transaction_id = codec::transaction_id(t);
         let fill = if matches!(
             t.body.operation,
@@ -1247,28 +1613,39 @@ fn index_block(
         }
         let id = hex::encode(transaction_id);
         let operation = t.body.operation.clone();
-        db.execute("INSERT OR REPLACE INTO explorer_transactions(txid,block_hash,height,position,record,data) VALUES(?1,?2,?3,?4,?5,?6)",params![id,hash_text,b.height,position as u64,serde_json::to_string(&value)?,hex::encode(&t.body.data)])?;
-        if let Some(message) = chat_value(
+        // Raw bytes, never a hex copy: every derived value stays no larger than
+        // the stored block, below SQLite's maximum value length.
+        let record = record_text(&value, "operation", RECORD_BYTES)
+            .context("oversized explorer transaction record")?;
+        db.execute("INSERT OR REPLACE INTO explorer_transactions(txid,block_hash,height,position,record,data) VALUES(?1,?2,?3,?4,?5,?6)",params![id,hash_text,b.height,position as u64,record,t.body.data])?;
+        if let Some(mut message) = chat_value(
             opening,
             t,
             Some(b.height),
             Some(hash),
             Some(position as u64),
         ) {
+            // Reads restore the text from the transaction data above.
+            if let Some(fields) = message.as_object_mut() {
+                fields.remove("text");
+            }
             db.execute("INSERT OR REPLACE INTO explorer_chat(txid,block_hash,height,position,record) VALUES(?1,?2,?3,?4,?5)", params![id,hash_text,b.height,position as u64,serde_json::to_string(&message)?])?;
         }
-        if let Some(message) = mail_value(
+        // Mail needs its complete signed record; one no response could carry
+        // is undeliverable and is not listed.
+        if let Some(record) = mail_value(
             opening,
             t,
             Some(b.height),
             Some(hash),
             Some(position as u64),
-        ) {
-            let record = serde_json::to_string(&message)?;
+        )
+        .and_then(|message| bounded_json(&message, RECORD_BYTES))
+        {
             db.execute("INSERT OR REPLACE INTO explorer_mail(txid,block_hash,height,position,record) VALUES(?1,?2,?3,?4,?5)",params![id,hash_text,b.height,position as u64,record])?;
         }
         let mut event = json!({"height":b.height,"block_hash":hash_text,"txid":id,"kind":kind(&operation),"role":"sender","fee":value["fee"],"amount":value.get("amount"),"asset":value.get("asset"),"recipient":value.get("recipient")});
-        conditional_fields(&operation, &mut event);
+        conditional_fields(opening, &operation, &mut event);
         if let Some(fill) = fill {
             attach_fill(&mut event, fill);
         }
@@ -1278,7 +1655,7 @@ fn index_block(
             &chain_id,
             &hash_text,
             b.height,
-            position as u64 * 4,
+            first + position as u64 * 4,
             &event,
         )?;
         if let Some(recipient) = recipient(&operation) {
@@ -1290,7 +1667,7 @@ fn index_block(
                 &chain_id,
                 &hash_text,
                 b.height,
-                position as u64 * 4 + 1,
+                first + position as u64 * 4 + 1,
                 &event,
             )?;
         }
@@ -1320,7 +1697,9 @@ fn index_block(
                     proposal,
                 ));
                 let record = json!({"id":id,"round":round,"description":hex::encode(description),"description_text":crate::proposal_data::from_transaction(t),"action":proposal,"support":support.to_str_radix(10),"created_height":b.height,"creator":value["sender"]});
-                db.execute("INSERT OR REPLACE INTO explorer_proposals(id,block_hash,height,position,record) VALUES(?1,?2,?3,?4,?5)",params![id,hash_text,b.height,position as u64,serde_json::to_string(&record)?])?;
+                let record = record_text(&record, "action", RECORD_BYTES)
+                    .context("oversized explorer proposal record")?;
+                db.execute("INSERT OR REPLACE INTO explorer_proposals(id,block_hash,height,position,record) VALUES(?1,?2,?3,?4,?5)",params![id,hash_text,b.height,position as u64,record])?;
                 contribution_row(
                     db,
                     &id,
@@ -1347,7 +1726,8 @@ fn index_block(
     }
     summary["phase"] = json!(post.phase_name());
     summary["rewards"] = json!({"subsidy":subsidy.to_str_radix(10),"transaction_fees":transaction_fees.to_str_radix(10),"extra_fees":extra_fees.to_str_radix(10),"minimum_fees":mandatory.to_str_radix(10),"miner_fees":miner_fees.to_str_radix(10),"revenue_fees":revenue_fees.to_str_radix(10),"miner_total":(&subsidy+&miner_fees).to_str_radix(10),"complete":true});
-    if b.height > 0 {
+    // Consensus credits the miner only a nonzero reward.
+    if b.height > 0 && !(&subsidy + &miner_fees).is_zero() {
         let event = json!({"height":b.height,"block_hash":hash_text,"kind":"mining_reward","amount":summary["rewards"]["miner_total"],"complete":true,"asset":"hash"});
         event_row(
             db,
@@ -1355,38 +1735,55 @@ fn index_block(
             &post.chain_id,
             &hash_text,
             b.height,
-            b.transactions.len() as u64 * 4 + 10,
+            first + b.transactions.len() as u64 * 4 + 10,
             &event,
         )?;
-    }
-    if let Some(parent) = parent
-        && let Phase::Governance(d) = &parent.phase
-        && post.decision_id() != Some(d.id)
-    {
-        let record = decision_record(c, parent, Some(b.height))?;
-        if record["outcome"] == "pass"
-            && let Proposal::Grant { payments } = &*d.proposal
-        {
-            for (index, payment) in payments.iter().enumerate() {
-                let event = json!({"height":b.height,"block_hash":hash_text,"kind":"governance_grant","amount":payment.amount.to_str_radix(10),"asset":"hash","decision":hex::encode(d.id),"proposal":hex::encode(d.proposal_id),"outcome":"pass","payout_index":index});
-                event_row(
-                    db,
-                    &payment.recipient,
-                    &post.chain_id,
-                    &hash_text,
-                    b.height,
-                    b.transactions.len() as u64 * 4 + 12 + index as u64,
-                    &event,
-                )?;
-            }
-        }
-        db.execute("INSERT OR REPLACE INTO explorer_decisions(id,proposal,block_hash,height,record) VALUES(?1,?2,?3,?4,?5)",params![hex::encode(d.id),hex::encode(d.proposal_id),hash_text,b.height,serde_json::to_string(&record)?])?;
     }
     db.execute(
         "INSERT OR REPLACE INTO explorer_blocks VALUES(?1,?2,1,?3)",
         params![hash_text, b.height, serde_json::to_string(&summary)?],
     )?;
     Ok(post)
+}
+/// Serialized JSON no longer than `limit`, without building a larger string.
+fn bounded_json(value: &impl serde::Serialize, limit: usize) -> Option<String> {
+    struct Bounded {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+    impl std::io::Write for Bounded {
+        fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
+            if input.len() > self.limit - self.bytes.len() {
+                return Err(std::io::Error::other("explorer record bound exceeded"));
+            }
+            self.bytes.extend_from_slice(input);
+            Ok(input.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut output = Bounded {
+        bytes: Vec::new(),
+        limit,
+    };
+    serde_json::to_writer(&mut output, value).ok()?;
+    String::from_utf8(output.bytes).ok()
+}
+/// A stored record, replacing its `bulky` field with `<bulky>_omitted` when
+/// the whole record would exceed `limit`.
+fn record_text(value: &Value, bulky: &str, limit: usize) -> Option<String> {
+    if let Some(text) = bounded_json(value, limit) {
+        return Some(text);
+    }
+    let mut reduced: serde_json::Map<String, Value> = value
+        .as_object()?
+        .iter()
+        .filter(|(name, _)| name.as_str() != bulky)
+        .map(|(name, field)| (name.clone(), field.clone()))
+        .collect();
+    reduced.insert(format!("{bulky}_omitted"), json!(true));
+    bounded_json(&reduced, limit)
 }
 fn event_row(
     db: &rusqlite::Transaction<'_>,
@@ -1517,6 +1914,15 @@ mod indexing_tests {
             assert_eq!(record["subsidy"], atoms.to_str_radix(10));
             assert_eq!(record["rewards"]["miner_total"], atoms.to_str_radix(10));
             assert_eq!(post.issued, atoms);
+            // Consensus credits no zero reward, so history records none.
+            let rewards: u64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM explorer_events WHERE block_hash=?1",
+                    [hex::encode(codec::block_hash(&block))],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(rewards, u64::from(!atoms.is_zero()));
             transaction.rollback().unwrap();
         }
     }
@@ -2039,6 +2445,317 @@ mod indexing_tests {
 }
 
 #[cfg(test)]
+mod worker_tests {
+    use super::*;
+    use crate::crypto;
+
+    fn extend(chain: &mut Chain, salt: u64) -> Block {
+        let miner = crypto::public_key(&[91; 32]).unwrap();
+        let mut block = chain
+            .template(miner, vec![], chain.tip_block().header.timestamp + 15)
+            .unwrap();
+        block.extranonce = salt.to_le_bytes();
+        block.header.merkle_root = codec::merkle_root(&block).unwrap();
+        let block = Chain::mine(block, 100_000).unwrap();
+        chain
+            .submit(block.clone(), block.header.timestamp as u64)
+            .unwrap();
+        block
+    }
+    /// Run the background worker's capture/apply loop to completion.
+    fn drain(index: &mut Explorer, chain: &Chain) -> Vec<&'static str> {
+        let mut kinds = Vec::new();
+        while let Some(update) = index.capture(chain).unwrap() {
+            kinds.push(match update {
+                Update::Advance(_) => "advance",
+                Update::Replay(_) => "replay",
+                Update::Rollback(..) => "rollback",
+                Update::Rebuild(..) => "rebuild",
+            });
+            index.apply_update(&chain.config, update).unwrap();
+        }
+        kinds
+    }
+    fn canonical_blocks(index: &Explorer) -> u64 {
+        index
+            .db
+            .as_ref()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM explorer_blocks WHERE canonical=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn restarted_index_rolls_back_a_shallow_reorg_to_its_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Config::devnet();
+        let path = dir.path().join("restart.sqlite");
+        let mut main = Chain::open(&path, c.clone()).unwrap();
+        for salt in 0..5 {
+            extend(&mut main, salt);
+        }
+        drop(Explorer::open(&path, &main).unwrap());
+        let shared: Vec<_> = (1..=4)
+            .map(|height| main.block(&main.hash_at_height(height).unwrap()).unwrap())
+            .collect();
+        drop(main);
+        // A restarted node has no worker memory, but its chain retains the
+        // recent states the explorer seeds as checkpoints without replay.
+        let mut main = Chain::open(&path, c.clone()).unwrap();
+        let mut index = Explorer::open(&path, &main).unwrap();
+        assert_eq!(index.states.len(), 6);
+        let mut fork = Chain::open(&dir.path().join("fork.sqlite"), c.clone()).unwrap();
+        for block in shared {
+            fork.submit(block.clone(), block.header.timestamp as u64)
+                .unwrap();
+        }
+        for salt in 100..102 {
+            let block = extend(&mut fork, salt);
+            main.submit(block.clone(), block.header.timestamp as u64)
+                .unwrap();
+        }
+        assert_eq!(main.tip_hash(), fork.tip_hash());
+        let update = index.capture(&main).unwrap().unwrap();
+        let Update::Rollback(hash, state) = &update else {
+            panic!("a one-block reorg must not rebuild from genesis");
+        };
+        assert_eq!((*hash, state.height), (main.hash_at_height(4).unwrap(), 4));
+        index.apply_update(&c, update).unwrap();
+        assert_eq!(drain(&mut index, &main), ["advance", "advance"]);
+        assert_eq!(index.tip, Some(main.tip_hash()));
+        assert_eq!(canonical_blocks(&index), 7);
+    }
+
+    #[test]
+    fn long_catch_up_commits_progress_and_replays_without_rewriting_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Config::devnet();
+        let path = dir.path().join("catch-up.sqlite");
+        let mut chain = Chain::open(&path, c.clone()).unwrap();
+        for salt in 0..(CHECKPOINTS as u64 + 12) {
+            extend(&mut chain, salt);
+        }
+        // Enabling the explorer on a long chain indexes only genesis before
+        // startup returns; the worker continues one committed block at a time.
+        let mut index = Explorer::open(&path, &chain).unwrap();
+        assert_eq!(index.tip, chain.hash_at_height(0));
+        let error = index
+            .rpc(
+                "explorer_blocks",
+                json!({}),
+                &c,
+                chain.tip_state(),
+                chain.tip_hash(),
+                &[],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("updating"));
+        for _ in 0..5 {
+            let update = index.capture(&chain).unwrap().unwrap();
+            assert!(matches!(update, Update::Advance(_)));
+            index.apply_update(&c, update).unwrap();
+        }
+        let db = index.db.as_ref().unwrap();
+        db.execute(
+            "UPDATE explorer_blocks SET record=json_set(record,'$.kept',1) WHERE height=3",
+            [],
+        )
+        .unwrap();
+        drop(index);
+        drop(chain);
+        // After a restart the chain no longer retains height 5's state: the
+        // index keeps its committed rows and re-executes them only to rebuild
+        // checkpoints, never through an unbudgeted chain state replay.
+        let chain = Chain::open(&path, c.clone()).unwrap();
+        assert!(
+            chain
+                .cached_state(&chain.hash_at_height(5).unwrap())
+                .is_none()
+        );
+        let mut index = Explorer::open(&path, &chain).unwrap();
+        assert_eq!(index.tip, chain.hash_at_height(5));
+        assert_eq!(index.states.len(), 1);
+        let kinds = drain(&mut index, &chain);
+        assert_eq!(kinds[..5], ["replay"; 5]);
+        assert!(kinds[5..].iter().all(|kind| *kind == "advance"));
+        assert_eq!(kinds.len() as u64, chain.tip_height());
+        assert_eq!(index.tip, Some(chain.tip_hash()));
+        assert_eq!(canonical_blocks(&index), chain.tip_height() + 1);
+        let kept: Option<u64> = index
+            .db
+            .as_ref()
+            .unwrap()
+            .query_row(
+                "SELECT json_extract(record,'$.kept') FROM explorer_blocks WHERE height=3",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, Some(1));
+        assert_eq!(index.states.len(), CHECKPOINTS);
+        drop(index);
+        drop(chain);
+        // A lag covered by retained states finishes before startup returns.
+        let mut chain = Chain::open(&path, c.clone()).unwrap();
+        extend(&mut chain, 999);
+        let index = Explorer::open(&path, &chain).unwrap();
+        assert_eq!(index.tip, Some(chain.tip_hash()));
+        assert!(
+            index
+                .rpc(
+                    "explorer_blocks",
+                    json!({}),
+                    &c,
+                    chain.tip_state(),
+                    chain.tip_hash(),
+                    &[],
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn failed_update_waits_for_the_next_canonical_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Config::devnet();
+        let path = dir.path().join("backoff.sqlite");
+        let mut chain = Chain::open(&path, c.clone()).unwrap();
+        let mut index = Explorer::open(&path, &chain).unwrap();
+        extend(&mut chain, 0);
+        let writer = Connection::open(path.with_extension("explorer.sqlite")).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let update = index.capture(&chain).unwrap().unwrap();
+        assert!(index.apply_update(&c, update).is_err());
+        writer.execute_batch("ROLLBACK").unwrap();
+        // Mempool and template notifications for the same tip do not
+        // re-execute the failed block.
+        assert!(index.capture(&chain).unwrap().is_none());
+        extend(&mut chain, 1);
+        assert_eq!(drain(&mut index, &chain), ["advance", "advance"]);
+        assert_eq!(index.tip, Some(chain.tip_hash()));
+    }
+
+    #[test]
+    fn detaching_rows_searches_height_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plans.sqlite");
+        let chain = Chain::open(&path, Config::devnet()).unwrap();
+        let index = Explorer::open(&path, &chain).unwrap();
+        let db = index.db.as_ref().unwrap();
+        for table in TABLES {
+            let plan = db
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN UPDATE {table} SET canonical=0 WHERE canonical=1 AND height>?1"
+                ))
+                .unwrap()
+                .query_map([0], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|step| step.starts_with(&format!("SEARCH {table} USING"))),
+                "{table}: {plan:?}"
+            );
+            if table == "explorer_events" {
+                assert!(
+                    plan.iter()
+                        .any(|step| step.contains("explorer_current_event_height")),
+                    "{plan:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_budget_spans_every_section_of_a_response() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE items(record TEXT,height INTEGER,position INTEGER)")
+            .unwrap();
+        for height in 1..=3 {
+            let record = json!({"height":height,"text":"x".repeat(200)}).to_string();
+            db.execute("INSERT INTO items VALUES(?1,?2,0)", params![record, height])
+                .unwrap();
+        }
+        let mut query = db.prepare("SELECT record,height,position FROM items WHERE height<?1 ORDER BY height DESC LIMIT 50").unwrap();
+        let mut budget = Budget::with_bytes(300);
+        let (first, cursor) = paged(&mut query, [4], 50, 3, &mut budget).unwrap();
+        assert_eq!((first.len(), cursor), (1, json!("3:0")));
+        // A later section of the same response always returns its first record.
+        let (second, cursor) = paged(&mut query, [4], 50, 3, &mut budget).unwrap();
+        assert_eq!((second.len(), cursor), (1, json!("3:0")));
+        let rows = pending([json!("a"), json!("b")].into_iter().map(Ok), &mut budget).unwrap();
+        assert_eq!(rows, json!(["a"]));
+        // Parsed JSON values are bounded together with text bytes.
+        let mut budget = Budget {
+            bytes: PAGE_BYTES,
+            values: 6,
+        };
+        let rows = pending(
+            [json!([1, 2]), json!([3, 4]), json!([5, 6])]
+                .into_iter()
+                .map(Ok),
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(rows, json!([[1, 2], [3, 4]]));
+    }
+
+    #[test]
+    fn transaction_cursors_follow_the_configured_signature_limit() {
+        let mut c = Config::testnet();
+        c.max_signatures = 200_000;
+        c.validate().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("positions.sqlite");
+        let chain = Chain::open(&path, c.clone()).unwrap();
+        let index = Explorer::open(&path, &chain).unwrap();
+        let query = |method, params| {
+            index.rpc(
+                method,
+                params,
+                &c,
+                chain.tip_state(),
+                chain.tip_hash(),
+                &[],
+            )
+        };
+        for (method, field) in [
+            ("explorer_transactions", "before"),
+            ("explorer_chat", "cursor"),
+            ("explorer_governance", "before"),
+            ("explorer_governance", "proposal_before"),
+        ] {
+            for (cursor, valid) in [("1:150000", true), ("1:200000", true), ("1:200001", false)] {
+                let mut params = serde_json::Map::new();
+                params.insert(field.into(), json!(cursor));
+                assert_eq!(
+                    query(method, Value::Object(params)).is_ok(),
+                    valid,
+                    "{method} {field} {cursor}"
+                );
+            }
+        }
+        let anchor = hex::encode(chain.tip_hash());
+        for (after, valid) in [
+            ("0:150000", true),
+            ("0:200001", false),
+            ("0:9223372036854775807", true),
+        ] {
+            assert_eq!(
+                query("explorer_mail", json!({"after":after,"anchor":anchor})).is_ok(),
+                valid,
+                "{after}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod chat_tests {
     use super::*;
     use crate::crypto;
@@ -2384,6 +3101,30 @@ mod chat_tests {
             .apply_update(&c, Update::Advance(Box::new(block.clone())))
             .unwrap();
         let tip = codec::block_hash(&block);
+        // Text is stored once, as raw transaction bytes; the chat projection
+        // keeps no second, JSON-escaped copy of it.
+        let db = index.db.as_ref().unwrap();
+        let (kind, length): (String, usize) = db
+            .query_row(
+                "SELECT typeof(data),length(data) FROM explorer_transactions WHERE txid=?1",
+                [hex::encode(codec::transaction_id(&first))],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((kind.as_str(), length), ("blob", first.body.data.len()));
+        let stored: String = db
+            .query_row(
+                "SELECT record FROM explorer_chat WHERE txid=?1",
+                [hex::encode(codec::transaction_id(&first))],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            serde_json::from_str::<Value>(&stored)
+                .unwrap()
+                .get("text")
+                .is_none()
+        );
         let feed = index
             .rpc("explorer_chat", json!({"limit":1}), &c, &post, tip, &[])
             .unwrap();

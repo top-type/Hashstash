@@ -348,11 +348,27 @@ fn governance_evidence_contributions_same_height_proposals_and_reorg() {
     );
     let trade_id = codec::transaction_id(&trade);
     a.submit_transaction(trade).unwrap();
+    // A payment made while the decision is live applies to both outcomes.
+    let shared = transfer(&a, &c, 97, 1);
+    let shared_id = codec::transaction_id(&shared);
+    a.submit_transaction(shared).unwrap();
     a.mine(1_000_000).unwrap();
     assert_eq!(lookup(&a, trade_id)["settlement"]["effect"], "conditional");
+    let common = lookup(&a, shared_id);
+    assert_eq!(common["decision"], hex::encode(decision));
+    assert!(common["outcome"].is_null());
+    assert_eq!(common["settlement"]["effect"], "common");
+    // Resolution pays the grant before the resolving block's transactions.
+    let resolution = started_height + c.initial.decision_blocks;
+    let mut after_grant = None;
     for _ in 0..80 {
         if a.status().unwrap()["phase"] == "rest" {
             break;
+        }
+        if a.status().unwrap()["height"].as_u64().unwrap() + 1 == resolution {
+            let payment = transfer(&a, &c, 96, 0);
+            after_grant = Some(codec::transaction_id(&payment));
+            a.submit_transaction(payment).unwrap();
         }
         a.mine(1_000_000).unwrap();
     }
@@ -374,16 +390,57 @@ fn governance_evidence_contributions_same_height_proposals_and_reorg() {
     assert!(decision_record["leading_blocks"].as_u64().unwrap() > c.initial.decision_blocks / 2);
     assert!(decision_record.get("pass_average").is_none());
     assert_eq!(lookup(&a, trade_id)["settlement"]["effect"], "survived");
+    let common = lookup(&a, shared_id);
+    assert_eq!(common["settlement"]["effect"], "common");
+    assert_eq!(common["settlement"]["resolved_outcome"], "pass");
     let grant_address = address::encode(&key(96), &c.chain_id()).unwrap();
     let granted = a
         .explorer_rpc("explorer_account", json!({"address":grant_address}))
         .unwrap();
-    assert_eq!(granted["account"]["ordinary"], "100");
-    assert_eq!(granted["history"][0]["kind"], "governance_grant");
-    assert_eq!(granted["history"][0]["amount"], "100");
-    assert_eq!(granted["history"][0]["proposal"], hex::encode(ids[1]));
-    assert_eq!(granted["history"][0]["settlement"]["effect"], "survived");
-    assert!(granted["history"][0].get("txid").is_none());
+    assert_eq!(granted["account"]["ordinary"], "125");
+    // Newest first: the block's payment is listed above the earlier grant.
+    assert_eq!(
+        granted["history"][0]["txid"],
+        hex::encode(after_grant.unwrap())
+    );
+    assert_eq!(granted["history"][0]["height"], resolution);
+    assert_eq!(granted["history"][1]["height"], resolution);
+    assert_eq!(granted["history"][1]["kind"], "governance_grant");
+    assert_eq!(granted["history"][1]["amount"], "100");
+    assert_eq!(granted["history"][1]["proposal"], hex::encode(ids[1]));
+    assert_eq!(granted["history"][1]["settlement"]["effect"], "survived");
+    assert!(granted["history"][1].get("txid").is_none());
+    // A refund credits the losing proposal's whole unclaimed backing.
+    let refund = tx(
+        &a,
+        &c,
+        Operation::Refund {
+            round,
+            proposal: ids[0],
+        },
+        0,
+        vec![],
+    );
+    let refund_id = codec::transaction_id(&refund);
+    a.submit_transaction(refund).unwrap();
+    a.mine(1_000_000).unwrap();
+    let refunded = lookup(&a, refund_id);
+    assert_eq!(refunded["amount"], "10");
+    assert_eq!(refunded["asset"], "hash");
+    let owner_history = a
+        .explorer_rpc(
+            "explorer_account",
+            json!({"address":address::encode(&owner(), &c.chain_id()).unwrap()}),
+        )
+        .unwrap();
+    let event = owner_history["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "refund")
+        .unwrap();
+    assert_eq!(event["txid"], hex::encode(refund_id));
+    assert_eq!(event["amount"], "10");
     let target = a.status().unwrap()["height"].as_u64().unwrap() + 3;
     while b.status().unwrap()["height"].as_u64().unwrap() < target {
         a.submit_block(b.mine(1_000_000).unwrap()).unwrap();

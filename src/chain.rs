@@ -580,6 +580,20 @@ impl Chain {
     pub fn state_at(&self, hash: &Hash) -> Option<Arc<State>> {
         self.load_state(hash).ok()
     }
+    /// A state this chain already retains: the tip, an active-chain checkpoint
+    /// or a recent state. Unlike state_at, it never replays history.
+    pub fn cached_state(&self, hash: &Hash) -> Option<Arc<State>> {
+        if *hash == self.tip {
+            return Some(self.tip_state.clone());
+        }
+        let checkpoint = self
+            .checkpoints
+            .borrow()
+            .values()
+            .find(|(retained, _)| retained == hash)
+            .map(|(_, state)| state.clone());
+        checkpoint.or_else(|| self.cache.borrow().states.get(hash).cloned())
+    }
     /// Recently validated or reconstructed states outside the active-chain checkpoints.
     pub fn cached_state_count(&self) -> usize {
         self.cache.borrow().states.len()
@@ -710,7 +724,8 @@ impl Chain {
             cache.states.remove(&old);
         }
     }
-    fn cached_state(&self, hash: &Hash) -> Option<Arc<State>> {
+    /// A recent state, marked most recently used.
+    fn recent_state(&self, hash: &Hash) -> Option<Arc<State>> {
         let mut cache = self.cache.borrow_mut();
         let state = cache.states.get(hash)?.clone();
         if let Some(position) = cache.order.iter().position(|cached| cached == hash) {
@@ -754,7 +769,7 @@ impl Chain {
         if *hash == self.tip {
             return Ok(self.tip_state.clone());
         }
-        if let Some(state) = self.cached_state(hash) {
+        if let Some(state) = self.recent_state(hash) {
             return Ok(state);
         }
         if let Some(entry) = self.load_entry(hash)?
@@ -813,7 +828,7 @@ impl Chain {
             let retained = if cursor == self.tip {
                 Some(self.tip_state.clone())
             } else {
-                self.cached_state(&cursor)
+                self.recent_state(&cursor)
             };
             if let Some(state) = retained {
                 replay.base = Some((cursor, state));
@@ -839,7 +854,7 @@ impl Chain {
                     .context("genesis checkpoint absent")?;
                 for retained in (height + 1..entry.height).rev() {
                     if let Some(hash) = self.canonical_hash(retained)?
-                        && let Some(state) = self.cached_state(&hash)
+                        && let Some(state) = self.recent_state(&hash)
                     {
                         (height, base) = (retained, (hash, state));
                         break;

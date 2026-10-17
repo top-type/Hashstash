@@ -203,8 +203,8 @@
           <a class="text-link" href="#stash">Open Stash →</a>
         </div></details>
         <details class="guide-section guide-disclosure disclosure" id="guide-revenue" hidden><summary>Revenue and grants</summary><div class="disclosure-body">
-          <p><strong>Revenue</strong> comes from the portion of transaction fees allocated to the network and from winning proposal bids. It replenishes the reserve until the curve is flat; any excess remains as waiting revenue.</p>
-          <p>Governance can approve a <strong>grant</strong> to specified accounts. The grant uses waiting revenue first, then draws any remainder from the reserve. Drawing from the reserve steepens its curve while preserving the current price.</p>
+          <p><strong>Revenue</strong> comes from the portion of transaction fees allocated to the network and from winning proposal bids. Outside a decision it replenishes the reserve until the curve is flat; any excess remains as waiting revenue.</p>
+          <p>Governance can approve a <strong>grant</strong> to specified accounts. The grant uses waiting revenue first, then draws any remainder from the reserve; a winning bid never funds its own grant. Drawing from the reserve steepens its curve while preserving the current price. FAIL sets the same amount aside as waiting revenue, so both outcomes start on the same curve.</p>
           <p>As revenue replenishes the reserve, the curve becomes flatter. These changes affect how the price responds to trades; they leave the amount of stash in each account unchanged.</p>
         </div></details>
         <details class="guide-section guide-disclosure disclosure"><summary>Reading your balances</summary><div class="disclosure-body">
@@ -275,7 +275,7 @@
             <p>Each stash trade signs the decision identity and selected outcome. Payments and fees apply equally to both states and require enough hashes in each. Settlement retains the winning state as the ordinary account balances.</p>
             <p id="guide-grant-flow"></p>
             <p id="guide-decision"></p>
-            <p>A grant funded entirely by waiting revenue leaves the reserve curves unchanged. Equal prices add no PASS lead; a decision without a strict majority of PASS-leading blocks fails. Prices are compared exactly before display rounding. An outcome with no stash has a zero price until a deposit starts its reserve.</p>
+            <p>A grant funded entirely by waiting revenue leaves the reserve curves unchanged. Equal prices add no PASS lead; a decision without a strict majority of PASS-leading blocks fails. Prices are compared exactly before display rounding. A block in which either outcome has no stash adds no PASS lead.</p>
             <p id="guide-proposals"></p>
             <p>Settlement retains the winning balances and reserve and pays an approved grant. Approved setting changes activate after the rest period.</p>
           </div></details>

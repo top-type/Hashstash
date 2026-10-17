@@ -24,6 +24,7 @@ An example configuration for a local development website is:
   "max_fee": "10",
   "cooldown_seconds": 86400,
   "subnet_cooldown_seconds": 60,
+  "subnet_daily_claims": 10,
   "hourly_claims": 100,
   "daily_claims": 250,
   "lifetime_claims": 1000,
@@ -38,6 +39,10 @@ faucet operating-system user access to that key and its database. Funding can be
 an ordinary transfer or mining rewards paid to the faucet address. Never give
 the faucet a visitor's key or the key to an account holding valuable funds.
 The daemon accepts the usual key-file JSON, with `secret` and `public` fields.
+On Unix it refuses a key file that is a symbolic link or is readable or writable
+by its group or other users (keep `keygen`'s 0600 mode). Parsed copies of the
+secret are wiped, and stored subnet digests use a key derived from the signer,
+never the signing key itself.
 Changing the ledger's network or signer requires a separate ledger. Changing
 `payout` applies to new claims after a restart; recorded payments keep their
 original amounts, and all cooldowns and claim counts are preserved.
@@ -45,16 +50,23 @@ The ledger stores the amount of each payment alongside its claim record.
 
 The example dispenses 1 hash per claim (1,000 raw hash atoms) and permits one claim
 per address each day. Configuration and API amounts use integer raw hash atoms.
-A shared IPv4 /24 or IPv6 /64 can make a new claim once per minute, so another
+A shared IPv4 /24 or IPv6 /56 can make a new claim once per minute, so another
 wallet on the same network does not inherit a full day's wait. The separate
 `subnet_cooldown_seconds` setting defaults to 60 when omitted; both cooldowns
-must be positive and at most one year. At this payout, the claim-count caps allow
-up to 100 hashes per hour, 250 hashes per day, and 1,000 hashes over the ledger's lifetime.
-The service additionally limits each exact quoted fee to 0.01 hash.
+must be positive and at most one year. Each such network also receives at most
+`subnet_daily_claims` claims in any 24 hours (default 10, at most 1,000,000), so
+one host generating fresh addresses cannot take most of the global allowance.
+IPv6 is grouped by /56, the usual customer delegation, so one holder does not
+receive a separate allowance for each of its /64 networks. At this payout, the
+claim-count caps allow up to 100 hashes per hour, 250 hashes per day, and 1,000
+hashes over the ledger's lifetime. The service additionally limits each exact
+quoted fee to 0.01 hash.
 This is a local spending allowance, not an encoded transaction cap. Pending
 and expired claims consume the allowance too. Changing the payout does not
 reset these counts; historical payments retain the amounts paid at the time. This
-limits the dispenser's exposure; IP limits are not proof of unique people.
+limits the dispenser's exposure; IP limits are not proof of unique people. To
+extend an exhausted lifetime allowance, raise `lifetime_claims` (up to
+1,000,000) and restart; the ledger and its history are kept.
 
 ## Website and proxy
 
@@ -91,7 +103,12 @@ Do not forward this endpoint through an additional proxy without explicitly
 designing how the actual client address is authenticated. The service supports
 CORS only for the exact configured website origins. POST also requires that
 Origin and JSON content type. It stores keyed subnet digests, not literal IPs.
-HTTP concurrency, request duration, and request-body size are bounded.
+HTTP concurrency, request duration, and request-body size are bounded: 16
+requests run at once, and one client network may hold at most four of them.
+The poll loop reads the node snapshot without holding the claim engine, so slow
+node replies do not delay status responses. The faucet's own node RPC client
+ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`; it always connects directly
+to the configured loopback node.
 
 `GET /faucet/status` returns:
 
@@ -109,7 +126,14 @@ HTTP concurrency, request duration, and request-body size are bounded.
 ```
 
 Other states are `waiting_for_mining`, `unfunded`, `pending`, `cooldown`, `quota_reached`,
-and `unavailable`. Add `?address=RECIPIENT_ADDRESS` to receive an optional
+`fee_cap_exceeded`, `capacity_exceeded`, and `unavailable`. `fee_cap_exceeded` means
+the governed minimum fee for a payment to a new account now exceeds `max_fee`;
+`capacity_exceeded` means that payment's weight exceeds the governed block
+capacity, so no block could include it. The faucet computes both from the node
+snapshot exactly as node preparation does and signs nothing while either holds.
+Raise `max_fee`, or wait for capacity to be restored. Refresh errors and pause
+reasons appear only in the operator journal as fixed categories, never in status.
+Add `?address=RECIPIENT_ADDRESS` to receive an optional
 `claim` object for that recipient. It contains `status`, `txid`, `chain_id`,
 `amount_hashes`, and `retry_after_seconds`. The top-level amount is the current
 payout; the nested claim amount is that payment's original amount.
@@ -119,7 +143,10 @@ the maximum remaining wait across that address and the trusted proxy's client
 subnet. It is zero when neither cooldown applies. When a cooldown blocks an
 otherwise available faucet, `state` is `cooldown`, `available` is false, and
 `cooldown_scope` is `address` or `network`. No other recipient, claim, client IP,
-or stored subnet digest is disclosed. Status queries do not reserve funds.
+or stored subnet digest is disclosed. Status queries do not reserve funds. Like
+any per-network limit that reports its wait, a `network` wait tells a caller
+that someone on the same /24 or /56 claimed recently or used that network's
+daily share; the claim response reports the same wait.
 
 `POST /faucet/claim` accepts only `{"address":"RECIPIENT_ADDRESS"}`. It returns
 the same claim object with `pending`, `confirmed`, or `expired` status. A repeated
@@ -153,16 +180,76 @@ integer before the service signs a payment.
 
 Confirmation requires locating that transaction in canonical block history and
 the configured confirmation depth. A higher account nonce alone is insufficient.
-Reorganization of a confirmed receipt, a deep reorganization across a pending
-claim's preparation height, or an unexplained consumed nonce pauses new payments
-for operator review. The service suppresses stale confirmation claims after a
-detected receipt reorganization. It never creates a replacement payment merely
-because broadcast timed out. Preserve the SQLite database, including its WAL,
-when backing up or moving the service; do not delete it to clear a pending claim.
+The faucet uses the node's private `blockreceipt` RPC for this: it returns one
+canonical block hash and whether that block holds the named transaction IDs (at
+most 64), so verification never transfers or parses a whole block.
+
+Every refresh accounts for the nonces the canonical chain consumed. Each nonce
+can pay at most one recorded claim, so these automatic repairs can never pay
+twice:
+
+- The newest confirmed receipt is checked by its block hash, which commits to
+  all older receipts. If that block leaves the canonical chain, the claim is
+  accounted again: found elsewhere it keeps a moved receipt, otherwise it is
+  retried while still valid, and expires after its lifetime.
+- A pending claim whose anchor was orphaned, even by a one-block reorganization,
+  or whose anchor lies above a shorter chain, keeps its exact bytes and expires
+  once the canonical height reaches its expiry height with its nonce unused.
+- A claim recorded as expired that a later branch includes is marked confirmed,
+  and any other claim signed with the same nonce becomes expired.
+- Inclusion searches resume across refreshes and inspect at most 64 blocks per
+  refresh. A completed search is not repeated while its blocks stay canonical.
+
+New claims pause, with state `unavailable`, only while a condition holds, and
+resume by themselves once it clears. The journal names it with a fixed category:
+`verifying_payments` while a search is incomplete, `node_behind_ledger` while
+the node's chain is shorter than the newest receipt, `clock_behind_ledger` (see
+below), and `nonce_conflict` when the faucet key's nonce was consumed by a
+transaction the ledger never recorded. A conflict means the key signed
+elsewhere, for example in a second instance or a restored ledger, and needs
+review. The service never creates a replacement payment merely because
+broadcast timed out. Preserve the SQLite database, including its WAL, when backing up or moving
+the service; do not delete it to clear a pending claim.
+
+`confirmations` may be 1. A receipt reorganized after confirmation is then
+repaired as above, so the claim object can briefly report a payment that a
+reorganization later moves or expires; use 2 or more to make that rarer.
+
+Operator commands run against the configured ledger, print a JSON summary and
+exit. Stop the service before running a command that changes the ledger:
+
+```text
+hashstash-faucet --config PATH --inspect
+hashstash-faucet --config PATH --accept-spent-nonce NONCE
+hashstash-faucet --config PATH --clamp-future-claims
+```
+
+`--inspect` reports claim counts, the pending claim, the newest receipt and the
+recorded and current times without changing anything. After confirming that
+the faucet key itself spent NONCE outside the ledger, `--accept-spent-nonce`
+expires an unpaid pending claim at or below that nonce and records that those
+nonces are settled, which clears `nonce_conflict`. All rows, receipts,
+cooldowns and budget usage are kept.
+
+Cooldowns and claim windows use the wall clock, but never move behind recorded
+claims: if the clock is up to five minutes behind the newest claim, the newest
+claim time is used instead. If it is further behind, for example after claims
+were served while the host clock ran ahead, new claims pause with
+`clock_behind_ledger` rather than extending every window until that false time
+passes. Once the host clock is verified, `--clamp-future-claims` moves future
+claim times to the present, so their cooldowns restart from now.
+
+Upgrading from a release without these rules keeps every claim, receipt,
+address cooldown and budget count. Stored subnet digests use the new derived
+key and IPv6 /56 grouping, so network cooldowns and daily network shares start
+afresh once.
 
 Mining availability is an operational observation: the node's height must have
-advanced recently and RPC must still respond. This adds no timestamps or clock
-rules to chain consensus. Startup waits for a new block before serving claims.
+advanced recently and RPC must still respond. "Recently" means within the larger
+of `recent_block_seconds` and twelve governed block intervals, so a governed
+increase of the interval does not leave the faucet unavailable for most of each
+interval. This adds no timestamps or clock rules to chain consensus. Startup
+waits for a new block before serving claims.
 When the chain stops, payouts pause. A pending transaction can still be pending
 when mining stops; the faucet does not mine or purchase hashpower itself.
 

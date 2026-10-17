@@ -1088,6 +1088,9 @@ impl Engine {
         }
         Ok(result)
     }
+    /// Tests refresh under the engine; the poll loop fetches the snapshot
+    /// without holding it and then calls `apply`.
+    #[cfg(test)]
     async fn refresh(&mut self) -> Result<()> {
         let snapshot = self
             .rpc("snapshot", json!({"key":hex::encode(self.sender)}))

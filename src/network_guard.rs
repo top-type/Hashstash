@@ -6,7 +6,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -35,6 +35,30 @@ pub const RESERVED_PEER_SLOTS: usize = 4;
 pub const VERIFIED_PEER_SLOTS: usize = 4;
 /// Concurrent inbound sessions from one network group (IPv4 /16, IPv6 /32).
 pub const PEER_SLOTS_PER_GROUP: usize = 2;
+/// Stratum connections awaiting authorization that any source may use, plus
+/// slots that only addresses which recently authorized may use when those are full.
+pub const STRATUM_PENDING_SLOTS: usize = 128;
+pub const RESERVED_STRATUM_PENDING: usize = 32;
+/// Concurrent pending Stratum sessions from one public group (IPv4 /24, IPv6
+/// /48) whose addresses have not recently authorized.
+pub const STRATUM_PENDING_PER_GROUP: usize = 8;
+/// Addresses remembered after a successful Stratum authorization.
+pub const STRATUM_TRUSTED_ADDRESSES: usize = 256;
+pub const STRATUM_AUTHORIZATION_WINDOW: Duration = Duration::from_secs(10);
+/// Waiting for authorization is charged to the source address. An attempt
+/// reserves a whole window from a budget of four windows that refills at half
+/// a second per second; the unused part returns when the session authorizes
+/// or closes, however it closes.
+const PENDING_WINDOW_MS: u64 = STRATUM_AUTHORIZATION_WINDOW.as_millis() as u64;
+const PENDING_BUDGET_MS: u64 = 4 * PENDING_WINDOW_MS;
+const PENDING_REFILL_MS: u64 = 500;
+/// Requests per second, and burst, for one Stratum session.
+const SESSION_REQUESTS: u64 = 8;
+const SESSION_REQUEST_BURST: u64 = 16;
+/// Lines an authorized Stratum worker may send past its session rate while
+/// its difficulty is raised. They are checked for a block, otherwise refused.
+const WORKER_OVERRUN: u64 = 8;
+const WORKER_OVERRUN_BURST: u64 = 64;
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
 pub enum Surface {
@@ -125,6 +149,19 @@ pub fn network_group(ip: IpAddr) -> Option<IpAddr> {
 pub fn peer_source(ip: IpAddr) -> IpAddr {
     network_group(ip).unwrap_or_else(|| admission_address(ip))
 }
+/// Pending Stratum group: IPv4 /24 or IPv6 /48, which one operator or site
+/// normally holds. As for network groups, only sources on local networks keep
+/// per-address accounting.
+fn pending_group(ip: IpAddr) -> Option<IpAddr> {
+    let ip = admission_address(ip);
+    if local_source(ip) {
+        return None;
+    }
+    Some(match ip {
+        IpAddr::V4(v) => IpAddr::V4(Ipv4Addr::from(u32::from(v) & !0xff)),
+        IpAddr::V6(v) => IpAddr::V6(Ipv6Addr::from(u128::from(v) & !(u128::MAX >> 48))),
+    })
+}
 
 #[derive(Clone, Copy)]
 struct Policy {
@@ -209,6 +246,25 @@ impl Bucket {
             true
         }
     }
+    /// Return unused tokens, never beyond capacity.
+    fn give(&mut self, amount: u64, rate: u64, capacity: u64, now: Instant) {
+        self.take(0, rate, capacity, now);
+        self.tokens = self.tokens.saturating_add(amount).min(capacity);
+        if self.tokens == capacity {
+            self.remainder = 0;
+        }
+    }
+    /// Tokens available at `now`, without changing the bucket.
+    fn level(&self, rate: u64, capacity: u64, now: Instant) -> u64 {
+        let units = now
+            .duration_since(self.last)
+            .as_nanos()
+            .saturating_mul(rate as u128)
+            .saturating_add(self.remainder);
+        self.tokens
+            .saturating_add((units / 1_000_000_000).min(u64::MAX as u128) as u64)
+            .min(capacity)
+    }
 }
 struct Record {
     active: usize,
@@ -264,6 +320,8 @@ pub struct Session {
     /// A configured or pinned peer, which may use the whole frame budget.
     operator: bool,
     request_bucket: Mutex<Bucket>,
+    overrun_bucket: Mutex<Bucket>,
+    worker: AtomicBool,
     reserved_frame: Mutex<u64>,
 }
 impl NetworkGuard {
@@ -401,7 +459,9 @@ impl NetworkGuard {
             key,
             group: network_group(ip),
             operator: false,
-            request_bucket: Mutex::new(Bucket::new(16, now)),
+            request_bucket: Mutex::new(Bucket::new(SESSION_REQUEST_BURST, now)),
+            overrun_bucket: Mutex::new(Bucket::new(WORKER_OVERRUN_BURST, now)),
+            worker: AtomicBool::new(false),
             reserved_frame: Mutex::new(0),
         })
     }
@@ -496,20 +556,63 @@ impl Session {
             }
         }
     }
+    /// Mark an authorized Stratum worker. An address cooldown, which another
+    /// session from a shared address can cause, then no longer ends this
+    /// session's requests; its budgets still apply.
+    pub fn authorize_worker(&self) {
+        self.worker.store(true, Ordering::Relaxed);
+    }
+    /// Charge one line from an authorized Stratum worker. Within the session
+    /// rate it is an ordinary request. Past it, the line draws on a separate
+    /// overrun allowance and no address request unit, so one fast worker
+    /// neither drains the budget of other sessions at its address nor is
+    /// disconnected while its difficulty is raised. `Ok(false)` marks such a
+    /// line. Bytes are always charged to the address.
+    pub fn worker_line(&self, bytes: usize) -> Result<bool> {
+        let now = Instant::now();
+        let within = accounting(&self.request_bucket).take(
+            1,
+            SESSION_REQUESTS,
+            SESSION_REQUEST_BURST,
+            now,
+        );
+        if !within {
+            let mut overrun = accounting(&self.overrun_bucket);
+            ensure!(
+                overrun.take(1, WORKER_OVERRUN, WORKER_OVERRUN_BURST, now),
+                "mining session request rate limit"
+            );
+        }
+        self.charge_address(u64::from(within), bytes as u64, 0, true, now)?;
+        Ok(within)
+    }
     fn charge(&self, requests: u64, bytes: u64, work: u64, penalize: bool) -> Result<()> {
         let now = Instant::now();
         if self.key.1 == Surface::Stratum && requests > 0 {
             let mut bucket = accounting(&self.request_bucket);
             ensure!(
-                bucket.take(requests, 8, 16, now),
+                bucket.take(requests, SESSION_REQUESTS, SESSION_REQUEST_BURST, now),
                 "mining session request rate limit"
             );
         }
+        self.charge_address(requests, bytes, work, penalize, now)
+    }
+    fn charge_address(
+        &self,
+        requests: u64,
+        bytes: u64,
+        work: u64,
+        penalize: bool,
+        now: Instant,
+    ) -> Result<()> {
         let mut records = accounting(&self.guard.records);
         let record = records
             .get_mut(&self.key)
             .expect("active sessions retain their accounting entry");
-        ensure!(now >= record.cooldown, "temporary network cooldown");
+        ensure!(
+            self.worker.load(Ordering::Relaxed) || now >= record.cooldown,
+            "temporary network cooldown"
+        );
         let p = self.guard.policy(self.key.1);
         if !record
             .requests
@@ -644,6 +747,181 @@ impl Drop for PeerSlot {
                 counts.groups.remove(&group);
             }
         }
+    }
+}
+
+struct PendingSource {
+    active: usize,
+    budget: Bucket,
+}
+#[derive(Default)]
+struct PendingCounts {
+    general: usize,
+    reserved: usize,
+    groups: HashMap<IpAddr, usize>,
+    sources: HashMap<IpAddr, PendingSource>,
+    trusted: HashMap<IpAddr, u64>,
+    sequence: u64,
+}
+/// Stratum connections awaiting authorization. A source that has not recently
+/// authorized pays for the time it holds a slot, and its public group has a
+/// concurrency cap. Addresses that recently authorized are not charged and
+/// keep reserved slots while the general slots are full.
+#[derive(Default)]
+pub struct StratumPending {
+    counts: Mutex<PendingCounts>,
+}
+pub struct PendingSlot {
+    pending: Arc<StratumPending>,
+    address: IpAddr,
+    group: Option<IpAddr>,
+    reserved: bool,
+    charged: bool,
+    started: Instant,
+    released: bool,
+}
+impl StratumPending {
+    pub fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<PendingSlot> {
+        self.try_acquire_at(ip, Instant::now())
+    }
+    fn try_acquire_at(self: &Arc<Self>, ip: IpAddr, now: Instant) -> Option<PendingSlot> {
+        let address = admission_address(ip);
+        let mut counts = accounting(&self.counts);
+        let counts = &mut *counts;
+        let slot = |group, reserved, charged| PendingSlot {
+            pending: self.clone(),
+            address,
+            group,
+            reserved,
+            charged,
+            started: now,
+            released: false,
+        };
+        if counts.trusted.contains_key(&address) {
+            let reserved = if counts.general < STRATUM_PENDING_SLOTS {
+                false
+            } else if counts.reserved < RESERVED_STRATUM_PENDING {
+                true
+            } else {
+                return None;
+            };
+            if reserved {
+                counts.reserved += 1;
+            } else {
+                counts.general += 1;
+            }
+            return Some(slot(None, reserved, false));
+        }
+        let group = pending_group(address);
+        if counts.general >= STRATUM_PENDING_SLOTS
+            || group.is_some_and(|g| {
+                counts.groups.get(&g).copied().unwrap_or(0) >= STRATUM_PENDING_PER_GROUP
+            })
+        {
+            return None;
+        }
+        if !counts.sources.contains_key(&address) {
+            if counts.sources.len() >= MAX_TRACKED_IPS {
+                // Forget the idle source with the most budget left, so new
+                // records do not cheaply erase the charge of a recent one.
+                let fullest = counts
+                    .sources
+                    .iter()
+                    .filter(|(_, source)| source.active == 0)
+                    .max_by_key(|(_, source)| {
+                        source
+                            .budget
+                            .level(PENDING_REFILL_MS, PENDING_BUDGET_MS, now)
+                    })
+                    .map(|(address, _)| *address)?;
+                counts.sources.remove(&fullest);
+            }
+            counts.sources.insert(
+                address,
+                PendingSource {
+                    active: 0,
+                    budget: Bucket::new(PENDING_BUDGET_MS, now),
+                },
+            );
+        }
+        let source = counts.sources.get_mut(&address)?;
+        if !source
+            .budget
+            .take(PENDING_WINDOW_MS, PENDING_REFILL_MS, PENDING_BUDGET_MS, now)
+        {
+            return None;
+        }
+        source.active += 1;
+        counts.general += 1;
+        if let Some(group) = group {
+            *counts.groups.entry(group).or_default() += 1;
+        }
+        Some(slot(group, false, true))
+    }
+}
+impl PendingSlot {
+    /// The session authorized. Its address may later wait uncharged and use
+    /// reserved slots, and dropping this slot releases it.
+    pub fn authorized(self) {
+        let mut counts = accounting(&self.pending.counts);
+        let counts = &mut *counts;
+        if counts.trusted.len() >= STRATUM_TRUSTED_ADDRESSES
+            && !counts.trusted.contains_key(&self.address)
+            && let Some(oldest) = counts
+                .trusted
+                .iter()
+                .min_by_key(|(_, sequence)| **sequence)
+                .map(|(address, _)| *address)
+        {
+            counts.trusted.remove(&oldest);
+        }
+        counts.sequence += 1;
+        counts.trusted.insert(self.address, counts.sequence);
+    }
+    #[cfg(test)]
+    fn close_at(mut self, now: Instant) {
+        self.release(now);
+    }
+    /// Release the slot and charge the time it was held to its source.
+    fn release(&mut self, now: Instant) {
+        if std::mem::replace(&mut self.released, true) {
+            return;
+        }
+        let mut counts = accounting(&self.pending.counts);
+        let counts = &mut *counts;
+        if self.reserved {
+            counts.reserved = counts.reserved.saturating_sub(1);
+        } else {
+            counts.general = counts.general.saturating_sub(1);
+        }
+        if let Some(group) = self.group
+            && let Some(count) = counts.groups.get_mut(&group)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.groups.remove(&group);
+            }
+        }
+        if self.charged
+            && let Some(source) = counts.sources.get_mut(&self.address)
+        {
+            source.active = source.active.saturating_sub(1);
+            let held = now
+                .duration_since(self.started)
+                .as_millis()
+                .min(PENDING_WINDOW_MS as u128) as u64;
+            source.budget.give(
+                PENDING_WINDOW_MS - held,
+                PENDING_REFILL_MS,
+                PENDING_BUDGET_MS,
+                now,
+            );
+        }
+    }
+}
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        self.release(Instant::now());
     }
 }
 
@@ -1346,6 +1624,129 @@ mod tests {
         drop(slot);
         assert!(slots.try_acquire(ip, PeerClass::General).is_some());
         assert_eq!(accounting(&slots.counts).general, 0);
+    }
+    #[test]
+    fn pending_stratum_sources_pay_for_waiting_however_they_close() {
+        let pending = Arc::new(StratumPending::default());
+        let now = Instant::now();
+        let ip: IpAddr = "8.1.1.1".parse().unwrap();
+        // A fresh source may wait in four slots at once.
+        let held: Vec<_> = (0..4)
+            .map(|_| pending.try_acquire_at(ip, now).unwrap())
+            .collect();
+        assert!(pending.try_acquire_at(ip, now).is_none());
+        // Closing cleanly just before the window ends costs nearly the whole
+        // window, so rotating sockets cannot hold slots for free.
+        let closed = now + Duration::from_millis(9_900);
+        for slot in held {
+            slot.close_at(closed);
+        }
+        assert!(pending.try_acquire_at(ip, closed).is_none());
+        let refilled = now + Duration::from_secs(20);
+        let one = pending.try_acquire_at(ip, refilled).unwrap();
+        assert!(pending.try_acquire_at(ip, refilled).is_none());
+        one.close_at(refilled);
+        // Prompt authorizations cost only their short wait.
+        let honest: IpAddr = "8.1.2.1".parse().unwrap();
+        for attempt in 0..16u64 {
+            let start = now + Duration::from_millis(200 * attempt);
+            pending
+                .try_acquire_at(honest, start)
+                .unwrap()
+                .close_at(start + Duration::from_millis(200));
+        }
+        let later = now + Duration::from_millis(3_200);
+        let concurrent: Vec<_> = (0..3)
+            .map(|_| pending.try_acquire_at(honest, later).unwrap())
+            .collect();
+        for slot in concurrent {
+            slot.close_at(later);
+        }
+        let counts = pending.counts.lock().unwrap();
+        assert_eq!((counts.general, counts.reserved), (0, 0));
+        assert!(counts.groups.is_empty());
+    }
+    #[test]
+    fn pending_stratum_groups_are_capped_and_recent_workers_keep_reserved_slots() {
+        let pending = Arc::new(StratumPending::default());
+        let now = Instant::now();
+        let v4 = |c: u8, d: u8| IpAddr::from([8, 1, c, d]);
+        // An operator's address authorizes once while capacity is available.
+        let worker = v4(200, 1);
+        pending.try_acquire_at(worker, now).unwrap().authorized();
+        // Four addresses in one public /24 share eight slots.
+        let mut held = Vec::new();
+        for host in 1..=4 {
+            for _ in 0..4 {
+                held.extend(pending.try_acquire_at(v4(1, host), now));
+            }
+        }
+        assert_eq!(held.len(), STRATUM_PENDING_PER_GROUP);
+        // Fresh /64s inside one public /48 share them too.
+        let v6 = |n: u16| IpAddr::from([0x2001, 0x4860, 7, n, 0, 0, 0, 1]);
+        let mut prefixes = Vec::new();
+        for n in 1..=12 {
+            prefixes.extend(pending.try_acquire_at(v6(n), now));
+        }
+        assert_eq!(prefixes.len(), STRATUM_PENDING_PER_GROUP);
+        held.extend(prefixes);
+        // Filling the general slots takes sixteen distinct groups.
+        for group in 2..=15 {
+            for host in 1..=2 {
+                for _ in 0..4 {
+                    held.push(pending.try_acquire_at(v4(group, host), now).unwrap());
+                }
+            }
+        }
+        assert_eq!(held.len(), STRATUM_PENDING_SLOTS);
+        assert!(pending.try_acquire_at(v4(99, 1), now).is_none());
+        // The address that authorized still connects, uncharged and outside
+        // the group cap, through the reserved slots.
+        let reserved: Vec<_> = (0..RESERVED_STRATUM_PENDING)
+            .map(|_| pending.try_acquire_at(worker, now).unwrap())
+            .collect();
+        assert!(pending.try_acquire_at(worker, now).is_none());
+        held.pop().unwrap().close_at(now);
+        assert!(pending.try_acquire_at(v4(99, 1), now).is_some());
+        drop((held, reserved));
+        let counts = pending.counts.lock().unwrap();
+        assert_eq!((counts.general, counts.reserved), (0, 0));
+        assert!(counts.groups.is_empty());
+        assert!(counts.sources.values().all(|source| source.active == 0));
+    }
+    #[test]
+    fn authorized_workers_outlast_address_cooldowns_and_throttle_past_their_rate() {
+        let guard = Arc::new(NetworkGuard::default());
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let worker = guard.admit(ip, Surface::Stratum).unwrap();
+        worker.authorize_worker();
+        let other = guard.admit(ip, Surface::Stratum).unwrap();
+        other.malformed();
+        // A cooldown from another session at the address refuses new
+        // connections and unauthenticated requests, not the worker.
+        assert!(guard.admit(ip, Surface::Stratum).is_err());
+        assert!(other.request().is_err());
+        assert!(worker.worker_line(100).unwrap());
+        assert!(worker.work(1).is_ok());
+        // Past its session rate a worker is throttled rather than refused
+        // until its overrun allowance runs out.
+        let (mut within, mut throttled) = (1, 0);
+        let error = loop {
+            match worker.worker_line(100) {
+                Ok(true) => within += 1,
+                Ok(false) => throttled += 1,
+                Err(error) => break error,
+            }
+        };
+        assert!(error.to_string().contains("session request rate limit"));
+        assert!((16..=18).contains(&within), "{within}");
+        assert!((64..=67).contains(&throttled), "{throttled}");
+        // Throttled lines spend no address request units and the overrun
+        // never penalizes the address.
+        let records = guard.records.lock().unwrap();
+        let record = &records[&(ip, Surface::Stratum, Direction::Inbound)];
+        assert!(record.requests.tokens >= 64 - 2 - within as u64);
+        assert_eq!(record.strikes, 1);
     }
     #[test]
     fn json_preflight_rejects_excess_shape_before_decoding() {

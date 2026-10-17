@@ -38,6 +38,9 @@ fn options() -> ServerOptions {
     }
 }
 async fn isolated() -> (TempDir, Config, Node, Server) {
+    isolated_with_bits(0x1f7fffff).await
+}
+async fn isolated_with_bits(bits: u32) -> (TempDir, Config, Node, Server) {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::devnet();
     config.genesis_time = SystemTime::now()
@@ -45,7 +48,7 @@ async fn isolated() -> (TempDir, Config, Node, Server) {
         .unwrap()
         .as_secs() as u32
         - 1;
-    config.initial_bits = 0x1f7fffff;
+    config.initial_bits = bits;
     let node = Node::open(
         &dir.path().join("node.sqlite"),
         config.clone(),
@@ -74,6 +77,24 @@ fn line(value: &Value) -> Vec<u8> {
     let mut bytes = serde_json::to_vec(value).unwrap();
     bytes.push(b'\n');
     bytes
+}
+/// An unauthenticated socket that subscribed, if the node kept it waiting for
+/// authorization. A refused socket is closed at once without a reply.
+async fn pending_socket(address: SocketAddr, host: u8) -> Option<TcpStream> {
+    let mut stream = connect(address, host).await;
+    let _ = stream
+        .write_all(&line(
+            &json!({"id":1,"method":"mining.subscribe","params":[]}),
+        ))
+        .await;
+    let mut reply = [0u8; 1024];
+    match timeout(DEADLINE, stream.read(&mut reply))
+        .await
+        .expect("waiting socket was neither answered nor closed")
+    {
+        Ok(size) if size > 0 => Some(stream),
+        _ => None,
+    }
 }
 struct Worker {
     read: BufReader<OwnedReadHalf>,
@@ -645,24 +666,24 @@ async fn full_mining_socket_budget_preserves_existing_workers_and_reclaims_capac
     let b_job = bob.authorize().await;
     let mut held = Vec::new();
     for index in 0..node::MAX_CONNECTIONS {
-        // Sixteen slots per source IP. Unauthenticated sockets equal to the
-        // whole authorized worker capacity must not lock out a new miner.
-        let mut stream = connect(server.stratum, 50 + (index / 16) as u8).await;
+        // A source waits in at most four slots. Unauthenticated sockets equal
+        // to the whole authorized worker capacity must not lock out a new miner.
+        let mut stream = connect(server.stratum, 50 + (index / 4) as u8).await;
         stream.write_all(b"{").await.unwrap();
         held.push(stream);
     }
     let mut carol = Worker::connect(server.stratum, 10).await;
     let c_job = carol.authorize().await;
     for index in 0..node::MAX_CONNECTIONS {
-        // The separate pre-authorization pool holds twice the worker capacity.
-        let mut stream = connect(server.stratum, 54 + (index / 16) as u8).await;
+        // The general pre-authorization slots hold twice the worker capacity.
+        let mut stream = connect(server.stratum, 66 + (index / 4) as u8).await;
         stream.write_all(b"{").await.unwrap();
         held.push(stream);
     }
     assert!(
         hostile_exchange(
             server.stratum,
-            58,
+            82,
             line(&json!({
                 "id":1,"method":"mining.subscribe","params":[]
             }))
@@ -671,6 +692,12 @@ async fn full_mining_socket_budget_preserves_existing_workers_and_reclaims_capac
             == 0,
         "mining connection limit was not enforced"
     );
+    // An address that has authorized keeps reserved slots, so the operator's
+    // miners can still reconnect while the general slots are full.
+    let mut again = Worker::connect(server.stratum, 8).await;
+    let d_job = again.authorize().await;
+    let share = reporting_share(&d_job, &again, [8; 4]);
+    assert_eq!(again.submit(&d_job, &share, [8; 4]).await["result"], true);
     for index in 0..5u32 {
         let extra = (index + 300).to_le_bytes();
         let a_share = reporting_share(&a_job, &alice, extra);
@@ -690,16 +717,16 @@ async fn full_mining_socket_budget_preserves_existing_workers_and_reclaims_capac
     // Let the accept loop observe closure of the deliberately incomplete frames.
     // Their source addresses retain penalties; an unrelated worker can reconnect.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let mut fresh = Worker::connect(server.stratum, 59).await;
+    let mut fresh = Worker::connect(server.stratum, 83).await;
     let job = fresh.authorize().await;
     let share = reporting_share(&job, &fresh, [66; 4]);
     assert_eq!(fresh.submit(&job, &share, [66; 4]).await["result"], true);
     assert_snapshot(&server, &before).await;
     let mining = node.rpc("mining", json!({})).unwrap();
-    assert_eq!(mining["workers_connected"], 4);
-    assert_eq!(mining["accepted_shares"], "16");
+    assert_eq!(mining["workers_connected"], 5);
+    assert_eq!(mining["accepted_shares"], "17");
     eprintln!(
-        "128 hostile partial connections filled the pre-authorization pool; three miners and RPC remained live; capacity recovered"
+        "128 hostile partial connections from 32 sources filled the general pre-authorization slots; a known address reconnected; miners and RPC remained live; capacity recovered"
     );
     server.stop().await;
 }
@@ -851,7 +878,7 @@ async fn same_parent_template_churn_neither_flushes_nor_evicts_inflight_jobs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unauthorized_mining_sockets_expire_quickly_and_cool_down_their_address() {
+async fn unauthorized_mining_sockets_expire_quickly_and_charge_their_address() {
     let (_dir, _config, node, server) = isolated().await;
     let before = node.status().unwrap();
     let started = Instant::now();
@@ -877,17 +904,11 @@ async fn unauthorized_mining_sockets_expire_quickly_and_cool_down_their_address(
         assert!(!reply.is_empty(), "subscribe was not answered");
     }
     assert!(started.elapsed() >= Duration::from_secs(9));
-    // Letting authorization lapse is penalized, so idle sockets cannot hold
-    // connection slots by reconnecting at no cost.
-    assert_eq!(
-        hostile_exchange(
-            server.stratum,
-            70,
-            line(&json!({"id":1,"method":"mining.subscribe","params":[]}))
-        )
-        .await,
-        0,
-        "expired address was not cooled down"
+    // Every expired socket spent a whole window of its address's waiting
+    // budget, so idle sockets cannot hold slots by reconnecting at no cost.
+    assert!(
+        pending_socket(server.stratum, 70).await.is_none(),
+        "expired address was not charged for its wait"
     );
     let mut honest = Worker::connect(server.stratum, 71).await;
     let job = honest.authorize().await;
@@ -904,7 +925,7 @@ async fn worker_capacity_is_enforced_at_registration_without_penalty() {
     let mut tasks = tokio::task::JoinSet::new();
     for index in 0..node::MAX_CONNECTIONS {
         tasks.spawn(async move {
-            let mut worker = Worker::connect(address, 80 + (index / 16) as u8).await;
+            let mut worker = Worker::connect(address, 80 + (index / 4) as u8).await;
             worker.authorize().await;
             worker
         });
@@ -919,7 +940,7 @@ async fn worker_capacity_is_enforced_at_registration_without_penalty() {
     );
     // Pending connections have their own pool, so a full registry is reported
     // at authorization. The session never becomes an unregistered worker.
-    let mut extra = Worker::connect(address, 90).await;
+    let mut extra = Worker::connect(address, 96).await;
     let reply = extra.call("mining.subscribe", json!(["capacity/1"])).await;
     assert!(reply["error"].is_null(), "{reply}");
     let name = extra.name.clone();
@@ -942,10 +963,10 @@ async fn worker_capacity_is_enforced_at_registration_without_penalty() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     // Capacity is not misbehaviour: the same address may retry at once.
-    let mut retry = Worker::connect(address, 90).await;
+    let mut retry = Worker::connect(address, 96).await;
     let job = retry.authorize().await;
-    let share = reporting_share(&job, &retry, [90; 4]);
-    assert_eq!(retry.submit(&job, &share, [90; 4]).await["result"], true);
+    let share = reporting_share(&job, &retry, [96; 4]);
+    assert_eq!(retry.submit(&job, &share, [96; 4]).await["result"], true);
     assert_eq!(
         node.rpc("mining", json!({})).unwrap()["workers_connected"],
         node::MAX_CONNECTIONS
@@ -955,28 +976,132 @@ async fn worker_capacity_is_enforced_at_registration_without_penalty() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fast_reporting_streams_raise_their_own_difficulty_instead_of_disconnecting() {
-    let (_dir, _config, node, server) = isolated().await;
+    // Network difficulty well above the floor, so raised reporting
+    // difficulty is not capped at block difficulty.
+    let (_dir, _config, node, server) = isolated_with_bits(0x1e7fffff).await;
     let mut worker = Worker::connect(server.stratum, 42).await;
     let job = worker.authorize().await;
-    for index in 0..16u32 {
+    // A miner far above the session rate sends its shares without waiting
+    // for replies, as an ASIC with too low a difficulty would.
+    const SHARES: u32 = 48;
+    let mut burst = Vec::new();
+    for index in 0..SHARES {
         let extra = (index + 400).to_le_bytes();
         let share = reporting_share(&job, &worker, extra);
-        assert_eq!(worker.submit(&job, &share, extra).await["result"], true);
+        worker.id += 1;
+        burst.extend(line(&json!({
+            "id":worker.id,"method":"mining.submit","params":worker.submission(&job, &share, extra)
+        })));
     }
-    let raised = worker.job().await;
-    assert_eq!(raised["params"][1], job["params"][1]);
-    assert_eq!(raised["params"][8], false);
+    worker.write.write_all(&burst).await.unwrap();
+    let (mut accepted, mut limited, mut replies) = (0, 0, 0);
+    let mut raised = FLOOR;
+    while replies < SHARES {
+        let message = worker.read().await;
+        if message["method"] == "mining.set_difficulty" {
+            raised = raised.max(message["params"][0].as_f64().unwrap());
+            continue;
+        }
+        if message["method"] == "mining.notify" {
+            worker.notices.push_back(message);
+            continue;
+        }
+        replies += 1;
+        if message["result"] == true {
+            accepted += 1;
+        } else {
+            // Past the session rate a share is refused, not disconnected.
+            assert_eq!(message["error"][0], 20, "{message}");
+            assert!(
+                message["error"][1].as_str().unwrap().contains("rate limit"),
+                "{message}"
+            );
+            limited += 1;
+        }
+    }
+    assert!(limited > 0, "the burst never exceeded the session rate");
+    // One measurement raised difficulty by a power of two at once. The wire
+    // value is compared after rounding, since JSON float parsing may differ
+    // from the exact value by one unit in the last place.
+    let factor = (raised / FLOOR).round();
+    assert!(factor >= 8.0 && factor.log2().fract() == 0.0, "{factor}");
+    let notices = std::mem::take(&mut worker.notices);
+    let current = notices
+        .iter()
+        .rev()
+        .find(|message| message["method"] == "mining.notify")
+        .expect("raised difficulty arrived without a job")
+        .clone();
+    assert_eq!(current["params"][1], job["params"][1]);
+    assert_eq!(current["params"][8], false);
     assert_eq!(
         node.rpc("mining", json!({})).unwrap()["workers"][0]["share_difficulty"],
-        FLOOR * 2.0
+        FLOOR * factor
     );
-    // Work already assigned keeps its original difficulty.
-    let extra = 416u32.to_le_bytes();
+    // Once its session budget refills, the same connection mines the raised
+    // job, and work already assigned keeps its original difficulty.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let header = header(&current, &worker.extra, [42; 4]);
+    let block = math::target_from_bits(header.bits).unwrap();
+    let hard = math::target_from_bits(0x1d00ffff).unwrap() * ((1e8 / factor) as u64 - 1);
+    let share = solve(header, |hash| hash <= &hard && hash > &block);
+    assert_eq!(
+        worker.submit(&current, &share, [42; 4]).await["result"],
+        true
+    );
+    let extra = 999u32.to_le_bytes();
     let share = reporting_share(&job, &worker, extra);
     assert_eq!(worker.submit(&job, &share, extra).await["result"], true);
     assert_eq!(
         node.rpc("mining", json!({})).unwrap()["accepted_shares"],
-        "17"
+        (accepted + 2).to_string()
     );
+    eprintln!(
+        "{SHARES} pipelined shares: {accepted} accepted, {limited} refused past the session rate, difficulty raised x{factor}, connection kept"
+    );
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rotating_clean_closing_sockets_cannot_hold_the_pre_authorization_slots() {
+    let (_dir, _config, node, server) = isolated().await;
+    let before = node.status().unwrap();
+    // Eight addresses try to keep sixteen sockets each waiting. Each socket
+    // subscribes, never authorizes and closes cleanly just before the
+    // authorization window would expire it, ready to reconnect.
+    let mut held = Vec::new();
+    for index in 0..128usize {
+        let opened = Instant::now();
+        if let Some(stream) = pending_socket(server.stratum, 140 + (index / 16) as u8).await {
+            held.push((opened, stream));
+        }
+    }
+    assert_eq!(held.len(), 32, "a source waited in more than four slots");
+    // An honest miner from another address still connects and mines.
+    let mut honest = Worker::connect(server.stratum, 150).await;
+    let job = honest.authorize().await;
+    let share = reporting_share(&job, &honest, [150; 4]);
+    assert_eq!(honest.submit(&job, &share, [150; 4]).await["result"], true);
+    for (opened, mut stream) in held {
+        tokio::time::sleep_until((opened + Duration::from_millis(9_700)).into()).await;
+        let _ = stream.shutdown().await;
+    }
+    // The clean closes still paid for the time waited, so the same sources
+    // cannot take the slots again at once.
+    let mut reopened = 0;
+    for index in 0..128usize {
+        if pending_socket(server.stratum, 140 + (index / 16) as u8)
+            .await
+            .is_some()
+        {
+            reopened += 1;
+        }
+    }
+    assert_eq!(reopened, 0, "rotating before the window avoided its cost");
+    let mut later = Worker::connect(server.stratum, 151).await;
+    let job = later.authorize().await;
+    let share = reporting_share(&job, &later, [151; 4]);
+    assert_eq!(later.submit(&job, &share, [151; 4]).await["result"], true);
+    assert_snapshot(&server, &before).await;
     server.stop().await;
 }

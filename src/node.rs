@@ -7,7 +7,9 @@ use crate::{
     crypto,
     explorer::Explorer,
     fees, math,
-    network_guard::{self, NetworkGuard, PeerClass, PeerSlots, Session, Surface},
+    network_guard::{
+        self, NetworkGuard, PeerClass, PeerSlots, Session, StratumPending, Surface,
+    },
     peer_auth::{Channel as PeerChannel, Policy as PeerPolicy},
     peer_discovery::{self, AddressBook, Options as DiscoveryOptions},
     peer_wire::{self, Message as PeerPacket, Sync as PeerMessage},
@@ -1003,6 +1005,7 @@ pub struct Node {
     mining: Arc<Mutex<MiningRuntime>>,
     work_updates: watch::Sender<u64>,
     mining_session_ids: Arc<Mutex<SessionIds>>,
+    stratum_pending: Arc<StratumPending>,
     listener_health: Arc<Mutex<HashMap<&'static str, ListenerHealth>>>,
     peer_auth: Option<Arc<PeerPolicy>>,
     peer_health: Arc<Mutex<HashMap<SocketAddr, PeerHealth>>>,
@@ -1041,7 +1044,8 @@ struct SessionId(Arc<Mutex<SessionIds>>, u32);
 impl SessionIds {
     fn allocate(ids: &Arc<Mutex<Self>>) -> Option<SessionId> {
         let mut state = ids.unpoisoned();
-        // Live IDs are bounded by the listener's connection limit.
+        // Live IDs are bounded by the pre-authorization slots plus the
+        // worker registry, since a session leaves the first only to enter it.
         loop {
             let id = state.next;
             state.next = state.next.wrapping_add(1);
@@ -1142,6 +1146,7 @@ impl Node {
             mining: Arc::new(Mutex::new(MiningRuntime::default())),
             work_updates: watch::channel(0).0,
             mining_session_ids: Arc::new(Mutex::new(SessionIds::default())),
+            stratum_pending: Arc::new(StratumPending::default()),
             listener_health: Arc::new(Mutex::new(HashMap::new())),
             peer_auth: None,
             peer_health: Arc::new(Mutex::new(HashMap::new())),
@@ -3031,11 +3036,7 @@ impl Node {
         {
             stratum.remove("bind_address");
             stratum.remove("loopback_only");
-            let advertised = self
-                .mining
-                .lock()
-                .map_err(|_| anyhow!("mining statistics lock poisoned"))?
-                .advertised;
+            let advertised = self.mining.unpoisoned().advertised;
             if !advertised {
                 stratum.insert("connect_url".into(), Value::Null);
             }
@@ -3945,13 +3946,7 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
         let password = options.stratum_password.clone();
         let share_difficulty = options.stratum_share_difficulty;
         let mut shutdown = rx.clone();
-        // A Stratum connection holds its slot only until authorization, so
-        // unauthenticated sockets cannot occupy the authorized worker capacity.
-        let limit = Arc::new(Semaphore::new(if kind == 2 {
-            MAX_STRATUM_PENDING
-        } else {
-            MAX_CONNECTIONS
-        }));
+        let limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let http = if kind == 3 {
             public_http.clone()
         } else {
@@ -3976,10 +3971,16 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
                         }
                     };
                     if kind == 1 && n.peer_auth.as_ref().is_some_and(|p| !p.allows_ip(address.ip())) { drop(stream); continue; }
-                    let Ok(permit) = limit.clone().try_acquire_owned() else { drop(stream); continue };
+                    // A Stratum connection's capacity is its pre-authorization slot, which it
+                    // holds only until authorization; authorized workers are bounded by the
+                    // worker registry, so unauthenticated sockets cannot occupy their capacity.
+                    let permit = if kind == 2 { None } else {
+                        let Ok(permit) = limit.clone().try_acquire_owned() else { drop(stream); continue };
+                        Some(permit)
+                    };
                     let surface=match kind {0|3=>Surface::Rpc,1=>Surface::Peer,_=>Surface::Stratum};
                     let guard = if kind == 0 || kind == 3 { &http.guard } else { &n.guard };
-                    let (admission, capacity) = if kind == 1 {
+                    let (admission, capacity, pending) = if kind == 1 {
                         // Rate limits and cooldowns apply before slot selection, so a
                         // connection flood spends its own request budget.
                         let Ok(admission)=guard.admit(address.ip(),surface) else {drop(stream);continue};
@@ -3987,24 +3988,25 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
                         let Some(slot) = n.peer_sessions.try_acquire(address.ip(), class) else { drop(stream); continue };
                         // Configured and pinned peers keep a share of frame memory too.
                         let admission = if class == PeerClass::Operator { admission.operator() } else { admission };
-                        (admission, SessionCapacity::Peer(slot))
-                    } else {
-                        let capacity = if kind == 2 {
-                            // Only mining sessions use an extranonce.
-                            let Some(id) = SessionIds::allocate(&n.mining_session_ids) else { drop(stream); continue };
-                            SessionCapacity::Mining(id)
-                        } else {
-                            let Ok(permit) = http.sessions.clone().try_acquire_owned() else { drop(stream); continue };
-                            SessionCapacity::Http(permit)
-                        };
+                        (admission, SessionCapacity::Peer(slot), None)
+                    } else if kind == 2 {
+                        // As for peers, an attempt refused for want of a slot still
+                        // spends its address's request budget and respects its cooldown.
                         let Ok(admission)=guard.admit(address.ip(),surface) else {drop(stream);continue};
-                        (admission, capacity)
+                        let Some(slot) = n.stratum_pending.try_acquire(address.ip()) else { drop(stream); continue };
+                        // Only mining sessions use an extranonce.
+                        let Some(id) = SessionIds::allocate(&n.mining_session_ids) else { drop(stream); continue };
+                        (admission, SessionCapacity::Mining(id), Some(slot))
+                    } else {
+                        let Ok(permit) = http.sessions.clone().try_acquire_owned() else { drop(stream); continue };
+                        let Ok(admission)=guard.admit(address.ip(),surface) else {drop(stream);continue};
+                        (admission, SessionCapacity::Http(permit), None)
                     };
                     let extranonce = match &capacity { SessionCapacity::Mining(id) => id.1, _ => 0 };
                     let node = n.clone(); let password = password.clone(); let http=http.clone();
-                    clients.spawn(async move { let mut permit = Some(permit); let _capacity = capacity; let _ = stream.set_nodelay(true);
+                    clients.spawn(async move { let _permit = permit; let _capacity = capacity; let _ = stream.set_nodelay(true);
                         let reporter = node.clone();
-                        let result = match kind { 0|3 => http_session(node, stream, http, admission).await, 1 => peer_session(node, stream, admission).await, _ => stratum_session(node, stream, password, share_difficulty, extranonce.to_le_bytes(), admission, permit.take()).await };
+                        let result = match kind { 0|3 => http_session(node, stream, http, admission).await, 1 => peer_session(node, stream, admission).await, _ => stratum_session(node, stream, password, share_difficulty, extranonce.to_le_bytes(), admission, pending).await };
                         // Peer data is untrusted; individual failures close only that connection.
                         // Only P2P failures enter the peer diagnostics ring, so web and
                         // mining clients cannot push synchronization errors out of it.
@@ -6778,13 +6780,21 @@ const MAX_STRATUM_JOBS: usize = 8;
 /// Same-parent template changes reach a connection at most once per interval,
 /// so a retained job survives at least MAX_STRATUM_JOBS intervals of churn.
 const STRATUM_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
-/// Connections awaiting authorization. Authorized workers leave this pool and
-/// are bounded separately by the MAX_CONNECTIONS worker registry.
-const MAX_STRATUM_PENDING: usize = 2 * MAX_CONNECTIONS;
-const STRATUM_AUTHORIZATION_WINDOW: Duration = Duration::from_secs(10);
-/// Accepted reporting shares per window that double a connection's difficulty.
-const STRATUM_WINDOW_SHARES: u32 = 16;
+/// Connections awaiting authorization hold network_guard pre-authorization
+/// slots. Authorized workers leave them for the MAX_CONNECTIONS worker registry.
+const STRATUM_AUTHORIZATION_WINDOW: Duration = network_guard::STRATUM_AUTHORIZATION_WINDOW;
+/// A connection whose reporting shares at its current difficulty exceed
+/// STRATUM_MAX_SHARE_RATE per second over at least STRATUM_RATE_SAMPLE
+/// intervals has its difficulty multiplied by the power of two that brings
+/// the observed rate to STRATUM_TARGET_SHARE_RATE.
+const STRATUM_MAX_SHARE_RATE: u64 = 2;
+const STRATUM_TARGET_SHARE_RATE: u64 = 1;
+const STRATUM_RATE_SAMPLE: u64 = 4;
+/// The shortest span a rate is measured over, so shares buffered together
+/// cannot imply an unbounded rate, and the age at which a sample restarts.
+const STRATUM_RATE_FLOOR: Duration = Duration::from_millis(250);
 const STRATUM_SHARE_WINDOW: Duration = Duration::from_secs(8);
+const STRATUM_RATE_LIMITED: &str = "mining session request rate limit";
 async fn new_job<W: AsyncWrite + Unpin>(
     node: &Node,
     write: &mut W,
@@ -6847,6 +6857,38 @@ async fn template_async(node: &Node) -> Result<Arc<Block>> {
 fn stratum_session_expired(authorized: bool, connected: Duration) -> bool {
     !authorized && connected >= STRATUM_AUTHORIZATION_WINDOW
 }
+/// Power-of-two difficulty multiplier for `intervals` share intervals observed
+/// over `elapsed`, or None while the rate is acceptable.
+fn stratum_rate_factor(intervals: u64, elapsed: Duration) -> Option<f64> {
+    let millis = elapsed
+        .max(STRATUM_RATE_FLOOR)
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let shares = intervals.saturating_mul(1000);
+    if intervals < STRATUM_RATE_SAMPLE || shares <= STRATUM_MAX_SHARE_RATE.saturating_mul(millis) {
+        return None;
+    }
+    let needed = shares.div_ceil(STRATUM_TARGET_SHARE_RATE.saturating_mul(millis));
+    Some(needed.checked_next_power_of_two().unwrap_or(1 << 63) as f64)
+}
+/// An authorized worker's line may carry a solved block, so it waits for a
+/// parser without a deadline. The parser semaphore is never closed.
+async fn parse_worker_line(node: &Node, bytes: Vec<u8>) -> Result<Value> {
+    let permit = node.stratum_parsers.clone().acquire_owned().await?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        network_guard::parse_json(&bytes)
+    })
+    .await
+    .context("JSON worker failed")?
+}
+/// The reply to a line an authorized worker sent past its rate or budget.
+fn stratum_restricted(limit: &Option<anyhow::Error>) -> anyhow::Error {
+    limit.as_ref().map_or_else(
+        || mining_error(20, STRATUM_RATE_LIMITED),
+        |error| anyhow!("{error}"),
+    )
+}
 fn disconnected_between_frames(error: &anyhow::Error, partial: &[u8]) -> bool {
     partial.is_empty()
         && error.downcast_ref::<std::io::Error>().is_some_and(|error| {
@@ -6867,7 +6909,7 @@ async fn stratum_session(
     floor: f64,
     extra: [u8; 4],
     admission: Session,
-    mut pending: Option<tokio::sync::OwnedSemaphorePermit>,
+    mut pending: Option<network_guard::PendingSlot>,
 ) -> Result<()> {
     let admission = Arc::new(admission);
     let (read, mut write) = stream.into_split();
@@ -6886,8 +6928,7 @@ async fn stratum_session(
     let mut counter = 0;
     let mut fingerprint: Option<(Hash, Hash)> = None;
     let mut deferred = false;
-    let mut window_started = tokio::time::Instant::now();
-    let mut window_shares = 0u32;
+    let mut share_window: Option<(tokio::time::Instant, u64)> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut updates = node.work_updates.subscribe();
     let connected = tokio::time::Instant::now();
@@ -6902,12 +6943,24 @@ async fn stratum_session(
                     Err(e) if disconnected_between_frames(&e, &partial_line) => return Ok(()),
                     Err(e) => { admission.malformed(); return Err(e); }
                 };
-                admission.request()?;
-                admission.bytes(line.len())?;
-                let request = match parse_value_async(&node,line,Surface::Stratum,JsonBody::Ordinary).await { Ok(v) => v, Err(e) => { admission.malformed(); return Err(e); } };
-                // An expired, never-authorized connection penalizes its address,
-                // so idle sockets cannot hold connection slots at no cost.
-                if stratum_session_expired(authorized,connected.elapsed()) { admission.malformed(); bail!("mining authorization timed out"); }
+                // An unauthenticated line is charged before it is parsed. An authorized
+                // worker's line is handled first and its charge enforced after the reply,
+                // so an address budget or rate overrun never discards a solved block.
+                // Past its rate or budget, a worker's line can only submit a block.
+                let mut limit = None;
+                let mut throttled = false;
+                if authorized {
+                    match admission.worker_line(line.len()) { Ok(within) => throttled = !within, Err(e) => limit = Some(e) }
+                } else {
+                    admission.request()?;
+                    admission.bytes(line.len())?;
+                }
+                let restricted = throttled || limit.is_some();
+                let parsed = if authorized { parse_worker_line(&node,line).await } else { parse_value_async(&node,line,Surface::Stratum,JsonBody::Ordinary).await };
+                let request = match parsed { Ok(v) => v, Err(e) => { admission.malformed(); return Err(e); } };
+                // The time a never-authorized connection waited is charged to its
+                // address when its pre-authorization slot is released, however it ends.
+                if stratum_session_expired(authorized,connected.elapsed()) { bail!("mining authorization timed out"); }
                 partial_since = None;
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
                 let method = request.get("method").and_then(Value::as_str).unwrap_or("");
@@ -6916,7 +6969,9 @@ async fn stratum_session(
                 let mut refresh = false;
                 let mut at_capacity = false;
                 let mut budget = None;
+                let mut retarget = false;
                 let mut result: Result<Value> = (|| {
+                    if restricted && method != "mining.submit" { return Err(stratum_restricted(&limit)); }
                     match method {
                         "mining.configure" => {
                             let extensions = params.first().and_then(Value::as_array).context("extensions required")?;
@@ -6976,10 +7031,12 @@ async fn stratum_session(
                             runtime.workers.insert(identity,MiningWorker {worker:name.to_owned(),accepted:0,rejected:0,blocks:0,difficulty,last_share:None});
                             registration = Some(MiningConnection {runtime:node.mining.clone(),id:identity});
                             // Authorize only once registered. The worker registry now
-                            // bounds this session; free its pre-authorization slot.
+                            // bounds this session; free its pre-authorization slot and
+                            // let its address reconnect uncharged into reserved slots.
                             worker = name.to_owned();
                             authorized = true;
-                            drop(pending.take());
+                            admission.authorize_worker();
+                            if let Some(slot) = pending.take() { slot.authorized(); }
                             refresh = true;
                             Ok(json!(true))
                         }
@@ -7002,7 +7059,6 @@ async fn stratum_session(
                             let extra2: [u8;4] = hex::decode(params[2].as_str().context("extranonce2 required")?)?.try_into().map_err(|_|anyhow!("extranonce2 must be four bytes"))?;
                             let timestamp = hex_u32(&params[3])?;
                             let nonce = hex_u32(&params[4])?;
-                            admission.work(1)?;
                             submission = Some((job,extra2,timestamp,nonce,version));
                             Ok(json!(true))
                         }
@@ -7032,11 +7088,25 @@ async fn stratum_session(
                         Err(error) => Err(error),
                         Ok((work,is_block)) => {
                             let submitted_parent = job.block.header.previous;
-                            let assigned = job.difficulty;
+                            // Valid shares at the connection's current, uncapped difficulty
+                            // measure its rate, including shares refused for that rate. A
+                            // job capped at network difficulty cannot be raised further.
+                            if work.is_some() && job.difficulty == difficulty {
+                                let now = tokio::time::Instant::now();
+                                let (start, intervals) = match share_window {
+                                    Some((start, intervals)) if now.duration_since(start) < STRATUM_SHARE_WINDOW => (start, intervals + 1),
+                                    _ => (now, 0),
+                                };
+                                share_window = Some((start, intervals));
+                                if let Some(factor) = stratum_rate_factor(intervals, now.duration_since(start)) {
+                                    let next = (difficulty * factor).min(1e18);
+                                    if next > difficulty { difficulty = next; retarget = true; share_window = None; }
+                                }
+                            }
                             let accepted = if is_block {
                                 // Budgets and worker queues may delay a solved block but
                                 // never discard it: validate first, enforce the budget after.
-                                budget = admission.work(job.block.transactions.len()).err();
+                                budget = admission.work(1 + job.block.transactions.len()).err();
                                 // The worker semaphore is never closed; wait without a deadline.
                                 let permit = node.stratum_workers.clone().acquire_owned().await.ok();
                                 let validator = node.clone();
@@ -7051,25 +7121,13 @@ async fn stratum_session(
                                     // with a competing child of the same parent.
                                     if validator.submit_block(block)? { Ok(()) } else { Err(mining_error(21,"stale job")) }
                                 }).await.unwrap_or_else(|_| Err(anyhow!("mining block worker failed")))
-                            } else { Ok(()) };
+                            } else if restricted {
+                                Err(stratum_restricted(&limit))
+                            } else { admission.work(1) };
                             accepted.map(|()| {
                                 seen.insert(hash, submitted_parent);
                                 node.mining.unpoisoned().submission(registration.as_ref().map(|r|r.id),Some((work.as_ref(),is_block)));
                                 refresh |= is_block;
-                                // Raise a fast reporting stream's difficulty instead of
-                                // letting it reach the session request limit. A job capped
-                                // at network difficulty cannot be raised further.
-                                if work.is_some() {
-                                    if window_started.elapsed() >= STRATUM_SHARE_WINDOW { window_started = tokio::time::Instant::now(); window_shares = 0; }
-                                    window_shares += 1;
-                                    let next = (assigned * 2.0).min(1e18);
-                                    if window_shares >= STRATUM_WINDOW_SHARES && next > difficulty {
-                                        difficulty = next;
-                                        refresh = true;
-                                        window_started = tokio::time::Instant::now();
-                                        window_shares = 0;
-                                    }
-                                }
                                 json!(true)
                             })
                         }
@@ -7087,10 +7145,13 @@ async fn stratum_session(
                 if denied && at_capacity { bail!("mining worker capacity reached"); }
                 if denied { admission.malformed(); bail!("mining authorization denied"); }
                 if let Some(error) = budget { return Err(error); }
+                if let Some(error) = limit { return Err(error); }
                 // Never evict duplicate evidence while the parent remains valid.
                 // A fresh connection gets a different extranonce and new work.
                 ensure!(seen.len()<MAX_SUBMITTED_HEADERS,"share history capacity reached; reconnect");
-                if successful && authorized && refresh {
+                // A raised difficulty takes effect with the next job, even when the
+                // share that measured the rate was itself refused for it.
+                if authorized && (retarget || (successful && refresh)) {
                     fingerprint=Some(new_job(&node,&mut write,&mut jobs,&mut counter,difficulty,&mut seen,u32::from_le_bytes(extra)).await?);
                     last_job=tokio::time::Instant::now();
                     deferred = false;
@@ -7124,7 +7185,7 @@ async fn stratum_session(
                 }
             }
             _ = tick.tick() => {
-                if stratum_session_expired(authorized,connected.elapsed()) { admission.malformed(); bail!("mining authorization timed out"); }
+                if stratum_session_expired(authorized,connected.elapsed()) { bail!("mining authorization timed out"); }
                 if !partial_line.is_empty() { let began=partial_since.get_or_insert_with(tokio::time::Instant::now); ensure!(began.elapsed()<IO_TIMEOUT,"mining partial frame timed out"); }
                 if authorized && last_job.elapsed()>=Duration::from_secs(30) {
                     fingerprint=Some(new_job(&node,&mut write,&mut jobs,&mut counter,difficulty,&mut seen,u32::from_le_bytes(extra)).await?);
@@ -8669,6 +8730,144 @@ mod tests {
         assert!(parse_amount("01").is_err());
         assert!(parse_amount("-1").is_err());
         assert_eq!(parse_amount("123").unwrap(), 123u32.into());
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn solved_block_survives_an_address_cooldown_from_another_session() {
+        async fn reply<R: AsyncBufRead + Unpin>(read: &mut R, id: u64) -> Value {
+            loop {
+                let line = timeout(Duration::from_secs(5), bounded_line(read, 16384))
+                    .await
+                    .expect("mining session stopped responding")
+                    .expect("mining session closed");
+                let value: Value = serde_json::from_slice(&line).unwrap();
+                if value["id"] == id {
+                    return value;
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(
+            &dir.path().join("node.db"),
+            Config::devnet(),
+            crypto::public_key(&[46; 32]).unwrap(),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        let admission = node.guard.admit(peer.ip(), Surface::Stratum).unwrap();
+        let extra1 = 11u32.to_le_bytes();
+        let session = tokio::spawn(stratum_session(
+            node.clone(),
+            server,
+            None,
+            DEFAULT_STRATUM_SHARE_DIFFICULTY,
+            extra1,
+            admission,
+            None,
+        ));
+        let (read, mut write) = client.into_split();
+        let mut read = BufReader::new(read);
+        write_json(
+            &mut write,
+            &json!({"id":1,"method":"mining.subscribe","params":[]}),
+        )
+        .await
+        .unwrap();
+        reply(&mut read, 1).await;
+        write_json(
+            &mut write,
+            &json!({"id":2,"method":"mining.authorize","params":["shared.worker","x"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply(&mut read, 2).await["result"], true);
+        let job = loop {
+            let line = timeout(Duration::from_secs(5), bounded_line(&mut read, 16384))
+                .await
+                .unwrap()
+                .unwrap();
+            let value: Value = serde_json::from_slice(&line).unwrap();
+            if value["method"] == "mining.notify" {
+                break value;
+            }
+        };
+        // Another device behind the same address misbehaves repeatedly. The
+        // longest cooldown refuses new connections from the address.
+        let other = node.guard.admit(peer.ip(), Surface::Stratum).unwrap();
+        for _ in 0..7 {
+            other.malformed();
+        }
+        assert!(node.guard.admit(peer.ip(), Surface::Stratum).is_err());
+        let p = &job["params"];
+        let word = |value: &Value| u32::from_str_radix(value.as_str().unwrap(), 16).unwrap();
+        let extra2 = [8u8; 4];
+        let mut coinbase = hex::decode(p[2].as_str().unwrap()).unwrap();
+        coinbase.extend(extra1);
+        coinbase.extend(extra2);
+        coinbase.extend(hex::decode(p[3].as_str().unwrap()).unwrap());
+        let mut previous: Hash = hex::decode(p[1].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        for chunk in previous.chunks_exact_mut(4) {
+            chunk.reverse();
+        }
+        let mut header = Header {
+            version: word(&p[5]),
+            previous,
+            merkle_root: crypto::sha256d(&coinbase),
+            timestamp: word(&p[7]),
+            bits: word(&p[6]),
+            nonce: 0,
+        };
+        let target = math::target_from_bits(header.bits).unwrap();
+        while math::check_pow(&header, &target).is_err() {
+            header.nonce += 1;
+        }
+        // The authorized worker's solved block is still submitted, and the
+        // worker stays connected.
+        write_json(
+            &mut write,
+            &json!({"id":3,"method":"mining.submit","params":["shared.worker",p[0],hex::encode(extra2),format!("{:08x}",header.timestamp),format!("{:08x}",header.nonce)]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply(&mut read, 3).await["result"], true);
+        assert_eq!(node.status().unwrap()["height"], 1);
+        write_json(
+            &mut write,
+            &json!({"id":4,"method":"mining.extranonce.subscribe","params":[]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply(&mut read, 4).await["result"], true);
+        write.shutdown().await.unwrap();
+        timeout(Duration::from_secs(5), session)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    #[test]
+    fn reporting_rate_raises_difficulty_by_a_power_of_two_toward_the_target() {
+        // Too few intervals, or at most two shares per second, keep difficulty.
+        assert_eq!(stratum_rate_factor(3, Duration::ZERO), None);
+        assert_eq!(stratum_rate_factor(16, Duration::from_secs(8)), None);
+        assert_eq!(stratum_rate_factor(17, Duration::from_secs(8)), Some(4.0));
+        assert_eq!(stratum_rate_factor(4, Duration::from_secs(1)), Some(4.0));
+        // Shares buffered together are measured over at least 250 ms.
+        assert_eq!(stratum_rate_factor(4, Duration::ZERO), Some(16.0));
+        assert_eq!(
+            stratum_rate_factor(40, Duration::from_millis(100)),
+            Some(256.0)
+        );
+        assert_eq!(
+            stratum_rate_factor(355 * 8, Duration::from_secs(8)),
+            Some(512.0)
+        );
     }
     #[test]
     fn authorized_solo_workers_need_not_find_a_block_to_stay_connected() {

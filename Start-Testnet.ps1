@@ -179,7 +179,7 @@ try {
         if (-not (Test-Path -LiteralPath $Executable)) { $Executable = Join-Path $PSScriptRoot 'bin/hashstash.exe' }
     }
     $Executable = [IO.Path]::GetFullPath($Executable)
-    if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) { throw 'Build the node with cargo build --release, or supply -Executable with its path.' }
+    if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) { throw 'Build the node with cargo build --release --locked, or supply -Executable with its path.' }
 
     if ($isNewNetwork) {
         $templatePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Config)

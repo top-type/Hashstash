@@ -156,7 +156,6 @@ impl WalletStore {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let fresh = selection.is_none();
         let (active, revision) = if let Some((active, revision)) = selection {
             (
                 active,
@@ -217,6 +216,10 @@ impl WalletStore {
             (entries.is_empty() && active.is_empty()) || entries.contains_key(&active),
             "selected wallet is missing"
         );
+        // Wallets are never deleted, so a store without any holds no choice to
+        // preserve: startup flags seed it, even after an earlier first start
+        // failed or ran without them.
+        let fresh = entries.is_empty();
         Ok(Self {
             connection,
             entries,
@@ -255,8 +258,8 @@ impl WalletStore {
         self.fresh = false;
         Ok(())
     }
-    /// A saved selection, even an empty one, survives startup flags. Report it
-    /// whenever that selection is not the requested wallet.
+    /// A store holding wallets keeps its saved selection over startup flags.
+    /// Report it whenever that selection is not the requested wallet.
     fn unapplied_seed(&self, flag: &str, mode: &str, public: &PublicKey) -> Option<String> {
         if self.active == format!("{mode}:{}", hex::encode(public)) {
             return None;
@@ -555,20 +558,42 @@ mod tests {
     }
 
     #[test]
-    fn ignored_startup_wallets_are_reported_unless_already_selected() {
+    fn empty_stores_are_seeded_and_ignored_startup_wallets_are_reported() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("chain.sqlite");
         let public = crypto::public_key(&[3; 32]).unwrap();
-        drop(WalletStore::open(&path, [1; 32]).unwrap());
-        let mut empty = WalletStore::open(&path, [1; 32]).unwrap();
-        let warning = empty.unapplied_seed("--wallet-key", "hot", &public).unwrap();
-        assert!(warning.contains("--wallet-key was not applied") && warning.contains("no wallet selected"));
-        empty.seed_hot([3; 32]).unwrap();
-        assert!(empty.entries.is_empty());
-        manage(&mut empty, json!({"action":"import","private_key":hex::encode([3;32])}));
-        assert!(empty.unapplied_seed("--wallet-key", "hot", &public).is_none());
-        let watch = empty.unapplied_seed("--watch-key", "watch", &public).unwrap();
-        assert!(watch.contains("hot wallet hsh"), "{watch}");
+        // A first start that failed later, or ran without flags, leaves an
+        // empty saved selection; the flags still seed that store.
+        for hot in [true, false] {
+            let path = dir.path().join(format!("empty-{hot}.sqlite"));
+            drop(WalletStore::open(&path, [1; 32]).unwrap());
+            let mut empty = WalletStore::open(&path, [1; 32]).unwrap();
+            assert!(empty.fresh);
+            if hot {
+                empty.seed_hot([3; 32]).unwrap();
+            } else {
+                empty.seed_watch(public).unwrap();
+            }
+            assert_eq!(empty.entries.len(), 1);
+            let mode = if hot { "hot" } else { "watch" };
+            assert_eq!(empty.active, format!("{mode}:{}", hex::encode(public)));
+            drop(empty);
+            let reopened = WalletStore::open(&path, [1; 32]).unwrap();
+            assert!(!reopened.fresh);
+            assert_eq!(reopened.status()["wallet_mode"], mode);
+        }
+        // A store holding wallets keeps its selection and says so.
+        let path = dir.path().join("chain.sqlite");
+        let mut store = WalletStore::open(&path, [1; 32]).unwrap();
+        manage(&mut store, json!({"action":"import","private_key":hex::encode([3;32])}));
+        drop(store);
+        let mut saved = WalletStore::open(&path, [1; 32]).unwrap();
+        assert!(saved.unapplied_seed("--wallet-key", "hot", &public).is_none());
+        let watch = saved.unapplied_seed("--watch-key", "watch", &public).unwrap();
+        assert!(watch.contains("--watch-key was not applied") && watch.contains("hot wallet hsh"), "{watch}");
+        let before = saved.status();
+        saved.seed_watch(public).unwrap();
+        saved.seed_hot([4; 32]).unwrap();
+        assert_eq!(saved.status(), before);
     }
 
     #[test]

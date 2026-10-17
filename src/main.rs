@@ -199,10 +199,10 @@ enum Command {
         data: PathBuf,
         #[arg(long)]
         miner: String,
-        /// Seed a fresh wallet store with this private key file. Saved wallet selection is preserved.
+        /// Seed a wallet store that holds no wallets with this private key file. A store holding wallets keeps its saved selection.
         #[arg(long, conflicts_with = "watch_key")]
         wallet_key: Option<PathBuf>,
-        /// Seed a fresh wallet store with this public key. Without wallet flags the store starts empty.
+        /// Seed a wallet store that holds no wallets with this public key. Without wallet flags the store starts empty.
         #[arg(long)]
         watch_key: Option<String>,
         #[arg(long, default_value = "127.0.0.1:18480")]

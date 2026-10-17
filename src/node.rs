@@ -1055,7 +1055,8 @@ impl Node {
         Ok(IO_TIMEOUT + Duration::from_secs(bytes / (1024 * 1024)))
     }
 
-    /// Seed a fresh wallet store. A saved runtime selection survives startup flags.
+    /// Seed a wallet store that holds no wallets. A store holding wallets keeps
+    /// its saved selection over startup flags.
     pub fn with_wallet(mut self, secret: [u8; 32]) -> Result<Self> {
         ensure!(
             self.startup_wallet_mode.is_none(),
@@ -1065,7 +1066,8 @@ impl Node {
         self.startup_wallet_mode = Some("hot");
         Ok(self)
     }
-    /// Seed a fresh store with a watched account; preserve a saved selection.
+    /// Seed a store holding no wallets with a watched account; a store holding
+    /// wallets keeps its saved selection.
     pub fn with_watch_key(mut self, public: PublicKey) -> Result<Self> {
         ensure!(
             self.startup_wallet_mode.is_none(),

@@ -64,6 +64,13 @@ try {
     try { & (Join-Path $fixture 'Start-WatchOnly.ps1') -WatchFile $invalidFile -Config $Config -Executable $Executable -DataDirectory $invalidDirectory -BasePort $BasePort -NoBrowser -PassThru | Out-Null }
     catch { $rejected = $_.Exception.Message -like '*does not match its address*' }
     Check ($rejected -and -not (Test-Path -LiteralPath $invalidDirectory)) 'V2 public key mismatch rejects before creating node data'
+    $manifestFile = $directory + '.manifest.json'
+    $manifest = [ordered]@{schema_version=1; config=$Config; chain_id=(([string]$network.chain_id).Substring(0,63) + $last); nodes=@(1,2,3 | ForEach-Object { [ordered]@{p2p_port=($BasePort + 20 + $_)} })}
+    [IO.File]::WriteAllText($manifestFile, ($manifest | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
+    $rejected = $false
+    try { & (Join-Path $fixture 'Start-WatchOnly.ps1') -PublicKey $publicKey -ManifestPath $manifestFile -Executable $Executable -DataDirectory $invalidDirectory -BasePort $BasePort -NoBrowser -PassThru | Out-Null }
+    catch { $rejected = $_.Exception.Message -like '*manifest chain identity*' }
+    Check ($rejected -and -not (Test-Path -LiteralPath $invalidDirectory)) 'Manifest chain ID mismatch is reported before launch instead of as a readiness timeout'
     [IO.File]::WriteAllText($invalidFile, (@{format='hashstash-watch-v1';public_key=$publicKey} | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
     $legacy = & (Join-Path $fixture 'Start-WatchOnly.ps1') -WatchFile $invalidFile -Config $Config -Executable $Executable -DataDirectory $directory -BasePort $BasePort -NoBrowser -PassThru
     Check ([int]$legacy.pid -eq [int]$first.pid) 'Legacy v1 watch descriptor remains compatible with the same account'

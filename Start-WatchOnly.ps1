@@ -69,6 +69,7 @@ if (-not $Executable) {
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
 $networkDescriptor = & $Executable network --config $Config | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0) { throw 'Could not read the network identity.' }
+if ($expectedChain -and $networkDescriptor.chain_id -cne $expectedChain) { throw 'The testnet manifest chain identity does not match its configuration.' }
 if ($null -ne $descriptor -and $descriptor.format -eq 'hashstash-watch-v2' -and $descriptor.chain_id -cne $networkDescriptor.chain_id) { throw 'The watch address belongs to a different network.' }
 if ($PublicKey -cmatch '^[0-9a-fA-F]{64}$' -and ($null -eq $descriptor -or $descriptor.format -eq 'hashstash-watch-v1')) {
     $PublicKey = $PublicKey.ToLowerInvariant()
@@ -124,16 +125,17 @@ try {
         Save-WatchJson $recordPath $record
     }
     $ready = $false
+    $servedChain = ''
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     while ([DateTime]::UtcNow -lt $deadline) {
         if ($null -eq (Find-WatchProcess $record)) { throw "Watch node exited. Read $DataDirectory\stderr.log." }
+        # Only startup request failures are retried; the identity check below is not swallowed.
         try {
             $session = Invoke-RestMethod -Uri ($record.url + 'api/session') -TimeoutSec 2
             $status = Invoke-RestMethod -Uri ($record.url + 'rpc') -Method Post -ContentType 'application/json' -Body '{"jsonrpc":"2.0","id":1,"method":"status","params":{}}' -TimeoutSec 2
             # The saved manager selection may have changed through the Wallet page.
             if ($session.miner -eq $PublicKey -and $session.wallet_id -and $status.result.chain_id) {
-                if ($expectedChain -and $status.result.chain_id -ne $expectedChain) { throw 'Watch node returned a different chain identity.' }
-                $record.chain_id = [string]$status.result.chain_id
+                $servedChain = [string]$status.result.chain_id
                 $ready = $true
                 break
             }
@@ -141,6 +143,8 @@ try {
         Start-Sleep -Milliseconds 200
     }
     if (-not $ready) { throw "Watch node did not become ready. Read $DataDirectory\stderr.log." }
+    if ($servedChain -cne $networkDescriptor.chain_id) { throw 'Watch node returned a different chain identity.' }
+    $record.chain_id = $servedChain
     Save-WatchJson $recordPath $record
     Save-WatchJson $latestPath ([PSCustomObject]@{ record = $recordPath })
     Write-Host ('Wallet: ' + $record.url)

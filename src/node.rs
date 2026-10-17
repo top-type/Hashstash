@@ -7,7 +7,7 @@ use crate::{
     crypto,
     explorer::Explorer,
     fees, math,
-    network_guard::{self, NetworkGuard, PeerSlots, Session, Surface},
+    network_guard::{self, NetworkGuard, PeerClass, PeerSlots, Session, Surface},
     peer_auth::{Channel as PeerChannel, Policy as PeerPolicy},
     peer_discovery::{self, AddressBook, Options as DiscoveryOptions},
     peer_wire::{self, Message as PeerPacket, Sync as PeerMessage},
@@ -580,12 +580,45 @@ struct Inner {
     pool_tip: Hash,
     template: Option<Arc<Block>>,
     // Download progress is independent of which branch currently has greatest work.
-    downloads: VecDeque<Hash>,
+    downloads: VecDeque<Download>,
     relay_cursor: usize,
 }
 impl Inner {
     fn pending(&self) -> impl Iterator<Item = &Transaction> {
         self.mempool.iter().chain(&self.backlog)
+    }
+}
+/// A stored side-branch block whose descendants a peer may still provide,
+/// and the source that delivered it (see `network_guard::peer_source`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Download {
+    hash: Hash,
+    source: IpAddr,
+}
+/// Record that `source` delivered `hash`, a child of `previous`. Each source
+/// advances only its own cursor for a branch and never moves or removes one
+/// another source contributed, even for the same block. When the list is
+/// full, a source displaces another source's oldest cursor only while that
+/// source holds more cursors than it does; otherwise it drops its own oldest.
+/// One source resending stored blocks, which needs no proof of work, can
+/// therefore never displace a source that holds fewer cursors.
+fn note_download(downloads: &mut VecDeque<Download>, hash: Hash, previous: Hash, source: IpAddr) {
+    downloads.retain(|d| d.source != source || (d.hash != hash && d.hash != previous));
+    downloads.push_front(Download { hash, source });
+    if downloads.len() > MAX_CONNECTIONS {
+        let mut held: HashMap<IpAddr, usize> = HashMap::new();
+        for download in downloads.iter() {
+            *held.entry(download.source).or_default() += 1;
+        }
+        let most = held.values().copied().max().unwrap_or(0);
+        let oldest = if held[&source] >= most {
+            downloads.iter().rposition(|d| d.source == source)
+        } else {
+            downloads.iter().rposition(|d| held[&d.source] == most)
+        };
+        if let Some(oldest) = oldest {
+            downloads.remove(oldest);
+        }
     }
 }
 struct PublishedChain {
@@ -1126,14 +1159,20 @@ impl Node {
             eprintln!("{name} listener accept failed: {error}; retrying in {delay:?}");
         }
     }
-    /// Configured or pinned peers, and discovery peers this node verified in
-    /// the last hour, may use reserved inbound capacity.
-    fn protected_peer(&self, configured: &HashSet<IpAddr>, ip: IpAddr) -> bool {
-        configured.contains(&network_guard::admission_address(ip))
-            || self.discovery.lock().is_ok_and(|book| {
-                book.as_ref()
-                    .is_some_and(|book| book.verified_ip(ip, now()))
-            })
+    /// Configured or pinned peers have their own reserved inbound capacity.
+    /// Discovery peers this node verified in the last hour have separate
+    /// reserved slots, but stay subject to network group caps.
+    fn peer_class(&self, configured: &HashSet<IpAddr>, ip: IpAddr) -> PeerClass {
+        if configured.contains(&network_guard::admission_address(ip)) {
+            PeerClass::Operator
+        } else if self.discovery.lock().is_ok_and(|book| {
+            book.as_ref()
+                .is_some_and(|book| book.verified_ip(ip, now()))
+        }) {
+            PeerClass::Verified
+        } else {
+            PeerClass::General
+        }
     }
     fn peer_event(&self, peer: String, result: &Result<()>) {
         if let Ok(mut events) = self.peer_events.lock() {
@@ -1712,6 +1751,21 @@ impl Node {
         }
         out
     }
+    /// A locator lists download cursors first and its sender's complete
+    /// active chain locator last. The run of hashes this node has active that
+    /// ends it, with heights rising towards its front, therefore lies on the
+    /// sender's active chain; return the highest. `canonical` gives each
+    /// locator entry's active height here, if any.
+    fn shared_active_tip(locator: &[Hash], canonical: &[Option<u64>]) -> Option<Hash> {
+        let mut shared: Option<(Hash, u64)> = None;
+        for (hash, height) in locator.iter().zip(canonical).rev() {
+            match *height {
+                Some(h) if shared.is_none_or(|(_, last)| h > last) => shared = Some((*hash, h)),
+                _ => break,
+            }
+        }
+        shared.map(|(hash, _)| hash)
+    }
     /// Blocks after the best canonical locator match, the recipient's minimum
     /// admission limits, and the framed block bytes.
     fn blocks_after(
@@ -1724,26 +1778,40 @@ impl Node {
         );
         // An untrusted locator is matched through the header index only: no
         // block body is decoded and no historical state is rebuilt for it.
+        // A repeated hash is ignored.
         let mut seen = HashSet::new();
-        let mut height = None;
-        for hash in locator.iter().filter(|h| seen.insert(**h)) {
-            if let Some(h) = chain.block_height(hash)?
+        let mut canonical = Vec::with_capacity(locator.len());
+        for hash in locator {
+            let mut height = None;
+            if seen.insert(*hash)
+                && let Some(h) = chain.block_height(hash)?
                 && chain.hash_at_height(h) == Some(*hash)
             {
-                height = height.max(Some(h));
+                height = Some(h);
             }
+            canonical.push(height);
         }
-        let height = height.context("no common ancestor")?;
-        // The recipient validated this common ancestor, so its admission
-        // allowance covers the genesis capacity and the ancestor's post-state
-        // capacity. The next active body proves a lower bound for the latter;
-        // at the tip the current state gives it exactly. Stop before a larger
-        // newly governed block so the recipient can first validate the
-        // transition and increase its allowance on the next synchronization.
+        let height = canonical
+            .iter()
+            .flatten()
+            .max()
+            .copied()
+            .context("no common ancestor")?;
+        // The recipient's admission allowance covers the genesis capacity and
+        // the branch capacity of every block on its own active chain, which
+        // the index records for the highest one this node shares. The next
+        // active body also fits the common ancestor's capacity. Later blocks
+        // stop before one requiring a larger capacity, so the recipient can
+        // first validate a governed increase and raise its allowance on the
+        // next synchronization.
         let tip = chain.tip_height();
         let mut capacity = chain.config.initial.block_bytes;
-        if height == tip {
-            capacity = capacity.max(chain.tip_state().settings.block_bytes);
+        if let Some(hash) = Self::shared_active_tip(locator, &canonical) {
+            capacity = capacity.max(
+                chain
+                    .block_capacity(&hash)?
+                    .context("shared active block missing")?,
+            );
         }
         let mut limits = peer_wire::Limits::for_capacity(&chain.config, capacity);
         let mut out = Vec::new();
@@ -1845,27 +1913,29 @@ impl Node {
         } else {
             (start + visited) % i.mempool.len()
         };
+        // Download cursors come first and the active chain locator last. The
+        // active part is never shortened by deduplication, so a responder can
+        // tell which of its hashes this node has on its active chain.
         let active = Self::locator(&i.chain);
         // A cursor into a presynced branch whose held headers now claim more
         // work than the tip resumes at its stored root, so the peer resends
         // the bodies; cursors the chain no longer knows are dropped.
+        let mut seen: HashSet<Hash> = active.iter().copied().collect();
         let mut request_locator = Vec::new();
         let mut cursors = std::mem::take(&mut i.downloads);
-        cursors.retain(|cursor| match i.chain.download_cursor(cursor) {
-            Ok(Some(entry)) => {
+        cursors.retain(|cursor| {
+            let entry = match i.chain.download_cursor(&cursor.hash) {
+                Ok(Some(entry)) => entry,
+                Ok(None) => return false,
+                Err(_) => cursor.hash,
+            };
+            if seen.insert(entry) {
                 request_locator.push(entry);
-                true
             }
-            Ok(None) => false,
-            Err(_) => {
-                request_locator.push(*cursor);
-                true
-            }
+            true
         });
         i.downloads = cursors;
         request_locator.extend(active);
-        let mut seen = HashSet::new();
-        request_locator.retain(|h| seen.insert(*h));
         // Keep genesis as the final fallback even for the largest supported height.
         if request_locator.len() > 128 {
             let genesis = i.chain.hash_at_height(0).expect("genesis exists");
@@ -1879,11 +1949,13 @@ impl Node {
             transactions,
         })
     }
-    fn receive_peer(&self, msg: &PeerMessage) -> Result<()> {
+    /// Accept a peer message from `source`, the address that sent it.
+    fn receive_peer(&self, msg: &PeerMessage, source: IpAddr) -> Result<()> {
         ensure!(
             msg.chain == self.read_view()?.chain.chain_id(),
             "different genesis configuration"
         );
+        let source = network_guard::peer_source(source);
         ensure!(
             msg.blocks.len() <= MAX_BATCH
                 && msg.transactions.len() <= MAX_MEMPOOL
@@ -1898,9 +1970,8 @@ impl Node {
             let known = {
                 let i = self.locked()?;
                 match i.chain.block_height(&hash)? {
-                    // A stored active block is never download progress: any
-                    // peer could resend one without proof of work to push
-                    // competing-branch cursors out.
+                    // A stored active block is never download progress by
+                    // itself; only a linked all-active reply is (below).
                     Some(height) if i.chain.hash_at_height(height) == Some(hash) => {
                         let linked = index == 0 || shared == Some(b.header.previous);
                         shared = linked.then_some(hash);
@@ -1928,42 +1999,48 @@ impl Node {
                     Err(error) => return Err(error),
                 }
             }
-            let mut i = self.locked()?;
-            // Replace the preceding cursor for this branch, so normal downloads
+            // A stored side block still refreshes its sender's cursor, so a
+            // download resumes after a restart or eviction. Replacing the
+            // sender's preceding cursor for this branch makes normal downloads
             // consume one entry each rather than one per batch.
             // Retain accepted progress even if a later message entry is invalid.
-            i.downloads
-                .retain(|h| *h != hash && *h != b.header.previous);
-            i.downloads.push_front(hash);
-            i.downloads.truncate(MAX_CONNECTIONS);
+            let mut i = self.locked()?;
+            note_download(&mut i.downloads, hash, b.header.previous, source);
         }
         if let Some(hash) = shared {
             // A reply wholly inside the active chain still shows where the
             // sender's chain continues; without it a fork deeper than one
             // batch beyond a sparse locator entry never reaches its blocks.
-            // Such a cursor replaces the reply's own starting cursor or the
-            // oldest active-chain cursor, and never a competing-branch cursor.
+            // Such a cursor belongs to its source and replaces that source's
+            // cursor at the reply's start. In a full list it displaces only
+            // the oldest active-chain cursor, never a competing-branch cursor,
+            // and only its own source's or one whose source holds more.
             let mut i = self.locked()?;
             let start = msg.blocks[0].header.previous;
-            if !i.downloads.contains(&hash) {
-                let chain = &i.chain;
-                let active = |h: &Hash| {
-                    chain
-                        .block_height(h)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|height| chain.hash_at_height(height) == Some(*h))
-                };
-                let mut replaced = i.downloads.iter().position(|h| *h == start);
-                if replaced.is_none() && i.downloads.len() >= MAX_CONNECTIONS {
-                    replaced = i.downloads.iter().rposition(active);
+            let Inner {
+                chain, downloads, ..
+            } = &mut *i;
+            downloads.retain(|d| d.source != source || (d.hash != hash && d.hash != start));
+            if downloads.len() >= MAX_CONNECTIONS {
+                let mut held: HashMap<IpAddr, usize> = HashMap::new();
+                for download in downloads.iter() {
+                    *held.entry(download.source).or_default() += 1;
                 }
-                if let Some(position) = replaced {
-                    i.downloads.remove(position);
+                let own = held.get(&source).copied().unwrap_or(0) + 1;
+                let oldest = downloads.iter().rposition(|d| {
+                    (d.source == source || held[&d.source] > own)
+                        && chain
+                            .block_height(&d.hash)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|height| chain.hash_at_height(height) == Some(d.hash))
+                });
+                if let Some(oldest) = oldest {
+                    downloads.remove(oldest);
                 }
-                if i.downloads.len() < MAX_CONNECTIONS {
-                    i.downloads.push_back(hash);
-                }
+            }
+            if downloads.len() < MAX_CONNECTIONS {
+                downloads.push_back(Download { hash, source });
             }
         }
         // Admit the batch together. Revalidating every growing prefix here made
@@ -3160,12 +3237,16 @@ async fn parse_value_with_slots(
     .await
     .context("JSON worker failed")?
 }
+/// Read and decode one peer frame. The read allowance, or an earlier
+/// `deadline`, applies only while waiting for the peer's bytes; exceeding it
+/// is the peer's fault. Waits for local workers afterwards never penalize it.
 async fn read_peer_packet<R: AsyncBufRead + Unpin>(
     r: &mut R,
     node: &Node,
     admission: &Session,
     transport: &mut PeerTransport,
     kind: PeerRead,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<PeerPacket> {
     admission.request()?;
     let limits = node.peer_limits()?;
@@ -3181,18 +3262,31 @@ async fn read_peer_packet<R: AsyncBufRead + Unpin>(
     } else {
         node.peer_exchange_timeout()?
     };
+    let mut read_by = tokio::time::Instant::now() + exchange_timeout;
+    if let Some(deadline) = deadline {
+        read_by = read_by.min(deadline);
+    }
     let result = match transport {
-        PeerTransport::Signed(channel) => timeout(
-            exchange_timeout,
-            channel.read(r, maximum, admission, node.peer_parsers.clone()),
-        )
-        .await
-        .map_err(anyhow::Error::from)
-        .and_then(|v| v),
-        PeerTransport::Plain => timeout(exchange_timeout, read_peer_frame(r, maximum, admission))
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|v| v),
+        PeerTransport::Signed(channel) => {
+            match tokio::time::timeout_at(read_by, channel.receive(r, maximum, admission))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|v| v)
+            {
+                Ok(frame) => {
+                    channel
+                        .open(frame, admission, node.peer_parsers.clone())
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        PeerTransport::Plain => {
+            tokio::time::timeout_at(read_by, read_peer_frame(r, maximum, admission))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|v| v)
+        }
         PeerTransport::Failed => Err(anyhow!("peer transport failed closed")),
     };
     let bytes = match result {
@@ -3264,7 +3358,7 @@ async fn read_peer<R: AsyncBufRead + Unpin>(
     admission: &Session,
     transport: &mut PeerTransport,
 ) -> Result<PeerMessage> {
-    match read_peer_packet(r, node, admission, transport, PeerRead::Sync).await? {
+    match read_peer_packet(r, node, admission, transport, PeerRead::Sync, None).await? {
         PeerPacket::Sync(message) => Ok(message),
         _ => bail!("unexpected message during synchronization"),
     }
@@ -3277,16 +3371,18 @@ async fn read_peer_frame<R: AsyncBufRead + Unpin>(
     let mut header = [0u8; 4];
     r.read_exact(&mut header).await?;
     admission.bytes(header.len())?;
+    admission.begin_frame()?;
     let length = u32::from_be_bytes(header) as usize;
     ensure!(
         length >= peer_wire::ACK_BYTES && length <= maximum,
         "peer frame too large or truncated"
     );
-    admission.reserve_frame(length)?;
+    // Frame memory is reserved as bytes arrive, never for a declared length.
     let mut out = Vec::with_capacity(length.min(8192));
     let mut chunk = [0u8; 8192];
     while out.len() < length {
         let take = chunk.len().min(length - out.len());
+        admission.reserve_frame(take)?;
         r.read_exact(&mut chunk[..take]).await?;
         admission.bytes(take)?;
         out.extend_from_slice(&chunk[..take]);
@@ -3580,8 +3676,7 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
                         Ok(accepted) => { accept_failures = 0; accepted }
                         Err(error) => {
                             // An accept failure never stops the listener or its live sessions.
-                            let delay = accept_retry_delay(&error, accept_failures);
-                            accept_failures = accept_failures.saturating_add(1);
+                            let delay = accept_retry_delay(&error, &mut accept_failures);
                             n.listener_error(kind, &error, delay);
                             tokio::select! { _ = shutdown.changed() => break, _ = tokio::time::sleep(delay) => {} }
                             continue;
@@ -3595,7 +3690,10 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
                         // Rate limits and cooldowns apply before slot selection, so a
                         // connection flood spends its own request budget.
                         let Ok(admission)=guard.admit(address.ip(),surface) else {drop(stream);continue};
-                        let Some(slot) = n.peer_sessions.try_acquire(address.ip(), n.protected_peer(&protected, address.ip())) else { drop(stream); continue };
+                        let class = n.peer_class(&protected, address.ip());
+                        let Some(slot) = n.peer_sessions.try_acquire(address.ip(), class) else { drop(stream); continue };
+                        // Configured and pinned peers keep a share of frame memory too.
+                        let admission = if class == PeerClass::Operator { admission.operator() } else { admission };
                         (admission, SessionCapacity::Peer(slot))
                     } else {
                         let capacity = if kind == 2 {
@@ -3672,22 +3770,29 @@ enum SessionCapacity {
     Peer(network_guard::PeerSlot),
     Mining(SessionId),
 }
-/// Accept errors never end a listener. A reset or aborted connection is that
-/// client's failure and is skipped at once; other errors, such as descriptor
-/// or memory exhaustion, back off from 10 ms to one second while existing
-/// sessions continue.
-fn accept_retry_delay(error: &std::io::Error, consecutive: u32) -> Duration {
+/// Accept errors never end a listener. A reset, aborted or refused connection
+/// is that client's failure: it consumed one queued connection, so it is
+/// skipped at once however often it repeats, and only listener health counts
+/// it. An interrupted call retries at once until it repeats 64 times. Other
+/// errors, such as descriptor or memory exhaustion, back off from 10 ms to
+/// one second while existing sessions continue. `consecutive` counts the
+/// listener's errors since its last accepted connection, except
+/// per-connection ones.
+fn accept_retry_delay(error: &std::io::Error, consecutive: &mut u32) -> Duration {
     use std::io::ErrorKind::*;
-    if consecutive < 64
-        && matches!(
-            error.kind(),
-            ConnectionAborted | ConnectionReset | ConnectionRefused | Interrupted | WouldBlock
-        )
-    {
+    if matches!(
+        error.kind(),
+        ConnectionAborted | ConnectionReset | ConnectionRefused
+    ) {
+        return Duration::ZERO;
+    }
+    let delay = if matches!(error.kind(), Interrupted | WouldBlock) && *consecutive < 64 {
         Duration::ZERO
     } else {
-        Duration::from_millis((10u64 << consecutive.min(7)).min(1000))
-    }
+        Duration::from_millis((10u64 << (*consecutive).min(7)).min(1000))
+    };
+    *consecutive = consecutive.saturating_add(1);
+    delay
 }
 /// A deferred replay or a held side-branch header is local validation
 /// progress, not a peer failure.
@@ -3866,6 +3971,7 @@ async fn discover_peer(node: &Node, peer: SocketAddr) -> Result<()> {
         &admission,
         &mut transport,
         PeerRead::Addresses,
+        None,
     )
     .await?
     {
@@ -3891,15 +3997,14 @@ async fn discover_peer(node: &Node, peer: SocketAddr) -> Result<()> {
 }
 async fn peer_session(node: Node, stream: TcpStream, admission: Session) -> Result<()> {
     // An absolute deadline bounds how long one connection holds an inbound
-    // slot, however each individual step is paced.
+    // slot, however each individual step is paced. It also covers waits for
+    // local workers and validation, so expiry closes without a cooldown;
+    // each peer read has its own allowance, and a peer that misses it is
+    // penalized there.
     let deadline = node.peer_exchange_timeout()?.saturating_mul(2);
-    match timeout(deadline, peer_session_steps(&node, stream, &admission)).await {
-        Ok(result) => result,
-        Err(_) => {
-            admission.malformed();
-            bail!("peer session exceeded its overall deadline")
-        }
-    }
+    timeout(deadline, peer_session_steps(&node, stream, &admission))
+        .await
+        .map_err(|_| anyhow!("peer session exceeded its overall deadline"))?
 }
 async fn peer_session_steps(node: &Node, mut stream: TcpStream, admission: &Session) -> Result<()> {
     let remote = stream.peer_addr()?;
@@ -3927,15 +4032,15 @@ async fn peer_session_steps(node: &Node, mut stream: TcpStream, admission: &Sess
     };
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
-    let request = tokio::time::timeout_at(
-        first,
-        read_peer_packet(&mut read, node, admission, &mut transport, PeerRead::Request),
+    let request = read_peer_packet(
+        &mut read,
+        node,
+        admission,
+        &mut transport,
+        PeerRead::Request,
+        Some(first),
     )
-    .await
-    .map_err(|_| {
-        admission.malformed();
-        anyhow!("peer request deadline exceeded")
-    })??;
+    .await?;
     let hello = match request {
         PeerPacket::Sync(hello) => hello,
         PeerPacket::GetAddresses {
@@ -3968,7 +4073,7 @@ async fn peer_session_steps(node: &Node, mut stream: TcpStream, admission: &Sess
         }
         _ => bail!("unexpected first peer message"),
     };
-    let hello = receive_peer_async(node, hello).await?;
+    let hello = receive_peer_async(node, hello, remote.ip()).await?;
     let reply = peer_snapshot_async(node, Some(hello.locator)).await?;
     write_peer(
         node,
@@ -3979,7 +4084,7 @@ async fn peer_session_steps(node: &Node, mut stream: TcpStream, admission: &Sess
     )
     .await?;
     let push = read_peer(&mut read, node, admission, &mut transport).await?;
-    receive_peer_async(node, push).await?;
+    receive_peer_async(node, push, remote.ip()).await?;
     write_peer(node, &mut write, PeerPacket::Ack, admission, &mut transport).await?;
     Ok(())
 }
@@ -4004,12 +4109,16 @@ pub async fn sync_peer(node: &Node, peer: SocketAddr) -> Result<()> {
     node.peer_event(peer.to_string(), &result);
     result
 }
-async fn receive_peer_async(node: &Node, message: PeerMessage) -> Result<PeerMessage> {
+async fn receive_peer_async(
+    node: &Node,
+    message: PeerMessage,
+    source: IpAddr,
+) -> Result<PeerMessage> {
     let permit = timeout(IO_TIMEOUT, node.peer_workers.clone().acquire_owned()).await??;
     let node = node.clone();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        node.receive_peer(&message)?;
+        node.receive_peer(&message, source)?;
         Ok(message)
     })
     .await
@@ -4027,16 +4136,18 @@ async fn peer_snapshot_async(node: &Node, locator: Option<Vec<Hash>>) -> Result<
 }
 async fn sync_peer_inner(node: &Node, peer: SocketAddr) -> Result<()> {
     // Keep the former five-stage overall budget, growing with the same
-    // validated capacity as individual exchanges. A slow peer can hold one of
-    // the two outbound slots only for this long, and waiting for a slot fails
-    // instead of hanging behind such peers.
-    let deadline = node.peer_exchange_timeout()?.saturating_mul(5);
+    // validated capacity as individual exchanges. One deadline covers the
+    // wait for an outbound slot and the exchange, so a slow peer can hold one
+    // of the two outbound slots only for this long, and waiting for a slot
+    // fails instead of hanging behind such peers.
+    let deadline = tokio::time::Instant::now() + node.peer_exchange_timeout()?.saturating_mul(5);
     // Reserve separate inbound capacity so simultaneous outgoing synchronizations
     // cannot consume every receiving slot on all peers.
-    let _frame_permit = timeout(deadline, node.outbound_sessions.clone().acquire_owned())
-        .await
-        .map_err(|_| anyhow!("outbound peer slots remained busy"))??;
-    timeout(deadline, sync_peer_steps(node, peer))
+    let _frame_permit =
+        tokio::time::timeout_at(deadline, node.outbound_sessions.clone().acquire_owned())
+            .await
+            .map_err(|_| anyhow!("outbound peer slots remained busy"))??;
+    tokio::time::timeout_at(deadline, sync_peer_steps(node, peer))
         .await
         .map_err(|_| anyhow!("peer synchronization exceeded its overall deadline"))?
 }
@@ -4071,7 +4182,7 @@ async fn sync_peer_steps(node: &Node, peer: SocketAddr) -> Result<()> {
     )
     .await?;
     let reply = read_peer(&mut read, node, &admission, &mut transport).await?;
-    let reply = receive_peer_async(node, reply).await?;
+    let reply = receive_peer_async(node, reply, peer.ip()).await?;
     write_peer(
         node,
         &mut write,
@@ -4080,7 +4191,15 @@ async fn sync_peer_steps(node: &Node, peer: SocketAddr) -> Result<()> {
         &mut transport,
     )
     .await?;
-    read_peer_packet(&mut read, node, &admission, &mut transport, PeerRead::Ack).await?;
+    read_peer_packet(
+        &mut read,
+        node,
+        &admission,
+        &mut transport,
+        PeerRead::Ack,
+        None,
+    )
+    .await?;
     Ok(())
 }
 #[derive(Deserialize)]
@@ -8203,7 +8322,9 @@ mod peer_tests {
         for round in 1..=limit {
             let request = target.peer_snapshot(None).unwrap();
             let reply = source.peer_snapshot(Some(&request.locator)).unwrap();
-            target.receive_peer(&reply).unwrap();
+            target
+                .receive_peer(&reply, "8.1.1.1".parse().unwrap())
+                .unwrap();
             if target.read_view().unwrap().chain.tip_hash()
                 == source.read_view().unwrap().chain.tip_hash()
             {
@@ -8318,6 +8439,20 @@ mod peer_tests {
         );
         assert!(Node::blocks_after(&chain, &[[9; 32], codec::block_hash(&fork)]).is_err());
         assert!(Node::blocks_after(&chain, &[]).is_err());
+        // Only the shared run ending the locator is the recipient's active
+        // chain: a cursor that this node has active, listed before the
+        // recipient's own diverging tip, is not.
+        let at = |height| chain.hash_at_height(height).unwrap();
+        let cursor_first = [at(200), codec::block_hash(&fork), at(10), at(3)];
+        assert_eq!(
+            Node::shared_active_tip(&cursor_first, &[Some(200), None, Some(10), Some(3)]),
+            Some(at(10))
+        );
+        assert_eq!(
+            Node::shared_active_tip(&[at(5), at(10), at(3)], &[Some(5), Some(10), Some(3)]),
+            Some(at(10))
+        );
+        assert_eq!(Node::shared_active_tip(&[[9; 32]], &[None]), None);
     }
 
     #[test]
@@ -8404,7 +8539,7 @@ mod peer_tests {
     }
 
     #[test]
-    fn known_active_blocks_cannot_push_out_download_cursors() {
+    fn resent_stored_blocks_cannot_displace_another_sources_download_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::devnet();
         let node = Node::open(
@@ -8413,57 +8548,162 @@ mod peer_tests {
             crypto::public_key(&[63; 32]).unwrap(),
         )
         .unwrap();
-        let mut known = Vec::new();
-        for _ in 0..64 {
+        let other = crypto::public_key(&[64; 32]).unwrap();
+        let sibling = |node: &Node| {
+            let i = node.locked().unwrap();
+            let template = i
+                .chain
+                .template(other, vec![], Node::timestamp(&i.chain))
+                .unwrap();
+            Chain::mine(template, 100_000).unwrap()
+        };
+        // Each stale block is a stored sibling of an active block, so none is
+        // another's parent.
+        let (mut known, mut stale) = (Vec::new(), Vec::new());
+        for _ in 0..2 * MAX_BATCH + 1 {
+            let block = sibling(&node);
             known.push(node.mine(100_000).unwrap());
+            assert!(!node.submit_block(block.clone()).unwrap());
+            stale.push(block);
         }
-        let cursor = [7; 32];
+        let honest: IpAddr = "8.1.1.1".parse().unwrap();
+        let attacker: IpAddr = "9.1.1.1".parse().unwrap();
+        // The honest cursor is a stored side block the attacker never sends;
+        // a request drops cursors the chain does not know.
+        let cursor = Download {
+            hash: codec::block_hash(&stale.pop().unwrap()),
+            source: network_guard::peer_source(honest),
+        };
         node.locked().unwrap().downloads.push_back(cursor);
-        // Non-adjacent known canonical blocks need no proof of work to resend.
-        let resent = known.iter().step_by(2).take(MAX_BATCH).cloned().collect();
-        let message = PeerMessage {
+        let message = |blocks: &[Block]| PeerMessage {
             chain: config.chain_id(),
             locator: vec![],
-            blocks: resent,
+            blocks: blocks.to_vec(),
             transactions: vec![],
         };
-        node.receive_peer(&message).unwrap();
-        node.receive_peer(&message).unwrap();
-        assert_eq!(
+        let downloads = || {
             node.locked()
                 .unwrap()
                 .downloads
                 .iter()
                 .copied()
-                .collect::<Vec<_>>(),
-            [cursor]
+                .collect::<Vec<_>>()
+        };
+        // Stored blocks need no proof of work to resend. Active ones never
+        // become cursors.
+        let resent: Vec<_> = known.iter().step_by(2).take(MAX_BATCH).cloned().collect();
+        for _ in 0..2 {
+            node.receive_peer(&message(&resent), attacker).unwrap();
+        }
+        assert_eq!(downloads(), [cursor]);
+        // 64 non-adjacent stored side blocks, sent repeatedly by one source,
+        // displace only that source's own cursors.
+        for _ in 0..2 {
+            for batch in stale.chunks(MAX_BATCH) {
+                node.receive_peer(&message(batch), attacker).unwrap();
+            }
+        }
+        let held = downloads();
+        assert_eq!(held.len(), MAX_CONNECTIONS);
+        assert!(held.contains(&cursor));
+        assert!(
+            held.iter()
+                .all(|d| *d == cursor || d.source == network_guard::peer_source(attacker))
         );
-        // A stored competing-branch block still restores its branch cursor.
-        let mut side = Chain::open(&dir.path().join("side.db"), config.clone()).unwrap();
-        let fork = advance(&mut side, crypto::public_key(&[64; 32]).unwrap());
-        node.submit_block(fork.clone()).unwrap();
-        node.receive_peer(&PeerMessage {
-            blocks: vec![fork.clone()],
-            ..message.clone()
-        })
-        .unwrap();
+        // A linked reply of known active blocks marks where its sender's
+        // chain continues, but never displaces a competing-branch cursor.
+        node.receive_peer(&message(&known[..MAX_BATCH]), attacker).unwrap();
+        assert_eq!(downloads(), held);
+        // The honest source resending a stored side block, as after a
+        // restart, still records its own cursor for it.
+        node.receive_peer(&message(&stale[..1]), honest).unwrap();
+        let held = downloads();
         assert_eq!(
-            node.locked().unwrap().downloads.front(),
-            Some(&codec::block_hash(&fork))
+            held[0],
+            Download {
+                hash: codec::block_hash(&stale[0]),
+                source: network_guard::peer_source(honest),
+            }
         );
+        assert!(held.contains(&cursor));
+        // A request lists each cursor once, before the complete active locator.
+        let locator = node.peer_snapshot(None).unwrap().locator;
+        assert!(locator.ends_with(&Node::locator(&node.locked().unwrap().chain)));
+        assert_eq!(locator.iter().filter(|h| **h == held[0].hash).count(), 1);
+        assert!(locator.contains(&cursor.hash));
         // A block missing its own proof of work is rejected before validation.
-        let mut invalid = side.tip_block().clone();
+        let mut invalid = sibling(&node);
         let target = math::target_from_bits(invalid.header.bits).unwrap();
         while math::check_pow(&invalid.header, &target).is_ok() {
             invalid.header.nonce = invalid.header.nonce.wrapping_add(1);
         }
-        let error = node
-            .receive_peer(&PeerMessage {
-                blocks: vec![invalid],
-                ..message
-            })
-            .unwrap_err();
+        let error = node.receive_peer(&message(&[invalid]), honest).unwrap_err();
         assert!(error.to_string().contains("proof of work"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_frame_holds_only_the_memory_its_bytes_used() {
+        let guard = Arc::new(NetworkGuard::default());
+        let session = guard
+            .admit("127.0.0.1".parse().unwrap(), Surface::Peer)
+            .unwrap();
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let mut reader = BufReader::new(reader);
+        // Declare a 3 MiB frame, send 10,000 of its bytes, then stall.
+        writer
+            .write_all(&(3u32 * 1024 * 1024).to_be_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&[0; 10_000]).await.unwrap();
+        let read = read_peer_frame(&mut reader, 4 * 1024 * 1024, &session);
+        assert!(timeout(Duration::from_millis(200), read).await.is_err());
+        // Only received bytes, in whole read chunks, hold the shared budget.
+        let held = guard.frame_memory_in_use();
+        assert!((10_000..=16 * 1024).contains(&held), "{held}");
+        drop(session);
+        assert_eq!(guard.frame_memory_in_use(), 0);
+        drop(writer);
+    }
+
+    #[test]
+    fn download_cursors_are_kept_per_source() {
+        let hash = |n: u32| {
+            let mut hash = [0; 32];
+            hash[..4].copy_from_slice(&n.to_be_bytes());
+            hash
+        };
+        let (a, b) = (IpAddr::from([8, 1, 0, 0]), IpAddr::from([9, 1, 0, 0]));
+        let first = Download {
+            hash: hash(2),
+            source: a,
+        };
+        let mut downloads = VecDeque::new();
+        // A source advances its own cursor along a branch.
+        note_download(&mut downloads, hash(1), hash(0), a);
+        note_download(&mut downloads, hash(2), hash(1), a);
+        assert_eq!(downloads, [first]);
+        // Another source extending that block, or sending it again, adds its
+        // own cursor and leaves the first source's in place.
+        note_download(&mut downloads, hash(3), hash(2), b);
+        note_download(&mut downloads, hash(2), hash(1), b);
+        assert_eq!(downloads.len(), 3);
+        assert!(downloads.contains(&first));
+        // A flooding source displaces others only down to its own count.
+        downloads.clear();
+        for n in 0..MAX_CONNECTIONS as u32 {
+            note_download(&mut downloads, hash(n), hash(n + 10_000), a);
+        }
+        for n in 0..1_000 {
+            note_download(&mut downloads, hash(n + 20_000), hash(n + 30_000), b);
+        }
+        assert_eq!(downloads.len(), MAX_CONNECTIONS);
+        let from_a = downloads.iter().filter(|d| d.source == a).count();
+        assert_eq!(from_a, MAX_CONNECTIONS / 2);
+        // The newest cursors survive.
+        assert!(downloads.contains(&Download {
+            hash: hash(MAX_CONNECTIONS as u32 - 1),
+            source: a,
+        }));
     }
 
     #[test]
@@ -8480,14 +8720,38 @@ mod peer_tests {
         drop(last);
         assert!(!ids.lock().unwrap().live.contains(&u32::MAX));
         use std::io::{Error, ErrorKind};
-        let reset = Error::from(ErrorKind::ConnectionReset);
-        assert_eq!(accept_retry_delay(&reset, 0), Duration::ZERO);
-        assert_eq!(accept_retry_delay(&reset, 64), Duration::from_millis(1000));
+        // A sustained flood of reset or aborted connections never slows the
+        // listener: each such error is one client's queued connection.
+        let mut failures = 0;
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionRefused,
+        ] {
+            for _ in 0..10_000 {
+                assert_eq!(
+                    accept_retry_delay(&Error::from(kind), &mut failures),
+                    Duration::ZERO
+                );
+            }
+        }
+        assert_eq!(failures, 0);
         let exhausted = Error::other("too many open files");
-        assert_eq!(accept_retry_delay(&exhausted, 0), Duration::from_millis(10));
-        assert_eq!(accept_retry_delay(&exhausted, 3), Duration::from_millis(80));
+        let delays: Vec<_> = (0..9)
+            .map(|_| accept_retry_delay(&exhausted, &mut failures).as_millis())
+            .collect();
+        assert_eq!(delays, [10, 20, 40, 80, 160, 320, 640, 1000, 1000]);
+        // Interrupted calls retry at once, but cannot spin without bound.
+        let mut interrupted = 0;
+        let interrupt = Error::from(ErrorKind::Interrupted);
+        for _ in 0..64 {
+            assert_eq!(
+                accept_retry_delay(&interrupt, &mut interrupted),
+                Duration::ZERO
+            );
+        }
         assert_eq!(
-            accept_retry_delay(&exhausted, 30),
+            accept_retry_delay(&interrupt, &mut interrupted),
             Duration::from_millis(1000)
         );
         assert!(sync_completed(&Ok(())));
@@ -8556,7 +8820,7 @@ mod peer_tests {
         );
         let mut empty: &[u8] = &[];
         assert!(
-            read_peer_packet(&mut empty, &node, &b, &mut failed, PeerRead::Ack)
+            read_peer_packet(&mut empty, &node, &b, &mut failed, PeerRead::Ack, None)
                 .await
                 .is_err()
         );

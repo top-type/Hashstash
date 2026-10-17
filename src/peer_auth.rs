@@ -2,7 +2,7 @@
 //! Frames are signed, not encrypted. Never use a spending key as a peer identity.
 use crate::{
     crypto,
-    network_guard::Session,
+    network_guard::{Busy, Session},
     types::{Hash, PublicKey},
 };
 use anyhow::{Context, Result, ensure};
@@ -29,6 +29,8 @@ const SESSION_TAG: &str = "Hashstash/PeerSession";
 const FRAME_TAG: &str = "Hashstash/PeerFrame";
 const KEY_FORMAT: &str = "hashstash-peer-v1";
 const FRAME_HEADER: usize = 4 + 8 + 64;
+/// Wait for a shared verification worker, as for other peer workers.
+const VERIFY_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Clone, Debug)]
 pub struct PeerPin {
@@ -245,10 +247,19 @@ fn read_key(path: &Path) -> Result<[u8; 32]> {
     );
     // Read through one handle, and require that handle to be the regular file
     // inspected above: a path swapped for a symbolic link in between fails.
-    let file = fs::File::open(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT opens a symbolic link or junction
+        // itself rather than its target, so the checks below reject it.
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(path)?;
     let opened = file.metadata()?;
     ensure!(
-        opened.is_file() && opened.len() <= 512,
+        opened.is_file() && !opened.file_type().is_symlink() && opened.len() <= 512,
         "invalid peer key file"
     );
     #[cfg(unix)]
@@ -490,9 +501,21 @@ impl Channel {
         admission: &Session,
         workers: Arc<Semaphore>,
     ) -> Result<Vec<u8>> {
+        let frame = self.receive(read, max, admission).await?;
+        self.open(frame, admission, workers).await
+    }
+    /// Read one signed frame. Only the peer's input is awaited, so a
+    /// deadline on this step measures the peer alone.
+    pub async fn receive<R: AsyncRead + Unpin>(
+        &self,
+        read: &mut R,
+        max: usize,
+        admission: &Session,
+    ) -> Result<SealedFrame> {
         let mut header = [0u8; FRAME_HEADER];
         read.read_exact(&mut header).await?;
         admission.bytes(header.len())?;
+        admission.begin_frame()?;
         let length = u32::from_be_bytes(header[..4].try_into()?) as usize;
         ensure!(
             length > 0 && length <= max,
@@ -504,18 +527,43 @@ impl Channel {
             "peer frame replay or sequence mismatch"
         );
         let signature = header[12..].try_into()?;
-        admission.reserve_frame(length)?;
         let mut bytes = Vec::with_capacity(length.min(8192));
         let mut chunk = [0u8; 8192];
         while bytes.len() < length {
             let take = chunk.len().min(length - bytes.len());
+            admission.reserve_frame(take)?;
             read.read_exact(&mut chunk[..take]).await?;
             admission.bytes(take)?;
             bytes.extend_from_slice(&chunk[..take]);
         }
+        Ok(SealedFrame {
+            sequence,
+            signature,
+            bytes,
+        })
+    }
+    /// Verify a received frame on a bounded worker. Waiting for a worker is
+    /// local capacity and fails as `Busy`; a bad signature is the peer's.
+    pub async fn open(
+        &mut self,
+        frame: SealedFrame,
+        admission: &Session,
+        workers: Arc<Semaphore>,
+    ) -> Result<Vec<u8>> {
+        ensure!(
+            frame.sequence == self.receive,
+            "peer frame replay or sequence mismatch"
+        );
         admission.work(1)?;
-        let permit = workers.acquire_owned().await?;
+        let permit = tokio::time::timeout(VERIFY_WAIT, workers.acquire_owned())
+            .await
+            .map_err(|_| Busy("peer authentication workers busy"))??;
         let (session, role, key) = (self.session, 1 - self.send_role, self.remote);
+        let SealedFrame {
+            sequence,
+            signature,
+            bytes,
+        } = frame;
         let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
             let _permit = permit;
             verify(
@@ -533,6 +581,12 @@ impl Channel {
             .context("peer receive sequence exhausted")?;
         Ok(bytes)
     }
+}
+/// A signed frame that has been read but not yet verified.
+pub struct SealedFrame {
+    sequence: u64,
+    signature: [u8; 64],
+    bytes: Vec<u8>,
 }
 
 #[cfg(test)]

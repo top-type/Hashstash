@@ -179,12 +179,15 @@ fn relay_selects_and_publishes_only_for_new_admissible_entries() {
     assert_eq!(published(&node), revision);
     let deliver = |transactions: Vec<Transaction>| {
         signatures();
-        node.receive_peer(&PeerMessage {
-            chain: config.chain_id(),
-            locator: Vec::new(),
-            blocks: Vec::new(),
-            transactions,
-        })
+        node.receive_peer(
+            &PeerMessage {
+                chain: config.chain_id(),
+                locator: Vec::new(),
+                blocks: Vec::new(),
+                transactions,
+            },
+            "127.0.0.1".parse().unwrap(),
+        )
         .unwrap();
         signatures()
     };
@@ -474,12 +477,15 @@ fn a_selection_cut_short_by_block_finishing_keeps_its_tail_pending() {
     // Finishing now fails for more than two transactions, so the relay's
     // reselection keeps a finishing prefix of the accepted set.
     crate::chain::FAIL_FINISH_ABOVE.with(|limit| limit.set(Some(2)));
-    let relayed = node.receive_peer(&PeerMessage {
-        chain: config.chain_id(),
-        locator: Vec::new(),
-        blocks: Vec::new(),
-        transactions: vec![pending[5].clone()],
-    });
+    let relayed = node.receive_peer(
+        &PeerMessage {
+            chain: config.chain_id(),
+            locator: Vec::new(),
+            blocks: Vec::new(),
+            transactions: vec![pending[5].clone()],
+        },
+        "127.0.0.1".parse().unwrap(),
+    );
     crate::chain::FAIL_FINISH_ABOVE.with(|limit| limit.set(None));
     relayed.unwrap();
     let (selected, backlog, _) = pool(&node);

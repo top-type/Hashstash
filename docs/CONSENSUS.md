@@ -82,7 +82,7 @@ For each block, physical expected work is W = floor(2^256 / (target + 1)). Produ
 
 ## Accounts, reserve and governance
 
-State uses persistent authenticated maps. The deterministic treap has priorities derived from keys, canonical roots independent of insertion order, and shared immutable subtrees. Account updates copy changed paths rather than cloning all accounts. Account field order is ordinary:Amount, shares:Amount, nonce:u64, epoch:u64. Each outcome's cash is its ordinary field; there is no extra conditional balance field. Public-key bytes are the map key, not an extra account field.
+State uses persistent authenticated maps. The deterministic treap has priorities derived from keys, canonical roots independent of insertion order, and shared immutable subtrees. Account updates copy changed paths rather than cloning all accounts. Priorities are public and many keys are user-chosen, so depth is logarithmic only in expectation: ground keys can build one arbitrarily deep path. Implementations must therefore not recurse per tree level, including when freeing or restoring a map. Account field order is ordinary:Amount, shares:Amount, nonce:u64, epoch:u64. Each outcome's cash is its ordinary field; there is no extra conditional balance field. Public-key bytes are the map key, not an extra account field.
 
 The account `epoch` is internal bookkeeping for governance context. Each decision increments `last_epoch`; account reads normalize the returned tag to that decision's number, or zero outside a decision. Stored records retain the context used when written. Changing this tag does not change a balance, mint funds or perform the PASS/FAIL split: the two account-tree roots hold those alternatives. The field participates in the account commitment and its stored value cannot exceed `last_epoch`. It is not a Unix timestamp.
 
@@ -96,6 +96,8 @@ Amount-only Deposit and Redeem operations are reserved from opening balances and
 
 Decision fields are id, epoch, round, proposal_id, proposal, started (scheduled clock), started_height, blocks, leading_blocks. The last three are u64. The opening height plus blocks is the resolution height; the observation occurs before that block’s transactions.
 
+A proposal ID is tagged_hash("Hashstash/proposal", encode((chain_id, round, proposer, description, proposal))), where proposer is the sender of the registering Propose. Proposal record fields are round, proposer, description, action, support, refund_height. A sender can register a given ID once; an identical Propose from another sender registers a separate proposal, so copying a pending Propose cannot invalidate it or replace its attached data.
+
 ## State commitments
 
 World root is tagged_hash("Hashstash/world", encode((accounts.root(), reserve, shares, revenue, grant_escrow, curve_mass, account_cash, account_shares))). Each dynamic curve field is committed.
@@ -108,7 +110,7 @@ Tree domains are Hashstash/TreeEmpty, Hashstash/TreeValue, Hashstash/TreePriorit
 
 The Bitcoin-style header is 80 bytes: version:u32 at offset 0, previous digest[32] at 4, Merkle root[32] at 36, timestamp:u32 at 68, bits:u32 at 72, nonce:u32 at 76. Integers are little endian; digest bytes are raw. Fixed version bits are 0x20000005, with rolling mask 0x1fffe000. Outside that mask the version must match exactly.
 
-The sole Merkle leaf is a Bitcoin-serialized system coinbase. It has transaction version 1, one zero-prevout input (index and sequence 0xffffffff), a minimally encoded height plus PUSH8 and eight extranonce bytes, one zero-value output, and locktime 0. Its output script is OP_RETURN, PUSH68, ASCII HST!, miner key[32], commitment[32]. The commitment is tagged_hash("Hashstash/block-commitment", encode((transactions,state_root))). There is no optional proof field or padding. Coinbase transaction counts and script lengths use canonical CompactSize.
+The sole Merkle leaf is a Bitcoin-serialized system coinbase. It has transaction version 1, one zero-prevout input (index and sequence 0xffffffff), a minimally encoded height plus PUSH8 and eight extranonce bytes, one zero-value output, and locktime 0. The height is a Bitcoin script-number push, as `CScript() << height` builds it: OP_0 (0x00) for 0, OP_1..OP_16 (0x51..0x60) for 1..16, and otherwise a length byte followed by the minimal little-endian magnitude, with a 0x00 byte appended when its top bit is set. For example 17 is 01 11, 128 is 02 80 00 and 32768 is 03 00 80 00; a length-prefixed push such as 01 05 is not valid for heights 1..16. Its output script is OP_RETURN, PUSH68, ASCII HST!, miner key[32], commitment[32]. The commitment is tagged_hash("Hashstash/block-commitment", encode((transactions,state_root))). There is no optional proof field or padding. Coinbase transaction counts and script lengths use canonical CompactSize.
 
 The header Merkle root is SHA256d of this coinbase, so Stratum supplies an empty Merkle branch. The complete ordered signed transaction vector is bound inside the commitment. Verifying that commitment needs the full vector; it does not provide short transaction-inclusion proofs.
 

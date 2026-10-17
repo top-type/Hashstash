@@ -59,6 +59,7 @@ fn governance_snapshot_keeps_current_proposal_after_more_than_one_page_of_histor
         largest_old = largest_old.max(state::proposal_id(
             &config.chain_id(),
             0,
+            &public,
             &description,
             &proposal,
         ));
@@ -86,7 +87,7 @@ fn governance_snapshot_keeps_current_proposal_after_more_than_one_page_of_histor
         .find_map(|index| {
             let mut description = [0; 32];
             description[..4].copy_from_slice(&index.to_le_bytes());
-            let id = state::proposal_id(&config.chain_id(), 1, &description, &proposal);
+            let id = state::proposal_id(&config.chain_id(), 1, &public, &description, &proposal);
             (id > largest_old).then_some((description, id))
         })
         .expect("description search exhausted");

@@ -95,7 +95,8 @@ fn main() -> Result<()> {
         new: old * 2,
     };
     let description = [7; 32];
-    let proposal = state::proposal_id(&config.chain_id(), round, &description, &action);
+    let proposer = crypto::public_key(&OWNER)?;
+    let proposal = state::proposal_id(&config.chain_id(), round, &proposer, &description, &action);
     node.submit_transaction(signed(
         &node,
         Operation::Propose {

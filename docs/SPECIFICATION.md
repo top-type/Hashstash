@@ -116,7 +116,7 @@ Grants reduce withdrawal backing while preserving the price at that moment. Reve
 
 ## 5 Proposals and auctions
 
-Anyone with a funded account can propose a grant or one permitted setting change and contribute a positive auction bid. Further Support transactions add bids to a proposal. The highest total bid must remain leader for the frozen lead period; ties and bounded cancellation rules are deterministic. An auction timeout enters rest without a decision.
+Anyone with a funded account can propose a grant or one permitted setting change and contribute a positive auction bid. Further Support transactions add bids to a proposal. The highest total bid must remain leader for the frozen lead period; ties and bounded cancellation rules are deterministic. A proposal ID binds the account that registered it, so a copied pending proposal becomes a separate proposal. An equal bid does not displace the current leader; otherwise the lowest proposal ID wins a tie. Proposers can grind their IDs, so this rule gives no fairness guarantee: anyone can break a tie with a one-atom Support. An auction timeout enters rest without a decision.
 
 The winning proposal's full bid becomes revenue even if the later decision rejects it. Losing contributions become refundable through signed Refund transactions; they are not automatically pushed to every contributor. Refund eligibility is recorded by round and proposal. Proposals with invalid activation conditions are cancelled under the auction rules.
 

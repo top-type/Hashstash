@@ -3700,13 +3700,15 @@ mod capacity_work_tests {
         let records: Vec<_> = (0..3)
             .map(|round| crate::state::ProposalRecord {
                 round,
+                proposer: recipient,
                 description: [44; 32],
                 action: Proposal::Grant {
                     payments: vec![GrantPayment {
                         recipient,
                         amount: 1u32.into(),
                     }],
-                },
+                }
+                .into(),
                 support: 1u32.into(),
                 refund_height: None,
             })
@@ -5007,7 +5009,8 @@ mod tests {
                 parameter: Parameter::BlockBytes,
                 old: 1_048_576,
                 new: 2_097_152,
-            },
+            }
+            .into(),
             started: 0,
             started_height: 0,
             blocks: 64,
@@ -5066,7 +5069,8 @@ mod tests {
                 parameter: Parameter::BlockBytes,
                 old: 1_048_576,
                 new: 2_097_152,
-            },
+            }
+            .into(),
             started: 0,
             started_height: 0,
             blocks: 64,
@@ -5377,7 +5381,8 @@ mod tests {
                 parameter: Parameter::BlockBytes,
                 old: 1_048_576,
                 new: 2_097_152,
-            },
+            }
+            .into(),
             started: 0,
             started_height: 0,
             blocks: 64,
@@ -5532,7 +5537,7 @@ mod tests {
         // A 100% downward movement allowance permits emptying a curve.
         let s = Arc::make_mut(&mut view.chain.state);
         s.settings.max_price_change_bps = 10_000;
-        s.world.accounts = crate::tree::Map::new();
+        s.world.accounts = Default::default();
         s.world.account_cash = 0u32.into();
         s.world.account_shares = 0u32.into();
         a.shares = s.world.shares.clone();

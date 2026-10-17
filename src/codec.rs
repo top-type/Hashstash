@@ -29,6 +29,10 @@ pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
         .expect("consensus serialization is infallible")
 }
 
+/// Decode exactly one canonical record: re-encoding must reproduce `bytes`.
+/// Declared collection lengths are bounded only by the input size, so a hostile
+/// length can make a standard collection reserve serde's cautious maximum (1 MiB)
+/// before the decode fails. Peer records are structurally preflighted first.
 pub fn decode<T: DeserializeOwned + Serialize>(bytes: &[u8], max: usize) -> Result<T> {
     ensure!(bytes.len() <= max, "encoded record exceeds limit");
     let available = u64::try_from(bytes.len())?;
@@ -99,6 +103,9 @@ fn compact_size(value: u64, out: &mut Vec<u8>) {
     }
 }
 
+/// Bitcoin script-number push of the height, as `CScript() << height` builds it:
+/// OP_0 for 0, OP_1..OP_16 (0x51..0x60) for 1..16, otherwise a length byte and
+/// the minimal little-endian magnitude, plus a zero byte if its top bit is set.
 fn height_script(height: u64) -> Vec<u8> {
     if height == 0 {
         return vec![0];
@@ -438,6 +445,38 @@ mod tests {
         header.version ^= 4;
         assert!(!is_current_header(&header));
     }
+    #[test]
+    fn coinbase_heights_use_bitcoin_script_number_pushes() {
+        for (height, script) in [
+            (0, "00"),
+            (1, "51"),
+            (16, "60"),
+            (17, "0111"),
+            (127, "017f"),
+            (128, "028000"),
+            (255, "02ff00"),
+            (256, "020001"),
+            (32_767, "02ff7f"),
+            (32_768, "03008000"),
+            (8_388_607, "03ffff7f"),
+            (8_388_608, "0400008000"),
+            (u32::MAX as u64, "05ffffffff00"),
+        ] {
+            assert_eq!(
+                hex::encode(height_script(height)),
+                script,
+                "height {height}"
+            );
+        }
+        // Version, one input, zero prevout, index, scriptSig length, height
+        // push, then PUSH8 for the extranonce.
+        let input = format!("0100000001{}ffffffff", "00".repeat(32));
+        for (height, tail) in [(1, "0a5108"), (16, "0a6008"), (17, "0b011108")] {
+            let (prefix, _) = coinbase_parts(height, &[1; 32], &[2; 32]);
+            assert_eq!(hex::encode(prefix), format!("{input}{tail}"));
+        }
+    }
+
     #[test]
     fn coinbase_only_tree_and_body_count_boundary() {
         for count in [0, 1, 2, 3, 251, 252, 1024] {

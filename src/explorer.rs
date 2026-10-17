@@ -1311,6 +1311,7 @@ fn index_block(
                 let id = hex::encode(crate::state::proposal_id(
                     &chain_id,
                     *round,
+                    &t.body.sender,
                     description,
                     proposal,
                 ));
@@ -1360,7 +1361,7 @@ fn index_block(
     {
         let record = decision_record(c, parent, Some(b.height))?;
         if record["outcome"] == "pass"
-            && let Proposal::Grant { payments } = &d.proposal
+            && let Proposal::Grant { payments } = &*d.proposal
         {
             for (index, payment) in payments.iter().enumerate() {
                 let event = json!({"height":b.height,"block_hash":hash_text,"kind":"governance_grant","amount":payment.amount.to_str_radix(10),"asset":"hash","decision":hex::encode(d.id),"proposal":hex::encode(d.proposal_id),"outcome":"pass","payout_index":index});
@@ -1428,7 +1429,7 @@ fn decision_record(c: &Config, s: &State, ended_height: Option<u64>) -> Result<V
             leading += 1;
         }
     }
-    let funded = match &d.proposal {
+    let funded = match &*d.proposal {
         Proposal::Grant { payments } => pass.grant_escrow == c.validate_grant(payments)?,
         _ => true,
     };
@@ -1647,7 +1648,8 @@ mod indexing_tests {
                 parameter: Parameter::Lead,
                 old: 1,
                 new: 2,
-            },
+            }
+            .into(),
             started: 5,
             started_height: 5,
             blocks: 3,

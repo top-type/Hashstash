@@ -159,10 +159,12 @@ mod windows {
             .creation_flags(CREATE_NO_WINDOW)
             .output()
             .with_context(|| format!("cannot run {tool}"))?;
+        // icacls reports some failures on standard output.
         anyhow::ensure!(
             output.status.success(),
-            "{tool} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            "{tool} failed: {} {}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+            String::from_utf8_lossy(&output.stdout).trim()
         );
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }

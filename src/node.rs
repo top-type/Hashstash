@@ -977,6 +977,8 @@ impl InvalidNonces {
         }
     }
 }
+/// A next-block selection and its capacity-displaced backlog.
+type Pool = (Vec<Transaction>, Vec<Transaction>);
 /// What a selection left of the next block, by the selection's own body
 /// accounting with one further record, and which senders it left undecided.
 struct Room {
@@ -3186,7 +3188,7 @@ impl Node {
         candidates: &[Transaction],
         retained: &HashSet<Hash>,
         authenticated: &HashSet<Hash>,
-    ) -> Result<(Vec<Transaction>, Vec<Transaction>)> {
+    ) -> Result<Pool> {
         Self::select_pool_room(chain, miner, candidates, retained, authenticated)
             .map(|(pool, _)| pool)
     }
@@ -3197,7 +3199,7 @@ impl Node {
         candidates: &[Transaction],
         retained: &HashSet<Hash>,
         authenticated: &HashSet<Hash>,
-    ) -> Result<((Vec<Transaction>, Vec<Transaction>), Room)> {
+    ) -> Result<(Pool, Room)> {
         let selection = chain.select_admission(
             miner,
             candidates,

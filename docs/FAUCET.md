@@ -46,11 +46,11 @@ same in every display language), lets in any account other than the faucet's
 own, SYSTEM and Administrators; inherited entries count, so a key copied into
 a folder that lets Users read is refused until it is restricted again
 (`keygen` sets an owner-only list), and so is one on a FAT or exFAT volume,
-which holds no access list. The key is
-read through the one opened handle those checks inspected, so a path replaced in
-between is refused: on Unix the handle must have the inspected device and inode,
-and on Windows the path is opened without following a symbolic link or
-junction, which is then refused. The access list is read by path after that.
+which holds no access list. The key is read through the one opened handle the
+other checks inspected, so a path replaced in between is refused: on Unix the
+handle must have the inspected device and inode, and on Windows the path is
+opened without following a symbolic link or junction, which is then refused.
+The Windows access list is read by path after that.
 The node's peer identity files use the same reader. Parsed copies of the
 secret are wiped, and stored subnet digests use a key derived from the signer,
 never the signing key itself.

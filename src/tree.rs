@@ -539,7 +539,10 @@ impl<V: Clone + Serialize> Map<V> {
 
     pub fn remove(&mut self, key: &[u8]) -> Option<V> {
         let (index, entry) = index_remove(&self.index, key)?;
-        self.trie = self.trie.as_ref().and_then(|trie| trie_remove(trie, &entry));
+        self.trie = self
+            .trie
+            .as_ref()
+            .and_then(|trie| trie_remove(trie, &entry));
         self.index = index;
         Some((*entry.value).clone())
     }
@@ -710,7 +713,10 @@ mod tests {
         }
         leaves.sort();
         let keys: Vec<_> = map.iter().map(|(k, _)| k.to_vec()).collect();
-        assert_eq!(leaves.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), keys);
+        assert_eq!(
+            leaves.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+            keys
+        );
         assert_eq!(map.len(), keys.len());
         let rebuilt: Map<u64> = codec::decode(&codec::encode(map), usize::MAX).unwrap();
         assert_eq!(rebuilt.root(), map.root());
@@ -915,7 +921,10 @@ mod tests {
         let mut path = [0u8; 32];
         path[0] = 0b1000_0000;
         path[31] = 1;
-        assert_eq!((side(&path, 0), side(&path, 1), side(&path, 255)), (1, 0, 1));
+        assert_eq!(
+            (side(&path, 0), side(&path, 1), side(&path, 255)),
+            (1, 0, 1)
+        );
         let mut other = path;
         assert_eq!(first_difference(&path, &other), None);
         other[31] = 0;

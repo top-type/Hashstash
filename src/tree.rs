@@ -1,56 +1,447 @@
 //! Persistent authenticated ordered map.
 //!
-//! The binary-search shape is the unique Cartesian tree of `(SHA256-tagged(key),
-//! key)` priorities. Thus insertion order and snapshot restoration cannot change
-//! the root. Nodes are immutable, reference counted, and cache their commitment.
-//! Values are shared between versions, so cloning is constant time and an update
-//! copies only the nodes of its search path, not the values stored on it.
+//! The commitment is a binary Patricia trie over hashed keys: each key's path
+//! is `tagged_hash("Hashstash/TriePath", key)`, a lone entry is a leaf, and a
+//! branch records the first path bit in which its two subtrees differ. The
+//! trie of a key set is unique, so insertion order, removals and snapshot
+//! restoration cannot change the root. A branch tests a later bit than its
+//! parent, so no entry lies under more than 256 branches. Paths are hashes, so
+//! chosen keys cannot cheaply deepen one: sharing L more leading path bits
+//! with an existing key costs about 2^L hash evaluations.
 //!
-//! Priorities are public functions of keys, and many keys (account public keys,
-//! proposal identifiers) are chosen by users. Depth is therefore logarithmic only
-//! in expectation: ground keys can lengthen one path by a level per key. Every
-//! operation, including dropping and restoring a map, walks paths with explicit
-//! heap worklists, so no depth exhausts a thread stack. Work still follows
-//! depth: an update copies and rehashes one node per level of its path, so
-//! updates under a ground path cost time linear in its length.
+//! Hashed paths have no useful order, so lookups and key-ordered access use a
+//! separate, uncommitted index of the same entries: a weight-balanced search
+//! tree over key bytes, whose height is logarithmic in the number of entries
+//! for any keys and insertion order. Its shape depends on history, but no
+//! result does.
+//!
+//! Entries and nodes are immutable and reference counted, and each entry is
+//! shared by both structures. Cloning is constant time and an update copies
+//! one path in each, never the values stored on it. Walks use explicit
+//! worklists; the only recursion is bounded by those heights.
 
 use crate::{codec, crypto, types::Hash};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeSeq};
 use std::{cmp::Ordering, fmt, sync::Arc};
 
-type Link<V> = Option<Arc<Node<V>>>;
-
-struct Node<V> {
+/// One stored entry, shared by the trie and index of every version holding it.
+struct Entry<V> {
     key: Vec<u8>,
     value: Arc<V>,
-    value_hash: Hash,
-    priority: Hash,
-    left: Link<V>,
-    right: Link<V>,
-    len: usize,
-    root: Hash,
+    /// The entry's position in the trie.
+    path: Hash,
+    /// The leaf commitment.
+    hash: Hash,
 }
 
-impl<V> Drop for Node<V> {
-    /// The derived drop would recurse once per level. Detach uniquely owned
-    /// descendants first and free them from a worklist; shared subtrees only
-    /// lose a reference.
-    fn drop(&mut self) {
-        let mut pending = Vec::new();
-        for link in [self.left.take(), self.right.take()] {
-            pending.extend(link.and_then(Arc::into_inner));
+impl<V: Serialize> Entry<V> {
+    fn new(key: Vec<u8>, value: Arc<V>) -> Arc<Self> {
+        Arc::new(Self {
+            path: key_path(&key),
+            hash: leaf_hash(&key, &*value),
+            key,
+            value,
+        })
+    }
+}
+
+fn empty_root() -> Hash {
+    crypto::tagged_hash("Hashstash/TrieEmpty", &[])
+}
+
+fn key_path(key: &[u8]) -> Hash {
+    crypto::tagged_hash("Hashstash/TriePath", key)
+}
+
+fn leaf_hash<V: Serialize>(key: &[u8], value: &V) -> Hash {
+    crypto::tagged_hash("Hashstash/TrieLeaf", &codec::encode(&(key, value)))
+}
+
+fn branch_hash(bit: u8, left: &Hash, right: &Hash) -> Hash {
+    let mut bytes = [0; 65];
+    bytes[0] = bit;
+    bytes[1..33].copy_from_slice(left);
+    bytes[33..].copy_from_slice(right);
+    crypto::tagged_hash("Hashstash/TrieBranch", &bytes)
+}
+
+/// Bit `index` of a path, most significant bit of the first byte first: the
+/// child (0 or 1) that holds the path below a branch at that bit.
+fn side(path: &Hash, index: u8) -> usize {
+    usize::from(path[usize::from(index / 8)] >> (7 - index % 8) & 1)
+}
+
+/// The first bit in which two paths differ; `None` when they are equal.
+fn first_difference(a: &Hash, b: &Hash) -> Option<u8> {
+    a.iter().zip(b).enumerate().find_map(|(i, (x, y))| {
+        let differ = x ^ y;
+        if differ == 0 {
+            return None;
         }
-        while let Some(mut node) = pending.pop() {
-            for link in [node.left.take(), node.right.take()] {
-                pending.extend(link.and_then(Arc::into_inner));
-            }
+        // i < 32 and a nonzero byte has at most seven leading zeros, so the
+        // bit fits a byte.
+        Some((i * 8) as u8 + differ.leading_zeros() as u8)
+    })
+}
+
+/// A committed subtree.
+enum Trie<V> {
+    Leaf(Arc<Entry<V>>),
+    Branch(Arc<Branch<V>>),
+}
+
+impl<V> Clone for Trie<V> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Leaf(entry) => Self::Leaf(entry.clone()),
+            Self::Branch(branch) => Self::Branch(branch.clone()),
         }
     }
 }
 
-#[derive(Clone)]
+struct Branch<V> {
+    /// The first path bit in which the two subtrees differ. Every path below
+    /// `children[0]` has a zero there, every path below `children[1]` a one,
+    /// and all of them share the bits before it.
+    bit: u8,
+    children: [Trie<V>; 2],
+    hash: Hash,
+}
+
+impl<V> Trie<V> {
+    fn hash(&self) -> Hash {
+        match self {
+            Self::Leaf(entry) => entry.hash,
+            Self::Branch(branch) => branch.hash,
+        }
+    }
+
+    fn branch(bit: u8, children: [Self; 2]) -> Self {
+        let hash = branch_hash(bit, &children[0].hash(), &children[1].hash());
+        Self::Branch(Arc::new(Branch {
+            bit,
+            children,
+            hash,
+        }))
+    }
+}
+
+/// Copies a recorded trie path bottom-up. Each branch takes the new subtree
+/// on the side the path followed and keeps its other child.
+fn rebuild_trie<V>(path: Vec<(&Branch<V>, usize)>, mut child: Trie<V>) -> Trie<V> {
+    for (branch, side) in path.into_iter().rev() {
+        let other = branch.children[1 - side].clone();
+        let children = if side == 0 {
+            [child, other]
+        } else {
+            [other, child]
+        };
+        child = Trie::branch(branch.bit, children);
+    }
+    child
+}
+
+fn trie_insert<V>(root: Option<&Trie<V>>, entry: Arc<Entry<V>>) -> Trie<V> {
+    let Some(root) = root else {
+        return Trie::Leaf(entry);
+    };
+    // Following the new path ends at the entry whose path shares the longest
+    // prefix with it, so their first difference is where the new leaf joins.
+    let mut next = root;
+    let nearest = loop {
+        match next {
+            Trie::Leaf(leaf) => break leaf,
+            Trie::Branch(b) => next = &b.children[side(&entry.path, b.bit)],
+        }
+    };
+    let split = first_difference(&entry.path, &nearest.path);
+    // Every branch above the split bit is shared with that entry. No branch on
+    // this route tests the split bit itself: `nearest` would differ there.
+    let mut path = Vec::new();
+    let mut next = root;
+    while let Trie::Branch(b) = next
+        && split.is_none_or(|bit| b.bit < bit)
+    {
+        let side = side(&entry.path, b.bit);
+        path.push((b.as_ref(), side));
+        next = &b.children[side];
+    }
+    let child = match split {
+        // The same path, so (short of a SHA-256 collision) the same key:
+        // replace its leaf.
+        None => Trie::Leaf(entry),
+        Some(bit) => {
+            let side = side(&entry.path, bit);
+            let mut children = [next.clone(), Trie::Leaf(entry)];
+            if side == 0 {
+                children.swap(0, 1);
+            }
+            Trie::branch(bit, children)
+        }
+    };
+    rebuild_trie(path, child)
+}
+
+/// The trie without `entry`, which it holds; `None` once it is empty. The
+/// leaf's parent branch is replaced by the leaf's sibling.
+fn trie_remove<V>(root: &Trie<V>, entry: &Entry<V>) -> Option<Trie<V>> {
+    let mut path = Vec::new();
+    let mut next = root;
+    let leaf = loop {
+        match next {
+            Trie::Leaf(leaf) => break leaf,
+            Trie::Branch(b) => {
+                let side = side(&entry.path, b.bit);
+                path.push((b.as_ref(), side));
+                next = &b.children[side];
+            }
+        }
+    };
+    if leaf.key != entry.key {
+        // Unreachable without a SHA-256 collision between the two keys' paths.
+        return Some(root.clone());
+    }
+    let (parent, side) = path.pop()?;
+    Some(rebuild_trie(path, parent.children[1 - side].clone()))
+}
+
+/// Builds the trie of entries in one pass, hashing each branch once. `None`
+/// when two paths are equal, which needs a SHA-256 collision.
+fn build_trie<V>(mut entries: Vec<Arc<Entry<V>>>) -> Option<Option<Trie<V>>> {
+    entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    let mut entries = entries.into_iter();
+    let Some(first) = entries.next() else {
+        return Some(None);
+    };
+    // `open` holds the branches on the right edge, whose right subtrees are
+    // still growing, with ascending bits; `current` is the newest subtree.
+    let mut open: Vec<(u8, Trie<V>)> = Vec::new();
+    let mut previous = first.path;
+    let mut current = Trie::Leaf(first);
+    for entry in entries {
+        // Sorted paths: the previous one has a zero at `bit`, this one a one.
+        let bit = first_difference(&previous, &entry.path)?;
+        while let Some((open_bit, left)) = open.pop_if(|(open_bit, _)| *open_bit > bit) {
+            current = Trie::branch(open_bit, [left, current]);
+        }
+        open.push((bit, current));
+        previous = entry.path;
+        current = Trie::Leaf(entry);
+    }
+    while let Some((bit, left)) = open.pop() {
+        current = Trie::branch(bit, [left, current]);
+    }
+    Some(Some(current))
+}
+
+type Link<V> = Option<Arc<Node<V>>>;
+
+/// An index node. The index is weight balanced: unless a node has at most one
+/// descendant, neither child holds more than `DELTA` times the other's entries.
+struct Node<V> {
+    entry: Arc<Entry<V>>,
+    left: Link<V>,
+    right: Link<V>,
+    size: usize,
+}
+
+/// Balance parameters of Adams' weight-balanced trees as used by Haskell's
+/// `Data.Map`; (3, 2) is the integer pair proven to keep every tree balanced
+/// under single insertions and deletions (Hirai and Yamamoto, 2011). Each
+/// child then holds at most three quarters of its parent's entries, so the
+/// height is below 2.41 * log2(n + 1) + 2.
+const DELTA: usize = 3;
+const RATIO: usize = 2;
+
+fn size<V>(link: &Link<V>) -> usize {
+    link.as_ref().map_or(0, |n| n.size)
+}
+
+fn node<V>(entry: Arc<Entry<V>>, left: Link<V>, right: Link<V>) -> Arc<Node<V>> {
+    let size = 1 + size(&left) + size(&right);
+    Arc::new(Node {
+        entry,
+        left,
+        right,
+        size,
+    })
+}
+
+/// A node over subtrees that were balanced before one insertion or deletion
+/// below it, rotated once or twice if that left it out of balance.
+fn balance<V>(entry: Arc<Entry<V>>, left: Link<V>, right: Link<V>) -> Arc<Node<V>> {
+    let (l, r) = (size(&left), size(&right));
+    if l + r <= 1 {
+        node(entry, left, right)
+    } else if r > DELTA * l {
+        rotate_left(entry, left, right)
+    } else if l > DELTA * r {
+        rotate_right(entry, left, right)
+    } else {
+        node(entry, left, right)
+    }
+}
+
+fn rotate_left<V>(entry: Arc<Entry<V>>, left: Link<V>, right: Link<V>) -> Arc<Node<V>> {
+    let Some(r) = right.as_deref() else {
+        return node(entry, left, right);
+    };
+    match r.left.as_deref() {
+        Some(rl) if size(&r.left) >= RATIO * size(&r.right) => node(
+            rl.entry.clone(),
+            Some(node(entry, left, rl.left.clone())),
+            Some(node(r.entry.clone(), rl.right.clone(), r.right.clone())),
+        ),
+        _ => node(
+            r.entry.clone(),
+            Some(node(entry, left, r.left.clone())),
+            r.right.clone(),
+        ),
+    }
+}
+
+fn rotate_right<V>(entry: Arc<Entry<V>>, left: Link<V>, right: Link<V>) -> Arc<Node<V>> {
+    let Some(l) = left.as_deref() else {
+        return node(entry, left, right);
+    };
+    match l.right.as_deref() {
+        Some(lr) if size(&l.right) >= RATIO * size(&l.left) => node(
+            lr.entry.clone(),
+            Some(node(l.entry.clone(), l.left.clone(), lr.left.clone())),
+            Some(node(entry, lr.right.clone(), right)),
+        ),
+        _ => node(
+            l.entry.clone(),
+            l.left.clone(),
+            Some(node(entry, l.right.clone(), right)),
+        ),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Left,
+    Right,
+}
+
+/// Copies a recorded index path bottom-up, rebalancing each copied node.
+fn rebalance<V>(path: Vec<(&Node<V>, Direction)>, mut child: Link<V>) -> Link<V> {
+    for (n, direction) in path.into_iter().rev() {
+        child = Some(match direction {
+            Direction::Left => balance(n.entry.clone(), child, n.right.clone()),
+            Direction::Right => balance(n.entry.clone(), n.left.clone(), child),
+        });
+    }
+    child
+}
+
+fn index_insert<V>(root: &Link<V>, entry: Arc<Entry<V>>) -> Link<V> {
+    let mut path = Vec::new();
+    let mut next = root.as_deref();
+    while let Some(n) = next {
+        let direction = match entry.key.cmp(&n.entry.key) {
+            // Sizes are unchanged, so rebalancing the path rotates nothing.
+            Ordering::Equal => {
+                let replaced = node(entry, n.left.clone(), n.right.clone());
+                return rebalance(path, Some(replaced));
+            }
+            Ordering::Less => Direction::Left,
+            Ordering::Greater => Direction::Right,
+        };
+        path.push((n, direction));
+        next = match direction {
+            Direction::Left => n.left.as_deref(),
+            Direction::Right => n.right.as_deref(),
+        };
+    }
+    rebalance(path, Some(node(entry, None, None)))
+}
+
+/// The index without `key` and the entry removed, if it was present.
+fn index_remove<V>(root: &Link<V>, key: &[u8]) -> Option<(Link<V>, Arc<Entry<V>>)> {
+    let mut path = Vec::new();
+    let mut next = root.as_deref();
+    while let Some(n) = next {
+        let direction = match key.cmp(n.entry.key.as_slice()) {
+            Ordering::Equal => {
+                let joined = join(&n.left, &n.right);
+                return Some((rebalance(path, joined), n.entry.clone()));
+            }
+            Ordering::Less => Direction::Left,
+            Ordering::Greater => Direction::Right,
+        };
+        path.push((n, direction));
+        next = match direction {
+            Direction::Left => n.left.as_deref(),
+            Direction::Right => n.right.as_deref(),
+        };
+    }
+    None
+}
+
+/// Joins the two subtrees of a removed node, all of whose keys are ordered
+/// before and after each other, around an extreme entry of the larger one.
+fn join<V>(left: &Link<V>, right: &Link<V>) -> Link<V> {
+    match (left.as_deref(), right.as_deref()) {
+        (None, _) => right.clone(),
+        (_, None) => left.clone(),
+        (Some(l), Some(r)) => Some(if l.size > r.size {
+            let (last, rest) = remove_extreme(l, Direction::Right);
+            balance(last, rest, right.clone())
+        } else {
+            let (first, rest) = remove_extreme(r, Direction::Left);
+            balance(first, left.clone(), rest)
+        }),
+    }
+}
+
+/// Removes the first (`Left`) or last (`Right`) entry of a subtree.
+fn remove_extreme<V>(top: &Node<V>, direction: Direction) -> (Arc<Entry<V>>, Link<V>) {
+    let mut path = Vec::new();
+    let mut n = top;
+    loop {
+        let (inner, outer) = match direction {
+            Direction::Left => (&n.left, &n.right),
+            Direction::Right => (&n.right, &n.left),
+        };
+        match inner.as_deref() {
+            Some(child) => {
+                path.push((n, direction));
+                n = child;
+            }
+            None => return (n.entry.clone(), rebalance(path, outer.clone())),
+        }
+    }
+}
+
+/// A perfectly balanced index of key-ordered entries. Recursion depth is
+/// log2 of their number.
+fn build_index<V>(entries: &[Arc<Entry<V>>]) -> Link<V> {
+    if entries.is_empty() {
+        return None;
+    }
+    let middle = entries.len() / 2;
+    Some(node(
+        entries[middle].clone(),
+        build_index(&entries[..middle]),
+        build_index(&entries[middle + 1..]),
+    ))
+}
+
 pub struct Map<V> {
-    node: Link<V>,
+    /// The committed trie; `None` when the map is empty.
+    trie: Option<Trie<V>>,
+    /// The uncommitted index of the same entries in key order.
+    index: Link<V>,
+}
+
+impl<V> Clone for Map<V> {
+    fn clone(&self) -> Self {
+        Self {
+            trie: self.trie.clone(),
+            index: self.index.clone(),
+        }
+    }
 }
 
 impl<V: fmt::Debug> fmt::Debug for Map<V> {
@@ -59,184 +450,12 @@ impl<V: fmt::Debug> fmt::Debug for Map<V> {
     }
 }
 
-fn empty_root() -> Hash {
-    crypto::tagged_hash("Hashstash/TreeEmpty", &[])
-}
-
-fn root<V>(node: &Link<V>) -> Hash {
-    node.as_ref().map_or_else(empty_root, |node| node.root)
-}
-
-fn value_hash<V: Serialize>(value: &V) -> Hash {
-    crypto::tagged_hash("Hashstash/TreeValue", &codec::encode(value))
-}
-
-fn node_hash(key: &[u8], value: &Hash, left: &Hash, right: &Hash) -> Hash {
-    crypto::tagged_hash(
-        "Hashstash/TreeNode",
-        &codec::encode(&(key, value, left, right)),
-    )
-}
-
-fn key_priority(key: &[u8]) -> Hash {
-    crypto::tagged_hash("Hashstash/TreePriority", key)
-}
-
-impl<V> Node<V> {
-    fn with_priority(
-        key: Vec<u8>,
-        value: Arc<V>,
-        value_hash: Hash,
-        priority: Hash,
-        left: Link<V>,
-        right: Link<V>,
-    ) -> Arc<Self> {
-        let len = 1 + left.as_ref().map_or(0, |n| n.len) + right.as_ref().map_or(0, |n| n.len);
-        let root = node_hash(&key, &value_hash, &root(&left), &root(&right));
-        Arc::new(Self {
-            key,
-            value,
-            value_hash,
-            priority,
-            left,
-            right,
-            len,
-            root,
-        })
-    }
-
-    fn rebuild(&self, left: Link<V>, right: Link<V>) -> Arc<Self> {
-        Self::with_priority(
-            self.key.clone(),
-            self.value.clone(),
-            self.value_hash,
-            self.priority,
-            left,
-            right,
-        )
-    }
-
-    fn precedes(&self, other: &Self) -> bool {
-        (self.priority, &self.key) < (other.priority, &other.key)
-    }
-
-    fn child(&self, direction: Direction) -> Option<&Arc<Self>> {
-        match direction {
-            Direction::Left => self.left.as_ref(),
-            Direction::Right => self.right.as_ref(),
-        }
-    }
-}
-
-/// Copies a recorded search path bottom-up. Each ancestor takes the new
-/// subtree on the side the search followed and keeps its other child.
-fn rebuild_path<V>(path: Vec<(&Node<V>, Direction)>, mut child: Link<V>) -> Link<V> {
-    for (n, direction) in path.into_iter().rev() {
-        child = Some(match direction {
-            Direction::Left => n.rebuild(child, n.right.clone()),
-            Direction::Right => n.rebuild(n.left.clone(), child),
-        });
-    }
-    child
-}
-
-/// Splits a subtree that does not contain `key` into the parts ordered before
-/// and after it. Only the nodes on the key's search path are copied.
-fn split<V>(mut next: Option<&Arc<Node<V>>>, key: &[u8]) -> (Link<V>, Link<V>) {
-    let (mut before, mut after) = (Vec::new(), Vec::new());
-    while let Some(n) = next {
-        if n.key.as_slice() < key {
-            before.push(n);
-            next = n.right.as_ref();
-        } else {
-            after.push(n);
-            next = n.left.as_ref();
-        }
-    }
-    let mut left = None;
-    for n in before.into_iter().rev() {
-        left = Some(n.rebuild(n.left.clone(), left));
-    }
-    let mut right = None;
-    for n in after.into_iter().rev() {
-        right = Some(n.rebuild(right, n.right.clone()));
-    }
-    (left, right)
-}
-
-fn insert<V: Serialize>(node: &Link<V>, key: Vec<u8>, value: V) -> Link<V> {
-    let priority = key_priority(&key);
-    let digest = value_hash(&value);
-    let mut path = Vec::new();
-    let mut next = node.as_ref();
-    while let Some(n) = next {
-        let direction = match key.cmp(&n.key) {
-            // An existing key keeps its priority, position and subtrees.
-            Ordering::Equal => {
-                let updated = Node::with_priority(
-                    key,
-                    Arc::new(value),
-                    digest,
-                    n.priority,
-                    n.left.clone(),
-                    n.right.clone(),
-                );
-                return rebuild_path(path, Some(updated));
-            }
-            // A new key that precedes this node roots its subtree.
-            _ if (priority, key.as_slice()) < (n.priority, n.key.as_slice()) => break,
-            Ordering::Less => Direction::Left,
-            Ordering::Greater => Direction::Right,
-        };
-        path.push((n.as_ref(), direction));
-        next = n.child(direction);
-    }
-    let (left, right) = split(next, &key);
-    let node = Node::with_priority(key, Arc::new(value), digest, priority, left, right);
-    rebuild_path(path, Some(node))
-}
-
-/// Joins two subtrees whose keys are all ordered before and after each other.
-fn merge<V>(left: &Link<V>, right: &Link<V>) -> Link<V> {
-    let mut path = Vec::new();
-    let (mut l, mut r) = (left.as_ref(), right.as_ref());
-    let rest = loop {
-        match (l, r) {
-            (Some(a), Some(b)) if a.precedes(b) => {
-                path.push((a.as_ref(), Direction::Right));
-                l = a.right.as_ref();
-            }
-            (Some(_), Some(b)) => {
-                path.push((b.as_ref(), Direction::Left));
-                r = b.left.as_ref();
-            }
-            (rest, None) | (None, rest) => break rest.cloned(),
-        }
-    };
-    rebuild_path(path, rest)
-}
-
-fn remove<V: Clone>(node: &Link<V>, key: &[u8]) -> (Link<V>, Option<V>) {
-    let mut path = Vec::new();
-    let mut next = node.as_ref();
-    while let Some(n) = next {
-        let direction = match key.cmp(n.key.as_slice()) {
-            Ordering::Equal => {
-                let merged = merge(&n.left, &n.right);
-                return (rebuild_path(path, merged), Some((*n.value).clone()));
-            }
-            Ordering::Less => Direction::Left,
-            Ordering::Greater => Direction::Right,
-        };
-        path.push((n.as_ref(), direction));
-        next = n.child(direction);
-    }
-    (node.clone(), None)
-}
-
 impl<V> Default for Map<V> {
     fn default() -> Self {
-        Self { node: None }
+        Self {
+            trie: None,
+            index: None,
+        }
     }
 }
 
@@ -245,13 +464,25 @@ impl<V> Map<V> {
         Self::default()
     }
     pub fn len(&self) -> usize {
-        self.node.as_ref().map_or(0, |n| n.len)
+        size(&self.index)
     }
     pub fn is_empty(&self) -> bool {
-        self.node.is_none()
+        self.index.is_none()
     }
     pub fn root(&self) -> Hash {
-        root(&self.node)
+        self.trie.as_ref().map_or_else(empty_root, Trie::hash)
+    }
+
+    fn entry(&self, key: &[u8]) -> Option<&Arc<Entry<V>>> {
+        let mut next = self.index.as_deref();
+        while let Some(n) = next {
+            match key.cmp(n.entry.key.as_slice()) {
+                Ordering::Equal => return Some(&n.entry),
+                Ordering::Less => next = n.left.as_deref(),
+                Ordering::Greater => next = n.right.as_deref(),
+            }
+        }
+        None
     }
 
     pub fn get(&self, key: &[u8]) -> Option<&V> {
@@ -261,76 +492,56 @@ impl<V> Map<V> {
     /// The stored value itself, for a holder that must outlive this version
     /// without copying it.
     pub fn get_shared(&self, key: &[u8]) -> Option<&Arc<V>> {
-        let mut next = self.node.as_deref();
-        while let Some(n) = next {
-            match key.cmp(n.key.as_slice()) {
-                std::cmp::Ordering::Equal => return Some(&n.value),
-                std::cmp::Ordering::Less => next = n.left.as_deref(),
-                std::cmp::Ordering::Greater => next = n.right.as_deref(),
-            }
-        }
-        None
+        self.entry(key).map(|entry| &entry.value)
     }
 
+    /// The entry with the greatest key.
     pub fn last(&self) -> Option<(&[u8], &V)> {
-        let mut n = self.node.as_deref()?;
+        let mut n = self.index.as_deref()?;
         while let Some(right) = n.right.as_deref() {
             n = right;
         }
-        Some((&n.key, &*n.value))
+        Some((&n.entry.key, &*n.entry.value))
     }
 
+    /// Entries in key order.
     pub fn iter(&self) -> Iter<'_, V> {
         let mut it = Iter { stack: Vec::new() };
-        it.push_left(self.node.as_deref());
+        it.push_left(self.index.as_deref());
         it
     }
 
     /// An inclusion proof commits to a value, not to a particular serialization
     /// of an in-memory tree. The caller supplies the independently trusted root.
+    /// Its length is the key's depth in the trie.
     pub fn proof(&self, key: &[u8]) -> Option<Proof> {
+        let entry = self.entry(key)?;
         let mut path = Vec::new();
-        let mut next = self.node.as_deref();
-        while let Some(n) = next {
-            let direction = match key.cmp(n.key.as_slice()) {
-                std::cmp::Ordering::Equal => {
-                    return Some(Proof {
-                        left: root(&n.left),
-                        right: root(&n.right),
-                        path,
-                    });
-                }
-                std::cmp::Ordering::Less => Direction::Left,
-                std::cmp::Ordering::Greater => Direction::Right,
-            };
-            let sibling = match direction {
-                Direction::Left => root(&n.right),
-                Direction::Right => root(&n.left),
-            };
+        let mut next = self.trie.as_ref()?;
+        while let Trie::Branch(b) = next {
+            let side = side(&entry.path, b.bit);
             path.push(ProofStep {
-                key: n.key.clone(),
-                value_hash: n.value_hash,
-                sibling,
-                direction,
+                bit: b.bit,
+                sibling: b.children[1 - side].hash(),
             });
-            next = match direction {
-                Direction::Left => n.left.as_deref(),
-                Direction::Right => n.right.as_deref(),
-            };
+            next = &b.children[side];
         }
-        None
+        Some(Proof { path })
     }
 }
 
 impl<V: Clone + Serialize> Map<V> {
     pub fn insert(&mut self, key: Vec<u8>, value: V) {
-        self.node = insert(&self.node, key, value);
+        let entry = Entry::new(key, Arc::new(value));
+        self.trie = Some(trie_insert(self.trie.as_ref(), entry.clone()));
+        self.index = index_insert(&self.index, entry);
     }
 
     pub fn remove(&mut self, key: &[u8]) -> Option<V> {
-        let (node, old) = remove(&self.node, key);
-        self.node = node;
-        old
+        let (index, entry) = index_remove(&self.index, key)?;
+        self.trie = self.trie.as_ref().and_then(|trie| trie_remove(trie, &entry));
+        self.index = index;
+        Some((*entry.value).clone())
     }
 }
 
@@ -352,7 +563,7 @@ impl<'a, V> Iterator for Iter<'a, V> {
     fn next(&mut self) -> Option<Self::Item> {
         let n = self.stack.pop()?;
         self.push_left(n.right.as_deref());
-        Some((&n.key, &*n.value))
+        Some((&n.entry.key, &*n.entry.value))
     }
 }
 
@@ -381,97 +592,52 @@ impl<'de, V: Clone + Serialize + Deserialize<'de>> Deserialize<'de> for Map<V> {
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("strictly key-ordered map entries")
             }
-            /// Sorted entries determine the unique Cartesian tree in one pass:
-            /// `spine` holds the right spine, whose right subtrees are still
-            /// open, and each node is hashed once, when its subtree closes.
+            /// Sorted entries determine a balanced index directly, and sorting
+            /// them by path builds the trie in one pass.
             fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Map<V>, A::Error> {
-                let mut spine: Vec<Open<V>> = Vec::new();
+                let mut entries: Vec<Arc<Entry<V>>> = Vec::new();
                 while let Some((key, value)) = seq.next_element::<(Vec<u8>, V)>()? {
-                    if spine.last().is_some_and(|last| last.key >= key) {
+                    if entries.last().is_some_and(|last| last.key >= key) {
                         return Err(de::Error::custom("map keys must be strictly increasing"));
                     }
-                    let entry = Open {
-                        priority: key_priority(&key),
-                        value_hash: value_hash(&value),
-                        value: Arc::new(value),
-                        key,
-                        left: None,
-                    };
-                    let mut left = None;
-                    while let Some(top) = spine.pop_if(|top| entry.precedes(top)) {
-                        left = Some(top.close(left));
-                    }
-                    spine.push(Open { left, ..entry });
+                    entries.push(Entry::new(key, Arc::new(value)));
                 }
-                let mut node = None;
-                while let Some(top) = spine.pop() {
-                    node = Some(top.close(node));
-                }
-                Ok(Map { node })
+                let index = build_index(&entries);
+                let trie = build_trie(entries)
+                    .ok_or_else(|| de::Error::custom("map key paths must be distinct"))?;
+                Ok(Map { trie, index })
             }
         }
         deserializer.deserialize_seq(Visitor(std::marker::PhantomData))
     }
 }
 
-/// A restored node whose right subtree is not yet known.
-struct Open<V> {
-    key: Vec<u8>,
-    value: Arc<V>,
-    value_hash: Hash,
-    priority: Hash,
-    left: Link<V>,
-}
-
-impl<V> Open<V> {
-    fn precedes(&self, other: &Self) -> bool {
-        (self.priority, &self.key) < (other.priority, &other.key)
-    }
-
-    fn close(self, right: Link<V>) -> Arc<Node<V>> {
-        Node::with_priority(
-            self.key,
-            self.value,
-            self.value_hash,
-            self.priority,
-            self.left,
-            right,
-        )
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Direction {
-    Left,
-    Right,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofStep {
-    pub key: Vec<u8>,
-    pub value_hash: Hash,
+    /// The branch's bit; the proven key's path selects its side.
+    pub bit: u8,
+    /// The root of the branch's other child.
     pub sibling: Hash,
-    pub direction: Direction,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Proof {
-    pub left: Hash,
-    pub right: Hash,
-    /// Root-to-leaf ancestors; the matching node itself is represented above.
+    /// Root-to-leaf branches above the proven entry's leaf.
     pub path: Vec<ProofStep>,
 }
 
 impl Proof {
     pub fn verify<V: Serialize>(&self, key: &[u8], value: &V, expected_root: &Hash) -> bool {
-        let mut digest = node_hash(key, &value_hash(value), &self.left, &self.right);
+        if !self.path.is_sorted_by(|a, b| a.bit < b.bit) {
+            return false;
+        }
+        let path = key_path(key);
+        let mut digest = leaf_hash(key, value);
         for step in self.path.iter().rev() {
-            let (left, right) = match step.direction {
-                Direction::Left if key < step.key.as_slice() => (digest, step.sibling),
-                Direction::Right if key > step.key.as_slice() => (step.sibling, digest),
-                _ => return false,
+            digest = match side(&path, step.bit) {
+                0 => branch_hash(step.bit, &digest, &step.sibling),
+                _ => branch_hash(step.bit, &step.sibling, &digest),
             };
-            digest = node_hash(&step.key, &step.value_hash, &left, &right);
         }
         digest == *expected_root
     }
@@ -494,32 +660,61 @@ mod tests {
         map
     }
 
-    fn check_node(n: &Link<u64>, low: Option<&[u8]>, high: Option<&[u8]>) -> usize {
+    /// Checks a trie subtree whose paths all share bits before `above`, and
+    /// returns its entries' keys and depths.
+    fn check_trie(t: &Trie<u64>, above: Option<u8>, depth: usize, out: &mut Vec<(Vec<u8>, usize)>) {
+        match t {
+            Trie::Leaf(e) => {
+                assert_eq!(e.path, key_path(&e.key));
+                assert_eq!(e.hash, leaf_hash(&e.key, &*e.value));
+                out.push((e.key.clone(), depth));
+            }
+            Trie::Branch(b) => {
+                assert!(above.is_none_or(|bit| bit < b.bit));
+                assert_eq!(
+                    b.hash,
+                    branch_hash(b.bit, &b.children[0].hash(), &b.children[1].hash())
+                );
+                for (side_index, child) in b.children.iter().enumerate() {
+                    let start = out.len();
+                    check_trie(child, Some(b.bit), depth + 1, out);
+                    for (k, _) in &out[start..] {
+                        assert_eq!(side(&key_path(k), b.bit), side_index);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Checks key order, sizes and weight balance; returns the height.
+    fn check_index(n: &Link<u64>, low: Option<&[u8]>, high: Option<&[u8]>) -> usize {
         let Some(n) = n else {
             return 0;
         };
-        assert!(low.is_none_or(|k| k < n.key.as_slice()));
-        assert!(high.is_none_or(|k| k > n.key.as_slice()));
-        assert_eq!(
-            n.priority,
-            crypto::tagged_hash("Hashstash/TreePriority", &n.key)
-        );
-        for child in [&n.left, &n.right].into_iter().flatten() {
-            assert!(n.precedes(child));
+        let key = n.entry.key.as_slice();
+        assert!(low.is_none_or(|k| k < key));
+        assert!(high.is_none_or(|k| k > key));
+        let (l, r) = (size(&n.left), size(&n.right));
+        assert_eq!(n.size, 1 + l + r);
+        assert!(l + r <= 1 || (l <= DELTA * r && r <= DELTA * l), "{l} {r}");
+        1 + check_index(&n.left, low, Some(key)).max(check_index(&n.right, Some(key), high))
+    }
+
+    /// Checks both structures and that the trie is the one its entries
+    /// determine; returns the trie's maximum depth and the index height.
+    fn check(map: &Map<u64>) -> (usize, usize) {
+        let height = check_index(&map.index, None, None);
+        let mut leaves = Vec::new();
+        if let Some(t) = &map.trie {
+            check_trie(t, None, 0, &mut leaves);
         }
-        let count =
-            1 + check_node(&n.left, low, Some(&n.key)) + check_node(&n.right, Some(&n.key), high);
-        assert_eq!(count, n.len);
-        assert_eq!(
-            n.root,
-            node_hash(
-                &n.key,
-                &value_hash(&*n.value),
-                &root(&n.left),
-                &root(&n.right)
-            )
-        );
-        count
+        leaves.sort();
+        let keys: Vec<_> = map.iter().map(|(k, _)| k.to_vec()).collect();
+        assert_eq!(leaves.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(), keys);
+        assert_eq!(map.len(), keys.len());
+        let rebuilt: Map<u64> = codec::decode(&codec::encode(map), usize::MAX).unwrap();
+        assert_eq!(rebuilt.root(), map.root());
+        (leaves.iter().map(|(_, d)| *d).max().unwrap_or(0), height)
     }
 
     #[test]
@@ -536,15 +731,22 @@ mod tests {
                 map.insert(k.clone(), i);
                 reference.insert(k, i);
             }
+            if i % 97 == 0 {
+                check(&map);
+            }
         }
         assert_eq!(map.len(), reference.len());
         assert_eq!(
             map.iter()
                 .map(|(k, v)| (k.to_vec(), *v))
                 .collect::<Vec<_>>(),
-            reference.into_iter().collect::<Vec<_>>()
+            reference.clone().into_iter().collect::<Vec<_>>()
         );
-        check_node(&map.node, None, None);
+        for (k, v) in &reference {
+            assert_eq!(map.get(k), Some(v));
+        }
+        assert_eq!(map.get(&key(600)), None);
+        check(&map);
         assert_eq!(map.last(), map.iter().last());
     }
 
@@ -558,7 +760,7 @@ mod tests {
         let restored: Map<u64> = codec::decode(&codec::encode(&a), 1_000_000).unwrap();
         assert_eq!(a.root(), restored.root());
         assert_eq!(a, restored);
-        check_node(&restored.node, None, None);
+        check(&restored);
         let json_restored: Map<u64> =
             serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
         assert_eq!(a.root(), json_restored.root());
@@ -566,29 +768,67 @@ mod tests {
             let small = populated(0..n);
             let restored: Map<u64> = codec::decode(&codec::encode(&small), 1000).unwrap();
             assert_eq!(small.root(), restored.root());
-            check_node(&restored.node, None, None);
+            check(&restored);
+        }
+        // A lone entry is its own leaf.
+        let one = populated(0..1);
+        assert_eq!(one.root(), leaf_hash(&key(0), &0u64));
+        assert_eq!(Map::<u64>::new().root(), empty_root());
+    }
+
+    #[test]
+    fn sorted_insertions_keep_the_index_balanced_and_the_trie_shallow() {
+        // Ascending and descending keys degenerate an unbalanced search tree.
+        for order in [
+            (0..4096).collect::<Vec<u32>>(),
+            (0..4096).rev().collect::<Vec<u32>>(),
+        ] {
+            let mut map = populated(order);
+            let (depth, height) = check(&map);
+            // 2.41 * log2(4097) + 2 < 31; a perfect tree has height 13.
+            assert!(height <= 30, "index height {height}");
+            // Random paths: about log2(4096) = 12, far below the 256 bound.
+            assert!(depth <= 40, "trie depth {depth}");
+            for n in (0..4096).step_by(2) {
+                map.remove(&key(n));
+            }
+            assert!(check(&map).1 <= 28);
         }
     }
 
     #[test]
-    fn path_copies_share_stored_values() {
+    fn updates_copy_one_path_and_share_stored_values() {
         let original = populated(0..200);
-        let root_key = original.node.as_ref().unwrap().key.clone();
         let mut next = original.clone();
-        // Key 87 is not the root, so this update copies the root node.
-        assert_ne!(root_key, key(87));
+        let depth = original.proof(&key(87)).unwrap().path.len();
         next.insert(key(87), 999);
-        let (old_root, new_root) = (original.node.as_ref(), next.node.as_ref());
-        assert!(!Arc::ptr_eq(old_root.unwrap(), new_root.unwrap()));
-        assert!(Arc::ptr_eq(&old_root.unwrap().value, &new_root.unwrap().value));
+        // Only the branches above the updated leaf are new.
+        let fresh = |t: &Trie<u64>, old: &Trie<u64>| {
+            let (mut count, mut pending) = (0, vec![(t.clone(), old.clone())]);
+            while let Some((a, b)) = pending.pop() {
+                match (a, b) {
+                    (Trie::Branch(x), Trie::Branch(y)) if Arc::ptr_eq(&x, &y) => {}
+                    (Trie::Leaf(x), Trie::Leaf(y)) if Arc::ptr_eq(&x, &y) => {}
+                    (Trie::Branch(x), Trie::Branch(y)) => {
+                        count += 1;
+                        pending.extend(x.children.iter().cloned().zip(y.children.iter().cloned()));
+                    }
+                    _ => count += 1,
+                }
+            }
+            count
+        };
+        let (new_trie, old_trie) = (next.trie.as_ref().unwrap(), original.trie.as_ref().unwrap());
+        assert_eq!(fresh(new_trie, old_trie), depth + 1);
+        // Untouched entries are the same records in both versions.
         assert!(Arc::ptr_eq(
-            original.get_shared(&root_key).unwrap(),
-            next.get_shared(&root_key).unwrap()
+            original.get_shared(&key(3)).unwrap(),
+            next.get_shared(&key(3)).unwrap()
         ));
         assert_eq!(next.remove(&key(87)), Some(999));
         assert!(std::ptr::eq(
-            original.get(&root_key).unwrap(),
-            next.get(&root_key).unwrap()
+            original.get(&key(150)).unwrap(),
+            next.get(&key(150)).unwrap()
         ));
         assert_eq!(
             format!("{:?}", populated(1..3)),
@@ -601,8 +841,8 @@ mod tests {
         let original = populated(0..200);
         let mut next = original.clone();
         assert!(Arc::ptr_eq(
-            original.node.as_ref().unwrap(),
-            next.node.as_ref().unwrap()
+            original.index.as_ref().unwrap(),
+            next.index.as_ref().unwrap()
         ));
         let old_root = original.root();
         next.insert(key(87), 999);
@@ -616,11 +856,15 @@ mod tests {
         assert_eq!(original.root(), old_root);
         for n in 0..200 {
             next.remove(&key(n));
+            if n % 23 == 0 {
+                check(&next);
+            }
         }
         assert!(next.is_empty());
         assert_eq!(next.root(), Map::<u64>::new().root());
         assert_eq!(next.remove(&key(7)), None);
         assert_eq!(next.last(), None);
+        assert!(next.trie.is_none());
     }
 
     #[test]
@@ -633,15 +877,22 @@ mod tests {
             assert!(!proof.verify(&key(n + 1), &(n as u64 * 3), &map.root()));
             assert!(!proof.verify(&key(n), &(n as u64 * 3), &[0; 32]));
             let mut modified = proof.clone();
-            modified.left[0] ^= 1;
+            modified.path[0].sibling[0] ^= 1;
             assert!(!modified.verify(&key(n), &(n as u64 * 3), &map.root()));
-            if !proof.path.is_empty() {
-                let mut modified = proof;
-                modified.path[0].sibling[0] ^= 1;
-                assert!(!modified.verify(&key(n), &(n as u64 * 3), &map.root()));
-            }
+            let mut modified = proof.clone();
+            modified.path[0].bit ^= 1;
+            assert!(!modified.verify(&key(n), &(n as u64 * 3), &map.root()));
+            // Steps must descend to ever later bits.
+            let mut modified = proof;
+            modified.path.swap(0, 1);
+            assert!(!modified.verify(&key(n), &(n as u64 * 3), &map.root()));
         }
         assert!(map.proof(&key(500)).is_none());
+        // A lone entry's proof is empty.
+        let one = populated(5..6);
+        let proof = one.proof(&key(5)).unwrap();
+        assert!(proof.path.is_empty());
+        assert!(proof.verify(&key(5), &15u64, &one.root()));
     }
 
     #[test]
@@ -657,5 +908,22 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn path_bits_read_most_significant_first() {
+        let mut path = [0u8; 32];
+        path[0] = 0b1000_0000;
+        path[31] = 1;
+        assert_eq!((side(&path, 0), side(&path, 1), side(&path, 255)), (1, 0, 1));
+        let mut other = path;
+        assert_eq!(first_difference(&path, &other), None);
+        other[31] = 0;
+        assert_eq!(first_difference(&path, &other), Some(255));
+        other[0] = 0;
+        assert_eq!(first_difference(&path, &other), Some(0));
+        other = path;
+        other[2] ^= 0b0001_0000;
+        assert_eq!(first_difference(&path, &other), Some(19));
     }
 }

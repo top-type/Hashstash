@@ -39,8 +39,9 @@ const IDLE_LOCKED: &str = "Wallet locked after a period without use; open it aga
 /// address-encoded and shown as two fields, so bytes alone do not bound the
 /// work; `hashstash-cold --max-review-payments` raises it.
 pub const DEFAULT_MAX_REVIEW_PAYMENTS: usize = 4096;
-/// Connections served at once. A browser opens at most six to one origin;
-/// further connections, from anything else on loopback, are closed unread.
+/// Connections served at once. A browser opens at most six to one origin. At
+/// the limit a new connection replaces the one idle longest, so another local
+/// program holding connections open cannot keep the browser out.
 pub const MAX_CONNECTIONS: usize = 16;
 
 /// Local bounds on one offline review.

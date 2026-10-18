@@ -635,6 +635,8 @@ fn compact_size_len(n: usize) -> usize {
 #[cfg(test)]
 mod pool_tests;
 #[cfg(test)]
+mod explorer_worker_tests;
+#[cfg(test)]
 thread_local! {
     /// Pool selections run on this thread, and the signatures they checked.
     static POOL_SELECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -864,58 +866,93 @@ impl ProposalIndex {
 struct ExplorerWorker {
     sender: Option<mpsc::SyncSender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Set when a notification first finds the worker gone, so that is logged once.
+    gone: AtomicBool,
 }
 impl ExplorerWorker {
-    fn start(mut explorer: Explorer, inner: Weak<Mutex<Inner>>, config: Config) -> Self {
+    fn start(explorer: Explorer, inner: Weak<Mutex<Inner>>, config: Config) -> Self {
         let (sender, receiver) = mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("hashstash-explorer".into())
             .spawn(move || {
-                'worker: while receiver.recv().is_ok() {
-                    loop {
-                        if matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
-                            break 'worker;
-                        }
-                        let update = (|| -> Result<_> {
-                            let Some(inner) = inner.upgrade() else {
-                                return Ok(None);
-                            };
-                            let guard = lock_inner(&inner);
-                            explorer.capture(&guard.chain)
-                        })();
-                        match update {
-                            Ok(Some(update)) => {
-                                if let Err(error) = explorer.apply_update(&config, update) {
-                                    eprintln!("Explorer index update unavailable: {error}");
-                                    break;
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(error) => {
-                                eprintln!("Explorer capture unavailable: {error}");
-                                break;
-                            }
-                        }
-                    }
+                // An update's own panic only fails that update. Any other
+                // panic unwound through the node lock or this loop; exit like
+                // a service task rather than leave the index frozen unlogged.
+                let worker = std::panic::AssertUnwindSafe(|| {
+                    explorer_worker(explorer, &inner, &config, &receiver)
+                });
+                if std::panic::catch_unwind(worker).is_err() {
+                    eprintln!("fatal: explorer worker panicked; exiting for a supervised restart");
+                    std::process::exit(70);
                 }
             });
         match thread {
             Ok(thread) => Self {
                 sender: Some(sender),
                 thread: Some(thread),
+                gone: AtomicBool::new(false),
             },
             Err(error) => {
                 eprintln!("Explorer worker unavailable: {error}");
                 Self {
                     sender: None,
                     thread: None,
+                    gone: AtomicBool::new(true),
                 }
             }
         }
     }
     fn notify(&self) {
-        if let Some(sender) = &self.sender {
-            let _ = sender.try_send(());
+        if let Some(sender) = &self.sender
+            && let Err(mpsc::TrySendError::Disconnected(())) = sender.try_send(())
+            && !self.gone.swap(true, Ordering::Relaxed)
+        {
+            eprintln!("Explorer worker stopped; the explorer index no longer follows the chain");
+        }
+    }
+}
+/// Index each canonical change as it is notified. After a failed capture or
+/// update the worker also wakes at the retry time, so an idle chain does not
+/// leave the index behind until the next block.
+fn explorer_worker(
+    mut explorer: Explorer,
+    inner: &Weak<Mutex<Inner>>,
+    config: &Config,
+    receiver: &mpsc::Receiver<()>,
+) {
+    loop {
+        let woke = match explorer.retry_at() {
+            Some(at) => !matches!(
+                receiver.recv_timeout(at.saturating_duration_since(Instant::now())),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            None => receiver.recv().is_ok(),
+        };
+        if !woke {
+            return;
+        }
+        loop {
+            if matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+                return;
+            }
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            let update = explorer.capture(&lock_inner(&inner).chain);
+            drop(inner);
+            match update {
+                Ok(Some(update)) => {
+                    if let Err(error) = explorer.apply_update(config, update) {
+                        eprintln!("Explorer index update unavailable: {error}");
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    eprintln!("Explorer capture unavailable: {error}");
+                    break;
+                }
+            }
         }
     }
 }

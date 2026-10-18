@@ -37,9 +37,13 @@ const ANCHOR_DEPTH: usize = 128;
 /// SQLite's 1e9-byte row limit. A larger projection omits its bulky signed
 /// detail instead of stalling the index on a consensus-valid block.
 const RECORD_BYTES: usize = crate::node::MAX_RESPONSE_FRAME - 64 * 1024;
-/// A failed update that may be deterministic is retried on a notification
-/// this long after it failed, or as soon as the canonical tip changes.
+/// A failed update that may be deterministic is retried this long after it
+/// failed, or as soon as the canonical tip changes. The worker wakes for the
+/// retry itself, so an idle chain does not leave the index behind for good.
 const RETRY_FAILED: Duration = Duration::from_secs(60);
+/// Lock contention is transient: the next notification retries it, and the
+/// worker wakes after this delay when none arrives.
+const RETRY_CONTENDED: Duration = Duration::from_secs(1);
 const TABLES: [&str; 8] = [
     "explorer_blocks",
     "explorer_transactions",
@@ -78,6 +82,19 @@ pub struct Explorer {
     /// worker notification.
     attempt: Option<(Hash, Hash)>,
     failed: Option<((Hash, Hash), Instant)>,
+    /// When the worker retries the last failed capture or update without
+    /// waiting for a notification.
+    retry: Option<Instant>,
+    /// RETRY_FAILED, shortened by worker tests.
+    pub(crate) retry_delay: Duration,
+    #[cfg(test)]
+    pub(crate) hooks: TestHooks,
+}
+/// Fault injection for the worker tests.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestHooks {
+    pub(crate) before_apply: Option<Box<dyn FnMut() -> Result<()> + Send>>,
 }
 /// One already validated canonical block, or retained rollback checkpoints.
 /// Capturing this performs no state replay and no derived-index writes under
@@ -110,6 +127,10 @@ impl Explorer {
             states: VecDeque::new(),
             attempt: None,
             failed: None,
+            retry: None,
+            retry_delay: RETRY_FAILED,
+            #[cfg(test)]
+            hooks: TestHooks::default(),
         }
     }
     /// `root` is the state root of `s`, which callers cache per published tip.
@@ -155,6 +176,10 @@ impl Explorer {
             states: VecDeque::new(),
             attempt: None,
             failed: None,
+            retry: None,
+            retry_delay: RETRY_FAILED,
+            #[cfg(test)]
+            hooks: TestHooks::default(),
         };
         reader.rpc_rooted(method, p, c, s, tip, root, mempool)
     }
@@ -223,6 +248,10 @@ impl Explorer {
             states: VecDeque::new(),
             attempt: None,
             failed: None,
+            retry: None,
+            retry_delay: RETRY_FAILED,
+            #[cfg(test)]
+            hooks: TestHooks::default(),
         };
         index.sync(chain)?;
         Ok(index)
@@ -230,13 +259,26 @@ impl Explorer {
 
     pub(crate) fn capture(&mut self, chain: &Chain) -> Result<Option<Update>> {
         if self.db.is_none() || self.tip == Some(chain.tip_hash()) {
+            self.retry = None;
             return Ok(None);
         }
-        let update = self.next_update(chain)?;
+        let update = self.next_update(chain).inspect_err(|_| {
+            self.retry = Some(Instant::now() + self.retry_failed());
+        })?;
         if let Some(update) = &update {
             self.attempt = Some((update.target(), chain.tip_hash()));
         }
         Ok(update)
+    }
+
+    /// When the worker should capture again without a notification: after
+    /// a failed capture or update, at its retry time.
+    pub(crate) fn retry_at(&self) -> Option<Instant> {
+        self.retry
+    }
+
+    fn retry_failed(&self) -> Duration {
+        self.retry_delay
     }
 
     /// A failed update's target is skipped, before any block is loaded under
@@ -308,14 +350,35 @@ impl Explorer {
 
     pub(crate) fn apply_update(&mut self, c: &Config, update: Update) -> Result<()> {
         let attempt = self.attempt.take();
-        let result = self.apply(c, update);
+        // A panic is a bug, possibly one block's. Unwinding rolls back the
+        // open SQLite transaction, and the checkpoints and tip change only
+        // after a commit, so it fails like an error instead of silently
+        // ending the worker and freezing the index.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if let Some(hook) = self.hooks.before_apply.as_mut() {
+                hook()?;
+            }
+            self.apply(c, update)
+        }))
+        .unwrap_or_else(|panic| {
+            let message = panic
+                .downcast_ref::<&str>()
+                .map(|text| text.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            Err(anyhow::anyhow!("explorer update panicked: {message}"))
+        });
         // Lock contention is retried on the next notification; any other
         // failure may be deterministic and waits for a new tip or the delay.
-        self.failed = match (&result, attempt) {
+        let now = Instant::now();
+        (self.failed, self.retry) = match (&result, attempt) {
             (Err(error), Some(attempt)) if !contended(error) => {
-                Some((attempt, Instant::now() + RETRY_FAILED))
+                let retry = now + self.retry_failed();
+                (Some((attempt, retry)), Some(retry))
             }
-            _ => None,
+            (Err(_), _) => (None, Some(now + RETRY_CONTENDED)),
+            _ => (None, None),
         };
         result
     }

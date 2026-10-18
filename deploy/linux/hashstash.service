@@ -7,6 +7,8 @@ After=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
+# Started once it runs: no start timeout cuts short a startup that
+# revalidates stored history, which a saved state checkpoint keeps short.
 Type=simple
 User=hashstash
 Group=hashstash
@@ -14,10 +16,19 @@ WorkingDirectory=/var/lib/hashstash
 ExecStart=/usr/local/libexec/hashstash/run-node.sh run
 # The node exits with status 70 when a panic poisoned its shared state or
 # stopped a long-lived service loop, so a restart revalidates history from
-# disk instead of leaving a stuck process.
+# disk (above its newest saved state checkpoint) instead of leaving a stuck
+# process.
 Restart=on-failure
 RestartSec=10
-# The node handles Ctrl+C/SIGINT for a graceful listener shutdown.
+# systemd 254 and later lengthen consecutive automatic restart delays from
+# RestartSec to RestartMaxDelaySec, so a crash loop backs off.
+RestartSteps=8
+RestartMaxDelaySec=15min
+# An out-of-memory kill repeats on every restart until MemoryMax fits the
+# measured need; say so in the journal (systemd sets SERVICE_RESULT).
+ExecStopPost=/bin/sh -c 'if [ "$$SERVICE_RESULT" = oom-kill ]; then echo "hashstash was killed for exceeding its memory limit; raise MemoryHigh/MemoryMax to the measured need (see deploy/linux/README.md)" >&2; fi'
+# The node handles Ctrl+C/SIGINT for a graceful listener shutdown, then
+# saves a state checkpoint near its tip.
 KillSignal=SIGINT
 TimeoutStopSec=90
 UMask=0077
@@ -31,7 +42,8 @@ CapabilityBoundingSet=
 MemoryHigh=512M
 MemoryMax=1G
 # These are operator resource limits, not proof that every valid chain fits.
-# Monitor pressure/OOM restarts and raise them for measured legitimate demand.
+# Monitor pressure/OOM restarts and raise them for measured legitimate demand:
+# the account state is held in memory in full and grows with the chain.
 TasksMax=128
 RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

@@ -120,27 +120,27 @@ A nightly schedule gives each fuzz target its own job: 15 minutes of libFuzzer, 
 
 ## Recorded results
 
-The latest full run of this guide, before the parallel audit workstreams were merged:
+The latest full run of this guide, with every audit workstream merged:
 
 | Item | Record |
 | --- | --- |
-| Source | `audit-fixes` at `cd21d49` plus the validation-gate, Windows-check and fuzzing commits of findings R15 and R34 |
+| Source | `audit-fixes` at `233a795` (all workstreams merged) plus the R15 and R34 review commits through the formatting-only commit `742233e`; this record changes only this file |
 | Platform | Windows 11 Home 10.0.26200 x86-64, with Ubuntu under WSL 2 for the Linux builds |
 | Toolchains | rustc, Cargo and Clippy 1.97.1 (2026-07-14) for x86_64-unknown-linux-gnu; rustfmt 1.9.0 of the same release on Windows; Node.js 24.20.0 on Windows; Python 3.14.4 under WSL |
 
 | Check | Result |
 | --- | --- |
 | `cargo build --release --locked --bins` | Passed |
-| `cargo test --all-targets --locked` | 382 passed, 47 ignored |
-| The same with `test-fixtures` | 721 passed, 7 ignored (debug, about 16 minutes); also with `--release` |
+| `cargo test --all-targets --locked` | 440 passed, 56 ignored (debug, about 5 minutes) |
+| The same with `test-fixtures` | 796 passed, 8 ignored (`--release`; the merged tree before these commits: 793 passed, 8 ignored) |
 | Both Clippy commands | Passed |
-| `cargo fmt --check` | Failed: files throughout the repository predate formatting. The files these commits add or rewrite are formatted; one formatting-only commit (`cargo fmt`) after the merge completes the gate |
-| Frontend runner and mail property check | 24 suites passed; 117 shared vectors and 20,000 mutations, plus 300,000 mutations at seed 12345 |
+| `cargo fmt --check` | Passed, as does `rustfmt --check --edition 2024 fuzz/src/lib.rs fuzz/fuzz_targets/*.rs` |
+| Frontend runner and mail property check | 24 suites passed; 117 shared vectors and 20,000 mutations |
 | Python unittest discovery | 210 tests passed with `HASHSTASH_TEST_BINARY` set to the fixture build |
 | Wallet CLI, wallet manager, addresses, wallet adversarial, mail wire | 16, 8, 4, 53 and 15 checks passed on disposable nodes (fixture build) |
-| Live network suites | `ci_network_suites.sh` with the fixture build: `test_network`, `test_economic_adversarial` and `test_load` (twelve 64-transaction waves, no refusals) passed on one fresh three-node network, `test_reserve_network` on another |
-| Windows, natively | 280 library unit tests (1 ignored, six consecutive runs) and 26 command-line unit tests passed, including the access-list and link checks; the in-process fuzz targets and listener tests passed; `test_cold_launcher.ps1` passed under Windows PowerShell 5.1. These were cross-built for x86_64-pc-windows-gnu with Rust 1.96.0 and MinGW-w64. Integration tests that embed build-host paths cannot run from such a build, and Clippy did not run for Windows; the Windows CI job covers both |
-| Fuzzing | The stable runner for 480 seconds per target (300 for `address_book`) and libFuzzer builds (stable toolchain, SanitizerCoverage, no address sanitizer) for 300 seconds per target. Found and fixed: a panic when `fee_quote` or `transfer_quote` received non-object parameters, and the browser opening a byte-order-mark-prefixed envelope that the node does not index as mail |
+| Live network suites | With the fixture build: `test_network`, `test_economic_adversarial` and `test_load` (twelve 64-transaction waves, no refusals) passed on one fresh three-node network, and `test_reserve_network` through `ci_network_suites.sh` on another; `test_stratum_wire.py`: 201 assertions passed |
+| Windows, natively | 333 library unit tests (1 ignored) and 30 command-line unit tests passed, including the access-list, fail-closed and link checks; the in-process fuzz targets, `stratum_session` included, and the listener tests passed; `test_cold_launcher.ps1` passed under Windows PowerShell 5.1 and, with a stand-in signer that never became ready, stopped that signer. These were cross-built for x86_64-pc-windows-gnu with Rust 1.96.0 and MinGW-w64. Integration tests that embed build-host paths cannot run from such a build, and Clippy did not run for Windows; the Windows CI job covers both |
+| Fuzzing | `stratum_session` under libFuzzer (stable toolchain, SanitizerCoverage, no address sanitizer) for 300 seconds, 2.1 million inputs, then the stable runner for 120 seconds from that corpus: no failures. The earlier run of the other targets (the stable runner for 480 seconds per target, libFuzzer for 300) found and fixed a panic when `fee_quote` or `transfer_quote` received non-object parameters, and the browser opening a byte-order-mark-prefixed envelope that the node does not index as mail |
 
 ## Isolated process and network scenarios
 

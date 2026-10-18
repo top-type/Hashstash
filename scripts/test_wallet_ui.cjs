@@ -717,11 +717,13 @@ async function run() {
  await h.get('guide-technical-tab').fire('keydown',{key:'Home'});eq(h.get('guide-overview-panel').hidden,false);eq(h.get('guide-technical-panel').hidden,true);eq(h.get('guide-overview-tab').tabIndex,0);
  await h.navigate('#governance');
  const values = {
-  BlockBytes:['1024','1537','33554433','18446744073709551615'],
-  Interval:['1','61','9007199254740993','18446744073709551615'],
+  // Capacity and interval move by at most one halving or doubling of the
+  // current 1 MiB and 15 seconds; the fee rate of 1 can at most double.
+  BlockBytes:['524288','1537000','2097152'],
+  Interval:['7','16','30'],
   Lead:['0','17','18446744073709551615'], Rest:['0','19','18446744073709551615'],
   DecisionBlocks:['1','73','18446744073709551615'], MinerFeePercent:['0','37','100'],
-  PassMarginBps:['0.01','150.01','184467440737095516.15'], MaxPriceChangeBps:['0','100','150.01','184467440737095516.15'], MinimumFeeRate:['0','3','18446744073709551615']
+  PassMarginBps:['0.01','150.01','184467440737095516.15'], MaxPriceChangeBps:['0.01','15.01','99.99'], MinimumFeeRate:['2']
  };
  const settingNames={BlockBytes:'block_bytes',Interval:'interval',Lead:'lead',Rest:'rest',DecisionBlocks:'decision_blocks',MaxPriceChangeBps:'max_price_change_bps',MinerFeePercent:'miner_fee_percent',PassMarginBps:'pass_margin_bps',MinimumFeeRate:'minimum_fee_rate'};
  for(const [parameter,inputs] of Object.entries(values)) for(const value of inputs) {
@@ -732,9 +734,39 @@ async function run() {
   eq(h.wallet.at(-1)?.operation.Propose.proposal.Parameter,{parameter,old:s.status.settings[settingNames[parameter]],new:next>BigInt(Number.MAX_SAFE_INTEGER)?String(next):Number(next)});
  }
  ok(!/proposal-direction|proposal-miner-fee|halve|double|1–60/.test(html),'all settings use one direct value field');
- for(const [parameter,value] of [['BlockBytes','1023'],['BlockBytes','0'],['Interval','0'],['DecisionBlocks','0'],['MinerFeePercent','101'],['Lead','-1'],['Rest','1.5'],['MinimumFeeRate','18446744073709551616'],['PassMarginBps','184467440737095516.16'],['PassMarginBps','0.001'],['MaxPriceChangeBps','0.001'],['MaxPriceChangeBps','184467440737095516.16'],['Interval','15']]) {
+ for(const [parameter,value,message] of [['BlockBytes','0'],['Interval','0'],['DecisionBlocks','0'],['MinerFeePercent','101'],['Lead','-1'],['Rest','1.5'],['MinimumFeeRate','18446744073709551616'],['PassMarginBps','184467440737095516.16'],['PassMarginBps','0.001'],['MaxPriceChangeBps','0.001'],['MaxPriceChangeBps','184467440737095516.16'],['Interval','15'],
+  // The node's governed bounds that follow from the current value.
+  ['BlockBytes','4095',/from 4,096 weight, room for a minimal proposal, its record and a new miner account, through 67,108,864/],['BlockBytes','67108865',/through 67,108,864/],
+  ['BlockBytes','524287',/halve or double the block capacity: from 524,288 through 2,097,152 weight/],['BlockBytes','2097153',/halve or double/],
+  ['Interval','6',/halve or double the target block interval: from 7 through 30 seconds/],['Interval','31',/halve or double/],
+  ['MinimumFeeRate','0',/must stay positive/],['MinimumFeeRate','3',/at most double the minimum fee rate.*at most 2\./],
+  ['MaxPriceChangeBps','0',/0\.01% through 99\.99%/],['MaxPriceChangeBps','100',/100% or more permits full redemption/],['MaxPriceChangeBps','150.01',/99\.99%/]]) {
   const count=h.wallet.length,form=h.get('propose-form');form.elements.parameter.value=parameter;form.elements.parameter_value.value=value;
   await form.fire('input');await h.timersDue();await form.requestSubmit();eq(h.wallet.length,count,`${parameter}=${value} cannot sign`);
+  if(message)ok(message.test(form.feedback.textContent),`${parameter}=${value}: ${form.feedback.textContent}`);
+ }
+ {
+  // At the floor and ceiling the step range is clipped to the capacity
+  // bounds. A refused value is refused by its settled fee quote too, not only
+  // by a quote still in flight.
+  const edge=await harness(),form=edge.get('propose-form');
+  const settled=async()=>{await edge.timersDue();const deadline=Date.now()+5000;while(edge.get('propose-fee-quote').textContent==='—'&&!edge.get('propose-fee-error').textContent&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,1));};
+  const propose=async(parameter,value)=>{form.elements.type.value='parameter';form.elements.parameter.value=parameter;form.elements.parameter_value.value=value;form.elements.support.value=amounts.exactInput('1');await edge.get('proposal-parameter').fire('change');await form.fire('input');await settled();await form.requestSubmit();};
+  for(const [capacity,value,message] of [[4096,'2048',/4,096 weight/],[4096,'8193',/from 4,096 through 8,192 weight/],[67108864,'33554431',/from 33,554,432 through 67,108,864 weight/],[67108864,'67108865',/through 67,108,864 \(64 MiB\)/]]) {
+   edge.currentSnapshot.status.settings.block_bytes=capacity;await edge.refresh();
+   const count=edge.wallet.length;await propose('BlockBytes',value);
+   eq(edge.wallet.length,count,`BlockBytes ${capacity}->${value} cannot sign`);
+   for(const shown of [form.feedback.textContent,edge.get('propose-fee-error').textContent,edge.get('parameter-preview').title])ok(message.test(shown),`BlockBytes ${capacity}->${value}: ${shown}`);
+  }
+  for(const [capacity,value] of [[4096,'8192'],[8193,'4096'],[67108864,'33554432'],[33554432,'67108864']]) {
+   edge.currentSnapshot.status.settings.block_bytes=capacity;await edge.refresh();await propose('BlockBytes',value);
+   eq(edge.wallet.at(-1)?.operation.Propose.proposal.Parameter,{parameter:'BlockBytes',old:capacity,new:Number(value)},form.feedback.textContent);
+  }
+  edge.currentSnapshot.status.settings.minimum_fee_rate=0;edge.currentSnapshot.status.fee_policy.minimum_fee_rate='0';await edge.refresh();
+  const count=edge.wallet.length;await propose('MinimumFeeRate','2');
+  eq(edge.wallet.length,count,'a zero fee rate can rise only to one');ok(/zero to one: at most 1\./.test(form.feedback.textContent),form.feedback.textContent);
+  await propose('MinimumFeeRate','1');
+  eq(edge.wallet.at(-1)?.operation.Propose.proposal.Parameter,{parameter:'MinimumFeeRate',old:0,new:1},form.feedback.textContent);
  }
  {
   const zero=await harness(),form=zero.get('send-form');zero.currentSnapshot.status.settings.minimum_fee_rate=0;await zero.refresh();

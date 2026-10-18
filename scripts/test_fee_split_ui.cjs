@@ -38,8 +38,12 @@ async function run(){
 
  {
   const h=await setup(),s=h.currentSnapshot;s.status.settings.minimum_fee_rate=2;s.status.fee_policy.minimum_fee_rate='2';s.governance.phase={Auction:{round:0,opened:0,leader:null,lead_since:0}};s.governance.pass=null;s.pass=s.fail=null;await h.refresh();
-  for(const value of ['0','3','1']) {
+  // Any positive rate up to double the current one; 0 and 5 are refused.
+  for(const value of ['1','3','4']) {
    const f=h.get('propose-form');f.elements.type.value='parameter';f.elements.parameter.value='MinimumFeeRate';f.elements.parameter_value.value=value;f.elements.support.value=amounts.exactInput('1');await h.get('proposal-parameter').fire('change');await f.fire('input');await h.timersDue();await f.requestSubmit();eq(h.wallet.at(-1).operation.Propose.proposal.Parameter,{parameter:'MinimumFeeRate',old:2,new:Number(value)});
+  }
+  for(const [value,message] of [['0',/must stay positive/],['5',/at most 4\./]]) {
+   const f=h.get('propose-form'),count=h.wallet.length;f.elements.parameter_value.value=value;await f.fire('input');await h.timersDue();await f.requestSubmit();eq(h.wallet.length,count,`fee rate ${value} cannot sign`);ok(message.test(f.feedback.textContent),f.feedback.textContent);
   }
  }
  {

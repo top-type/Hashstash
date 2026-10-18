@@ -204,7 +204,14 @@
     const parameter = expected.operation?.Propose?.proposal?.Parameter;
     if (parameter?.parameter === 'MinerFeePercent' && (u64(parameter.old) > 100n || u64(parameter.new) > 100n)) fail('Miner fee share must be from 0 to 100 percent.');
     if (parameter && ['Interval','DecisionBlocks','BlockBytes'].includes(parameter.parameter) && (!u64(parameter.old) || !u64(parameter.new))) fail('This setting must be positive.');
-    if (parameter?.parameter === 'BlockBytes' && (u64(parameter.old) < 1024n || u64(parameter.new) < 1024n)) fail('Block capacity must cover the miner account’s 1,024 weight.');
+    if (parameter?.parameter === 'BlockBytes' && [parameter.old,parameter.new].some(value => u64(value) < 4096n || u64(value) > 67108864n)) fail('Block capacity must be from 4,096 weight, room for a minimal proposal, its record and a new miner account, through 67,108,864 (64 MiB).');
+    // Governed bounds that follow from the old value alone, as in consensus: one
+    // decision at most halves or doubles capacity and interval, keeps the fee
+    // rate positive and at most doubles it, and keeps the price bound below 100%.
+    if (parameter && ['BlockBytes','Interval'].includes(parameter.parameter) && (u64(parameter.new) < u64(parameter.old)/2n || u64(parameter.new) > 2n*u64(parameter.old))) fail('One proposal can at most halve or double this setting.');
+    if (parameter?.parameter === 'MinimumFeeRate' && !u64(parameter.new)) fail('Minimum fee rate must stay positive.');
+    if (parameter?.parameter === 'MinimumFeeRate' && u64(parameter.new) > (u64(parameter.old) ? 2n*u64(parameter.old) : 1n)) fail('One proposal can at most double the minimum fee rate, or raise it from zero to one.');
+    if (parameter?.parameter === 'MaxPriceChangeBps' && (!u64(parameter.new) || u64(parameter.new) > 9999n)) fail('Price change per block must be from 0.01% through 99.99%.');
     const op = encodeOperation(expected.operation), data = fromHex(expected.data_hex ?? '', undefined, 'Transaction data');
     const fee = amount(expected.fee);
     const w = new Writer(); w.hash(expected.sender,true); w.uint(nonce); w.amount(fee); w.hash(expected.anchor); w.uint(lifetime); w.raw(op); w.vector(data);

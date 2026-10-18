@@ -2062,12 +2062,12 @@
         input.required = $("proposal-type").value === "parameter";
         text("proposal-value-label", parameter === "MinimumFeeRate" ? "Minimum fee rate · raw hashes / 1,024 weight" : `${setting[1]} · ${margin ? "%" : setting[2]}`);
         input.inputMode = margin ? "decimal" : "numeric";
-        input.min = parameter === "BlockBytes" ? "1024" : positive ? "1" : "0";
-        input.max = margin ? "184467440737095516.15" : parameter === "MinerFeePercent" ? "100" : "18446744073709551615";
+        input.min = parameter === "BlockBytes" ? "4096" : parameter === "MaxPriceChangeBps" ? "0.01" : positive || parameter === "MinimumFeeRate" ? "1" : "0";
+        input.max = parameter === "BlockBytes" ? "67108864" : parameter === "MaxPriceChangeBps" ? "99.99" : margin ? "184467440737095516.15" : parameter === "MinerFeePercent" ? "100" : "18446744073709551615";
         input.step = margin ? "0.01" : "1";
         let next;
         try {
-            next = directParameterValue(parameter, input.value);
+            next = directParameterValue(parameter, input.value, BigInt(old));
         } catch (error) {
             text("parameter-preview", `Current: ${settingValue(setting[0], old, setting[2])}`);
             $("parameter-preview").title = error.message;
@@ -2076,7 +2076,7 @@
         text("parameter-preview", `${settingValue(setting[0], old, setting[2])} → ${settingValue(setting[0], next, setting[2])}`);
         $("parameter-preview").title = "Applies after rest if approved.";
     }
-    function directParameterValue(parameter, value) {
+    function directParameterValue(parameter, value, old) {
         if (!parameterAvailable(parameter)) throw new Error("This network does not support this parameter.");
         const raw = String(value ?? "").trim();
         let next;
@@ -2090,8 +2090,18 @@
         }
         if (next > 18446744073709551615n) throw new Error("Setting exceeds the supported integer range.");
         if (["Interval", "DecisionBlocks", "BlockBytes"].includes(parameter) && next === 0n) throw new Error(`${settings[parameter][1]} must be positive.`);
-        if (parameter === "BlockBytes" && next < 1024n) throw new Error("Block capacity must cover the miner account’s 1,024 weight.");
+        if (parameter === "BlockBytes" && (next < 4096n || next > 67108864n)) throw new Error("Block capacity must be from 4,096 weight, room for a minimal proposal, its record and a new miner account, through 67,108,864 (64 MiB).");
         if (parameter === "MinerFeePercent" && next > 100n) throw new Error("Miner fee share must be between 0 and 100%.");
+        // The node's governed bounds that follow from the current value alone.
+        // It also checks the genesis-relative interval and fee-rate limits and
+        // every schedule, and rejects what these pre-checks miss.
+        if (["BlockBytes", "Interval"].includes(parameter) && (next < old / 2n || next > old * 2n)) {
+            const capacity = parameter === "BlockBytes", low = capacity && old / 2n < 4096n ? 4096n : old / 2n || 1n, high = capacity && old * 2n > 67108864n ? 67108864n : old * 2n;
+            throw new Error(`One proposal can at most halve or double the ${settings[parameter][1].toLowerCase()}: from ${commas(low)} through ${commas(high)} ${settings[parameter][2]}.`);
+        }
+        if (parameter === "MinimumFeeRate" && next === 0n) throw new Error("Minimum fee rate must stay positive.");
+        if (parameter === "MinimumFeeRate" && next > (old ? old * 2n : 1n)) throw new Error(`One proposal can at most double the minimum fee rate, or raise it from zero to one: at most ${commas(old ? old * 2n : 1n)}.`);
+        if (parameter === "MaxPriceChangeBps" && (next === 0n || next > 9999n)) throw new Error("Price change per block must be from 0.01% through 99.99%; 100% or more permits full redemption.");
         return next;
     }
     function networkView() {
@@ -3315,7 +3325,7 @@
             };
         } else {
             if (!parameterAvailable(v.parameter)) throw new Error("This network does not support this parameter.");
-            const current = BigInt(state.status.settings[settings[v.parameter][0]]), next = directParameterValue(v.parameter, v.parameter_value);
+            const current = BigInt(state.status.settings[settings[v.parameter][0]]), next = directParameterValue(v.parameter, v.parameter_value, current);
             if (next === current) throw new Error("Choose a different value.");
             proposal = {
                 Parameter: {

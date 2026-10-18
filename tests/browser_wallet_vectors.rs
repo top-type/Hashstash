@@ -1,7 +1,9 @@
 //! Cross-language browser signing regression. Requires Node.js on PATH (or
 //! HASHSTASH_NODE); no server, funded wallets or external network are involved.
 use hashstash::{
-    codec, crypto,
+    codec,
+    config::{MAX_GOVERNED_BLOCK_BYTES, MAX_GOVERNED_PRICE_CHANGE_BPS},
+    crypto,
     types::{Amount, Operation, Outcome, Parameter, Proposal, TransactionBody},
     wallet,
 };
@@ -124,9 +126,13 @@ fn browser_signatures_verify_in_rust_for_every_current_operation() {
         Parameter::MinimumFeeRate,
         Parameter::MaxPriceChangeBps,
     ] {
+        // The browser signer refuses changes outside the governed bounds that
+        // follow from the old value; the others keep 9-byte encodings.
         let (old, new) = match parameter {
             Parameter::MinerFeePercent => (50, 51),
             Parameter::Interval => (15, 17),
+            Parameter::BlockBytes => (MAX_GOVERNED_BLOCK_BYTES / 2, MAX_GOVERNED_BLOCK_BYTES),
+            Parameter::MaxPriceChangeBps => (u64::MAX / 2, MAX_GOVERNED_PRICE_CHANGE_BPS),
             _ => (u64::MAX / 2, u64::MAX - 1),
         };
         add(

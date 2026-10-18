@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use num_traits::Zero;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{
     Deserialize, Serialize,
     de::{DeserializeOwned, IgnoredAny},
@@ -20,6 +20,7 @@ use serde::{
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
+    future::Future,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
@@ -27,7 +28,7 @@ use std::{
 };
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, Semaphore, oneshot},
+    sync::{Mutex, OwnedMutexGuard, Semaphore, oneshot},
     task::JoinHandle,
 };
 use zeroize::Zeroizing;
@@ -45,6 +46,15 @@ const SCAN_BLOCKS_PER_REFRESH: u64 = 64;
 const RECEIPT_REPAIRS_PER_REFRESH: usize = 8;
 /// Concurrent HTTP requests one client network may hold.
 const CLIENT_SESSIONS: usize = 4;
+/// HTTP connections served at once; further ones are closed unread.
+const HTTP_CONNECTIONS: usize = 64;
+/// The usual pause between refreshes.
+const POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// The longest pause a busy node's `Retry-After` can impose between refreshes.
+const MAX_POLL_WAIT: Duration = Duration::from_secs(60);
+/// The longest `Retry-After` waited out before a refused request is resent
+/// once. It fits a claim's 15-second answer deadline with both lookups.
+const NODE_RETRY_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -225,39 +235,25 @@ impl std::fmt::Display for Fault {
 }
 impl std::error::Error for Fault {}
 
+/// The node refused a request on admission grounds, answering HTTP 429 or
+/// 503. The request did not run and may be resent after `retry_after`.
+#[derive(Clone, Copy, Debug)]
+struct NodeBusy {
+    retry_after: Option<Duration>,
+}
+impl std::fmt::Display for NodeBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("node is busy")
+    }
+}
+impl std::error::Error for NodeBusy {}
+
 /// Loads the dedicated signer from a regular, owner-only file and wipes every
 /// parsed copy of the secret.
 fn read_signer(path: &Path) -> Result<(Zeroizing<[u8; 32]>, PublicKey)> {
-    use std::io::Read;
-    let metadata = std::fs::symlink_metadata(path)?;
-    ensure!(
-        metadata.is_file() && metadata.len() <= 4096,
-        "faucet key must be a regular file of at most 4096 bytes"
-    );
-    // Read through one handle, and require that handle to be the regular file
-    // inspected above: a path swapped for a symbolic link in between fails.
-    let file = std::fs::File::open(path)?;
-    let opened = file.metadata()?;
-    ensure!(
-        opened.is_file() && opened.len() <= 4096,
-        "faucet key must be a regular file of at most 4096 bytes"
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        ensure!(
-            opened.dev() == metadata.dev() && opened.ino() == metadata.ino(),
-            "faucet key file changed while it was opened"
-        );
-        ensure!(
-            opened.permissions().mode() & 0o077 == 0,
-            "faucet key file must be owner-only (0600)"
-        );
-    }
-    // Preallocated, so reading does not leave a reallocated copy of the secret.
-    let mut bytes = Zeroizing::new(Vec::with_capacity(4097));
-    file.take(4097).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= 4096, "key file is too large");
+    // Read through the one handle that was checked, so a path swapped for a
+    // symbolic link or junction in between fails, on Windows too.
+    let bytes = crate::local_files::read_private(path, 4096).context("faucet key")?;
     let mut key: Value = serde_json::from_slice(&bytes)?;
     let wiped = |value: Option<Value>| match value {
         Some(Value::String(text)) => Some(Zeroizing::new(text)),
@@ -403,11 +399,65 @@ fn cooldown(
     }))
 }
 
+/// The pending claim; at most one exists.
+fn pending_claim(db: &Connection) -> Result<Option<Claim>> {
+    Ok(db
+        .query_row(
+            &format!("SELECT {CLAIM_COLUMNS} FROM claims WHERE status='pending'"),
+            [],
+            row_claim,
+        )
+        .optional()?)
+}
+
+/// The newest claim for `address`.
+fn last_claim(db: &Connection, address: &str) -> Result<Option<Claim>> {
+    Ok(db.query_row(&format!("SELECT {CLAIM_COLUMNS} FROM claims WHERE address=?1 ORDER BY created DESC,rowid DESC LIMIT 1"), [address], row_claim).optional()?)
+}
+
+/// The quota clock. It never moves behind recorded claims; a wall clock far
+/// behind them pauses payouts instead of stretching old windows.
+fn quota_clock(db: &Connection, wall: i64) -> Result<i64> {
+    let latest: Option<i64> = db.query_row("SELECT MAX(created) FROM claims", [], |r| r.get(0))?;
+    match latest {
+        Some(latest) if latest > wall.saturating_add(CLOCK_TOLERANCE_SECONDS) => {
+            Err(Fault("clock_behind_ledger").into())
+        }
+        Some(latest) => Ok(wall.max(latest)),
+        None => Ok(wall),
+    }
+}
+
+/// Whether the hourly, daily and lifetime allowances admit another claim.
+/// `lifetime` is the recorded claim count, kept so status never counts the
+/// whole ledger.
+fn within_budget(db: &Connection, c: &FaucetConfig, lifetime: u64, time: i64) -> Result<bool> {
+    if lifetime >= c.lifetime_claims {
+        return Ok(false);
+    }
+    for (period, cap) in [(3600, c.hourly_claims), (86400, c.daily_claims)] {
+        let used: u64 = db.query_row(
+            "SELECT COUNT(*) FROM claims WHERE created>=?1",
+            [time.saturating_sub(period)],
+            |r| r.get(0),
+        )?;
+        if used >= cap {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 struct Ledger {
     db: Connection,
     /// Every recorded claim, maintained by reservation so status never counts
     /// the whole ledger.
     lifetime: u64,
+    /// Reservations since the ledger opened. Claims are the only ledger
+    /// writers besides refreshes, and may reserve while a refresh waits for
+    /// node lookups; the refresh applies what those found only while this is
+    /// unchanged.
+    generation: u64,
 }
 impl Ledger {
     fn open(
@@ -498,20 +548,17 @@ impl Ledger {
         }
         let lifetime: u64 = tx.query_row("SELECT COUNT(*) FROM claims", [], |r| r.get(0))?;
         tx.commit()?;
-        Ok(Self { db, lifetime })
+        Ok(Self {
+            db,
+            lifetime,
+            generation: 0,
+        })
     }
     fn pending(&self) -> Result<Option<Claim>> {
-        Ok(self
-            .db
-            .query_row(
-                &format!("SELECT {CLAIM_COLUMNS} FROM claims WHERE status='pending'"),
-                [],
-                row_claim,
-            )
-            .optional()?)
+        pending_claim(&self.db)
     }
     fn last(&self, address: &str) -> Result<Option<Claim>> {
-        Ok(self.db.query_row(&format!("SELECT {CLAIM_COLUMNS} FROM claims WHERE address=?1 ORDER BY created DESC,rowid DESC LIMIT 1"), [address], row_claim).optional()?)
+        last_claim(&self.db, address)
     }
     /// The newest confirmed claim with its recorded receipt height and hash.
     fn top_receipt(&self) -> Result<Option<(Claim, u64, String)>> {
@@ -558,35 +605,11 @@ impl Ledger {
         )?;
         Ok(())
     }
-    /// The quota clock. It never moves behind recorded claims; a wall clock far
-    /// behind them pauses payouts instead of stretching old windows.
     fn clock(&self, wall: i64) -> Result<i64> {
-        let latest: Option<i64> =
-            self.db
-                .query_row("SELECT MAX(created) FROM claims", [], |r| r.get(0))?;
-        match latest {
-            Some(latest) if latest > wall.saturating_add(CLOCK_TOLERANCE_SECONDS) => {
-                Err(Fault("clock_behind_ledger").into())
-            }
-            Some(latest) => Ok(wall.max(latest)),
-            None => Ok(wall),
-        }
+        quota_clock(&self.db, wall)
     }
     fn budget(&self, c: &FaucetConfig, time: i64) -> Result<bool> {
-        if self.lifetime >= c.lifetime_claims {
-            return Ok(false);
-        }
-        for (period, cap) in [(3600, c.hourly_claims), (86400, c.daily_claims)] {
-            let used: u64 = self.db.query_row(
-                "SELECT COUNT(*) FROM claims WHERE created>=?1",
-                [time.saturating_sub(period)],
-                |r| r.get(0),
-            )?;
-            if used >= cap {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        within_budget(&self.db, c, self.lifetime, time)
     }
     fn eligible(&self, c: &FaucetConfig, address: &str, subnet: &str, time: i64) -> Result<()> {
         if let Some(wait) = cooldown(&self.db, c, address, subnet, time)? {
@@ -624,6 +647,7 @@ impl Ledger {
         tx.execute("INSERT INTO claims(address,subnet,created,nonce,txid,raw,status,height,expiry,amount_hashes) VALUES(?1,?2,?3,?4,?5,?6,'pending',?7,?8,?9)", params![claim.address,subnet,claim.created,claim.nonce.to_string(),claim.txid,claim.raw,claim.height,claim.expiry,claim.amount_hashes])?;
         tx.commit()?;
         self.lifetime = lifetime + 1;
+        self.generation = self.generation.wrapping_add(1);
         Ok(())
     }
     fn summary(&self, time: i64) -> Result<Value> {
@@ -729,6 +753,9 @@ impl RefreshDiagnostics {
         // request data or secrets and must never reach status or the journal.
         let category = if let Some(fault) = error.downcast_ref::<Fault>() {
             fault.0
+        } else if error.is::<NodeBusy>() {
+            // The node is up and asked the faucet to wait, unlike a transport fault.
+            "node_busy"
         } else if let Some(e) = error.downcast_ref::<reqwest::Error>() {
             if e.is_timeout() {
                 "node_timeout"
@@ -812,25 +839,64 @@ struct BlockReceipt {
     checked_canonical: Option<bool>,
 }
 
-/// Calls the loopback node. Snapshot replies grow with governed content, so they
-/// follow the node's own response frame; other replies keep a small fixed cap.
+/// Calls the loopback node. A request the node refuses on admission grounds
+/// did not run, so after a `Retry-After` of at most `NODE_RETRY_WAIT` it is
+/// resent once; otherwise the refusal is returned as `NodeBusy`.
 async fn node_rpc<T: DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
     method: &str,
     params: Value,
 ) -> Result<T> {
+    let first = node_rpc_once(client, url, method, &params).await;
+    let wait = first
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<NodeBusy>())
+        .and_then(|busy| busy.retry_after);
+    match wait {
+        Some(wait) if wait <= NODE_RETRY_WAIT => {
+            tokio::time::sleep(wait).await;
+            node_rpc_once(client, url, method, &params).await
+        }
+        _ => first,
+    }
+}
+
+/// One node call. Snapshot replies grow with governed content, so they follow
+/// the node's own response frame; other replies keep a small fixed cap.
+async fn node_rpc_once<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+    method: &str,
+    params: &Value,
+) -> Result<T> {
     let limit = if method == "snapshot" {
         crate::node::MAX_RESPONSE_FRAME
     } else {
         RPC_REPLY_BYTES
     };
-    let mut response = client
+    let response = client
         .post(url)
         .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let status = response.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+    {
+        // An admission refusal: 429 for this client's quota, 503 for capacity
+        // shared by all. Only the wait matters; the error text is never
+        // journaled, so its body is left unread.
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+        return Err(NodeBusy { retry_after }.into());
+    }
+    let mut response = response.error_for_status()?;
     ensure!(
         response.content_length().unwrap_or(0) <= limit as u64,
         "RPC reply is too large"
@@ -848,11 +914,65 @@ async fn node_rpc<T: DeserializeOwned>(
     reply.result.context("missing RPC result")
 }
 
-enum Receipts {
-    /// The newest confirmed receipt is canonical; this is its nonce.
-    Verified(Option<u64>),
-    /// More reorganized receipts remain for the next refresh.
-    Repairing,
+/// The pause before the next refresh: the usual interval, or the longer wait
+/// a busy node asked for, within a minute.
+fn poll_wait(refreshed: &Result<()>) -> Duration {
+    refreshed
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<NodeBusy>())
+        .and_then(|busy| busy.retry_after)
+        .map_or(POLL_INTERVAL, |wait| wait.clamp(POLL_INTERVAL, MAX_POLL_WAIT))
+}
+
+/// The loopback node RPC endpoint, cloned out of the engine so node lookups
+/// hold no lock.
+#[derive(Clone)]
+struct NodeClient {
+    client: reqwest::Client,
+    url: String,
+}
+impl NodeClient {
+    async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
+        node_rpc(&self.client, &self.url, method, params).await
+    }
+    /// The canonical block at `height` and which of `txids` it holds. With
+    /// `checked`, `None` means that earlier block is no longer canonical; the
+    /// node reads both heights together, so a returned block shares its chain.
+    async fn block_receipt(
+        &self,
+        height: u64,
+        txids: &[String],
+        checked: Option<(u64, Hash)>,
+    ) -> Result<Option<(Hash, Vec<bool>)>> {
+        ensure!(
+            txids.len() <= crate::node::MAX_RECEIPT_TXIDS,
+            "too many receipt transaction IDs"
+        );
+        let mut params = json!({"height":height,"txids":txids});
+        if let Some((at, hash)) = checked {
+            params["checked"] = json!({"height":at,"hash":hex::encode(hash)});
+        }
+        let receipt: BlockReceipt = self.call("blockreceipt", params).await?;
+        ensure!(
+            receipt.height == height
+                && receipt.included.len() == txids.len()
+                && receipt.checked_canonical.is_some() == checked.is_some(),
+            "node returned another block receipt"
+        );
+        if receipt.checked_canonical == Some(false) {
+            return Ok(None);
+        }
+        Ok(Some((parse_hash(&receipt.hash)?, receipt.included)))
+    }
+    /// The canonical block hash at `height`, read from the node's index alone.
+    async fn canonical_hash(&self, height: u64) -> Result<Hash> {
+        Ok(self
+            .block_receipt(height, &[], None)
+            .await?
+            .context("missing block receipt")?
+            .0)
+    }
 }
 
 enum Located {
@@ -902,16 +1022,300 @@ impl Scan {
     }
 }
 
+/// Inspects a bounded number of blocks, asking each only for the claims whose
+/// windows cover its height. Heights no window covers are skipped.
+async fn advance(node: &NodeClient, scan: &mut Scan, high: u64) -> Result<Located> {
+    if let Some((at, hash, txid)) = scan.found.clone() {
+        // The recorded hash commits to the block that held the payment.
+        if at <= high && node.canonical_hash(at).await? == hash {
+            return Ok(Located::Found(at, hash, txid));
+        }
+        *scan = Scan::new(scan.nonce, std::mem::take(&mut scan.windows));
+    }
+    let mut budget = SCAN_BLOCKS_PER_REFRESH;
+    loop {
+        let Some(at) = scan.upcoming(high) else {
+            // Every height that could hold a recorded claim was inspected.
+            if let Some((at, hash)) = scan.checked
+                && (at > high || node.canonical_hash(at).await? != hash)
+            {
+                *scan = Scan::new(scan.nonce, std::mem::take(&mut scan.windows));
+                continue;
+            }
+            return Ok(Located::Missing);
+        };
+        if budget == 0 {
+            return Ok(Located::Incomplete);
+        }
+        let txids: Vec<String> = scan
+            .windows
+            .iter()
+            .filter(|w| w.first <= at && at <= w.last)
+            .map(|w| w.txid.clone())
+            .collect();
+        let mut block = None;
+        let mut found = None;
+        let mut moved = false;
+        // One height's IDs are inspected together, so every refresh makes
+        // progress even when more claims than one lookup names share it.
+        for chunk in txids.chunks(crate::node::MAX_RECEIPT_TXIDS) {
+            budget = budget.saturating_sub(1);
+            let Some((hash, included)) = node.block_receipt(at, chunk, scan.checked).await? else {
+                moved = true;
+                break;
+            };
+            if block.is_some_and(|seen| seen != hash) {
+                moved = true;
+                break;
+            }
+            block = Some(hash);
+            if let Some(index) = included.iter().position(|found| *found) {
+                found = Some(chunk[index].clone());
+                break;
+            }
+        }
+        if moved {
+            // The canonical chain changed between inspections. Blocks from
+            // different branches never prove absence, so start again.
+            *scan = Scan::new(scan.nonce, std::mem::take(&mut scan.windows));
+            continue;
+        }
+        match (block, found) {
+            (Some(hash), Some(txid)) => {
+                scan.found = Some((at, hash, txid.clone()));
+                return Ok(Located::Found(at, hash, txid));
+            }
+            (Some(hash), None) => scan.checked = Some((at, hash)),
+            (None, _) => {}
+        }
+        scan.next = at + 1;
+    }
+}
+
+/// Whether the node still responds and its chain advanced recently. Freshness
+/// follows the governed interval, so slower blocks never make the faucet
+/// unavailable for most of every interval.
+fn fresh(
+    last_advance: Option<Instant>,
+    last_success: Option<Instant>,
+    interval: u64,
+    recent_block_seconds: u64,
+) -> bool {
+    let window = recent_block_seconds.max(interval.saturating_mul(FRESHNESS_INTERVALS));
+    last_advance.is_some_and(|v| v.elapsed() < Duration::from_secs(window))
+        && last_success.is_some_and(|v| v.elapsed() < Duration::from_secs(20))
+}
+
+/// What status reports, and a claim checks, of the engine's latest accounted
+/// snapshot. The engine publishes one after every refresh and reservation;
+/// status answers from it with its own ledger connection, so it never waits
+/// for the engine, its node lookups or its commits.
+#[derive(Default)]
+struct View {
+    fault: Option<&'static str>,
+    last_advance: Option<Instant>,
+    last_success: Option<Instant>,
+    /// The governed block interval, or zero before the first snapshot.
+    interval: u64,
+    /// The governed limit, if any, refusing a payment to an existing account
+    /// and to a new one.
+    limits: [Option<&'static str>; 2],
+    funded: bool,
+    lifetime: u64,
+}
+impl View {
+    fn mining(&self, config: &FaucetConfig) -> bool {
+        fresh(
+            self.last_advance,
+            self.last_success,
+            self.interval,
+            config.recent_block_seconds,
+        )
+    }
+    /// Whether the last refresh succeeded recently enough to report a payment.
+    fn recent(&self) -> bool {
+        self.last_success
+            .is_some_and(|v| v.elapsed() < Duration::from_secs(20))
+    }
+    /// Whether a claim may be prepared. Governed limits refuse every claim here
+    /// only when even a payment to an existing account, the lightest kind,
+    /// could not be included within the fee allowance. Otherwise each claim's
+    /// exact quote decides, before anything is signed or reserved.
+    fn availability(&self, db: &Connection, config: &FaucetConfig) -> Result<&'static str> {
+        if self.fault.is_some() {
+            return Ok("unavailable");
+        }
+        if !self.mining(config) {
+            return Ok("waiting_for_mining");
+        }
+        if pending_claim(db)?.is_some() {
+            return Ok("pending");
+        }
+        let time = match quota_clock(db, now()) {
+            Ok(time) => time,
+            Err(error) if error.is::<Fault>() => return Ok("unavailable"),
+            Err(error) => return Err(error),
+        };
+        if !within_budget(db, config, self.lifetime, time)? {
+            return Ok("quota_reached");
+        }
+        if let Some(limit) = self.limits[0] {
+            return Ok(limit);
+        }
+        if !self.funded {
+            return Ok("unfunded");
+        }
+        Ok("ready")
+    }
+    fn state(&self, db: &Connection, config: &FaucetConfig) -> Result<&'static str> {
+        let state = self.availability(db, config)?;
+        // A payment to a new account is the costliest claim. Governance can make
+        // it unincludable or more expensive than the operator's fee allowance,
+        // which status reports although existing accounts can still be paid.
+        if state == "ready"
+            && let Some(limit) = self.limits[1]
+        {
+            return Ok(limit);
+        }
+        Ok(state)
+    }
+}
+
+fn claim_json(config: &FaucetConfig, claim: &Claim, time: i64) -> Value {
+    json!({"status":claim.status,"txid":claim.txid,"chain_id":config.chain_id,"amount_hashes":claim.amount_hashes,"retry_after_seconds":(claim.created.saturating_add(config.cooldown_seconds as i64).saturating_sub(time)).max(0)})
+}
+
+/// Public status: the faucet's state and, for a named recipient, its claim and
+/// the cooldown across that recipient and the client's network.
+fn status_json(
+    config: &FaucetConfig,
+    chain: &Hash,
+    sender: &PublicKey,
+    view: &View,
+    db: &Connection,
+    recipient: Option<&str>,
+    client_subnet: &str,
+) -> Result<Value> {
+    let state = view.state(db, config)?;
+    // Refresh diagnostics stay in the operator journal, never in public status.
+    let mut result = json!({"enabled":true,"chain_id":config.chain_id,"amount_hashes":config.payout,"available":state=="ready","mining_active":view.mining(config),"state":state,"cooldown_seconds":config.cooldown_seconds,"address":address::encode(sender,chain)?});
+    if let Some(recipient) = recipient {
+        let key = address::decode(recipient, chain)?;
+        let canonical = address::encode(&key, chain)?;
+        // Best-effort quota time for display; claims use the strict ledger clock.
+        let time = quota_clock(db, now()).unwrap_or_else(|_| now());
+        let waiting = cooldown(db, config, &canonical, client_subnet, time)?;
+        result["retry_after_seconds"] = json!(waiting.map_or(0, |v| v.retry_after_seconds));
+        if let Some(wait) = waiting {
+            result["cooldown_scope"] = json!(wait.scope);
+            if state == "ready" {
+                result["state"] = json!("cooldown");
+                result["available"] = json!(false);
+            }
+        }
+        if let Some(claim) = last_claim(db, &canonical)?
+            && view.fault.is_none()
+            && (claim.status != "confirmed" || view.recent())
+        {
+            result["claim"] = claim_json(config, &claim, time);
+        }
+    }
+    Ok(result)
+}
+
+/// Status answers from the latest published view and a read-only ledger
+/// connection of their own, on a blocking thread. Write-ahead logging lets
+/// that connection read while the engine commits.
+struct StatusSource {
+    config: FaucetConfig,
+    chain: Hash,
+    sender: PublicKey,
+    view: std::sync::RwLock<Arc<View>>,
+    reader: std::sync::Mutex<Connection>,
+}
+impl StatusSource {
+    fn answer(&self, recipient: Option<&str>, client_subnet: &str) -> Result<Value> {
+        let view = self
+            .view
+            .read()
+            .map_err(|_| anyhow!("faucet status unavailable"))?
+            .clone();
+        let db = self
+            .reader
+            .lock()
+            .map_err(|_| anyhow!("faucet status unavailable"))?;
+        status_json(
+            &self.config,
+            &self.chain,
+            &self.sender,
+            &view,
+            &db,
+            recipient,
+            client_subnet,
+        )
+    }
+}
+
+/// One node snapshot as a refresh reads it. The engine adopts it once its
+/// accounting completes, so claims in the meantime keep using the last
+/// snapshot whose payments were accounted for.
+struct Snap {
+    height: u64,
+    tip: Hash,
+    state_root: Hash,
+    settings: NodeSettings,
+    nonce: u64,
+    funds: Amount,
+}
+
+/// The newest confirmed receipt, to be checked against the canonical chain.
+struct ReceiptCheck {
+    txid: String,
+    nonce: u64,
+    at: u64,
+    hash: String,
+    generation: u64,
+}
+
+/// A consumed nonce some recorded claim must account for, with its search.
+struct Settle {
+    scan: Scan,
+    generation: u64,
+}
+
+/// A claim ready for the node to prepare, with everything its signed transfer
+/// must match.
+struct Preparation {
+    canonical: String,
+    client_subnet: String,
+    operation: Operation,
+    params: Value,
+    nonce: u64,
+    height: u64,
+    anchor: Hash,
+    state_root: Hash,
+    settings: NodeSettings,
+    expiry_blocks: u64,
+    expiry: u64,
+}
+
+enum ClaimStart {
+    /// A pending or cooling-down claim answers a repeated request.
+    Answered(Value),
+    Prepare(Preparation),
+}
+
 struct Engine {
     config: FaucetConfig,
     chain: Hash,
     secret: Zeroizing<[u8; 32]>,
-    subnet_key: Zeroizing<[u8; 32]>,
+    subnet_key: Arc<Zeroizing<[u8; 32]>>,
     sender: PublicKey,
     payout: Amount,
     maximum_fee: Amount,
     ledger: Ledger,
-    client: reqwest::Client,
+    node: NodeClient,
+    published: Arc<StatusSource>,
     height: Option<u64>,
     tip: Option<Hash>,
     state_root: Option<Hash>,
@@ -931,21 +1335,39 @@ impl Engine {
         config.validate()?;
         let (secret, sender) = read_signer(&config.key_file)?;
         // Subnet digests use a derived key, so requests never copy the signer.
-        let subnet_key = Zeroizing::new(crypto::tagged_hash(
+        let subnet_key = Arc::new(Zeroizing::new(crypto::tagged_hash(
             "Hashstash/FaucetSubnetKey/v1",
             &secret[..],
-        ));
+        )));
         let chain = parse_hash(&config.chain_id)?;
         let payout = amount(&config.payout)?;
         let maximum_fee = amount(&config.max_fee)?;
         let ledger = Ledger::open(&config.database, &chain, &sender, &payout.to_str_radix(10))?;
+        // Status reads through its own connection, opened once the ledger
+        // exists in write-ahead mode.
+        let reader = Connection::open_with_flags(
+            &config.database,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        reader.busy_timeout(Duration::from_secs(2))?;
+        let published = Arc::new(StatusSource {
+            config: config.clone(),
+            chain,
+            sender,
+            view: std::sync::RwLock::new(Arc::new(View::default())),
+            reader: std::sync::Mutex::new(reader),
+        });
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
             // The node RPC is loopback only; environment proxies never relay it.
             .no_proxy()
             .build()?;
-        Ok(Self {
+        let node = NodeClient {
+            client,
+            url: config.rpc_url.clone(),
+        };
+        let engine = Self {
             config,
             chain,
             secret,
@@ -954,7 +1376,8 @@ impl Engine {
             payout,
             maximum_fee,
             ledger,
-            client,
+            node,
+            published,
             height: None,
             tip: None,
             state_root: None,
@@ -967,66 +1390,42 @@ impl Engine {
             fault: None,
             scan: None,
             reported_state: None,
-        })
+        };
+        engine.publish();
+        Ok(engine)
     }
-    // Exclusive access keeps these futures Send: the ledger connection is not Sync.
-    async fn rpc<T: DeserializeOwned>(&mut self, method: &str, params: Value) -> Result<T> {
-        node_rpc(&self.client, &self.config.rpc_url, method, params).await
-    }
-    /// The canonical block at `height` and which of `txids` it holds. With
-    /// `checked`, `None` means that earlier block is no longer canonical; the
-    /// node reads both heights together, so a returned block shares its chain.
-    async fn block_receipt(
-        &mut self,
-        height: u64,
-        txids: &[String],
-        checked: Option<(u64, Hash)>,
-    ) -> Result<Option<(Hash, Vec<bool>)>> {
-        ensure!(
-            txids.len() <= crate::node::MAX_RECEIPT_TXIDS,
-            "too many receipt transaction IDs"
-        );
-        let mut params = json!({"height":height,"txids":txids});
-        if let Some((at, hash)) = checked {
-            params["checked"] = json!({"height":at,"hash":hex::encode(hash)});
-        }
-        let receipt: BlockReceipt = self.rpc("blockreceipt", params).await?;
-        ensure!(
-            receipt.height == height
-                && receipt.included.len() == txids.len()
-                && receipt.checked_canonical.is_some() == checked.is_some(),
-            "node returned another block receipt"
-        );
-        if receipt.checked_canonical == Some(false) {
-            return Ok(None);
-        }
-        Ok(Some((parse_hash(&receipt.hash)?, receipt.included)))
-    }
-    /// The canonical block hash at `height`, read from the node's index alone.
-    async fn canonical_hash(&mut self, height: u64) -> Result<Hash> {
-        Ok(self
-            .block_receipt(height, &[], None)
-            .await?
-            .context("missing block receipt")?
-            .0)
-    }
+    #[cfg(test)]
     fn mining(&self) -> bool {
-        // Freshness follows the governed interval, so slower blocks never make
-        // the faucet unavailable for most of every interval.
-        let interval = self.settings.map_or(0, |s| s.interval);
-        let window = self
-            .config
-            .recent_block_seconds
-            .max(interval.saturating_mul(FRESHNESS_INTERVALS));
-        self.last_advance
-            .is_some_and(|v| v.elapsed() < Duration::from_secs(window))
-            && self
-                .last_success
-                .is_some_and(|v| v.elapsed() < Duration::from_secs(20))
+        fresh(
+            self.last_advance,
+            self.last_success,
+            self.settings.map_or(0, |s| s.interval),
+            self.config.recent_block_seconds,
+        )
     }
-    /// Best-effort quota time for display; claims use the strict ledger clock.
-    fn display_time(&self) -> i64 {
-        self.ledger.clock(now()).unwrap_or_else(|_| now())
+    /// The state status reports and claims check, from this engine's fields.
+    fn view(&self) -> View {
+        // A fee estimate that cannot be made pays nothing.
+        let limit = |new_account| {
+            self.payout_limit(new_account)
+                .unwrap_or(Some("unavailable"))
+        };
+        View {
+            fault: self.fault,
+            last_advance: self.last_advance,
+            last_success: self.last_success,
+            interval: self.settings.map_or(0, |s| s.interval),
+            limits: [limit(false), limit(true)],
+            funded: self.funds >= &self.payout + &self.maximum_fee,
+            lifetime: self.ledger.lifetime,
+        }
+    }
+    /// Makes the current state the one status answers from.
+    fn publish(&self) {
+        let view = Arc::new(self.view());
+        if let Ok(mut published) = self.published.view.write() {
+            *published = view;
+        }
     }
     /// The exact weight and automatic fee of this faucet's payment under the
     /// latest governed settings, derived as node preparation derives them: the
@@ -1083,47 +1482,11 @@ impl Engine {
             None
         })
     }
-    /// Whether a claim may be prepared. Governed limits refuse every claim here
-    /// only when even a payment to an existing account, the lightest kind,
-    /// could not be included within the fee allowance. Otherwise each claim's
-    /// exact quote decides, before anything is signed or reserved.
     fn availability(&self) -> Result<&'static str> {
-        if self.fault.is_some() {
-            return Ok("unavailable");
-        }
-        if !self.mining() {
-            return Ok("waiting_for_mining");
-        }
-        if self.ledger.pending()?.is_some() {
-            return Ok("pending");
-        }
-        let time = match self.ledger.clock(now()) {
-            Ok(time) => time,
-            Err(error) if error.is::<Fault>() => return Ok("unavailable"),
-            Err(error) => return Err(error),
-        };
-        if !self.ledger.budget(&self.config, time)? {
-            return Ok("quota_reached");
-        }
-        if let Some(limit) = self.payout_limit(false)? {
-            return Ok(limit);
-        }
-        if self.funds < &self.payout + &self.maximum_fee {
-            return Ok("unfunded");
-        }
-        Ok("ready")
+        self.view().availability(&self.ledger.db, &self.config)
     }
     fn state(&self) -> Result<&'static str> {
-        let state = self.availability()?;
-        // A payment to a new account is the costliest claim. Governance can make
-        // it unincludable or more expensive than the operator's fee allowance,
-        // which status reports although existing accounts can still be paid.
-        if state == "ready"
-            && let Some(limit) = self.payout_limit(true)?
-        {
-            return Ok(limit);
-        }
-        Ok(state)
+        self.view().state(&self.ledger.db, &self.config)
     }
     /// Journals operator-relevant state changes by fixed name only.
     fn report_state(&mut self) {
@@ -1140,54 +1503,26 @@ impl Engine {
             }
         }
     }
-    fn claim_json(&self, claim: &Claim, time: i64) -> Value {
-        json!({"status":claim.status,"txid":claim.txid,"chain_id":self.config.chain_id,"amount_hashes":claim.amount_hashes,"retry_after_seconds":(claim.created.saturating_add(self.config.cooldown_seconds as i64).saturating_sub(time)).max(0)})
-    }
     fn status(&self, recipient: Option<&str>, client_subnet: &str) -> Result<Value> {
-        let state = self.state()?;
-        // Refresh diagnostics stay in the operator journal, never in public status.
-        let mut result = json!({"enabled":true,"chain_id":self.config.chain_id,"amount_hashes":self.config.payout,"available":state=="ready","mining_active":self.mining(),"state":state,"cooldown_seconds":self.config.cooldown_seconds,"address":address::encode(&self.sender,&self.chain)?});
-        if let Some(recipient) = recipient {
-            let key = address::decode(recipient, &self.chain)?;
-            let canonical = address::encode(&key, &self.chain)?;
-            let time = self.display_time();
-            let waiting = cooldown(
-                &self.ledger.db,
-                &self.config,
-                &canonical,
-                client_subnet,
-                time,
-            )?;
-            result["retry_after_seconds"] = json!(waiting.map_or(0, |v| v.retry_after_seconds));
-            if let Some(wait) = waiting {
-                result["cooldown_scope"] = json!(wait.scope);
-                if state == "ready" {
-                    result["state"] = json!("cooldown");
-                    result["available"] = json!(false);
-                }
-            }
-            if let Some(claim) = self.ledger.last(&canonical)?
-                && self.fault.is_none()
-                && (claim.status != "confirmed"
-                    || self
-                        .last_success
-                        .is_some_and(|v| v.elapsed() < Duration::from_secs(20)))
-            {
-                result["claim"] = self.claim_json(&claim, time);
-            }
-        }
-        Ok(result)
+        status_json(
+            &self.config,
+            &self.chain,
+            &self.sender,
+            &self.view(),
+            &self.ledger.db,
+            recipient,
+            client_subnet,
+        )
     }
-    /// Tests refresh under the engine; the poll loop fetches the snapshot
-    /// without holding it and then calls `apply`.
+    /// Tests drive refreshes on an engine they own, through the same steps.
     #[cfg(test)]
     async fn refresh(&mut self) -> Result<()> {
-        let snapshot = self
-            .rpc("snapshot", json!({"key":hex::encode(self.sender)}))
-            .await?;
-        self.apply(snapshot).await
+        let (node, key) = (self.node.clone(), hex::encode(self.sender));
+        poll_once(self, &node, &key).await
     }
-    async fn apply(&mut self, snapshot: NodeSnapshot) -> Result<()> {
+    /// Checks a node snapshot and notes whether the chain advanced; the rest
+    /// is adopted when its accounting finishes.
+    fn observe(&mut self, snapshot: NodeSnapshot) -> Result<Snap> {
         let status = snapshot.status;
         ensure!(
             status.chain_id == self.config.chain_id,
@@ -1197,27 +1532,37 @@ impl Engine {
         let tip = parse_hash(&status.tip)?;
         let state_root = parse_hash(&status.state_root)?;
         ensure!(height <= i64::MAX as u64, "unsupported chain height");
+        // A missing account is expected until the dedicated mining payout is funded.
+        let (funds, nonce) = match snapshot.account {
+            None => (Amount::zero(), 0),
+            Some(account) => (
+                snapshot_payment_funds(&snapshot.payment_available_hash)?,
+                account.account.nonce,
+            ),
+        };
         if self.height.is_some_and(|v| height > v) {
             self.last_advance = Some(Instant::now());
         }
-        self.height = Some(height);
-        self.tip = Some(tip);
-        self.state_root = Some(state_root);
-        self.settings = Some(status.settings);
-        // A missing account is expected until the dedicated mining payout is funded.
-        match snapshot.account {
-            None => {
-                self.funds = Amount::zero();
-                self.nonce = 0;
-            }
-            Some(account) => {
-                self.funds = snapshot_payment_funds(&snapshot.payment_available_hash)?;
-                self.nonce = account.account.nonce;
-            }
-        }
-        match self.reconcile(height).await {
-            Ok(hold) => {
-                self.fault = hold;
+        Ok(Snap {
+            height,
+            tip,
+            state_root,
+            settings: status.settings,
+            nonce,
+            funds,
+        })
+    }
+    /// Adopts a snapshot together with the outcome of its accounting.
+    fn finish_refresh(&mut self, snap: Snap, outcome: Result<Option<Fault>>) -> Result<()> {
+        self.height = Some(snap.height);
+        self.tip = Some(snap.tip);
+        self.state_root = Some(snap.state_root);
+        self.settings = Some(snap.settings);
+        self.funds = snap.funds;
+        self.nonce = snap.nonce;
+        match outcome {
+            Ok(pause) => {
+                self.fault = pause.map(|pause| pause.0);
                 self.last_success = Some(Instant::now());
                 Ok(())
             }
@@ -1229,95 +1574,117 @@ impl Engine {
             }
         }
     }
-    /// Accounts for every faucet nonce the canonical chain consumed, and returns
-    /// a pause category while that accounting is incomplete. Reorganizations
-    /// relocate, retry or expire records automatically. Each nonce pays at most
-    /// one recorded claim, so no repair can create another payment.
-    async fn reconcile(&mut self, height: u64) -> Result<Option<&'static str>> {
+    /// Journals a refresh by fixed category and publishes the resulting state.
+    fn record_refresh(&mut self, refreshed: Result<()>) {
+        match refreshed {
+            Ok(()) => self.refresh_diagnostics.recovered(),
+            Err(error) => {
+                self.last_success = None;
+                if self
+                    .refresh_diagnostics
+                    .record(&error, now(), Instant::now())
+                    && let Some(status) = self.refresh_diagnostics.error.as_ref()
+                {
+                    eprintln!(
+                        "faucet refresh category={} consecutive_errors={} first_at={} last_at={}",
+                        status.category,
+                        status.consecutive_errors,
+                        status.first_at,
+                        status.last_at
+                    );
+                }
+            }
+        }
+        self.report_state();
+        self.publish();
+    }
+    /// The newest confirmed receipt, whose block commits to its own
+    /// transactions, which included the payment, and to all older receipts.
+    fn receipt_to_check(&self, height: u64) -> Result<Option<ReceiptCheck>> {
         self.ledger.clock(now())?;
-        let top = match self.verify_receipts(height).await? {
-            Receipts::Verified(top) => top,
-            Receipts::Repairing => return Ok(Some("verifying_payments")),
+        let Some((claim, at, hash)) = self.ledger.top_receipt()? else {
+            return Ok(None);
         };
+        if height < at {
+            // A shorter chain cannot show yet whether this payment survived.
+            return Err(Fault("node_behind_ledger").into());
+        }
+        Ok(Some(ReceiptCheck {
+            txid: claim.txid,
+            nonce: claim.nonce,
+            at,
+            hash,
+            generation: self.ledger.generation,
+        }))
+    }
+    /// Accounts a receipt that left the canonical chain again from its nonce,
+    /// unless a claim was reserved since it was read; it is then read again.
+    fn repair_receipt(&mut self, check: ReceiptCheck) -> Result<()> {
+        if check.generation != self.ledger.generation {
+            return Ok(());
+        }
+        let status = if self.ledger.pending()?.is_some() {
+            "expired"
+        } else {
+            "pending"
+        };
+        self.ledger.db.execute(
+            "UPDATE claims SET status=?1,receipt_height=NULL,receipt_hash=NULL WHERE txid=?2 AND status='confirmed'",
+            params![status, check.txid],
+        )?;
+        self.scan = None;
+        Ok(())
+    }
+    /// The nonce below `nonce`, the account's next one, that some recorded
+    /// claim must account for, with the search for it resumed while it covers
+    /// the same windows. A pending claim at an already settled nonce expires.
+    fn settlement(&mut self, top: Option<u64>, nonce: u64) -> Result<Option<Settle>> {
         let floor = match top {
             Some(nonce) => Some(nonce.saturating_add(1)),
             None => self.ledger.first_nonce()?,
         }
         .max(self.ledger.nonce_floor()?);
-        let pending = match self.ledger.pending()? {
-            Some(claim) => {
-                self.verify_stored(&claim)?;
-                if floor.is_some_and(|floor| claim.nonce < floor) {
-                    // A recorded payment already settled this nonce on this chain.
-                    self.ledger.expire(&claim.txid)?;
-                    None
-                } else {
-                    Some(claim)
-                }
-            }
-            None => None,
-        };
-        if let Some(floor) = floor
-            && floor < self.nonce
-            && let Some(hold) = self.settle(floor, height).await?
-        {
-            return Ok(Some(hold));
-        }
-        // Only bytes whose nonce is still unused here may be retried or expired.
-        if let Some(claim) = pending
-            && claim.nonce >= self.nonce
-        {
-            // Neither an orphaned anchor nor a shorter chain can include the
-            // bytes after their lifetime, so they expire with the nonce unused.
-            if height >= claim.expiry {
+        if let Some(claim) = self.ledger.pending()? {
+            self.verify_stored(&claim)?;
+            if floor.is_some_and(|floor| claim.nonce < floor) {
+                // A recorded payment already settled this nonce on this chain.
                 self.ledger.expire(&claim.txid)?;
-            } else if self.mining() {
-                // Any RPC error is uncertain. Keep the durable pending record and its
-                // quota reservation; a later poll retries exactly these signed bytes.
-                let _ = self
-                    .rpc::<IgnoredAny>("broadcasttransaction", json!({"raw":claim.raw}))
-                    .await;
             }
         }
-        Ok(None)
-    }
-    /// Checks the newest confirmed receipt with one block-hash lookup. Its block
-    /// commits to its own transactions, which included the payment, and to all
-    /// older receipts. A receipt that left the canonical chain is accounted
-    /// again from its nonce.
-    async fn verify_receipts(&mut self, height: u64) -> Result<Receipts> {
-        for _ in 0..RECEIPT_REPAIRS_PER_REFRESH {
-            let Some((claim, at, hash)) = self.ledger.top_receipt()? else {
-                return Ok(Receipts::Verified(None));
-            };
-            if height < at {
-                // A shorter chain cannot show yet whether this payment survived.
-                return Err(Fault("node_behind_ledger").into());
-            }
-            if hex::encode(self.canonical_hash(at).await?) == hash {
-                return Ok(Receipts::Verified(Some(claim.nonce)));
-            }
-            let status = if self.ledger.pending()?.is_some() {
-                "expired"
-            } else {
-                "pending"
-            };
-            self.ledger.db.execute(
-                "UPDATE claims SET status=?1,receipt_height=NULL,receipt_hash=NULL WHERE txid=?2 AND status='confirmed'",
-                params![status, claim.txid],
-            )?;
-            self.scan = None;
-        }
-        Ok(Receipts::Repairing)
-    }
-    /// Finds the recorded claim that consumed `nonce` and confirms it at depth.
-    /// A consumed nonce matching no recorded claim means the key signed elsewhere.
-    async fn settle(&mut self, nonce: u64, height: u64) -> Result<Option<&'static str>> {
-        let windows = self.ledger.unsettled(nonce)?;
+        let Some(floor) = floor.filter(|floor| *floor < nonce) else {
+            return Ok(None);
+        };
+        let windows = self.ledger.unsettled(floor)?;
         if windows.is_empty() {
+            // A consumed nonce matching no recorded claim: the key signed elsewhere.
             return Err(Fault("nonce_conflict").into());
         }
-        match self.locate(nonce, windows, height).await? {
+        let scan = match self.scan.take() {
+            Some(scan) if scan.nonce == floor && scan.windows == windows => scan,
+            _ => Scan::new(floor, windows),
+        };
+        Ok(Some(Settle {
+            scan,
+            generation: self.ledger.generation,
+        }))
+    }
+    /// Applies what a search found: the claim that consumed the nonce is
+    /// confirmed at depth and other bytes signed with it expire. A claim
+    /// reserved during the search defers this to the next refresh.
+    fn settled(
+        &mut self,
+        job: Settle,
+        located: Result<Located>,
+        height: u64,
+    ) -> Result<Option<Fault>> {
+        let nonce = job.scan.nonce;
+        // Progress survives a failed lookup and resumes on the next refresh.
+        self.scan = Some(job.scan);
+        let located = located?;
+        if job.generation != self.ledger.generation {
+            return Ok(Some(Fault("verifying_payments")));
+        }
+        match located {
             Located::Found(at, hash, txid) => {
                 // Other bytes signed with this nonce can never apply on this chain.
                 self.ledger.db.execute(
@@ -1330,91 +1697,34 @@ impl Engine {
                 }
                 Ok(None)
             }
+            // A consumed nonce matching no recorded claim: the key signed elsewhere.
             Located::Missing => Err(Fault("nonce_conflict").into()),
-            Located::Incomplete => Ok(Some("verifying_payments")),
+            Located::Incomplete => Ok(Some(Fault("verifying_payments"))),
         }
     }
-    /// Searches the recorded windows through `high` for the claim that consumed
-    /// `nonce`, resuming earlier progress while it remains canonical.
-    async fn locate(&mut self, nonce: u64, windows: Vec<Window>, high: u64) -> Result<Located> {
-        let mut scan = match self.scan.take() {
-            Some(scan) if scan.nonce == nonce && scan.windows == windows => scan,
-            _ => Scan::new(nonce, windows),
+    /// The pending claim's bytes to broadcast again, if its nonce is still
+    /// unused and it may still be included. Neither an orphaned anchor nor a
+    /// shorter chain can include the bytes after their lifetime, so they
+    /// expire with the nonce unused.
+    fn pending_retry(&mut self, height: u64, nonce: u64, interval: u64) -> Result<Option<String>> {
+        let Some(claim) = self.ledger.pending()? else {
+            return Ok(None);
         };
-        // Progress survives a failed lookup and resumes on the next refresh.
-        let located = self.advance(&mut scan, high).await;
-        self.scan = Some(scan);
-        located
-    }
-    /// Inspects a bounded number of blocks, asking each only for the claims
-    /// whose windows cover its height. Heights no window covers are skipped.
-    async fn advance(&mut self, scan: &mut Scan, high: u64) -> Result<Located> {
-        if let Some((at, hash, txid)) = scan.found.clone() {
-            // The recorded hash commits to the block that held the payment.
-            if at <= high && self.canonical_hash(at).await? == hash {
-                return Ok(Located::Found(at, hash, txid));
-            }
-            *scan = Scan::new(scan.nonce, std::mem::take(&mut scan.windows));
+        if claim.nonce < nonce {
+            return Ok(None);
         }
-        let mut budget = SCAN_BLOCKS_PER_REFRESH;
-        loop {
-            let Some(at) = scan.upcoming(high) else {
-                // Every height that could hold a recorded claim was inspected.
-                if let Some((at, hash)) = scan.checked
-                    && (at > high || self.canonical_hash(at).await? != hash)
-                {
-                    *scan = Scan::new(scan.nonce, std::mem::take(&mut scan.windows));
-                    continue;
-                }
-                return Ok(Located::Missing);
-            };
-            if budget == 0 {
-                return Ok(Located::Incomplete);
-            }
-            let txids: Vec<String> = scan
-                .windows
-                .iter()
-                .filter(|w| w.first <= at && at <= w.last)
-                .map(|w| w.txid.clone())
-                .collect();
-            let mut block = None;
-            let mut found = None;
-            let mut moved = false;
-            // One height's IDs are inspected together, so every refresh makes
-            // progress even when more claims than one lookup names share it.
-            for chunk in txids.chunks(crate::node::MAX_RECEIPT_TXIDS) {
-                budget = budget.saturating_sub(1);
-                let Some((hash, included)) = self.block_receipt(at, chunk, scan.checked).await?
-                else {
-                    moved = true;
-                    break;
-                };
-                if block.is_some_and(|seen| seen != hash) {
-                    moved = true;
-                    break;
-                }
-                block = Some(hash);
-                if let Some(index) = included.iter().position(|found| *found) {
-                    found = Some(chunk[index].clone());
-                    break;
-                }
-            }
-            if moved {
-                // The canonical chain changed between inspections. Blocks from
-                // different branches never prove absence, so start again.
-                *scan = Scan::new(scan.nonce, std::mem::take(&mut scan.windows));
-                continue;
-            }
-            match (block, found) {
-                (Some(hash), Some(txid)) => {
-                    scan.found = Some((at, hash, txid.clone()));
-                    return Ok(Located::Found(at, hash, txid));
-                }
-                (Some(hash), None) => scan.checked = Some((at, hash)),
-                (None, _) => {}
-            }
-            scan.next = at + 1;
+        self.verify_stored(&claim)?;
+        if height >= claim.expiry {
+            self.ledger.expire(&claim.txid)?;
+            return Ok(None);
         }
+        let mining = fresh(
+            self.last_advance,
+            self.last_success,
+            interval,
+            self.config.recent_block_seconds,
+        );
+        Ok(mining.then_some(claim.raw))
     }
     /// A stored claim must still be exactly its signed fixed intent before it
     /// is retried.
@@ -1445,7 +1755,15 @@ impl Engine {
         );
         Ok(())
     }
+    /// Tests drive claims on an engine they own, through the same steps.
+    #[cfg(test)]
     async fn claim(&mut self, recipient: &str, client_subnet: &str) -> Result<Value> {
+        let node = self.node.clone();
+        claim_with(self, &node, recipient.to_owned(), client_subnet.to_owned()).await
+    }
+    /// Answers a repeated claim from the ledger, or checks eligibility and
+    /// fixes everything the node is asked to prepare.
+    fn claim_start(&self, recipient: &str, client_subnet: &str) -> Result<ClaimStart> {
         ensure!(self.fault.is_none(), "Faucet needs operator review");
         let time = self.ledger.clock(now())?;
         let key = address::decode(recipient, &self.chain)?;
@@ -1465,7 +1783,7 @@ impl Engine {
                         .is_some_and(|v| v.elapsed() < Duration::from_secs(20)),
                 "Faucet is verifying its payment history"
             );
-            let mut result = self.claim_json(&existing, time);
+            let mut result = claim_json(&self.config, &existing, time);
             if let Some(wait) = cooldown(
                 &self.ledger.db,
                 &self.config,
@@ -1476,7 +1794,7 @@ impl Engine {
                 result["retry_after_seconds"] = json!(wait.retry_after_seconds);
                 result["cooldown_scope"] = json!(wait.scope);
             }
-            return Ok(result);
+            return Ok(ClaimStart::Answered(result));
         }
         ensure!(
             self.availability()? == "ready",
@@ -1488,9 +1806,8 @@ impl Engine {
         let anchor = self.tip.context("missing quoted tip")?;
         let state_root = self.state_root.context("missing quoted state root")?;
         let settings = self.settings.context("missing governed settings")?;
-        let expiry = height
-            .checked_add(self.config.expiry_blocks)
-            .context("expiry overflow")?;
+        let expiry_blocks = self.config.expiry_blocks;
+        let expiry = height.checked_add(expiry_blocks).context("expiry overflow")?;
         // Durable claim heights use SQLite signed INTEGERs. Reject before signing
         // instead of truncating a valid u64 lifetime or corrupting the receipt.
         ensure!(
@@ -1501,7 +1818,37 @@ impl Engine {
             recipient: key,
             amount: self.payout.clone(),
         };
-        let result: Value = self.rpc("preparetransaction",json!({"sender":hex::encode(self.sender),"operation":operation,"nonce":self.nonce,"anchor":hex::encode(anchor),"expiry_blocks":self.config.expiry_blocks,"extra_fee":"0"})).await?;
+        let params = json!({"sender":hex::encode(self.sender),"operation":operation,"nonce":self.nonce,"anchor":hex::encode(anchor),"expiry_blocks":expiry_blocks,"extra_fee":"0"});
+        Ok(ClaimStart::Prepare(Preparation {
+            canonical,
+            client_subnet: client_subnet.to_owned(),
+            operation,
+            params,
+            nonce: self.nonce,
+            height,
+            anchor,
+            state_root,
+            settings,
+            expiry_blocks,
+            expiry,
+        }))
+    }
+    /// Verifies the node's preparation against the claim, signs it and
+    /// reserves it durably. Returns the signed bytes and the claim's answer.
+    fn claim_commit(&mut self, claim: Preparation, result: Value) -> Result<(String, Value)> {
+        let Preparation {
+            canonical,
+            client_subnet,
+            operation,
+            nonce,
+            height,
+            anchor,
+            state_root,
+            settings,
+            expiry_blocks,
+            expiry,
+            ..
+        } = claim;
         let quote = &result["fee_quote"];
         ensure!(
             quote["chain_id"] == self.config.chain_id
@@ -1510,7 +1857,7 @@ impl Engine {
                 && quote["height"] == height
                 && quote["anchor"] == hex::encode(anchor)
                 && quote["anchor_height"] == height
-                && quote["expiry_blocks"] == self.config.expiry_blocks
+                && quote["expiry_blocks"] == expiry_blocks
                 && quote["expiry_height"] == expiry,
             "prepared faucet snapshot changed"
         );
@@ -1553,9 +1900,9 @@ impl Engine {
         verify_intent(
             &body,
             self.sender,
-            self.nonce,
+            nonce,
             anchor,
-            self.config.expiry_blocks,
+            expiry_blocks,
             &operation,
             &self.maximum_fee,
         )?;
@@ -1572,12 +1919,177 @@ impl Engine {
             expiry,
         };
         // No broadcast is allowed above this durable commit.
-        self.ledger.reserve(&self.config, &claim, client_subnet)?;
-        let _ = self
-            .rpc::<IgnoredAny>("broadcasttransaction", json!({"raw":claim.raw}))
-            .await;
-        Ok(self.claim_json(&claim, claim.created))
+        self.ledger.reserve(&self.config, &claim, &client_subnet)?;
+        self.publish();
+        let answer = claim_json(&self.config, &claim, claim.created);
+        Ok((claim.raw, answer))
     }
+}
+
+/// Exclusive use of the engine for one local step of a refresh or a claim.
+/// The service runs each step on a blocking thread, so SQLite work, including
+/// its synchronous commits, never occupies the async workers. Between steps a
+/// refresh holds nothing while it waits for the node; a claim keeps the
+/// engine (see `Held`).
+trait Hold: Send {
+    fn step<R, F>(&mut self, work: F) -> impl Future<Output = Result<R>> + Send
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Engine) -> Result<R> + Send + 'static;
+    /// Gives up a hold kept between steps.
+    fn release(&mut self) {}
+}
+
+/// Tests own their engine and run each step in place.
+#[cfg(test)]
+impl Hold for Engine {
+    fn step<R, F>(&mut self, work: F) -> impl Future<Output = Result<R>> + Send
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Engine) -> Result<R> + Send + 'static,
+    {
+        std::future::ready(work(self))
+    }
+}
+
+/// The service engine as a refresh uses it: taken for each step only.
+struct Shared(Arc<Mutex<Engine>>);
+impl Hold for Shared {
+    fn step<R, F>(&mut self, work: F) -> impl Future<Output = Result<R>> + Send
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Engine) -> Result<R> + Send + 'static,
+    {
+        let engine = self.0.clone();
+        async move {
+            let mut engine = engine.lock_owned().await;
+            tokio::task::spawn_blocking(move || work(&mut engine))
+                .await
+                .context("faucet engine step failed")?
+        }
+    }
+}
+
+/// The service engine as a claim uses it: kept from the eligibility checks
+/// through the reservation, so the nonce, the anchor and the one pending
+/// payment cannot change while the node prepares the transfer.
+struct Held(Option<OwnedMutexGuard<Engine>>);
+impl Hold for Held {
+    fn step<R, F>(&mut self, work: F) -> impl Future<Output = Result<R>> + Send
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Engine) -> Result<R> + Send + 'static,
+    {
+        async move {
+            let mut engine = self.0.take().context("faucet engine released")?;
+            let (engine, result) = tokio::task::spawn_blocking(move || {
+                let result = work(&mut engine);
+                (engine, result)
+            })
+            .await
+            .context("faucet engine step failed")?;
+            self.0 = Some(engine);
+            result
+        }
+    }
+    fn release(&mut self) {
+        self.0 = None;
+    }
+}
+
+/// One refresh: the node snapshot, its accounting, then its adoption.
+async fn poll_once(hold: &mut impl Hold, node: &NodeClient, key: &str) -> Result<()> {
+    // The snapshot is the largest reply; nothing is held while it arrives.
+    let snapshot: NodeSnapshot = node.call("snapshot", json!({"key":key})).await?;
+    let snap = hold.step(move |engine| engine.observe(snapshot)).await?;
+    let outcome = reconcile(hold, node, &snap).await;
+    hold.step(move |engine| engine.finish_refresh(snap, outcome))
+        .await
+}
+
+/// Accounts for every faucet nonce the canonical chain consumed, and returns
+/// a pause category while that accounting is incomplete. Reorganizations
+/// relocate, retry or expire records automatically. Each nonce pays at most
+/// one recorded claim, so no repair can create another payment. Node lookups
+/// run between local steps, holding nothing, so a claim can be reserved
+/// meanwhile; what those lookups found is then applied on a later refresh,
+/// against the ledger as it is by then.
+async fn reconcile(hold: &mut impl Hold, node: &NodeClient, snap: &Snap) -> Result<Option<Fault>> {
+    let (height, nonce, interval) = (snap.height, snap.nonce, snap.settings.interval);
+    // The newest confirmed receipt is checked by its block hash alone. One
+    // that left the canonical chain is accounted again from its nonce.
+    let mut verified = None;
+    for _ in 0..RECEIPT_REPAIRS_PER_REFRESH {
+        let Some(receipt) = hold
+            .step(move |engine| engine.receipt_to_check(height))
+            .await?
+        else {
+            verified = Some(None);
+            break;
+        };
+        if hex::encode(node.canonical_hash(receipt.at).await?) == receipt.hash {
+            verified = Some(Some(receipt.nonce));
+            break;
+        }
+        hold.step(move |engine| engine.repair_receipt(receipt))
+            .await?;
+    }
+    let Some(top) = verified else {
+        // More reorganized receipts remain for the next refresh.
+        return Ok(Some(Fault("verifying_payments")));
+    };
+    if let Some(mut job) = hold
+        .step(move |engine| engine.settlement(top, nonce))
+        .await?
+    {
+        let located = advance(node, &mut job.scan, height).await;
+        if let Some(pause) = hold
+            .step(move |engine| engine.settled(job, located, height))
+            .await?
+        {
+            return Ok(Some(pause));
+        }
+    }
+    // Only bytes whose nonce is still unused here may be retried or expired.
+    if let Some(raw) = hold
+        .step(move |engine| engine.pending_retry(height, nonce, interval))
+        .await?
+    {
+        // Any RPC error is uncertain. Keep the durable pending record and its
+        // quota reservation; a later poll retries exactly these signed bytes.
+        let _ = node
+            .call::<IgnoredAny>("broadcasttransaction", json!({"raw":raw}))
+            .await;
+    }
+    Ok(None)
+}
+
+/// Pays one claim, or answers a repeated one. A refresh retries reserved
+/// bytes anyway, so the broadcast needs no hold.
+async fn claim_with(
+    hold: &mut impl Hold,
+    node: &NodeClient,
+    recipient: String,
+    client_subnet: String,
+) -> Result<Value> {
+    let preparation = match hold
+        .step(move |engine| engine.claim_start(&recipient, &client_subnet))
+        .await?
+    {
+        ClaimStart::Answered(answer) => return Ok(answer),
+        ClaimStart::Prepare(preparation) => preparation,
+    };
+    let prepared: Value = node
+        .call("preparetransaction", preparation.params.clone())
+        .await?;
+    let (raw, answer) = hold
+        .step(move |engine| engine.claim_commit(preparation, prepared))
+        .await?;
+    hold.release();
+    let _ = node
+        .call::<IgnoredAny>("broadcasttransaction", json!({"raw":raw}))
+        .await;
+    Ok(answer)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1609,10 +2121,30 @@ fn verify_intent(
 #[derive(Clone)]
 struct App {
     engine: Arc<Mutex<Engine>>,
+    status: Arc<StatusSource>,
+    node: NodeClient,
+    chain: Hash,
+    subnet_key: Arc<Zeroizing<[u8; 32]>>,
     origins: Arc<Vec<String>>,
     hosts: Arc<Vec<String>>,
     sessions: Arc<Semaphore>,
     clients: Arc<ClientSessions>,
+}
+impl App {
+    fn new(engine: Engine, origins: Vec<String>, hosts: Vec<String>) -> Self {
+        engine.publish();
+        Self {
+            status: engine.published.clone(),
+            node: engine.node.clone(),
+            chain: engine.chain,
+            subnet_key: engine.subnet_key.clone(),
+            engine: Arc::new(Mutex::new(engine)),
+            origins: Arc::new(origins),
+            hosts: Arc::new(hosts),
+            sessions: Arc::new(Semaphore::new(16)),
+            clients: Arc::default(),
+        }
+    }
 }
 
 /// Requests in flight per client network, so one network cannot hold every
@@ -1741,10 +2273,10 @@ struct ClaimRequest {
     address: String,
 }
 
-fn private_client_subnet(engine: &Engine, headers: &HeaderMap) -> Option<String> {
+fn private_client_subnet(subnet_key: &[u8; 32], headers: &HeaderMap) -> Option<String> {
     let client = one_header(headers, "x-real-ip").and_then(|v| subnet(v).ok())?;
     let mut private_subnet = Zeroizing::new(Vec::with_capacity(32 + client.len()));
-    private_subnet.extend_from_slice(&engine.subnet_key[..]);
+    private_subnet.extend_from_slice(&subnet_key[..]);
     private_subnet.extend_from_slice(client.as_bytes());
     Some(hex::encode(crypto::tagged_hash(
         "Hashstash/FaucetSubnet/v1",
@@ -1757,13 +2289,18 @@ async fn status_handler(
     headers: HeaderMap,
     Query(query): Query<StatusQuery>,
 ) -> Response {
-    let engine = app.engine.lock().await;
-    let Some(client) = private_client_subnet(&engine, &headers) else {
+    let Some(client) = private_client_subnet(&app.subnet_key, &headers) else {
         return failure(StatusCode::FORBIDDEN, "Client address required");
     };
-    match engine.status(query.address.as_deref(), &client) {
-        Ok(v) => Json(v).into_response(),
-        Err(_) => failure(StatusCode::BAD_REQUEST, "Invalid test-network address"),
+    // Status never waits for the engine: it reads the published view and its
+    // own ledger connection, off the async workers.
+    let status = app.status.clone();
+    match tokio::task::spawn_blocking(move || status.answer(query.address.as_deref(), &client))
+        .await
+    {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(_)) => failure(StatusCode::BAD_REQUEST, "Invalid test-network address"),
+        Err(_) => failure(StatusCode::SERVICE_UNAVAILABLE, "Faucet status is unavailable"),
     }
 }
 async fn claim_handler(
@@ -1771,15 +2308,17 @@ async fn claim_handler(
     headers: HeaderMap,
     Json(request): Json<ClaimRequest>,
 ) -> Response {
-    let mut engine = app.engine.lock().await;
     // Store only a keyed digest of the subnet, never the visitor's literal IP.
-    let Some(client) = private_client_subnet(&engine, &headers) else {
+    let Some(client) = private_client_subnet(&app.subnet_key, &headers) else {
         return failure(StatusCode::FORBIDDEN, "Client address required");
     };
-    if address::decode(&request.address, &engine.chain).is_err() {
+    if address::decode(&request.address, &app.chain).is_err() {
         return failure(StatusCode::BAD_REQUEST, "Invalid test-network address");
     }
-    match engine.claim(&request.address, &client).await {
+    // Claims take turns with the engine; a refresh waiting for the node holds
+    // it only between its lookups.
+    let mut held = Held(Some(app.engine.clone().lock_owned().await));
+    match claim_with(&mut held, &app.node, request.address, client).await {
         Ok(v) => Json(v).into_response(),
         Err(error) => {
             let message = error.to_string();
@@ -1831,7 +2370,8 @@ impl Drop for FaucetServer {
 }
 
 pub async fn serve(config: FaucetConfig) -> Result<FaucetServer> {
-    let engine = Arc::new(Mutex::new(Engine::open(config.clone())?));
+    let opened = config.clone();
+    let engine = tokio::task::spawn_blocking(move || Engine::open(opened)).await??;
     let listener = TcpListener::bind(config.bind).await?;
     let address = listener.local_addr()?;
     let hosts = config
@@ -1839,64 +2379,39 @@ pub async fn serve(config: FaucetConfig) -> Result<FaucetServer> {
         .iter()
         .map(|s| s.split_once("://").expect("validated origin").1.to_owned())
         .collect();
-    let app = App {
-        engine: engine.clone(),
-        origins: Arc::new(config.origins.clone()),
-        hosts: Arc::new(hosts),
-        sessions: Arc::new(Semaphore::new(16)),
-        clients: Arc::default(),
-    };
+    let key = hex::encode(engine.sender);
+    let app = App::new(engine, config.origins.clone(), hosts);
+    let (engine, node) = (app.engine.clone(), app.node.clone());
     let routes = router(app);
     let poll = tokio::spawn(async move {
+        // The engine is taken only for each local step of a refresh, never
+        // while it waits for the node, so status and claims never wait on a
+        // slow or busy node's lookups.
+        let mut shared = Shared(engine);
         loop {
-            // The snapshot is the largest reply. Fetch it without holding the
-            // engine, so visitors wait only for local accounting and receipts.
-            let (client, url, key) = {
-                let engine = engine.lock().await;
-                (
-                    engine.client.clone(),
-                    engine.config.rpc_url.clone(),
-                    hex::encode(engine.sender),
-                )
-            };
-            let snapshot =
-                node_rpc::<NodeSnapshot>(&client, &url, "snapshot", json!({"key":key})).await;
-            let mut engine = engine.lock().await;
-            let refreshed = match snapshot {
-                Ok(snapshot) => engine.apply(snapshot).await,
-                Err(error) => Err(error),
-            };
-            match refreshed {
-                Ok(()) => engine.refresh_diagnostics.recovered(),
-                Err(error) => {
-                    engine.last_success = None;
-                    if engine
-                        .refresh_diagnostics
-                        .record(&error, now(), Instant::now())
-                    {
-                        let status = engine.refresh_diagnostics.error.as_ref().unwrap();
-                        eprintln!(
-                            "faucet refresh category={} consecutive_errors={} first_at={} last_at={}",
-                            status.category,
-                            status.consecutive_errors,
-                            status.first_at,
-                            status.last_at
-                        );
-                    }
-                }
-            }
-            engine.report_state();
-            drop(engine);
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            let refreshed = poll_once(&mut shared, &node, &key).await;
+            let wait = poll_wait(&refreshed);
+            let _ = shared
+                .step(move |engine| {
+                    engine.record_refresh(refreshed);
+                    Ok(())
+                })
+                .await;
+            tokio::time::sleep(wait).await;
         }
     });
     let (stop, shutdown) = oneshot::channel();
     let task = tokio::spawn(async move {
-        let _ = axum::serve(listener, routes)
-            .with_graceful_shutdown(async {
+        crate::local_http::serve(
+            listener,
+            routes,
+            HTTP_CONNECTIONS,
+            crate::local_http::HEAD_TIMEOUT,
+            async {
                 let _ = shutdown.await;
-            })
-            .await;
+            },
+        )
+        .await;
     });
     Ok(FaucetServer {
         address,
@@ -2632,6 +3147,12 @@ mod tests {
         existing: Vec<PublicKey>,
         /// After this many receipt lookups, these blocks replace the branch.
         switch_after: Option<(usize, Vec<Block>)>,
+        /// The next receipt lookup signals the first and waits for the second.
+        receipt_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        /// Admission refusals: the next call of the method is answered with
+        /// the status and `Retry-After`, without running.
+        refusals: Vec<(&'static str, StatusCode, Option<&'static str>)>,
+        prepared: usize,
     }
     fn mock_hash(node: &MockNode, height: u64) -> Hash {
         codec::block_hash(node.blocks.get(&height).unwrap_or(&block(height, vec![])))
@@ -2640,13 +3161,37 @@ mod tests {
         State(node): State<Arc<Mutex<MockNode>>>,
         Json(request): Json<Value>,
     ) -> Response {
+        let method = request["method"].as_str().unwrap();
+        if method == "blockreceipt" {
+            // Waiting here holds nothing, so other calls are answered meanwhile.
+            let gate = node.lock().await.receipt_gate.take();
+            if let Some((entered, release)) = gate {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
         let mut node = node.lock().await;
+        if let Some(index) = node.refusals.iter().position(|(m, ..)| *m == method) {
+            let (_, status, retry_after) = node.refusals.remove(index);
+            let mut response = (
+                status,
+                Json(json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"node is busy"}})),
+            )
+                .into_response();
+            if let Some(wait) = retry_after {
+                response
+                    .headers_mut()
+                    .insert("retry-after", HeaderValue::from_static(wait));
+            }
+            return response;
+        }
         let p = &request["params"];
-        let result = match request["method"].as_str().unwrap() {
+        let result = match method {
             "snapshot" => {
                 json!({"status":{"chain_id":hex::encode([7;32]),"height":node.height,"tip":hex::encode(codec::block_hash(node.blocks.get(&node.height).unwrap_or(&block(node.height,vec![])))),"state_root":hex::encode([0;32]),"settings":{"block_bytes":node.block_bytes,"minimum_fee_rate":node.fee_rate,"interval":node.interval}},"payment_available_hash":"1000000000000000000","account":{"account":{"ordinary":"1000000000000000000","nonce":node.nonce}}})
             }
             "preparetransaction" => {
+                node.prepared += 1;
                 let mut operation: Operation =
                     serde_json::from_value(p["operation"].clone()).unwrap();
                 if node.malicious_prepare {
@@ -3145,21 +3690,19 @@ mod tests {
         engine.refresh().await.unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("x-real-ip", HeaderValue::from_static("192.0.2.1"));
-        let network = private_client_subnet(&engine, &headers).unwrap();
+        let network = private_client_subnet(&engine.subnet_key, &headers).unwrap();
         let first = record(1, now() - 17);
         engine
             .ledger
             .reserve(&engine.config.clone(), &first, &network)
             .unwrap();
         finish(&engine.ledger, &first);
-        let engine = Arc::new(Mutex::new(engine));
-        let app = App {
-            engine: engine.clone(),
-            origins: Arc::new(vec!["https://faucet.example".into()]),
-            hosts: Arc::new(vec!["faucet.example".into()]),
-            sessions: Arc::new(Semaphore::new(16)),
-            clients: Arc::default(),
-        };
+        let app = App::new(
+            engine,
+            vec!["https://faucet.example".into()],
+            vec!["faucet.example".into()],
+        );
+        let engine = app.engine.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -3282,13 +3825,11 @@ mod tests {
     async fn http_rejects_cross_origin_missing_ip_unknown_fields_and_large_bodies() {
         let dir = TempDir::new().unwrap();
         let c = config(&dir);
-        let app = App {
-            engine: Arc::new(Mutex::new(Engine::open(c).unwrap())),
-            origins: Arc::new(vec!["https://faucet.example".into()]),
-            hosts: Arc::new(vec!["faucet.example".into()]),
-            sessions: Arc::new(Semaphore::new(16)),
-            clients: Arc::default(),
-        };
+        let app = App::new(
+            Engine::open(c).unwrap(),
+            vec!["https://faucet.example".into()],
+            vec!["faucet.example".into()],
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -3932,7 +4473,7 @@ mod tests {
         let engine = Engine::open(c.clone()).unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("x-real-ip", HeaderValue::from_static("192.0.2.1"));
-        let digest = private_client_subnet(&engine, &headers).unwrap();
+        let digest = private_client_subnet(&engine.subnet_key, &headers).unwrap();
         let derived = crypto::tagged_hash("Hashstash/FaucetSubnetKey/v1", &[41; 32]);
         let keyed = [&derived[..], b"192.0.2.0/24"].concat();
         assert_eq!(
@@ -3980,17 +4521,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn one_client_network_cannot_hold_every_http_session() {
         let dir = TempDir::new().unwrap();
-        let engine = Arc::new(Mutex::new(Engine::open(config(&dir)).unwrap()));
-        let clients = Arc::new(ClientSessions::default());
-        let app = App {
-            engine: engine.clone(),
-            origins: Arc::new(vec!["https://faucet.example".into()]),
-            hosts: Arc::new(vec!["faucet.example".into()]),
-            sessions: Arc::new(Semaphore::new(16)),
-            clients: clients.clone(),
-        };
+        let app = App::new(
+            Engine::open(config(&dir)).unwrap(),
+            vec!["https://faucet.example".into()],
+            vec!["faucet.example".into()],
+        );
+        let (clients, status_source) = (app.clients.clone(), app.status.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -4010,8 +4549,8 @@ mod tests {
                     .status()
             }
         };
-        // Local accounting holds the engine, so admitted requests stay in flight.
-        let held = engine.lock().await;
+        // Holding the status ledger connection keeps admitted requests in flight.
+        let held = status_source.reader.lock().unwrap();
         let waiting = (1..=CLIENT_SESSIONS)
             .map(|n| tokio::spawn(status(format!("192.0.2.{n}"))))
             .collect::<Vec<_>>();
@@ -4026,7 +4565,7 @@ mod tests {
             status("192.0.2.99".into()).await,
             StatusCode::TOO_MANY_REQUESTS
         );
-        // Another network is still admitted and waits for the engine.
+        // Another network is still admitted and waits for the ledger.
         let other = tokio::spawn(status("198.51.100.7".into()));
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!other.is_finished());
@@ -4037,5 +4576,267 @@ mod tests {
         assert_eq!(other.await.unwrap(), StatusCode::OK);
         assert!(clients.0.lock().unwrap().is_empty());
         server.abort();
+    }
+
+    /// The next receipt lookup the mock node answers waits for the second
+    /// signal after giving the first.
+    fn gate_receipts(
+        node: &mut MockNode,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let gate = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        node.receipt_gate = Some(gate.clone());
+        gate
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_and_claims_proceed_while_a_refresh_waits_for_the_node() {
+        let dir = TempDir::new().unwrap();
+        let (mut engine, _, node, mock_task) = ready_engine(&dir, |_| {}).await;
+        // A confirmed receipt makes every refresh look up its block.
+        engine.claim(&recipient(3), "a").await.unwrap();
+        {
+            let mut node = node.lock().await;
+            let transactions = node.transactions.clone();
+            node.blocks.insert(3, block(3, transactions));
+            node.nonce = 1;
+            node.height = 4;
+        }
+        engine.refresh().await.unwrap();
+        assert_eq!(
+            engine.status(Some(&recipient(3)), "a").unwrap()["claim"]["status"],
+            "confirmed"
+        );
+        let key = hex::encode(engine.sender);
+        let app = App::new(
+            engine,
+            vec!["https://faucet.example".into()],
+            vec!["faucet.example".into()],
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let routes = router(app.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, routes).await.unwrap();
+        });
+        // The next refresh's receipt lookup waits until the test releases it,
+        // as a slow or throttled node's would.
+        let (entered, release) = gate_receipts(&mut *node.lock().await);
+        let refresh = {
+            let (engine, client) = (app.engine.clone(), app.node.clone());
+            tokio::spawn(async move { poll_once(&mut Shared(engine), &client, &key).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let started = Instant::now();
+        let status: Value = client
+            .get(format!("{base}/faucet/status"))
+            .query(&[("address", recipient(4))])
+            .header("host", "faucet.example")
+            .header("x-real-ip", "192.0.2.4")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(status["state"], "ready");
+        // A claim takes the engine between the refresh's steps and is paid.
+        let paid = client
+            .post(format!("{base}/faucet/claim"))
+            .header("host", "faucet.example")
+            .header("origin", "https://faucet.example")
+            .header("x-real-ip", "192.0.2.4")
+            .json(&json!({"address":recipient(4)}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paid.status(), StatusCode::OK);
+        assert_eq!(paid.json::<Value>().await.unwrap()["status"], "pending");
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(!refresh.is_finished());
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), refresh)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let engine = app.engine.lock().await;
+        assert!(engine.fault.is_none());
+        assert_eq!(
+            engine.ledger.pending().unwrap().unwrap().address,
+            recipient(4)
+        );
+        assert_eq!(node.lock().await.transactions.len(), 2);
+        server.abort();
+        mock_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_reserved_during_refresh_lookups_is_accounted_on_the_next_refresh() {
+        let dir = TempDir::new().unwrap();
+        let (mut engine, _, node, task) = ready_engine(&dir, |_| {}).await;
+        let first = engine.claim(&recipient(3), "a").await.unwrap();
+        node.lock().await.height = 4;
+        engine.refresh().await.unwrap();
+        assert_eq!(
+            engine.status(Some(&recipient(3)), "a").unwrap()["claim"]["status"],
+            "expired"
+        );
+        // That payment is included after all, on a branch of the same height.
+        let (entered, release) = {
+            let mut node = node.lock().await;
+            let mut branch = block(3, vec![node.transactions[0].clone()]);
+            branch.header.nonce = 77;
+            node.blocks.insert(3, branch);
+            node.nonce = 1;
+            gate_receipts(&mut node)
+        };
+        let key = hex::encode(engine.sender);
+        let client = engine.node.clone();
+        let engine = Arc::new(Mutex::new(engine));
+        let refresh = {
+            let (engine, client) = (engine.clone(), client.clone());
+            tokio::spawn(async move { poll_once(&mut Shared(engine), &client, &key).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        // While the search waits for the node, a claim signs the nonce that
+        // the adopted snapshot still shows unused.
+        let mut held = Held(Some(engine.clone().lock_owned().await));
+        let second = claim_with(&mut held, &client, recipient(4), "b".into())
+            .await
+            .unwrap();
+        drop(held);
+        assert_eq!(second["status"], "pending");
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), refresh)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut engine = engine.lock().await;
+        // What the search found predates that reservation. Payouts pause
+        // until the next refresh accounts for both claims with the nonce.
+        assert_eq!(engine.fault, Some("verifying_payments"));
+        assert_eq!(engine.state().unwrap(), "unavailable");
+        assert!(engine.ledger.pending().unwrap().is_some());
+        engine.refresh().await.unwrap();
+        assert!(engine.fault.is_none());
+        let paid = engine.status(Some(&recipient(3)), "a").unwrap();
+        assert_eq!(paid["claim"]["status"], "confirmed");
+        assert_eq!(paid["claim"]["txid"], first["txid"]);
+        // The later bytes with the same nonce can never apply.
+        assert_eq!(
+            engine.status(Some(&recipient(4)), "b").unwrap()["claim"]["status"],
+            "expired"
+        );
+        assert!(engine.ledger.pending().unwrap().is_none());
+        engine.claim(&recipient(5), "c").await.unwrap();
+        let next = engine.ledger.pending().unwrap().unwrap();
+        assert_eq!(wallet::decode_signed(&next.raw, &[7; 32]).unwrap().body.nonce, 1);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn node_admission_refusals_are_resent_after_their_wait_and_reported_as_busy() {
+        let dir = TempDir::new().unwrap();
+        let (mut engine, _, node, task) = ready_engine(&dir, |_| {}).await;
+        // A refused request did not run. After a short Retry-After it is
+        // resent once, so the claim is paid instead of failing as if the
+        // node were down.
+        node.lock().await.refusals.extend([
+            ("snapshot", StatusCode::SERVICE_UNAVAILABLE, Some("1")),
+            ("preparetransaction", StatusCode::TOO_MANY_REQUESTS, Some("1")),
+        ]);
+        let started = Instant::now();
+        engine.refresh().await.unwrap();
+        assert_eq!(
+            engine.claim(&recipient(3), "a").await.unwrap()["status"],
+            "pending"
+        );
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        {
+            let node = node.lock().await;
+            assert!(node.refusals.is_empty());
+            assert_eq!((node.prepared, node.transactions.len()), (1, 1));
+        }
+        // A longer wait, none, or a second refusal ends the request as
+        // node_busy, never as a transport fault, and the next refresh waits
+        // as long as the node asked.
+        for (refusals, wait) in [
+            (
+                vec![("snapshot", StatusCode::SERVICE_UNAVAILABLE, Some("30"))],
+                Duration::from_secs(30),
+            ),
+            (
+                vec![("snapshot", StatusCode::TOO_MANY_REQUESTS, None)],
+                POLL_INTERVAL,
+            ),
+            (
+                vec![
+                    ("snapshot", StatusCode::TOO_MANY_REQUESTS, Some("1")),
+                    ("snapshot", StatusCode::SERVICE_UNAVAILABLE, Some("1")),
+                ],
+                POLL_INTERVAL,
+            ),
+        ] {
+            node.lock().await.refusals.extend(refusals);
+            let error = engine.refresh().await.unwrap_err();
+            assert!(node.lock().await.refusals.is_empty());
+            let mut diagnostics = RefreshDiagnostics::default();
+            diagnostics.record(&error, 1, Instant::now());
+            assert_eq!(diagnostics.error.unwrap().category, "node_busy");
+            assert_eq!(poll_wait(&Err(error)), wait);
+        }
+        let busy = |seconds| -> Result<()> {
+            Err(NodeBusy {
+                retry_after: Some(Duration::from_secs(seconds)),
+            }
+            .into())
+        };
+        assert_eq!(poll_wait(&busy(3600)), MAX_POLL_WAIT);
+        assert_eq!(poll_wait(&Ok(())), POLL_INTERVAL);
+        assert_eq!(poll_wait(&Err(anyhow!("transport"))), POLL_INTERVAL);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_connections_must_send_heads_promptly_and_are_capped() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = TempDir::new().unwrap();
+        let server = serve(config(&dir)).await.unwrap();
+        let opened = Instant::now();
+        let mut held = Vec::new();
+        for _ in 0..HTTP_CONNECTIONS {
+            held.push(tokio::net::TcpStream::connect(server.address).await.unwrap());
+        }
+        // One connection over the cap is closed before anything is read.
+        let mut refused = tokio::net::TcpStream::connect(server.address).await.unwrap();
+        let mut byte = [0; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(2), refused.read(&mut byte))
+            .await
+            .expect("a connection over the cap was held");
+        assert!(matches!(closed, Ok(0) | Err(_)));
+        assert!(opened.elapsed() < crate::local_http::HEAD_TIMEOUT);
+        // A partial request head is closed unanswered at the head deadline.
+        held[0]
+            .write_all(b"GET /faucet/status HTTP/1.1\r\nHost: faucet.example\r\n")
+            .await
+            .unwrap();
+        let closed = tokio::time::timeout(
+            crate::local_http::HEAD_TIMEOUT + Duration::from_secs(3),
+            held[0].read(&mut byte),
+        )
+        .await
+        .expect("a partial head was held past the deadline");
+        assert!(matches!(closed, Ok(0) | Err(_)));
+        server.stop().await;
     }
 }

@@ -7,7 +7,9 @@ param(
 # Start-ColdWallet.ps1 token hand-off: the launcher chooses the session token,
 # passes it only through the signer's environment and prints it only in the
 # launch URL's fragment; the signer never serves it and requires it for every
-# POST. Uses a public fixture chain ID and stops only the signer it started.
+# POST. Uses a public fixture chain ID and stops only the signer it started:
+# any process of the selected executable that was not running before the
+# launch, even when the launcher fails after starting it.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repository = Split-Path -Parent $PSScriptRoot
@@ -16,8 +18,13 @@ if (-not $Report) { $Report = Join-Path $repository 'work/cold-launcher-report.j
 [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Report))) | Out-Null
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
 $checks = [Collections.Generic.List[string]]::new()
-$result = [ordered]@{ passed=$false; signer_sha256=(Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash.ToLowerInvariant(); port=$Port; checks=$checks; owned_process_stopped=$false }
+$result = [ordered]@{ passed=$false; signer_sha256=(Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash.ToLowerInvariant(); port=$Port; checks=$checks; owned_processes=0; owned_process_stopped=$false }
 $signer = $null
+function Get-Signer {
+    $name = [IO.Path]::GetFileNameWithoutExtension($Executable)
+    @(Get-Process -Name $name -ErrorAction SilentlyContinue | Where-Object { try { $_.Path -eq $Executable } catch { $false } })
+}
+$running = @(Get-Signer | ForEach-Object { $_.Id })
 Add-Type -AssemblyName System.Net.Http
 $client = [Net.Http.HttpClient]::new()
 
@@ -47,7 +54,7 @@ try {
     $notice = @($output | Where-Object { $_ -match 'Process ID: (\d+)\.' })
     if ($notice.Count -ne 1) { throw 'The launcher did not report the signer process.' }
     $signer = Get-Process -Id ([int]$Matches[1])
-    Check ($signer.Path -eq $Executable) 'The reported process is the selected signer executable'
+    Check ($signer.Path -eq $Executable -and $running -notcontains $signer.Id) 'The reported process is a new instance of the selected signer executable'
     $commandLine = [string](Get-CimInstance Win32_Process -Filter "ProcessId=$($signer.Id)").CommandLine
     Check (-not $commandLine.Contains($token)) 'The token never appears on the signer command line'
     Check ($null -eq $env:HASHSTASH_COLD_TOKEN) 'The launcher leaves no token in its own environment'
@@ -59,9 +66,15 @@ try {
     $result.passed = $true
 } finally {
     $client.Dispose()
-    if ($signer) {
-        Stop-Process -Id $signer.Id -ErrorAction SilentlyContinue
-        $result.owned_process_stopped = $signer.WaitForExit(10000)
+    # The launcher can start the signer and then fail, before the signer it
+    # reports is known here; stop whatever this launch started.
+    $owned = @(Get-Signer | Where-Object { $running -notcontains $_.Id })
+    $result.owned_processes = $owned.Count
+    $stopped = $true
+    foreach ($process in $owned) {
+        Stop-Process -Id $process.Id -ErrorAction SilentlyContinue
+        $stopped = $process.WaitForExit(10000) -and $stopped
     }
+    $result.owned_process_stopped = $stopped
     $result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Report -Encoding utf8
 }

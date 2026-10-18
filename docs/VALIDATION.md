@@ -120,7 +120,7 @@ A nightly schedule gives each fuzz target its own job: 15 minutes of libFuzzer, 
 
 ## Recorded results
 
-The latest full run of this guide, with every audit workstream merged:
+The latest full run of this guide, with every audit workstream and the R15 and R34 review commits merged, before the other review branches (see the integration run below):
 
 | Item | Record |
 | --- | --- |
@@ -141,6 +141,8 @@ The latest full run of this guide, with every audit workstream merged:
 | Live network suites | With the fixture build: `test_network`, `test_economic_adversarial` and `test_load` (twelve 64-transaction waves, no refusals) passed on one fresh three-node network, and `test_reserve_network` through `ci_network_suites.sh` on another; `test_stratum_wire.py`: 201 assertions passed |
 | Windows, natively | 333 library unit tests (1 ignored) and 30 command-line unit tests passed, including the access-list, fail-closed and link checks; the in-process fuzz targets, `stratum_session` included, and the listener tests passed; `test_cold_launcher.ps1` passed under Windows PowerShell 5.1 and, with a stand-in signer that never became ready, stopped that signer. These were cross-built for x86_64-pc-windows-gnu with Rust 1.96.0 and MinGW-w64. Integration tests that embed build-host paths cannot run from such a build, and Clippy did not run for Windows; the Windows CI job covers both |
 | Fuzzing | `stratum_session` under libFuzzer (stable toolchain, SanitizerCoverage, no address sanitizer) for 300 seconds, 2.1 million inputs, then the stable runner for 120 seconds from that corpus: no failures. The earlier run of the other targets (the stable runner for 480 seconds per target, libFuzzer for 300) found and fixed a panic when `fee_quote` or `transfer_quote` received non-object parameters, and the browser opening a byte-order-mark-prefixed envelope that the node does not index as mail |
+
+The integration run after the other review branches were merged on top (the R01, R02, R03, R04, R05, R06, R08, R09, R11, R12, R13, R16, R17, R20, R22, R23, R25, R30 and R40 review commits, with `cargo fmt` over the merged tree) repeated part of this guide under WSL 2 and on Windows: `cargo fmt --check` and the fuzz `rustfmt` check passed; the `test-fixtures` suite with `--release` passed 823 tests, 8 ignored; the frontend runner passed its 24 suites; the seven self-contained Python unit scripts passed; and `test_network`, `test_economic_adversarial` and `test_load` (twelve 64-transaction waves, no refusals) passed with the fixture build on one fresh three-node network. Clippy, the plain suite, the Windows native checks and fuzzing were not repeated; continuous integration runs them.
 
 ## Isolated process and network scenarios
 

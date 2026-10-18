@@ -2644,9 +2644,15 @@ mod tests {
         // twelve slots, the four others are all candidates, and the newest
         // session of a group holding two goes.
         let operators: Vec<_> = (1..=12)
-            .map(|n| slots.try_acquire(public(50, n, 1), PeerClass::Operator).unwrap())
+            .map(|n| {
+                slots
+                    .try_acquire(public(50, n, 1), PeerClass::Operator)
+                    .unwrap()
+            })
             .collect();
-        let newcomer = slots.try_acquire(public(30, 1, 1), PeerClass::General).unwrap();
+        let newcomer = slots
+            .try_acquire(public(30, 1, 1), PeerClass::General)
+            .unwrap();
         let id = v6[1].occupant.unwrap();
         assert!(!slots.counts.lock().unwrap().occupants.contains_key(&id));
         drop((newcomer, v6));
@@ -2657,7 +2663,11 @@ mod tests {
         // never use configured capacity.
         drop(same);
         let held: Vec<_> = (13..=16)
-            .map(|n| slots.try_acquire(public(50, n, 1), PeerClass::Operator).unwrap())
+            .map(|n| {
+                slots
+                    .try_acquire(public(50, n, 1), PeerClass::Operator)
+                    .unwrap()
+            })
             .chain(operators)
             .collect();
         assert_eq!(slots.counts.lock().unwrap().general, INBOUND_PEER_SLOTS);
@@ -3055,7 +3065,9 @@ mod tests {
         let share = || guard.visitor_share(&guard.records.lock().unwrap(), Instant::now());
         // Forty /64s of one /48 are one network: the share stays an eighth.
         for n in 0..40 {
-            visitor(IpAddr::from([0x2001, 0xdb8, 0x77, n, 0, 0, 0, 1])).request().unwrap();
+            visitor(IpAddr::from([0x2001, 0xdb8, 0x77, n, 0, 0, 0, 1]))
+                .request()
+                .unwrap();
         }
         assert_eq!(share(), PUBLIC_WEB_VISITOR_SHARE);
         // A visitor in a cooldown that admission refuses counts not at all.
@@ -3192,7 +3204,10 @@ mod tests {
         assert_eq!(slots.counts.lock().unwrap().general, INBOUND_PEER_SLOTS);
         drop((held, newcomer, second));
         let counts = slots.counts.lock().unwrap();
-        assert_eq!((counts.general, counts.verified, counts.operator), (0, 0, 0));
+        assert_eq!(
+            (counts.general, counts.verified, counts.operator),
+            (0, 0, 0)
+        );
         assert!(counts.groups.is_empty() && counts.occupants.is_empty());
     }
     #[test]
@@ -3211,12 +3226,20 @@ mod tests {
         // seventeenth still takes one over, and so does every later newcomer
         // from yet another group: one session each, never a refusal.
         let slots = Arc::new(PeerSlots::default());
-        let held = fill(&slots, (1..=16).map(|a| (public(a, 1), PeerClass::General)).collect());
+        let held = fill(
+            &slots,
+            (1..=16)
+                .map(|a| (public(a, 1), PeerClass::General))
+                .collect(),
+        );
         let mut newcomers = Vec::new();
         for a in 17..=60 {
             let slot = slots.try_acquire_at(public(a, 1), PeerClass::General, now);
             newcomers.push(slot.unwrap());
-            let gone = held.iter().chain(&newcomers).filter(|s| taken_over(&slots, s));
+            let gone = held
+                .iter()
+                .chain(&newcomers)
+                .filter(|s| taken_over(&slots, s));
             assert_eq!(gone.count(), newcomers.len());
             assert_eq!(slots.counts.lock().unwrap().general, INBOUND_PEER_SLOTS);
         }
@@ -3226,13 +3249,18 @@ mod tests {
         // session it takes over is not one of those sources'.
         let slots = Arc::new(PeerSlots::default());
         let sources = (1..=8).flat_map(|a| [public(a, 1), public(a, 2)]);
-        let held = fill(&slots, sources.map(|ip| (ip, PeerClass::Verified)).collect());
+        let held = fill(
+            &slots,
+            sources.map(|ip| (ip, PeerClass::Verified)).collect(),
+        );
         for a in 1..=4 {
             slots.delivered_at(public(a, 2), now);
         }
         let newcomer = slots.try_acquire_at(public(30, 1), PeerClass::General, now);
         assert!(newcomer.is_some());
-        let gone: Vec<usize> = (0..held.len()).filter(|n| taken_over(&slots, &held[*n])).collect();
+        let gone: Vec<usize> = (0..held.len())
+            .filter(|n| taken_over(&slots, &held[*n]))
+            .collect();
         assert_eq!(gone.len(), 1);
         assert!(![1, 3, 5, 7].contains(&gone[0]), "{gone:?}");
         drop((held, newcomer));
@@ -3245,18 +3273,34 @@ mod tests {
         let held = fill(&slots, operators.chain(others).collect());
         let mut newcomers = Vec::new();
         for a in 50..=53 {
-            newcomers.push(slots.try_acquire_at(public(a, 1), PeerClass::General, now).unwrap());
+            newcomers.push(
+                slots
+                    .try_acquire_at(public(a, 1), PeerClass::General, now)
+                    .unwrap(),
+            );
         }
         assert!(held[..12].iter().all(|s| !taken_over(&slots, s)));
-        let gone = held[12..].iter().chain(&newcomers).filter(|s| taken_over(&slots, s));
+        let gone = held[12..]
+            .iter()
+            .chain(&newcomers)
+            .filter(|s| taken_over(&slots, s));
         assert_eq!(gone.count(), 4);
         drop((held, newcomers));
-        let all = (1..=16).map(|n| (public(41, n), PeerClass::Operator)).collect();
+        let all = (1..=16)
+            .map(|n| (public(41, n), PeerClass::Operator))
+            .collect();
         let operators = fill(&slots, all);
-        assert!(slots.try_acquire_at(public(54, 1), PeerClass::General, now).is_none());
+        assert!(
+            slots
+                .try_acquire_at(public(54, 1), PeerClass::General, now)
+                .is_none()
+        );
         drop(operators);
         let counts = slots.counts.lock().unwrap();
-        assert_eq!((counts.general, counts.verified, counts.operator), (0, 0, 0));
+        assert_eq!(
+            (counts.general, counts.verified, counts.operator),
+            (0, 0, 0)
+        );
         assert!(counts.groups.is_empty() && counts.occupants.is_empty());
     }
     #[test]

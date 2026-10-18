@@ -231,7 +231,15 @@
   });
   $('download-backup').addEventListener('click', () => {
     if (!pendingBackup) return;
-    download('hashstash-private-key.json', JSON.stringify(pendingBackup,null,2)+'\n','application/json');
+    // Encode the file into bytes wiped once the browser holds its own copy,
+    // with no other string of the whole document; the key text cannot be wiped.
+    const {format, private_key, public_key} = pendingBackup, encoder = new TextEncoder();
+    const parts = [`{\n  "format": ${JSON.stringify(format)},\n  "private_key": "`, private_key, `",\n  "public_key": ${JSON.stringify(public_key)}\n}\n`];
+    if (!parts.every(part => /^[\x00-\x7f]*$/.test(part))) { say('Invalid private key backup', true); return; }
+    const bytes = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
+    let offset = 0;
+    for (const part of parts) offset += encoder.encodeInto(part, bytes.subarray(offset)).written;
+    try { download('hashstash-private-key.json', bytes, 'application/json'); } finally { bytes.fill(0); }
   });
   $('backup-done').addEventListener('click', () => action(async () => {
     const result = await api('backup', {saved:true});

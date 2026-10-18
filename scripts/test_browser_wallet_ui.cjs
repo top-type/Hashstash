@@ -262,6 +262,7 @@ async function run() {
     await r.timersDue(30000);assert.equal(r.clipboard.at(-1),bobSecret);checks++;
     r.navigator.clipboard.writeText=write;await r.windowEvents.get('focus')();await settle();assert.equal(r.clipboard.at(-1),'','an unfocused page clears the key on return');checks++;
     await r.get('backup-download').click();assert.deepEqual(JSON.parse(r.downloads.at(-1)),{format:'hashstash-private-v1',private_key:bobSecret,public_key:bob});checks++;
+    assert.ok(r.blobParts.at(-1).every(part=>part instanceof Uint8Array&&part.every(byte=>byte===0)),'the backup bytes are wiped once the file holds its copy');checks++;
     await r.get('backup-close').click();
     // An idle page locks itself; a backup then asks for the passphrase too.
     r.wallClock+=5*60*1000;await r.timersDue(5*60*1000);await r.refresh();

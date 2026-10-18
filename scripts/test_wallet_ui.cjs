@@ -292,7 +292,7 @@ async function harness(options = {}) {
 
   const timers = new Map(); let nextTimer = 0;
 
-  const calls = [], wallet = [], managers = [], storage = [], clipboard = [], downloads = [];
+  const calls = [], wallet = [], managers = [], storage = [], clipboard = [], downloads = [], blobParts = [];
 
   const h = { get, forms, timers, calls, wallet, managers, storage, clipboard, currentSnapshot: options.initialSnapshot || snapshot(), currentSession: { address_hrp:addressHrp, wallet_enabled: true, wallet_mode:'hot', wallet_id:`hot:${publicKey}`, wallet_revision:0, wallets:[{id:`hot:${publicKey}`,name:'First wallet',public_key:publicKey,mode:'hot'}], public_key: publicKey, miner: publicKey, token: 'old-token' }, handlers: {} };
 
@@ -307,6 +307,7 @@ async function harness(options = {}) {
   h.grantRow = (index=0) => { const row=get('grant-payments').children[index];return {recipient:row.children[0].children[0],amount:row.children[1].children[0],remove:row.children[2],review:row.children[3]}; };
 
   h.downloads = downloads;
+  h.blobParts = blobParts;
   h.publicWeb = !!options.publicWeb;
   h.faucetCalls = [];
   h.faucetTransport = options.faucetTransport;
@@ -497,7 +498,7 @@ async function harness(options = {}) {
 
     },
 
-    Blob: class {constructor(parts) {this.content=parts.map(part=>typeof part==='string'?part:new TextDecoder().decode(part)).join('');}},
+    Blob: class {constructor(parts) {this.content=parts.map(part=>typeof part==='string'?part:new TextDecoder().decode(part)).join('');blobParts.push(parts);}},
 
     URL: {createObjectURL(blob) {downloads.push(blob.content);return 'blob:local-test';},revokeObjectURL(){}},
 

@@ -65,6 +65,14 @@ for endpoint in '[2001:db8:0:0:0:0:0:2]:18481' '[2001:db8:1:2:3:4:5::]:18481'; d
 done
 base; printf 'STRATUM_ENABLED=false\n' >> "$fixture/node.env"; rm -- "$fixture/password"; pass run; has --no-stratum; lacks --stratum; lacks --stratum-password-file; pass check
 printf 'fixture-password\n' > "$fixture/password"
+base; printf 'STRATUM_TRUSTED=198.51.100.0/24 2001:db8:10::/48 192.0.2.9\n' >> "$fixture/node.env"; pass run
+[[ $(grep -Fxc -- --stratum-trusted "$fixture/args") == 3 ]]; checks=$((checks+1)); has 198.51.100.0/24; has 2001:db8:10::/48; has 192.0.2.9
+base; pass run; lacks --stratum-trusted
+for prefix in 'miner.example' '192.0.2.0/24;id' '192.0.2.0/1234'; do
+  base; printf 'STRATUM_TRUSTED=%s\n' "$prefix" >> "$fixture/node.env"; reject run "trusted prefix $prefix"
+done
+base; printf 'STRATUM_ENABLED=false\nSTRATUM_TRUSTED=192.0.2.9\n' >> "$fixture/node.env"; rm -- "$fixture/password"; reject run 'trusted prefix without Stratum'
+printf 'fixture-password\n' > "$fixture/password"
 for endpoint in 256.0.0.1:18481 01.0.0.1:18481 1.2.3.4:0 1.2.3.4:65536 1.2.3.4:018481 0.0.0.0:18481 255.255.255.255:18481 bad.example:18481; do
   base; replace PEERS "$endpoint"; reject run "peer $endpoint"
   base; auth; replace PEER_PINS "$endpoint=$peer_key"; reject run "pin $endpoint"

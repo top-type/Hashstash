@@ -27,7 +27,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     key=${line%%=*}
     value=${line#*=}
     case "$key" in
-        MINER_PUBLIC_KEY|RPC_PORT|P2P_PORT|STRATUM_PORT|STRATUM_ADVERTISE|SHARE_DIFFICULTY|PEERS|PUBLIC_WEB_PORT|STRATUM_ENABLED|PEER_KEY_FILE|PEER_PINS|PEER_DISCOVERY|PEER_SEEDS|PEER_ADVERTISE|ALLOW_EASY_TARGET) ;;
+        MINER_PUBLIC_KEY|RPC_PORT|P2P_PORT|STRATUM_PORT|STRATUM_ADVERTISE|SHARE_DIFFICULTY|PEERS|PUBLIC_WEB_PORT|STRATUM_ENABLED|STRATUM_TRUSTED|PEER_KEY_FILE|PEER_PINS|PEER_DISCOVERY|PEER_SEEDS|PEER_ADVERTISE|ALLOW_EASY_TARGET) ;;
         *) fail "unknown node.env field: $key" ;;
     esac
     [[ ! ${settings[$key]+present} ]] || fail "duplicate node.env field: $key"
@@ -127,6 +127,15 @@ for seed in "${seeds[@]}"; do
     [[ ! ${seed_set[$normalized_seed]+present} ]] || fail 'duplicate peer seed'
     seed_set[$normalized_seed]=1
 done
+trusted=()
+read -r -a trusted <<< "${settings[STRATUM_TRUSTED]:-}"
+(( ${#trusted[@]} <= 64 )) || fail 'too many trusted Stratum prefixes'
+for prefix in "${trusted[@]}"; do
+    # Shape only; the node parses each address and prefix length exactly.
+    [[ "$prefix" =~ ^([0-9.]+|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)(/[0-9]{1,3})?$ && ${#prefix} -le 64 ]] \
+        || fail 'STRATUM_TRUSTED must contain IP addresses, optionally with /LENGTH'
+done
+[[ "$stratum_enabled" == true || ${#trusted[@]} -eq 0 ]] || fail 'STRATUM_TRUSTED requires STRATUM_ENABLED=true'
 peer_advertise=${settings[PEER_ADVERTISE]:-}
 [[ -z "$peer_advertise" ]] || valid_endpoint "$peer_advertise" || fail 'PEER_ADVERTISE must be a numeric IPv4:PORT or [IPv6]:PORT endpoint'
 if [[ "$peer_discovery" == false ]]; then
@@ -181,6 +190,7 @@ args=(run --config "$genesis" --data /var/lib/hashstash/chain.sqlite
 if [[ "$stratum_enabled" == true ]]; then
     args+=(--stratum "0.0.0.0:${settings[STRATUM_PORT]}" --stratum-advertise "$advertise"
         --stratum-share-difficulty "$difficulty" --stratum-password-file "$password_file")
+    for prefix in "${trusted[@]}"; do args+=(--stratum-trusted "$prefix"); done
 else
     args+=(--no-stratum)
 fi

@@ -153,6 +153,7 @@ The [local testnet guide](TESTNET.md) describes creating a disposable three-node
 | [test_wallet_adversarial.py](../scripts/test_wallet_adversarial.py) | Wallet and cold-signer rejection scenarios; select the rebuilt executables, disposable directory, unused ports and report path |
 | [test_wallet_cli.py](../scripts/test_wallet_cli.py), [test_wallet_manager.py](../scripts/test_wallet_manager.py), [test_addresses.py](../scripts/test_addresses.py) | CLI preparation, cold signing, wallet management and address round trips on their own disposable nodes; select the fixture executables, a disposable directory and report path; ports are chosen by the system |
 | [test_mail_wire.py](../scripts/test_mail_wire.py) | End-to-end encrypted mail on one disposable chain; select the fixture executable and report path |
+| [test_peer_discovery_process.py](../scripts/test_peer_discovery_process.py) | Three discovery nodes on a disposable loopback devnet: joining through one seed, block relay after the seed exits, and recovery from the saved address book; select any build and a new report path. Discovery accepts untrusted peers, so it runs the nodes with `--allow-easy-target` and `--dev-rpc` |
 
 Read each program's `--help` before running it. Pass explicit paths for generated reports and fixture directories. Use a fresh fixture for independent scenarios whose setup expects an empty chain. Stop test nodes through their owning launcher and manifest when finished.
 

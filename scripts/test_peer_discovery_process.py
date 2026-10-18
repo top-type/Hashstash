@@ -1,7 +1,10 @@
 """Independent local-process joining, seed loss, and persisted-peer recovery.
 
 Only disposable devnet databases and loopback listeners are used. The supplied
-binary is never pointed at public nodes or existing runtime manifests.
+binary is never pointed at public nodes or existing runtime manifests. Discovery
+accepts untrusted peers, so outside a test-fixtures build the uncalibrated devnet
+needs --allow-easy-target to run and --dev-rpc to mine through RPC; this
+isolated network passes both, which a fixture build accepts as well.
 """
 import argparse
 import hashlib
@@ -77,7 +80,7 @@ def main():
             command = [str(binary), 'run', '--config', str(config), '--data', str(base / (name + '.sqlite')),
                        '--miner', miner, '--rpc', f'127.0.0.1:{port}', '--p2p', f'127.0.0.1:{peerport}',
                        '--no-stratum', '--peer-discovery', '--allow-private-peers',
-                       '--advertise-peer', f'127.0.0.1:{peerport}']
+                       '--advertise-peer', f'127.0.0.1:{peerport}', '--allow-easy-target', '--dev-rpc']
             if seed:
                 command += ['--seed', f'localhost:{ports[seed][1]}']
             log = (base / (name + '-' + str(len(handles)) + '.log')).open('w+')

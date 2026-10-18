@@ -839,10 +839,23 @@ async fn shared_networks_need_calibration_before_untrusted_peers_reach_them() {
             "--no-stratum",
         ]);
         run.extend(args(exposure));
+        // An installer's preflight refuses exactly what the service would.
+        for preflight in [false, true] {
+            let mut run = run.clone();
+            if preflight {
+                run.push("--preflight".into());
+            }
+            let output = cli(&run, &[]).await;
+            assert!(!output.status.success(), "{exposure:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("--allow-easy-target"), "{stderr}");
+            assert!(stderr.contains("init --hashrate 73.4G or more"), "{stderr}");
+        }
+        run.push("--allow-easy-target".into());
+        run.push("--preflight".into());
         let output = cli(&run, &[]).await;
-        assert!(!output.status.success(), "{exposure:?}");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("--allow-easy-target"), "{stderr}");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("warning: "));
         assert!(!directory.path().join("chain.sqlite").exists());
     }
 }

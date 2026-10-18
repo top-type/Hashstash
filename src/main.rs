@@ -263,9 +263,13 @@ enum Command {
         #[arg(long)]
         allow_easy_target: bool,
         /// Allow the development `mine` RPC although this network's proof of
-        /// work is not a development target.
+        /// work is not a development target or untrusted peers reach the node.
         #[arg(long)]
         dev_rpc: bool,
+        /// Make the checks `run` makes before it opens the database, then exit
+        /// without opening it or binding any listener.
+        #[arg(long)]
+        preflight: bool,
     },
     /// Call a JSON-RPC method. Params may be inline JSON or a JSON file.
     /// Replies are bounded only by the response frame; query endpoints you trust.
@@ -541,8 +545,43 @@ fn easy_limit(config: &Config) -> Option<String> {
 
 fn proof_of_work_warning(config: &Config) -> Option<String> {
     easy_limit(config).map(|limit| {
-        format!("{limit}; use init --hashrate for a network that untrusted peers can reach")
+        format!(
+            "{limit}; a network that untrusted peers can reach needs {}",
+            shared_calibration(config)
+        )
     })
+}
+
+/// The calibration that clears the easy limit. Calibrating sets the easiest
+/// target 2^CALIBRATED_LIMIT_RANGE_BITS times easier than the initial one,
+/// so a lower rate still leaves the limit under EASY_LIMIT_WORK.
+fn shared_calibration(config: &Config) -> String {
+    let work = u128::from(node::EASY_LIMIT_WORK) << CALIBRATED_LIMIT_RANGE_BITS;
+    let rate = work.div_ceil(u128::from(config.initial.interval.max(1)));
+    format!(
+        "init --hashrate {} or more at {}-second blocks (its easiest target is {} times easier than the calibrated one)",
+        hashrate_text(rate),
+        config.initial.interval,
+        1u32 << CALIBRATED_LIMIT_RANGE_BITS
+    )
+}
+
+/// A hash rate as `init --hashrate` reads it, rounded up to a tenth of its
+/// largest whole prefix, so the text is never below `rate`.
+fn hashrate_text(rate: u128) -> String {
+    let (prefix, scale) = [("E", 18), ("P", 15), ("T", 12), ("G", 9), ("M", 6), ("K", 3)]
+        .into_iter()
+        .map(|(prefix, power)| (prefix, 10u128.pow(power)))
+        .find(|(_, scale)| rate >= *scale)
+        .unwrap_or(("", 1));
+    if scale == 1 {
+        return rate.to_string();
+    }
+    let tenths = rate.saturating_mul(10).div_ceil(scale);
+    match tenths % 10 {
+        0 => format!("{}{prefix}", tenths / 10),
+        tenth => format!("{}.{tenth}{prefix}", tenths / 10),
+    }
 }
 
 /// Why `run` would expose an easy-target network to untrusted peers: through
@@ -1738,6 +1777,7 @@ async fn main() -> Result<()> {
             stratum_trusted,
             allow_easy_target,
             dev_rpc,
+            preflight,
         } => {
             let c: Config = serde_json::from_value(read_json(&config)?)?;
             // A hand-edited genesis can be valid yet unsafe to operate.
@@ -1749,7 +1789,8 @@ async fn main() -> Result<()> {
             if let Some(exposure) = easy_target_exposure(&c, p2p, peer_discovery) {
                 ensure!(
                     allow_easy_target,
-                    "{exposure}; create the network with init --hashrate, or pass --allow-easy-target to run it anyway"
+                    "{exposure}; create the network with {}, or pass --allow-easy-target to run it anyway",
+                    shared_calibration(&c)
                 );
                 eprintln!("warning: {exposure}");
             }
@@ -1778,6 +1819,12 @@ async fn main() -> Result<()> {
                 no_stratum || stratum.ip().is_loopback() || password.is_some(),
                 "a non-loopback Stratum listener requires a password; pass --stratum-password-file"
             );
+            // An installer's check: the service's own options, refused here
+            // rather than in a restart loop.
+            if preflight {
+                println!("Run options are valid. No database opened and no listeners started.");
+                return Ok(());
+            }
             let mut node = Node::open(&data, c, node::parse_account(&miner, &chain_id)?)?;
             let wallet_public = wallet.as_ref().map(|(_, public)| *public);
             if peer_discovery {
@@ -2715,6 +2762,7 @@ mod tests {
         assert!(flagged(&uncalibrated));
         let warning = proof_of_work_warning(&uncalibrated).unwrap();
         assert!(warning.contains("needs only 2 expected hashes"), "{warning}");
+        assert!(warning.contains("init --hashrate 73.4G or more"), "{warning}");
         let mut dev = initial_config(InitPreset::Dev, None, false, Some(1_800_000_000)).unwrap();
         dev.test_work = false;
         assert!(flagged(&dev));
@@ -2725,6 +2773,27 @@ mod tests {
             initial_config(InitPreset::Slow, Some("100T"), false, Some(1_800_000_000)).unwrap();
         calibrated.test_work = false;
         assert!(!node::easy_proof_of_work(&calibrated) && !flagged(&calibrated));
+        // Calibrating eases the limit 256-fold, so a rate below 2^40 hashes
+        // per block (73.3 GH/s at 15 seconds) still leaves it easy, and the
+        // warning names the rate that clears it rather than just --hashrate.
+        for preset in [InitPreset::Dev, InitPreset::Slow] {
+            let mut low = initial_config(preset, Some("73G"), false, Some(1_800_000_000)).unwrap();
+            low.test_work = false;
+            assert!(flagged(&low));
+            let warning = proof_of_work_warning(&low).unwrap();
+            assert!(
+                warning.contains("needs init --hashrate 73.4G or more at 15-second blocks"),
+                "{warning}"
+            );
+            let mut named =
+                initial_config(preset, Some("73.4G"), false, Some(1_800_000_000)).unwrap();
+            named.test_work = false;
+            assert!(!node::easy_proof_of_work(&named) && !flagged(&named));
+        }
+        assert_eq!(hashrate_text(73_300_775_186), "73.4G");
+        assert_eq!(hashrate_text(100_000_000_000_000), "100T");
+        assert_eq!(hashrate_text(1_050), "1.1K");
+        assert_eq!(hashrate_text(999), "999");
         // The boundary: a limit just below 2^32 expected hashes is easy.
         let mut boundary = calibrated.clone();
         boundary.limit_bits = math::bits_from_target(&((Amount::one() << 224usize) - 1u32));

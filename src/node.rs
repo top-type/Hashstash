@@ -573,9 +573,11 @@ pub fn easy_proof_of_work(config: &Config) -> bool {
     limit_work(config).is_ok_and(|work| work < Amount::from(EASY_LIMIT_WORK))
 }
 /// A disposable development network: fixture issuance, or proof of work
-/// that a CPU mines at once. Only there may local processes mine through RPC.
-pub fn development_network(config: &Config) -> bool {
-    config.test_work || easy_proof_of_work(config)
+/// that a CPU mines at once on a node that no untrusted peer reaches (see
+/// `serve`). Only there may local processes mine through RPC. Untrusted
+/// peers' hashrate can lift an easy network's difficulty far above its limit.
+pub fn development_network(config: &Config, untrusted_peers: bool) -> bool {
+    config.test_work || (!untrusted_peers && easy_proof_of_work(config))
 }
 /// Mining attempts charged as one work unit by the `mine` RPC.
 const MINE_ATTEMPTS_PER_WORK: u64 = 4096;
@@ -1684,9 +1686,6 @@ struct TipCache {
     /// An ancestor's index and the proposals registered since, when this tip
     /// extends the previously published one; its index derives from them.
     proposal_base: Option<ProposalBase>,
-    /// Every proposal ID in consensus key order, only for unfiltered pages,
-    /// which pay for the walk when they build it.
-    proposal_ids: std::sync::OnceLock<Vec<Hash>>,
 }
 impl TipCache {
     /// The cache of a tip whose block extends the tip `parent` was published
@@ -1995,21 +1994,6 @@ impl ReadView {
             )
         })
     }
-    /// Every proposal ID in key order. The first unfiltered page of a tip
-    /// walks them all, so it pays one work unit per 64 proposals.
-    fn proposal_ids(&self, meter: Option<&Session>) -> Result<&[Hash]> {
-        if let Some(ids) = self.cache.proposal_ids.get() {
-            return Ok(ids);
-        }
-        let s = self.chain.tip_state();
-        charge(meter, s.proposals.len() / 64)?;
-        Ok(self.cache.proposal_ids.get_or_init(|| {
-            s.proposals
-                .iter()
-                .filter_map(|(key, _)| Hash::try_from(key).ok())
-                .collect()
-        }))
-    }
     /// The governance projection with a large decision grant summarized, so
     /// the retained copy stays bounded however many payments the grant has.
     fn governance_summary(&self) -> Value {
@@ -2172,6 +2156,9 @@ pub struct Node {
     dev_mining: Arc<Semaphore>,
     /// `run --dev-rpc`: allow `mine` on a network that is not a development one.
     dev_rpc: bool,
+    /// Set by `serve` when peers beyond loopback or discovery can reach this
+    /// node, which then is no development network (see `development_network`).
+    untrusted_peers: bool,
     peer_workers: Arc<Semaphore>,
     stratum_workers: Arc<Semaphore>,
     /// Solved Stratum blocks validate on their own permits, never behind
@@ -2352,6 +2339,7 @@ impl Node {
             wallet_mutations: Arc::new(Semaphore::new(1)),
             dev_mining: Arc::new(Semaphore::new(1)),
             dev_rpc: false,
+            untrusted_peers: false,
             peer_workers: Arc::new(Semaphore::new(2)),
             stratum_workers: Arc::new(Semaphore::new(2)),
             block_submissions: Arc::new(Semaphore::new(2)),
@@ -4687,12 +4675,25 @@ impl Node {
                         "proposal pages changed with a new tip; restart from offset 0"
                     );
                 }
-                let ids = match round {
-                    Some(round) => i.proposal_index().round(round),
-                    None => i.proposal_ids(meter)?,
+                let ids: Vec<Hash> = match round {
+                    Some(round) => {
+                        let ids = i.proposal_index().round(round);
+                        let ids = ids.get(offset..).unwrap_or_default();
+                        ids[..ids.len().min(limit)].to_vec()
+                    }
+                    // Key order is the map's own: the offset is found by
+                    // subtree size, so a page reads only its rows however
+                    // many proposals history holds.
+                    None => i
+                        .chain
+                        .tip_state()
+                        .proposals
+                        .iter_from(offset)
+                        .take(limit)
+                        .filter_map(|(key, _)| Hash::try_from(key).ok())
+                        .collect(),
                 };
-                let ids = ids.get(offset..).unwrap_or_default();
-                proposal_page(i, &ids[..ids.len().min(limit)], false, meter)
+                proposal_page(i, &ids, false, meter)
             }
             "support" => {
                 let key = parse_account(required_str(&params, "key")?, &chain_id)?;
@@ -5350,11 +5351,18 @@ impl Node {
             }
             "mine" => {
                 // Any local process can reach the private listener. On a real
-                // network this would let it burn the node's CPU and pick the
-                // payout; only an explicit operator flag allows that.
+                // network, or one untrusted peers reach, this would let it
+                // burn the node's CPU and pick the payout; only an explicit
+                // operator flag allows that.
+                let config = self.read_view()?.chain.config.clone();
                 ensure!(
-                    self.dev_rpc || development_network(&self.read_view()?.chain.config),
-                    "mine is a development method and this network's proof of work is not a development target; start the node with --dev-rpc to allow it"
+                    self.dev_rpc || development_network(&config, self.untrusted_peers),
+                    "mine is a development method, and {}; start the node with --dev-rpc to allow it",
+                    if easy_proof_of_work(&config) {
+                        "untrusted peers can reach this node"
+                    } else {
+                        "this network's proof of work is not a development target"
+                    }
                 );
                 let recipient = params
                     .get("recipient")
@@ -6038,7 +6046,7 @@ impl Drop for Server {
     }
 }
 
-pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
+pub async fn serve(mut node: Node, options: ServerOptions) -> Result<Server> {
     ensure!(
         node.server_active
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -6080,6 +6088,9 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
             || node.peer_auth.as_ref().is_some_and(|p| p.is_discovery()),
         "peer discovery requires explicit open authenticated transport"
     );
+    // Set before this server's clones of the node: RPC mining treats a node
+    // that untrusted peers can reach as a real network.
+    node.untrusted_peers = node.discovery_options.enabled || !options.p2p.ip().is_loopback();
     {
         let mut health = node.peer_health.unpoisoned();
         for peer in &options.peers {

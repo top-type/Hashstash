@@ -27,7 +27,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     key=${line%%=*}
     value=${line#*=}
     case "$key" in
-        MINER_PUBLIC_KEY|RPC_PORT|P2P_PORT|STRATUM_PORT|STRATUM_ADVERTISE|SHARE_DIFFICULTY|PEERS|PUBLIC_WEB_PORT|STRATUM_ENABLED|PEER_KEY_FILE|PEER_PINS|PEER_DISCOVERY|PEER_SEEDS|PEER_ADVERTISE) ;;
+        MINER_PUBLIC_KEY|RPC_PORT|P2P_PORT|STRATUM_PORT|STRATUM_ADVERTISE|SHARE_DIFFICULTY|PEERS|PUBLIC_WEB_PORT|STRATUM_ENABLED|PEER_KEY_FILE|PEER_PINS|PEER_DISCOVERY|PEER_SEEDS|PEER_ADVERTISE|ALLOW_EASY_TARGET) ;;
         *) fail "unknown node.env field: $key" ;;
     esac
     [[ ! ${settings[$key]+present} ]] || fail "duplicate node.env field: $key"
@@ -40,6 +40,8 @@ stratum_enabled=${settings[STRATUM_ENABLED]:-true}
 [[ "$stratum_enabled" == true || "$stratum_enabled" == false ]] || fail 'STRATUM_ENABLED must be true or false'
 peer_discovery=${settings[PEER_DISCOVERY]-false}
 [[ "$peer_discovery" == true || "$peer_discovery" == false ]] || fail 'PEER_DISCOVERY must be true or false'
+allow_easy_target=${settings[ALLOW_EASY_TARGET]-false}
+[[ "$allow_easy_target" == true || "$allow_easy_target" == false ]] || fail 'ALLOW_EASY_TARGET must be true or false'
 [[ ${settings[MINER_PUBLIC_KEY]} =~ ^[0-9a-fA-F]{64}$ ]] || fail 'MINER_PUBLIC_KEY must be a 32-byte hexadecimal public key'
 valid_port() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 <= 65535 )); }
 valid_ipv4_endpoint() {
@@ -172,18 +174,6 @@ password=${password%$'\r'}
 [[ -n "$password" && ${#password} -le 256 && "$password" =~ ^[[:graph:]]+$ ]] || fail 'Stratum password must be one nonempty ASCII token, at most 256 characters'
 unset password
 fi
-if [[ "$mode" == check ]]; then
-    "$binary" network --config "$genesis" > /dev/null
-    "$binary" address --public-key "${settings[MINER_PUBLIC_KEY]}" --config "$genesis" > /dev/null
-    if [[ -n "$peer_key" ]]; then
-        auth_args=(peer-keycheck --key-file "$key_to_check" --miner "${settings[MINER_PUBLIC_KEY]}")
-        [[ "$peer_discovery" == false ]] || auth_args+=(--peer-discovery)
-        for pin in "${peer_pins[@]}"; do auth_args+=(--peer-pin "$pin"); done
-        "$binary" "${auth_args[@]}" > /dev/null
-    fi
-    printf 'Configuration and payout public key are valid. No listeners started.\n'
-    exit 0
-fi
 args=(run --config "$genesis" --data /var/lib/hashstash/chain.sqlite
     --miner "${settings[MINER_PUBLIC_KEY]}"
     --rpc "127.0.0.1:${settings[RPC_PORT]}"
@@ -207,6 +197,24 @@ fi
 if [[ ${settings[PUBLIC_WEB_PORT]+present} ]]; then
     # A separate restricted API, reached through the HTTPS reverse proxy only.
     args+=(--public-web "127.0.0.1:${settings[PUBLIC_WEB_PORT]}")
+fi
+# P2P always binds 0.0.0.0, so only a calibrated genesis runs without this.
+[[ "$allow_easy_target" == false ]] || args+=(--allow-easy-target)
+if [[ "$mode" == check ]]; then
+    "$binary" network --config "$genesis" > /dev/null
+    "$binary" address --public-key "${settings[MINER_PUBLIC_KEY]}" --config "$genesis" > /dev/null
+    if [[ -n "$peer_key" ]]; then
+        auth_args=(peer-keycheck --key-file "$key_to_check" --miner "${settings[MINER_PUBLIC_KEY]}")
+        [[ "$peer_discovery" == false ]] || auth_args+=(--peer-discovery)
+        for pin in "${peer_pins[@]}"; do auth_args+=(--peer-pin "$pin"); done
+        "$binary" "${auth_args[@]}" > /dev/null
+    fi
+    # Every refusal run makes before it opens the database, such as an easy
+    # proof-of-work limit behind the public P2P listener, fails here rather
+    # than in the service's restart loop.
+    "$binary" "${args[@]}" --preflight > /dev/null
+    printf 'Configuration and payout public key are valid. No listeners started.\n'
+    exit 0
 fi
 # No wallet key, watch key, or software miner is started by this service.
 exec "$binary" "${args[@]}"

@@ -1503,6 +1503,8 @@ impl Engine {
             }
         }
     }
+    /// Status from this engine's own fields and ledger connection.
+    #[cfg(test)]
     fn status(&self, recipient: Option<&str>, client_subnet: &str) -> Result<Value> {
         status_json(
             &self.config,

@@ -2,7 +2,7 @@ use crate::{
     codec,
     config::Config,
     consensus, crypto, fees, math,
-    state::{Phase, State},
+    state::{Phase, SavedPassChanges, State},
     types::*,
 };
 use anyhow::{Context, Result, ensure};
@@ -744,18 +744,19 @@ impl Chain {
             );
             false
         });
+        let mut pruned = 0;
         if !restored {
             // A failed restore may have committed index batches; they are rebuilt below.
             let _ = chain.db.execute_batch("ROLLBACK;");
             let db = std::mem::replace(&mut chain.db, Connection::open_in_memory()?);
             chain = Self::at_genesis(chain.config.clone(), db)?;
-            chain.replay_all()?;
+            pruned = chain.replay_all()?;
         }
         // Admitted held headers of chains still competing with the tip are
         // restored before stale branches are pruned, so their roots stay.
         chain.load_held()?;
         chain.prune_held()?;
-        let pruned = chain.prune_stale_branches()?;
+        let pruned = pruned + chain.prune_stale_branches()?;
         chain.refresh_capacity();
         if pruned > 0 {
             eprintln!("Pruned {pruned} stored losing-branch block(s) that fell out of competition");
@@ -843,15 +844,52 @@ impl Chain {
     /// Rebuild every derived index from all stored block bodies, inside the
     /// open transaction. Saved checkpoints are dropped first, in the same
     /// transaction: none outlives the entries it was saved with, so another
-    /// build's checkpoint never meets entries this build derived.
-    fn replay_all(&mut self) -> Result<()> {
+    /// build's checkpoint never meets entries this build derived. Returns
+    /// how many stored losing-branch blocks it pruned without executing them.
+    fn replay_all(&mut self) -> Result<u64> {
         let genesis_hash = codec::block_hash(&self.genesis);
+        // Judged before the persisted index is wiped; any doubt about it
+        // leaves nothing to skip.
+        let judged = self.judge_stale_branches().ok();
+        let mut skipped = judged
+            .as_ref()
+            .map(|(_, _, stale)| stale.clone())
+            .unwrap_or_default();
         self.db.execute_batch("BEGIN IMMEDIATE; DELETE FROM entry_index; DELETE FROM canonical_index; DELETE FROM state_checkpoint_parts; DELETE FROM state_checkpoints;")?;
         self.index_genesis()?;
         // Stored blocks that fail current validation are set aside when they
         // belong to losing branches. Storage and index errors still stop startup.
         let mut rejected = BTreeMap::<Hash, (Option<Amount>, String)>::new();
-        self.replay_stored(Some(&mut rejected))?;
+        self.replay_stored(Some(&mut rejected), Some(&mut skipped))?;
+        let mut pruned = 0u64;
+        if !skipped.is_empty() {
+            // The judgement stands only if the replay reproduced the persisted
+            // tip's index entry exactly, as the rules that wrote the persisted
+            // index would, and skipped no block judged worth keeping, below a
+            // stale parent; otherwise the skipped blocks are executed after all.
+            let reproduced = judged.as_ref().is_some_and(|(tip, bytes, stale)| {
+                skipped.len() == stale.len()
+                    && self.load_entry(tip).ok().flatten().is_some_and(|entry| {
+                        entry.work == self.tip_entry.work && codec::encode(entry.as_ref()) == *bytes
+                    })
+            });
+            if reproduced {
+                for hash in &skipped {
+                    self.db
+                        .prepare_cached("DELETE FROM blocks WHERE hash=?1")?
+                        .execute([hash.as_slice()])?;
+                    pruned += 1;
+                    if pruned.is_multiple_of(INDEX_REBUILD_BATCH) {
+                        self.db.execute_batch("COMMIT; BEGIN IMMEDIATE;")?;
+                    }
+                }
+            } else {
+                eprintln!(
+                    "The rebuilt index does not confirm the persisted one; replaying the stored losing branches judged stale from it too"
+                );
+                self.replay_stored(Some(&mut rejected), None)?;
+            }
+        }
         let saved_tip = self.persisted_tip()?;
         let persisted = saved_tip
             .as_deref()
@@ -899,7 +937,74 @@ impl Chain {
                 rejected.len()
             );
         }
-        Ok(())
+        Ok(pruned)
+    }
+    /// Before a full replay: the persisted tip, its persisted index entry, and
+    /// the stored losing-branch blocks that [Chain::prune_stale_branches]
+    /// would delete once the replay had executed them, judged from the
+    /// persisted index by the same rule against the persisted tip. The tip's
+    /// ancestry, and a stored block that a persisted held header follows,
+    /// are always kept, whatever the persisted canonical index says. Each
+    /// block judged stale must have an entry that agrees with its parent's
+    /// (see [Chain::check_entry]); a missing or disagreeing entry, or one
+    /// claiming more work than the persisted tip, is an error.
+    fn judge_stale_branches(&self) -> Result<(Hash, Vec<u8>, BTreeSet<Hash>)> {
+        let tip = self
+            .persisted_tip()?
+            .and_then(|raw| Hash::try_from(raw.as_slice()).ok())
+            .context("persisted tip absent")?;
+        let bytes: Vec<u8> = self.db.query_row(
+            "SELECT bytes FROM entry_index WHERE hash=?1",
+            [tip.as_slice()],
+            |r| r.get(0),
+        )?;
+        let tip_entry = codec::decode::<Entry>(&bytes, 4096)?;
+        let next = math::work(&self.target(&tip_entry)?);
+        let mut needed = BTreeSet::from([tip]);
+        let held: Vec<Vec<u8>> = self
+            .db
+            .prepare("SELECT header FROM held_headers")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for header in held {
+            needed.insert(crate::peer_wire::header_from_bytes(&header)?.previous);
+        }
+        let mut stale = BTreeSet::new();
+        let mut sequence = i64::MAX;
+        loop {
+            let row: Option<(i64, Vec<u8>)> = self
+                .db
+                .query_row(
+                    "SELECT seq,hash FROM blocks WHERE seq<?1 ORDER BY seq DESC LIMIT 1",
+                    [sequence],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((seq, raw)) = row else {
+                break;
+            };
+            sequence = seq;
+            let hash: Hash = raw.as_slice().try_into().context("malformed block hash")?;
+            let entry = Self::read_entry(&self.db, &hash)?.context("stored block entry absent")?;
+            // A stale tip hint is no reference: the replay replaces it.
+            ensure!(
+                entry.work <= tip_entry.work,
+                "a stored block claims more work than the persisted tip"
+            );
+            let child = math::work(&self.target(&entry)?);
+            let branch = &entry.work + &child;
+            if needed.remove(&hash)
+                || Self::competitive(&tip_entry.work, &branch, &child, &next).is_ok()
+            {
+                needed.insert(entry.header.previous);
+                continue;
+            }
+            let parent = Self::read_entry(&self.db, &entry.header.previous)?
+                .context("stored block parent entry absent")?;
+            self.check_entry(&hash, &entry, &parent, None)?;
+            stale.insert(hash);
+        }
+        Ok((tip, bytes, stale))
     }
     /// An equal-work persisted tip only breaks the first-seen tie between
     /// already revalidated branches. True when it became the tip.
@@ -928,10 +1033,12 @@ impl Chain {
     /// Validate, in storage order, every stored block without an index entry,
     /// adding its entry and canonical heights. With `rejected`, a block that
     /// fails validation and its descendants are set aside there; without it,
-    /// the failure is returned.
+    /// the failure is returned. A block in `skipped`, and every descendant,
+    /// which joins it, is neither executed nor indexed.
     fn replay_stored(
         &mut self,
         mut rejected: Option<&mut BTreeMap<Hash, (Option<Amount>, String)>>,
+        mut skipped: Option<&mut BTreeSet<Hash>>,
     ) -> Result<()> {
         let claimed_work = |parent: Option<&Amount>, block: &Block| {
             let target = math::target_from_bits(block.header.bits).ok()?;
@@ -952,11 +1059,21 @@ impl Chain {
             let block: Block = codec::decode_block(&bytes, bytes.len())?;
             let hash = codec::block_hash(&block);
             ensure!(raw_hash == hash, "stored block hash mismatch");
-            if let Some(rejected) = rejected.as_deref_mut()
-                && let Some((parent, _)) = rejected.get(&block.header.previous)
+            if let Some(rejected) = rejected.as_deref_mut() {
+                // Set aside by an earlier pass of the same replay.
+                if rejected.contains_key(&hash) {
+                    continue;
+                }
+                if let Some((parent, _)) = rejected.get(&block.header.previous) {
+                    let claimed = claimed_work(parent.as_ref(), &block);
+                    rejected.insert(hash, (claimed, "parent block fails validation".into()));
+                    continue;
+                }
+            }
+            if let Some(skipped) = skipped.as_deref_mut()
+                && (skipped.contains(&hash) || skipped.contains(&block.header.previous))
             {
-                let claimed = claimed_work(parent.as_ref(), &block);
-                rejected.insert(hash, (claimed, "parent block fails validation".into()));
+                skipped.insert(hash);
                 continue;
             }
             let (entry, state) = match self.validate_block(&block, accepted_at, false) {
@@ -1015,7 +1132,11 @@ impl Chain {
             )
             .optional()?;
         if indexed_by.as_deref() != Some(build.as_slice()) {
-            eprintln!("Ignoring state checkpoints: another binary rebuilt the chain indexes since");
+            // After an upgrade, the previous binary derived the indexes and
+            // saved the checkpoints alike.
+            eprintln!(
+                "Ignoring state checkpoints saved by another build; replaying all stored history"
+            );
             return Ok(false);
         }
         let mut foreign = false;
@@ -1055,6 +1176,10 @@ impl Chain {
     /// Decode a saved state and check it against the block it belongs to: its
     /// root must equal the committed state root, and since that root omits a
     /// decision's copy of its winning action, the full state audit must pass.
+    /// A decision's PASS world is rebuilt on its FAIL world (see
+    /// [State::split_pass_records]), so decoding it never holds a second copy
+    /// of the account records the two worlds share, and the root check covers
+    /// the rebuilt world too.
     fn load_checkpoint(&self, height: u64, hash: &Hash, length: u64) -> Result<Arc<State>> {
         let mut parts = PartReader {
             db: &self.db,
@@ -1063,10 +1188,11 @@ impl Chain {
             buffer: Vec::new(),
             offset: 0,
         };
-        let mut state: State = checkpoint_options()
+        let (state, pass): (State, SavedPassChanges) = checkpoint_options()
             .with_limit(length)
             .deserialize_from(&mut parts)?;
         ensure!(parts.read(&mut [0])? == 0, "saved state has trailing bytes");
+        let mut state = state.with_pass_records(pass)?;
         let block = self.load_block(hash)?.context("checkpoint block absent")?;
         ensure!(
             codec::block_hash(&block) == *hash
@@ -1127,7 +1253,7 @@ impl Chain {
                     let skip = self
                         .canonical_hash(skip_height(entry.height))?
                         .context("saved skip target absent")?;
-                    self.check_entry(&block_hash, entry, &ancestry.1, skip)?;
+                    self.check_entry(&block_hash, entry, &ancestry.1, Some(skip))?;
                     ancestry = (block_hash, Arc::new(entry.clone()));
                     continue;
                 }
@@ -1203,13 +1329,13 @@ impl Chain {
             );
             let mut cursor = Some((previous, parent.clone()));
             let skip = self.branch_ancestor(&mut cursor, skip_height(entry.height))?;
-            self.check_entry(&hash, &entry, &parent, skip)?;
+            self.check_entry(&hash, &entry, &parent, Some(skip))?;
             heaviest = heaviest.max(entry.work.clone());
             checked.insert(hash);
             let tip = (self.tip, self.tip_entry.clone());
             self.note_branch(hash, &entry, false, tip);
         }
-        self.replay_stored(None)?;
+        self.replay_stored(None, None)?;
         self.follow_tip_hint(Some(saved_tip))?;
         ensure!(
             self.tip == saved_tip && heaviest <= self.tip_entry.work,
@@ -1221,8 +1347,14 @@ impl Chain {
     /// A persisted index entry agrees with its checked parent's: its header
     /// hashes to the block, its height, target, work and schedule anchors
     /// follow from the parent, its clock advances and its capacity never
-    /// falls. `skip` is the checked ancestor at its skip height.
-    fn check_entry(&self, hash: &Hash, entry: &Entry, parent: &Entry, skip: Hash) -> Result<()> {
+    /// falls. `skip`, when given, is the checked ancestor at its skip height.
+    fn check_entry(
+        &self,
+        hash: &Hash,
+        entry: &Entry,
+        parent: &Entry,
+        skip: Option<Hash>,
+    ) -> Result<()> {
         let target = self.target(parent)?;
         let interval = entry
             .clock
@@ -1246,7 +1378,7 @@ impl Chain {
                 && entry.work == &parent.work + math::work(&target)
                 && (entry.anchor_timestamp, entry.anchor_clock) == anchors
                 && entry.capacity >= parent.capacity
-                && entry.skip == skip,
+                && skip.is_none_or(|skip| entry.skip == skip),
             "index entry disagrees with its parent's"
         );
         Ok(())
@@ -1319,7 +1451,9 @@ impl Chain {
         transaction.commit()?;
         Ok(())
     }
-    /// Store `state` as the saved checkpoint of the block `hash` at `height`.
+    /// Store `state` as the saved checkpoint of the block `hash` at `height`:
+    /// its serde encoding, except that a decision's PASS world lists only its
+    /// account records that differ from the FAIL world's.
     fn write_saved_state(
         db: &Connection,
         height: u64,
@@ -1338,7 +1472,7 @@ impl Chain {
             length: 0,
             buffer: Vec::with_capacity(CHECKPOINT_PART_BYTES),
         };
-        checkpoint_options().serialize_into(&mut parts, state)?;
+        checkpoint_options().serialize_into(&mut parts, &state.split_pass_records())?;
         parts.flush_part()?;
         db.execute(
             "INSERT OR REPLACE INTO state_checkpoints(height,hash,build,length) VALUES(?1,?2,?3,?4)",
@@ -1526,7 +1660,9 @@ impl Chain {
         checkpoint.or_else(|| self.cache.borrow().states.get(hash).cloned())
     }
     /// The newest retained active-chain checkpoint at or below `height`, at most
-    /// about half that height's depth below it. Like cached_state, it never replays.
+    /// about half that height's depth below it, except below the state a start
+    /// restored, where only genesis is retained until a replay through that
+    /// height retains checkpoints again. Like cached_state, it never replays.
     pub fn checkpoint_at_or_below(&self, height: u64) -> Option<(Hash, Arc<State>)> {
         self.checkpoints
             .borrow()
@@ -2107,7 +2243,7 @@ impl Chain {
             return Ok(());
         }
         let next = math::work(&self.target(&self.tip_entry)?);
-        self.competitive(&branch, work, &next).map_err(SideBranchRefused)?;
+        Self::competitive(&self.tip_entry.work, &branch, work, &next).map_err(SideBranchRefused)?;
         if self.side_budget == 0 {
             return Err(SideBranchRefused("side-branch admission budget is spent").into());
         }
@@ -2135,9 +2271,10 @@ impl Chain {
         let mut cursor = Some((*previous, parent.clone()));
         Ok(self.branch_ancestor(&mut cursor, height)? != hash)
     }
-    /// Whether a losing branch ending in a block of `work` stays worth keeping.
+    /// Whether a losing branch ending in a block of `work` stays worth keeping
+    /// against a tip of work `tip` whose next block carries `next`.
     fn competitive(
-        &self,
+        tip: &Amount,
         branch: &Amount,
         work: &Amount,
         next: &Amount,
@@ -2145,7 +2282,7 @@ impl Chain {
         if work * SIDE_BRANCH_WORK_RATIO < *next {
             return Err("block work is far below the active chain's");
         }
-        if branch + work * SIDE_BRANCH_CATCH_UP_BLOCKS < self.tip_entry.work {
+        if branch + work * SIDE_BRANCH_CATCH_UP_BLOCKS < *tip {
             return Err("branch cannot plausibly overtake the active chain");
         }
         Ok(())
@@ -2520,7 +2657,7 @@ impl Chain {
             // downloads resume.
             if needed.remove(&hash)
                 || self.held.roots.contains_key(&hash)
-                || self.competitive(&branch, &child, &next).is_ok()
+                || Self::competitive(&self.tip_entry.work, &branch, &child, &next).is_ok()
             {
                 needed.insert(entry.header.previous);
                 continue;
@@ -4108,15 +4245,50 @@ mod cache_tests {
         assert!(!chain.submit(siblings[2].clone(), siblings[2].header.timestamp as u64).unwrap());
         assert_eq!(chain.held_header_count(), 0);
     }
+    /// How [prune_at_startup] starts the chain again.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Restart {
+        /// A full replay, which judges the stale branch from the persisted
+        /// index and never executes it.
+        Full,
+        /// A full replay that does not reproduce the persisted tip's entry,
+        /// so it executes the branch judged stale after all.
+        TipDiffers,
+        /// A full replay that finds a stale block's entry disagreeing with
+        /// its parent's, so it judges nothing stale.
+        EntryDiffers,
+        /// A start from a saved checkpoint, which executes neither the stale
+        /// branch nor anything else below it.
+        Restored,
+    }
     #[test]
     fn stale_losing_branches_are_pruned_at_startup() {
-        // After a full replay, and after a start from a saved checkpoint
-        // that executes neither the stale branch nor anything else below it.
-        for restored in [false, true] {
-            prune_at_startup(restored);
+        for restart in [
+            Restart::Full,
+            Restart::TipDiffers,
+            Restart::EntryDiffers,
+            Restart::Restored,
+        ] {
+            prune_at_startup(restart);
         }
     }
-    fn prune_at_startup(restored: bool) {
+    /// Edit the persisted index entry of `hash` in the closed database.
+    fn edit_entry(path: &Path, hash: &Hash, edit: impl FnOnce(&mut Entry)) {
+        let db = Connection::open(path).unwrap();
+        let mut entry = Chain::read_entry(&db, hash)
+            .unwrap()
+            .unwrap()
+            .as_ref()
+            .clone();
+        edit(&mut entry);
+        db.execute(
+            "UPDATE entry_index SET bytes=?2 WHERE hash=?1",
+            params![hash.as_slice(), codec::encode(&entry)],
+        )
+        .unwrap();
+    }
+    fn prune_at_startup(restart: Restart) {
+        let restored = restart == Restart::Restored;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("prune.db");
         let config = Config::devnet();
@@ -4167,14 +4339,26 @@ mod cache_tests {
             // A clean stop saves the state CHECKPOINT_DEPTH below the tip.
             chain.checkpoint_every = 8;
         }
+        // The active chain's blocks and the sibling; the stale branch aside.
+        let kept = chain.tip_height() + 1;
         drop(chain);
+        match restart {
+            Restart::TipDiffers => edit_entry(&path, &tip, |entry| entry.capacity += 1),
+            Restart::EntryDiffers => edit_entry(&path, &codec::block_hash(&stale[1]), |entry| {
+                entry.work += 1u32
+            }),
+            Restart::Full | Restart::Restored => {}
+        }
         let (chain, validated) = reopen(&path, &config);
         assert_eq!(chain.tip_hash(), tip);
         assert_eq!(chain.restored.is_some(), restored);
-        if restored {
+        let expected = match restart {
+            Restart::Full => kept,
+            Restart::TipDiffers | Restart::EntryDiffers => kept + stale.len() as u64,
             // Only the blocks above the checkpoint, the sibling among them.
-            assert_eq!(validated as u64, CHECKPOINT_DEPTH + 1);
-        }
+            Restart::Restored => CHECKPOINT_DEPTH + 1,
+        };
+        assert_eq!(validated as u64, expected, "{restart:?}");
         for block in &stale {
             assert!(chain.block(&codec::block_hash(block)).is_none());
             assert!(chain.block_height(&codec::block_hash(block)).unwrap().is_none());
@@ -4331,10 +4515,11 @@ mod cache_tests {
             buffer: Vec::new(),
             offset: 0,
         };
-        let mut state: State = checkpoint_options()
+        let (state, pass): (State, SavedPassChanges) = checkpoint_options()
             .with_limit(length)
             .deserialize_from(&mut parts)
             .unwrap();
+        let mut state = state.with_pass_records(pass).unwrap();
         edit(&mut state);
         let (hash, build) = (hash.try_into().unwrap(), build.try_into().unwrap());
         Chain::write_saved_state(&db, height, &hash, &build, &state).unwrap();
@@ -4485,6 +4670,11 @@ mod cache_tests {
         let mut chain = Chain::open(&path, config.clone()).unwrap();
         let secret = [91; 32];
         let owner = crypto::public_key(&secret).unwrap();
+        // An account that nothing touches once the decision opens.
+        let bystander = crypto::public_key(&[92; 32]).unwrap();
+        let time = chain.tip_block().header.timestamp + 15;
+        let block = Chain::mine(chain.template(bystander, vec![], time).unwrap(), 100_000).unwrap();
+        assert!(chain.submit(block, time as u64).unwrap());
         let mut salt = 0;
         while chain.tip_state().auction_round().is_none() {
             extend(&mut chain, 1, salt);
@@ -4535,6 +4725,19 @@ mod cache_tests {
         let (height, hash, root) = (chain.tip_height(), chain.tip_hash(), chain.tip_state().root());
         let build = build_identity().unwrap();
         Chain::write_saved_state(&chain.db, height, &hash, &build, chain.tip_state()).unwrap();
+        // The records both worlds share are saved once, not once per world.
+        let plain = checkpoint_options()
+            .serialized_size(chain.tip_state())
+            .unwrap();
+        let saved: u64 = chain
+            .db
+            .query_row(
+                "SELECT length FROM state_checkpoints WHERE height=?1",
+                [height],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(saved < plain, "{saved} >= {plain}");
         drop(chain);
         let (chain, validated) = reopen(&path, &config);
         assert_eq!((validated, chain.restored), (0, Some((height, hash))));
@@ -4545,6 +4748,14 @@ mod cache_tests {
         // The restored decision shares the committed action, as execution does.
         let committed = state.actions.get_shared(&decision.proposal_id).unwrap();
         assert!(Arc::ptr_eq(&decision.proposal, committed));
+        // The PASS world is rebuilt on the FAIL world: an account untouched
+        // since the decision opened is one shared record, not two copies.
+        let pass = state.alternative.as_ref().unwrap();
+        let shared = state.world.accounts.get_shared(&bystander).unwrap();
+        assert!(Arc::ptr_eq(
+            shared,
+            pass.accounts.get_shared(&bystander).unwrap()
+        ));
         drop(chain);
         // The root omits the decision's copy of its action, so another copy
         // still matches the committed root; the audit refuses it.
@@ -4619,5 +4830,74 @@ mod cache_tests {
         let (chain, validated) = reopen(&path, &config);
         assert_eq!(chain.tip_hash(), fork.tip_hash());
         assert_eq!((chain.restored, validated), (None, 60 + branch.len()));
+    }
+    #[test]
+    fn a_reorganization_below_the_restored_state_rebuilds_its_fork_point_from_genesis() {
+        // Below a restored state only genesis is retained, so the fork point
+        // of a heavier branch forking there is rebuilt from genesis, in
+        // budgeted steps: about its height, where a process that never
+        // restarted rebuilds it from a retained state about its depth below.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deep.db");
+        let config = Config::devnet();
+        let mut chain = Chain::open(&path, config.clone()).unwrap();
+        chain.checkpoint_every = 8;
+        let mut live = Chain::open(&directory.path().join("live.db"), config.clone()).unwrap();
+        let mut fork = Chain::open(&directory.path().join("fork.db"), config.clone()).unwrap();
+        for n in 0..20 {
+            let block = candidate(&chain, n);
+            for target in [&mut chain, &mut live, &mut fork] {
+                target
+                    .submit(block.clone(), block.header.timestamp as u64)
+                    .unwrap();
+            }
+        }
+        for n in 0..40 {
+            let block = candidate(&chain, 100 + n);
+            for target in [&mut chain, &mut live] {
+                target
+                    .submit(block.clone(), block.header.timestamp as u64)
+                    .unwrap();
+            }
+        }
+        extend(&mut fork, 46, 1_000);
+        drop(chain);
+        let (mut chain, _) = reopen(&path, &config);
+        assert_eq!(chain.restored.map(|(height, _)| height), Some(29));
+        let branch: Vec<Block> = active_chain(&fork)[21..]
+            .iter()
+            .map(|hash| fork.block(hash).unwrap())
+            .collect();
+        for block in &branch {
+            let held = chain
+                .submit(block.clone(), block.header.timestamp as u64)
+                .unwrap_err();
+            assert!(held.is::<SideBranchRefused>(), "{held:#}");
+        }
+        // Each attempt may replay four blocks; returns how often the first
+        // block, whose parent is the fork point, was deferred.
+        let adopt = |target: &mut Chain| {
+            let mut deferred = 0;
+            for (index, block) in branch.iter().enumerate() {
+                loop {
+                    let time = block.header.timestamp as u64;
+                    match target.submit_with_replay_budget(block.clone(), time, 4) {
+                        Ok(_) => break,
+                        Err(error) if error.is::<ValidationDeferred>() && index == 0 => {
+                            deferred += 1
+                        }
+                        Err(error) => panic!("{error:#}"),
+                    }
+                }
+            }
+            assert_eq!(target.tip_hash(), fork.tip_hash());
+            assert_eq!(target.tip_state().root(), fork.tip_state().root());
+            deferred
+        };
+        // Twenty blocks from genesis, against four from the state the live
+        // process retains at height 16.
+        assert_eq!(adopt(&mut chain), 4);
+        assert_eq!(adopt(&mut live), 0);
+        assert_eq!(chain.restored, None);
     }
 }

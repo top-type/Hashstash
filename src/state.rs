@@ -12,9 +12,11 @@ use std::sync::Arc;
 
 /// One world's account records. No code outside this module can insert or
 /// remove a record: [`World::put`] is the only per-key writer, and it updates
-/// `account_cash` and `account_shares` with each record. The `World` fields
-/// themselves stay public, because tests build worlds field by field, so code
-/// that assigns a whole map or an aggregate must keep the others consistent.
+/// `account_cash` and `account_shares` with each record. The one exception,
+/// [`State::with_pass_records`], restores a saved world whose aggregates were
+/// saved with it. The `World` fields themselves stay public, because tests
+/// build worlds field by field, so code that assigns a whole map or an
+/// aggregate must keep the others consistent.
 /// `World::validate` checks conservation against the aggregates only;
 /// `State::audit` recounts them from the records.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -26,6 +28,13 @@ impl std::ops::Deref for Accounts {
         &self.0
     }
 }
+
+/// The PASS world's account records that differ from the FAIL world's, in
+/// key order, as [State::split_pass_records] lists them: a changed or added
+/// record, or None for a removed one.
+pub type PassChanges<'a> = Vec<(&'a [u8], Option<&'a Account>)>;
+/// [PassChanges] as a saved state decodes them.
+pub type SavedPassChanges = Vec<(Vec<u8>, Option<Account>)>;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct World {
@@ -443,6 +452,62 @@ impl State {
         } else {
             Some(cash)
         }
+    }
+    /// This state as a saved checkpoint stores it: during a decision the PASS
+    /// world's account records are left out, and listed instead as their
+    /// differences from the FAIL world's records, in key order (a changed or
+    /// added record, or None for a removed one). Execution opens the PASS
+    /// world as a copy of the FAIL world, so the records both worlds still
+    /// share are stored once, and [State::with_pass_records] restores them
+    /// shared again rather than as a second copy of every account.
+    pub fn split_pass_records(&self) -> (State, PassChanges<'_>) {
+        let mut state = self.clone();
+        let (Some(saved), Some(pass)) = (&mut state.alternative, &self.alternative) else {
+            return (state, Vec::new());
+        };
+        saved.accounts = Accounts::default();
+        let mut changes = Vec::new();
+        let mut fail = self.world.accounts.iter().peekable();
+        for (key, record) in pass.accounts.iter() {
+            while let Some((removed, _)) = fail.next_if(|&(other, _)| other < key) {
+                changes.push((removed, None));
+            }
+            match fail.next_if(|&(other, _)| other == key) {
+                Some((_, shared)) if std::ptr::eq(shared, record) || shared == record => {}
+                _ => changes.push((key, Some(record))),
+            }
+        }
+        changes.extend(fail.map(|(removed, _)| (removed, None)));
+        (state, changes)
+    }
+    /// The state [State::split_pass_records] split, with the PASS world's
+    /// account records rebuilt from the FAIL world's and the listed changes,
+    /// so the records they share are shared. The caller still checks the
+    /// result against its committed root.
+    pub fn with_pass_records(mut self, changes: SavedPassChanges) -> Result<Self> {
+        let Some(pass) = &mut self.alternative else {
+            ensure!(changes.is_empty(), "PASS records without a PASS world");
+            return Ok(self);
+        };
+        ensure!(pass.accounts.is_empty(), "PASS records saved twice");
+        let mut accounts = self.world.accounts.0.clone();
+        let mut previous: Option<Vec<u8>> = None;
+        for (key, record) in changes {
+            ensure!(
+                previous.as_ref().is_none_or(|previous| *previous < key),
+                "PASS record changes are not in key order"
+            );
+            match record {
+                Some(record) => accounts.insert(key.clone(), record),
+                None => ensure!(
+                    accounts.remove(&key).is_some(),
+                    "removed PASS record absent"
+                ),
+            }
+            previous = Some(key);
+        }
+        pass.accounts = Accounts(accounts);
+        Ok(self)
     }
     pub fn root(&self) -> Hash {
         crypto::tagged_hash(
@@ -1062,6 +1127,66 @@ mod tests {
         let mut other = s.clone();
         other.actions.insert(id.to_vec(), grant(39));
         assert_ne!(other.root(), s.root());
+    }
+
+    #[test]
+    fn saved_pass_records_list_only_differences_and_restore_shared() {
+        let c = Config::devnet();
+        let (mut s, _) = governed();
+        let account = |ordinary: u32| Account {
+            ordinary: ordinary.into(),
+            ..Account::default()
+        };
+        for key in 1..=5u8 {
+            s.world.put([key; 32], account(u32::from(key)), &c).unwrap();
+        }
+        let mut pass = s.world.clone();
+        // Changed, removed and added records; one rewritten with its value.
+        pass.put([2; 32], account(20), &c).unwrap();
+        pass.accounts.0.remove(&[3; 32]);
+        pass.put([6; 32], account(6), &c).unwrap();
+        pass.put([5; 32], account(5), &c).unwrap();
+        s.alternative = Some(pass);
+        let (saved, changes) = s.split_pass_records();
+        assert!(saved.alternative.as_ref().unwrap().accounts.is_empty());
+        let listed: Vec<(u8, Option<Amount>)> = changes
+            .iter()
+            .map(|(key, record)| (key[0], record.map(|a| a.ordinary.clone())))
+            .collect();
+        let expected: Vec<(u8, Option<Amount>)> =
+            vec![(2, Some(20u32.into())), (3, None), (6, Some(6u32.into()))];
+        assert_eq!(listed, expected);
+        // The saved encoding restores the same state, with unchanged records
+        // shared by both worlds.
+        let decoded: (State, SavedPassChanges) =
+            codec::decode(&codec::encode(&(&saved, &changes)), usize::MAX).unwrap();
+        let restored = decoded.0.with_pass_records(decoded.1).unwrap();
+        assert_eq!(restored.root(), s.root());
+        let pass = restored.alternative.as_ref().unwrap();
+        for key in [1, 4, 5] {
+            let fail = restored.world.accounts.get_shared(&[key; 32]).unwrap();
+            assert!(Arc::ptr_eq(
+                fail,
+                pass.accounts.get_shared(&[key; 32]).unwrap()
+            ));
+        }
+        // Changes out of key order, a removal of an absent record, and
+        // records without a PASS world are refused.
+        fn owned(changes: &[(&[u8], Option<&Account>)]) -> SavedPassChanges {
+            changes
+                .iter()
+                .map(|(key, record)| (key.to_vec(), record.cloned()))
+                .collect()
+        }
+        let mut reversed = owned(&changes);
+        reversed.reverse();
+        assert!(saved.clone().with_pass_records(reversed).is_err());
+        let absent = vec![([9; 32].to_vec(), None)];
+        assert!(saved.clone().with_pass_records(absent.clone()).is_err());
+        let mut rest = saved.clone();
+        rest.alternative = None;
+        assert!(rest.with_pass_records(owned(&changes)).is_err());
+        assert!(saved.with_pass_records(owned(&changes)).is_ok());
     }
 
     #[test]

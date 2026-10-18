@@ -94,7 +94,7 @@ fn systemd_unit_backs_off_restarts_and_names_out_of_memory_kills() {
         "Type=simple",
         "Restart=on-failure",
         "RestartSteps=8",
-        "RestartMaxDelaySec=15min",
+        "RestartMaxDelaySec=2min",
         "StartLimitIntervalSec=0",
     ] {
         assert!(unit.lines().any(|line| line == directive), "missing {directive}");

@@ -20,7 +20,7 @@ Keep the exact source snapshot, `Cargo.lock`, compiler versions, and binary SHA2
 
 ## Prepare shared and per-node files
 
-Choose **one** reviewed genesis `network.json`, record its SHA256 and chain ID, and distribute it unchanged to all hosts. Do not run `init` separately on each host. Every genesis field contributes to network identity. Initial difficulty, the fixed target limit and initial settings belong in this shared file; a node's mining public key does not.
+Choose **one** reviewed genesis `network.json`, record its SHA256 and chain ID, and distribute it unchanged to all hosts. Do not run `init` separately on each host. Every genesis field contributes to network identity. Initial difficulty, the fixed target limit and initial settings belong in this shared file; a node's mining public key does not. Create it with `init --preset slow --hashrate RATE` for the miners' expected aggregate hashrate: this service binds P2P to `0.0.0.0`, and `run` refuses that for a genesis that keeps the presets' uncalibrated proof-of-work limit (see [running a node](../../docs/RUNNING.md)).
 
 The governed miner percentage starts at 50% and applies to the entire exact signed fee; integer rounding goes to waiting revenue. The signed fee must meet the governed minimum rate times transaction weight, rounded up per 1,024 units. Block usage does not adjust that rate. During a decision, each account has its own full cash balance in both alternative worlds; outcome trades affect only that world's cash, while payments and fees must be affordable in both. At the block's opening, every order needs its input in the selected world and every fee needs cash in both outcomes. Same-block withdrawal proceeds, refunds and incoming transfers cannot fund another input or fee.
 

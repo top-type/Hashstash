@@ -20,10 +20,13 @@ ExecStart=/usr/local/libexec/hashstash/run-node.sh run
 # process.
 Restart=on-failure
 RestartSec=10
-# systemd 254 and later lengthen consecutive automatic restart delays from
-# RestartSec to RestartMaxDelaySec, so a crash loop backs off.
+# systemd 254 and later lengthen the delay with each automatic restart, from
+# RestartSec up to RestartMaxDelaySec after RestartSteps of them, so a crash
+# loop backs off. A healthy run does not reset that count; only a manual
+# restart or `systemctl reset-failed hashstash` does. The cap therefore stays
+# short: every later crash, however far apart, waits that long.
 RestartSteps=8
-RestartMaxDelaySec=15min
+RestartMaxDelaySec=2min
 # An out-of-memory kill repeats on every restart until MemoryMax fits the
 # measured need; say so in the journal (systemd sets SERVICE_RESULT).
 ExecStopPost=/bin/sh -c 'if [ "$$SERVICE_RESULT" = oom-kill ]; then echo "hashstash was killed for exceeding its memory limit; raise MemoryHigh/MemoryMax to the measured need (see deploy/linux/README.md)" >&2; fi'

@@ -45,6 +45,10 @@ fn priced_status(units: usize) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 async fn the_documented_wallet_load_is_never_refused_by_rpc_admission() {
     // test_load.py's waves: 64 wallet-signed self-payments, then a block.
     // Each submission used to be charged a full 4,096-entry pool selection,

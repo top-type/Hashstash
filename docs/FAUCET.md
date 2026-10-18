@@ -39,11 +39,16 @@ faucet operating-system user access to that key and its database. Funding can be
 an ordinary transfer or mining rewards paid to the faucet address. Never give
 the faucet a visitor's key or the key to an account holding valuable funds.
 The daemon accepts the usual key-file JSON, with `secret` and `public` fields.
-On Unix it refuses a key file that is a symbolic link or is readable or writable
-by its group or other users (keep `keygen`'s 0600 mode). The key is read through
-the one opened handle those checks inspected, so a path replaced in between is
-refused. Parsed copies of the secret are wiped, and stored subnet digests use a
-key derived from the signer, never the signing key itself.
+It refuses a key file that is a symbolic link, and on Unix one readable or
+writable by its group or other users (keep `keygen`'s 0600 mode). The key is
+read through the one opened handle those checks inspected, so a path replaced in
+between is refused: on Unix the handle must have the inspected device and inode,
+and on Windows the path is opened without following a symbolic link or
+junction, which is then refused. Windows access lists are not inspected; keep
+the key where only the faucet's account can read it (`keygen` sets such a
+list). The node's peer identity files use the same reader. Parsed copies of the
+secret are wiped, and stored subnet digests use a key derived from the signer,
+never the signing key itself.
 Changing the ledger's network or signer requires a separate ledger. Changing
 `payout` applies to new claims after a restart; recorded payments keep their
 original amounts, and all cooldowns and claim counts are preserved.
@@ -117,13 +122,30 @@ CORS only for the exact configured website origins. POST also requires that
 Origin and JSON content type. It stores keyed subnet digests, not literal IPs.
 HTTP concurrency, request duration, and request-body size are bounded: 16
 requests run at once, and one client network may hold at most four of them.
-The poll loop reads the node snapshot, its largest reply, without holding the
-claim engine. Receipt lookups and the rebroadcast of a pending payment still run
-while the engine is held, each with a five-second timeout, so a slow node can
-delay status and claim responses; a request still waiting after 15 seconds
-receives HTTP 503. The faucet's own node RPC client ignores `HTTP_PROXY`,
-`HTTPS_PROXY` and `ALL_PROXY`; it always connects directly to the configured
-loopback node.
+At most 64 connections are served at once; another is closed as soon as it is
+accepted, before anything is read. Each connection must send every request
+head within five seconds of opening or of its previous response, so a partial
+head or an idle keep-alive connection is closed unanswered.
+
+Status never waits for payments or node lookups. It answers from the state the
+latest refresh or reservation published, reading cooldowns and claims through
+its own read-only ledger connection. A refresh holds the claim engine only for
+each local accounting step, never while it waits for the node (each node call
+has a five-second timeout). A claim holds the engine from its eligibility checks
+through its reservation, including the node's preparation of the transfer, so
+the nonce, anchor and one pending payment cannot change meanwhile; the
+broadcast that follows holds nothing. All ledger work, including its
+synchronous commits, runs on blocking threads rather than the HTTP workers. A
+request still waiting after 15 seconds receives HTTP 503.
+
+A node refusing a request on admission grounds answers 429 or 503 with
+`Retry-After`; the request did not run. The faucet waits out a `Retry-After` of
+up to five seconds and resends the request once. A longer wait, a refusal
+without one, or a second refusal fails the request with the journal category
+`node_busy` rather than `node_transport`, and the next refresh then waits as
+long as the node asked, up to one minute. The faucet's own node RPC client
+ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`; it always connects
+directly to the configured loopback node.
 
 `GET /faucet/status` returns:
 
@@ -232,6 +254,12 @@ twice:
 - Inclusion searches resume across refreshes and make at most 64 block lookups
   per refresh. A completed search is not repeated while its blocks stay
   canonical: it then costs one lookup per refresh, which loads no block.
+- Claims keep using the last snapshot whose payments were accounted for until
+  a refresh finishes accounting for a new one. A claim reserved while a refresh
+  waits for its lookups makes that refresh set aside what they found: a moved
+  receipt is read again, and a search result is applied by the next refresh,
+  against the ledger as it is then. Until then new claims pause with
+  `verifying_payments`.
 
 New claims pause, with state `unavailable`, only while a condition holds, and
 resume by themselves once it clears. The journal names it with a fixed category:

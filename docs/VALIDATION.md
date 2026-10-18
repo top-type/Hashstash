@@ -109,7 +109,7 @@ A run that finds nothing shows only that the inputs it tried passed. Mutation fr
 
 ## Windows checks
 
-On Windows the library tests also read back the access list of each secret file written on NTFS with `icacls`: one protected entry granting the current account full control, nothing inherited. They also check that a symbolic link to a peer identity is refused; creating the link needs Developer Mode or administrator rights, and the check reports itself skipped without them. [`scripts/test_cold_launcher.ps1`](../scripts/test_cold_launcher.ps1) starts `Start-ColdWallet.ps1` for a fixture chain and checks the token hand-off: the token reaches the signer only through its environment, never its command line or `/api/session`, and every POST needs it. It stops only the signer it started.
+On Windows the library tests also read back the access list of each secret file written on NTFS with `icacls`: one protected entry granting the current account full control, nothing inherited. They also check that a symbolic link to a peer identity is refused; creating the link needs Developer Mode or administrator rights, and the check reports itself skipped without them. [`scripts/test_cold_launcher.ps1`](../scripts/test_cold_launcher.ps1) starts `Start-ColdWallet.ps1` for a fixture chain and checks the token hand-off: the token reaches the signer only through its environment, never its command line or `/api/session`, and every POST needs it. It stops only the signer it started. It also checks the launcher's Windows Error Reporting exclusion of the signer under a test key of the current account, which it removes, never the real `ExcludedApplications` key; `-RegistryOnly` runs just that check, without a signer build.
 
 ## Continuous integration
 

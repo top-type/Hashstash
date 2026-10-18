@@ -43,6 +43,27 @@ pub const DEFAULT_MAX_REVIEW_PAYMENTS: usize = 4096;
 /// further connections, from anything else on loopback, are closed unread.
 pub const MAX_CONNECTIONS: usize = 16;
 
+/// Keeps a loaded key out of the crash dumps the signer can refuse itself. On
+/// Unix its core file size limit becomes zero, and on Linux the process is
+/// also marked not dumpable, which keeps other programs of the same account
+/// from attaching a debugger to read its memory. On Windows the launcher
+/// excludes the signer from Windows Error Reporting instead.
+pub fn suppress_core_dumps() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use rustix::process::{Resource, Rlimit, setrlimit};
+        let none = Rlimit {
+            current: Some(0),
+            maximum: Some(0),
+        };
+        setrlimit(Resource::Core, none).map_err(|e| anyhow!("cannot disable core dumps: {e}"))?;
+    }
+    #[cfg(target_os = "linux")]
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+        .map_err(|e| anyhow!("cannot mark the signer not dumpable: {e}"))?;
+    Ok(())
+}
+
 /// Local bounds on one offline review.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReviewLimits {
@@ -720,4 +741,37 @@ async fn sign(State(app): State<App>, bytes: Bytes) -> Response {
         state.review = None;
         Ok(json!({"raw":wallet::signed_hex(&transaction),"txid":hex::encode(codec::transaction_id(&transaction))}))
     }).await
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    /// Runs in a child test process, since the change applies to a whole
+    /// process and cannot be undone.
+    #[test]
+    fn the_signer_process_cannot_dump_core() {
+        const CHILD: &str = "HASHSTASH_CORE_DUMP_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            super::suppress_core_dumps().unwrap();
+            let limit = rustix::process::getrlimit(rustix::process::Resource::Core);
+            assert_eq!((limit.current, limit.maximum), (Some(0), Some(0)));
+            assert_eq!(
+                rustix::process::dumpable_behavior().unwrap(),
+                rustix::process::DumpableBehavior::NotDumpable
+            );
+            return;
+        }
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cold::tests::the_signer_process_cannot_dump_core",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let output = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            child.status.success() && output.contains("1 passed"),
+            "{output}"
+        );
+    }
 }

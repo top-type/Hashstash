@@ -18,7 +18,7 @@ The Stratum password file must contain one printable ASCII token of at most 256 
 
 The node needs only the public mining key. Keep any private backup inaccessible to untrusted users. `--no-stratum` disables the mining listener without disabling validation or relay. Mining payout and listener/password/reporting settings are operator configuration, not wallet controls. See [mining](MINING.md) and [Linux deployment](../deploy/linux/README.md).
 
-`--wallet-key PATH` and `--watch-key ADDRESS` are mutually exclusive opt-in server-wallet modes for private operator tooling. Without them the server wallet database starts empty. Browser wallets are independent and sign locally. The separate cold signer requires no node connection to review/sign exported transactions. See [wallets](WALLETS.md).
+`--wallet-key PATH` and `--watch-key ADDRESS` are mutually exclusive opt-in server-wallet modes for private operator tooling. Without them the server wallet database starts empty. `--wallet-passphrase-file PATH` names an owner-only file whose passphrase encrypts that database's hot keys; once a start has used it, the database opens only with it (see [node wallet passphrase](WALLETS.md#node-wallet-passphrase)). Browser wallets are independent and sign locally. The separate cold signer requires no node connection to review/sign exported transactions. See [wallets](WALLETS.md).
 
 ## API boundaries
 

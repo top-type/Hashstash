@@ -722,6 +722,34 @@ fn a_damaged_wallet_store_stops_startup_before_history_replay() {
     assert!(!path.exists(), "the chain is not opened before the wallet check");
 }
 
+/// `run --wallet-passphrase-file`: a startup wallet is saved encrypted, and
+/// the store refuses a later start without the passphrase before history.
+#[test]
+fn a_locked_wallet_store_opens_only_with_its_passphrase() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("chain.sqlite");
+    let file = directory.path().join("wallet-passphrase");
+    crate::local_files::write_private(&file, b"node wallet passphrase\n").unwrap();
+    let passphrase = WalletPassphrase::read(&file).unwrap();
+    let config = configuration(16 * 1024);
+    let node = Node::open_with_wallet_passphrase(&path, config.clone(), key(), Some(&passphrase))
+        .unwrap()
+        .with_wallet(SECRET)
+        .unwrap();
+    assert!(node.wallets_locked().unwrap().hot_enabled());
+    drop(node);
+    let wallets = std::fs::read(path.with_extension("wallets.sqlite")).unwrap();
+    assert!(!wallets.windows(32).any(|window| window == SECRET));
+    let error = Node::open(&path, config.clone(), key()).err().unwrap();
+    assert!(
+        error.to_string().contains("--wallet-passphrase-file"),
+        "{error:#}"
+    );
+    let reopened =
+        Node::open_with_wallet_passphrase(&path, config, key(), Some(&passphrase)).unwrap();
+    assert!(reopened.wallets_locked().unwrap().hot_enabled());
+}
+
 #[test]
 fn rejected_transaction_memory_is_bounded_and_scoped() {
     let mut rejected = RejectedTransactions::default();

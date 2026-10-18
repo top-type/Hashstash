@@ -637,6 +637,8 @@ mod pool_tests;
 #[cfg(test)]
 mod explorer_worker_tests;
 #[cfg(test)]
+mod proposal_index_tests;
+#[cfg(test)]
 thread_local! {
     /// Pool selections run on this thread, and the signatures they checked.
     static POOL_SELECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -647,6 +649,8 @@ thread_local! {
     /// how long it held that lock in all.
     static CLEARING_UNDER_INNER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static INNER_HELD: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    /// Full proposal index builds, each a walk of every proposal, on this thread.
+    static PROPOSAL_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The node lock. Test builds meter it: a std mutex is held by one thread and
@@ -808,33 +812,98 @@ struct TipCache {
     root: std::sync::OnceLock<Hash>,
     /// The bounded governance summary; a complete large grant is never kept.
     governance: std::sync::OnceLock<Value>,
-    proposals: std::sync::OnceLock<ProposalIndex>,
+    proposals: std::sync::OnceLock<Arc<ProposalIndex>>,
+    /// An ancestor's index and the proposals registered since, when this tip
+    /// extends the previously published one; its index derives from them.
+    proposal_base: Option<ProposalBase>,
+    /// Every proposal ID in consensus key order, only for unfiltered pages,
+    /// which pay for the walk when they build it.
+    proposal_ids: std::sync::OnceLock<Vec<Hash>>,
+}
+impl TipCache {
+    /// The cache of a tip whose block extends the tip `parent` was published
+    /// for, registering `registered` proposals. Its index derives from the
+    /// parent's or, if no read built that one, from the parent's own base.
+    fn extending(parent: &TipCache, registered: Vec<Hash>) -> Self {
+        let proposal_base = match parent.proposals.get() {
+            Some(index) => Some(ProposalBase {
+                index: index.clone(),
+                registered,
+            }),
+            None => parent.proposal_base.as_ref().and_then(|base| {
+                let total = base.registered.len().checked_add(registered.len())?;
+                (total <= MAX_DERIVED_REGISTRATIONS).then(|| ProposalBase {
+                    index: base.index.clone(),
+                    registered: [&base.registered[..], &registered].concat(),
+                })
+            }),
+        };
+        Self {
+            proposal_base,
+            ..Self::default()
+        }
+    }
+}
+/// Registrations a chain of unread tips may carry before the next read
+/// builds its index in full instead of deriving it.
+const MAX_DERIVED_REGISTRATIONS: usize = 16_384;
+struct ProposalBase {
+    index: Arc<ProposalIndex>,
+    registered: Vec<Hash>,
+}
+/// Proposals a block registers, in the order its transactions run.
+fn registered_proposals(chain_id: &Hash, block: &Block) -> Vec<Hash> {
+    block
+        .transactions
+        .iter()
+        .filter_map(|tx| match &tx.body.operation {
+            Operation::Propose {
+                round,
+                description,
+                proposal,
+                ..
+            } => Some(crate::state::proposal_id(
+                chain_id,
+                *round,
+                &tx.body.sender,
+                description,
+                proposal,
+            )),
+            _ => None,
+        })
+        .collect()
 }
 /// Consensus keys proposals by ID only and never removes them. This local
-/// index is built once per tip, so a round page never walks all history.
+/// index of each round's proposals is maintained from tip to tip: a round no
+/// descendant can change is shared, so a new block re-ranks only the open
+/// round, and neither a snapshot nor a round page walks all history.
+#[derive(Debug, PartialEq, Eq)]
 struct ProposalIndex {
-    /// Every proposal ID in consensus key order, for unfiltered pages.
-    all: Vec<Hash>,
+    /// Rounds before `open_from`. Their proposals, support and winner are
+    /// final on every descendant of this tip.
+    closed: Arc<BTreeMap<u64, Arc<[Hash]>>>,
+    /// Rounds from `open_from` on (the auction round, if any).
+    open: BTreeMap<u64, Arc<[Hash]>>,
+    open_from: u64,
+    /// Proposals indexed; equal to the state's count.
+    count: usize,
+}
+impl ProposalIndex {
+    /// The first round a descendant can still change: only the auction round
+    /// accepts proposals and support, and only it can change its leader. A
+    /// decision's round already records its winner.
+    fn open_from(s: &State) -> u64 {
+        match &s.phase {
+            crate::state::Phase::Auction(a) => a.round,
+            _ if s.rounds.is_empty() => 0,
+            _ => s.last_round.saturating_add(1),
+        }
+    }
     /// Each round's IDs: its leader, decision or winner first, then by
     /// support (highest first) and ID. Cheap spam cannot hide better-backed
     /// proposals behind ground IDs that sort first.
-    rounds: std::collections::BTreeMap<u64, Vec<Hash>>,
-}
-impl ProposalIndex {
-    fn build(s: &State) -> Self {
-        let mut all = Vec::with_capacity(s.proposals.len());
-        let mut rounds = std::collections::BTreeMap::<u64, Vec<(&Amount, Hash)>>::new();
-        for (key, proposal) in s.proposals.iter() {
-            let Ok(id) = Hash::try_from(key) else {
-                continue;
-            };
-            all.push(id);
-            rounds
-                .entry(proposal.round)
-                .or_default()
-                .push((&proposal.support, id));
-        }
-        let first = |round: u64| match &s.phase {
+    fn rank(s: &State, round: u64, mut ids: Vec<(&Amount, Hash)>) -> Arc<[Hash]> {
+        let first = match &s.phase {
             crate::state::Phase::Auction(a) if a.round == round && a.leader.is_some() => a.leader,
             crate::state::Phase::Governance(d) if d.round == round => Some(d.proposal_id),
             _ => match s.rounds.get(&round.to_be_bytes()).map(|r| &r.status) {
@@ -842,23 +911,86 @@ impl ProposalIndex {
                 _ => None,
             },
         };
-        let rounds = rounds
-            .into_iter()
-            .map(|(round, mut ids)| {
-                let first = first(round);
-                ids.sort_by(|(a_support, a), (b_support, b)| {
-                    (Some(*b) == first)
-                        .cmp(&(Some(*a) == first))
-                        .then_with(|| b_support.cmp(a_support))
-                        .then_with(|| a.cmp(b))
-                });
-                (round, ids.into_iter().map(|(_, id)| id).collect())
-            })
-            .collect();
-        Self { all, rounds }
+        ids.sort_by(|(a_support, a), (b_support, b)| {
+            (Some(*b) == first)
+                .cmp(&(Some(*a) == first))
+                .then_with(|| b_support.cmp(a_support))
+                .then_with(|| a.cmp(b))
+        });
+        ids.into_iter().map(|(_, id)| id).collect()
+    }
+    fn assemble(
+        s: &State,
+        mut closed: Arc<BTreeMap<u64, Arc<[Hash]>>>,
+        rounds: BTreeMap<u64, Vec<(&Amount, Hash)>>,
+    ) -> Self {
+        let open_from = Self::open_from(s);
+        let mut open = BTreeMap::new();
+        for (round, ids) in rounds {
+            let ranked = Self::rank(s, round, ids);
+            if round < open_from {
+                Arc::make_mut(&mut closed).insert(round, ranked);
+            } else {
+                open.insert(round, ranked);
+            }
+        }
+        Self {
+            closed,
+            open,
+            open_from,
+            count: s.proposals.len(),
+        }
+    }
+    /// Walks every proposal ever recorded: once at startup or after a
+    /// reorganization, not once per tip.
+    fn build(s: &State) -> Self {
+        #[cfg(test)]
+        PROPOSAL_INDEX_BUILDS.with(|builds| builds.set(builds.get() + 1));
+        let mut rounds = BTreeMap::<u64, Vec<(&Amount, Hash)>>::new();
+        for (key, proposal) in s.proposals.iter() {
+            let Ok(id) = Hash::try_from(key) else {
+                continue;
+            };
+            rounds
+                .entry(proposal.round)
+                .or_default()
+                .push((&proposal.support, id));
+        }
+        Self::assemble(s, Arc::default(), rounds)
+    }
+    /// The index of a descendant of `base`'s tip that registered `registered`
+    /// since. Rounds closed at the base are kept; the base's open rounds and
+    /// the new proposals are ranked again. Returns None, for a full build,
+    /// if the counts disagree, which a missed registration would cause.
+    fn derive(base: &Self, registered: &[Hash], s: &State) -> Option<Self> {
+        if Self::open_from(s) < base.open_from
+            || base.count.checked_add(registered.len())? != s.proposals.len()
+        {
+            return None;
+        }
+        let mut rounds = BTreeMap::<u64, Vec<(&Amount, Hash)>>::new();
+        for id in base.open.values().flat_map(|ids| ids.iter()).chain(registered) {
+            let proposal = s.proposals.get(id)?;
+            if proposal.round < base.open_from {
+                return None;
+            }
+            rounds
+                .entry(proposal.round)
+                .or_default()
+                .push((&proposal.support, *id));
+        }
+        Some(Self::assemble(s, base.closed.clone(), rounds))
+    }
+    fn round(&self, round: u64) -> &[Hash] {
+        let rounds = if round < self.open_from {
+            &*self.closed
+        } else {
+            &self.open
+        };
+        rounds.get(&round).map_or(&[][..], |ids| &ids[..])
     }
     fn round_len(&self, round: u64) -> usize {
-        self.rounds.get(&round).map_or(0, Vec::len)
+        self.round(round).len()
     }
 }
 /// The worker owns only a weak node reference. Dropping the last node closes its
@@ -984,9 +1116,31 @@ impl ReadView {
             .get_or_init(|| self.chain.tip_state().root())
     }
     fn proposal_index(&self) -> &ProposalIndex {
-        self.cache
-            .proposals
-            .get_or_init(|| ProposalIndex::build(self.chain.tip_state()))
+        self.cache.proposals.get_or_init(|| {
+            let s = self.chain.tip_state();
+            Arc::new(
+                self.cache
+                    .proposal_base
+                    .as_ref()
+                    .and_then(|base| ProposalIndex::derive(&base.index, &base.registered, s))
+                    .unwrap_or_else(|| ProposalIndex::build(s)),
+            )
+        })
+    }
+    /// Every proposal ID in key order. The first unfiltered page of a tip
+    /// walks them all, so it pays one work unit per 64 proposals.
+    fn proposal_ids(&self, meter: Option<&Session>) -> Result<&[Hash]> {
+        if let Some(ids) = self.cache.proposal_ids.get() {
+            return Ok(ids);
+        }
+        let s = self.chain.tip_state();
+        charge(meter, s.proposals.len() / 64)?;
+        Ok(self.cache.proposal_ids.get_or_init(|| {
+            s.proposals
+                .iter()
+                .filter_map(|(key, _)| Hash::try_from(key).ok())
+                .collect()
+        }))
     }
     /// The governance projection with a large decision grant summarized, so
     /// the retained copy stays bounded however many payments the grant has.
@@ -1366,12 +1520,21 @@ impl Node {
     fn publish(&self, inner: &Inner) -> Result<()> {
         self.note_capacity(&inner.chain)?;
         let mut next = ReadView::capture(inner);
+        // One block extending the published tip derives its proposal index
+        // from that tip's; a reorganization builds it in full. The caller's
+        // node lock serializes publication, so the tip read here stays current.
+        let block = inner.chain.tip_block();
+        let registered = (block.header.previous == self.read_view()?.chain.tip_hash())
+            .then(|| registered_proposals(&inner.chain.chain_id(), block));
         let mut published = self
             .published
             .write()
             .unwrap_or_else(|_| poisoned("snapshot"));
         if published.chain.tip_hash() != next.chain.tip_hash() {
             self.last_tip_change.store(now(), Ordering::Relaxed);
+            if let Some(registered) = registered {
+                next.cache = Arc::new(TipCache::extending(&published.cache, registered));
+            }
         } else {
             // A mempool-only change keeps the tip's derived read results.
             next.cache = published.cache.clone();
@@ -2747,10 +2910,9 @@ impl Node {
                         "proposal pages changed with a new tip; restart from offset 0"
                     );
                 }
-                let index = i.proposal_index();
                 let ids = match round {
-                    Some(round) => index.rounds.get(&round).map_or(&[][..], Vec::as_slice),
-                    None => &index.all,
+                    Some(round) => i.proposal_index().round(round),
+                    None => i.proposal_ids(meter)?,
                 };
                 let ids = ids.get(offset..).unwrap_or_default();
                 proposal_page(i, &ids[..ids.len().min(limit)], false, meter)
@@ -3102,11 +3264,7 @@ impl Node {
                 // return complete records.
                 let proposals = match round {
                     Some(round) => {
-                        let ids = i
-                            .proposal_index()
-                            .rounds
-                            .get(&round)
-                            .map_or(&[][..], Vec::as_slice);
+                        let ids = i.proposal_index().round(round);
                         proposal_page(i, &ids[..ids.len().min(128)], true, meter)?
                     }
                     None => json!([]),

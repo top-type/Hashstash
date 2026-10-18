@@ -75,6 +75,26 @@ fn systemd_unit_confines_the_node() {
 }
 
 #[test]
+fn systemd_unit_backs_off_restarts_and_names_out_of_memory_kills() {
+    let unit = repository("deploy/linux/hashstash.service");
+    for directive in [
+        "Type=simple",
+        "Restart=on-failure",
+        "RestartSteps=8",
+        "RestartMaxDelaySec=15min",
+        "StartLimitIntervalSec=0",
+    ] {
+        assert!(unit.lines().any(|line| line == directive), "missing {directive}");
+    }
+    // A literal `$$` reaches the shell as `$`, which reads systemd's variable.
+    let stop = unit
+        .lines()
+        .find(|line| line.starts_with("ExecStopPost="))
+        .expect("missing ExecStopPost");
+    assert!(stop.contains(r#""$$SERVICE_RESULT" = oom-kill"#), "{stop}");
+}
+
+#[test]
 fn documented_stratum_advertisements_are_bare_endpoints() {
     let mut documents = vec![
         "README.md".to_owned(),

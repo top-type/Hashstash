@@ -1,13 +1,22 @@
-use crate::{codec, config::Config, consensus, crypto, fees, math, state::State, types::*};
+use crate::{
+    codec,
+    config::Config,
+    consensus, crypto, fees, math,
+    state::{Phase, State},
+    types::*,
+};
 use anyhow::{Context, Result, ensure};
+use bincode::Options;
 use num_traits::Zero;
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use std::{
     cell::{Cell, RefCell},
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    io::{Read, Write},
     path::Path,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -49,6 +58,21 @@ pub const MAX_BLOCK_ROW_BYTES: u64 = crate::config::MAX_GOVERNED_BLOCK_BYTES + (
 /// Blocks replayed per committed batch of the startup index rebuild. Unit tests
 /// use small batches so reopening their short chains crosses batch boundaries.
 const INDEX_REBUILD_BATCH: u64 = if cfg!(test) { 7 } else { 4096 };
+/// Active-chain heights between persisted state checkpoints. A chain shorter
+/// than this plus CHECKPOINT_DEPTH saves none and replays all history on start.
+const CHECKPOINT_INTERVAL: u64 = 1024;
+/// A checkpoint saves the state this far below the tip, within the dense
+/// retained window, so a restart validates the blocks above it again and
+/// branches forking within that depth stay cheap to reconstruct.
+const CHECKPOINT_DEPTH: u64 = DENSE_STATE_CHECKPOINTS - 1;
+/// Saved checkpoints kept; the older one serves when the newer fails its checks.
+const MAX_SAVED_CHECKPOINTS: usize = 2;
+/// A saved state is split into rows of at most this size, far below SQLite's value limit.
+const CHECKPOINT_PART_BYTES: usize = 4 << 20;
+/// Canonical-index row naming the build that derived the persisted indexes.
+/// A binary that predates saved checkpoints clears that index on every start,
+/// this row with it, so indexes it rebuilt never meet a checkpoint.
+const INDEX_BUILD_HEIGHT: i64 = -1;
 const INVALID_BLOCK_TTL: Duration = Duration::from_secs(60);
 #[derive(Debug)]
 struct PermanentBlockError(String);
@@ -116,6 +140,104 @@ thread_local! {
     /// Run on this thread when a template build starts, before any clearing.
     pub(crate) static TEMPLATE_BUILD_HOOK: RefCell<Option<Box<dyn FnMut()>>> =
         const { RefCell::new(None) };
+    /// Blocks executed by validation on this thread.
+    pub(crate) static VALIDATED_BLOCKS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Digest of the running executable. A saved checkpoint is used only by the
+/// build that wrote it: any other build, whose validation rules may differ,
+/// revalidates all stored history once instead. An unreadable image (None)
+/// disables checkpoints, which leaves every start a full replay.
+fn build_identity() -> Option<Hash> {
+    static IDENTITY: OnceLock<Option<Hash>> = OnceLock::new();
+    *IDENTITY.get_or_init(|| {
+        // On Linux this is the running image even if its path was replaced since.
+        let path = if cfg!(target_os = "linux") {
+            "/proc/self/exe".into()
+        } else {
+            std::env::current_exe().ok()?
+        };
+        let mut digest = Sha256::new();
+        std::io::copy(&mut std::fs::File::open(path).ok()?, &mut digest).ok()?;
+        Some(digest.finalize().into())
+    })
+}
+/// The consensus record options (see codec), streamed: a saved state is
+/// written and read in parts, never as one buffer.
+fn checkpoint_options() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_varint_encoding()
+        .with_little_endian()
+}
+/// Writes a saved state as consecutive part rows of one checkpoint height.
+struct PartWriter<'a> {
+    db: &'a Connection,
+    height: u64,
+    parts: u64,
+    length: u64,
+    buffer: Vec<u8>,
+}
+impl PartWriter<'_> {
+    fn flush_part(&mut self) -> rusqlite::Result<()> {
+        if !self.buffer.is_empty() {
+            self.db
+                .prepare_cached(
+                    "INSERT INTO state_checkpoint_parts(height,part,bytes) VALUES(?1,?2,?3)",
+                )?
+                .execute(params![self.height, self.parts, self.buffer])?;
+            self.parts += 1;
+            self.buffer.clear();
+        }
+        Ok(())
+    }
+}
+impl Write for PartWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let taken = bytes.len().min(CHECKPOINT_PART_BYTES - self.buffer.len());
+        self.buffer.extend_from_slice(&bytes[..taken]);
+        self.length += taken as u64;
+        if self.buffer.len() == CHECKPOINT_PART_BYTES {
+            self.flush_part().map_err(std::io::Error::other)?;
+        }
+        Ok(taken)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+/// Reads the part rows of one checkpoint height back as one stream.
+struct PartReader<'a> {
+    db: &'a Connection,
+    height: u64,
+    part: u64,
+    buffer: Vec<u8>,
+    offset: usize,
+}
+impl Read for PartReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        while self.offset == self.buffer.len() {
+            let next: Option<Vec<u8>> = self
+                .db
+                .prepare_cached(
+                    "SELECT bytes FROM state_checkpoint_parts WHERE height=?1 AND part=?2",
+                )
+                .and_then(|mut statement| {
+                    statement
+                        .query_row(params![self.height, self.part], |r| r.get(0))
+                        .optional()
+                })
+                .map_err(std::io::Error::other)?;
+            let Some(next) = next else {
+                return Ok(0);
+            };
+            (self.buffer, self.offset) = (next, 0);
+            self.part += 1;
+        }
+        let count = out.len().min(self.buffer.len() - self.offset);
+        out[..count].copy_from_slice(&self.buffer[self.offset..self.offset + count]);
+        self.offset += count;
+        Ok(count)
+    }
 }
 
 /// Local transaction-selection policy; these are not consensus block limits.
@@ -353,6 +475,22 @@ pub struct Chain {
     // Remaining side-branch admissions and the active height that last refilled them.
     side_budget: u64,
     side_budget_height: u64,
+    // The saved checkpoint this process started from, while it stays on the
+    // active chain. Below it only genesis is retained, so it stays retained too.
+    restored: Option<(u64, Hash)>,
+    // Active-chain heights between saved checkpoints (CHECKPOINT_INTERVAL).
+    checkpoint_every: u64,
+    // Startup finished; only an opened chain saves a checkpoint when dropped.
+    opened: bool,
+}
+impl Drop for Chain {
+    /// A clean stop saves a checkpoint near the tip, so the next start
+    /// replays only the blocks above it.
+    fn drop(&mut self) {
+        if self.opened && !std::thread::panicking() {
+            self.save_checkpoint(1);
+        }
+    }
 }
 impl Chain {
     pub fn open(path: &Path, config: Config) -> Result<Self> {
@@ -376,9 +514,10 @@ impl Chain {
         // The journal limit returns WAL space after checkpoints of the batched
         // startup index rebuild instead of keeping the log at its peak size.
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_size_limit=67108864; CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value BLOB NOT NULL); CREATE TABLE IF NOT EXISTS blocks(seq INTEGER PRIMARY KEY AUTOINCREMENT, hash BLOB NOT NULL UNIQUE, bytes BLOB NOT NULL, accepted_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS rejected_blocks(hash BLOB PRIMARY KEY, bytes BLOB NOT NULL, accepted_at INTEGER NOT NULL, reason TEXT NOT NULL);")?;
-        // Derived indexes are rebuilt from independently validated block bodies on every open.
+        // Derived indexes are rebuilt from independently validated block bodies,
+        // except below a saved state checkpoint that passes its checks.
         // SQLite bounds its page cache; canonical and losing-branch metadata stay on disk.
-        db.execute_batch("PRAGMA cache_size=-8192; PRAGMA temp_store=FILE; CREATE TABLE IF NOT EXISTS entry_index(hash BLOB PRIMARY KEY, bytes BLOB NOT NULL); CREATE TABLE IF NOT EXISTS canonical_index(height INTEGER PRIMARY KEY, hash BLOB NOT NULL); CREATE TEMP TABLE IF NOT EXISTS state_replay_path(target BLOB NOT NULL, position INTEGER NOT NULL, hash BLOB NOT NULL, PRIMARY KEY(target,position));")?;
+        db.execute_batch("PRAGMA cache_size=-8192; PRAGMA temp_store=FILE; CREATE TABLE IF NOT EXISTS entry_index(hash BLOB PRIMARY KEY, bytes BLOB NOT NULL); CREATE TABLE IF NOT EXISTS canonical_index(height INTEGER PRIMARY KEY, hash BLOB NOT NULL); CREATE TABLE IF NOT EXISTS state_checkpoints(height INTEGER PRIMARY KEY, hash BLOB NOT NULL, build BLOB NOT NULL, length INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS state_checkpoint_parts(height INTEGER NOT NULL, part INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(height,part)); CREATE TEMP TABLE IF NOT EXISTS state_replay_path(target BLOB NOT NULL, position INTEGER NOT NULL, hash BLOB NOT NULL, PRIMARY KEY(target,position));")?;
         let saved: Option<Vec<u8>> = db
             .query_row("SELECT value FROM metadata WHERE key='config'", [], |r| {
                 r.get(0)
@@ -396,6 +535,37 @@ impl Chain {
                 [&encoded],
             )?;
         }
+        let mut chain = Self::at_genesis(config, db)?;
+        chain.db.execute_batch("BEGIN IMMEDIATE;")?;
+        // A saved checkpoint spares replaying the history below it. Any doubt
+        // about it, or about the indexes it relies on, means a full replay.
+        let restored = chain.restore().unwrap_or_else(|error| {
+            eprintln!(
+                "Not using the saved state checkpoint: {error:#}; replaying all stored history"
+            );
+            false
+        });
+        if !restored {
+            // A failed restore may have committed index batches; they are rebuilt below.
+            let _ = chain.db.execute_batch("ROLLBACK;");
+            let db = std::mem::replace(&mut chain.db, Connection::open_in_memory()?);
+            chain = Self::at_genesis(chain.config.clone(), db)?;
+            chain.replay_all()?;
+        }
+        let pruned = chain.prune_stale_branches()?;
+        if pruned > 0 {
+            eprintln!("Pruned {pruned} stored losing-branch block(s) that fell out of competition");
+        }
+        chain.side_budget_height = chain.tip_height();
+        chain.db.execute_batch("COMMIT")?;
+        // Housekeeping only: a failed WAL checkpoint leaves committed history intact.
+        let _ = chain.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        chain.opened = true;
+        chain.save_checkpoint(chain.checkpoint_every);
+        Ok(chain)
+    }
+    /// A chain holding only genesis in memory; its database rows are untouched.
+    fn at_genesis(config: Config, db: Connection) -> Result<Self> {
         let state = State::genesis(&config);
         state.validate(&config)?;
         let genesis = codec::genesis_block(&config)?;
@@ -410,20 +580,8 @@ impl Chain {
             skip: ZERO_HASH,
             capacity: state.settings.block_bytes,
         });
-        db.execute_batch("BEGIN IMMEDIATE; DELETE FROM entry_index; DELETE FROM canonical_index;")?;
-        db.execute(
-            "INSERT INTO entry_index(hash,bytes) VALUES(?1,?2)",
-            params![
-                genesis_hash.as_slice(),
-                codec::encode(genesis_entry.as_ref())
-            ],
-        )?;
-        db.execute(
-            "INSERT INTO canonical_index(height,hash) VALUES(0,?1)",
-            [genesis_hash.as_slice()],
-        )?;
         let state = Arc::new(state);
-        let mut chain = Self {
+        let chain = Self {
             config,
             db,
             entries: RefCell::new(EntryCache::default()),
@@ -443,68 +601,53 @@ impl Chain {
             held: HeldHeaders::default(),
             side_budget: SIDE_BRANCH_BURST,
             side_budget_height: 0,
+            restored: None,
+            checkpoint_every: CHECKPOINT_INTERVAL,
+            opened: false,
         };
         chain.cache_entry(genesis_hash, genesis_entry);
-        // Stored blocks that fail current validation are set aside when they
-        // belong to losing branches. Storage and index errors still stop startup.
-        let mut rejected = BTreeMap::<Hash, (Option<Amount>, String)>::new();
-        let claimed_work = |parent: Option<&Amount>, block: &Block| {
-            let target = math::target_from_bits(block.header.bits).ok()?;
-            Some(parent? + math::work(&target))
-        };
-        // Replay one bounded record at a time instead of buffering the entire database.
-        let mut sequence = 0i64;
-        let mut replayed = 0u64;
-        loop {
-            let row: Option<(i64, Vec<u8>, Vec<u8>, u64)> = chain.db.query_row(
-                "SELECT seq,hash,bytes,accepted_at FROM blocks WHERE seq>?1 ORDER BY seq LIMIT 1",
-                [sequence], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            ).optional()?;
-            let Some((seq, raw_hash, bytes, accepted_at)) = row else {
-                break;
-            };
-            sequence = seq;
-            let block: Block = codec::decode_block(&bytes, bytes.len())?;
-            let hash = codec::block_hash(&block);
-            ensure!(raw_hash == hash, "stored block hash mismatch");
-            if let Some((parent, _)) = rejected.get(&block.header.previous) {
-                let claimed = claimed_work(parent.as_ref(), &block);
-                rejected.insert(hash, (claimed, "parent block fails validation".into()));
-                continue;
-            }
-            let (entry, state) = match chain.validate_block(&block, accepted_at, false) {
-                Ok(valid) => valid,
-                Err(error) if error.is::<PermanentBlockError>() => {
-                    let parent = chain.load_entry(&block.header.previous)?;
-                    let claimed = claimed_work(parent.as_ref().map(|entry| &entry.work), &block);
-                    rejected.insert(hash, (claimed, error.to_string()));
-                    continue;
-                }
-                Err(error) => return Err(error.context("invalid stored history")),
-            };
-            let best = entry.work > chain.tip_entry.work;
-            chain.db.execute(
-                "INSERT INTO entry_index(hash,bytes) VALUES(?1,?2)",
-                params![hash.as_slice(), codec::encode(&entry)],
-            )?;
-            if best {
-                Self::write_canonical(&chain.db, hash, entry.height)?;
-            }
-            chain.record(hash, block, Arc::new(entry), state, best);
-            replayed += 1;
-            // Derived indexes are rebuilt from scratch on every open, so an
-            // interrupted rebuild loses nothing; committing in batches keeps the
-            // write-ahead log, and the free space it needs, bounded.
-            if replayed % INDEX_REBUILD_BATCH == 0 {
-                chain.db.execute_batch("COMMIT; BEGIN IMMEDIATE;")?;
-            }
-        }
-        let saved_tip: Option<Vec<u8>> = chain
+        Ok(chain)
+    }
+    /// Write the genesis index rows, which every derived index starts from,
+    /// and mark the indexes as derived by this build.
+    fn index_genesis(&self) -> Result<()> {
+        let genesis = codec::block_hash(&self.genesis);
+        self.db.execute(
+            "INSERT OR REPLACE INTO entry_index(hash,bytes) VALUES(?1,?2)",
+            params![genesis.as_slice(), codec::encode(self.tip_entry.as_ref())],
+        )?;
+        self.db.execute(
+            "INSERT OR REPLACE INTO canonical_index(height,hash) VALUES(0,?1)",
+            [genesis.as_slice()],
+        )?;
+        let build = build_identity().unwrap_or(ZERO_HASH);
+        self.db.execute(
+            "INSERT OR REPLACE INTO canonical_index(height,hash) VALUES(?1,?2)",
+            params![INDEX_BUILD_HEIGHT, build.as_slice()],
+        )?;
+        Ok(())
+    }
+    fn persisted_tip(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self
             .db
             .query_row("SELECT value FROM metadata WHERE key='tip'", [], |r| {
                 r.get(0)
             })
-            .optional()?;
+            .optional()?)
+    }
+    /// Rebuild every derived index from all stored block bodies, inside the
+    /// open transaction. Saved checkpoints are dropped first, in the same
+    /// transaction: none outlives the entries it was saved with, so another
+    /// build's checkpoint never meets entries this build derived.
+    fn replay_all(&mut self) -> Result<()> {
+        let genesis_hash = codec::block_hash(&self.genesis);
+        self.db.execute_batch("BEGIN IMMEDIATE; DELETE FROM entry_index; DELETE FROM canonical_index; DELETE FROM state_checkpoint_parts; DELETE FROM state_checkpoints;")?;
+        self.index_genesis()?;
+        // Stored blocks that fail current validation are set aside when they
+        // belong to losing branches. Storage and index errors still stop startup.
+        let mut rejected = BTreeMap::<Hash, (Option<Amount>, String)>::new();
+        self.replay_stored(Some(&mut rejected))?;
+        let saved_tip = self.persisted_tip()?;
         let persisted = saved_tip
             .as_deref()
             .and_then(|raw| Hash::try_from(raw).ok());
@@ -513,7 +656,7 @@ impl Chain {
         // persisted tip. Anything else means the persisted tip itself, or the
         // database, disagrees with current validation: fail closed.
         let persisted_work = match persisted {
-            Some(hash) => chain.load_entry(&hash)?.map(|entry| entry.work.clone()),
+            Some(hash) => self.load_entry(&hash)?.map(|entry| entry.work.clone()),
             None => None,
         };
         for (hash, (claimed, reason)) in &rejected {
@@ -528,39 +671,21 @@ impl Chain {
                 );
             }
         }
-        let hinted = match persisted {
-            Some(hash) if hash != chain.tip => chain
-                .load_entry(&hash)?
-                .filter(|entry| entry.work == chain.tip_entry.work)
-                .map(|entry| (hash, entry)),
-            _ => None,
-        };
-        if let Some((hash, entry)) = hinted {
-            // An equal-work hint only breaks the first-seen tie between
-            // already revalidated branches.
-            let block = chain
-                .load_block(&hash)?
-                .context("persisted tip block absent")?;
-            let state = chain.load_state(&hash)?;
-            Self::write_canonical(&chain.db, hash, entry.height)?;
-            let previous = (chain.tip, chain.tip_entry.clone());
-            chain.select_tip(hash, block, state, entry.clone());
-            chain.note_branch(hash, &entry, true, previous);
-            chain.refresh_capacity();
-        } else if persisted != Some(chain.tip) && (saved_tip.is_some() || chain.tip != genesis_hash)
+        if !self.follow_tip_hint(persisted)?
+            && persisted != Some(self.tip)
+            && (saved_tip.is_some() || self.tip != genesis_hash)
         {
             // A missing, malformed or lower-work hint cannot override validated
             // history; record the replayed best tip instead.
             eprintln!("Ignoring a stale persisted chain tip; using the replayed best tip");
-            chain.db.execute("INSERT INTO metadata(key,value) VALUES('tip',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [chain.tip.as_slice()])?;
+            self.db.execute("INSERT INTO metadata(key,value) VALUES('tip',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [self.tip.as_slice()])?;
         }
         for (hash, (_, reason)) in &rejected {
-            chain.db.execute(
+            self.db.execute(
                 "INSERT OR IGNORE INTO rejected_blocks(hash,bytes,accepted_at,reason) SELECT hash,bytes,accepted_at,?2 FROM blocks WHERE hash=?1",
                 params![hash.as_slice(), reason],
             )?;
-            chain
-                .db
+            self.db
                 .execute("DELETE FROM blocks WHERE hash=?1", [hash.as_slice()])?;
         }
         if !rejected.is_empty() {
@@ -569,15 +694,460 @@ impl Chain {
                 rejected.len()
             );
         }
-        let pruned = chain.prune_stale_branches()?;
-        if pruned > 0 {
-            eprintln!("Pruned {pruned} stored losing-branch block(s) that fell out of competition");
+        Ok(())
+    }
+    /// An equal-work persisted tip only breaks the first-seen tie between
+    /// already revalidated branches. True when it became the tip.
+    fn follow_tip_hint(&mut self, persisted: Option<Hash>) -> Result<bool> {
+        let hinted = match persisted {
+            Some(hash) if hash != self.tip => self
+                .load_entry(&hash)?
+                .filter(|entry| entry.work == self.tip_entry.work)
+                .map(|entry| (hash, entry)),
+            _ => None,
+        };
+        let Some((hash, entry)) = hinted else {
+            return Ok(false);
+        };
+        let block = self
+            .load_block(&hash)?
+            .context("persisted tip block absent")?;
+        let state = self.load_state(&hash)?;
+        Self::write_canonical(&self.db, hash, entry.height)?;
+        let previous = (self.tip, self.tip_entry.clone());
+        self.select_tip(hash, block, state, entry.clone());
+        self.note_branch(hash, &entry, true, previous);
+        self.refresh_capacity();
+        Ok(true)
+    }
+    /// Validate, in storage order, every stored block without an index entry,
+    /// adding its entry and canonical heights. With `rejected`, a block that
+    /// fails validation and its descendants are set aside there; without it,
+    /// the failure is returned.
+    fn replay_stored(
+        &mut self,
+        mut rejected: Option<&mut BTreeMap<Hash, (Option<Amount>, String)>>,
+    ) -> Result<()> {
+        let claimed_work = |parent: Option<&Amount>, block: &Block| {
+            let target = math::target_from_bits(block.header.bits).ok()?;
+            Some(parent? + math::work(&target))
+        };
+        // Replay one bounded record at a time instead of buffering the entire database.
+        let mut sequence = 0i64;
+        let mut replayed = 0u64;
+        loop {
+            let row: Option<(i64, Vec<u8>, Vec<u8>, u64)> = self.db.query_row(
+                "SELECT seq,hash,bytes,accepted_at FROM blocks WHERE seq>?1 AND NOT EXISTS(SELECT 1 FROM entry_index e WHERE e.hash=blocks.hash) ORDER BY seq LIMIT 1",
+                [sequence], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            ).optional()?;
+            let Some((seq, raw_hash, bytes, accepted_at)) = row else {
+                break;
+            };
+            sequence = seq;
+            let block: Block = codec::decode_block(&bytes, bytes.len())?;
+            let hash = codec::block_hash(&block);
+            ensure!(raw_hash == hash, "stored block hash mismatch");
+            if let Some(rejected) = rejected.as_deref_mut()
+                && let Some((parent, _)) = rejected.get(&block.header.previous)
+            {
+                let claimed = claimed_work(parent.as_ref(), &block);
+                rejected.insert(hash, (claimed, "parent block fails validation".into()));
+                continue;
+            }
+            let (entry, state) = match self.validate_block(&block, accepted_at, false) {
+                Ok(valid) => valid,
+                Err(error) if error.is::<PermanentBlockError>() && rejected.is_some() => {
+                    let parent = self.load_entry(&block.header.previous)?;
+                    let claimed = claimed_work(parent.as_ref().map(|entry| &entry.work), &block);
+                    if let Some(rejected) = rejected.as_deref_mut() {
+                        rejected.insert(hash, (claimed, error.to_string()));
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error.context("invalid stored history")),
+            };
+            let best = entry.work > self.tip_entry.work;
+            self.db.execute(
+                "INSERT INTO entry_index(hash,bytes) VALUES(?1,?2)",
+                params![hash.as_slice(), codec::encode(&entry)],
+            )?;
+            if best {
+                Self::write_canonical(&self.db, hash, entry.height)?;
+            }
+            self.record(hash, block, Arc::new(entry), state, best);
+            replayed += 1;
+            // Derived indexes are rebuilt from scratch whenever they are in
+            // doubt, so an interrupted rebuild loses nothing; committing in
+            // batches keeps the write-ahead log, and the free space it needs,
+            // bounded.
+            if replayed % INDEX_REBUILD_BATCH == 0 {
+                self.db.execute_batch("COMMIT; BEGIN IMMEDIATE;")?;
+            }
         }
-        chain.side_budget_height = chain.tip_height();
-        chain.db.execute_batch("COMMIT")?;
-        // Housekeeping only: a failed checkpoint leaves committed history intact.
-        let _ = chain.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-        Ok(chain)
+        Ok(())
+    }
+    /// Start from the newest saved checkpoint that passes its checks, see
+    /// [Chain::resume]. False when none qualifies. An error leaves only
+    /// derived rows changed, which a full replay rebuilds.
+    fn restore(&mut self) -> Result<bool> {
+        let Some(build) = build_identity() else {
+            return Ok(false);
+        };
+        let saved: Vec<(u64, Vec<u8>, Vec<u8>, u64)> = self
+            .db
+            .prepare("SELECT height,hash,build,length FROM state_checkpoints ORDER BY height DESC")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        if saved.is_empty() {
+            return Ok(false);
+        }
+        let indexed_by: Option<Vec<u8>> = self
+            .db
+            .query_row(
+                "SELECT hash FROM canonical_index WHERE height=?1",
+                [INDEX_BUILD_HEIGHT],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if indexed_by.as_deref() != Some(build.as_slice()) {
+            eprintln!("Ignoring state checkpoints: another binary rebuilt the chain indexes since");
+            return Ok(false);
+        }
+        let mut foreign = false;
+        for (height, hash, saved_build, length) in saved {
+            // Only this build's checkpoint on the saved active chain qualifies.
+            let Ok(hash) = Hash::try_from(hash.as_slice()) else {
+                continue;
+            };
+            if saved_build != build {
+                if !foreign {
+                    eprintln!("Ignoring state checkpoints saved by another build");
+                }
+                foreign = true;
+                continue;
+            }
+            if height == 0 || self.canonical_hash(height)? != Some(hash) {
+                continue;
+            }
+            match self.load_checkpoint(height, &hash, length) {
+                Ok(state) => {
+                    self.resume(height, hash, state)?;
+                    eprintln!(
+                        "Started from the state checkpoint at height {height}; revalidated the stored blocks above it"
+                    );
+                    return Ok(true);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Discarding the saved state checkpoint at height {height}: {error:#}"
+                    );
+                    Self::delete_saved_state(&self.db, height)?;
+                }
+            }
+        }
+        Ok(false)
+    }
+    /// Decode a saved state and check it against the block it belongs to: its
+    /// root must equal the committed state root, and since that root omits a
+    /// decision's copy of its winning action, the full state audit must pass.
+    fn load_checkpoint(&self, height: u64, hash: &Hash, length: u64) -> Result<Arc<State>> {
+        let mut parts = PartReader {
+            db: &self.db,
+            height,
+            part: 0,
+            buffer: Vec::new(),
+            offset: 0,
+        };
+        let mut state: State = checkpoint_options()
+            .with_limit(length)
+            .deserialize_from(&mut parts)?;
+        ensure!(parts.read(&mut [0])? == 0, "saved state has trailing bytes");
+        let block = self.load_block(hash)?.context("checkpoint block absent")?;
+        ensure!(
+            codec::block_hash(&block) == *hash
+                && block.height == height
+                && state.height == height
+                && codec::merkle_root(&block)? == block.header.merkle_root,
+            "saved state does not belong to its block"
+        );
+        ensure!(
+            state.root() == block.state_root,
+            "saved state differs from its block's state commitment"
+        );
+        state.audit(&self.config)?;
+        // Share the decision's action with its committed entry, as execution does.
+        if let Phase::Governance(decision) = &mut state.phase
+            && let Some(action) = state.actions.get_shared(&decision.proposal_id)
+        {
+            decision.proposal = action.clone();
+        }
+        Ok(Arc::new(state))
+    }
+    /// Make a checked saved state the tip and rebuild only what lies above it.
+    /// Its active-chain ancestors and the stored losing branches forking below
+    /// it keep their persisted index entries, each checked against its
+    /// parent's (see [Chain::check_entry]); none of them is executed. Its
+    /// stored descendants are validated again in storage order, and the saved
+    /// tip must come out on top, so the result is the one a full replay gives.
+    fn resume(&mut self, height: u64, hash: Hash, state: Arc<State>) -> Result<()> {
+        self.index_genesis()?;
+        let mut ancestry = (codec::block_hash(&self.genesis), self.tip_entry.clone());
+        let mut descendants = BTreeSet::from([hash]);
+        let mut losing = Vec::new();
+        let mut indexed = 1u64;
+        {
+            // Parents precede children in storage order, so the ancestry
+            // arrives one height at a time and descendants after their parents.
+            let mut statement = self.db.prepare(
+                "SELECT b.hash,e.bytes FROM blocks b LEFT JOIN entry_index e ON e.hash=b.hash ORDER BY b.seq",
+            )?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let raw: Vec<u8> = row.get(0)?;
+                let block_hash = Hash::try_from(raw.as_slice()).context("malformed block hash")?;
+                let entry = row
+                    .get::<_, Option<Vec<u8>>>(1)?
+                    .map(|bytes| codec::decode::<Entry>(&bytes, 4096))
+                    .transpose()?;
+                indexed += u64::from(entry.is_some());
+                if let Some(entry) = &entry
+                    && entry.height <= height
+                    && self.canonical_hash(entry.height)? == Some(block_hash)
+                {
+                    ensure!(
+                        entry.height == ancestry.1.height + 1
+                            && entry.header.previous == ancestry.0,
+                        "saved active chain is not linked"
+                    );
+                    let skip = self
+                        .canonical_hash(skip_height(entry.height))?
+                        .context("saved skip target absent")?;
+                    self.check_entry(&block_hash, entry, &ancestry.1, skip)?;
+                    ancestry = (block_hash, Arc::new(entry.clone()));
+                    continue;
+                }
+                // A descendant without an entry is one an interrupted start
+                // had not rebuilt yet; it is validated below either way.
+                let previous = match &entry {
+                    Some(entry) => entry.header.previous,
+                    None => {
+                        self.load_block(&block_hash)?
+                            .context("stored block absent")?
+                            .header
+                            .previous
+                    }
+                };
+                if descendants.contains(&previous) {
+                    descendants.insert(block_hash);
+                } else {
+                    ensure!(entry.is_some(), "stored losing block has no index entry");
+                    losing.push(block_hash);
+                }
+            }
+        }
+        ensure!(
+            ancestry.0 == hash && ancestry.1.height == height,
+            "checkpoint is not on the saved active chain"
+        );
+        let entry = ancestry.1;
+        ensure!(
+            entry.clock == state.clock && entry.capacity >= state.settings.block_bytes,
+            "saved state disagrees with its block's index entry"
+        );
+        let total: u64 = self
+            .db
+            .query_row("SELECT COUNT(*) FROM entry_index", [], |r| r.get(0))?;
+        ensure!(total == indexed, "index entries without stored blocks");
+        let saved_tip = self
+            .persisted_tip()?
+            .and_then(|raw| Hash::try_from(raw.as_slice()).ok())
+            .context("saved tip absent")?;
+        ensure!(
+            descendants.contains(&saved_tip),
+            "saved tip does not descend from the checkpoint"
+        );
+        descendants.remove(&hash);
+        for descendant in &descendants {
+            self.db
+                .prepare_cached("DELETE FROM entry_index WHERE hash=?1")?
+                .execute([descendant.as_slice()])?;
+        }
+        self.db
+            .execute("DELETE FROM canonical_index WHERE height>?1", [height])?;
+        self.tip_block = self
+            .load_block(&hash)?
+            .context("checkpoint block absent")?;
+        self.tip = hash;
+        self.tip_entry = entry;
+        self.tip_state = state;
+        self.restored = Some((height, hash));
+        // Losing blocks follow their parents too: each is checked against an
+        // ancestor or a losing block already checked.
+        let mut checked = BTreeSet::new();
+        let mut heaviest = Amount::zero();
+        for hash in losing {
+            let entry = Self::read_entry(&self.db, &hash)?.context("losing entry absent")?;
+            let previous = entry.header.previous;
+            let parent = self
+                .load_entry(&previous)?
+                .context("losing block parent absent")?;
+            ensure!(
+                checked.contains(&previous)
+                    || self.canonical_hash(parent.height)? == Some(previous),
+                "losing block parent is not checked"
+            );
+            let mut cursor = Some((previous, parent.clone()));
+            let skip = self.branch_ancestor(&mut cursor, skip_height(entry.height))?;
+            self.check_entry(&hash, &entry, &parent, skip)?;
+            heaviest = heaviest.max(entry.work.clone());
+            checked.insert(hash);
+            let tip = (self.tip, self.tip_entry.clone());
+            self.note_branch(hash, &entry, false, tip);
+        }
+        self.replay_stored(None)?;
+        self.follow_tip_hint(Some(saved_tip))?;
+        ensure!(
+            self.tip == saved_tip && heaviest <= self.tip_entry.work,
+            "blocks above the checkpoint do not lead to the saved tip"
+        );
+        self.refresh_capacity();
+        Ok(())
+    }
+    /// A persisted index entry agrees with its checked parent's: its header
+    /// hashes to the block, its height, target, work and schedule anchors
+    /// follow from the parent, its clock advances and its capacity never
+    /// falls. `skip` is the checked ancestor at its skip height.
+    fn check_entry(&self, hash: &Hash, entry: &Entry, parent: &Entry, skip: Hash) -> Result<()> {
+        let target = self.target(parent)?;
+        let interval = entry
+            .clock
+            .checked_sub(parent.clock)
+            .filter(|interval| *interval > 0)
+            .context("index entry clock does not advance")?;
+        let anchors = match parent.height {
+            0 => (entry.header.timestamp, entry.clock),
+            1 => (
+                parent.anchor_timestamp.max(u32::try_from(
+                    u64::from(entry.header.timestamp).saturating_sub(interval),
+                )?),
+                parent.anchor_clock,
+            ),
+            _ => (parent.anchor_timestamp, parent.anchor_clock),
+        };
+        ensure!(
+            crypto::sha256d(&codec::header_bytes(&entry.header)) == *hash
+                && entry.height == parent.height + 1
+                && entry.header.bits == math::bits_from_target(&target)
+                && entry.work == &parent.work + math::work(&target)
+                && (entry.anchor_timestamp, entry.anchor_clock) == anchors
+                && entry.capacity >= parent.capacity
+                && entry.skip == skip,
+            "index entry disagrees with its parent's"
+        );
+        Ok(())
+    }
+    /// Saved checkpoints on the active chain, newest first.
+    fn saved_checkpoints(&self) -> Result<Vec<(u64, Hash)>> {
+        let rows: Vec<(u64, Vec<u8>)> = self
+            .db
+            .prepare_cached("SELECT height,hash FROM state_checkpoints ORDER BY height DESC")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut saved = Vec::new();
+        for (height, hash) in rows {
+            if let Ok(hash) = Hash::try_from(hash.as_slice())
+                && self.canonical_hash(height)? == Some(hash)
+            {
+                saved.push((height, hash));
+            }
+        }
+        Ok(saved)
+    }
+    /// Save the active-chain state CHECKPOINT_DEPTH below the tip once it is
+    /// at least `gap` heights above the newest checkpoint saved on the active
+    /// chain, and at least one checkpoint interval above genesis. Saving is an
+    /// optimisation only: a failure is logged and costs the next start replay.
+    fn save_checkpoint(&mut self, gap: u64) {
+        if let Err(error) = self.try_save_checkpoint(gap) {
+            eprintln!("Could not save a state checkpoint: {error:#}");
+        }
+    }
+    fn try_save_checkpoint(&mut self, gap: u64) -> Result<()> {
+        let Some(build) = build_identity() else {
+            return Ok(());
+        };
+        let Some(height) = self
+            .tip_height()
+            .checked_sub(CHECKPOINT_DEPTH)
+            .filter(|height| *height >= self.checkpoint_every.max(1))
+        else {
+            return Ok(());
+        };
+        let saved = self.saved_checkpoints()?;
+        if saved
+            .first()
+            .is_some_and(|(newest, _)| newest.saturating_add(gap) > height)
+        {
+            return Ok(());
+        }
+        let Some(hash) = self.canonical_hash(height)? else {
+            return Ok(());
+        };
+        // The dense window retains it unless a reorganization just evicted it.
+        let Some(state) = self.checkpoint_state(height, &hash) else {
+            return Ok(());
+        };
+        let transaction = self.db.transaction()?;
+        Self::write_saved_state(&transaction, height, &hash, &build, &state)?;
+        // Keep the newest saved on the active chain; drop everything else.
+        let keep: BTreeSet<u64> = std::iter::once(height)
+            .chain(saved.iter().map(|(height, _)| *height))
+            .take(MAX_SAVED_CHECKPOINTS)
+            .collect();
+        let all: Vec<u64> = transaction
+            .prepare("SELECT height FROM state_checkpoints")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for old in all.into_iter().filter(|height| !keep.contains(height)) {
+            Self::delete_saved_state(&transaction, old)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+    /// Store `state` as the saved checkpoint of the block `hash` at `height`.
+    fn write_saved_state(
+        db: &Connection,
+        height: u64,
+        hash: &Hash,
+        build: &Hash,
+        state: &State,
+    ) -> Result<()> {
+        db.execute(
+            "DELETE FROM state_checkpoint_parts WHERE height=?1",
+            [height],
+        )?;
+        let mut parts = PartWriter {
+            db,
+            height,
+            parts: 0,
+            length: 0,
+            buffer: Vec::with_capacity(CHECKPOINT_PART_BYTES),
+        };
+        checkpoint_options().serialize_into(&mut parts, state)?;
+        parts.flush_part()?;
+        db.execute(
+            "INSERT OR REPLACE INTO state_checkpoints(height,hash,build,length) VALUES(?1,?2,?3,?4)",
+            params![height, hash.as_slice(), build.as_slice(), parts.length],
+        )?;
+        Ok(())
+    }
+    fn delete_saved_state(db: &Connection, height: u64) -> Result<()> {
+        db.execute(
+            "DELETE FROM state_checkpoint_parts WHERE height=?1",
+            [height],
+        )?;
+        db.execute("DELETE FROM state_checkpoints WHERE height=?1", [height])?;
+        Ok(())
     }
     pub fn chain_id(&self) -> Hash {
         self.config.chain_id()
@@ -1186,6 +1756,14 @@ impl Chain {
             for height in stale {
                 self.checkpoints.get_mut().remove(&height);
             }
+            // A reorganization below the restored state rebuilt its fork point
+            // from genesis, retaining checkpoints on the way like any replay,
+            // so branches off the new active chain are cheap to rebuild again.
+            if let Some((height, hash)) = self.restored
+                && self.canonical_hash(height).ok().flatten() != Some(hash)
+            {
+                self.restored = None;
+            }
             // Recently validated states of the new active chain become
             // checkpoints, at the dense heights and at every deeper retained one.
             let dense = height.saturating_sub(DENSE_STATE_CHECKPOINTS)..height;
@@ -1200,9 +1778,10 @@ impl Chain {
                 }
             }
         }
-        self.checkpoints
-            .get_mut()
-            .retain(|retained, _| checkpoint_retained(*retained, height));
+        let restored = self.restored.map(|(height, _)| height);
+        self.checkpoints.get_mut().retain(|retained, _| {
+            checkpoint_retained(*retained, height) || Some(*retained) == restored
+        });
     }
     /// Track stored losing-branch leaves that could still raise peer capacity.
     fn note_branch(&mut self, hash: Hash, entry: &Entry, best: bool, previous: (Hash, Arc<Entry>)) {
@@ -1306,7 +1885,7 @@ impl Chain {
     }
     /// Local anti-DoS admission for a block that would not become the tip. Its
     /// claimed work is backed by the proof of work checked before this runs.
-    fn admit_branch(&self, parent: &Entry, work: &Amount) -> Result<()> {
+    fn admit_branch(&self, previous: &Hash, parent: &Arc<Entry>, work: &Amount) -> Result<()> {
         let branch = &parent.work + work;
         if branch > self.tip_entry.work {
             return Ok(());
@@ -1316,7 +1895,29 @@ impl Chain {
         if self.side_budget == 0 {
             return Err(SideBranchRefused("side-branch admission budget is spent").into());
         }
+        if self.forks_below_restored(previous, parent)? {
+            return Err(
+                SideBranchRefused("branch forks below the state restored at startup").into(),
+            );
+        }
         Ok(())
+    }
+    /// After a start from a saved checkpoint, only genesis is retained below
+    /// it: rebuilding a parent state on a branch that forks there would replay
+    /// from genesis rather than about its depth. Such a losing branch is held
+    /// as headers until it claims more work than the tip, like any declined one.
+    fn forks_below_restored(&self, previous: &Hash, parent: &Arc<Entry>) -> Result<bool> {
+        let Some((height, hash)) = self.restored else {
+            return Ok(false);
+        };
+        if self.cached_state(previous).is_some() {
+            return Ok(false);
+        }
+        if parent.height < height {
+            return Ok(true);
+        }
+        let mut cursor = Some((*previous, parent.clone()));
+        Ok(self.branch_ancestor(&mut cursor, height)? != hash)
     }
     /// Whether a losing branch ending in a block of `work` stays worth keeping.
     fn competitive(
@@ -1509,9 +2110,10 @@ impl Chain {
         .map_err(permanent)?;
         let work = math::work(&target);
         // Admission policy runs after the cheap header checks and before any
-        // ancestry walk or state reconstruction for the block.
+        // ancestry walk or state reconstruction for the block, beyond the
+        // logarithmic skip-link lookup of a start from a saved checkpoint.
         if admission {
-            self.admit_branch(&parent, &work)?;
+            self.admit_branch(&block.header.previous, &parent, &work)?;
         }
         self.validate_transaction_anchors(&block.header.previous, &block.transactions)
             .map_err(permanent)?;
@@ -1523,6 +2125,8 @@ impl Chain {
                 codec::body_size(block)? as u64 <= parent_state.settings.block_bytes,
                 "block body exceeds byte limit"
             );
+            #[cfg(test)]
+            VALIDATED_BLOCKS.with(|count| count.set(count.get() + 1));
             let state = consensus::execute(
                 &self.config,
                 &parent_state,
@@ -1648,6 +2252,9 @@ impl Chain {
         }
         self.held.remove(&hash);
         self.record(hash, block, Arc::new(entry), state, best);
+        if best {
+            self.save_checkpoint(self.checkpoint_every);
+        }
         Ok(best)
     }
     pub fn template(
@@ -2782,6 +3389,13 @@ mod cache_tests {
     }
     #[test]
     fn stale_losing_branches_are_pruned_at_startup() {
+        // After a full replay, and after a start from a saved checkpoint
+        // that executes neither the stale branch nor anything else below it.
+        for restored in [false, true] {
+            prune_at_startup(restored);
+        }
+    }
+    fn prune_at_startup(restored: bool) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("prune.db");
         let config = Config::devnet();
@@ -2828,9 +3442,18 @@ mod cache_tests {
         let sibling = Chain::mine(sibling, 1_000_000).unwrap();
         assert!(!chain.submit(sibling.clone(), time as u64).unwrap());
         let tip = chain.tip_hash();
+        if restored {
+            // A clean stop saves the state CHECKPOINT_DEPTH below the tip.
+            chain.checkpoint_every = 8;
+        }
         drop(chain);
-        let chain = Chain::open(&path, config.clone()).unwrap();
+        let (chain, validated) = reopen(&path, &config);
         assert_eq!(chain.tip_hash(), tip);
+        assert_eq!(chain.restored.is_some(), restored);
+        if restored {
+            // Only the blocks above the checkpoint, the sibling among them.
+            assert_eq!(validated as u64, CHECKPOINT_DEPTH + 1);
+        }
         for block in &stale {
             assert!(chain.block(&codec::block_hash(block)).is_none());
             assert!(chain.block_height(&codec::block_hash(block)).unwrap().is_none());
@@ -2938,5 +3561,342 @@ mod cache_tests {
         drop(chain);
         let chain = Chain::open(&path, config).unwrap();
         assert_eq!(chain.tip_hash(), tip);
+    }
+    fn extend(chain: &mut Chain, count: u64, salt: u64) {
+        for n in 0..count {
+            let block = candidate(chain, salt + n);
+            assert!(
+                chain
+                    .submit(block.clone(), block.header.timestamp as u64)
+                    .unwrap()
+            );
+        }
+    }
+    /// The reopened chain and the blocks its startup executed.
+    fn reopen(path: &Path, config: &Config) -> (Chain, usize) {
+        VALIDATED_BLOCKS.with(|count| count.set(0));
+        let chain = Chain::open(path, config.clone()).unwrap();
+        (chain, VALIDATED_BLOCKS.with(Cell::get))
+    }
+    fn saved_heights(chain: &Chain) -> Vec<u64> {
+        chain
+            .db
+            .prepare("SELECT height FROM state_checkpoints ORDER BY height")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+    fn active_chain(chain: &Chain) -> Vec<Hash> {
+        (0..=chain.tip_height())
+            .map(|height| chain.hash_at_height(height).unwrap())
+            .collect()
+    }
+    /// Decode the state saved at `height` of the closed database, edit it and store it again.
+    fn rewrite_saved_state(path: &Path, height: u64, edit: impl FnOnce(&mut State)) {
+        let db = Connection::open(path).unwrap();
+        let (hash, build, length): (Vec<u8>, Vec<u8>, u64) = db
+            .query_row(
+                "SELECT hash,build,length FROM state_checkpoints WHERE height=?1",
+                [height],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let mut parts = PartReader {
+            db: &db,
+            height,
+            part: 0,
+            buffer: Vec::new(),
+            offset: 0,
+        };
+        let mut state: State = checkpoint_options()
+            .with_limit(length)
+            .deserialize_from(&mut parts)
+            .unwrap();
+        edit(&mut state);
+        let (hash, build) = (hash.try_into().unwrap(), build.try_into().unwrap());
+        Chain::write_saved_state(&db, height, &hash, &build, &state).unwrap();
+    }
+    #[test]
+    fn saved_checkpoints_restart_without_executing_the_history_below_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("saved.db");
+        let config = Config::devnet();
+        let mut chain = Chain::open(&path, config.clone()).unwrap();
+        chain.checkpoint_every = 8;
+        let mut early = Chain::open(&directory.path().join("early.db"), config.clone()).unwrap();
+        for n in 0..10 {
+            let block = candidate(&chain, n);
+            for target in [&mut chain, &mut early] {
+                target
+                    .submit(block.clone(), block.header.timestamp as u64)
+                    .unwrap();
+            }
+        }
+        // A losing block at height 11, stored while it is competitive.
+        let losing = candidate(&early, 500);
+        extend(&mut chain, 50, 100);
+        assert!(!chain.submit(losing.clone(), losing.header.timestamp as u64).unwrap());
+        // Every 8 heights once the state 31 below the tip passes the first
+        // interval; only the newest two stay.
+        assert_eq!(saved_heights(&chain), [16, 24]);
+        let (tip, root, active) = (
+            chain.tip_hash(),
+            chain.tip_state().root(),
+            active_chain(&chain),
+        );
+        // A clean stop saves the state 31 below the tip at height 60.
+        drop(chain);
+        let (chain, validated) = reopen(&path, &config);
+        assert_eq!(validated as u64, CHECKPOINT_DEPTH);
+        assert_eq!((chain.tip_hash(), chain.tip_state().root()), (tip, root));
+        assert_eq!(active_chain(&chain), active);
+        assert_eq!(saved_heights(&chain), [24, 29]);
+        assert_eq!(chain.restored, Some((29, active[29])));
+        chain.tip_state().audit(&chain.config).unwrap();
+        // The losing block kept its checked index entry; it was not executed.
+        assert_eq!(chain.block_height(&codec::block_hash(&losing)).unwrap(), Some(11));
+        // Below the restored state only genesis is retained, and the restored
+        // state itself stays retained.
+        assert!(chain.cached_state(&active[29]).is_some());
+        assert!((1..29).all(|height| chain.cached_state(&active[height]).is_none()));
+        drop(chain);
+        // A start interrupted while it rebuilt the blocks above the checkpoint
+        // starts from it again.
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("DELETE FROM entry_index WHERE hash IN (SELECT hash FROM canonical_index WHERE height>40); DELETE FROM canonical_index WHERE height>40;").unwrap();
+        drop(db);
+        let (mut chain, validated) = reopen(&path, &config);
+        assert_eq!(validated as u64, CHECKPOINT_DEPTH);
+        assert_eq!((chain.tip_hash(), chain.tip_state().root()), (tip, root));
+        assert_eq!(active_chain(&chain), active);
+        // A losing branch forking above the restored state is admitted as before.
+        let mut near = Chain::open(&directory.path().join("near.db"), config.clone()).unwrap();
+        for hash in &active[1..60] {
+            let block = chain.block(hash).unwrap();
+            near.submit(block.clone(), block.header.timestamp as u64)
+                .unwrap();
+        }
+        let sibling = candidate(&near, 900);
+        assert!(!chain.submit(sibling.clone(), sibling.header.timestamp as u64).unwrap());
+        assert!(chain.block(&codec::block_hash(&sibling)).is_some());
+    }
+    #[test]
+    fn checkpoints_failing_any_check_fall_back_to_a_full_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fallback.db");
+        let config = Config::devnet();
+        let mut chain = Chain::open(&path, config.clone()).unwrap();
+        chain.checkpoint_every = 8;
+        extend(&mut chain, 45, 0);
+        let (tip, root) = (chain.tip_hash(), chain.tip_state().root());
+        drop(chain);
+        let sql = |sql: &str| Connection::open(&path).unwrap().execute_batch(sql).unwrap();
+        let start = |restored: Option<u64>| {
+            let (mut chain, validated) = reopen(&path, &config);
+            assert_eq!((chain.tip_hash(), chain.tip_state().root()), (tip, root));
+            assert_eq!(chain.restored.map(|(height, _)| height), restored);
+            let expected = restored.map_or(45, |height| 45 - height);
+            assert_eq!(validated as u64, expected);
+            chain.tip_state().audit(&chain.config).unwrap();
+            // The next clean stop saves the state at height 14 again.
+            chain.checkpoint_every = 8;
+            saved_heights(&chain)
+        };
+        // A damaged newest checkpoint is discarded and the older one serves.
+        sql("UPDATE state_checkpoint_parts SET bytes=zeroblob(length(bytes)) WHERE height=14");
+        assert_eq!(start(Some(8)), [8]);
+        assert_eq!(start(Some(14)), [8, 14]);
+        // Another build's checkpoints are never used; the full replay drops
+        // them. Each later fallback starts from the one its stop saved.
+        sql("UPDATE state_checkpoints SET build=x'00'");
+        assert!(start(None).is_empty());
+        // A saved state that differs from the committed state root.
+        rewrite_saved_state(&path, 14, |state| state.world.revenue += 1u32);
+        assert!(start(None).is_empty());
+        // An ancestor entry whose clock is off by a second: the parent's
+        // schedule no longer yields its child's required target.
+        {
+            let db = Connection::open(&path).unwrap();
+            let hash: Vec<u8> = db
+                .query_row("SELECT hash FROM canonical_index WHERE height=5", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let mut entry = Chain::read_entry(&db, &hash.as_slice().try_into().unwrap())
+                .unwrap()
+                .unwrap()
+                .as_ref()
+                .clone();
+            entry.clock += 1;
+            db.execute(
+                "UPDATE entry_index SET bytes=?2 WHERE hash=?1",
+                params![hash, codec::encode(&entry)],
+            )
+            .unwrap();
+        }
+        assert!(start(None).is_empty());
+        // Indexes rebuilt by a binary that predates checkpoints (it clears the
+        // whole canonical index, the build marker with it), a missing
+        // active-chain index, and an index entry without a block.
+        sql("DELETE FROM canonical_index WHERE height<0");
+        assert!(start(None).is_empty());
+        sql("DELETE FROM canonical_index WHERE height>0");
+        assert!(start(None).is_empty());
+        sql("INSERT INTO entry_index(hash,bytes) VALUES(zeroblob(32),x'00')");
+        assert!(start(None).is_empty());
+        // A saved tip that the checkpoint's descendants cannot reach.
+        sql("UPDATE metadata SET value=(SELECT hash FROM canonical_index WHERE height=10) WHERE key='tip'");
+        assert!(start(None).is_empty());
+        // The last fallback's stop saved a checkpoint that serves again.
+        assert_eq!(start(Some(14)), [14]);
+    }
+    #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
+    fn a_saved_decision_whose_action_is_not_the_committed_one_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("decision.db");
+        let config = Config::devnet();
+        let mut chain = Chain::open(&path, config.clone()).unwrap();
+        let secret = [91; 32];
+        let owner = crypto::public_key(&secret).unwrap();
+        let mut salt = 0;
+        while chain.tip_state().auction_round().is_none() {
+            extend(&mut chain, 1, salt);
+            salt += 1;
+        }
+        let blocks = chain.tip_state().settings.decision_blocks;
+        let action = |new| Proposal::Parameter {
+            parameter: Parameter::DecisionBlocks,
+            old: blocks,
+            new,
+        };
+        let mut body = TransactionBody {
+            sender: owner,
+            nonce: chain.tip_state().account(&owner, None).unwrap().nonce,
+            fee: 0u32.into(),
+            anchor: chain.tip_hash(),
+            expiry_blocks: 10,
+            operation: Operation::Propose {
+                round: chain.tip_state().auction_round().unwrap(),
+                description: [14; 32],
+                proposal: action(blocks * 2),
+                support: 10u32.into(),
+            },
+            data: vec![],
+        };
+        let proposal = loop {
+            let tx = crypto::sign(&chain.chain_id(), &body, &secret).unwrap();
+            let minimum = fees::quote(&config, chain.tip_state(), &tx)
+                .unwrap()
+                .minimum_fee;
+            if minimum <= body.fee {
+                break tx;
+            }
+            body.fee = minimum;
+        };
+        let time = chain.tip_block().header.timestamp + 15;
+        let block = Chain::mine(
+            chain.template(owner, vec![proposal], time).unwrap(),
+            100_000,
+        )
+        .unwrap();
+        assert!(chain.submit(block, time as u64).unwrap());
+        while chain.tip_state().decision_id().is_none() {
+            extend(&mut chain, 1, salt);
+            salt += 1;
+        }
+        // Save the decision state at the tip itself.
+        let (height, hash, root) = (chain.tip_height(), chain.tip_hash(), chain.tip_state().root());
+        let build = build_identity().unwrap();
+        Chain::write_saved_state(&chain.db, height, &hash, &build, chain.tip_state()).unwrap();
+        drop(chain);
+        let (chain, validated) = reopen(&path, &config);
+        assert_eq!((validated, chain.restored), (0, Some((height, hash))));
+        let state = chain.tip_state();
+        let Phase::Governance(decision) = &state.phase else {
+            panic!("decision not restored");
+        };
+        // The restored decision shares the committed action, as execution does.
+        let committed = state.actions.get_shared(&decision.proposal_id).unwrap();
+        assert!(Arc::ptr_eq(&decision.proposal, committed));
+        drop(chain);
+        // The root omits the decision's copy of its action, so another copy
+        // still matches the committed root; the audit refuses it.
+        rewrite_saved_state(&path, height, |state| {
+            let Phase::Governance(decision) = &mut state.phase else {
+                unreachable!()
+            };
+            decision.proposal = Arc::new(action(blocks * 3));
+            assert_eq!(state.root(), root);
+        });
+        let (chain, validated) = reopen(&path, &config);
+        assert_eq!((validated as u64, chain.restored), (height, None));
+        assert_eq!(chain.tip_state().root(), root);
+        chain.tip_state().audit(&chain.config).unwrap();
+        let state = chain.tip_state();
+        let Phase::Governance(decision) = &state.phase else {
+            panic!("decision not replayed");
+        };
+        assert_eq!(*decision.proposal, action(blocks * 2));
+    }
+    #[test]
+    fn a_branch_forking_below_the_restored_state_is_held_until_it_leads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("restored.db");
+        let config = Config::devnet();
+        let mut chain = Chain::open(&path, config.clone()).unwrap();
+        chain.checkpoint_every = 8;
+        let mut fork = Chain::open(&directory.path().join("fork.db"), config.clone()).unwrap();
+        for n in 0..10 {
+            let block = candidate(&chain, n);
+            for target in [&mut chain, &mut fork] {
+                target
+                    .submit(block.clone(), block.header.timestamp as u64)
+                    .unwrap();
+            }
+        }
+        extend(&mut chain, 50, 100);
+        extend(&mut fork, 55, 1_000);
+        drop(chain);
+        let (mut chain, _) = reopen(&path, &config);
+        assert_eq!(chain.restored.map(|(height, _)| height), Some(29));
+        let branch: Vec<Block> = active_chain(&fork)[11..]
+            .iter()
+            .map(|hash| fork.block(hash).unwrap())
+            .collect();
+        // Its fork point could only be rebuilt from genesis, so the branch is
+        // held as headers while it trails.
+        let refused = chain
+            .submit(branch[0].clone(), branch[0].header.timestamp as u64)
+            .unwrap_err();
+        assert!(refused.is::<SideBranchRefused>(), "{refused:#}");
+        assert!(refused.to_string().contains("restored at startup"), "{refused:#}");
+        for block in &branch[1..] {
+            let held = chain
+                .submit(block.clone(), block.header.timestamp as u64)
+                .unwrap_err();
+            assert!(held.is::<SideBranchRefused>(), "{held:#}");
+        }
+        assert!(chain.block(&codec::block_hash(&branch[0])).is_none());
+        // Once its headers claim more work than the tip, it is validated and adopted.
+        for block in &branch {
+            chain
+                .submit(block.clone(), block.header.timestamp as u64)
+                .unwrap();
+        }
+        assert_eq!(chain.tip_hash(), fork.tip_hash());
+        assert_eq!(chain.tip_state().root(), fork.tip_state().root());
+        assert_eq!(active_chain(&chain), active_chain(&fork));
+        assert_eq!(chain.restored, None);
+        drop(chain);
+        // Neither saved checkpoint is on the new active chain.
+        let (chain, validated) = reopen(&path, &config);
+        assert_eq!(chain.tip_hash(), fork.tip_hash());
+        assert_eq!((chain.restored, validated), (None, 60 + branch.len()));
     }
 }

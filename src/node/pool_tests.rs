@@ -240,16 +240,32 @@ fn relay_selects_and_publishes_only_for_new_admissible_entries() {
     assert_eq!(deliver(vec![outbid.clone()]), 0, "a replacement must raise the fee rate");
     assert_eq!(published(&node), revision, "an unchanged selection does not publish");
     // A newcomer only execution refuses costs one selection, then loses it.
-    let support = Operation::Support {
-        round: 0,
-        proposal: [9; 32],
-        amount: 1u32.into(),
+    let refused_support = |salt: u8, extra: u64| {
+        let support = Operation::Support {
+            round: 0,
+            proposal: [9; 32],
+            amount: 1u32.into(),
+        };
+        let mut body = unsigned(config, &OTHER, nonce(&node, &other()), support);
+        body.data = vec![salt];
+        exact(config, state, &OTHER, body, extra)
     };
-    let body = unsigned(config, &OTHER, nonce(&node, &other()), support);
-    let lost = exact(config, state, &OTHER, body, 0);
+    let lost = refused_support(0, 0);
     assert_eq!(deliver(vec![lost.clone()]), 1, "one selection for one new candidate");
     assert_eq!(published(&node), revision, "an unchanged selection does not publish");
-    assert_eq!(deliver(vec![lost]), 0, "a lost selection is remembered");
+    assert_eq!(deliver(vec![lost.clone()]), 0, "a lost selection is remembered");
+    // So is the sender nonce it lost at for validity: copies changed in one
+    // data byte, relayed together or one by one, cost no selection unless
+    // they raise its fee rate as a replacement would.
+    let variants: Vec<_> = (1..=16).map(|salt| refused_support(salt, 0)).collect();
+    assert_eq!(deliver(variants.clone()), 0);
+    assert!(variants.iter().all(|tx| tx.body.fee == lost.body.fee));
+    for salt in 17..=24 {
+        assert_eq!(deliver(vec![refused_support(salt, 0)]), 0);
+    }
+    let raised = refused_support(30, lost.body.fee.to_u64().unwrap() + 2);
+    assert_eq!(deliver(vec![raised]), 1, "a raised bid is judged again");
+    assert_eq!(deliver(vec![refused_support(31, 0)]), 0);
     for _ in 0..3 {
         assert_eq!(
             deliver(vec![forged.clone(), used.clone(), unpayable.clone(), outbid.clone()]),
@@ -1595,10 +1611,22 @@ fn admission_from_many_sources_stays_within_the_node_wide_selection_budget() {
     assert_eq!(queued(&node), 0);
     assert_eq!(ids(&pool(&node).0), ids(&sent));
     SELECTION_CHARGE.with(|charge| charge.set(None));
-    // A spent budget refuses public broadcasts until it has refilled.
+    // Relays spend only the node-wide budget, never the one reserved for
+    // public broadcasts: with the first spent, a public broadcast is still
+    // admitted at once.
     node.admission.unpoisoned().budget.spend(SELECTION_TIME_BURST * 2, Instant::now());
     let wait = node.selection_wait().expect("the budget is spent");
     assert!(wait > Duration::from_secs(3) && wait <= Duration::from_secs(8), "{wait:?}");
+    assert_eq!(node.public_selection_wait(), None);
+    let broadcast = payment(config, state, &SECRET, start + 16, key(), 1, 0);
+    SELECTION_CHARGE.with(|charge| charge.set(Some(PUBLIC_SELECTION_TIME_BURST * 2)));
+    node.submit_transaction_from(broadcast.clone(), true).unwrap();
+    SELECTION_CHARGE.with(|charge| charge.set(None));
+    assert_eq!(selections(), 1);
+    assert!(ids(&pool(&node).0).contains(&codec::transaction_id(&broadcast)));
+    // Public broadcasts are refused only once they spent their own budget.
+    let wait = node.public_selection_wait().expect("the public budget is spent");
+    assert!(wait > Duration::from_secs(4) && wait <= Duration::from_secs(6), "{wait:?}");
 }
 
 #[test]
@@ -1610,33 +1638,86 @@ fn the_admission_queue_keeps_each_source_a_fair_share() {
         }),
         signature: [0; 64],
     };
-    let newcomer = |n: u32, source: &str| {
-        let mut id = [0; 32];
-        id[..4].copy_from_slice(&n.to_le_bytes());
-        Newcomer {
-            id,
-            transaction: transaction.clone(),
-            source: Some(source.parse().unwrap()),
-            authenticated: true,
-        }
-    };
+    let newcomer = |n: u32, source: &str| queued_newcomer(&transaction, n, source, 100);
+    // Bytes never bind here.
+    let roomy = usize::MAX / 8;
     let mut queue = AdmissionQueue::default();
     for n in 0..MAX_QUEUED_ADMISSIONS as u32 {
-        queue.push(newcomer(n, "127.0.0.1"));
+        queue.push(newcomer(n, "127.0.0.1"), roomy);
     }
     assert_eq!(queue.entries.len(), MAX_QUEUED_ADMISSIONS);
     // The flooding source cannot add more; another source displaces its
     // oldest entry, and a repeated identity is ignored.
-    queue.push(newcomer(5_000, "127.0.0.1"));
+    queue.push(newcomer(5_000, "127.0.0.1"), roomy);
     assert!(!queue.ids.contains(&newcomer(5_000, "127.0.0.1").id));
-    queue.push(newcomer(6_000, "127.0.0.2"));
+    queue.push(newcomer(6_000, "127.0.0.2"), roomy);
     assert!(queue.ids.contains(&newcomer(6_000, "127.0.0.2").id));
     assert!(!queue.ids.contains(&newcomer(0, "127.0.0.1").id));
-    queue.push(newcomer(6_000, "127.0.0.3"));
+    queue.push(newcomer(6_000, "127.0.0.3"), roomy);
     assert_eq!(queue.entries.len(), MAX_QUEUED_ADMISSIONS);
-    assert_eq!(queue.held[&Some("127.0.0.2".parse().unwrap())], 1);
-    assert_eq!(queue.take().len(), MAX_QUEUED_ADMISSIONS);
-    assert!(queue.is_empty() && queue.held.is_empty());
+    assert_eq!(queue.held[&Some("127.0.0.2".parse().unwrap())], (1, 100));
+    // Drains take at most MAX_DRAINED_ADMISSIONS at a time, oldest first.
+    let mut drained = 0;
+    while !queue.is_empty() {
+        let batch = queue.take(roomy);
+        assert!(!batch.is_empty() && batch.len() <= MAX_DRAINED_ADMISSIONS);
+        drained += batch.len();
+    }
+    assert_eq!(drained, MAX_QUEUED_ADMISSIONS);
+    assert!(queue.held.is_empty() && queue.ids.is_empty() && queue.bytes == 0);
+}
+
+/// A queued newcomer identified by `n` that claims `bytes` encoded bytes.
+fn queued_newcomer(transaction: &Transaction, n: u32, source: &str, bytes: usize) -> Newcomer {
+    let mut id = [0; 32];
+    id[..4].copy_from_slice(&n.to_le_bytes());
+    Newcomer {
+        id,
+        transaction: transaction.clone(),
+        bytes,
+        source: Some(source.parse().unwrap()),
+        peer: None,
+        authenticated: true,
+        operator: false,
+    }
+}
+
+#[test]
+fn the_admission_queue_is_bounded_by_bytes_and_drained_a_block_at_a_time() {
+    let transaction = Transaction {
+        body: unsigned(&configuration(16 * 1024), &SECRET, 0, Operation::Refund {
+            round: 0,
+            proposal: [0; 32],
+        }),
+        signature: [0; 64],
+    };
+    let block = 1_000;
+    let sized = |n: u32, source: &str| queued_newcomer(&transaction, n, source, 100);
+    let mut queue = AdmissionQueue::default();
+    // One source holds at most one block's bytes.
+    for n in 0..20 {
+        queue.push(sized(n, "127.0.0.1"), block);
+    }
+    assert_eq!(queue.held[&Some("127.0.0.1".parse().unwrap())], (10, block));
+    // In all the queue holds QUEUED_ADMISSION_BLOCKS blocks' bytes.
+    let others = ["127.0.0.2", "127.0.0.3", "127.0.0.4"];
+    for (offset, source) in (1..).zip(others) {
+        for n in 0..10 {
+            queue.push(sized(100 * offset + n, source), block);
+        }
+    }
+    assert_eq!(queue.bytes, QUEUED_ADMISSION_BLOCKS * block);
+    // A newcomer from another source displaces the oldest bytes of a source
+    // holding the most.
+    queue.push(sized(999, "127.0.0.5"), block);
+    assert_eq!(queue.bytes, QUEUED_ADMISSION_BLOCKS * block);
+    assert!(queue.ids.contains(&sized(999, "127.0.0.5").id));
+    assert_eq!(queue.entries.len(), 4 * 10);
+    // One drain takes at most one block's bytes, and always one entry.
+    assert_eq!(queue.take(block).len(), 10);
+    assert_eq!(queue.take(250).len(), 2);
+    assert_eq!(queue.take(50).len(), 1);
+    assert_eq!(queue.bytes, (40 - 13) * 100);
 }
 
 #[test]
@@ -1911,4 +1992,292 @@ fn spends_awaiting_funding_are_bounded_and_expire() {
     assert_eq!(awaiting(&node).len(), AWAITING_PER_SENDER);
     assert!(node.submit_block(empty_block(&node)).unwrap());
     assert!(awaiting(&node).is_empty());
+}
+
+#[test]
+fn a_side_block_rebuilding_its_parent_state_is_bounded_before_any_replay() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    for _ in 0..92 {
+        node.mine(1_000_000).unwrap();
+    }
+    // A fork at height 45, below the dense checkpoints and between sparse
+    // ones: its parent state is replayed from the checkpoint at height 32.
+    let mut fork = Chain::open(
+        &directory.path().join("fork.sqlite"),
+        configuration(16 * 1024),
+    )
+    .unwrap();
+    for height in 1..=45 {
+        let block = {
+            let i = node.locked().unwrap();
+            i.chain
+                .hash_at_height(height)
+                .and_then(|hash| i.chain.block(&hash))
+        }
+        .unwrap();
+        let time = block.header.timestamp as u64;
+        assert!(fork.submit(block, time).unwrap());
+    }
+    let side = {
+        let time = fork.tip_block().header.timestamp + 1;
+        let mut candidate = fork.template(node.miner, Vec::new(), time).unwrap();
+        candidate.extranonce = 7u64.to_le_bytes();
+        candidate.header.merkle_root = codec::merkle_root(&candidate).unwrap();
+        Chain::mine(candidate, 1_000_000).unwrap()
+    };
+    let replayed = || crate::chain::REPLAYED_BLOCKS.with(|count| count.replace(0));
+    let share = |source: &str| network_guard::peer_source(source.parse().unwrap());
+    // A source whose stored side blocks are spent is declined before the
+    // anchors, the ancestry walk or any replay, however often it resends.
+    let height = snapshot(&node).chain.tip_height();
+    node.side_validation.unpoisoned().sources.insert(
+        share("127.0.0.1"),
+        SideSource {
+            blocks: 0,
+            ..SideSource::new(height)
+        },
+    );
+    replayed();
+    for _ in 0..3 {
+        relay_from(&node, "127.0.0.1", Vec::new(), vec![side.clone()]);
+    }
+    assert_eq!(replayed(), 0);
+    assert!(!stored(&node, &side));
+    let held = node
+        .locked()
+        .unwrap()
+        .chain
+        .header_parent(&codec::block_hash(&side));
+    assert!(matches!(held.unwrap(), HeaderParent::Held { .. }));
+    // Another source's replay runs one historical block per lock hold, each
+    // charged as execution is; once its time is spent, the replay stops and
+    // keeps its progress.
+    SIDE_CHARGE.with(|charge| charge.set(Some(SIDE_VALIDATION_TIME_BURST * 2)));
+    relay_from(&node, "127.0.0.2", Vec::new(), vec![side.clone()]);
+    SIDE_CHARGE.with(|charge| charge.set(None));
+    assert_eq!(replayed(), 1);
+    assert!(!stored(&node, &side));
+    // A third source, once node-wide time has refilled, completes it.
+    node.side_validation.unpoisoned().budget =
+        TimeBudget::new(SIDE_VALIDATION_TIME_PER_SECOND, SIDE_VALIDATION_TIME_BURST);
+    relay_from(&node, "127.0.0.3", Vec::new(), vec![side.clone()]);
+    let resumed = replayed();
+    assert!(stored(&node, &side));
+    assert_eq!(resumed, 45 - 32 - 1, "the replay resumed from its progress");
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn a_spend_admitted_with_or_before_its_funding_waits_for_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let start = nonce(&node, &key());
+    // Signatures are randomized, so each record is signed once.
+    let (fundings, spends): (Vec<_>, Vec<_>) = [[83; 32], [84; 32], [85; 32]]
+        .iter()
+        .zip(0..)
+        .map(|(secret, offset)| {
+            let recipient = crypto::public_key(secret).unwrap();
+            (
+                payment(config, state, &SECRET, start + offset, recipient, 5_000, 0),
+                payment(config, state, secret, 0, key(), 1, 0),
+            )
+        })
+        .unzip();
+    let id = codec::transaction_id;
+    // Relayed in one message, the spend before its funding: the funding
+    // that the same admission selects counts.
+    relay(&node, vec![spends[0].clone(), fundings[0].clone()]);
+    assert_eq!(awaiting(&node), vec![id(&spends[0])]);
+    assert_eq!(pool(&node).0, vec![fundings[0].clone()]);
+    // Refused for want of any funding, a spend is refused only until the
+    // pool changes: once its funding is pending, a resubmission waits.
+    let refused = node.submit_transaction(spends[1].clone()).unwrap_err();
+    assert!(refused.to_string().contains("sender account does not exist"), "{refused}");
+    node.submit_transaction(fundings[1].clone()).unwrap();
+    node.submit_transaction(spends[1].clone()).unwrap();
+    assert!(awaiting(&node).contains(&id(&spends[1])));
+    // A transfer still queued for admission counts as well.
+    node.admission.unpoisoned().budget.spend(SELECTION_TIME_BURST * 2, Instant::now());
+    relay(&node, vec![fundings[2].clone()]);
+    assert_eq!(queued(&node), 1);
+    node.submit_transaction(spends[2].clone()).unwrap();
+    assert!(awaiting(&node).contains(&id(&spends[2])));
+    node.admission.unpoisoned().budget =
+        TimeBudget::new(SELECTION_TIME_PER_SECOND, SELECTION_TIME_BURST);
+    relay(&node, Vec::new());
+    assert_eq!(queued(&node), 0);
+    assert_eq!(ids(&pool(&node).0), ids(&fundings));
+    // Each spend confirms one block after its funding.
+    assert_eq!(ids(&node.mine(1_000_000).unwrap().transactions), ids(&fundings));
+    assert_eq!(ids(&node.mine(1_000_000).unwrap().transactions), ids(&spends));
+}
+
+#[tokio::test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+async fn a_relayed_newcomer_credits_its_own_source_when_it_enters_the_pool() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let message = |transactions| PeerMessage {
+        chain: config.chain_id(),
+        locator: Vec::new(),
+        blocks: Vec::new(),
+        transactions,
+    };
+    let (relayer, trigger): (IpAddr, IpAddr) =
+        ("127.0.0.7".parse().unwrap(), "127.0.0.8".parse().unwrap());
+    // Queued while the selection budget is spent, a relay changes no pool.
+    node.admission.unpoisoned().budget.spend(SELECTION_TIME_BURST * 2, Instant::now());
+    let start = nonce(&node, &key());
+    let paid = payment(config, state, &SECRET, start, key(), 1, 0);
+    receive_peer_async(&node, message(vec![paid.clone()]), relayer)
+        .await
+        .unwrap();
+    assert_eq!(queued(&node), 1);
+    assert!(!node.peer_sessions.delivered_recently(relayer));
+    // Another source's forged transaction then starts the drain that admits
+    // it: the relayer is credited, not the source that happened to drain.
+    node.admission.unpoisoned().budget =
+        TimeBudget::new(SELECTION_TIME_PER_SECOND, SELECTION_TIME_BURST);
+    let mut forged = payment(config, state, &SECRET, start + 1, key(), 1, 0);
+    forged.signature[0] ^= 1;
+    receive_peer_async(&node, message(vec![forged]), trigger)
+        .await
+        .unwrap();
+    assert_eq!(pool(&node).0, vec![paid]);
+    assert!(node.peer_sessions.delivered_recently(relayer));
+    assert!(!node.peer_sessions.delivered_recently(trigger));
+}
+
+/// A node in an auction round with one parameter proposal by `key()`, and
+/// `other()` funded: the node, the round and the proposal's ID.
+fn auction_node(directory: &Path) -> (Node, u64, Hash) {
+    let config = configuration(16 * 1024);
+    let path = directory.join("node.sqlite");
+    let mut chain = Chain::open(&path, config.clone()).unwrap();
+    let signed = |chain: &Chain, operation: Operation| {
+        let state = chain.tip_state();
+        let nonce = state.account(&key(), None).unwrap().nonce;
+        exact(&config, state, &SECRET, unsigned(&config, &SECRET, nonce, operation), 0)
+    };
+    for _ in 0..8 {
+        extend(&mut chain, Vec::new());
+    }
+    let funding = signed(
+        &chain,
+        Operation::TransferExact {
+            recipient: other(),
+            amount: 5_000u32.into(),
+        },
+    );
+    extend(&mut chain, vec![funding]);
+    for _ in 0..500 {
+        if matches!(chain.tip_state().phase, crate::state::Phase::Auction(_)) {
+            break;
+        }
+        extend(&mut chain, Vec::new());
+    }
+    let state = chain.tip_state();
+    let round = state.auction_round().expect("an auction round");
+    let description = [72; 32];
+    let proposal = Proposal::Parameter {
+        parameter: Parameter::Lead,
+        old: state.settings.lead,
+        new: state.settings.lead * 2,
+    };
+    let id = crate::state::proposal_id(&state.chain_id, round, &key(), &description, &proposal);
+    let propose = signed(
+        &chain,
+        Operation::Propose {
+            round,
+            description,
+            proposal,
+            support: 1u32.into(),
+        },
+    );
+    extend(&mut chain, vec![propose]);
+    assert!(chain.tip_state().proposals.get(&id).is_some());
+    drop(chain);
+    (Node::open(&path, config, key()).unwrap(), round, id)
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn a_support_signed_at_its_in_block_minimum_is_admitted_after_the_one_creating_its_record() {
+    let directory = tempfile::tempdir().unwrap();
+    let (node, round, proposal) = auction_node(directory.path());
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let start = nonce(&node, &other());
+    let support = |nonce: u64| {
+        let operation = Operation::Support {
+            round,
+            proposal,
+            amount: 1u32.into(),
+        };
+        unsigned(config, &OTHER, nonce, operation)
+    };
+    // The first creates other()'s support record, and pays for it.
+    let first = exact(config, state, &OTHER, support(start), 0);
+    assert!(!fees::quote(config, state, &first).unwrap().record_fee.is_zero());
+    // The second adds to that record, so in their block its minimum fee
+    // has no record charge, and it is signed at exactly that minimum.
+    let mut body = support(start + 1);
+    let second = loop {
+        let tx = crypto::sign(&state.chain_id, &body, &OTHER).unwrap();
+        let quote = fees::quote(config, state, &tx).unwrap();
+        let fee = &quote.minimum_fee - &quote.record_fee;
+        if tx.body.fee == fee {
+            break tx;
+        }
+        body.fee = fee;
+    };
+    node.submit_transaction(first.clone()).unwrap();
+    relay(&node, vec![second.clone()]);
+    assert_eq!(pool(&node).0, vec![first.clone(), second.clone()]);
+    assert_eq!(node.mine(1_000_000).unwrap().transactions, vec![first, second]);
+    // A proposal's own record is always new: it keeps the full charge.
+    let mut body = unsigned(
+        config,
+        &OTHER,
+        start + 2,
+        Operation::Propose {
+            round,
+            description: [73; 32],
+            proposal: Proposal::Parameter {
+                parameter: Parameter::Lead,
+                old: state.settings.lead,
+                new: state.settings.lead * 3,
+            },
+            support: 1u32.into(),
+        },
+    );
+    let underpriced = loop {
+        let tx = crypto::sign(&state.chain_id, &body, &OTHER).unwrap();
+        let quote = fees::quote(config, state, &tx).unwrap();
+        let fee = &quote.minimum_fee - &quote.record_fee;
+        if tx.body.fee == fee {
+            break tx;
+        }
+        body.fee = fee;
+    };
+    let i = node.locked().unwrap();
+    let screened = i.chain.opening_screen(node.miner, &[&underpriced]);
+    drop(i);
+    let refused = screened.unwrap().remove(0).unwrap_err().to_string();
+    assert!(refused.contains("below the mandatory minimum"), "{refused}");
 }

@@ -1358,6 +1358,13 @@ impl PeerSlots {
         }
         counts.useful.insert(source, now);
     }
+    /// Whether `ip`'s source is credited with a recent delivery.
+    #[cfg(test)]
+    pub(crate) fn delivered_recently(&self, ip: IpAddr) -> bool {
+        accounting(&self.counts)
+            .useful
+            .contains_key(&admission_address(ip))
+    }
 }
 impl Drop for PeerSlot {
     fn drop(&mut self) {

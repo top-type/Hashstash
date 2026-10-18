@@ -666,14 +666,27 @@ struct Newcomers<'a> {
 /// Node-wide wall time that admission work may hold the node lock for, per
 /// second and in a burst: every selection a newcomer causes, from a relay, a
 /// submission or a hot-wallet send, is charged what it took. Relayed
-/// newcomers wait in a queue while it is spent, and public broadcasts are
-/// answered 429; however many sources send, their admission keeps the lock
-/// at most this fraction of the time, plus one selection. The operator's own
-/// private submissions are charged but never refused.
-const SELECTION_TIME_PER_SECOND: Duration = Duration::from_millis(250);
+/// newcomers wait in a queue while it is spent. Public broadcasts have a
+/// reserved budget of their own, which relays cannot spend and which is
+/// answered 429 while it is spent; however many sources send, their
+/// admission keeps the lock at most the sum of the two fractions of the
+/// time, plus one selection. The operator's own private submissions are
+/// charged to the first but never refused.
+const SELECTION_TIME_PER_SECOND: Duration = Duration::from_millis(200);
 const SELECTION_TIME_BURST: Duration = Duration::from_secs(1);
-/// Relayed newcomers queued for that budget, admitted together by one selection.
+const PUBLIC_SELECTION_TIME_PER_SECOND: Duration = Duration::from_millis(50);
+const PUBLIC_SELECTION_TIME_BURST: Duration = Duration::from_millis(250);
+/// Relayed newcomers queued for that budget, admitted together by one
+/// selection: in entries, and in block bytes in all and per source.
 const MAX_QUEUED_ADMISSIONS: usize = 1024;
+const QUEUED_ADMISSION_BLOCKS: usize = 4;
+/// Queued newcomers one drain admits with its selection, at most, and at
+/// most one block's bytes of them; the rest wait for the next drain, so one
+/// lock hold stays about one selection.
+const MAX_DRAINED_ADMISSIONS: usize = MAX_MEMPOOL;
+/// Sender nonces remembered as refused for validity by recent selections,
+/// for the tip and pool they were judged against.
+const MAX_INVALID_NONCES: usize = MAX_REJECTED_TRANSACTIONS;
 /// A transaction replacing a pending one at the same sender nonce must raise
 /// the signed fee per weight unit by at least 1/REPLACEMENT_RAISE, and by at
 /// least the minimum fee rate.
@@ -693,9 +706,13 @@ const SIDE_SOURCE_BLOCKS_PER_TIP: u64 = 1;
 /// Sources tracked for side-branch shares; fully refilled ones are forgotten.
 const MAX_SIDE_SOURCES: usize = 1024;
 /// Historical state replay one block submission may run, in steps between
-/// which the node lock is released.
+/// which the node lock is released: in all, and per lock hold for a block
+/// that would become the tip and for a side block. Every hold of a side
+/// block is charged to the side-validation budgets, which are checked again
+/// before the next.
+const REPLAY_STEPS: usize = 64;
 const REPLAY_STEPS_PER_HOLD: usize = 8;
-const REPLAY_HOLDS: usize = 8;
+const SIDE_REPLAY_STEPS_PER_HOLD: usize = 1;
 /// Spends from accounts that a pending transfer creates, held until that
 /// funding confirms: in all, per sender and per source, and the new tips
 /// one may wait for. They also stay within one block's bytes.
@@ -758,9 +775,30 @@ impl TimeBudget {
 struct Newcomer {
     id: Hash,
     transaction: Transaction,
+    /// Its encoded length.
+    bytes: usize,
     source: Option<IpAddr>,
+    /// The relaying peer's own address, credited when the newcomer enters
+    /// the pool (see `PeerSlots::delivered`).
+    peer: Option<IpAddr>,
     /// Its signature was already checked.
     authenticated: bool,
+    /// The operator's own private submission, exempt from [InvalidNonces].
+    operator: bool,
+}
+impl Newcomer {
+    fn new(transaction: Transaction, source: Option<IpAddr>, authenticated: bool) -> Self {
+        let encoded = codec::encode(&transaction);
+        Self {
+            id: crypto::sha256d(&encoded),
+            bytes: encoded.len(),
+            transaction,
+            source,
+            peer: None,
+            authenticated,
+            operator: false,
+        }
+    }
 }
 /// Where admission put a newcomer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -771,60 +809,101 @@ enum Admitted {
     Awaiting,
 }
 /// Relayed newcomers waiting for the selection budget or for a block
-/// submission (see `Node::drain_admissions`). Each source keeps a fair
-/// share: a newcomer for a full queue displaces the oldest entry of the
-/// source holding the most, unless its own source holds as many.
+/// submission (see `Node::drain_admissions`), at most MAX_QUEUED_ADMISSIONS
+/// entries and QUEUED_ADMISSION_BLOCKS blocks' bytes. Each source keeps a
+/// fair share: it may hold at most one block's bytes, and a newcomer for a
+/// full queue displaces the oldest entries of the source holding the most
+/// (entries, or bytes for a queue full of bytes), unless its own source
+/// holds as many.
 #[derive(Default)]
 struct AdmissionQueue {
     entries: VecDeque<Newcomer>,
     ids: HashSet<Hash>,
-    held: BTreeMap<Option<IpAddr>, usize>,
+    /// Entries and bytes held, in all and by source.
+    bytes: usize,
+    held: BTreeMap<Option<IpAddr>, (usize, usize)>,
 }
 impl AdmissionQueue {
-    fn push(&mut self, newcomer: Newcomer) {
+    /// Queue `newcomer` within the bounds for blocks of `block_bytes`.
+    fn push(&mut self, newcomer: Newcomer, block_bytes: usize) {
         if self.ids.contains(&newcomer.id) {
             return;
         }
-        if self.entries.len() >= MAX_QUEUED_ADMISSIONS {
-            let own = self.held.get(&newcomer.source).copied().unwrap_or(0);
-            let Some((&largest, &most)) = self.held.iter().max_by_key(|(_, held)| **held) else {
+        let own = self.held.get(&newcomer.source).copied().unwrap_or_default();
+        if own.1.saturating_add(newcomer.bytes) > block_bytes {
+            return;
+        }
+        let byte_limit = block_bytes.saturating_mul(QUEUED_ADMISSION_BLOCKS);
+        loop {
+            let by_bytes = self.bytes.saturating_add(newcomer.bytes) > byte_limit;
+            if !by_bytes && self.entries.len() < MAX_QUEUED_ADMISSIONS {
+                break;
+            }
+            let share = |held: &(usize, usize)| if by_bytes { held.1 } else { held.0 };
+            let Some((&largest, most)) = self.held.iter().max_by_key(|(_, held)| share(held)) else {
                 return;
             };
-            if own >= most {
+            if share(&own) >= share(most) {
                 return;
             }
-            if let Some(oldest) = self.entries.iter().position(|q| q.source == largest)
-                && let Some(evicted) = self.entries.remove(oldest)
-            {
-                self.forget(&evicted);
-            }
+            let Some(evicted) = self
+                .entries
+                .iter()
+                .position(|queued| queued.source == largest)
+                .and_then(|oldest| self.entries.remove(oldest))
+            else {
+                return;
+            };
+            self.forget(&evicted);
         }
-        *self.held.entry(newcomer.source).or_default() += 1;
+        let held = self.held.entry(newcomer.source).or_default();
+        held.0 += 1;
+        held.1 += newcomer.bytes;
+        self.bytes += newcomer.bytes;
         self.ids.insert(newcomer.id);
         self.entries.push_back(newcomer);
     }
     fn forget(&mut self, newcomer: &Newcomer) {
         self.ids.remove(&newcomer.id);
+        self.bytes -= newcomer.bytes;
         if let Some(held) = self.held.get_mut(&newcomer.source) {
-            *held -= 1;
-            if *held == 0 {
+            held.0 -= 1;
+            held.1 -= newcomer.bytes;
+            if held.0 == 0 {
                 self.held.remove(&newcomer.source);
             }
         }
     }
-    fn take(&mut self) -> Vec<Newcomer> {
-        self.ids.clear();
-        self.held.clear();
-        self.entries.drain(..).collect()
+    /// The oldest entries, at least one while any is queued, up to
+    /// MAX_DRAINED_ADMISSIONS of them and `block_bytes` bytes in all.
+    fn take(&mut self, block_bytes: usize) -> Vec<Newcomer> {
+        let mut taken = Vec::new();
+        let mut bytes = 0usize;
+        while let Some(next) = self.entries.front() {
+            if taken.len() >= MAX_DRAINED_ADMISSIONS
+                || (!taken.is_empty() && bytes.saturating_add(next.bytes) > block_bytes)
+            {
+                break;
+            }
+            bytes = bytes.saturating_add(next.bytes);
+            let Some(newcomer) = self.entries.pop_front() else {
+                break;
+            };
+            self.forget(&newcomer);
+            taken.push(newcomer);
+        }
+        taken
     }
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 }
-/// The node-wide selection budget and the relayed newcomers queued for it.
+/// The node-wide selection budget, the relayed newcomers queued for it, and
+/// the budget reserved for public broadcasts.
 struct Admission {
     budget: TimeBudget,
     queue: AdmissionQueue,
+    public: TimeBudget,
 }
 
 /// A spend whose sender has no account yet, though a pending transfer creates
@@ -833,16 +912,11 @@ struct Admission {
 struct Awaiting {
     id: Hash,
     transaction: Transaction,
+    /// Its encoded length.
+    bytes: usize,
     source: Option<IpAddr>,
     /// New tips seen while its sender still had no account.
     tips: u32,
-}
-/// Whether `transaction` creates `account` by paying it.
-fn creates_account(transaction: &Transaction, account: &PublicKey) -> bool {
-    matches!(
-        &transaction.body.operation,
-        Operation::TransferExact { recipient, .. } if recipient == account
-    )
 }
 
 /// Whether `new` may replace `old`, a pending transaction at the same sender
@@ -857,14 +931,116 @@ fn replaces(config: &Config, state: &State, new: &Transaction, old: &Transaction
     ) else {
         return true;
     };
-    let (new_weight, old_weight) = (Amount::from(quoted.weight), Amount::from(pending.weight));
-    let offered = &new.body.fee * &old_weight;
-    let held = &old.body.fee * &new_weight;
+    raises(state, (&new.body.fee, quoted.weight), (&old.body.fee, pending.weight))
+}
+/// Whether a signed fee and weight raise the fee per weight unit of another
+/// by the replacement rule's margins (see [replaces]).
+fn raises(state: &State, new: (&Amount, u64), old: (&Amount, u64)) -> bool {
+    let (new_weight, old_weight) = (Amount::from(new.1), Amount::from(old.1));
+    let offered = new.0 * &old_weight;
+    let held = old.0 * &new_weight;
     let scale = Amount::from(fees::FEE_SCALE);
     let increment = Amount::from(state.settings.minimum_fee_rate) * &new_weight * &old_weight;
     offered > held
         && &offered * REPLACEMENT_RAISE >= &held * (REPLACEMENT_RAISE + 1)
         && &offered * &scale >= &held * &scale + increment
+}
+/// Sender nonces at which a selection refused a newcomer for validity, not
+/// for capacity, with that newcomer's signed fee and weight, for the tip
+/// and pool revision it was judged against. Another relayed or publicly
+/// broadcast newcomer at such a nonce, such as a copy changed in one data
+/// byte, is refused without a selection unless it raises that fee rate by
+/// the replacement rule. The operator's private submissions are exempt.
+#[derive(Default)]
+struct InvalidNonces {
+    at: (Hash, u64),
+    entries: BTreeMap<(PublicKey, u64), (Amount, u64)>,
+}
+impl InvalidNonces {
+    /// The refused fee and weight at `transaction`'s sender nonce, while
+    /// that refusal holds.
+    fn refused(&self, at: (Hash, u64), transaction: &Transaction) -> Option<&(Amount, u64)> {
+        let body = &transaction.body;
+        (self.at == at)
+            .then(|| self.entries.get(&(body.sender, body.nonce)))
+            .flatten()
+    }
+    fn refuse(&mut self, at: (Hash, u64), transaction: &Transaction, weight: u64) {
+        if self.at != at {
+            self.at = at;
+            self.entries.clear();
+        }
+        if self.entries.len() < MAX_INVALID_NONCES {
+            let body = &transaction.body;
+            self.entries
+                .insert((body.sender, body.nonce), (body.fee.clone(), weight));
+        }
+    }
+}
+/// What a selection left of the next block, by the selection's own body
+/// accounting with one further record, and which senders it left undecided.
+struct Room {
+    used_bytes: usize,
+    used_weight: u64,
+    byte_limit: usize,
+    weight_limit: u64,
+    /// Each selected sender's next nonce.
+    next: BTreeMap<PublicKey, u64>,
+    /// Truncated (which an admission selection never is) or count-full:
+    /// every entry it left out is undecided.
+    saturated: bool,
+    /// Senders whose attempt budget ran out before one of their candidates
+    /// was tried. Another sender's spent budget says nothing about an entry.
+    exhausted: BTreeSet<PublicKey>,
+}
+impl Room {
+    fn after(chain: &Chain, miner: PublicKey, selection: &SelectionResult) -> Result<Self> {
+        let state = chain.tip_state();
+        let limit = mempool_limit(&chain.config).min(chain.config.max_signatures);
+        let height = state.height.checked_add(1).context("candidate height overflow")?;
+        let (prefix, suffix) = codec::coinbase_parts(height, &miner, &ZERO_HASH);
+        let system = prefix.len() + 8 + suffix.len();
+        let mut room = Self {
+            used_bytes: compact_size_len(selection.transactions.len() + 2)
+                + compact_size_len(system)
+                + system
+                + 32,
+            // Weighted capacity equals block bytes; a missing miner account
+            // may reserve one account weight.
+            used_weight: if state.account(&miner, None).is_none() {
+                fees::ACCOUNT_WEIGHT
+            } else {
+                0
+            },
+            byte_limit: usize::try_from(state.settings.block_bytes).unwrap_or(usize::MAX),
+            weight_limit: state.settings.block_bytes,
+            next: BTreeMap::new(),
+            saturated: selection.truncated || selection.transactions.len() >= limit,
+            exhausted: selection.exhausted_senders.clone(),
+        };
+        for tx in &selection.transactions {
+            let bytes = codec::encode(tx).len();
+            room.used_bytes = room.used_bytes.saturating_add(compact_size_len(bytes) + bytes);
+            let weight = fees::quote(&chain.config, state, tx).map_or(u64::MAX, |quote| quote.weight);
+            room.used_weight = room.used_weight.saturating_add(weight);
+            let nonce = room.next.entry(tx.body.sender).or_insert(0);
+            *nonce = tx.body.nonce.saturating_add(1).max(*nonce);
+        }
+        Ok(room)
+    }
+    fn fits(&self, bytes: usize, weight: u64) -> bool {
+        self.used_bytes.saturating_add(compact_size_len(bytes) + bytes) <= self.byte_limit
+            && self.used_weight.saturating_add(weight) <= self.weight_limit
+    }
+    /// The nonce after `sender`'s selected entries, or its account nonce.
+    fn start(&self, state: &State, sender: &PublicKey) -> u64 {
+        self.next.get(sender).copied().unwrap_or_else(|| {
+            state.account(sender, None).map_or(0, |account| account.nonce)
+        })
+    }
+    fn undecided(&self, sender: &PublicKey) -> bool {
+        self.saturated || self.exhausted.contains(sender)
+    }
 }
 /// The weakest entry of a count-full selection, by the selection's own order:
 /// miner fee per weight unit, then transaction ID.
@@ -898,6 +1074,16 @@ struct SideValidation {
     budget: TimeBudget,
     sources: BTreeMap<IpAddr, SideSource>,
 }
+/// A locally submitted side block found the execution slot busy. It waits
+/// for the slot without the node lock, then checks again.
+#[derive(Debug)]
+struct SideSlotBusy;
+impl std::fmt::Display for SideSlotBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "another side-branch block is being validated")
+    }
+}
+impl std::error::Error for SideSlotBusy {}
 /// One relaying source's side-branch share.
 struct SideSource {
     blocks: u64,
@@ -1038,6 +1224,9 @@ thread_local! {
     /// Charge admission work on this thread this long, whatever it took.
     static SELECTION_CHARGE: std::cell::Cell<Option<Duration>> =
         const { std::cell::Cell::new(None) };
+    /// Charge each side block's replay hold or execution on this thread
+    /// this long, whatever it took.
+    static SIDE_CHARGE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
     /// Full proposal index builds, each a walk of every proposal, on this thread.
     static PROPOSAL_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -1112,6 +1301,8 @@ struct Inner {
     /// The weakest entry of a count-full selection, and the selection
     /// revision it was found at.
     weakest: Option<(u64, Option<Weakest>)>,
+    /// Sender nonces recent selections refused for validity.
+    invalid_nonces: InvalidNonces,
 }
 impl Inner {
     fn pending(&self) -> impl Iterator<Item = &Transaction> {
@@ -2017,6 +2208,7 @@ impl Node {
             relay_cursor: 0,
             awaiting: Vec::new(),
             weakest: None,
+            invalid_nonces: InvalidNonces::default(),
         };
         // A derived index failure never makes chain validation unavailable.
         let explorer = Explorer::open(path, &inner.chain).unwrap_or_else(|error| {
@@ -2061,6 +2253,10 @@ impl Node {
             admission: Arc::new(Mutex::new(Admission {
                 budget: TimeBudget::new(SELECTION_TIME_PER_SECOND, SELECTION_TIME_BURST),
                 queue: AdmissionQueue::default(),
+                public: TimeBudget::new(
+                    PUBLIC_SELECTION_TIME_PER_SECOND,
+                    PUBLIC_SELECTION_TIME_BURST,
+                ),
             })),
             admission_run: Arc::new(Mutex::new(())),
             blocks_waiting: Arc::new(AtomicUsize::new(0)),
@@ -2396,9 +2592,13 @@ impl Node {
     /// [Node::admissible], except that a sender without an account yields
     /// false instead of a refusal: a pending transfer may still create it.
     fn admissible_or_unfunded(chain: &Chain, tx: &Transaction) -> Result<bool> {
+        Self::admissible_sized(chain, tx, codec::encode(tx).len())
+    }
+    /// [Node::admissible_or_unfunded] for a transaction of `bytes` encoded bytes.
+    fn admissible_sized(chain: &Chain, tx: &Transaction, bytes: usize) -> Result<bool> {
         let state = chain.tip_state();
         ensure!(
-            codec::encode(tx).len() <= chain.config.transaction_bytes(&state.settings),
+            bytes <= chain.config.transaction_bytes(&state.settings),
             "transaction too large"
         );
         ensure!(
@@ -2447,7 +2647,10 @@ impl Node {
     }
     /// Admissible newcomers sorted by what a selection could do with them,
     /// without running one: a replacement that does not raise its pending
-    /// predecessor's fee rate enough, an entry the next block's opening
+    /// predecessor's fee rate enough, one at a sender nonce where a selection
+    /// on this tip and pool refused another for validity (see
+    /// [InvalidNonces]; `operator` submissions are exempt) that does not
+    /// raise that one's fee rate enough, an entry the next block's opening
     /// refuses for its fee or funds, one after a missing earlier nonce of its
     /// sender, and, while the selection is count-full, one that does not
     /// outrank its weakest entry, are never selected on this tip and pool. A
@@ -2459,6 +2662,7 @@ impl Node {
         i: &Inner,
         newcomers: Vec<(Hash, &'a Transaction)>,
         floor: Option<&Weakest>,
+        operator: &HashSet<Hash>,
     ) -> Result<Newcomers<'a>> {
         let state = i.chain.tip_state();
         let mut screened = Newcomers::default();
@@ -2468,16 +2672,32 @@ impl Node {
             nonces.entry(tx.body.sender).or_default().insert(tx.body.nonce);
             pending.insert((tx.body.sender, tx.body.nonce), tx);
         }
+        let judged = (i.chain.tip_hash(), i.pool_revision);
         let mut replacing = Vec::new();
         for (id, tx) in newcomers {
-            match pending.get(&(tx.body.sender, tx.body.nonce)) {
-                Some(old) if !replaces(&i.chain.config, state, tx, old) => screened.outbid.push((
+            if let Some(old) = pending.get(&(tx.body.sender, tx.body.nonce))
+                && !replaces(&i.chain.config, state, tx, old)
+            {
+                screened.outbid.push((
                     id,
                     anyhow!(
                         "a pending transaction at this nonce is replaced only by one raising its fee rate by at least an eighth and by the minimum fee rate"
                     ),
-                )),
-                _ => replacing.push((id, tx)),
+                ));
+            } else if !operator.contains(&id)
+                && let Some((fee, weight)) = i.invalid_nonces.refused(judged, tx)
+                && fees::quote(&i.chain.config, state, tx).is_ok_and(|quote| {
+                    !raises(state, (&tx.body.fee, quote.weight), (fee, *weight))
+                })
+            {
+                screened.outbid.push((
+                    id,
+                    anyhow!(
+                        "the last selection refused a transaction at this sender nonce as invalid; until the pool changes, another is considered only if it raises that fee rate by at least an eighth and by the minimum fee rate"
+                    ),
+                ));
+            } else {
+                replacing.push((id, tx));
             }
         }
         if replacing.is_empty() {
@@ -2552,7 +2772,8 @@ impl Node {
     /// Admit authenticated or locally signed newcomers against the current
     /// tip, with at most one selection for all of them, and say where each
     /// went. Every refusal is remembered for as long as it holds, so a
-    /// resent identity, relayed or submitted, never reaches a selection.
+    /// resent identity, relayed or submitted, never reaches a selection. A
+    /// relaying peer whose newcomer enters the pool delivered something new.
     fn admit_locked(
         &self,
         i: &mut Inner,
@@ -2563,6 +2784,9 @@ impl Node {
         let mut outcomes: Vec<Option<Result<Admitted>>> = newcomers.iter().map(|_| None).collect();
         let mut index = HashMap::new();
         let mut checked = Vec::new();
+        // Spends whose sender has no account yet are held only after this
+        // admission's selection, so funding admitted with them counts.
+        let mut unfunded = Vec::new();
         for (position, newcomer) in newcomers.iter().enumerate() {
             let id = newcomer.id;
             if retained.contains(&id) {
@@ -2585,33 +2809,32 @@ impl Node {
             // against the whole pool by fee, so a better bid displaces the
             // weakest entry.
             let settings = &i.chain.tip_state().settings;
-            let message = if codec::encode(&newcomer.transaction).len()
-                > i.chain.config.transaction_bytes(settings)
-            {
+            let message = if newcomer.bytes > i.chain.config.transaction_bytes(settings) {
                 "transaction too large".to_owned()
             } else {
-                let refusal = match Self::admissible_or_unfunded(&i.chain, &newcomer.transaction) {
+                match Self::admissible_sized(&i.chain, &newcomer.transaction, newcomer.bytes) {
                     Ok(true) => {
                         checked.push((id, &newcomer.transaction));
                         continue;
                     }
-                    Ok(false) => match self.hold_unfunded(i, newcomer) {
-                        Ok(()) => {
-                            outcomes[position] = Some(Ok(Admitted::Awaiting));
-                            continue;
-                        }
-                        Err(error) => error,
-                    },
-                    Err(error) => error,
-                };
-                format!("transaction not valid in next block: {refusal}")
+                    Ok(false) => {
+                        unfunded.push(position);
+                        continue;
+                    }
+                    Err(error) => format!("transaction not valid in next block: {error}"),
+                }
             };
             self.rejected_locked().refuse(id, Refusal::Tip(tip), &message);
             outcomes[position] = Some(Err(anyhow!(message)));
         }
         if !checked.is_empty() {
             let floor = Self::pool_floor(i);
-            let screened = self.screen_newcomers(i, checked, floor.as_ref())?;
+            let operator: HashSet<Hash> = newcomers
+                .iter()
+                .filter(|newcomer| newcomer.operator)
+                .map(|newcomer| newcomer.id)
+                .collect();
+            let screened = self.screen_newcomers(i, checked, floor.as_ref(), &operator)?;
             {
                 let mut rejected = self.rejected_locked();
                 for (id, error) in &screened.unpayable {
@@ -2643,7 +2866,7 @@ impl Node {
                     candidates.push((*tx).clone());
                 }
                 retained.extend(&screened.waiting);
-                let pool = Self::select_pool(
+                let (pool, room) = Self::select_pool_room(
                     &i.chain,
                     self.miner,
                     &candidates,
@@ -2657,20 +2880,62 @@ impl Node {
                 // tip or the pool changes, for example after a competing chain
                 // is replaced.
                 let refusal = Refusal::Pool(tip, i.pool_revision);
+                let state = i.chain.tip_state();
+                let mut invalid = Vec::new();
                 let mut rejected = self.rejected_locked();
-                for (id, _) in &screened.candidates {
+                for (id, tx) in &screened.candidates {
+                    let newcomer = &newcomers[index[id]];
                     if accepted.contains(id) {
+                        if let Some(peer) = newcomer.peer {
+                            self.peer_sessions.delivered(peer);
+                        }
                         outcomes[index[id]] = Some(Ok(Admitted::Pending));
                         continue;
                     }
                     let message = if screened.waiting.contains(id) {
                         "block capacity exhausted: an earlier transaction from this sender is still waiting for capacity, and this one does not outbid the waiting backlog"
                     } else {
+                        // Left out at its sender's next nonce by a selection
+                        // that decided that sender, with room to spare: it
+                        // was refused for validity, not for capacity.
+                        let sender = &tx.body.sender;
+                        if !room.undecided(sender)
+                            && tx.body.nonce == room.start(state, sender)
+                            && let Ok(quote) = fees::quote(&i.chain.config, state, tx)
+                            && room.fits(newcomer.bytes, quote.weight)
+                        {
+                            invalid.push((*tx, quote.weight));
+                        }
                         "transaction not valid in next block or block capacity exhausted"
                     };
                     rejected.refuse(*id, refusal, message);
                     outcomes[index[id]] = Some(Err(anyhow!(message)));
                 }
+                drop(rejected);
+                let judged = (tip, i.pool_revision);
+                for (tx, weight) in invalid {
+                    i.invalid_nonces.refuse(judged, tx, weight);
+                }
+            }
+        }
+        if !unfunded.is_empty() {
+            let funding = self.funded_accounts(i);
+            for position in unfunded {
+                let newcomer = &newcomers[position];
+                outcomes[position] = Some(match Self::hold_unfunded(i, newcomer, &funding) {
+                    Ok(()) => Ok(Admitted::Awaiting),
+                    Err((pooled, reason)) => {
+                        let message = format!("transaction not valid in next block: {reason}");
+                        // Funding may still enter the pool on this tip.
+                        let scope = if pooled {
+                            Refusal::Pool(tip, i.pool_revision)
+                        } else {
+                            Refusal::Tip(tip)
+                        };
+                        self.rejected_locked().refuse(newcomer.id, scope, &message);
+                        Err(anyhow!(message))
+                    }
+                });
             }
         }
         Ok(outcomes
@@ -2678,62 +2943,85 @@ impl Node {
             .map(|outcome| outcome.unwrap_or_else(|| Err(anyhow!("transaction not admitted"))))
             .collect())
     }
-    /// Hold a newcomer whose sender has no account, if a pending transfer
-    /// creates that account, within the holding bounds. Its signature was
-    /// checked before it got here, or its detached block checked it.
-    fn hold_unfunded(&self, i: &mut Inner, newcomer: &Newcomer) -> Result<()> {
-        let body = &newcomer.transaction.body;
-        ensure!(
-            i.pending().any(|tx| creates_account(tx, &body.sender)),
-            "sender account does not exist"
-        );
-        ensure!(
-            body.nonce < AWAITING_PER_SENDER as u64,
-            "sender account does not exist, and its pending funding leaves this nonce too far ahead"
-        );
-        let held = |matches: &dyn Fn(&Awaiting) -> bool| {
-            i.awaiting.iter().filter(|entry| matches(entry)).count()
+    /// Accounts that a pending transfer, or one still queued for admission,
+    /// creates by paying them.
+    fn funded_accounts(&self, i: &Inner) -> HashSet<PublicKey> {
+        let recipient = |tx: &Transaction| match &tx.body.operation {
+            Operation::TransferExact { recipient, .. } => Some(*recipient),
+            _ => None,
         };
-        ensure!(
-            held(&|entry| entry.transaction.body.sender == body.sender
-                && entry.transaction.body.nonce == body.nonce)
-                == 0,
-            "sender account does not exist, and another transaction at this nonce waits for its funding"
+        let mut funded: HashSet<PublicKey> = i.pending().filter_map(recipient).collect();
+        let admission = self.admission.unpoisoned();
+        funded.extend(
+            admission
+                .queue
+                .entries
+                .iter()
+                .filter_map(|queued| recipient(&queued.transaction)),
         );
-        let bytes = codec::encode(&newcomer.transaction).len();
-        let total: usize = i
-            .awaiting
-            .iter()
-            .map(|entry| codec::encode(&entry.transaction).len())
-            .sum();
+        funded
+    }
+    /// Hold a newcomer whose sender has no account, if a transfer in
+    /// `funding` (see [Node::funded_accounts]) creates that account, within
+    /// the holding bounds. Its signature was checked before it got here, or
+    /// its detached block checked it. A refusal says whether it depends on
+    /// the pool, because no transfer creates the account yet; the others
+    /// hold for the tip, during which held spends are only added.
+    fn hold_unfunded(
+        i: &mut Inner,
+        newcomer: &Newcomer,
+        funding: &HashSet<PublicKey>,
+    ) -> std::result::Result<(), (bool, &'static str)> {
+        let body = &newcomer.transaction.body;
+        if !funding.contains(&body.sender) {
+            return Err((true, "sender account does not exist"));
+        }
+        if body.nonce >= AWAITING_PER_SENDER as u64 {
+            return Err((
+                false,
+                "sender account does not exist, and its pending funding leaves this nonce too far ahead",
+            ));
+        }
+        let (mut sender, mut source, mut bytes) = (0usize, 0usize, 0usize);
+        for entry in &i.awaiting {
+            let held = &entry.transaction.body;
+            if held.sender == body.sender {
+                if held.nonce == body.nonce {
+                    return Err((
+                        false,
+                        "sender account does not exist, and another transaction at this nonce waits for its funding",
+                    ));
+                }
+                sender += 1;
+            }
+            source += usize::from(entry.source == newcomer.source);
+            bytes = bytes.saturating_add(entry.bytes);
+        }
         let limit = usize::try_from(i.chain.tip_state().settings.block_bytes).unwrap_or(usize::MAX);
-        ensure!(
-            i.awaiting.len() < MAX_AWAITING
-                && total.saturating_add(bytes) <= limit
-                && held(&|entry| entry.transaction.body.sender == body.sender) < AWAITING_PER_SENDER
-                && held(&|entry| entry.source == newcomer.source) < AWAITING_PER_SOURCE,
-            "sender account does not exist, and no more spends can wait for their funding"
-        );
+        if i.awaiting.len() >= MAX_AWAITING
+            || sender >= AWAITING_PER_SENDER
+            || source >= AWAITING_PER_SOURCE
+            || bytes.saturating_add(newcomer.bytes) > limit
+        {
+            return Err((
+                false,
+                "sender account does not exist, and no more spends can wait for their funding",
+            ));
+        }
         i.awaiting.push(Awaiting {
             id: newcomer.id,
             transaction: newcomer.transaction.clone(),
+            bytes: newcomer.bytes,
             source: newcomer.source,
             tips: 0,
         });
         Ok(())
     }
     /// After a new tip: held spends whose sender now has an account go back
-    /// through admission; the rest wait while a pending transfer still
+    /// through admission; the rest wait while a transfer in `funding` still
     /// creates the account, their anchors allow them, and for at most
     /// AWAITING_TIPS tips.
-    fn reconsider_awaiting(i: &mut Inner) -> Vec<Newcomer> {
-        let funding: HashSet<PublicKey> = i
-            .pending()
-            .filter_map(|tx| match &tx.body.operation {
-                Operation::TransferExact { recipient, .. } => Some(*recipient),
-                _ => None,
-            })
-            .collect();
+    fn reconsider_awaiting(i: &mut Inner, funding: &HashSet<PublicKey>) -> Vec<Newcomer> {
         let mut ready = Vec::new();
         for mut entry in std::mem::take(&mut i.awaiting) {
             let sender = entry.transaction.body.sender;
@@ -2741,8 +3029,11 @@ impl Node {
                 ready.push(Newcomer {
                     id: entry.id,
                     transaction: entry.transaction,
+                    bytes: entry.bytes,
                     source: entry.source,
+                    peer: None,
                     authenticated: true,
+                    operator: false,
                 });
                 continue;
             }
@@ -2771,25 +3062,38 @@ impl Node {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
-    /// Charge admission work to the node-wide selection budget.
-    fn charge_selection(&self, spent: Duration) {
+    /// Charge admission work to the node-wide selection budget, or to the
+    /// budget reserved for public broadcasts.
+    fn charge_selection(&self, spent: Duration, public: bool) {
         #[cfg(test)]
         let spent = SELECTION_CHARGE.with(|charge| charge.get()).unwrap_or(spent);
-        self.admission
-            .unpoisoned()
-            .budget
-            .spend(spent, Instant::now());
+        let mut admission = self.admission.unpoisoned();
+        let budget = if public {
+            &mut admission.public
+        } else {
+            &mut admission.budget
+        };
+        budget.spend(spent, Instant::now());
     }
     /// How long until the node-wide selection budget has credit, if it has none.
+    #[cfg(test)]
     fn selection_wait(&self) -> Option<Duration> {
         let wait = self.admission.unpoisoned().budget.wait(Instant::now());
         (!wait.is_zero()).then_some(wait)
     }
+    /// How long until the budget reserved for public broadcasts has credit,
+    /// if it has none. Relays never spend it.
+    fn public_selection_wait(&self) -> Option<Duration> {
+        let wait = self.admission.unpoisoned().public.wait(Instant::now());
+        (!wait.is_zero()).then_some(wait)
+    }
     /// Admit one newcomer at once, as a direct submission does: after any
     /// newcomer admission in progress and after waiting block submissions.
-    /// Its lock time is charged to the node-wide selection budget.
+    /// Its lock time is charged to the node-wide selection budget, or for a
+    /// public broadcast to the budget reserved for those.
     fn admit_now(
         &self,
+        public: bool,
         prepare: impl FnOnce(&mut Inner) -> Result<Newcomer>,
     ) -> Result<(Hash, Admitted)> {
         let outcome = {
@@ -2797,13 +3101,14 @@ impl Node {
             self.yield_to_blocks();
             let mut i = self.locked()?;
             let started = Instant::now();
-            let outcome = prepare(&mut i).and_then(|newcomer| {
+            let outcome = prepare(&mut i).and_then(|mut newcomer| {
+                newcomer.operator = !public;
                 let id = newcomer.id;
                 let outcome = self.admit_locked(&mut i, vec![newcomer])?.pop();
                 Ok((id, outcome.context("admission outcome missing")??))
             });
             drop(i);
-            self.charge_selection(started.elapsed());
+            self.charge_selection(started.elapsed(), public);
             outcome
         };
         if let Err(error) = self.drain_admissions() {
@@ -2811,14 +3116,17 @@ impl Node {
         }
         outcome
     }
-    /// Queue relayed newcomers for admission (see [AdmissionQueue]).
-    fn queue_admissions(&self, newcomers: impl IntoIterator<Item = Newcomer>) {
+    /// Queue relayed newcomers for admission (see [AdmissionQueue]) within
+    /// the bounds for blocks of `block_bytes`.
+    fn queue_admissions(&self, newcomers: impl IntoIterator<Item = Newcomer>, block_bytes: u64) {
+        let block_bytes = usize::try_from(block_bytes).unwrap_or(usize::MAX);
         let mut admission = self.admission.unpoisoned();
         for newcomer in newcomers {
-            admission.queue.push(newcomer);
+            admission.queue.push(newcomer, block_bytes);
         }
     }
-    /// Admit every queued newcomer with one selection, while the node-wide
+    /// Admit queued newcomers, at most a block's bytes and
+    /// MAX_DRAINED_ADMISSIONS of them per selection, while the node-wide
     /// selection budget has credit and no block submission waits for the
     /// node lock. Admission already running in another thread takes what is
     /// queued meanwhile, so this returns at once; anything left waits for
@@ -2837,18 +3145,21 @@ impl Node {
                     Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
                 };
                 loop {
+                    let block_bytes = self.read_view()?.chain.tip_state().settings.block_bytes;
                     let batch = {
                         let mut admission = self.admission.unpoisoned();
                         if !ready(&mut admission) {
                             break;
                         }
-                        admission.queue.take()
+                        admission
+                            .queue
+                            .take(usize::try_from(block_bytes).unwrap_or(usize::MAX))
                     };
                     let mut i = self.locked()?;
                     let started = Instant::now();
                     let outcome = self.admit_locked(&mut i, batch);
                     drop(i);
-                    self.charge_selection(started.elapsed());
+                    self.charge_selection(started.elapsed(), false);
                     outcome?;
                 }
             }
@@ -2876,6 +3187,17 @@ impl Node {
         retained: &HashSet<Hash>,
         authenticated: &HashSet<Hash>,
     ) -> Result<(Vec<Transaction>, Vec<Transaction>)> {
+        Self::select_pool_room(chain, miner, candidates, retained, authenticated)
+            .map(|(pool, _)| pool)
+    }
+    /// [Node::select_pool], with the room its selection left (see [Room]).
+    fn select_pool_room(
+        chain: &Chain,
+        miner: PublicKey,
+        candidates: &[Transaction],
+        retained: &HashSet<Hash>,
+        authenticated: &HashSet<Hash>,
+    ) -> Result<((Vec<Transaction>, Vec<Transaction>), Room)> {
         let selection = chain.select_admission(
             miner,
             candidates,
@@ -2887,8 +3209,9 @@ impl Node {
             POOL_SELECTIONS.with(|count| count.set(count.get() + 1));
             POOL_SIGNATURES.with(|count| count.set(count.get() + selection.signatures_checked));
         }
-        let backlog = Self::displaced(chain, miner, &selection, candidates, retained)?;
-        Ok((selection.transactions, backlog))
+        let room = Room::after(chain, miner, &selection)?;
+        let backlog = Self::displaced(chain, &selection, &room, candidates, retained)?;
+        Ok(((selection.transactions, backlog), room))
     }
     /// Retained entries the selection left out only for block capacity. Unless
     /// the selection was saturated (or truncated, which an admission selection
@@ -2901,8 +3224,8 @@ impl Node {
     /// of the selection's size: a count-saturated selection keeps its backlog.
     fn displaced(
         chain: &Chain,
-        miner: PublicKey,
         selection: &SelectionResult,
+        room: &Room,
         candidates: &[Transaction],
         retained: &HashSet<Hash>,
     ) -> Result<Vec<Transaction>> {
@@ -2919,38 +3242,11 @@ impl Node {
                 .then_with(|| a.id.cmp(&b.id))
         };
         let state = chain.tip_state();
-        let byte_limit = usize::try_from(state.settings.block_bytes).unwrap_or(usize::MAX);
-        let limit = mempool_limit(&chain.config).min(chain.config.max_signatures);
-        // Another sender's spent budget says nothing about this entry; only a
-        // truncated or count-full selection leaves every entry undecided.
-        let saturated = selection.truncated || selection.transactions.len() >= limit;
-        let height = state.height.checked_add(1).context("candidate height overflow")?;
-        let (prefix, suffix) = codec::coinbase_parts(height, &miner, &ZERO_HASH);
-        let system = prefix.len() + 8 + suffix.len();
-        // The selection's own body accounting, counting one further record.
-        let mut used_bytes = compact_size_len(selection.transactions.len() + 2)
-            + compact_size_len(system)
-            + system
-            + 32;
-        // Weighted capacity equals block bytes; a missing miner account may
-        // reserve one account weight.
-        let weight_limit = state.settings.block_bytes;
-        let mut used_weight = if state.account(&miner, None).is_none() {
-            fees::ACCOUNT_WEIGHT
-        } else {
-            0
-        };
-        let mut next = BTreeMap::new();
-        let mut seen = HashSet::new();
-        for tx in &selection.transactions {
-            let bytes = codec::encode(tx).len();
-            used_bytes = used_bytes.saturating_add(compact_size_len(bytes) + bytes);
-            let weight = fees::quote(&chain.config, state, tx).map_or(u64::MAX, |quote| quote.weight);
-            used_weight = used_weight.saturating_add(weight);
-            seen.insert(codec::transaction_id(tx));
-            let nonce = next.entry(tx.body.sender).or_insert(0);
-            *nonce = tx.body.nonce.saturating_add(1).max(*nonce);
-        }
+        let mut seen: HashSet<Hash> = selection
+            .transactions
+            .iter()
+            .map(codec::transaction_id)
+            .collect();
         let mut senders = BTreeMap::<PublicKey, Vec<Waiting<'_>>>::new();
         for transaction in candidates {
             let id = codec::transaction_id(transaction);
@@ -2981,11 +3277,9 @@ impl Node {
                 let nonce = a.transaction.body.nonce.cmp(&b.transaction.body.nonce);
                 nonce.then_with(|| better(a, b))
             });
-            let start = next.get(&sender).copied().unwrap_or_else(|| {
-                state.account(&sender, None).map_or(0, |account| account.nonce)
-            });
+            let start = room.start(state, &sender);
             first.insert(sender, start);
-            let undecided = saturated || selection.exhausted_senders.contains(&sender);
+            let undecided = room.undecided(&sender);
             let mut expected = start;
             for entry in entries {
                 let nonce = entry.transaction.body.nonce;
@@ -2996,10 +3290,7 @@ impl Node {
                 if nonce > expected {
                     break;
                 }
-                let fits = used_bytes.saturating_add(compact_size_len(entry.bytes) + entry.bytes)
-                    <= byte_limit
-                    && used_weight.saturating_add(entry.weight) <= weight_limit;
-                if fits && !undecided && expected == start {
+                if room.fits(entry.bytes, entry.weight) && !undecided && expected == start {
                     break;
                 }
                 waiting.push(entry);
@@ -3007,6 +3298,7 @@ impl Node {
             }
         }
         waiting.sort_by(|a, b| better(a, b));
+        let byte_limit = room.byte_limit;
         let mut bytes = 0usize;
         let mut kept = BTreeMap::<PublicKey, HashSet<u64>>::new();
         let mut backlog = Vec::new();
@@ -3178,8 +3470,14 @@ impl Node {
         }
     }
     pub fn submit_transaction(&self, tx: Transaction) -> Result<Hash> {
+        self.submit_transaction_from(tx, false)
+    }
+    /// [Node::submit_transaction], charged to the budget reserved for public
+    /// broadcasts when `public`.
+    fn submit_transaction_from(&self, tx: Transaction, public: bool) -> Result<Hash> {
         let view = self.read_view()?;
-        let id = codec::transaction_id(&tx);
+        let newcomer = Newcomer::new(tx, None, true);
+        let id = newcomer.id;
         // A refused identity is answered from the refusal cache, without the
         // node lock or a selection, as a relayed copy is.
         if let Some(reason) = self
@@ -3189,22 +3487,15 @@ impl Node {
             bail!("{reason}");
         }
         // Authenticate before waiting for chain state.
-        if let Err(error) = Self::screen_signed(&view.chain.chain_id(), &tx) {
+        if let Err(error) = Self::screen_signed(&view.chain.chain_id(), &newcomer.transaction) {
             let message = format!("transaction not valid in next block: {error:#}");
             self.rejected_locked()
                 .refuse(id, Refusal::Permanent, &message);
             bail!(message);
         }
         drop(view);
-        self.admit_now(|_| {
-            Ok(Newcomer {
-                id,
-                transaction: tx,
-                source: None,
-                authenticated: true,
-            })
-        })
-        .map(|(id, _)| id)
+        self.admit_now(public, |_| Ok(newcomer))
+            .map(|(id, _)| id)
     }
     fn wallet_submit(&self, request: HotWalletRequest) -> Result<Hash> {
         let sender = parse_account(
@@ -3219,7 +3510,7 @@ impl Node {
                 .wallets_locked()?
                 .selected_secret(&sender, request.wallet_revision)?,
         );
-        self.admit_now(|i| {
+        self.admit_now(false, |i| {
             let body = self.prepare_locked(
                 i,
                 sender,
@@ -3234,12 +3525,7 @@ impl Node {
                 },
             )?;
             let transaction = crypto::sign(&i.chain.tip_state().chain_id, &body, &secret)?;
-            Ok(Newcomer {
-                id: codec::transaction_id(&transaction),
-                transaction,
-                source: None,
-                authenticated: false,
-            })
+            Ok(Newcomer::new(transaction, None, false))
         })
         .map(|(id, _)| id)
     }
@@ -3321,45 +3607,60 @@ impl Node {
     /// against the chain, in bounded replay steps between which it is
     /// released, and to store it: execution, which may clear batch trades
     /// for seconds, runs without it, so admission, templates and reads go
-    /// on meanwhile. A block that would not become the tip executes only
-    /// within the side-branch bounds (see [Node::side_permit]); otherwise
-    /// its header is held, as the side-branch admission policy holds it.
+    /// on meanwhile. A block that would not become the tip replays its
+    /// parent state and executes only within the side-branch bounds (see
+    /// [Node::side_permit]), checked before any of that work and between
+    /// its replay steps; otherwise its header is held, as the side-branch
+    /// admission policy holds it.
     fn submit_block_from(&self, block: Block, source: Option<IpAddr>) -> Result<bool> {
         // A parent another worker is still validating is stored first.
         drop(self.validating.settle(&block.header.previous));
         let _validating = self.validating.claim(codec::block_hash(&block));
-        let mut holds = 0;
-        let (validation, height) = loop {
+        // The execution slot of a block that would not become the tip.
+        let mut slot = None;
+        let mut replay = REPLAY_STEPS;
+        let validation = loop {
             let mut i = self.locked_for_block()?;
-            match i
-                .chain
-                .begin_submission(&block, now(), Some(REPLAY_STEPS_PER_HOLD))
-            {
-                Ok(Some(validation)) => break (validation, i.chain.tip_height()),
+            let height = i.chain.tip_height();
+            let started = Instant::now();
+            let mut granted = 0;
+            let begun = i.chain.begin_submission(&block, now(), &mut |side| {
+                let steps = if side {
+                    self.side_permit(&mut slot, source, height)?;
+                    SIDE_REPLAY_STEPS_PER_HOLD
+                } else {
+                    REPLAY_STEPS_PER_HOLD
+                };
+                granted = steps.min(replay);
+                Ok(Some(granted))
+            });
+            // A side block's checks and replay under the lock are charged
+            // as its execution is.
+            if slot.is_some() {
+                self.charge_side(source, started.elapsed());
+            }
+            match begun {
+                Ok(Some(validation)) => break validation,
                 Ok(None) => return Ok(false),
+                // A local block waits for the slot without the node lock.
+                Err(error) if error.is::<SideSlotBusy>() => {
+                    drop(i);
+                    slot = Some(self.side_running.unpoisoned());
+                }
                 // The replay resumes from its retained progress.
                 Err(error)
-                    if error.is::<crate::chain::ValidationDeferred>()
-                        && holds + 1 < REPLAY_HOLDS =>
+                    if error.is::<crate::chain::ValidationDeferred>() && replay > granted =>
                 {
-                    holds += 1
+                    replay -= granted;
                 }
-                Err(error) => return Err(error),
-            }
-        };
-        let side = !validation.extends_tip() && !validation.admitted();
-        let slot = if side {
-            match self.side_permit(source, height) {
-                Ok(slot) => Some(slot),
-                Err(reason) => {
-                    return Err(self
-                        .locked_for_block()?
-                        .chain
-                        .decline_checked(&block, reason));
+                Err(error) => {
+                    // A held header may raise the peer capacity allowance.
+                    if let Err(error) = self.note_capacity(&i.chain) {
+                        eprintln!("Peer capacity allowance unchanged: {error:#}");
+                    }
+                    return Err(error);
                 }
             }
-        } else {
-            None
         };
         let started = Instant::now();
         let executed = validation.execute(&block);
@@ -3409,42 +3710,68 @@ impl Node {
                 }
             }
         }
-        let funded = Self::reconsider_awaiting(&mut i);
+        let funding = self.funded_accounts(&i);
+        let funded = Self::reconsider_awaiting(&mut i, &funding);
+        let block_bytes = i.chain.tip_state().settings.block_bytes;
         drop(i);
         // Spends whose funding just confirmed, and relayed newcomers that
         // waited for the block, go through admission now.
-        self.queue_admissions(funded);
+        self.queue_admissions(funded, block_bytes);
         if let Err(error) = self.drain_admissions() {
             eprintln!("Queued transaction admission deferred: {error:#}");
         }
         Ok(true)
     }
-    /// Admit the execution of a block that would not become the tip: one at
-    /// a time node-wide, while node-wide side-validation time remains, and,
-    /// for a relayed block, within its source's own share of stored side
-    /// blocks and of that time. Execution time is charged after it ran
-    /// ([Node::charge_side]). Local submissions are trusted: they wait for
-    /// the slot. A refused block is not invalid; its header is held, so its
-    /// branch is still followed once it claims more work than the tip.
-    fn side_permit(
-        &self,
+    /// Admit a block that would not become the tip to replay its parent
+    /// state and execute, into `slot`: one at a time node-wide, while
+    /// node-wide side-validation time remains, and, for a relayed block,
+    /// within its source's own share of stored side blocks and of that time.
+    /// Replay holds and execution are charged after they ran
+    /// ([Node::charge_side]); a block holding the slot continues its replay
+    /// only while that time remains. Local submissions are trusted: they
+    /// wait for the slot ([SideSlotBusy]). A refused block is not invalid;
+    /// its header is held, so its branch is still followed once it claims
+    /// more work than the tip.
+    fn side_permit<'a>(
+        &'a self,
+        slot: &mut Option<std::sync::MutexGuard<'a, ()>>,
         source: Option<IpAddr>,
         height: u64,
-    ) -> std::result::Result<std::sync::MutexGuard<'_, ()>, &'static str> {
+    ) -> Result<()> {
+        let refused = |reason| Err(crate::chain::SideBranchRefused(reason).into());
         let Some(source) = source else {
-            return Ok(self.side_running.unpoisoned());
+            if slot.is_none() {
+                *slot = Some(match self.side_running.try_lock() {
+                    Ok(running) => running,
+                    Err(std::sync::TryLockError::Poisoned(running)) => running.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => return Err(SideSlotBusy.into()),
+                });
+            }
+            return Ok(());
         };
-        let slot = match self.side_running.try_lock() {
-            Ok(slot) => slot,
-            Err(std::sync::TryLockError::Poisoned(slot)) => slot.into_inner(),
+        let now = Instant::now();
+        if slot.is_some() {
+            let mut side = self.side_validation.unpoisoned();
+            if !side.budget.wait(now).is_zero() {
+                return refused("side-branch validation time is spent");
+            }
+            if let Some(share) = side.sources.get_mut(&source)
+                && !share.time.wait(now).is_zero()
+            {
+                return refused("this source's side-branch validation time is spent");
+            }
+            return Ok(());
+        }
+        let running = match self.side_running.try_lock() {
+            Ok(running) => running,
+            Err(std::sync::TryLockError::Poisoned(running)) => running.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
-                return Err("another side-branch block is being validated");
+                return refused("another side-branch block is being validated");
             }
         };
         let mut side = self.side_validation.unpoisoned();
-        let now = Instant::now();
         if !side.budget.wait(now).is_zero() {
-            return Err("side-branch validation time is spent");
+            return refused("side-branch validation time is spent");
         }
         if side.sources.len() >= MAX_SIDE_SOURCES && !side.sources.contains_key(&source) {
             side.sources.retain(|_, share| {
@@ -3452,7 +3779,7 @@ impl Node {
                 share.blocks < SIDE_SOURCE_BLOCKS || !share.time.full(now)
             });
             if side.sources.len() >= MAX_SIDE_SOURCES {
-                return Err("too many sources hold side-branch shares");
+                return refused("too many sources hold side-branch shares");
             }
         }
         let share = side
@@ -3461,16 +3788,20 @@ impl Node {
             .or_insert_with(|| SideSource::new(height));
         share.refill(height);
         if share.blocks == 0 {
-            return Err("this source's side-branch blocks are spent");
+            return refused("this source's side-branch blocks are spent");
         }
         if !share.time.wait(now).is_zero() {
-            return Err("this source's side-branch validation time is spent");
+            return refused("this source's side-branch validation time is spent");
         }
         share.blocks -= 1;
-        Ok(slot)
+        *slot = Some(running);
+        Ok(())
     }
-    /// Charge a side block's execution time node-wide and to its source.
+    /// Charge a side block's replay or execution time node-wide and to its
+    /// source.
     fn charge_side(&self, source: Option<IpAddr>, spent: Duration) {
+        #[cfg(test)]
+        let spent = SIDE_CHARGE.with(|charge| charge.get()).unwrap_or(spent);
         let mut side = self.side_validation.unpoisoned();
         let now = Instant::now();
         side.budget.spend(spent, now);
@@ -3549,16 +3880,13 @@ impl Node {
         let retained = candidates.iter().map(codec::transaction_id).collect();
         let pool = Self::select_pool(&i.chain, self.miner, &candidates, &retained, &retained)?;
         let changed = self.install_pool(i, pool)?;
-        for transaction in unfunded {
-            let newcomer = Newcomer {
-                id: codec::transaction_id(&transaction),
-                transaction,
-                source: None,
-                authenticated: true,
-            };
-            // Beyond the holding bounds, or without a pending transfer that
-            // creates its sender, it can be submitted again once funded.
-            let _ = self.hold_unfunded(i, &newcomer);
+        if !unfunded.is_empty() {
+            let funding = self.funded_accounts(i);
+            for transaction in unfunded {
+                // Beyond the holding bounds, or without a transfer that
+                // creates its sender, it can be submitted again once funded.
+                let _ = Self::hold_unfunded(i, &Newcomer::new(transaction, None, true), &funding);
+            }
         }
         Ok(changed)
     }
@@ -3981,6 +4309,7 @@ impl Node {
             msg.chain == self.read_view()?.chain.chain_id(),
             "different genesis configuration"
         );
+        let peer = source;
         let source = network_guard::peer_source(source);
         ensure!(
             msg.blocks.len() <= MAX_BATCH
@@ -4092,20 +4421,29 @@ impl Node {
         {
             let rejected = self.rejected_locked();
             for tx in &msg.transactions {
-                let id = codec::transaction_id(tx);
+                let encoded = codec::encode(tx);
+                let id = crypto::sha256d(&encoded);
                 if !rejected.contains(&id, &view.chain.tip_hash(), view.pool_revision)
                     && seen.insert(id)
                 {
-                    fresh.push((id, tx));
+                    fresh.push(Newcomer {
+                        id,
+                        transaction: tx.clone(),
+                        bytes: encoded.len(),
+                        source: Some(source),
+                        peer: Some(peer),
+                        authenticated: true,
+                        operator: false,
+                    });
                 }
             }
         }
         let chain_id = view.chain.chain_id();
-        fresh.retain(|(id, tx)| match Self::screen_signed(&chain_id, tx) {
+        fresh.retain(|newcomer| match Self::screen_signed(&chain_id, &newcomer.transaction) {
             Ok(()) => true,
             Err(error) => {
                 self.rejected_locked().refuse(
-                    *id,
+                    newcomer.id,
                     Refusal::Permanent,
                     &format!("transaction not valid in next block: {error:#}"),
                 );
@@ -4114,12 +4452,8 @@ impl Node {
         });
         // Newcomers wait for the node-wide selection budget and for block
         // submissions in a queue, which one selection drains.
-        self.queue_admissions(fresh.into_iter().map(|(id, tx)| Newcomer {
-            id,
-            transaction: tx.clone(),
-            source: Some(source),
-            authenticated: true,
-        }));
+        self.queue_admissions(fresh, view.chain.tip_state().settings.block_bytes);
+        drop(view);
         self.drain_admissions()
     }
     #[cfg(test)]
@@ -4696,6 +5030,14 @@ impl Node {
     pub fn rpc(&self, method: &str, params: Value) -> Result<Value> {
         self.rpc_with_admission(method, params, None)
     }
+    /// `broadcasttransaction`: admit one signed transaction. A public one is
+    /// charged to the admission budget reserved for public broadcasts.
+    fn broadcast(&self, params: Value, public: bool) -> Result<Value> {
+        let request: BroadcastRequest = serde_json::from_value(params)?;
+        let tx = wallet::decode_signed(&request.raw, &self.read_view()?.chain.chain_id())?;
+        let id = self.submit_transaction_from(tx, public)?;
+        Ok(json!({"transaction_id":hex::encode(id)}))
+    }
     fn public_rpc(&self, method: &str, params: Value, admission: &Session) -> Result<Value> {
         ensure!(
             public_rpc_allowed(method),
@@ -4707,6 +5049,8 @@ impl Node {
             required_str(&params, "sender")?;
             let view = self.read_view()?;
             Self::read_rpc_metered(&view, method, params, Some(admission))
+        } else if method == "broadcasttransaction" {
+            self.broadcast(params, true)
         } else {
             self.rpc_with_admission(method, params, Some(admission))
         }
@@ -4804,11 +5148,7 @@ impl Node {
                 }
                 Self::read_rpc_metered(&i, method, params, admission)
             }
-            "broadcasttransaction" => {
-                let request: BroadcastRequest = serde_json::from_value(params)?;
-                let tx = wallet::decode_signed(&request.raw, &self.read_view()?.chain.chain_id())?;
-                Ok(json!({"transaction_id":hex::encode(self.submit_transaction(tx)?)}))
-            }
+            "broadcasttransaction" => self.broadcast(params, false),
             "getblock" => {
                 let block = {
                     let i = self.locked()?;
@@ -6374,13 +6714,12 @@ async fn receive_peer_async(
     })
     .await
     .context("peer validation worker failed")??;
-    // A source whose message became the tip, or changed the pool, delivered
-    // something new; its inbound sessions are then kept from eviction.
-    let after = node.read_view()?;
-    let tip = after.chain.tip_hash();
-    if (tip != before.chain.tip_hash()
-        && message.blocks.iter().any(|b| codec::block_hash(b) == tip))
-        || (after.pool_revision != before.pool_revision && !message.transactions.is_empty())
+    // A source whose message became the tip delivered something new; its
+    // inbound sessions are then kept from eviction. So is one whose own
+    // relayed transaction entered the pool, which admission credits when it
+    // happens, queued or not (see [Node::admit_locked]).
+    let tip = node.read_view()?.chain.tip_hash();
+    if tip != before.chain.tip_hash() && message.blocks.iter().any(|b| codec::block_hash(b) == tip)
     {
         node.peer_sessions.delivered(source);
     }
@@ -7741,12 +8080,13 @@ async fn http_session(
     let rpc_error =
         |message: &str| json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":message}});
     let public = http.public;
-    // A public broadcast waits while the node-wide budget for admission
-    // selections is spent, rather than queueing for the node lock. Nothing
-    // ran, so it is answered 429 before its work is charged.
+    // A public broadcast waits while the admission budget reserved for
+    // public broadcasts, which relays never spend, is spent, rather than
+    // queueing for the node lock. Nothing ran, so it is answered 429 before
+    // its work is charged.
     if public
         && method == "broadcasttransaction"
-        && let Some(wait) = node.selection_wait()
+        && let Some(wait) = node.public_selection_wait()
     {
         let busy = network_guard::Limited {
             reason: "transaction admission is busy",

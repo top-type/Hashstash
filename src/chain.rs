@@ -149,13 +149,17 @@ pub enum HeaderHold {
 /// can still be received; once held headers claim more work than the tip,
 /// the branch's blocks are admitted when delivered again.
 #[derive(Debug)]
-pub struct SideBranchRefused(&'static str);
+pub struct SideBranchRefused(pub &'static str);
 impl std::fmt::Display for SideBranchRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "side branch header held, block not stored: {}", self.0)
     }
 }
 impl std::error::Error for SideBranchRefused {}
+/// A submitter's own bounds on a received block, consulted by
+/// [Chain::begin_submission] with whether the block would be stored on a
+/// side branch: the replayed blocks this call may run, or a refusal.
+pub type SubmissionBudget<'a> = &'a mut dyn FnMut(bool) -> Result<Option<usize>>;
 /// Retained reconstruction progress no longer links to the active chain.
 #[derive(Debug)]
 struct StaleReplay;
@@ -202,6 +206,8 @@ thread_local! {
         const { RefCell::new(None) };
     /// Blocks executed by validation on this thread.
     pub(crate) static VALIDATED_BLOCKS: Cell<usize> = const { Cell::new(0) };
+    /// Historical blocks replayed to rebuild a parent state on this thread.
+    pub(crate) static REPLAYED_BLOCKS: Cell<usize> = const { Cell::new(0) };
     /// Run on this thread when a received block's execution starts.
     pub(crate) static BLOCK_EXECUTION_HOOK: RefCell<Option<Box<dyn FnMut()>>> =
         const { RefCell::new(None) };
@@ -1886,6 +1892,8 @@ impl Chain {
         Ok(state)
     }
     fn replay_block(&self, block: &Block, parent: &State) -> Result<Arc<State>> {
+        #[cfg(test)]
+        REPLAYED_BLOCKS.with(|count| count.set(count.get() + 1));
         let subsidy = math::work(&math::target_from_bits(block.header.bits)?);
         self.validate_transaction_anchors(&block.header.previous, &block.transactions)?;
         let replayed = consensus::execute(
@@ -2556,7 +2564,7 @@ impl Chain {
         now: u64,
         admission: bool,
     ) -> Result<(Entry, Arc<State>)> {
-        let validation = self.check_block(block, now, admission, None)?;
+        let validation = self.check_block(block, now, admission, None, &mut |_| Ok(None))?;
         let executed = validation.execute(block)?;
         Ok((executed.entry, executed.state))
     }
@@ -2564,12 +2572,15 @@ impl Chain {
     /// stored parent and that parent's required target, proof of work and
     /// Merkle root, the side-branch admission policy, transaction anchors and
     /// the parent state. Executing the block needs only the returned capture.
+    /// `budget` is consulted between the admission policy and the anchors
+    /// (see [Chain::begin_submission]).
     fn check_block(
         &self,
         block: &Block,
         now: u64,
         admission: bool,
         bytes: Option<Vec<u8>>,
+        budget: SubmissionBudget<'_>,
     ) -> Result<BlockValidation> {
         let parent = self
             .load_entry(&block.header.previous)?
@@ -2615,6 +2626,10 @@ impl Chain {
         if admission {
             self.admit_branch(&block.header.previous, &parent, &work)?;
         }
+        // So are the caller's own bounds on a block that would be stored on a
+        // side branch, and the replay its parent state may need.
+        let extends = &parent.work + &work > self.tip_entry.work;
+        self.replay_budget.set(budget(admission && !extends)?);
         self.validate_transaction_anchors(&block.header.previous, &block.transactions)
             .map_err(permanent)?;
         // The skip link depends only on the block's own branch, whichever
@@ -2626,7 +2641,6 @@ impl Chain {
         // Disk/reconstruction failures here are transient local failures and are
         // never entered into the cache of permanently invalid block messages.
         let parent_state = self.load_state(&block.header.previous)?;
-        let extends = &parent.work + &work > self.tip_entry.work;
         Ok(BlockValidation {
             config: self.config.clone(),
             hash: codec::block_hash(block),
@@ -2649,23 +2663,30 @@ impl Chain {
         steps: usize,
     ) -> Result<bool> {
         ensure!(steps > 0, "replay budget must be positive");
-        let Some(validation) = self.begin_submission(&block, now, Some(steps))? else {
+        let Some(validation) = self.begin_submission(&block, now, &mut |_| Ok(Some(steps)))?
+        else {
             return Ok(false);
         };
         let executed = validation.execute(&block);
         self.finish_submission(validation, block, executed, now)
     }
     pub fn submit(&mut self, block: Block, now: u64) -> Result<bool> {
-        let Some(validation) = self.begin_submission(&block, now, None)? else {
+        let Some(validation) = self.begin_submission(&block, now, &mut |_| Ok(None))? else {
             return Ok(false);
         };
         let executed = validation.execute(&block);
         self.finish_submission(validation, block, executed, now)
     }
-    /// The checks of [Chain::submit] that need this chain, with the replay of
-    /// a historical parent state limited to `steps` replayed blocks when
-    /// given (see [Chain::submit_with_replay_budget]). None for a block that
-    /// is already stored. The returned capture executes the block without
+    /// The checks of [Chain::submit] that need this chain. None for a block
+    /// that is already stored. Once the block has passed its header checks
+    /// and the side-branch admission policy, and before its transaction
+    /// anchors, skip-link walk or parent state, `budget` is told whether the
+    /// block would be stored on a side branch (it would not become the tip
+    /// and is not part of an admitted held chain). It returns the replayed
+    /// blocks that rebuilding a historical parent state may run in this call
+    /// (None for no limit; see [Chain::submit_with_replay_budget]), or refuses
+    /// with [SideBranchRefused], which holds the block's header as the
+    /// admission policy does. The returned capture executes the block without
     /// the chain, so a node runs execution, which may clear batch trades for
     /// seconds, outside its chain lock; [Chain::finish_submission] then
     /// stores the result, which is exactly what [Chain::submit] would give
@@ -2674,7 +2695,7 @@ impl Chain {
         &mut self,
         block: &Block,
         now: u64,
-        steps: Option<usize>,
+        budget: SubmissionBudget<'_>,
     ) -> Result<Option<BlockValidation>> {
         let hash = codec::block_hash(block);
         if self.load_entry(&hash)?.is_some() {
@@ -2694,8 +2715,7 @@ impl Chain {
         }
         // A held chain that claimed more work than the tip is not declined again.
         let admitted = self.held.admitted(&hash);
-        self.replay_budget.set(steps);
-        let checked = self.check_block(block, now, !admitted, Some(bytes));
+        let checked = self.check_block(block, now, !admitted, Some(bytes), budget);
         self.replay_budget.set(None);
         match checked {
             Ok(validation) => Ok(Some(validation)),
@@ -2779,15 +2799,6 @@ impl Chain {
             self.save_checkpoint(self.checkpoint_every);
         }
         Ok(best)
-    }
-    /// Hold the header of a block that [Chain::begin_submission] checked but
-    /// that local policy declined to execute for `reason`, as the side-branch
-    /// admission policy holds one, and return that refusal.
-    pub fn decline_checked(&mut self, block: &Block, reason: &'static str) -> anyhow::Error {
-        match self.decline(block) {
-            Ok(()) => SideBranchRefused(reason).into(),
-            Err(error) => error,
-        }
     }
     /// Hold the header of a block the side-branch admission policy declined.
     /// Its header checks passed against the stored parent, so the block's
@@ -2975,7 +2986,8 @@ impl Chain {
     /// The checks that the next block's opening alone decides, for each
     /// transaction on its own: a fee quote, the least minimum fee it could
     /// need in that block (an earlier transaction may still create its payment
-    /// recipient), and opening funds for its declared inputs and fee. Settings
+    /// recipient, or for a Support the sender's support record), and opening
+    /// funds for its declared inputs and fee. Settings
     /// are fixed within a block, accounts are never removed and commitments
     /// only grow, so a transaction failing any of these is never selected on
     /// the current tip, whatever else is pending. This costs one block
@@ -2996,9 +3008,14 @@ impl Chain {
             .iter()
             .map(|transaction| {
                 let quote = fees::quote(&self.config, &execution.state, transaction)?;
-                // Account creation adds exactly its rate to the rounded minimum.
+                // Account and record creation each add exactly their rate to
+                // the rounded minimum. A proposal's own record is always new.
+                let creation = match &transaction.body.operation {
+                    Operation::Support { .. } => &quote.account_creation_fee + &quote.record_fee,
+                    _ => quote.account_creation_fee.clone(),
+                };
                 ensure!(
-                    transaction.body.fee >= &quote.minimum_fee - &quote.account_creation_fee,
+                    transaction.body.fee >= &quote.minimum_fee - &creation,
                     "signed fee is below the mandatory minimum"
                 );
                 ensure!(

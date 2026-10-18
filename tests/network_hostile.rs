@@ -649,21 +649,35 @@ async fn p2p_admission_saturation_does_not_starve_rpc_or_a_different_peer() {
             held.push(stream);
         }
     }
-    let mut global_excess = connect(server.p2p, 6, 5).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // A fifth address takes over the newest session of the most represented
+    // source instead of waiting for one to end; that session closes at once.
+    // Each source's oldest and the longest-connected others stay.
+    let mut newcomer = connect(server.p2p, 6, 5).await;
+    let mut evicted = held.pop().unwrap();
     assert!(
-        read_closed(&mut global_excess, Instant::now() + FAST_DEADLINE)
+        read_closed(&mut evicted, Instant::now() + FAST_DEADLINE)
             .await
             .is_empty()
+    );
+    let mut probe = [0u8; 1];
+    assert!(
+        timeout(Duration::from_millis(500), newcomer.read(&mut probe))
+            .await
+            .is_err(),
+        "the newcomer holds the slot it took over"
     );
     for _ in 0..8 {
         healthy(&server, &before).await;
     }
     // A configured peer still synchronizes through reserved capacity.
     valid_peer(server.p2p, &hello(&node), 6, 9).await;
-    drop(held);
+    drop((held, newcomer));
     // Admission alone should not permanently ban an address. Allow tasks to
-    // observe the closed sockets, then retry a well-formed local handshake.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // observe the closed sockets, and the newcomer's first cooldown for the
+    // frame it abandoned (250 ms) to pass, then retry a well-formed local
+    // handshake.
+    tokio::time::sleep(Duration::from_millis(400)).await;
     healthy(&server, &before).await;
     valid_peer(server.p2p, &hello(&node), 6, 5).await;
     server.stop().await;

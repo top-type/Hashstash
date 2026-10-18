@@ -21,6 +21,9 @@ pub const MAX_PERSISTED_BYTES: usize = 128 * 1024;
 pub const MAX_PER_IP: usize = 2;
 /// Consecutive failures after which a never-verified learned entry is dropped.
 pub const MAX_UNVERIFIED_FAILURES: u32 = 3;
+/// The last verified outbound peers, in distinct network groups, saved with
+/// the book and tried first after a restart.
+pub const MAX_ANCHORS: usize = 2;
 const MAX_AGE: u64 = 7 * 24 * 3600;
 const CONFIGURED: &str = "configured";
 /// How long every requester receives the same address sample.
@@ -174,6 +177,8 @@ struct Saved {
     version: u8,
     chain: Hash,
     entries: Vec<Entry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    anchors: Vec<SocketAddr>,
 }
 /// The address sample every requester receives, and the recent peers it
 /// was drawn from.
@@ -198,6 +203,10 @@ pub struct AddressBook {
     /// peer, which shows that the clock and network work.
     stale: Vec<Entry>,
     verified_this_run: bool,
+    /// The last verified outbound peers, most recent first, in distinct groups.
+    anchors: Vec<SocketAddr>,
+    /// Anchors saved by the previous run that this run has not tried yet.
+    reconnect: Vec<SocketAddr>,
     /// The sidecar bytes last read or durably written.
     persisted: Option<Vec<u8>>,
     /// Unpredictable per-process order for replacement and equal-age probes.
@@ -229,6 +238,8 @@ impl AddressBook {
             dormant: Vec::new(),
             stale: Vec::new(),
             verified_this_run: false,
+            anchors: Vec::new(),
+            reconnect: Vec::new(),
             persisted: None,
             salt,
             advertised_cache: None,
@@ -243,6 +254,8 @@ impl AddressBook {
             book.entries.clear();
             book.dormant.clear();
             book.stale.clear();
+            book.anchors.clear();
+            book.reconnect.clear();
             book.persisted = None;
             let mut aside = book.path.clone().into_os_string();
             aside.push(".invalid");
@@ -310,6 +323,16 @@ impl AddressBook {
                 self.restore(entry, at);
             }
         }
+        // Anchors keep distinct groups. One whose row is dormant or stale stays
+        // saved with that row; only admitted ones are reconnected.
+        for anchor in saved.anchors.into_iter().map(normalized) {
+            if self.anchors.len() < MAX_ANCHORS
+                && !self.anchors.iter().any(|a| group(*a) == group(anchor))
+            {
+                self.anchors.push(anchor);
+            }
+        }
+        self.reconnect = self.anchors.clone();
         self.persisted = Some(bytes);
         Ok(())
     }
@@ -569,6 +592,30 @@ impl AddressBook {
             .filter(|e| e.busy)
             .map(|e| group(e.address))
             .collect::<BTreeSet<_>>();
+        // The previous run's anchors come first, once each: a book that an
+        // attacker's verified addresses have since crowded cannot displace
+        // the peers this node last synchronized with.
+        let mut reconnect = std::mem::take(&mut self.reconnect);
+        reconnect.retain(|address| {
+            let Some(entry) = self.entries.get_mut(address) else {
+                return false;
+            };
+            if entry.busy || entry.next_attempt > at {
+                return true;
+            }
+            let network = group(*address);
+            if selected.len() >= maximum.min(2)
+                || (!self.options.allow_private && groups.contains(&network))
+            {
+                return true;
+            }
+            groups.insert(network);
+            entry.busy = true;
+            entry.last_attempt = at;
+            selected.push(*address);
+            false
+        });
+        self.reconnect = reconnect;
         // Reserve one slot for established paths. An untrusted book flood must
         // never queue both slots for minutes ahead of an already healthy peer.
         // Within each class oldest-attempt rotation preserves fairness.
@@ -616,6 +663,12 @@ impl AddressBook {
                 entry.last_success = at;
                 entry.failures = 0;
                 self.verified_this_run = true;
+                // This outbound peer becomes the newest anchor, replacing an
+                // older one in its group.
+                self.anchors
+                    .retain(|a| *a != address && group(*a) != group(address));
+                self.anchors.insert(0, address);
+                self.anchors.truncate(MAX_ANCHORS);
             } else {
                 entry.failures = entry.failures.saturating_add(1).min(16);
             }
@@ -669,10 +722,17 @@ impl AddressBook {
                 entries.push(entry.clone());
             }
         }
+        let anchors = self
+            .anchors
+            .iter()
+            .filter(|a| entries.iter().any(|e| e.address == **a))
+            .copied()
+            .collect();
         let bytes = serde_json::to_vec(&Saved {
             version: 1,
             chain: self.chain,
             entries,
+            anchors,
         })?;
         ensure!(
             bytes.len() <= MAX_PERSISTED_BYTES,
@@ -1232,6 +1292,63 @@ mod tests {
         b.save().unwrap();
         assert!(path.is_file());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+    #[test]
+    fn the_last_verified_outbound_peers_are_reconnected_first_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+        let mut b = book(path.clone());
+        // Twenty verified peers in distinct groups, all last tried long ago.
+        let peers: Vec<SocketAddr> = (1..=20u8)
+            .map(|n| SocketAddr::from(([30, n, 1, 1], 9)))
+            .collect();
+        let sibling = SocketAddr::from(([30, 18, 2, 1], 9));
+        for (n, peer) in peers.iter().chain([&sibling]).enumerate() {
+            b.learn(SocketAddr::from(([20, n as u8, 1, 1], 9)), &[*peer], 100);
+            let entry = b.entries.get_mut(peer).unwrap();
+            (entry.last_success, entry.last_attempt) = (100, 100);
+        }
+        // This node last synchronized with three of them. Anchors keep
+        // distinct groups, so the newest replaces its group's older one.
+        let (first, second) = (peers[17], peers[18]);
+        for (anchor, at) in [(sibling, 150), (first, 200), (second, 200)] {
+            b.entries.get_mut(&anchor).unwrap().last_attempt = at;
+            b.finished(anchor, true, at, 0);
+        }
+        assert_eq!(b.anchors, [second, first]);
+        b.save().unwrap();
+        // After a restart they are tried first, although rotation by oldest
+        // attempt would try every other verified peer before them.
+        let mut reopened = AddressBook::open(
+            path,
+            [1; 32],
+            Options {
+                enabled: true,
+                ..Default::default()
+            },
+            "0.0.0.0:9".parse().unwrap(),
+            &[],
+            300,
+        )
+        .unwrap();
+        let mut next = reopened.next(300, 2);
+        next.sort();
+        assert_eq!(next, [first, second]);
+        // Only once: afterwards the usual rotation resumes.
+        reopened.finished(first, true, 300, 0);
+        reopened.finished(second, true, 300, 0);
+        let rotation = reopened.next(400, 2);
+        assert_eq!(rotation.len(), 2);
+        assert!(!rotation.contains(&first) && !rotation.contains(&second));
+        // A book saved before anchors existed still loads.
+        let old = dir.path().join("old.json");
+        fs::write(
+            &old,
+            serde_json::to_vec(&serde_json::json!({"version":1,"chain":vec![1; 32],"entries":[]}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(book(old).load_error.is_none());
     }
     #[test]
     fn source_host_cannot_advertise_a_victim_or_grow_existing_lifetime() {

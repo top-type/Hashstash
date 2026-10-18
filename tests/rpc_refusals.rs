@@ -1,7 +1,7 @@
 //! The private RPC answers a request it refuses on admission grounds with a
 //! status and a time to retry (a connection refused before its session
-//! starts, once per address and wait), and the documented local wallet load
-//! fits its budgets.
+//! starts, once per address and wait), the documented local wallet load fits
+//! its budgets, and other loopback addresses cannot multiply them.
 use hashstash::{
     config::Config,
     crypto,
@@ -36,10 +36,10 @@ fn retry_after(response: &reqwest::Response) -> u64 {
         .unwrap()
 }
 
-/// A status request priced by its visitor-chosen grant-payments list: about
-/// one work unit per element.
-fn priced_status(units: usize) -> Value {
-    json!({"jsonrpc":"2.0","id":7,"method":"status","params":{
+/// A fee quote priced by its client-chosen grant-payments list, one work unit
+/// per element, charged before the list is validated (and refused).
+fn priced_quote(units: usize) -> Value {
+    json!({"jsonrpc":"2.0","id":7,"method":"fee_quote","params":{
         "operation":{"Propose":{"proposal":{"Grant":{"payments":vec![0; units]}}}}
     }})
 }
@@ -127,7 +127,7 @@ async fn an_exhausted_rpc_budget_is_answered_with_429_and_a_time_to_retry() {
     let rpc = format!("http://{}/rpc", server.rpc);
     let client = reqwest::Client::new();
     // About 60,000 units each: the 1,048,576-unit burst admits about 17.
-    let expensive = priced_status(60_000);
+    let expensive = priced_quote(60_000);
     let mut admitted = 0;
     let refused = loop {
         let response = client
@@ -290,6 +290,55 @@ async fn one_address_past_its_connection_quota_is_told_when_to_return() {
     drop(held);
     tokio::time::sleep(Duration::from_secs(1)).await;
     let served = client.post(&rpc).json(&status).send().await.unwrap();
+    assert_eq!(served.status(), 200);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn other_loopback_addresses_share_one_rpc_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let miner = crypto::public_key(&[125; 32]).unwrap();
+    let database = directory.path().join("chain.sqlite");
+    let node = Node::open(&database, Config::devnet(), miner).unwrap();
+    let server = node::serve(node, options()).await.unwrap();
+    let rpc = format!("http://{}/rpc", server.rpc);
+    // A local process that binds 127.0.0.2 and beyond gets four address
+    // budgets for all of loopback, not one per address. Each request costs
+    // about 75,000 units, so one address's burst admits 13 and loopback's 55,
+    // plus what refills meanwhile.
+    let expensive = priced_quote(75_000);
+    let mut admitted = Vec::new();
+    let mut fresh_refused = false;
+    for host in 2..=12u8 {
+        let client = reqwest::Client::builder()
+            .local_address(std::net::IpAddr::from([127, 0, 0, host]))
+            .build()
+            .unwrap();
+        let mut count = 0;
+        let refused = loop {
+            let response = client.post(&rpc).json(&expensive).send().await.unwrap();
+            if response.status() != 200 {
+                break response;
+            }
+            count += 1;
+            assert!(count < 32, "127.0.0.{host} was never refused");
+        };
+        assert_eq!(refused.status(), 429);
+        let reply: Value = refused.json().await.unwrap();
+        assert_eq!(reply["error"]["message"], "network rate budget exhausted");
+        fresh_refused |= count == 0;
+        admitted.push(count);
+    }
+    // Separate budgets would admit about as many from every address. The
+    // shared one admits about four addresses' worth and its refill, so an
+    // address whose own budget is untouched is refused at its first request.
+    let total: usize = admitted.iter().sum();
+    assert!(total < 8 * admitted[0], "{admitted:?}");
+    assert!(fresh_refused, "{admitted:?}");
+    // The operator's own requests wait for that refill, without a cooldown.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let status = json!({"jsonrpc":"2.0","id":1,"method":"status","params":{}});
+    let served = reqwest::Client::new().post(&rpc).json(&status).send().await.unwrap();
     assert_eq!(served.status(), 200);
     server.stop().await;
 }

@@ -29,7 +29,12 @@ fn failed_and_panicking_updates_retry_without_another_notification() {
     let directory = tempfile::tempdir().unwrap();
     let config = Config::devnet();
     let miner = crypto::public_key(&[71; 32]).unwrap();
-    let node = Node::open(&directory.path().join("chain.sqlite"), config.clone(), miner).unwrap();
+    let node = Node::open(
+        &directory.path().join("chain.sqlite"),
+        config.clone(),
+        miner,
+    )
+    .unwrap();
     // A second index of the same node, driven only by this test's notifications.
     let database = directory.path().join("index.sqlite");
     let mut explorer = Explorer::open(&database, &lock_inner(&node.inner).chain).unwrap();

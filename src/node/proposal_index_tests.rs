@@ -206,7 +206,11 @@ fn derived_indexes_equal_full_builds_over_a_governance_history() {
             older = (previous.clone(), Vec::new());
         }
     }
-    assert!(rounds.len() >= 10, "history closed only {} rounds", rounds.len());
+    assert!(
+        rounds.len() >= 10,
+        "history closed only {} rounds",
+        rounds.len()
+    );
     assert!(history.s.proposals.len() >= 200);
 }
 
@@ -240,7 +244,9 @@ fn a_new_tip_reads_its_snapshot_and_round_pages_without_walking_history() {
             refund_height: 0,
         },
     );
-    let open: Vec<Hash> = (0..5).map(|support| mint(&mut s, 4, 10 + support)).collect();
+    let open: Vec<Hash> = (0..5)
+        .map(|support| mint(&mut s, 4, 10 + support))
+        .collect();
     s.phase = auction(4, Some(open[0]));
     let parent = view(s.clone(), TipCache::default());
     let before = builds();
@@ -256,17 +262,11 @@ fn a_new_tip_reads_its_snapshot_and_round_pages_without_walking_history() {
     s.proposals.insert(open[1].to_vec(), record);
     s.phase = auction(4, Some(added));
     s.height += 1;
-    let child = view(
-        s.clone(),
-        TipCache::extending(&parent.cache, vec![added]),
-    );
+    let child = view(s.clone(), TipCache::extending(&parent.cache, vec![added]));
     // Another block nobody read in between: its base is the parent's index.
     let late = mint(&mut s, 4, 1);
     s.height += 1;
-    let grandchild = view(
-        s.clone(),
-        TipCache::extending(&child.cache, vec![late]),
-    );
+    let grandchild = view(s.clone(), TipCache::extending(&child.cache, vec![late]));
     let reads = |v: &ReadView| -> Vec<Value> {
         let mut values = vec![Node::read_rpc(v, "snapshot", json!({})).unwrap()];
         for round in 0..5u64 {
@@ -281,7 +281,13 @@ fn a_new_tip_reads_its_snapshot_and_round_pages_without_walking_history() {
     assert_eq!(derived[0]["proposals_total"], 7);
     assert_eq!(derived[0]["proposals"][0]["id"], hex::encode(added));
     // Each equals a cold read of the same state, which builds the index.
-    assert_eq!(first, reads(&view(child.chain.state.as_ref().clone(), TipCache::default())));
+    assert_eq!(
+        first,
+        reads(&view(
+            child.chain.state.as_ref().clone(),
+            TipCache::default()
+        ))
+    );
     assert_eq!(derived, reads(&view(s, TipCache::default())));
     assert_eq!(builds(), before + 2);
     // Closed rounds are shared between tips rather than copied.
@@ -309,7 +315,10 @@ fn published_blocks_derive_the_index_from_the_previous_tip() {
         if height == 2 {
             node.mine(1_000_000).unwrap();
         }
-        assert_eq!(poll()["status"]["height"], if height == 1 { 1 } else { height + 1 });
+        assert_eq!(
+            poll()["status"]["height"],
+            if height == 1 { 1 } else { height + 1 }
+        );
     }
     assert_eq!(builds(), before + 1, "a published block rebuilt the index");
 }
@@ -328,9 +337,6 @@ fn unfiltered_pages_list_every_proposal_in_key_order() {
         .iter()
         .map(|row| row["id"].as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(
-        ids,
-        [1u8, 2, 3].map(|id| hex::encode([id; 32])).to_vec()
-    );
+    assert_eq!(ids, [1u8, 2, 3].map(|id| hex::encode([id; 32])).to_vec());
     assert_eq!(v.cache.proposal_ids.get().map(Vec::len), Some(3));
 }

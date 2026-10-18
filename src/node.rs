@@ -641,8 +641,9 @@ struct Newcomers<'a> {
 /// second and in a burst: every selection a newcomer causes, from a relay, a
 /// submission or a hot-wallet send, is charged what it took. Relayed
 /// newcomers wait in a queue while it is spent, and public broadcasts are
-/// answered 429; however many sources send, admission keeps the lock at most
-/// this fraction of the time, plus one selection.
+/// answered 429; however many sources send, their admission keeps the lock
+/// at most this fraction of the time, plus one selection. The operator's own
+/// private submissions are charged but never refused.
 const SELECTION_TIME_PER_SECOND: Duration = Duration::from_millis(250);
 const SELECTION_TIME_BURST: Duration = Duration::from_secs(1);
 /// Relayed newcomers queued for that budget, admitted together by one selection.

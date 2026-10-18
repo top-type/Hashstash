@@ -64,6 +64,35 @@ async function run(){
   await d.refresh();await d.navigate('#governance');await settle();ok(d.get('proposal-list').textContent.includes('Final public explanation'),'this session still shows its own submitted explanation before the explorer has it');
   ok(!d.get('proposal-list').textContent.includes('Secret first wording'),'abandoned drafts are not shown');
  }
+ {
+  // Anyone can register proposals whose text is never published. Their
+  // lookups back off instead of repeating on every block, and each refresh
+  // starts only a few, the active decision first.
+  const g=await harness({rationale:true}),gs=g.currentSnapshot,round=gs.governance.phase.Auction.round;
+  const ids=Array.from({length:12},(_,i)=>(0x40+i).toString(16).repeat(32)),published=ids[11],text='Published once, cached after';
+  gs.proposals=ids.map(id=>({id,proposal:{round,support:'1',description:sha(id===published?text:id),action:{Parameter:{parameter:'Interval',old:15,new:5}},refund_height:null}}));
+  g.handlers.explorer_governance=p=>response({result:{chain_id:gs.status.chain_id,proposals:[{id:p.proposal,description:sha(p.proposal===published?text:p.proposal),description_text:p.proposal===published?text:null}]}});
+  const lookups=id=>g.calls.filter(c=>c.body.method==='explorer_governance'&&(!id||c.body.params.proposal===id)).length;
+  const block=async()=>{gs.status.height++;gs.status.tip=gs.status.height.toString(16).padStart(64,'0');await g.refresh();await settle();};
+  await g.refresh();await g.navigate('#governance');await settle();
+  eq(lookups(),4,'one refresh starts at most four explanation lookups');
+  for(let i=0;i<8;i++)await block();
+  eq(ids.map(id=>lookups(id)),ids.map(()=>1),'every proposal is looked up once across many new blocks');
+  ok(g.get('proposal-list').textContent.includes(text),'a published explanation is verified and shown');
+  g.wallClock+=31e3;for(let i=0;i<4;i++)await block();
+  eq(lookups(published),1,'a verified explanation stays cached');
+  eq(ids.slice(0,11).map(id=>lookups(id)),ids.slice(0,11).map(()=>2),'unpublished ones are retried once after the back-off');
+  g.wallClock+=31e3;for(let i=0;i<4;i++)await block();
+  eq(lookups(),23,'the next retry waits twice as long');
+  // The active decision is looked up first, and its description hash, once
+  // known, is a new commitment to check.
+  const active='4c'.repeat(32);gs.governance.phase={Governance:{id:'de'.repeat(32),proposal_id:active,round,started:240,blocks:16,started_height:16,leading_blocks:0,proposal:{Parameter:{parameter:'Interval',old:15,new:5}}}};gs.governance.pass={...gs.governance.world};
+  const before=g.calls.length;await block();
+  eq(g.calls.slice(before).filter(c=>c.body.method==='explorer_governance')[0]?.body.params.proposal,active,'the active decision is looked up first');
+  await block();eq(lookups(active),1);
+  gs.proposals=[{id:active,proposal:{round,support:'1',description:sha(active),action:{Parameter:{parameter:'Interval',old:15,new:5}},refund_height:null}},...gs.proposals];await block();
+  eq(lookups(active),2,'a newly known description hash is checked without waiting for the back-off');
+ }
  console.log(`${checks} shared-proposal explanation checks passed`);
 }
 run().catch(e=>{console.error(e);process.exitCode=1;});

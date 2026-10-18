@@ -58,7 +58,7 @@
     let quoteTimer, toastTimer, sendTimer, rpcId = 0, sendVersion = 0, sessionVersion = 0;
     let privateBackup = null, importedPublic = null, browserWallet = null, walletChain = null, unsubscribeWallet = null, walletStorageError = "";
     const walletBalanceNodes = new Map;
-    const proposalExplanations = new Map, explanationRequests = new Set;
+    const proposalExplanations = new Map, explanationRequests = new Set, explanationMisses = new Map;
     const feeForms = [ "trade", "send", "propose", "support", "refund", "mail" ];
     const feeQuotes = new Map, feeBuilders = new Map, feeTimers = new Map, feeVersions = new Map;
     const pendingFeeRefresh = new Set;
@@ -1801,34 +1801,47 @@
             typeof name === "string" && name.startsWith("hashstash-description-") && localStorage.removeItem(name);
         }
     } catch {/* Cleanup of the retired draft cache is optional. */}
+    // Only verified texts are cached, and anyone can register proposals whose
+    // text is never published. A proposal without one is asked about again
+    // only after a growing back-off, or once its description hash is known or
+    // changes; each refresh starts a few lookups, the active decision first.
+    const EXPLANATION_LOOKUPS = 4, EXPLANATION_RETRY_MS = 30e3, EXPLANATION_RETRY_MAX_MS = 600e3;
+    function explanationMissed(miss) {
+        const delay = Math.min(2 * (explanationMisses.get(miss)?.delay || EXPLANATION_RETRY_MS / 2), EXPLANATION_RETRY_MAX_MS);
+        explanationMisses.delete(miss);
+        explanationMisses.set(miss, {retryAt: Date.now() + delay, delay: delay});
+        explanationMisses.size > 200 && explanationMisses.delete(explanationMisses.keys().next().value);
+    }
     function refreshExplanations() {
         if (typeof HashstashProposalData !== "object" || !state.ready || location.hash.split("?")[0] !== "#governance") return;
-        const chain = state.status.chain_id;
+        const chain = state.status.chain_id, now = Date.now();
         const activeId = hex(activeDecision()?.proposal_id);
         const known = proposalRecords();
         const activeRecord = activeId && (known.find(record => hex(record.id) === activeId) || { id: activeId, proposal: {} });
         const records = activeRecord ? [activeRecord, ...known.filter(record => hex(record.id) !== activeId)] : known;
+        let started = 0;
         for (const record of records.slice(0, 40)) {
-            const id = hex(record.id), cache = `${chain}:${id}`, request = `${cache}:${state.status.tip}`;
-            if (proposalExplanations.has(cache) || explanationRequests.has(request)) continue;
-            explanationRequests.add(request);
+            if (started >= EXPLANATION_LOOKUPS) break;
+            const id = hex(record.id), cache = `${chain}:${id}`, miss = `${cache}:${hex(record.proposal.description ?? "")}`;
+            if (proposalExplanations.has(cache) || explanationRequests.has(cache) || explanationMisses.get(miss)?.retryAt > now) continue;
+            explanationRequests.add(cache);
+            started++;
             rpc("explorer_governance", {
                 proposal: id,
                 limit: 1
             }).then(result => {
-                if (result.chain_id !== chain) return;
-                const p = result.proposals?.find(p => p.id === id);
-                const verified = HashstashProposalData.verifiedText(p?.description_text, hex(record.proposal.description ?? p?.description));
-                if (verified) {
-                    proposalExplanations.set(cache, verified);
-                    proposalExplanations.size > 200 && proposalExplanations.delete(proposalExplanations.keys().next().value);
-                }
+                const p = result.chain_id === chain ? result.proposals?.find(p => p.id === id) : null;
+                const verified = p && HashstashProposalData.verifiedText(p.description_text, hex(record.proposal.description ?? p.description));
+                if (!verified) return explanationMissed(miss);
+                explanationMisses.delete(miss);
+                proposalExplanations.set(cache, verified);
+                proposalExplanations.size > 200 && proposalExplanations.delete(proposalExplanations.keys().next().value);
                 if (state.ready && state.status.chain_id === chain) {
                     renderProposals();
                     renderDecisionMessage();
                 }
-            }).catch(() => {}).finally(() => {
-                explanationRequests.size > 200 && explanationRequests.clear();
+            }).catch(() => explanationMissed(miss)).finally(() => {
+                explanationRequests.delete(cache);
             });
         }
     }

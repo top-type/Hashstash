@@ -6989,6 +6989,36 @@ mod capacity_work_tests {
     }
 
     #[test]
+    fn rpc_replies_are_serialized_by_their_worker_within_the_response_limit() {
+        let id = json!(7);
+        let decode = |body: &[u8]| serde_json::from_slice::<Value>(body).unwrap();
+        let (body, refusal) = rpc_reply(&id, Ok(json!({"page":"x".repeat(100)})), 1024).unwrap();
+        assert_eq!(decode(&body)["result"]["page"].as_str().unwrap().len(), 100);
+        assert!(refusal.is_none());
+        // An oversized result becomes the short limit error, keeping its ID.
+        let (body, refusal) = rpc_reply(&id, Ok(json!("x".repeat(2048))), 1024).unwrap();
+        let reply = decode(&body);
+        assert_eq!(reply["id"], 7);
+        assert_eq!(
+            reply["error"]["message"],
+            "RPC response exceeds the local response limit"
+        );
+        assert!(refusal.is_none() && body.len() < 1024);
+        // A refused request keeps its refusal status for the async writer.
+        let limited = anyhow::Error::from(network_guard::Limited {
+            reason: "transaction admission is busy",
+            retry_after: Some(Duration::from_millis(1500)),
+        });
+        let (body, refusal) = rpc_reply(&id, Err(limited), 1024).unwrap();
+        let refusal = refusal.unwrap();
+        assert_eq!((refusal.status, refusal.retry_after), (429, Some(2)));
+        assert_eq!(
+            decode(&body)["error"]["message"],
+            "transaction admission is busy"
+        );
+    }
+
+    #[test]
     fn large_grant_preparation_reserves_work_for_every_recipient() {
         let params = json!({"operation":{"Propose":{"proposal":{"Grant":{"payments":vec![Value::Null; 1000]}}}}});
         assert_eq!(rpc_cost("fee_quote", &params), 1008);

@@ -1476,8 +1476,9 @@ fn admission_from_many_sources_stays_within_the_node_wide_selection_budget() {
     let view = snapshot(&node);
     let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
     let (start, other_start) = (nonce(&node, &key()), nonce(&node, &other()));
-    // Charge every admission 400 ms of the one-second burst, whatever it took.
-    SELECTION_CHARGE.with(|charge| charge.set(Some(Duration::from_millis(400))));
+    // Charge every admission 900 ms of the one-second burst, whatever it took,
+    // so the budget is seconds in debt after two.
+    SELECTION_CHARGE.with(|charge| charge.set(Some(Duration::from_millis(900))));
     selections();
     // Eight sources each relay four newcomers, one per message, at once.
     let mut sent = Vec::new();
@@ -1493,11 +1494,11 @@ fn admission_from_many_sources_stays_within_the_node_wide_selection_budget() {
             sent.push(tx);
         }
     }
-    // Three admissions spent the burst; the other 29 newcomers wait, costing
+    // Two admissions spent the burst; the other 30 newcomers wait, costing
     // nothing, however many sources sent them.
-    assert_eq!(selections(), 3);
-    assert_eq!(queued(&node), 29);
-    assert_eq!(pool(&node).0.len(), 3);
+    assert_eq!(selections(), 2);
+    assert_eq!(queued(&node), 30);
+    assert_eq!(pool(&node).0.len(), 2);
     // Once the budget has refilled, the next message admits all of them
     // with one selection.
     node.admission.unpoisoned().budget =

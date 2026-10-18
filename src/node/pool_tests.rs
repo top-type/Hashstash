@@ -1552,6 +1552,10 @@ fn parked_submission(
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn admission_from_many_sources_stays_within_the_node_wide_selection_budget() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 64 * 1024);
@@ -1636,6 +1640,10 @@ fn the_admission_queue_keeps_each_source_a_fair_share() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn a_low_bid_at_a_count_full_pool_is_refused_without_a_selection() {
     let directory = tempfile::tempdir().unwrap();
     let mut config = configuration(64 * 1024);
@@ -1672,6 +1680,10 @@ fn a_low_bid_at_a_count_full_pool_is_refused_without_a_selection() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn a_waiting_block_submission_goes_ahead_of_queued_admissions() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 16 * 1024);
@@ -1696,6 +1708,10 @@ fn a_waiting_block_submission_goes_ahead_of_queued_admissions() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn block_execution_runs_off_the_node_lock() {
     let directory = tempfile::tempdir().unwrap();
     let node = decision_node(directory.path(), 64 * 1024);
@@ -1821,6 +1837,10 @@ fn a_new_tip_template_never_waits_for_a_build_of_the_old_tip() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn a_spend_from_an_account_a_pending_transfer_creates_waits_for_its_funding() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 16 * 1024);
@@ -1856,6 +1876,10 @@ fn a_spend_from_an_account_a_pending_transfer_creates_waits_for_its_funding() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn spends_awaiting_funding_are_bounded_and_expire() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 16 * 1024);

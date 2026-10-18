@@ -51,6 +51,10 @@ fn mine_needs_a_development_network_or_dev_rpc() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 async fn development_mining_and_server_wallets_have_their_own_workers() {
     let directory = tempfile::tempdir().unwrap();
     let secret = [82; 32];

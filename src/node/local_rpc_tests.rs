@@ -23,7 +23,7 @@ fn mine_needs_a_development_network_or_dev_rpc() {
     calibrated.test_work = false;
     calibrated.initial_bits = 0x1d00ffff;
     calibrated.limit_bits = 0x1d00ffff;
-    assert!(!development_network(&calibrated));
+    assert!(!development_network(&calibrated, false));
     let node = Node::open(
         &directory.path().join("calibrated.sqlite"),
         calibrated,
@@ -44,10 +44,64 @@ fn mine_needs_a_development_network_or_dev_rpc() {
     // The presets' development limit is a development network in any build.
     let mut easy = Config::devnet();
     easy.test_work = false;
-    assert!(easy_proof_of_work(&easy) && development_network(&easy));
+    assert!(easy_proof_of_work(&easy) && development_network(&easy, false));
     let node = Node::open(&directory.path().join("easy.sqlite"), easy, miner).unwrap();
     node.rpc("mine", json!({"count":2})).unwrap();
     assert_eq!(node.status().unwrap()["height"], 2);
+}
+
+/// `run --allow-easy-target` exposes an easy network to untrusted peers,
+/// whose hashrate can lift difficulty far above its limit: the node is then
+/// no development network, and `mine` needs `--dev-rpc` as on a calibrated one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mine_on_a_node_untrusted_peers_reach_needs_dev_rpc() {
+    let directory = tempfile::tempdir().unwrap();
+    let miner = crypto::public_key(&[84; 32]).unwrap();
+    let mut easy = Config::devnet();
+    easy.test_work = false;
+    assert!(!development_network(&easy, true));
+    // Fixture networks need a test build and are never shared.
+    let mut fixture = easy.clone();
+    fixture.test_work = true;
+    assert!(development_network(&fixture, true));
+    let client = reqwest::Client::new();
+    let exposed = ServerOptions {
+        p2p: "0.0.0.0:0".parse().unwrap(),
+        ..options()
+    };
+    for (name, dev_rpc, options, allowed) in [
+        ("exposed", false, exposed.clone(), false),
+        ("flagged", true, exposed, true),
+        ("loopback", false, options(), true),
+    ] {
+        let path = directory.path().join(format!("{name}.sqlite"));
+        let mut node = Node::open(&path, easy.clone(), miner).unwrap();
+        if dev_rpc {
+            node = node.with_dev_rpc();
+        }
+        let server = serve(node.clone(), options).await.unwrap();
+        let reply: Value = client
+            .post(format!("http://{}/rpc", server.rpc))
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"mine","params":{"count":1}}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if allowed {
+            assert!(reply["result"]["blocks"].is_array(), "{name}: {reply}");
+        } else {
+            let error = reply["error"]["message"].as_str().unwrap_or_default();
+            assert!(error.contains("--dev-rpc"), "{name}: {reply}");
+        }
+        assert_eq!(
+            node.status().unwrap()["height"],
+            u64::from(allowed),
+            "{name}"
+        );
+        server.stop().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -9,7 +9,8 @@ fixture=$(mktemp -d /tmp/hashstash-install-check.XXXXXXXX)
 trap 'rm -rf -- "$fixture"' EXIT
 checks=0
 binary_hash=$(sha256sum -- "$binary"); binary_hash=${binary_hash%% *}
-"$binary" init --config "$fixture/network.json" --preset dev > "$fixture/init.out"
+# The service binds P2P to 0.0.0.0, which run allows only on a calibrated genesis.
+"$binary" init --config "$fixture/network.json" --preset dev --hashrate 100T > "$fixture/init.out"
 genesis_hash=$(sha256sum -- "$fixture/network.json"); genesis_hash=${genesis_hash%% *}
 own=$("$binary" peer-keygen --out "$fixture/peer.json")
 other=$("$binary" peer-keygen --out "$fixture/other-peer.json")
@@ -30,10 +31,10 @@ PEER_KEY_FILE=/etc/hashstash/peer-identity.json
 PEER_PINS=192.0.2.2:18481=$other
 EOF
 }
-stage_tmpdir= candidate= candidate_hash=
+stage_tmpdir= candidate= candidate_hash= genesis_file= genesis_pin=
 check() {
   TMPDIR=${stage_tmpdir:-${TMPDIR:-/tmp}} bash "$repo/deploy/linux/install.sh" --binary "${candidate:-$binary}" --sha256 "${candidate_hash:-$binary_hash}" \
-    --genesis "$fixture/network.json" --genesis-sha256 "$genesis_hash" \
+    --genesis "${genesis_file:-$fixture/network.json}" --genesis-sha256 "${genesis_pin:-$genesis_hash}" \
     --node-env "$fixture/node.env" "$@" --check > "$fixture/out" 2> "$fixture/err"
 }
 pass() { check "$@" || { cat "$fixture/err" >&2; exit 1; }; checks=$((checks+1)); }
@@ -66,4 +67,14 @@ base; sed -i 's/^STRATUM_ENABLED=false/STRATUM_ENABLED=true/' "$fixture/node.env
 printf 'test-mining-password\n' > "$fixture/password"; pass --peer-key-file "$fixture/peer.json" --stratum-password-file "$fixture/password"
 base; sed -i '/^PEER_KEY_FILE=/d; /^PEER_PINS=/d' "$fixture/node.env"; pass
 reject --peer-key-file "$fixture/peer.json"
+# The uncalibrated development limit of a production-denominated genesis: the
+# preflight refuses it behind the service's 0.0.0.0 P2P listener, as the
+# service itself would at every restart, unless node.env allows it.
+"$binary" init --config "$fixture/easy.json" --preset dev > "$fixture/init.out" 2>&1
+sed -i 's/"test_work": true/"test_work": false/' "$fixture/easy.json"
+genesis_file=$fixture/easy.json; genesis_pin=$(sha256sum -- "$genesis_file"); genesis_pin=${genesis_pin%% *}
+base; sed -i '/^PEER_KEY_FILE=/d; /^PEER_PINS=/d' "$fixture/node.env"; reject
+grep -Fq -- '--allow-easy-target' "$fixture/err"; checks=$((checks+1))
+printf 'ALLOW_EASY_TARGET=true\n' >> "$fixture/node.env"; pass
+genesis_file= genesis_pin=
 printf '%s real-binary read-only Linux installation checks passed\n' "$checks"

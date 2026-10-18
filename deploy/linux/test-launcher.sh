@@ -37,15 +37,22 @@ reject() { : > "$fixture/args"; if launch "${1:-run}"; then printf 'Unexpected a
 has() { grep -Fxq -- "$1" "$fixture/args"; checks=$((checks+1)); }
 lacks() { ! grep -Fxq -- "$1" "$fixture/args"; checks=$((checks+1)); }
 replace() { sed -i "s|^$1=.*|$1=$2|" "$fixture/node.env"; }
-base; pass run; has --stratum; has --stratum-password-file; lacks --wallet
+# Check mode starts the node only as a preflight, which opens and binds nothing.
+preflight() { has run; has --preflight; [[ $(grep -Fxc -- run "$fixture/args") == $(grep -Fxc -- --preflight "$fixture/args") ]]; checks=$((checks+1)); }
+base; pass run; has --stratum; has --stratum-password-file; lacks --wallet; lacks --preflight; lacks --allow-easy-target
+# An easy-target genesis behind the 0.0.0.0 P2P listener runs only when node.env says so.
+base; printf 'ALLOW_EASY_TARGET=true\n' >> "$fixture/node.env"; pass run; has --allow-easy-target; lacks --preflight
+pass check; preflight; has --allow-easy-target
+base; printf 'ALLOW_EASY_TARGET=false\n' >> "$fixture/node.env"; pass run; lacks --allow-easy-target; pass check; preflight; lacks --allow-easy-target
+for enabled in '' maybe True 1; do base; printf 'ALLOW_EASY_TARGET=%s\n' "$enabled" >> "$fixture/node.env"; reject run 'invalid easy-target mode'; done
 base; auth; pass run; has --peer-key-file; has --peer-pin; has "192.0.2.2:18481=$peer_key"
-base; auth; pass check; has peer-keycheck; lacks run
+base; auth; pass check; has peer-keycheck; preflight
 base; auth; pass run; lacks --peer-discovery; lacks --seed; lacks --advertise-peer
 base; auth; discovery; pass run
 has --peer-discovery; has --seed; has seed.example:18481; has 192.0.2.3:18481; has --advertise-peer; has 192.0.2.1:18481
 has --peer-key-file; has --peer-pin; has "192.0.2.2:18481=$peer_key"; has --peer; has 192.0.2.2:18481
 [[ $(grep -Fxc -- --seed "$fixture/args") == 2 ]]; checks=$((checks+1))
-pass check; has peer-keycheck; has --peer-discovery; has --peer-pin; lacks run
+pass check; has peer-keycheck; has --peer-discovery; has --peer-pin; preflight
 base; auth; discovery; replace PEER_PINS ''; pass run; has --peer-key-file; has --peer-discovery; lacks --peer-pin
 pass check; has peer-keycheck; has --peer-discovery; lacks --peer-pin
 base; auth; discovery; replace PEERS ''; replace PEER_PINS ''; replace PEER_SEEDS ''; replace PEER_ADVERTISE ''; pass run; has --peer-discovery; lacks --peer; lacks --seed; lacks --advertise-peer

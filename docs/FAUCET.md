@@ -255,7 +255,11 @@ twice:
   per refresh. A completed search is not repeated while its blocks stay
   canonical: it then costs one lookup per refresh, which loads no block.
 - Claims keep using the last snapshot whose payments were accounted for until
-  a refresh finishes accounting for a new one. A claim reserved while a refresh
+  a refresh finishes accounting for a new one. A refresh that fails, for
+  example because a lookup timed out or the node was busy, pauses new claims in
+  the same step that ends it, so no claim, even one already waiting, is
+  prepared from a snapshot whose accounting failed; claims resume after the
+  next refresh that succeeds. A claim reserved while a refresh
   waits for its lookups makes that refresh set aside what they found: a moved
   receipt is read again, and a search result is applied by the next refresh,
   against the ledger as it is then. Until then new claims pause with

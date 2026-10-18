@@ -1554,37 +1554,40 @@ impl Engine {
             funds,
         })
     }
-    /// Adopts a snapshot together with the outcome of its accounting.
-    fn finish_refresh(&mut self, snap: Snap, outcome: Result<Option<Fault>>) -> Result<()> {
-        self.height = Some(snap.height);
-        self.tip = Some(snap.tip);
-        self.state_root = Some(snap.state_root);
-        self.settings = Some(snap.settings);
-        self.funds = snap.funds;
-        self.nonce = snap.nonce;
-        match outcome {
-            Ok(pause) => {
-                self.fault = pause.map(|pause| pause.0);
-                self.last_success = Some(Instant::now());
-                Ok(())
-            }
-            Err(error) => {
-                if let Some(fault) = error.downcast_ref::<Fault>() {
-                    self.fault = Some(fault.0);
+    /// Ends a refresh in one step: adopts its snapshot with the outcome of its
+    /// accounting, journals that outcome by fixed category and publishes the
+    /// resulting state. A failed refresh clears the last success here, in the
+    /// step that adopts its unaccounted snapshot, so the claim the engine goes
+    /// to next can never prepare against that snapshot as if it were fresh.
+    fn finish_refresh(&mut self, accounted: Result<(Snap, Result<Option<Fault>>)>) -> Result<()> {
+        let refreshed = accounted.and_then(|(snap, outcome)| {
+            self.height = Some(snap.height);
+            self.tip = Some(snap.tip);
+            self.state_root = Some(snap.state_root);
+            self.settings = Some(snap.settings);
+            self.funds = snap.funds;
+            self.nonce = snap.nonce;
+            match outcome {
+                Ok(pause) => {
+                    self.fault = pause.map(|pause| pause.0);
+                    self.last_success = Some(Instant::now());
+                    Ok(())
                 }
-                Err(error)
+                Err(error) => {
+                    if let Some(fault) = error.downcast_ref::<Fault>() {
+                        self.fault = Some(fault.0);
+                    }
+                    Err(error)
+                }
             }
-        }
-    }
-    /// Journals a refresh by fixed category and publishes the resulting state.
-    fn record_refresh(&mut self, refreshed: Result<()>) {
-        match refreshed {
+        });
+        match &refreshed {
             Ok(()) => self.refresh_diagnostics.recovered(),
             Err(error) => {
                 self.last_success = None;
                 if self
                     .refresh_diagnostics
-                    .record(&error, now(), Instant::now())
+                    .record(error, now(), Instant::now())
                     && let Some(status) = self.refresh_diagnostics.error.as_ref()
                 {
                     eprintln!(
@@ -1599,6 +1602,7 @@ impl Engine {
         }
         self.report_state();
         self.publish();
+        refreshed
     }
     /// The newest confirmed receipt, whose block commits to its own
     /// transactions, which included the payment, and to all older receipts.
@@ -1997,14 +2001,25 @@ impl Hold for Held {
     }
 }
 
-/// One refresh: the node snapshot, its accounting, then its adoption.
+/// One refresh: the node snapshot and its accounting, then one step that
+/// adopts it and records the outcome, whether the refresh succeeded or not.
 async fn poll_once(hold: &mut impl Hold, node: &NodeClient, key: &str) -> Result<()> {
+    let accounted = account(hold, node, key).await;
+    hold.step(move |engine| engine.finish_refresh(accounted))
+        .await
+}
+
+/// A node snapshot with the outcome of its accounting, not yet adopted.
+async fn account(
+    hold: &mut impl Hold,
+    node: &NodeClient,
+    key: &str,
+) -> Result<(Snap, Result<Option<Fault>>)> {
     // The snapshot is the largest reply; nothing is held while it arrives.
     let snapshot: NodeSnapshot = node.call("snapshot", json!({"key":key})).await?;
     let snap = hold.step(move |engine| engine.observe(snapshot)).await?;
     let outcome = reconcile(hold, node, &snap).await;
-    hold.step(move |engine| engine.finish_refresh(snap, outcome))
-        .await
+    Ok((snap, outcome))
 }
 
 /// Accounts for every faucet nonce the canonical chain consumed, and returns
@@ -2390,14 +2405,7 @@ pub async fn serve(config: FaucetConfig) -> Result<FaucetServer> {
         let mut shared = Shared(engine);
         loop {
             let refreshed = poll_once(&mut shared, &node, &key).await;
-            let wait = poll_wait(&refreshed);
-            let _ = shared
-                .step(move |engine| {
-                    engine.record_refresh(refreshed);
-                    Ok(())
-                })
-                .await;
-            tokio::time::sleep(wait).await;
+            tokio::time::sleep(poll_wait(&refreshed)).await;
         }
     });
     let (stop, shutdown) = oneshot::channel();
@@ -4741,6 +4749,104 @@ mod tests {
         engine.claim(&recipient(5), "c").await.unwrap();
         let next = engine.ledger.pending().unwrap().unwrap();
         assert_eq!(wallet::decode_signed(&next.raw, &[7; 32]).unwrap().body.nonce, 1);
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_queued_behind_a_failed_refresh_never_uses_its_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let (mut engine, _, node, task) = ready_engine(&dir, |c| c.expiry_blocks = 20).await;
+        let first = engine.claim(&recipient(3), "a").await.unwrap();
+        {
+            let mut node = node.lock().await;
+            let transactions = node.transactions.clone();
+            node.blocks.insert(3, block(3, transactions));
+            node.nonce = 1;
+            node.height = 4;
+        }
+        engine.refresh().await.unwrap();
+        assert_eq!(
+            engine.status(Some(&recipient(3)), "a").unwrap()["claim"]["status"],
+            "confirmed"
+        );
+        // A reorganization drops the payment, so its nonce is unused again,
+        // and the busy node refuses the lookup that would show it.
+        let (entered, release) = {
+            let mut node = node.lock().await;
+            let mut branch = block(3, vec![]);
+            branch.header.nonce = 55;
+            node.blocks.insert(3, branch);
+            node.nonce = 0;
+            node.height = 5;
+            node.refusals
+                .push(("blockreceipt", StatusCode::SERVICE_UNAVAILABLE, None));
+            gate_receipts(&mut node)
+        };
+        let key = hex::encode(engine.sender);
+        let client = engine.node.clone();
+        let engine = Arc::new(Mutex::new(engine));
+        let refresh = {
+            let (engine, client) = (engine.clone(), client.clone());
+            tokio::spawn(async move { poll_once(&mut Shared(engine), &client, &key).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        // Queue the refresh's last step and then a claim behind the engine,
+        // so the claim takes the engine as soon as that step releases it.
+        let held = engine.clone().lock_owned().await;
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !node.lock().await.refusals.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let claim = {
+            let (engine, client) = (engine.clone(), client.clone());
+            tokio::spawn(async move {
+                let mut held = Held(Some(engine.lock_owned().await));
+                claim_with(&mut held, &client, recipient(4), "b".into()).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(held);
+        let error = tokio::time::timeout(Duration::from_secs(5), refresh)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.is::<NodeBusy>());
+        // That claim would have signed the payment's nonce again from the
+        // unaccounted snapshot. The step that adopted it also paused claims.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), claim)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        let mut engine = engine.lock().await;
+        assert_eq!(node.lock().await.prepared, 1);
+        assert_eq!(
+            engine.refresh_diagnostics.error.as_ref().unwrap().category,
+            "node_busy"
+        );
+        assert_eq!(
+            engine.published.answer(None, "b").unwrap()["state"],
+            "waiting_for_mining"
+        );
+        assert!(engine.ledger.last(&recipient(4)).unwrap().is_none());
+        // The next refreshes account the payment again and retry its bytes.
+        engine.refresh().await.unwrap();
+        engine.refresh().await.unwrap();
+        let retried = engine.ledger.pending().unwrap().unwrap();
+        assert_eq!(retried.txid, first["txid"]);
+        assert_eq!(engine.state().unwrap(), "pending");
+        assert_eq!(engine.published.answer(None, "b").unwrap()["state"], "pending");
+        assert_eq!(node.lock().await.transactions.len(), 1);
         task.abort();
     }
 

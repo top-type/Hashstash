@@ -1474,7 +1474,7 @@ async fn main() -> Result<()> {
                 public: String,
                 secret: &'a str,
             }
-            let secret_hex = Zeroizing::new(hex::encode(&*secret));
+            let secret_hex = Zeroizing::new(hex::encode(secret.as_slice()));
             write_new(
                 &out,
                 &NewKeyFile {

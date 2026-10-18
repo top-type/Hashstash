@@ -40,13 +40,13 @@
 //!
 //!     cargo run --release --example poc_treap_depth -- [N] [STACK_BYTES] [VALID_POINTS]
 //!
-//! * N            number of spine keys to grind and insert (default 20000).
-//! * STACK_BYTES  worker-thread stack size (default 2097152 = 2 MiB, the Tokio
-//!                blocking-thread default; pass 1048576 for the 1 MiB default
-//!                Windows main-thread stack).
-//! * VALID_POINTS 1 (default) requires each key to be a valid x-only secp256k1
-//!                point, matching the real accounts map; 0 runs the pure
-//!                data-structure demonstration with arbitrary 32-byte keys.
+//! * `N`: number of spine keys to grind and insert (default 20000).
+//! * `STACK_BYTES`: worker-thread stack size (default 2097152 = 2 MiB, the
+//!   Tokio blocking-thread default; pass 1048576 for the 1 MiB default
+//!   Windows main-thread stack).
+//! * `VALID_POINTS`: 1 (default) requires each key to be a valid x-only
+//!   secp256k1 point, matching the real accounts map; 0 runs the pure
+//!   data-structure demonstration with arbitrary 32-byte keys.
 //!
 //! Output:
 //! * The grind reports the number of `tagged_hash` calls and the elapsed time.

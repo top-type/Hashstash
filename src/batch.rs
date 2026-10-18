@@ -510,6 +510,7 @@ fn constraint_gap(
     (gap, divisor)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn candidate(
     w: &World,
     buys: &[Order],

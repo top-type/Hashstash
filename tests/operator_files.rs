@@ -9,7 +9,13 @@ fn repository(path: &str) -> String {
 /// "Hashstash 0.42.0", "version=0.42.0" or "/opt/hashstash/0.42.0-". Other
 /// products' versions (nginx, systemd) may appear; IPv4 addresses have four parts.
 fn release_numbers(text: &str) -> Vec<&str> {
-    const CONTEXTS: [&str; 5] = ["hashstash ", "hashstash/", "version ", "version=", "release "];
+    const CONTEXTS: [&str; 5] = [
+        "hashstash ",
+        "hashstash/",
+        "version ",
+        "version=",
+        "release ",
+    ];
     let lower = text.to_ascii_lowercase();
     let mut found = Vec::new();
     let mut start = None;
@@ -25,7 +31,9 @@ fn release_numbers(text: &str) -> Vec<&str> {
         let parts: Vec<_> = run.split('.').collect();
         if parts.len() == 3
             && parts.iter().all(|part| !part.is_empty())
-            && CONTEXTS.iter().any(|context| lower[..begin].ends_with(context))
+            && CONTEXTS
+                .iter()
+                .any(|context| lower[..begin].ends_with(context))
         {
             found.push(run);
         }
@@ -42,7 +50,9 @@ fn linux_installer_accepts_exactly_this_release() {
     let version = env!("CARGO_PKG_VERSION");
     let installer = repository("deploy/linux/install.sh");
     assert!(
-        installer.lines().any(|line| line == format!("version={version}")),
+        installer
+            .lines()
+            .any(|line| line == format!("version={version}")),
         "install.sh must pin the Cargo.toml version"
     );
     for path in ["deploy/linux/install.sh", "deploy/linux/README.md"] {
@@ -70,7 +80,10 @@ fn systemd_unit_confines_the_node() {
         "ProcSubset=pid",
         "LimitCORE=0",
     ] {
-        assert!(unit.lines().any(|line| line == directive), "missing {directive}");
+        assert!(
+            unit.lines().any(|line| line == directive),
+            "missing {directive}"
+        );
     }
 }
 
@@ -160,12 +173,14 @@ fn public_web_proxy_names_each_visitor_and_stays_within_node_sessions() {
             .map(|rest| rest.trim_end_matches(';').parse().unwrap())
             .collect()
     };
-    // One client stays below the node's per-visitor cap, and all clients
+    // One client stays within the node's per-visitor cap, and all clients
     // together within its public session pool, in every proxied location.
+    // The cap is below the pool, so one client never holds all of it.
+    const { assert!(PUBLIC_WEB_VISITOR_SESSIONS < PUBLIC_WEB_SESSIONS) };
     let per_client = limits("hashstash_connections");
     assert!(per_client.len() >= 2, "{per_client:?}");
     for limit in per_client {
-        assert!(limit <= PUBLIC_WEB_VISITOR_SESSIONS && limit < PUBLIC_WEB_SESSIONS);
+        assert!(limit <= PUBLIC_WEB_VISITOR_SESSIONS, "{limit}");
     }
     assert_eq!(limits("hashstash_upstream"), [PUBLIC_WEB_SESSIONS; 2]);
 }
@@ -196,5 +211,8 @@ fn linux_launcher_script_regressions() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_installer_checks_with_this_binary() {
-    run_script(&["deploy/linux/test-install-check.sh", env!("CARGO_BIN_EXE_hashstash")]);
+    run_script(&[
+        "deploy/linux/test-install-check.sh",
+        env!("CARGO_BIN_EXE_hashstash"),
+    ]);
 }

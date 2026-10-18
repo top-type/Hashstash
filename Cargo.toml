@@ -80,6 +80,10 @@ name = "exact_wallet"
 required-features = ["test-fixtures"]
 
 [[test]]
+name = "f006_worst_case"
+required-features = ["test-fixtures"]
+
+[[test]]
 name = "explorer"
 required-features = ["test-fixtures"]
 

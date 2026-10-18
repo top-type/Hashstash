@@ -5370,10 +5370,10 @@ impl HttpRefusal {
                     message: format!("{}: the request exceeds the whole budget", limited.reason),
                 },
             })
-        } else if let Some(busy) = error.downcast_ref::<network_guard::Busy>() {
-            Some(Self::busy(busy.0))
         } else {
-            None
+            error
+                .downcast_ref::<network_guard::Busy>()
+                .map(|busy| Self::busy(busy.0))
         }
     }
     async fn send<W: AsyncWrite + Unpin>(&self, write: &mut W, body: &Value) -> Result<()> {
@@ -9869,6 +9869,10 @@ mod peer_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
     fn catch_up_replies_are_bounded_by_recipient_work_as_well_as_bytes() {
         use secp256k1::{Keypair, Secp256k1, SecretKey};
         let dir = tempfile::tempdir().unwrap();
@@ -9930,7 +9934,8 @@ mod peer_tests {
         let (blocks, limits, size) = Node::blocks_after(&chain, &[funded]).unwrap();
         assert!(2 * size < limits.block_batch_bytes());
         assert_eq!(blocks.len(), 1, "work, not bytes, ends this reply");
-        assert!(blocks[0].transactions.len() + 1 <= PEER_BATCH_WORK);
+        // A block's work is its transaction count plus one.
+        assert!(blocks[0].transactions.len() < PEER_BATCH_WORK);
         let (blocks, _, _) = Node::blocks_after(&chain, &[codec::block_hash(&blocks[0])]).unwrap();
         assert_eq!(blocks.len(), 1);
         // A genesis signature limit above the baseline burst still admits

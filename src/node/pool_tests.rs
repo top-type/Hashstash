@@ -109,6 +109,10 @@ fn fund_other(node: &Node) {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn runtime_reads_preparation_and_wallet_status_do_not_wait_for_the_node_lock() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 16 * 1024)
@@ -165,6 +169,10 @@ fn runtime_reads_preparation_and_wallet_status_do_not_wait_for_the_node_lock() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn relay_selects_and_publishes_only_for_new_admissible_entries() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 16 * 1024);
@@ -248,6 +256,10 @@ fn relay_selects_and_publishes_only_for_new_admissible_entries() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn the_opening_screen_allows_a_recipient_an_earlier_transaction_may_create() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 16 * 1024);
@@ -274,6 +286,10 @@ fn the_opening_screen_allows_a_recipient_an_earlier_transaction_may_create() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn a_relayed_nonce_gap_is_not_remembered_and_its_chain_is_admitted_together() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 16 * 1024);
@@ -305,6 +321,10 @@ fn a_relayed_nonce_gap_is_not_remembered_and_its_chain_is_admitted_together() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn reorg_recovery_is_one_selection_without_rechecking_reincluded_transactions() {
     fn append(chain: &mut Chain, transactions: Vec<Transaction>) -> Block {
         let time = chain.tip_block().header.timestamp + chain.tip_state().settings.interval as u32;
@@ -381,6 +401,10 @@ fn reorg_recovery_is_one_selection_without_rechecking_reincluded_transactions() 
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn a_failed_recovery_still_reports_the_block_and_keeps_pending_entries() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 16 * 1024);
@@ -416,6 +440,10 @@ fn a_failed_recovery_still_reports_the_block_and_keeps_pending_entries() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn capacity_displaced_entries_wait_in_the_backlog_for_the_next_block() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 16 * 1024);
@@ -473,6 +501,10 @@ fn capacity_displaced_entries_wait_in_the_backlog_for_the_next_block() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn weight_displaced_account_creations_also_wait_in_the_backlog() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 16 * 1024);
@@ -502,6 +534,10 @@ fn weight_displaced_account_creations_also_wait_in_the_backlog() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn a_count_full_pool_still_admits_a_better_bid() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 2 * 1024 * 1024);
@@ -532,6 +568,10 @@ fn a_count_full_pool_still_admits_a_better_bid() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn a_new_tip_is_published_once_together_with_its_recovered_pool() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 16 * 1024);
@@ -580,6 +620,10 @@ fn a_launch_on_the_wrong_network_leaves_the_wallet_store_unchanged() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn an_entry_that_failed_every_attempt_is_dropped_rather_than_kept_undecided() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 1024 * 1024);
@@ -608,6 +652,10 @@ fn an_entry_that_failed_every_attempt_is_dropped_rather_than_kept_undecided() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn a_block_finishing_failure_truncates_only_the_template() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 1024 * 1024);
@@ -886,6 +934,10 @@ fn empty_block(node: &Node) -> Block {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn admission_spends_no_curve_work_under_the_node_lock() {
     let directory = tempfile::tempdir().unwrap();
     let node = decision_node(directory.path(), 64 * 1024)
@@ -992,6 +1044,10 @@ fn admission_spends_no_curve_work_under_the_node_lock() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn equal_rate_replacement_churn_clears_only_when_a_template_is_built() {
     let directory = tempfile::tempdir().unwrap();
     let node = decision_node(directory.path(), 64 * 1024);
@@ -1055,6 +1111,10 @@ fn equal_rate_replacement_churn_clears_only_when_a_template_is_built() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn template_clearing_runs_off_the_node_lock() {
     let directory = tempfile::tempdir().unwrap();
     let node = decision_node(directory.path(), 64 * 1024);
@@ -1115,6 +1175,10 @@ fn template_clearing_runs_off_the_node_lock() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn node_templates_match_consensus_execution_byte_for_byte() {
     let directory = tempfile::tempdir().unwrap();
     let node = decision_node(directory.path(), 64 * 1024);
@@ -1162,6 +1226,10 @@ fn node_templates_match_consensus_execution_byte_for_byte() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn same_parent_rebuilds_wait_for_the_previous_build_time() {
     let directory = tempfile::tempdir().unwrap();
     let node = decision_node(directory.path(), 64 * 1024);
@@ -1195,6 +1263,10 @@ fn same_parent_rebuilds_wait_for_the_previous_build_time() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn a_new_tip_template_is_never_throttled() {
     let directory = tempfile::tempdir().unwrap();
     let node = decision_node(directory.path(), 64 * 1024);

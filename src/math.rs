@@ -97,7 +97,7 @@ fn log_atanh(z_numerator: &Amount, z_denominator: &Amount, bits: usize) -> Bound
 fn log_two(bits: usize) -> &'static Bounds {
     const LEVELS: usize = CURVE_BITS / PRECISION_STEP + 1;
     static VALUES: [OnceLock<Bounds>; LEVELS] = [const { OnceLock::new() }; LEVELS];
-    assert!(bits % PRECISION_STEP == 0 && bits <= CURVE_BITS);
+    assert!(bits.is_multiple_of(PRECISION_STEP) && bits <= CURVE_BITS);
     VALUES[bits / PRECISION_STEP]
         .get_or_init(|| log_atanh(&Amount::one(), &Amount::from(3u32), bits))
 }

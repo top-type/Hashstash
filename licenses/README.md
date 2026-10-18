@@ -4,7 +4,6 @@ This directory preserves available license and notice files from the exact regis
 
 | Dependency | Version | Declared license | Notice files |
 | --- | --- | --- | --- |
-| ahash | 0.8.12 | MIT OR Apache-2.0 | 2 |
 | anstream | 1.0.0 | MIT OR Apache-2.0 | 2 |
 | anstyle | 1.0.14 | MIT OR Apache-2.0 | 2 |
 | anstyle-parse | 1.0.0 | MIT OR Apache-2.0 | 2 |
@@ -47,6 +46,7 @@ This directory preserves available license and notice files from the exact regis
 | fallible-streaming-iterator | 0.1.9 | MIT/Apache-2.0 | 2 |
 | fastrand | 2.5.0 | Apache-2.0 OR MIT | 2 |
 | find-msvc-tools | 0.1.14 | MIT OR Apache-2.0 | 2 |
+| foldhash | 0.2.0 | Zlib | 1 |
 | form_urlencoded | 1.2.2 | MIT OR Apache-2.0 | 2 |
 | futures-channel | 0.3.34 | MIT OR Apache-2.0 | 2 |
 | futures-core | 0.3.34 | MIT OR Apache-2.0 | 2 |
@@ -56,8 +56,8 @@ This directory preserves available license and notice files from the exact regis
 | getrandom | 0.2.17 | MIT OR Apache-2.0 | 2 |
 | getrandom | 0.3.4 | MIT OR Apache-2.0 | 2 |
 | getrandom | 0.4.3 | MIT OR Apache-2.0 | 2 |
-| hashbrown | 0.14.5 | MIT OR Apache-2.0 | 2 |
-| hashlink | 0.9.1 | MIT OR Apache-2.0 | 2 |
+| hashbrown | 0.16.1 | MIT OR Apache-2.0 | 2 |
+| hashlink | 0.11.1 | MIT OR Apache-2.0 | 2 |
 | heck | 0.5.0 | MIT OR Apache-2.0 | 2 |
 | hex | 0.4.3 | MIT OR Apache-2.0 | 2 |
 | hex-conservative | 0.2.3 | CC0-1.0 | 1 |
@@ -84,7 +84,7 @@ This directory preserves available license and notice files from the exact regis
 | itoa | 1.0.18 | MIT OR Apache-2.0 | 2 |
 | js-sys | 0.3.106 | MIT OR Apache-2.0 | 2 |
 | libc | 0.2.190 | MIT OR Apache-2.0 | 2 |
-| libsqlite3-sys | 0.30.1 | MIT | 2 |
+| libsqlite3-sys | 0.37.0 | MIT | 2 |
 | linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 4 |
 | litemap | 0.8.3 | Unicode-3.0 | 1 |
 | lock_api | 0.4.14 | MIT OR Apache-2.0 | 2 |
@@ -122,7 +122,8 @@ This directory preserves available license and notice files from the exact regis
 | redox_syscall | 0.5.18 | MIT | 1 |
 | reqwest | 0.12.28 | MIT OR Apache-2.0 | 2 |
 | ring | 0.17.14 | Apache-2.0 AND ISC | 6 |
-| rusqlite | 0.32.1 | MIT | 1 |
+| rsqlite-vfs | 0.1.1 | MIT | 0 |
+| rusqlite | 0.39.0 | MIT | 1 |
 | rustc-hash | 2.1.3 | Apache-2.0 OR MIT | 2 |
 | rustix | 1.1.5 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 4 |
 | rustls | 0.23.46 | Apache-2.0 OR ISC OR MIT | 3 |
@@ -145,6 +146,7 @@ This directory preserves available license and notice files from the exact regis
 | slab | 0.4.12 | MIT | 1 |
 | smallvec | 1.16.2 | MIT OR Apache-2.0 | 2 |
 | socket2 | 0.6.5 | MIT OR Apache-2.0 | 2 |
+| sqlite-wasm-rs | 0.5.5 | MIT | 1 |
 | stable_deref_trait | 1.2.1 | MIT OR Apache-2.0 | 2 |
 | strsim | 0.11.1 | MIT | 1 |
 | subtle | 2.6.1 | BSD-3-Clause | 1 |

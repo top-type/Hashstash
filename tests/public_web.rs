@@ -757,3 +757,63 @@ async fn garbage_lists_cost_only_their_bytes_and_wallet_calls_outlast_an_explore
     assert_ne!(reply["error"]["message"], "network rate budget exhausted");
     server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visitor_loads_the_wallet_twice_while_many_networks_share_the_website() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = crypto::public_key(&[114; 32]).unwrap();
+    let node = Node::open(&directory.path().join("chain.sqlite"), config(), key).unwrap();
+    let server = node::serve(node, options()).await.unwrap();
+    let base = format!("http://{}", server.public_web.unwrap());
+    let client = reqwest::Client::new();
+    let call = |visitor: String, method: &'static str| {
+        client
+            .post(format!("{base}/rpc"))
+            .header("X-Real-IP", visitor)
+            .json(&json!({"jsonrpc":"2.0","id":5,"method":method,"params":{}}))
+            .send()
+    };
+    // Thirty-two networks poll once each, so every visitor now refills at a
+    // thirty-second of the shared rates.
+    for n in 1..=32u8 {
+        let response = call(format!("203.0.{n}.1"), "status").await.unwrap();
+        assert_eq!(response.status(), 200);
+    }
+    // A browser loads the interface, reloads it, and makes its startup
+    // calls each time. Every request, a proxied connection and a request at
+    // the node, is served.
+    let browser = || "192.0.2.80".to_string();
+    let assets = [
+        "/",
+        "/style.css",
+        "/app.js",
+        "/chat.js",
+        "/mail-crypto.js",
+        "/transaction-mail.js",
+        "/mail.js",
+        "/proposal-data.js",
+        "/explorer.js",
+        "/vendor/noble.js",
+        "/browser-wallet.js",
+        "/amounts.js",
+        "/shares.js",
+        "/address.js",
+        "/api/session",
+    ];
+    for _ in 0..2 {
+        for asset in assets {
+            let response = client
+                .get(format!("{base}{asset}"))
+                .header("X-Real-IP", browser())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200, "{asset}");
+        }
+        for method in ["status", "config", "snapshot", "governance", "mining"] {
+            let response = call(browser(), method).await.unwrap();
+            assert_eq!(response.status(), 200, "{method}");
+        }
+    }
+    server.stop().await;
+}

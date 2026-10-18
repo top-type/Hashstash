@@ -50,13 +50,18 @@ pub const VERIFIED_PEER_SLOTS: usize = 4;
 /// Concurrent inbound sessions from one network group (IPv4 /16, IPv6 /32).
 pub const PEER_SLOTS_PER_GROUP: usize = 2;
 /// A source that delivered a new valid block or transaction keeps its general
-/// inbound sessions from eviction this long; at most `PROTECTED_USEFUL` such
-/// sessions, the most recent deliverers, and `PROTECTED_LONGEST` of the
-/// longest-connected others are protected, as is each group's oldest.
+/// inbound sessions from eviction this long. Eviction spares at most
+/// `PROTECTED_USEFUL` such sessions, the most recent deliverers, the oldest
+/// session of `PROTECTED_GROUPS` network groups ranked by a key no source
+/// knows, and `PROTECTED_LONGEST` of the longest-connected others, and never
+/// so many that fewer than `EVICTABLE_GENERAL` sessions other than configured
+/// or pinned peers remain candidates.
 pub const USEFUL_PEER_WINDOW: Duration = Duration::from_secs(600);
 const USEFUL_PEER_SOURCES: usize = 256;
 const PROTECTED_USEFUL: usize = 4;
+const PROTECTED_GROUPS: usize = 4;
 const PROTECTED_LONGEST: usize = 4;
+const EVICTABLE_GENERAL: usize = INBOUND_PEER_SLOTS / 4;
 /// Stratum connections awaiting authorization that any source may use, plus
 /// slots that only addresses which recently authorized may use when those are full.
 pub const STRATUM_PENDING_SLOTS: usize = 128;
@@ -110,6 +115,10 @@ const PUBLIC_WEB_VISITOR_ACTIVITY: Duration = Duration::from_secs(10);
 /// One over this much of the proxy's work and byte bursts is kept for
 /// wallet-critical calls: other calls must leave it in the bucket.
 const PUBLIC_WEB_ESSENTIAL_SHARE: u64 = 4;
+/// A public reply whose method price is flat, such as an explorer read, pays
+/// one work unit per this many bytes it returns. Public work bursts admit the
+/// work of one largest reply.
+pub const REPLY_BYTES_PER_WORK: u64 = 1024;
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
 pub enum Surface {
@@ -409,11 +418,16 @@ impl Bucket {
 struct Record {
     active: usize,
     last: Instant,
+    /// When a connection or charge of this record was last admitted.
+    admitted: Option<Instant>,
     cooldown: Instant,
     /// Until when a connection refused before its session started goes
     /// unanswered, because this address was already told when to return.
     answered_until: Instant,
     strikes: u32,
+    /// When this record was last penalized. Its strikes lapse after a minute
+    /// without a penalty, however busy it stays meanwhile.
+    penalized: Instant,
     /// When an aggregate last took a strike, and its distinct members
     /// penalized since a minute without strikes, up to `AGGREGATE_STRIKES`.
     struck: Instant,
@@ -427,9 +441,11 @@ impl Record {
         Self {
             active: 0,
             last: now,
+            admitted: None,
             cooldown: now,
             answered_until: now,
             strikes: 0,
+            penalized: now,
             struck: now,
             members: Vec::new(),
             requests: Bucket::new(p.request_burst, now),
@@ -438,10 +454,11 @@ impl Record {
         }
     }
     fn penalize(&mut self, now: Instant) {
-        if now.duration_since(self.last) > Duration::from_secs(60) {
+        if now.saturating_duration_since(self.penalized) > Duration::from_secs(60) {
             self.strikes = 0;
         }
         self.strikes = self.strikes.saturating_add(1).min(7);
+        self.penalized = now;
         self.last = now;
         self.cooldown = now + Duration::from_millis((250u64 << (self.strikes - 1)).min(16_000));
     }
@@ -575,8 +592,11 @@ impl NetworkGuard {
         )
     }
     /// A visitor's share of the proxy's budgets: one over the number of
-    /// visitors (named or direct) active in the last ten seconds, within
-    /// bounds. Unused on the private guard.
+    /// visitor networks (named or direct) holding a session or admitted in
+    /// the last ten seconds, within bounds. A visitor with an aggregate is
+    /// counted by it, so the addresses of one /24 or /48 count once, and an
+    /// attempt that admission refused counts not at all. Unused on the
+    /// private guard.
     fn visitor_share(&self, records: &HashMap<Key, Record>, now: Instant) -> u64 {
         if !self.loopback_rpc_is_proxy {
             return PUBLIC_WEB_VISITOR_SHARE;
@@ -585,9 +605,12 @@ impl NetworkGuard {
             .iter()
             .filter(|(key, record)| {
                 key.1 == Surface::Rpc
-                    && key.3 == Scope::Address
                     && !self.is_proxy(**key)
-                    && now.saturating_duration_since(record.last) < PUBLIC_WEB_VISITOR_ACTIVITY
+                    && (key.3 == Scope::Aggregate || self.aggregate_of(**key).is_none())
+                    && (record.active > 0
+                        || record.admitted.is_some_and(|at| {
+                            now.saturating_duration_since(at) < PUBLIC_WEB_VISITOR_ACTIVITY
+                        }))
             })
             .count();
         (active as u64).clamp(PUBLIC_WEB_VISITOR_SHARE, PUBLIC_WEB_MAX_VISITOR_SHARE)
@@ -596,22 +619,27 @@ impl NetworkGuard {
         let mut policy = self.policy_at(key.1, frame);
         if self.loopback_rpc_is_proxy && key.1 == Surface::Rpc {
             let base = Surface::Rpc.policy();
+            // The work one largest public reply pays for its bytes.
+            let reply_work = frame / REPLY_BYTES_PER_WORK;
             if self.is_proxy(key) {
                 policy.connections = PUBLIC_WEB_SESSIONS;
                 // One largest reply still fits above the essential reserve.
-                policy.byte_burst = base
-                    .byte_burst
-                    .max(frame.saturating_add(Self::essential_reserve().0));
+                let (bytes, work) = Self::essential_reserve();
+                policy.byte_burst = base.byte_burst.max(frame.saturating_add(bytes));
+                policy.work_burst = base.work_burst.max(reply_work.saturating_add(work));
             } else {
+                // Refill rates are the visitor's current share. Bursts stay
+                // an eighth whatever the share, and still admit one largest
+                // reply's bytes and work, so how many others are active
+                // changes how long a call waits, never whether it can fit.
+                let burst = PUBLIC_WEB_VISITOR_SHARE;
                 policy.connections = PUBLIC_WEB_VISITOR_SESSIONS;
-                policy.requests = (policy.requests / share).max(1);
-                policy.request_burst = (policy.request_burst / share).max(1);
-                policy.bytes = (policy.bytes / share).max(1);
-                policy.work = (policy.work / share).max(1);
-                policy.work_burst = (policy.work_burst / share).max(1);
-                // A visitor's byte burst still admits one largest reply; its
-                // refill rate is its share.
-                policy.byte_burst = (base.byte_burst / share).max(frame);
+                policy.requests = (base.requests / share).max(1);
+                policy.request_burst = (base.request_burst / burst).max(1);
+                policy.bytes = (base.bytes / share).max(1);
+                policy.byte_burst = (base.byte_burst / burst).max(frame);
+                policy.work = (base.work / share).max(1);
+                policy.work_burst = (base.work_burst / burst).max(reply_work);
             }
         }
         if key.3 == Scope::Aggregate {
@@ -676,13 +704,18 @@ impl NetworkGuard {
             if key.1 == Surface::Stratum {
                 continue;
             }
-            let old = self.key_policy_at(*key, share, previous).byte_burst;
-            let new = self.key_policy_at(*key, share, maximum).byte_burst;
-            record.bytes.tokens = record
-                .bytes
-                .tokens
-                .saturating_add(new.saturating_sub(old))
-                .min(new);
+            // Public work bursts also admit one largest reply's work.
+            let old = self.key_policy_at(*key, share, previous);
+            let new = self.key_policy_at(*key, share, maximum);
+            for (bucket, old, new) in [
+                (&mut record.bytes, old.byte_burst, new.byte_burst),
+                (&mut record.work, old.work_burst, new.work_burst),
+            ] {
+                bucket.tokens = bucket
+                    .tokens
+                    .saturating_add(new.saturating_sub(old))
+                    .min(new);
+            }
         }
         Ok(())
     }
@@ -812,6 +845,7 @@ impl NetworkGuard {
             record.requests.take(1, p.requests, p.request_burst, now);
             record.active += 1;
             record.last = now;
+            record.admitted = Some(now);
         }
         Ok(())
     }
@@ -890,11 +924,17 @@ impl Session {
     }
     /// Release the previous frame's memory before another frame is read.
     pub fn begin_frame(&self) -> Result<()> {
+        self.frame_processed();
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+    /// The current frame's message was decoded and processed, and none of
+    /// its memory is held any longer: release its reservation now, so a peer
+    /// that stops reading a reply or never sends its next frame holds none.
+    pub fn frame_processed(&self) {
         let mut held = accounting(&self.reserved_frame);
         let mut memory = accounting(&self.guard.frame_memory);
         self.release_frame(&mut memory, std::mem::take(&mut *held));
-        self.frames.fetch_add(1, Ordering::Relaxed);
-        Ok(())
     }
     /// The number of frames this session has begun and the shared frame
     /// memory it holds, for a session whose frames use the shared budget;
@@ -913,8 +953,9 @@ impl Session {
     /// largest frame; other sessions share the rest, at most one largest frame
     /// or an equal share of the general slots per network group. The
     /// reservation also covers decoding and processing of that message and is
-    /// released by the session's next frame or its close. Connections this
-    /// node opened are bounded separately and never wait on inbound traffic.
+    /// released once that is done (`frame_processed`), or by the session's
+    /// next frame or its close. Connections this node opened are bounded
+    /// separately and never wait on inbound traffic.
     pub fn reserve_frame(&self, bytes: usize) -> Result<()> {
         if self.key.2 == Direction::Outbound {
             return Ok(());
@@ -1082,6 +1123,7 @@ impl Session {
             record.bytes.take(bytes, p.bytes, p.byte_burst, now);
             record.work.take(work, p.work, p.work_burst, now);
             record.last = now;
+            record.admitted = Some(now);
         }
         Ok(())
     }
@@ -1159,7 +1201,8 @@ impl Drop for Session {
 pub enum PeerClass {
     General,
     /// A discovery peer this node synchronized with during the last hour.
-    /// Any remote can arrange that, so its network group stays capped.
+    /// Any remote can arrange that, so its network group stays capped and a
+    /// general slot it holds can be taken over like any other.
     Verified,
     /// A configured or pinned peer address the operator chose.
     Operator,
@@ -1187,21 +1230,31 @@ struct SlotCounts {
     admitted: u64,
     /// When each source last delivered a new valid block or transaction.
     useful: HashMap<IpAddr, Instant>,
+    /// Ranks network groups for eviction protection. It never leaves this
+    /// process, so no source can tell which groups it favours.
+    key: [u8; 32],
 }
 impl SlotCounts {
     /// The general-slot session a newcomer takes over when every slot it may
-    /// use is full. Configured, pinned and recently verified peers are never
-    /// evicted, nor are the sessions of the sources that most recently
-    /// delivered a new block or transaction, each group's oldest session and
-    /// the longest-connected others. Of the rest, the newest session of the
-    /// group holding the most general slots goes.
+    /// use is full. Configured and pinned peers are never evicted. Of the
+    /// others, the sessions of the sources that most recently delivered a new
+    /// block or transaction, the oldest session of a few groups ranked by a
+    /// keyed hash and the longest-connected others are spared, each within
+    /// its bound and never so many that fewer than `EVICTABLE_GENERAL`
+    /// candidates remain. Of the rest, the newest session of the group
+    /// holding the most general slots goes. However many groups or useful
+    /// sources the occupants span, a newcomer is therefore refused only when
+    /// configured and pinned peers hold every general slot.
     fn victim(&self, now: Instant) -> Option<u64> {
         let mut candidates: Vec<(u64, &Occupant)> = self
             .occupants
             .iter()
-            .filter(|(_, occupant)| occupant.class == PeerClass::General)
+            .filter(|(_, occupant)| occupant.class != PeerClass::Operator)
             .map(|(id, occupant)| (*id, occupant))
             .collect();
+        let spare = |candidates: &[(u64, &Occupant)], wanted: usize| {
+            wanted.min(candidates.len().saturating_sub(EVICTABLE_GENERAL))
+        };
         let mut useful: Vec<(Instant, u64)> = candidates
             .iter()
             .filter_map(|(id, occupant)| {
@@ -1214,13 +1267,26 @@ impl SlotCounts {
         useful.sort_by(|a, b| b.cmp(a));
         let protected: HashSet<u64> = useful
             .iter()
-            .take(PROTECTED_USEFUL)
+            .take(spare(&candidates, PROTECTED_USEFUL))
             .map(|(_, id)| *id)
             .collect();
         candidates.retain(|(id, _)| !protected.contains(id));
+        // Candidates are oldest first, so a group's first is its oldest.
         let mut seen = HashSet::new();
-        candidates.retain(|(_, occupant)| !seen.insert(occupant.group));
-        candidates.drain(..PROTECTED_LONGEST.min(candidates.len()));
+        let mut oldest: Vec<([u8; 32], u64)> = candidates
+            .iter()
+            .filter(|(_, occupant)| seen.insert(occupant.group))
+            .map(|(id, occupant)| (self.rank(occupant.group), *id))
+            .collect();
+        oldest.sort_unstable();
+        let protected: HashSet<u64> = oldest
+            .iter()
+            .take(spare(&candidates, PROTECTED_GROUPS))
+            .map(|(_, id)| *id)
+            .collect();
+        candidates.retain(|(id, _)| !protected.contains(id));
+        let longest = spare(&candidates, PROTECTED_LONGEST);
+        candidates.drain(..longest);
         let mut held: HashMap<IpAddr, usize> = HashMap::new();
         for occupant in self.occupants.values() {
             *held.entry(occupant.group).or_default() += 1;
@@ -1230,6 +1296,14 @@ impl SlotCounts {
             .max_by_key(|(id, occupant)| (held[&occupant.group], *id))
             .map(|(id, _)| id)
     }
+    /// A network group's place in the order of eviction protection.
+    fn rank(&self, group: IpAddr) -> [u8; 32] {
+        let bytes = match group {
+            IpAddr::V4(v) => v.octets().to_vec(),
+            IpAddr::V6(v) => v.octets().to_vec(),
+        };
+        crate::crypto::hmac_sha256(&self.key, &[&bytes])
+    }
 }
 /// Inbound peer session capacity. Network groups have a concurrency cap.
 /// While the general slots are full, configured and pinned peers keep slots
@@ -1237,9 +1311,15 @@ impl SlotCounts {
 /// slots, at most one per network group, and any other newcomer takes over
 /// an unprotected general session's slot (`SlotCounts::victim`), whose
 /// session is told to close.
-#[derive(Default)]
 pub struct PeerSlots {
     counts: Mutex<SlotCounts>,
+}
+impl Default for PeerSlots {
+    fn default() -> Self {
+        let mut key = [0u8; 32];
+        let _ = getrandom::fill(&mut key);
+        Self::with_group_key(key)
+    }
 }
 pub struct PeerSlot {
     slots: Arc<PeerSlots>,
@@ -1257,6 +1337,15 @@ impl PeerSlot {
     }
 }
 impl PeerSlots {
+    /// Slots whose eviction protection ranks network groups by `key`.
+    fn with_group_key(key: [u8; 32]) -> Self {
+        Self {
+            counts: Mutex::new(SlotCounts {
+                key,
+                ..Default::default()
+            }),
+        }
+    }
     pub fn try_acquire(self: &Arc<Self>, ip: IpAddr, class: PeerClass) -> Option<PeerSlot> {
         self.try_acquire_at(ip, class, Instant::now())
     }
@@ -1357,6 +1446,13 @@ impl PeerSlots {
             counts.useful.remove(&oldest);
         }
         counts.useful.insert(source, now);
+    }
+    /// Whether `ip`'s source was credited with delivering something new.
+    #[cfg(test)]
+    pub(crate) fn delivered_by(&self, ip: IpAddr) -> bool {
+        accounting(&self.counts)
+            .useful
+            .contains_key(&admission_address(ip))
     }
 }
 impl Drop for PeerSlot {
@@ -2543,33 +2639,37 @@ mod tests {
             .filter_map(|n| slots.try_acquire(ipv6(n), PeerClass::General))
             .collect();
         assert_eq!(v6.len(), 2);
-        // Filling the general slots needs many distinct groups. When every
-        // session is its group's oldest or among the longest connected, none
-        // is evicted and a newcomer is refused.
-        let held: Vec<_> = (2..=13)
-            .map(|group| {
-                slots
-                    .try_acquire(public(group, 1, 1), PeerClass::General)
-                    .unwrap()
-            })
+        // A full general pool takes over an unprotected session's slot rather
+        // than refusing a newcomer. With configured or pinned peers holding
+        // twelve slots, the four others are all candidates, and the newest
+        // session of a group holding two goes.
+        let operators: Vec<_> = (1..=12)
+            .map(|n| slots.try_acquire(public(50, n, 1), PeerClass::Operator).unwrap())
             .collect();
+        let newcomer = slots.try_acquire(public(30, 1, 1), PeerClass::General).unwrap();
+        let id = v6[1].occupant.unwrap();
+        assert!(!slots.counts.lock().unwrap().occupants.contains_key(&id));
+        drop((newcomer, v6));
+        // Once configured and pinned peers hold every general slot, other
+        // newcomers are refused. Recently verified discovery peers remain
+        // group-capped and take at most one verified slot per group, so
+        // verified addresses in one /16 gain nothing, and verified peers
+        // never use configured capacity.
+        drop(same);
+        let held: Vec<_> = (13..=16)
+            .map(|n| slots.try_acquire(public(50, n, 1), PeerClass::Operator).unwrap())
+            .chain(operators)
+            .collect();
+        assert_eq!(slots.counts.lock().unwrap().general, INBOUND_PEER_SLOTS);
         assert!(
             slots
                 .try_acquire(public(30, 1, 1), PeerClass::General)
                 .is_none()
         );
-        // Recently verified discovery peers remain group-capped and take at
-        // most one verified slot per group, so verified addresses in one /16
-        // gain nothing, and verified peers never use configured capacity.
         let verified: Vec<_> = (1..=8)
             .filter_map(|n| slots.try_acquire(public(30, n, 1), PeerClass::Verified))
             .collect();
         assert_eq!(verified.len(), 1);
-        assert!(
-            slots
-                .try_acquire(public(1, 7, 1), PeerClass::Verified)
-                .is_none()
-        );
         let verified: Vec<_> = (31..=40)
             .filter_map(|group| slots.try_acquire(public(group, 1, 1), PeerClass::Verified))
             .chain(verified)
@@ -2599,13 +2699,13 @@ mod tests {
             })
             .collect();
         assert_eq!(local.len(), INBOUND_PEER_SLOTS - 4);
-        drop((same, local));
+        drop(local);
         let counts = slots.counts.lock().unwrap();
         assert_eq!(
             (counts.general, counts.verified, counts.operator),
-            (2, 0, 0)
+            (0, 0, 0)
         );
-        assert_eq!(counts.groups.len(), 1);
+        assert!(counts.groups.is_empty() && counts.occupants.is_empty());
     }
     #[test]
     fn a_panic_during_accounting_never_disables_admission() {
@@ -2867,6 +2967,20 @@ mod tests {
         assert!(guard.admit("127.0.0.1".parse().unwrap(), Surface::Rpc).is_ok());
     }
     #[test]
+    fn strikes_lapse_a_minute_after_the_last_penalty_however_busy_the_record_stays() {
+        let now = Instant::now();
+        let mut record = Record::new(Surface::Rpc.policy(), now);
+        record.penalize(now);
+        record.penalize(now + Duration::from_secs(1));
+        assert_eq!(record.strikes, 2);
+        // Admitted calls kept the record active meanwhile.
+        let later = now + Duration::from_secs(70);
+        record.last = later;
+        record.penalize(later);
+        assert_eq!(record.strikes, 1);
+        assert_eq!(record.cooldown, later + Duration::from_millis(250));
+    }
+    #[test]
     fn wallet_calls_keep_a_reserve_that_flooding_visitors_cannot_spend() {
         let guard = Arc::new(NetworkGuard::for_public_web());
         let proxy: IpAddr = "127.0.0.1".parse().unwrap();
@@ -2928,6 +3042,58 @@ mod tests {
         }
     }
     #[test]
+    fn a_largest_reply_and_a_page_load_fit_a_visitor_however_many_networks_are_active() {
+        const MIB: usize = 1024 * 1024;
+        let guard = Arc::new(NetworkGuard::for_public_web());
+        guard.set_frame(200 * MIB).unwrap();
+        let proxy: IpAddr = "127.0.0.1".parse().unwrap();
+        let visitor = |client: IpAddr| -> Session {
+            let session = guard.admit(proxy, Surface::Rpc).unwrap();
+            session.forwarded_for(client).unwrap();
+            session
+        };
+        let share = || guard.visitor_share(&guard.records.lock().unwrap(), Instant::now());
+        // Forty /64s of one /48 are one network: the share stays an eighth.
+        for n in 0..40 {
+            visitor(IpAddr::from([0x2001, 0xdb8, 0x77, n, 0, 0, 0, 1])).request().unwrap();
+        }
+        assert_eq!(share(), PUBLIC_WEB_VISITOR_SHARE);
+        // A visitor in a cooldown that admission refuses counts not at all.
+        let refused: IpAddr = "198.51.100.200".parse().unwrap();
+        let named = (refused, Surface::Rpc, Direction::Forwarded, Scope::Address);
+        guard.records.lock().unwrap().insert(named, {
+            let mut record = Record::new(guard.key_policy(named, 8), Instant::now());
+            record.cooldown = Instant::now() + Duration::from_secs(60);
+            record
+        });
+        let session = guard.admit(proxy, Surface::Rpc).unwrap();
+        assert!(session.forwarded_for(refused).is_err());
+        assert_eq!(share(), PUBLIC_WEB_VISITOR_SHARE);
+        // Thirty-two other networks make one call each: every visitor now
+        // refills at a thirty-second of the shared rates.
+        for n in 1..=32 {
+            visitor(IpAddr::from([203, 0, n, 1])).request().unwrap();
+        }
+        assert_eq!(share(), PUBLIC_WEB_MAX_VISITOR_SHARE);
+        // An explorer reply of 200 MiB pays 204,800 work units, more than a
+        // thirty-second of the shared work burst. It still fits at once, and
+        // the next one waits for refill instead of never fitting.
+        let reader = visitor("192.0.2.7".parse().unwrap());
+        reader.nonessential();
+        let work = 200 * MIB / REPLY_BYTES_PER_WORK as usize;
+        reader.outgoing(200 * MIB, work).unwrap();
+        let error = reader.outgoing(200 * MIB, work).unwrap_err();
+        let wait = error.downcast::<Limited>().unwrap().retry_after;
+        assert!(wait.is_some_and(|wait| wait > Duration::ZERO), "{wait:?}");
+        // A browser loading the wallet twice, with its scripts and startup
+        // calls, makes about 48 requests through the proxy, each a named
+        // connection and a request. None is refused.
+        let browser: IpAddr = "192.0.2.8".parse().unwrap();
+        for _ in 0..48 {
+            visitor(browser).request().unwrap();
+        }
+    }
+    #[test]
     fn a_lower_frame_allowance_lowers_byte_bursts_and_frame_memory_again() {
         const MIB: usize = 1024 * 1024;
         let guard = Arc::new(NetworkGuard::default());
@@ -2981,6 +3147,11 @@ mod tests {
         assert_eq!(stalled[0].frame_progress(), Some((1, 0)));
         fifth.reserve_frame(FRAME).unwrap();
     }
+    /// Whether `slot` lost its general slot to a newcomer.
+    fn taken_over(slots: &PeerSlots, slot: &PeerSlot) -> bool {
+        let id = slot.occupant.expect("a general slot");
+        !accounting(&slots.counts).occupants.contains_key(&id)
+    }
     #[tokio::test]
     async fn a_full_general_pool_evicts_the_newest_session_of_the_most_represented_group() {
         use tokio::time::timeout;
@@ -2995,44 +3166,95 @@ mod tests {
                     .is_ok()
             }
         };
-        // Eight groups hold two general slots each.
+        // Twelve groups hold a general slot each, and groups 1 to 4 a second.
         let mut held = Vec::new();
-        for a in 1..=8 {
-            for b in 1..=2 {
-                let slot = slots.try_acquire_at(public(a, b), PeerClass::General, now);
-                held.push(slot.unwrap());
-            }
+        for (a, b) in (1..=12).map(|a| (a, 1)).chain((1..=4).map(|a| (a, 2))) {
+            let slot = slots.try_acquire_at(public(a, b), PeerClass::General, now);
+            held.push(slot.unwrap());
         }
-        // The newest session's source delivered a new block, so it stays.
-        // Each group's oldest and the four longest-connected others stay
-        // too, which leaves the second sessions of groups 5 to 7; group 7's
-        // is the newest of the most represented.
-        slots.delivered_at(public(8, 2), now);
+        // At most four groups' oldest sessions and the four longest-connected
+        // others are spared. The second sessions are the newest and belong to
+        // the most represented groups, so group 4's goes first; its session
+        // is told to close at once.
         let newcomer = slots
-            .try_acquire_at(public(9, 1), PeerClass::General, now)
+            .try_acquire_at(public(20, 1), PeerClass::General, now)
             .unwrap();
-        assert!(evicted(&held[13]).await);
-        assert!(!evicted(&held[15]).await);
-        assert!(!evicted(&held[12]).await);
-        // Group 7 now holds one slot; the next victim is group 6's second.
+        assert!(evicted(&held[15]).await);
+        assert!(!evicted(&held[14]).await);
+        assert_eq!(held.iter().filter(|s| taken_over(&slots, s)).count(), 1);
+        // A source that delivered a new block keeps its sessions: group 3's
+        // second is spared, and group 2's goes next.
+        slots.delivered_at(public(3, 2), now);
         let second = slots
-            .try_acquire_at(public(10, 1), PeerClass::General, now)
+            .try_acquire_at(public(21, 1), PeerClass::General, now)
             .unwrap();
-        assert!(evicted(&held[11]).await);
-        // Configured, pinned and verified peers in general slots are never
-        // evicted. Once only protected sessions remain, newcomers wait.
-        drop(held.drain(..));
-        let verified: Vec<_> = (11..=17)
-            .flat_map(|a| [public(a, 1), public(a, 2)])
-            .map(|address| {
-                let slot = slots.try_acquire_at(address, PeerClass::Verified, now);
-                slot.unwrap()
-            })
-            .collect();
+        assert!(taken_over(&slots, &held[13]) && !taken_over(&slots, &held[14]));
         assert_eq!(slots.counts.lock().unwrap().general, INBOUND_PEER_SLOTS);
-        let late = slots.try_acquire_at(public(30, 1), PeerClass::General, now);
-        assert!(late.is_none());
-        drop((verified, newcomer, second));
+        drop((held, newcomer, second));
+        let counts = slots.counts.lock().unwrap();
+        assert_eq!((counts.general, counts.verified, counts.operator), (0, 0, 0));
+        assert!(counts.groups.is_empty() && counts.occupants.is_empty());
+    }
+    #[test]
+    fn eviction_protection_is_bounded_however_many_groups_or_useful_sources_hold_slots() {
+        let now = Instant::now();
+        let public = |a: u8, b: u8| IpAddr::from([8, a, b, 1]);
+        let fill = |slots: &Arc<PeerSlots>, sources: Vec<(IpAddr, PeerClass)>| -> Vec<PeerSlot> {
+            let held: Vec<_> = sources
+                .into_iter()
+                .map(|(ip, class)| slots.try_acquire_at(ip, class, now).unwrap())
+                .collect();
+            assert_eq!(slots.counts.lock().unwrap().general, INBOUND_PEER_SLOTS);
+            held
+        };
+        // Sixteen groups each hold one general slot. A newcomer from a
+        // seventeenth still takes one over, and so does every later newcomer
+        // from yet another group: one session each, never a refusal.
+        let slots = Arc::new(PeerSlots::default());
+        let held = fill(&slots, (1..=16).map(|a| (public(a, 1), PeerClass::General)).collect());
+        let mut newcomers = Vec::new();
+        for a in 17..=60 {
+            let slot = slots.try_acquire_at(public(a, 1), PeerClass::General, now);
+            newcomers.push(slot.unwrap());
+            let gone = held.iter().chain(&newcomers).filter(|s| taken_over(&slots, s));
+            assert_eq!(gone.count(), newcomers.len());
+            assert_eq!(slots.counts.lock().unwrap().general, INBOUND_PEER_SLOTS);
+        }
+        drop((held, newcomers));
+        // Eight groups of two recently verified peers, four of whose sources
+        // delivered something new, cannot keep a newcomer out either, and the
+        // session it takes over is not one of those sources'.
+        let slots = Arc::new(PeerSlots::default());
+        let sources = (1..=8).flat_map(|a| [public(a, 1), public(a, 2)]);
+        let held = fill(&slots, sources.map(|ip| (ip, PeerClass::Verified)).collect());
+        for a in 1..=4 {
+            slots.delivered_at(public(a, 2), now);
+        }
+        let newcomer = slots.try_acquire_at(public(30, 1), PeerClass::General, now);
+        assert!(newcomer.is_some());
+        let gone: Vec<usize> = (0..held.len()).filter(|n| taken_over(&slots, &held[*n])).collect();
+        assert_eq!(gone.len(), 1);
+        assert!(![1, 3, 5, 7].contains(&gone[0]), "{gone:?}");
+        drop((held, newcomer));
+        // Configured and pinned peers are never taken over: with twelve of
+        // them, the four other sessions are the only candidates, and only
+        // when they hold every general slot are newcomers refused.
+        let slots = Arc::new(PeerSlots::default());
+        let operators = (1..=12).map(|n| (public(40, n), PeerClass::Operator));
+        let others = (1..=4).map(|a| (public(a, 1), PeerClass::General));
+        let held = fill(&slots, operators.chain(others).collect());
+        let mut newcomers = Vec::new();
+        for a in 50..=53 {
+            newcomers.push(slots.try_acquire_at(public(a, 1), PeerClass::General, now).unwrap());
+        }
+        assert!(held[..12].iter().all(|s| !taken_over(&slots, s)));
+        let gone = held[12..].iter().chain(&newcomers).filter(|s| taken_over(&slots, s));
+        assert_eq!(gone.count(), 4);
+        drop((held, newcomers));
+        let all = (1..=16).map(|n| (public(41, n), PeerClass::Operator)).collect();
+        let operators = fill(&slots, all);
+        assert!(slots.try_acquire_at(public(54, 1), PeerClass::General, now).is_none());
+        drop(operators);
         let counts = slots.counts.lock().unwrap();
         assert_eq!((counts.general, counts.verified, counts.operator), (0, 0, 0));
         assert!(counts.groups.is_empty() && counts.occupants.is_empty());

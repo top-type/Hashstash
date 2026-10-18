@@ -759,6 +759,8 @@ struct Newcomer {
     id: Hash,
     transaction: Transaction,
     source: Option<IpAddr>,
+    /// The address that relayed it, credited if a selection admits it new.
+    relayer: Option<IpAddr>,
     /// Its signature was already checked.
     authenticated: bool,
 }
@@ -2660,6 +2662,10 @@ impl Node {
                 let mut rejected = self.rejected_locked();
                 for (id, _) in &screened.candidates {
                     if accepted.contains(id) {
+                        // A new pool entry: its relayer delivered something.
+                        if let Some(relayer) = newcomers[index[id]].relayer {
+                            self.peer_sessions.delivered(relayer);
+                        }
                         outcomes[index[id]] = Some(Ok(Admitted::Pending));
                         continue;
                     }
@@ -2742,6 +2748,7 @@ impl Node {
                     id: entry.id,
                     transaction: entry.transaction,
                     source: entry.source,
+                    relayer: None,
                     authenticated: true,
                 });
                 continue;
@@ -3201,6 +3208,7 @@ impl Node {
                 id,
                 transaction: tx,
                 source: None,
+                relayer: None,
                 authenticated: true,
             })
         })
@@ -3238,6 +3246,7 @@ impl Node {
                 id: codec::transaction_id(&transaction),
                 transaction,
                 source: None,
+                relayer: None,
                 authenticated: false,
             })
         })
@@ -3554,6 +3563,7 @@ impl Node {
                 id: codec::transaction_id(&transaction),
                 transaction,
                 source: None,
+                relayer: None,
                 authenticated: true,
             };
             // Beyond the holding bounds, or without a pending transfer that
@@ -3975,12 +3985,16 @@ impl Node {
         }
         legacy.insert(peer, Instant::now());
     }
-    /// Accept a peer message from `source`, the address that sent it.
+    /// Accept a peer message from `source`, the address that sent it. A block
+    /// of it that this call makes the tip, and a transaction of it that a
+    /// selection admits as new, credit that address with a delivery, which
+    /// keeps its inbound sessions from eviction (`PeerSlots::delivered`).
     fn receive_peer(&self, msg: &PeerMessage, source: IpAddr) -> Result<()> {
         ensure!(
             msg.chain == self.read_view()?.chain.chain_id(),
             "different genesis configuration"
         );
+        let relayer = source;
         let source = network_guard::peer_source(source);
         ensure!(
             msg.blocks.len() <= MAX_BATCH
@@ -4018,7 +4032,8 @@ impl Node {
                 );
                 math::check_pow(&b.header, &target)?;
                 match self.submit_block_from(b.clone(), Some(source)) {
-                    Ok(_) => {}
+                    Ok(true) => self.peer_sessions.delivered(relayer),
+                    Ok(false) => {}
                     // A declined side block's header is held for presync, so
                     // the rest of its branch is still downloaded after it. A
                     // full presync bound may evict that header at once; the
@@ -4118,6 +4133,7 @@ impl Node {
             id,
             transaction: tx.clone(),
             source: Some(source),
+            relayer: Some(relayer),
             authenticated: true,
         }));
         self.drain_admissions()
@@ -5433,7 +5449,8 @@ async fn read_peer_packet<R: AsyncBufRead + Unpin>(
 /// receive `FRAME_PROGRESS_BYTES` more in every `FRAME_PROGRESS_WINDOW`;
 /// otherwise the read ends as `Busy`, which releases the memory with the
 /// session and starts no cooldown. Configured and pinned peers, and
-/// connections this node opened, are exempt.
+/// connections this node opened, are exempt. A complete frame holds its
+/// memory only until its message has been processed (`frame_processed`).
 async fn keep_frame_progress<T>(
     admission: &Session,
     read: impl std::future::Future<Output = Result<Result<T>, tokio::time::error::Elapsed>>,
@@ -6287,6 +6304,9 @@ async fn peer_session_steps(node: &Node, mut stream: TcpStream, admission: &Sess
         }
         declared = Some(capacity);
         let reply = headers_reply_async(node, locator, version).await?;
+        // A processed message holds no frame memory while its reply is
+        // written and the next frame awaited (see `Session::frame_processed`).
+        admission.frame_processed();
         write_peer(node, &mut write, reply, admission, &mut transport).await?;
         request = read_peer_packet(
             &mut read,
@@ -6322,13 +6342,16 @@ async fn peer_session_steps(node: &Node, mut stream: TcpStream, admission: &Sess
                     addresses: book.advertised(now(), random_u64()),
                 }
             };
+            admission.frame_processed();
             write_peer(node, &mut write, reply, admission, &mut transport).await?;
             return Ok(());
         }
         _ => bail!("unexpected first peer message"),
     };
-    let hello = receive_peer_async(node, hello, remote.ip()).await?;
-    let reply = peer_snapshot_async(node, Some(hello.locator), declared).await?;
+    // Only the locator outlives the hello's processing.
+    let PeerMessage { locator, .. } = receive_peer_async(node, hello, remote.ip()).await?;
+    admission.frame_processed();
+    let reply = peer_snapshot_async(node, Some(locator), declared).await?;
     write_peer(
         node,
         &mut write,
@@ -6339,6 +6362,7 @@ async fn peer_session_steps(node: &Node, mut stream: TcpStream, admission: &Sess
     .await?;
     let push = read_peer(&mut read, node, admission, &mut transport).await?;
     receive_peer_async(node, push, remote.ip()).await?;
+    admission.frame_processed();
     write_peer(node, &mut write, PeerPacket::Ack, admission, &mut transport).await?;
     Ok(())
 }
@@ -6365,26 +6389,14 @@ async fn receive_peer_async(
     source: IpAddr,
 ) -> Result<PeerMessage> {
     let permit = timeout(IO_TIMEOUT, node.peer_workers.clone().acquire_owned()).await??;
-    let before = node.read_view()?;
     let worker = node.clone();
-    let message = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let _permit = permit;
         worker.receive_peer(&message, source)?;
         anyhow::Ok(message)
     })
     .await
-    .context("peer validation worker failed")??;
-    // A source whose message became the tip, or changed the pool, delivered
-    // something new; its inbound sessions are then kept from eviction.
-    let after = node.read_view()?;
-    let tip = after.chain.tip_hash();
-    if (tip != before.chain.tip_hash()
-        && message.blocks.iter().any(|b| codec::block_hash(b) == tip))
-        || (after.pool_revision != before.pool_revision && !message.transactions.is_empty())
-    {
-        node.peer_sessions.delivered(source);
-    }
-    Ok(message)
+    .context("peer validation worker failed")?
 }
 async fn peer_snapshot_async(
     node: &Node,
@@ -7317,10 +7329,12 @@ fn charge_public_reply(admission: &Session, bytes: usize, work: usize) -> Result
     admission.outgoing(bytes, work)
 }
 /// Explorer replies pay one work unit per this many bytes they return, once
-/// they are built, in addition to their method price.
-const EXPLORER_REPLY_BYTES_PER_WORK: usize = 1024;
-/// Public calls a wallet needs to show its balance and to prepare, price and
-/// broadcast a transaction. Only these may spend the reserve that the public
+/// they are built, in addition to their method price. Public work bursts
+/// admit the work of one largest reply.
+const EXPLORER_REPLY_BYTES_PER_WORK: usize = network_guard::REPLY_BYTES_PER_WORK as usize;
+/// Public calls a wallet needs to show its balance, to price, prepare and
+/// broadcast a transfer, a Stash deposit or redemption, and to check its
+/// support for a refund. Only these may spend the reserve that the public
 /// website's shared budget keeps; explorer and other reads must leave it.
 fn public_rpc_essential(method: &str) -> bool {
     matches!(
@@ -7330,6 +7344,8 @@ fn public_rpc_essential(method: &str) -> bool {
             | "account"
             | "fee_quote"
             | "transfer_quote"
+            | "stash_quote"
+            | "support"
             | "preparetransaction"
             | "broadcasttransaction"
     )
@@ -12283,6 +12299,60 @@ mod peer_tests {
         // The stalled frame's memory returned with its session; the others'
         // with theirs.
         assert_eq!(guard.frame_memory_in_use(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_processed_hello_holds_no_frame_memory_while_its_sender_stalls() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        let miner = crypto::public_key(&[71; 32]).unwrap();
+        let node = Node::open(&dir.path().join("node.db"), config, miner).unwrap();
+        let guard = Arc::new(NetworkGuard::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, remote) = listener.accept().await.unwrap();
+        let admission = guard.admit(remote.ip(), Surface::Peer).unwrap();
+        let session = tokio::spawn(peer_session(node.clone(), stream, admission, None));
+        // A hello padded with loose transactions that fail validation: it is
+        // processed without error, and its sender then never reads the reply
+        // nor sends its push.
+        let junk = |n: u8| Transaction {
+            body: TransactionBody {
+                sender: crypto::public_key(&[n; 32]).unwrap(),
+                nonce: 0,
+                fee: 1u32.into(),
+                anchor: [0; 32],
+                expiry_blocks: 10,
+                operation: Operation::TransferExact {
+                    recipient: miner,
+                    amount: 1u32.into(),
+                },
+                data: vec![0; 8 * 1024],
+            },
+            signature: [0; 64],
+        };
+        let mut hello = node.peer_snapshot(None).unwrap();
+        hello.transactions = (1..=32).map(junk).collect();
+        let limits = node.peer_limits().unwrap();
+        let payload = peer_wire::encode(&PeerPacket::Sync(hello), limits).unwrap();
+        assert!(payload.len() > 256 * 1024);
+        let frame = peer_wire::frame(&payload, limits.frame_bytes()).unwrap();
+        client.write_all(&frame).await.unwrap();
+        // The reply starts arriving once the hello was processed. From then
+        // on the session holds none of the shared frame memory, although it
+        // waits a whole read allowance for the push.
+        timeout(Duration::from_secs(10), client.readable())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(guard.frame_memory_in_use(), 0);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!session.is_finished());
+        assert_eq!(guard.frame_memory_in_use(), 0);
+        drop(client);
+        assert!(session.await.unwrap().is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

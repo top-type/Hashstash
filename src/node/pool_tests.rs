@@ -1617,6 +1617,7 @@ fn the_admission_queue_keeps_each_source_a_fair_share() {
             id,
             transaction: transaction.clone(),
             source: Some(source.parse().unwrap()),
+            relayer: None,
             authenticated: true,
         }
     };
@@ -1911,4 +1912,57 @@ fn spends_awaiting_funding_are_bounded_and_expire() {
     assert_eq!(awaiting(&node).len(), AWAITING_PER_SENDER);
     assert!(node.submit_block(empty_block(&node)).unwrap());
     assert!(awaiting(&node).is_empty());
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn only_a_sources_own_new_block_or_transaction_protects_its_inbound_sessions() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    fund_other(&node);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let pooled = payment(config, state, &SECRET, nonce(&node, &key()), key(), 1, 10);
+    node.submit_transaction(pooled.clone()).unwrap();
+    let address = |text: &str| -> IpAddr { text.parse().unwrap() };
+    let (honest, replayer) = (address("8.1.1.1"), address("8.2.1.1"));
+    // Another source's newcomer waits for admission, and a replayer relays
+    // only the transaction already pooled. Admitting the newcomer while that
+    // message is handled changes the pool, but credits only its relayer.
+    let fresh = payment(config, state, &OTHER, nonce(&node, &other()), key(), 1, 0);
+    node.queue_admissions([Newcomer {
+        id: codec::transaction_id(&fresh),
+        transaction: fresh.clone(),
+        source: Some(network_guard::peer_source(honest)),
+        relayer: Some(honest),
+        authenticated: false,
+    }]);
+    let message = |transactions: Vec<Transaction>, blocks: Vec<Block>| PeerMessage {
+        chain: config.chain_id(),
+        locator: Vec::new(),
+        blocks,
+        transactions,
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let relay = |message: PeerMessage, source: IpAddr| {
+        runtime
+            .block_on(receive_peer_async(&node, message, source))
+            .unwrap();
+    };
+    relay(message(vec![pooled], Vec::new()), replayer);
+    assert!(ids(&snapshot(&node).mempool).contains(&codec::transaction_id(&fresh)));
+    assert!(node.peer_sessions.delivered_by(honest));
+    assert!(!node.peer_sessions.delivered_by(replayer));
+    // A block that becomes the tip credits its sender; the same block sent
+    // again by another source is already known and credits nobody.
+    let block = child(&node, 7);
+    let (first, second) = (address("8.3.1.1"), address("8.4.1.1"));
+    relay(message(Vec::new(), vec![block.clone()]), first);
+    assert_eq!(snapshot(&node).chain.tip_hash(), codec::block_hash(&block));
+    relay(message(Vec::new(), vec![block]), second);
+    assert!(node.peer_sessions.delivered_by(first));
+    assert!(!node.peer_sessions.delivered_by(second));
 }

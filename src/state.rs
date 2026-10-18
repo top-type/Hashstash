@@ -493,8 +493,12 @@ impl State {
                 .ok_or_else(|| anyhow::anyhow!("expired pending rest"))?;
             let activation =
                 crate::consensus::rounded_deadline(self.clock, remaining, self.frozen.interval)?;
-            let height =
-                crate::consensus::activation_height(self.height, 0, remaining, self.frozen.interval);
+            let height = crate::consensus::activation_height(
+                self.height,
+                0,
+                remaining,
+                self.frozen.interval,
+            );
             c.parameter_change_at(
                 &self.frozen,
                 parameter,
@@ -932,7 +936,10 @@ mod tests {
             unreachable!()
         };
         assert!(Arc::ptr_eq(&a.proposal, &b.proposal));
-        assert!(Arc::ptr_eq(&a.proposal, copy.actions.get_shared(&id).unwrap()));
+        assert!(Arc::ptr_eq(
+            &a.proposal,
+            copy.actions.get_shared(&id).unwrap()
+        ));
         let plain = (
             a.id,
             a.epoch,
@@ -999,49 +1006,59 @@ mod tests {
         assert!(empty.shares(&empty.clone()));
     }
 
+    /// Phase commitment bytes, packed by hand from docs/CONSENSUS.md and
+    /// checked with an independent model. Every field holds a distinct value,
+    /// so reordering any two fields changes the bytes. Whole state roots are
+    /// pinned in tests/commitment_encoding.rs.
     #[test]
-    fn the_state_root_commits_actions_once_and_never_in_the_phase() {
+    fn phase_commitments_are_frozen() {
         // Auction and rest commitments are the phase encoding itself.
-        for phase in [
-            Phase::Auction(Auction {
-                round: 2,
-                opened: 30,
-                leader: Some([7; 32]),
-                lead_since: 45,
-                replacement_height: 4,
-                displaced: vec![([8; 32], 35)].into(),
-            }),
-            Phase::Rest(Rest {
-                until: 90,
-                pending: Some((Parameter::Lead, 30)),
-            }),
-        ] {
-            assert_eq!(
-                codec::encode(&PhaseCommitment::from(&phase)),
-                codec::encode(&phase)
-            );
-        }
-        // A decision commits its tag and every field but its proposal copy.
-        let (s, id) = governed();
-        let Phase::Governance(d) = &s.phase else {
-            unreachable!()
-        };
-        let committed = (
-            1u32,
-            d.id,
-            d.epoch,
-            d.round,
-            d.proposal_id,
-            d.started,
-            d.started_height,
-            d.blocks,
-            d.leading_blocks,
+        let auction = Phase::Auction(Auction {
+            round: 2,
+            opened: 30,
+            leader: Some([7; 32]),
+            lead_since: 45,
+            replacement_height: 4,
+            displaced: vec![([8; 32], 35), ([9; 32], 300)].into(),
+        });
+        let rest = Phase::Rest(Rest {
+            until: 90,
+            pending: Some((Parameter::Lead, 30)),
+        });
+        // Tag 0, round, opened, Some(leader), lead_since, replacement
+        // height, then a count and each (ID, lead start).
+        let auction_bytes = format!(
+            "00021e01{}2d0402{}23{}fb2c01",
+            "07".repeat(32),
+            "08".repeat(32),
+            "09".repeat(32)
         );
+        // Tag 2, until, Some((Lead = 2, 30)).
+        for (phase, expected) in [(auction, auction_bytes), (rest, "025a01021e".into())] {
+            let committed = codec::encode(&PhaseCommitment::from(&phase));
+            assert_eq!(hex::encode(&committed), expected);
+            assert_eq!(committed, codec::encode(&phase));
+        }
+        // A decision commits tag 1 and every field but its proposal copy: id,
+        // epoch, round, proposal_id, started, started_height, blocks and
+        // leading_blocks.
+        let decision = Phase::Governance(Decision {
+            id: [5; 32],
+            epoch: 3,
+            round: 1,
+            proposal_id: [6; 32],
+            proposal: Arc::new(grant(40)),
+            started: 330,
+            started_height: 22,
+            blocks: 6,
+            leading_blocks: 2,
+        });
         assert_eq!(
-            codec::encode(&PhaseCommitment::from(&s.phase)),
-            codec::encode(&committed)
+            hex::encode(codec::encode(&PhaseCommitment::from(&decision))),
+            format!("01{}0301{}fb4a01160602", "05".repeat(32), "06".repeat(32))
         );
         // The action is committed through the actions map instead.
+        let (s, id) = governed();
         let mut other = s.clone();
         other.actions.insert(id.to_vec(), grant(39));
         assert_ne!(other.root(), s.root());

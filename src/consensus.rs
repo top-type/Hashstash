@@ -1250,7 +1250,7 @@ fn finish_block_with_fills(
             leader: None,
             lead_since: s.clock,
             replacement_height: s.height + 1,
-            displaced: Vec::new(),
+            displaced: Displaced::default(),
         });
         s.rounds.insert(
             s.last_round.to_be_bytes().to_vec(),

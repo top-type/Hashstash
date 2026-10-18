@@ -169,7 +169,66 @@ pub struct Auction {
     /// Leaders that lost the lead to a strictly higher bid, oldest first,
     /// with the lead start each held. One of them resumes that lead start
     /// when it leads again because every later leader was cancelled.
-    pub displaced: Vec<(Hash, u64)>,
+    pub displaced: Displaced,
+}
+/// An auction's displaced leaders. A round can displace one leader per block,
+/// so the list can hold thousands of entries. State versions share it: a clone
+/// is constant time, and only a version that changes it copies it. It encodes
+/// and commits exactly as the plain list.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Displaced(Arc<Vec<(Hash, u64)>>);
+impl std::fmt::Debug for Displaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+impl Displaced {
+    /// Keeps the entries `keep` accepts; an unchanged list stays shared.
+    pub fn retain(&mut self, mut keep: impl FnMut(&(Hash, u64)) -> bool) {
+        let Some(first) = self.0.iter().position(|entry| !keep(entry)) else {
+            return;
+        };
+        let mut kept = self.0[..first].to_vec();
+        kept.extend(self.0[first + 1..].iter().filter(|&entry| keep(entry)));
+        self.0 = Arc::new(kept);
+    }
+    pub fn push(&mut self, entry: (Hash, u64)) {
+        Arc::make_mut(&mut self.0).push(entry);
+    }
+    pub fn pop(&mut self) -> Option<(Hash, u64)> {
+        if self.0.is_empty() {
+            return None;
+        }
+        Arc::make_mut(&mut self.0).pop()
+    }
+    #[cfg(test)]
+    fn shares(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl std::ops::Deref for Displaced {
+    type Target = [(Hash, u64)];
+    fn deref(&self) -> &[(Hash, u64)] {
+        &self.0
+    }
+}
+impl<'a> IntoIterator for &'a Displaced {
+    type Item = &'a (Hash, u64);
+    type IntoIter = std::slice::Iter<'a, (Hash, u64)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+impl From<Vec<(Hash, u64)>> for Displaced {
+    fn from(entries: Vec<(Hash, u64)>) -> Self {
+        Self(Arc::new(entries))
+    }
+}
+impl PartialEq<Vec<(Hash, u64)>> for Displaced {
+    fn eq(&self, other: &Vec<(Hash, u64)>) -> bool {
+        *self.0 == *other
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -310,7 +369,7 @@ impl State {
                 leader: None,
                 lead_since: 0,
                 replacement_height: 0,
-                displaced: Vec::new(),
+                displaced: Displaced::default(),
             })
         } else {
             Phase::Rest(Rest {
@@ -889,6 +948,58 @@ mod tests {
     }
 
     #[test]
+    fn state_clones_share_displaced_leaders_without_changing_encodings() {
+        // Audit R26: the list was an inline Vec copied by every state clone.
+        let entries: Vec<(Hash, u64)> = (0..3600u32)
+            .map(|i| {
+                let mut id = [0; 32];
+                id[..4].copy_from_slice(&i.to_be_bytes());
+                (id, u64::from(i))
+            })
+            .collect();
+        let mut s = State::genesis(&Config::devnet());
+        s.phase = Phase::Auction(Auction {
+            round: 0,
+            opened: 0,
+            leader: None,
+            lead_since: 0,
+            replacement_height: 0,
+            displaced: entries.clone().into(),
+        });
+        let copy = s.clone();
+        let (Phase::Auction(a), Phase::Auction(b)) = (&s.phase, &copy.phase) else {
+            unreachable!()
+        };
+        assert!(a.displaced.shares(&b.displaced));
+        // The encoding, and so the phase commitment, is the plain list's.
+        assert_eq!(codec::encode(&a.displaced), codec::encode(&entries));
+        assert_eq!(
+            serde_json::to_string(&a.displaced).unwrap(),
+            serde_json::to_string(&entries).unwrap()
+        );
+        let decoded: Displaced = codec::decode(&codec::encode(&entries), usize::MAX).unwrap();
+        assert_eq!(decoded, entries);
+        assert_eq!(format!("{decoded:?}"), format!("{entries:?}"));
+        // Only a change copies the list, and only for the changed version.
+        let mut changed = b.displaced.clone();
+        changed.retain(|_| true);
+        assert!(changed.shares(&a.displaced));
+        changed.retain(|(id, _)| id[3] != 7);
+        assert!(!changed.shares(&a.displaced));
+        let mut expected = entries.clone();
+        expected.retain(|(id, _)| id[3] != 7);
+        assert_eq!((changed.len(), a.displaced.len()), (3585, 3600));
+        assert_eq!(changed, expected);
+        changed.push(([9; 32], 9));
+        assert_eq!(changed.last(), Some(&([9; 32], 9)));
+        assert_eq!(changed.pop(), Some(([9; 32], 9)));
+        assert_eq!(changed, expected);
+        let mut empty = Displaced::default();
+        assert_eq!(empty.pop(), None);
+        assert!(empty.shares(&empty.clone()));
+    }
+
+    #[test]
     fn the_state_root_commits_actions_once_and_never_in_the_phase() {
         // Auction and rest commitments are the phase encoding itself.
         for phase in [
@@ -898,7 +1009,7 @@ mod tests {
                 leader: Some([7; 32]),
                 lead_since: 45,
                 replacement_height: 4,
-                displaced: vec![([8; 32], 35)],
+                displaced: vec![([8; 32], 35)].into(),
             }),
             Phase::Rest(Rest {
                 until: 90,

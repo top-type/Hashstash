@@ -6266,7 +6266,7 @@ mod read_admission_tests {
             leader: None,
             lead_since: 0,
             replacement_height: 0,
-            displaced: Vec::new(),
+            displaced: Default::default(),
         });
         s
     }
@@ -6567,7 +6567,7 @@ mod read_admission_tests {
             leader: Some([4; 32]),
             lead_since: 0,
             replacement_height: 0,
-            displaced: Vec::new(),
+            displaced: Default::default(),
         });
         let auction = view(s.clone(), vec![]);
         let round = Node::read_rpc(&auction, "proposals", json!({"round":0})).unwrap();
@@ -8441,7 +8441,7 @@ mod tests {
             leader: None,
             lead_since: 0,
             replacement_height: 0,
-            displaced: Vec::new(),
+            displaced: Default::default(),
         });
         s.world.validate(&c, &s.issued, &s.auction_escrow).unwrap();
         (

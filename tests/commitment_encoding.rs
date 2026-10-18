@@ -1,5 +1,36 @@
-use hashstash::codec;
+use hashstash::{
+    codec,
+    state::{Auction, Phase},
+};
 use num_bigint::BigUint;
+
+/// Auction phases encode, and commit, displaced leaders as a plain list even
+/// though state versions share it (audit R26). Independently packed: variant
+/// 0, compact round, opened, Some(leader), lead_since, replacement height,
+/// then a count and each (ID, lead start).
+#[test]
+fn auction_phase_bytes_are_frozen() {
+    let phase = Phase::Auction(Auction {
+        round: 2,
+        opened: 30,
+        leader: Some([7; 32]),
+        lead_since: 45,
+        replacement_height: 4,
+        displaced: vec![([8; 32], 35), ([9; 32], 300)].into(),
+    });
+    let expected = format!(
+        "00021e01{}2d0402{}23{}fb2c01",
+        "07".repeat(32),
+        "08".repeat(32),
+        "09".repeat(32)
+    );
+    assert_eq!(hex::encode(codec::encode(&phase)), expected);
+    let decoded: Phase = codec::decode(&hex::decode(&expected).unwrap(), 1000).unwrap();
+    let Phase::Auction(a) = decoded else {
+        panic!("auction phase expected")
+    };
+    assert_eq!(a.displaced, vec![([8; 32], 35), ([9; 32], 300)]);
+}
 
 /// State and world commitments encode bare `BigUint` values with num-bigint
 /// 0.4's own serde format: a compact limb count followed by compact

@@ -64,7 +64,8 @@ async fn catch_up_after_a_capacity_increase_sends_full_batches_of_mixed_blocks()
     let mut chain = Chain::open(&source_path, config.clone()).unwrap();
     append(&mut chain, secret, vec![]);
     curved::chain(&mut chain, &secret);
-    let capacity = 1024 * 1024 + 173;
+    // One decision can at most double capacity.
+    let capacity = 2 * initial - 173;
     let proposal = signed(
         &chain,
         &secret,
@@ -125,7 +126,7 @@ async fn catch_up_after_a_capacity_increase_sends_full_batches_of_mixed_blocks()
                     recipient: miner,
                     amount: 1u32.into(),
                 },
-                vec![n as u8; initial as usize + 1024 * n],
+                vec![n as u8; initial as usize + 200 * n],
             )]
         } else {
             vec![]

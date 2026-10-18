@@ -39,11 +39,12 @@ fn current_presets_govern_block_time_and_the_whole_fee_split() {
         ] {
             assert!(c.governance_parameters().contains(&p));
         }
+        // One decision at most halves or doubles the interval (audit R05).
         for seconds in 0..=61 {
             assert_eq!(
                 c.parameter_change(&c.initial, Parameter::Interval, 15, seconds)
                     .is_ok(),
-                seconds > 0 && seconds != 15
+                (7..=30).contains(&seconds) && seconds != 15
             );
         }
         assert!(

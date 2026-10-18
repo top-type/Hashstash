@@ -134,10 +134,11 @@ fn zero_subsidy_charges_miner_creation_only_when_fees_pay_it() {
     let mut c = production();
     c.initial.minimum_fee_rate = 0;
     c.initial.miner_fee_percent = Some(100);
-    c.initial.block_bytes = hashstash::fees::ACCOUNT_WEIGHT;
+    c.initial.block_bytes = hashstash::config::MIN_GOVERNED_BLOCK_BYTES;
     c.validate().unwrap();
     let q = c.work_per_atom().unwrap();
     let funded = step(&c, &State::genesis(&c), 1, &q * 100u32, &[]);
+    // The payment's data leaves less than one account write of capacity.
     // Changing the configuration below changes the chain ID the payment binds.
     let payment = |chain: &Hash, fee: u32| {
         crypto::sign(
@@ -152,7 +153,7 @@ fn zero_subsidy_charges_miner_creation_only_when_fees_pay_it() {
                     recipient: key(1),
                     amount: 1u32.into(),
                 },
-                data: vec![],
+                data: vec![0; 3_000],
             },
             &[1; 32],
         )

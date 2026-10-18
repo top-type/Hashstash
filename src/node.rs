@@ -8005,7 +8005,9 @@ mod tests {
         // Other settings never invalidate a quoted fee or size.
         s.phase = rest(interval, (Parameter::MinerFeePercent, 10));
         assert!(check(&s, body(2, 2)).is_none());
-        let capacity = crate::config::MIN_GOVERNED_BLOCK_BYTES;
+        // The projection only compares sizes; this capacity is below the
+        // transaction's weight (and the governed floor).
+        let capacity = crate::fees::ACCOUNT_WEIGHT;
         s.phase = rest(interval, (Parameter::BlockBytes, capacity));
         let change = check(&s, body(2, 2)).unwrap();
         assert_eq!(change["value"], capacity.to_string());

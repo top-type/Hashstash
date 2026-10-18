@@ -142,9 +142,23 @@ fn genesis_settings_use_defined_domains_without_policy_limits() {
     c.initial.lead = 0;
     c.initial.minimum_fee_rate = 0;
     c.validate().unwrap();
+    // Audit R31: these stay valid and are only reported to the operator.
+    let mut warned = c.sanity_warnings();
     c.daa_half_life = u64::MAX;
     c.timestamp_window = usize::MAX;
     c.validate().unwrap();
+    warned.extend(c.sanity_warnings());
+    for field in [
+        "timestamp_window",
+        "max_signatures",
+        "daa_half_life",
+        "future_seconds",
+    ] {
+        assert!(
+            warned.iter().any(|w| w.starts_with(field)),
+            "{field}: {warned:?}"
+        );
+    }
     for field in ["timestamp_window", "daa_half_life"] {
         let mut value = serde_json::to_value(&c).unwrap();
         value[field] = 0.into();
@@ -160,6 +174,42 @@ fn genesis_settings_use_defined_domains_without_policy_limits() {
     c = Config::devnet();
     c.genesis_time = u32::MAX;
     assert!(c.validate().is_err());
+}
+
+#[test]
+fn operator_warnings_mark_each_unsafe_genesis_field_at_its_threshold() {
+    for preset in [Config::devnet(), Config::testnet(), Config::slow_testnet()] {
+        assert!(preset.sanity_warnings().is_empty());
+    }
+    // Each field at its last quiet value, then past it.
+    let with = |edits: &[(&str, u64)]| {
+        let mut value = serde_json::to_value(Config::devnet()).unwrap();
+        for (field, setting) in edits {
+            value[*field] = (*setting).into();
+        }
+        serde_json::from_value::<Config>(value).unwrap()
+    };
+    for (field, quiet, warned, expected) in [
+        ("timestamp_window", 1, 0, "timestamp_window 0"),
+        ("timestamp_window", 1024, 1025, "timestamp_window 1025"),
+        ("max_signatures", 1, 0, "max_signatures is 0"),
+        ("max_signatures", 65_535, 65_536, "max_signatures 65536"),
+        ("daa_half_life", 15, 14, "daa_half_life 14"),
+        ("daa_half_life", 1 << 22, 1 << 23, "daa_half_life 8388608"),
+        ("future_seconds", 1, 0, "future_seconds is 0"),
+        ("future_seconds", 900, 901, "future_seconds 901"),
+    ] {
+        // A short half-life is checked with a future allowance below it.
+        let future = if field == "daa_half_life" { 1 } else { 120 };
+        let c = with(&[("future_seconds", future), (field, quiet)]);
+        assert!(c.sanity_warnings().is_empty(), "{:?}", c.sanity_warnings());
+        let c = with(&[("future_seconds", future), (field, warned)]);
+        let warnings = c.sanity_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with(expected), "{warnings:?}");
+        // Warnings never change what consensus accepts.
+        assert_eq!(c.validate().is_ok(), c.timestamp_window > 0);
+    }
 }
 
 #[test]

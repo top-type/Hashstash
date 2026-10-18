@@ -90,7 +90,7 @@ fn zero_rest_and_lead_open_and_resolve_without_stuck_transient_phases() {
     assert!(matches!(s.phase, Phase::Auction(_)));
     for (parameter, value) in [
         (Parameter::DecisionBlocks, 155),
-        (Parameter::Interval, 77),
+        (Parameter::Interval, 29),
         (Parameter::MinimumFeeRate, 1),
     ] {
         let tx = propose(
@@ -301,7 +301,7 @@ fn grant_draws_at_most_half_of_a_live_reserve() {
 fn zero_signature_capacity_still_mines_empty_blocks_and_rejects_transactions() {
     let mut c = config();
     c.max_signatures = 0;
-    c.initial.block_bytes = hashstash::fees::ACCOUNT_WEIGHT;
+    c.initial.block_bytes = hashstash::config::MIN_GOVERNED_BLOCK_BYTES;
     c.validate().unwrap();
     let s = step(&c, &State::genesis(&c), 1_000, &[]);
     let tx = sign(

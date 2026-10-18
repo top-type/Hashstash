@@ -752,8 +752,9 @@ fn governed_minimum_rate_changes_only_after_rest_and_leaves_signed_fee_exact() {
 #[test]
 fn prepaid_grant_settlement_leaves_capacity_but_new_miner_still_counts() {
     let mut c = config();
-    // Room for the one-payout proposal, its payout and its proposal record.
-    c.initial.block_bytes = 2048 + fees::RECORD_WEIGHT;
+    // The smallest valid capacity: room for the one-payout proposal, its
+    // payout and its proposal record, with a minimal Propose's margin.
+    c.initial.block_bytes = hashstash::config::MIN_GOVERNED_BLOCK_BYTES;
     c.validate().unwrap();
     let mut s = decision(&c, true);
     let buy = sign(
@@ -791,7 +792,7 @@ fn prepaid_grant_settlement_leaves_capacity_but_new_miner_still_counts() {
     // A separate new payment recipient plus the new miner still exceeds the
     // capacity once the payment carries enough data.
     let mut padded = transfer(&c, &s, key(&[64; 32]), 1, 3, 0, 0).body;
-    padded.data = vec![0; 1_000];
+    padded.data = vec![0; 2_000];
     let new_account = crypto::sign(&s.chain_id, &padded, &ALICE).unwrap();
     let weight = fees::quote(&c, &s, &new_account).unwrap().weight;
     assert!(weight <= c.initial.block_bytes);

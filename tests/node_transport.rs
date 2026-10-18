@@ -427,10 +427,18 @@ async fn version_1_peers_keep_block_synchronization_and_reject_header_requests_c
     use std::sync::{Arc, Mutex};
     let dir = tempfile::tempdir().unwrap();
     let c = Config::devnet();
-    let a = Node::open(&dir.path().join("a.db"), c.clone(), crypto::public_key(&[87; 32]).unwrap())
-        .unwrap();
-    let b = Node::open(&dir.path().join("b.db"), c.clone(), crypto::public_key(&[88; 32]).unwrap())
-        .unwrap();
+    let a = Node::open(
+        &dir.path().join("a.db"),
+        c.clone(),
+        crypto::public_key(&[87; 32]).unwrap(),
+    )
+    .unwrap();
+    let b = Node::open(
+        &dir.path().join("b.db"),
+        c.clone(),
+        crypto::public_key(&[88; 32]).unwrap(),
+    )
+    .unwrap();
     for _ in 0..3 {
         a.mine(100_000).unwrap();
     }
@@ -493,7 +501,10 @@ async fn version_1_peers_keep_block_synchronization_and_reject_header_requests_c
         }
     });
     let error = node::sync_peer(&b, legacy).await.unwrap_err();
-    assert!(format!("{error:#}").contains("peer transport version 1"), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("peer transport version 1"),
+        "{error:#}"
+    );
     let status = b.rpc("peerstatus", json!({})).unwrap();
     assert_eq!(status["transport_version"], 2);
     assert_eq!(status["version1_peers"], json!([legacy.to_string()]));

@@ -535,7 +535,8 @@ impl WalletStore {
 const BACKUP_PREFIX: &[u8] = br#"{"format":"hashstash-private-v1","private_key":""#;
 const BACKUP_MIDDLE: &[u8] = br#"","public_key":""#;
 const BACKUP_SUFFIX: &[u8] = br#""}"#;
-const BACKUP_BYTES: usize = BACKUP_PREFIX.len() + 64 + BACKUP_MIDDLE.len() + 64 + BACKUP_SUFFIX.len();
+const BACKUP_BYTES: usize =
+    BACKUP_PREFIX.len() + 64 + BACKUP_MIDDLE.len() + 64 + BACKUP_SUFFIX.len();
 /// The `hashstash-private-v1` backup, the one response that carries a key.
 /// Its JSON is written straight into a buffer reserved at its exact size, so
 /// no reallocation leaves a copy behind, and wiped on drop after the node
@@ -589,7 +590,10 @@ mod tests {
     fn exported_backups_are_built_in_one_wiped_buffer() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = WalletStore::open(&dir.path().join("chain.sqlite"), [1; 32]).unwrap();
-        let status = manage(&mut store, json!({"action":"import","private_key":hex::encode([3;32])}));
+        let status = manage(
+            &mut store,
+            json!({"action":"import","private_key":hex::encode([3;32])}),
+        );
         let request = json!({"action":"export","id":status["wallet_id"],"revision":store.revision});
         let body: Zeroizing<Vec<u8>> = store
             .manage(serde_json::from_value(request).unwrap())
@@ -602,9 +606,16 @@ mod tests {
             json!({"format":"hashstash-private-v1","private_key":hex::encode([3;32]),
                 "public_key":hex::encode(crypto::public_key(&[3;32]).unwrap())})
         );
-        let watch = manage(&mut store, json!({"action":"watch","public_key":hex::encode(crypto::public_key(&[4;32]).unwrap())}));
+        let watch = manage(
+            &mut store,
+            json!({"action":"watch","public_key":hex::encode(crypto::public_key(&[4;32]).unwrap())}),
+        );
         let refused = json!({"action":"export","id":watch["wallet_id"],"revision":store.revision});
-        assert!(store.manage(serde_json::from_value(refused).unwrap()).is_err());
+        assert!(
+            store
+                .manage(serde_json::from_value(refused).unwrap())
+                .is_err()
+        );
     }
 
     #[test]
@@ -703,12 +714,24 @@ mod tests {
         // A store holding wallets keeps its selection and says so.
         let path = dir.path().join("chain.sqlite");
         let mut store = WalletStore::open(&path, [1; 32]).unwrap();
-        manage(&mut store, json!({"action":"import","private_key":hex::encode([3;32])}));
+        manage(
+            &mut store,
+            json!({"action":"import","private_key":hex::encode([3;32])}),
+        );
         drop(store);
         let mut saved = WalletStore::open(&path, [1; 32]).unwrap();
-        assert!(saved.unapplied_seed("--wallet-key", "hot", &public).is_none());
-        let watch = saved.unapplied_seed("--watch-key", "watch", &public).unwrap();
-        assert!(watch.contains("--watch-key was not applied") && watch.contains("hot wallet hsh"), "{watch}");
+        assert!(
+            saved
+                .unapplied_seed("--wallet-key", "hot", &public)
+                .is_none()
+        );
+        let watch = saved
+            .unapplied_seed("--watch-key", "watch", &public)
+            .unwrap();
+        assert!(
+            watch.contains("--watch-key was not applied") && watch.contains("hot wallet hsh"),
+            "{watch}"
+        );
         let before = saved.status();
         saved.seed_watch(public).unwrap();
         saved.seed_hot([4; 32]).unwrap();
@@ -721,7 +744,10 @@ mod tests {
         let saved = crypto::public_key(&[6; 32]).unwrap();
         let peer = crypto::public_key(&[7; 32]).unwrap();
         let mut store = WalletStore::open(&dir.path().join("chain.sqlite"), [1; 32]).unwrap();
-        manage(&mut store, json!({"action":"watch","public_key":hex::encode(saved)}));
+        manage(
+            &mut store,
+            json!({"action":"watch","public_key":hex::encode(saved)}),
+        );
         let error = store.reserve_peer_identity(saved).unwrap_err();
         assert!(error.to_string().contains("peer identity"), "{error}");
         store.reserve_peer_identity(peer).unwrap();
@@ -770,13 +796,21 @@ mod tests {
                 std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
             }
             drop(WalletStore::open(&path, [1; 32]).unwrap());
-            assert_eq!(mode(&wallets), 0o600, "existing permissive storage is tightened");
+            assert_eq!(
+                mode(&wallets),
+                0o600,
+                "existing permissive storage is tightened"
+            );
             assert_eq!(mode(&journal), 0o600);
         }
         assert!(wallets.exists());
         let reopened = WalletStore::open(&path, [2; 32]).unwrap();
         assert_eq!(network(&reopened), hex::encode([2; 32]));
-        assert_eq!(reopened.entries.len(), 1, "keys remain shared across networks");
+        assert_eq!(
+            reopened.entries.len(),
+            1,
+            "keys remain shared across networks"
+        );
     }
 
     /// `net.db` and `net.sqlite` once shared `net.wallets.sqlite`. Each now
@@ -786,7 +820,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sqlite = dir.path().join("net.sqlite");
         let mut shared = WalletStore::open(&sqlite, [1; 32]).unwrap();
-        manage(&mut shared, json!({"action":"import","private_key":hex::encode([3;32])}));
+        manage(
+            &mut shared,
+            json!({"action":"import","private_key":hex::encode([3;32])}),
+        );
         let saved = shared.status();
         drop(shared);
         let legacy = dir.path().join("net.wallets.sqlite");
@@ -799,18 +836,23 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&own).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(&own).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         // The stores now diverge: changes to one never reach the other.
         manage(&mut copied, json!({"action":"create"}));
         drop(copied);
         assert_eq!(WalletStore::open(&sqlite, [1; 32]).unwrap().status(), saved);
         assert_eq!(WalletStore::open(&db, [1; 32]).unwrap().entries.len(), 2);
-        assert!(
-            !std::fs::read_dir(dir.path())
+        assert!(!std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+            entry
                 .unwrap()
-                .any(|entry| entry.unwrap().file_name().to_string_lossy().ends_with(".tmp"))
-        );
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
         // A new store under a name of its own copies nothing.
         let fresh = WalletStore::open(&dir.path().join("other.db"), [1; 32]).unwrap();
         assert!(fresh.entries.is_empty());

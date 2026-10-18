@@ -87,9 +87,7 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 /// land in one buffer allocated up front and wiped when dropped.
 pub fn read_private(path: &Path, limit: usize) -> Result<Zeroizing<Vec<u8>>> {
     let fits = |metadata: &fs::Metadata| {
-        metadata.is_file()
-            && !metadata.file_type().is_symlink()
-            && metadata.len() <= limit as u64
+        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= limit as u64
     };
     let inspected = fs::symlink_metadata(path)?;
     ensure!(

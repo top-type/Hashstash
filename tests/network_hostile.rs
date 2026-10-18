@@ -716,7 +716,11 @@ async fn first_peer_message_is_bounded_before_its_body_is_read() {
     .unwrap();
     let mut request = hello(&node);
     request.blocks.push(block);
-    assert!(exchange(server.p2p, 16, 2, &peer_bytes(&request)).await.is_empty());
+    assert!(
+        exchange(server.p2p, 16, 2, &peer_bytes(&request))
+            .await
+            .is_empty()
+    );
     assert_eq!(node.status().unwrap()["tip"], before["tip"]);
     valid_peer(server.p2p, &hello(&node), 16, 3).await;
     healthy(&server, &before).await;

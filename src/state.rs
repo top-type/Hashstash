@@ -493,8 +493,12 @@ impl State {
                 .ok_or_else(|| anyhow::anyhow!("expired pending rest"))?;
             let activation =
                 crate::consensus::rounded_deadline(self.clock, remaining, self.frozen.interval)?;
-            let height =
-                crate::consensus::activation_height(self.height, 0, remaining, self.frozen.interval);
+            let height = crate::consensus::activation_height(
+                self.height,
+                0,
+                remaining,
+                self.frozen.interval,
+            );
             c.parameter_change_at(
                 &self.frozen,
                 parameter,
@@ -932,7 +936,10 @@ mod tests {
             unreachable!()
         };
         assert!(Arc::ptr_eq(&a.proposal, &b.proposal));
-        assert!(Arc::ptr_eq(&a.proposal, copy.actions.get_shared(&id).unwrap()));
+        assert!(Arc::ptr_eq(
+            &a.proposal,
+            copy.actions.get_shared(&id).unwrap()
+        ));
         let plain = (
             a.id,
             a.epoch,

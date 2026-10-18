@@ -157,8 +157,12 @@ fn data_bytes_are_fully_charged_and_fee_distribution_is_unchanged() {
         transfer(key(&BOB))
     };
     assert!(
-        rejected(&c, &s, &crypto::sign(&s.chain_id, &inadequate, &ALICE).unwrap())
-            .contains("minimum")
+        rejected(
+            &c,
+            &s,
+            &crypto::sign(&s.chain_id, &inadequate, &ALICE).unwrap()
+        )
+        .contains("minimum")
     );
 }
 

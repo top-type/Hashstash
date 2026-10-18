@@ -718,7 +718,10 @@ mod tests {
             let wire = encode(&packet, limits).unwrap();
             assert_eq!(decode(&wire, limits).unwrap(), packet);
             for end in 0..wire.len() {
-                assert!(decode(&wire[..end], limits).is_err(), "accepted truncation {end}");
+                assert!(
+                    decode(&wire[..end], limits).is_err(),
+                    "accepted truncation {end}"
+                );
             }
             let mut trailing = wire.clone();
             trailing.push(0);
@@ -735,7 +738,9 @@ mod tests {
         };
         assert_eq!(
             headers.iter().map(codec::header_bytes).collect::<Vec<_>>(),
-            (0..MAX_HEADERS as u32).map(|n| codec::header_bytes(&header(n))).collect::<Vec<_>>()
+            (0..MAX_HEADERS as u32)
+                .map(|n| codec::header_bytes(&header(n)))
+                .collect::<Vec<_>>()
         );
         // Version 1 never carries these messages, and limits apply before allocation.
         for (tag, version) in [(4u8, 1u8), (5, 0)] {
@@ -745,7 +750,10 @@ mod tests {
                 wire.push(0);
             }
             assert!(
-                decode(&wire, limits).unwrap_err().to_string().contains("version"),
+                decode(&wire, limits)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("version"),
                 "tag {tag}"
             );
         }
@@ -1036,7 +1044,8 @@ mod tests {
                 panic!()
             };
             *proposal = Proposal::Grant { payments };
-            template = crypto::sign(&Config::devnet().chain_id(), &template.body, &[1; 32]).unwrap();
+            template =
+                crypto::sign(&Config::devnet().chain_id(), &template.body, &[1; 32]).unwrap();
             let mut current = sync.clone();
             current.transactions = vec![template.clone()];
             current.blocks[0].transactions = vec![template.clone()];
@@ -1156,8 +1165,12 @@ mod tests {
         let (limits, mut sync) = fixture();
         sync.transactions[0].body.nonce = u64::MAX;
         sync.transactions[0].body.expiry_blocks = u64::MAX;
-        sync.transactions[0] =
-            crypto::sign(&Config::devnet().chain_id(), &sync.transactions[0].body, &[1; 32]).unwrap();
+        sync.transactions[0] = crypto::sign(
+            &Config::devnet().chain_id(),
+            &sync.transactions[0].body,
+            &[1; 32],
+        )
+        .unwrap();
         sync.blocks[0].height = u64::MAX;
         let wire = encode(&Message::Sync(sync.clone()), limits).unwrap();
         assert_eq!(decode(&wire, limits).unwrap(), Message::Sync(sync.clone()));

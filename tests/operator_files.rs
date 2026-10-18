@@ -97,7 +97,10 @@ fn systemd_unit_backs_off_restarts_and_names_out_of_memory_kills() {
         "RestartMaxDelaySec=15min",
         "StartLimitIntervalSec=0",
     ] {
-        assert!(unit.lines().any(|line| line == directive), "missing {directive}");
+        assert!(
+            unit.lines().any(|line| line == directive),
+            "missing {directive}"
+        );
     }
     // A literal `$$` reaches the shell as `$`, which reads systemd's variable.
     let stop = unit
@@ -168,7 +171,10 @@ fn documented_shared_network_genesis_is_calibrated() {
             }
         }
     }
-    assert!(checked >= 2, "documented slow-preset genesis commands were not found");
+    assert!(
+        checked >= 2,
+        "documented slow-preset genesis commands were not found"
+    );
     let running = repository("docs/RUNNING.md");
     assert!(running.contains("hashstash init --config network.json --preset slow --hashrate "));
 }

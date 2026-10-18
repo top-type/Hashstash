@@ -175,7 +175,13 @@ async fn embedded_assets_session_and_atomic_pending_wallet_nonces() {
         session(&url, None).await,
         session(&url, Some("incorrect-session-token")).await,
     ] {
-        for field in ["public_key", "address", "wallets", "wallet_id", "wallet_revision"] {
+        for field in [
+            "public_key",
+            "address",
+            "wallets",
+            "wallet_id",
+            "wallet_revision",
+        ] {
             assert!(anonymous.get(field).is_none(), "{field}: {anonymous}");
         }
         assert_eq!(anonymous["miner"], hex::encode(public));
@@ -393,7 +399,10 @@ async fn restarting_server_rotates_token_and_unfunded_wallet_fails_cleanly() {
     let url = format!("http://{}", second.rpc);
     let new_token = session_token(&second);
     let new_session = session(&url, Some(new_token.as_str())).await;
-    assert_eq!(old_session["wallet_revision"], new_session["wallet_revision"]);
+    assert_eq!(
+        old_session["wallet_revision"],
+        new_session["wallet_revision"]
+    );
     assert_ne!(old_token, new_token);
     let response = client
         .post(format!("{url}/api/wallet"))

@@ -113,7 +113,13 @@ fn bare_biguint_commitment_bytes_are_frozen() {
 #[test]
 fn commitment_tuple_layout_is_frozen() {
     let amount = BigUint::from(258u32);
-    let encoded = codec::encode(&([7u8; 32], &amount, Some([9u8; 32]), None::<[u8; 32]>, 300u64));
+    let encoded = codec::encode(&(
+        [7u8; 32],
+        &amount,
+        Some([9u8; 32]),
+        None::<[u8; 32]>,
+        300u64,
+    ));
     // Array, amount, Some(array), None, compact u64.
     let expected = format!("{}01fb020101{}00fb2c01", "07".repeat(32), "09".repeat(32));
     assert_eq!(hex::encode(encoded), expected);

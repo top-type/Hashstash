@@ -227,7 +227,13 @@ fn replay_and_reopen(d: TempDir, chain: Chain) {
 fn propose(chain: &mut Chain, proposal: Proposal, tag: u8, support: u32) -> (u64, Hash) {
     until(chain, "auction", 0);
     let round = chain.tip_state().auction_round().unwrap();
-    let id = state::proposal_id(&chain.chain_id(), round, &key(&MINER), &[tag; 32], &proposal);
+    let id = state::proposal_id(
+        &chain.chain_id(),
+        round,
+        &key(&MINER),
+        &[tag; 32],
+        &proposal,
+    );
     let tx = sign(
         chain,
         &MINER,
@@ -712,7 +718,10 @@ fn a_recovered_spend_whose_account_only_a_recovered_transfer_creates_confirms_af
     let second = node.mine(1_000_000).unwrap();
     assert_eq!(second.transactions, vec![spend]);
     for block in [first, second] {
-        assert!(new.submit(block.clone(), block.header.timestamp as u64).unwrap());
+        assert!(
+            new.submit(block.clone(), block.header.timestamp as u64)
+                .unwrap()
+        );
     }
     new.tip_state().audit(&new.config).unwrap();
     assert_eq!(

@@ -520,7 +520,12 @@ async fn real_cli_watch_only_prepare_offline_sign_broadcast_and_hot_send_use_exa
     };
     // The signature binds a network, so the signer must be told which one.
     assert!(!sign(None).await.status.success());
-    successful(sign(Some(hex::encode(wallet::unsigned_chain(&envelope).unwrap()))).await);
+    successful(
+        sign(Some(hex::encode(
+            wallet::unsigned_chain(&envelope).unwrap(),
+        )))
+        .await,
+    );
     let signed: hashstash::types::Transaction =
         serde_json::from_slice(&std::fs::read(signed_path).unwrap()).unwrap();
     assert_eq!(signed.body, prepared);

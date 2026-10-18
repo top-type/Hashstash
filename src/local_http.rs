@@ -179,9 +179,10 @@ mod tests {
         // Accepted in order, so the third is the one over the cap. It is
         // closed long before the head timeout.
         let mut refused = TcpStream::connect(address).await.unwrap();
-        let (received, _) = tokio::time::timeout(Duration::from_secs(5), until_closed(&mut refused))
-            .await
-            .expect("a connection over the cap was held");
+        let (received, _) =
+            tokio::time::timeout(Duration::from_secs(5), until_closed(&mut refused))
+                .await
+                .expect("a connection over the cap was held");
         assert!(received.is_empty());
         // Admitted connections are still served.
         held[0]
@@ -200,9 +201,10 @@ mod tests {
                 .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
                 .await
                 .unwrap();
-            let (answer, _) = tokio::time::timeout(Duration::from_secs(5), until_closed(&mut stream))
-                .await
-                .unwrap();
+            let (answer, _) =
+                tokio::time::timeout(Duration::from_secs(5), until_closed(&mut stream))
+                    .await
+                    .unwrap();
             if !answer.is_empty() {
                 next = Some(answer);
                 break;

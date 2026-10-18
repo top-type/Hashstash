@@ -294,11 +294,7 @@ pub fn dynamic_deposit_total(
     } else if let Some((u, v)) = small_ratio(reserve, mass) {
         deposit_total(reserve, supply, deposit, u, v)
     } else {
-        let exponent = scale_bounds(
-            log_ratio(&next_reserve, reserve, CURVE_BITS),
-            reserve,
-            mass,
-        );
+        let exponent = scale_bounds(log_ratio(&next_reserve, reserve, CURVE_BITS), reserve, mass);
         let factor = exp_bounds(&exponent)?;
         ((supply * factor.low) >> CURVE_BITS).max(supply.clone())
     };
@@ -687,13 +683,24 @@ mod tests {
                 assert_eq!(ceil_shift(&n, bits), ceil_div(&n, &(Amount::one() << bits)));
             }
         }
-        let zs = [(1u32, 3u32), (1, 1_000), (1, 7), (2, 7), (999, 3_000), (1, u32::MAX)];
+        let zs = [
+            (1u32, 3u32),
+            (1, 1_000),
+            (1, 7),
+            (2, 7),
+            (999, 3_000),
+            (1, u32::MAX),
+        ];
         for bits in [192, 448, 1088, CURVE_BITS] {
             for (n, d) in zs {
                 let (n, d) = (Amount::from(n), Amount::from(d));
                 let fast = log_atanh(&n, &d, bits);
                 let slow = full_series(&n, &d, bits);
-                assert_eq!((fast.low, fast.high), (slow.low, slow.high), "{n}/{d} at {bits}");
+                assert_eq!(
+                    (fast.low, fast.high),
+                    (slow.low, slow.high),
+                    "{n}/{d} at {bits}"
+                );
             }
         }
         assert_eq!(clearing_precision(1), 192);

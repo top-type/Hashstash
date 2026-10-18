@@ -44,8 +44,14 @@ fn repeated_clearing_reuses_the_memoized_result() {
 
     let first = batch::clear_memoized(&c, &w, &buys, &sells, bps).unwrap();
     assert_eq!(first, uncached);
-    assert_eq!(batch::memo_peek(&c, &w, &buys, &sells, bps), Some(first.clone()));
-    assert_eq!(batch::clear_memoized(&c, &w, &buys, &sells, bps).unwrap(), first);
+    assert_eq!(
+        batch::memo_peek(&c, &w, &buys, &sells, bps),
+        Some(first.clone())
+    );
+    assert_eq!(
+        batch::clear_memoized(&c, &w, &buys, &sells, bps).unwrap(),
+        first
+    );
 
     // Any changed input is a different clearing.
     let mut other_world = w.clone();
@@ -55,7 +61,10 @@ fn repeated_clearing_reuses_the_memoized_result() {
     let reordered = [buys[1].clone(), buys[0].clone()];
     assert_eq!(batch::memo_peek(&c, &w, &buys, &sells, bps + 1), None);
     assert_eq!(batch::memo_peek(&c, &other_world, &buys, &sells, bps), None);
-    assert_eq!(batch::memo_peek(&other_config, &w, &buys, &sells, bps), None);
+    assert_eq!(
+        batch::memo_peek(&other_config, &w, &buys, &sells, bps),
+        None
+    );
     assert_eq!(batch::memo_peek(&c, &w, &reordered, &sells, bps), None);
     assert_eq!(batch::memo_peek(&c, &w, &buys[..1], &sells, bps), None);
     assert_eq!(batch::memo_peek(&c, &w, &sells, &buys[..1], bps), None);
@@ -75,7 +84,10 @@ fn repeated_clearing_reuses_the_memoized_result() {
         let r = batch::clear_memoized(&c, &w, &small, &[], bps).unwrap();
         assert_eq!(batch::memo_peek(&c, &w, &small, &[], bps), Some(r.clone()));
         assert_eq!(r, batch::clear(&c, &w, &small, &[], bps).unwrap());
-        assert_eq!(batch::clear_memoized(&c, &w, &buys, &sells, bps).unwrap(), first);
+        assert_eq!(
+            batch::clear_memoized(&c, &w, &buys, &sells, bps).unwrap(),
+            first
+        );
     }
     let oldest = [order(10, &reserve / 100u32)];
     assert_eq!(batch::memo_peek(&c, &w, &oldest, &[], bps), None);

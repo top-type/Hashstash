@@ -201,7 +201,11 @@ fn relay_selects_and_publishes_only_for_new_admissible_entries() {
             "127.0.0.1".parse().unwrap(),
         )
         .unwrap();
-        assert_eq!(signatures(), 0, "selection never re-verifies an authenticated entry");
+        assert_eq!(
+            signatures(),
+            0,
+            "selection never re-verifies an authenticated entry"
+        );
         selections()
     };
     let mut forged = pooled.clone();
@@ -215,7 +219,12 @@ fn relay_selects_and_publishes_only_for_new_admissible_entries() {
         crypto::sign(&state.chain_id, &body, &SECRET).unwrap()
     };
     assert_eq!(
-        deliver(vec![forged.clone(), used.clone(), unpayable.clone(), underpriced.clone()]),
+        deliver(vec![
+            forged.clone(),
+            used.clone(),
+            unpayable.clone(),
+            underpriced.clone()
+        ]),
         0
     );
     assert_eq!(published(&node), revision, "refused records do not publish");
@@ -227,7 +236,11 @@ fn relay_selects_and_publishes_only_for_new_admissible_entries() {
         assert!(rejected.contains(&codec::transaction_id(&used), &tip, pool_revision + 1));
         assert!(!rejected.contains(&codec::transaction_id(&used), &[0; 32], pool_revision));
         assert!(rejected.contains(&codec::transaction_id(&unpayable), &tip, pool_revision + 1));
-        assert!(rejected.contains(&codec::transaction_id(&underpriced), &tip, pool_revision + 1));
+        assert!(rejected.contains(
+            &codec::transaction_id(&underpriced),
+            &tip,
+            pool_revision + 1
+        ));
     }
     assert!(
         node.submit_transaction(unpayable.clone())
@@ -237,8 +250,16 @@ fn relay_selects_and_publishes_only_for_new_admissible_entries() {
     );
     // A lower bid at the pooled nonce cannot replace it: refused at once.
     let outbid = payment(config, state, &SECRET, start, other(), 1, 0);
-    assert_eq!(deliver(vec![outbid.clone()]), 0, "a replacement must raise the fee rate");
-    assert_eq!(published(&node), revision, "an unchanged selection does not publish");
+    assert_eq!(
+        deliver(vec![outbid.clone()]),
+        0,
+        "a replacement must raise the fee rate"
+    );
+    assert_eq!(
+        published(&node),
+        revision,
+        "an unchanged selection does not publish"
+    );
     // A newcomer only execution refuses costs one selection, then loses it.
     let support = Operation::Support {
         round: 0,
@@ -247,12 +268,25 @@ fn relay_selects_and_publishes_only_for_new_admissible_entries() {
     };
     let body = unsigned(config, &OTHER, nonce(&node, &other()), support);
     let lost = exact(config, state, &OTHER, body, 0);
-    assert_eq!(deliver(vec![lost.clone()]), 1, "one selection for one new candidate");
-    assert_eq!(published(&node), revision, "an unchanged selection does not publish");
+    assert_eq!(
+        deliver(vec![lost.clone()]),
+        1,
+        "one selection for one new candidate"
+    );
+    assert_eq!(
+        published(&node),
+        revision,
+        "an unchanged selection does not publish"
+    );
     assert_eq!(deliver(vec![lost]), 0, "a lost selection is remembered");
     for _ in 0..3 {
         assert_eq!(
-            deliver(vec![forged.clone(), used.clone(), unpayable.clone(), outbid.clone()]),
+            deliver(vec![
+                forged.clone(),
+                used.clone(),
+                unpayable.clone(),
+                outbid.clone()
+            ]),
             0,
             "replayed refusals never reach selection"
         );
@@ -294,7 +328,9 @@ fn the_opening_screen_allows_a_recipient_an_earlier_transaction_may_create() {
     let least = paying(&quote.minimum_fee - &quote.account_creation_fee);
     let below = paying(&quote.minimum_fee - &quote.account_creation_fee - 1u32);
     let i = node.locked().unwrap();
-    let screened = i.chain.opening_screen(node.miner, &[&creating, &least, &below]);
+    let screened = i
+        .chain
+        .opening_screen(node.miner, &[&creating, &least, &below]);
     drop(i);
     let screened = screened.unwrap();
     assert!(screened[0].is_ok() && screened[1].is_ok());
@@ -331,7 +367,12 @@ fn a_relayed_nonce_gap_is_not_remembered_and_its_chain_is_admitted_together() {
     // The later nonce alone cannot be selected; it costs no selection and is
     // not remembered, because its predecessor may still arrive on this tip.
     assert_eq!(deliver(vec![second.clone()]), 0);
-    assert!(!node.rejected_locked().entries.contains_key(&codec::transaction_id(&second)));
+    assert!(
+        !node
+            .rejected_locked()
+            .entries
+            .contains_key(&codec::transaction_id(&second))
+    );
     assert_eq!(deliver(vec![first.clone(), second.clone()]), 1);
     assert_eq!(snapshot(&node).mempool, vec![first, second]);
 }
@@ -344,8 +385,11 @@ fn a_relayed_nonce_gap_is_not_remembered_and_its_chain_is_admitted_together() {
 fn reorg_recovery_is_one_selection_without_rechecking_reincluded_transactions() {
     fn append(chain: &mut Chain, transactions: Vec<Transaction>) -> Block {
         let time = chain.tip_block().header.timestamp + chain.tip_state().settings.interval as u32;
-        let block =
-            Chain::mine(chain.template(key(), transactions, time).unwrap(), 1_000_000).unwrap();
+        let block = Chain::mine(
+            chain.template(key(), transactions, time).unwrap(),
+            1_000_000,
+        )
+        .unwrap();
         chain.submit(block.clone(), time as u64).unwrap();
         block
     }
@@ -469,7 +513,15 @@ fn capacity_displaced_entries_wait_in_the_backlog_for_the_next_block() {
     let start = nonce(&node, &key());
     let mut low = Vec::new();
     loop {
-        let tx = payment(config, state, &SECRET, start + low.len() as u64, key(), 1, 0);
+        let tx = payment(
+            config,
+            state,
+            &SECRET,
+            start + low.len() as u64,
+            key(),
+            1,
+            0,
+        );
         if node.submit_transaction(tx.clone()).is_err() {
             break;
         }
@@ -479,14 +531,27 @@ fn capacity_displaced_entries_wait_in_the_backlog_for_the_next_block() {
     assert!(pool(&node).1.is_empty());
     let other_start = nonce(&node, &other());
     let high: Vec<_> = (0..4)
-        .map(|offset| payment(config, state, &OTHER, other_start + offset, other(), 1, 1_000))
+        .map(|offset| {
+            payment(
+                config,
+                state,
+                &OTHER,
+                other_start + offset,
+                other(),
+                1,
+                1_000,
+            )
+        })
         .collect();
     for tx in &high {
         node.submit_transaction(tx.clone()).unwrap();
     }
     let (selected, backlog, _) = pool(&node);
     assert!(ids(&high).is_subset(&ids(&selected)));
-    assert!(!backlog.is_empty(), "outbid entries wait instead of vanishing");
+    assert!(
+        !backlog.is_empty(),
+        "outbid entries wait instead of vanishing"
+    );
     // Every displaced entry is a suffix of the low-fee nonce chain.
     let kept = selected.len() - high.len();
     assert_eq!(ids(&backlog), ids(&low[kept..]));
@@ -533,7 +598,15 @@ fn weight_displaced_account_creations_also_wait_in_the_backlog() {
     let mut low = Vec::new();
     loop {
         let recipient = fresh(100 + low.len() as u8);
-        let tx = payment(config, state, &SECRET, start + low.len() as u64, recipient, 10, 0);
+        let tx = payment(
+            config,
+            state,
+            &SECRET,
+            start + low.len() as u64,
+            recipient,
+            10,
+            0,
+        );
         if node.submit_transaction(tx.clone()).is_err() {
             break;
         }
@@ -567,12 +640,26 @@ fn a_count_full_pool_still_admits_a_better_bid() {
         .collect();
     let installed = {
         let mut i = node.locked().unwrap();
-        Node::select_pool(&i.chain, node.miner, &full, &HashSet::new(), &HashSet::new())
-            .and_then(|selected| node.install_pool(&mut i, selected))
+        Node::select_pool(
+            &i.chain,
+            node.miner,
+            &full,
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .and_then(|selected| node.install_pool(&mut i, selected))
     };
     installed.unwrap();
     assert_eq!(pool(&node).0.len(), limit);
-    let bid = payment(config, state, &OTHER, nonce(&node, &other()), other(), 1, 1_000);
+    let bid = payment(
+        config,
+        state,
+        &OTHER,
+        nonce(&node, &other()),
+        other(),
+        1,
+        1_000,
+    );
     node.submit_transaction(bid.clone()).unwrap();
     let (selected, backlog, _) = pool(&node);
     assert!(selected.contains(&bid));
@@ -655,7 +742,15 @@ fn an_entry_that_failed_every_attempt_is_dropped_rather_than_kept_undecided() {
     }
     // An affordable, high-fee zero transfer that can never apply, retained
     // in the pool as if it had become invalid after admission.
-    let failing = payment(config, state, &OTHER, nonce(&node, &other()), other(), 0, 1_000);
+    let failing = payment(
+        config,
+        state,
+        &OTHER,
+        nonce(&node, &other()),
+        other(),
+        0,
+        1_000,
+    );
     node.locked().unwrap().mempool.push(failing.clone());
     // Reselection retries it after every acceptance until its sender's own
     // budget is spent, which used to mark the whole selection saturated and
@@ -664,7 +759,10 @@ fn an_entry_that_failed_every_attempt_is_dropped_rather_than_kept_undecided() {
     node.submit_transaction(newcomer.clone()).unwrap();
     let (selected, backlog, _) = pool(&node);
     assert_eq!(ids(&selected), &ids(&honest) | &ids(&[newcomer]));
-    assert!(backlog.is_empty(), "a refused entry is not capacity-displaced");
+    assert!(
+        backlog.is_empty(),
+        "a refused entry is not capacity-displaced"
+    );
 }
 
 #[test]
@@ -717,9 +815,16 @@ fn a_block_finishing_failure_truncates_only_the_template() {
 fn a_damaged_wallet_store_stops_startup_before_history_replay() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("chain.sqlite");
-    std::fs::write(path.with_extension("wallets.sqlite"), b"not a wallet database").unwrap();
+    std::fs::write(
+        path.with_extension("wallets.sqlite"),
+        b"not a wallet database",
+    )
+    .unwrap();
     assert!(Node::open(&path, configuration(16 * 1024), key()).is_err());
-    assert!(!path.exists(), "the chain is not opened before the wallet check");
+    assert!(
+        !path.exists(),
+        "the chain is not opened before the wallet check"
+    );
 }
 
 #[test]
@@ -738,16 +843,28 @@ fn rejected_transaction_memory_is_bounded_and_scoped() {
         );
     }
     assert_eq!(rejected.entries.len(), MAX_REJECTED_TRANSACTIONS);
-    assert!(!rejected.contains(&[0; 32], &[1; 32], 5), "the oldest identity is forgotten");
+    assert!(
+        !rejected.contains(&[0; 32], &[1; 32], 5),
+        "the oldest identity is forgotten"
+    );
     let mut id = [0; 32];
     id[0] = 3;
-    assert!(rejected.contains(&id, &[9; 32], 0), "permanent refusals hold on any tip");
+    assert!(
+        rejected.contains(&id, &[9; 32], 0),
+        "permanent refusals hold on any tip"
+    );
     id[0] = 4;
     assert!(rejected.contains(&id, &[1; 32], 0));
-    assert!(!rejected.contains(&id, &[9; 32], 5), "state refusals end with their tip");
+    assert!(
+        !rejected.contains(&id, &[9; 32], 5),
+        "state refusals end with their tip"
+    );
     id[0] = 5;
     assert!(rejected.contains(&id, &[1; 32], 5));
-    assert!(!rejected.contains(&id, &[1; 32], 6), "lost selections end with their pool");
+    assert!(
+        !rejected.contains(&id, &[1; 32], 6),
+        "lost selections end with their pool"
+    );
     assert!(!rejected.contains(&id, &[9; 32], 5));
 }
 
@@ -789,7 +906,11 @@ fn unsigned(
 }
 fn extend(chain: &mut Chain, transactions: Vec<Transaction>) {
     let time = chain.tip_block().header.timestamp + chain.tip_state().settings.interval as u32;
-    let block = Chain::mine(chain.template(key(), transactions, time).unwrap(), 1_000_000).unwrap();
+    let block = Chain::mine(
+        chain.template(key(), transactions, time).unwrap(),
+        1_000_000,
+    )
+    .unwrap();
     assert!(chain.submit(block, time as u64).unwrap());
 }
 /// A node in its second governance decision. The first, a reserve grant
@@ -803,7 +924,13 @@ fn decision_node(directory: &Path, block_bytes: u64) -> Node {
     let signed = |chain: &Chain, operation: Operation| {
         let state = chain.tip_state();
         let nonce = state.account(&key(), None).unwrap().nonce;
-        exact(&config, state, &SECRET, unsigned(&config, &SECRET, nonce, operation), 0)
+        exact(
+            &config,
+            state,
+            &SECRET,
+            unsigned(&config, &SECRET, nonce, operation),
+            0,
+        )
     };
     let until = |chain: &mut Chain, reached: &dyn Fn(&State) -> bool| {
         for _ in 0..500 {
@@ -835,10 +962,15 @@ fn decision_node(directory: &Path, block_bytes: u64) -> Node {
         },
     );
     extend(&mut chain, vec![deposit]);
-    until(&mut chain, &|s| matches!(s.phase, crate::state::Phase::Auction(_)));
+    until(&mut chain, &|s| {
+        matches!(s.phase, crate::state::Phase::Auction(_))
+    });
     let state = chain.tip_state();
     let grant = &state.world.reserve / 20u32;
-    assert!(grant > &state.world.revenue + 10u32, "the grant draws reserve");
+    assert!(
+        grant > &state.world.revenue + 10u32,
+        "the grant draws reserve"
+    );
     let proposal = signed(
         &chain,
         Operation::Propose {
@@ -867,9 +999,14 @@ fn decision_node(directory: &Path, block_bytes: u64) -> Node {
         },
     );
     extend(&mut chain, vec![deposit]);
-    until(&mut chain, &|s| matches!(s.phase, crate::state::Phase::Auction(_)));
+    until(&mut chain, &|s| {
+        matches!(s.phase, crate::state::Phase::Auction(_))
+    });
     let state = chain.tip_state();
-    assert!(state.world.curve_mass > state.world.reserve, "the grant left a sloped curve");
+    assert!(
+        state.world.curve_mass > state.world.reserve,
+        "the grant left a sloped curve"
+    );
     let proposal = signed(
         &chain,
         Operation::Propose {
@@ -905,7 +1042,13 @@ fn decision_trade(
         decision: state.decision_id(),
         outcome: Some(outcome),
     };
-    exact(config, state, secret, unsigned(config, secret, nonce, operation), 0)
+    exact(
+        config,
+        state,
+        secret,
+        unsigned(config, secret, nonce, operation),
+        0,
+    )
 }
 fn relay(node: &Node, transactions: Vec<Transaction>) {
     node.receive_peer(
@@ -1055,7 +1198,10 @@ fn admission_spends_no_curve_work_under_the_node_lock() {
         assert_eq!(cost.under_lock, 0, "{name}: curve work under the node lock");
         assert_eq!(cost.evaluations, 0, "{name}: admission needs no clearing");
     }
-    assert!(template.evaluations > 0, "the fixture's trades cost curve work");
+    assert!(
+        template.evaluations > 0,
+        "the fixture's trades cost curve work"
+    );
     assert_eq!(template.under_lock, 0, "templates clear off the node lock");
 }
 
@@ -1087,7 +1233,11 @@ fn equal_rate_replacement_churn_is_refused_without_a_selection() {
     // A voluntary extra fee leaves room for raises below an eighth.
     let base = 1000;
     let mut variants: Vec<_> = (0..32u8).map(|salt| variant(salt, base)).collect();
-    assert!(variants.iter().all(|tx| tx.body.fee == variants[0].body.fee));
+    assert!(
+        variants
+            .iter()
+            .all(|tx| tx.body.fee == variants[0].body.fee)
+    );
     variants.sort_by_key(|tx| std::cmp::Reverse(codec::transaction_id(tx)));
     let revision = published(&node);
     selections();
@@ -1186,9 +1336,15 @@ fn template_clearing_runs_off_the_node_lock() {
     assert_eq!(cost.under_lock, 0);
     let (stored, revision) = {
         let i = node.locked().unwrap();
-        (i.template.as_ref().map(|entry| entry.selection), i.selection_revision)
+        (
+            i.template.as_ref().map(|entry| entry.selection),
+            i.selection_revision,
+        )
     };
-    assert!(stored.is_some_and(|selection| selection != revision), "kept, but outdated");
+    assert!(
+        stored.is_some_and(|selection| selection != revision),
+        "kept, but outdated"
+    );
     let fresh = node.template().unwrap();
     assert_eq!(fresh.transactions, vec![first, newcomer]);
     // Both are the blocks consensus execution builds, and both mine.
@@ -1204,7 +1360,10 @@ fn template_clearing_runs_off_the_node_lock() {
         assert_eq!(codec::encode(&expected.unwrap()), codec::encode(block));
         Chain::mine(block.clone(), 1_000_000).unwrap();
     }
-    assert!(node.submit_block(Chain::mine(fresh, 1_000_000).unwrap()).unwrap());
+    assert!(
+        node.submit_block(Chain::mine(fresh, 1_000_000).unwrap())
+            .unwrap()
+    );
 }
 
 #[test]
@@ -1273,7 +1432,10 @@ fn same_parent_rebuilds_wait_for_the_previous_build_time() {
     let second = decision_trade(config, state, &SECRET, start + 1, Outcome::Pass, 502);
     node.submit_transaction(first.clone()).unwrap();
     let (built, retry) = node.template_shared(Freshness::Throttled).unwrap();
-    assert_eq!((built.transactions.clone(), retry), (vec![first.clone()], None));
+    assert_eq!(
+        (built.transactions.clone(), retry),
+        (vec![first.clone()], None)
+    );
     // As if that build had taken a minute.
     let finished = {
         let mut i = node.locked().unwrap();
@@ -1283,12 +1445,18 @@ fn same_parent_rebuilds_wait_for_the_previous_build_time() {
     };
     node.submit_transaction(second.clone()).unwrap();
     let ((block, retry), cost) = metered(|| node.template_shared(Freshness::Throttled).unwrap());
-    assert!(Arc::ptr_eq(&block, &built), "the same-parent template is served");
+    assert!(
+        Arc::ptr_eq(&block, &built),
+        "the same-parent template is served"
+    );
     assert_eq!(retry, Some(finished + Duration::from_secs(60)));
     assert_eq!(cost.evaluations, 0, "nothing is built inside the window");
     // Local mining and RPC are never throttled.
     let ((block, retry), cost) = metered(|| node.template_shared(Freshness::Current).unwrap());
-    assert_eq!((block.transactions.clone(), retry), (vec![first, second], None));
+    assert_eq!(
+        (block.transactions.clone(), retry),
+        (vec![first, second], None)
+    );
     assert!(cost.evaluations > 0);
     assert_eq!(cost.under_lock, 0);
     let ((again, retry), cost) = metered(|| node.template_shared(Freshness::Throttled).unwrap());
@@ -1325,7 +1493,10 @@ fn deferred_stratum_refreshes_wait_for_the_interval_and_the_template_throttle() 
     let last = tokio::time::Instant::now();
     let interval = last + STRATUM_REFRESH_INTERVAL;
     assert_eq!(stratum_refresh_at(last, None), interval);
-    assert_eq!(stratum_refresh_at(last, Some(last + Duration::from_millis(1))), interval);
+    assert_eq!(
+        stratum_refresh_at(last, Some(last + Duration::from_millis(1))),
+        interval
+    );
     let later = last + STRATUM_REFRESH_INTERVAL + Duration::from_secs(3);
     assert_eq!(stratum_refresh_at(last, Some(later)), later);
 }
@@ -1411,8 +1582,14 @@ fn admission_lock_hold_at_full_pool() {
         .collect();
     let (installed, fill) = metered(|| {
         let mut i = node.locked().unwrap();
-        Node::select_pool(&i.chain, node.miner, &full, &HashSet::new(), &HashSet::new())
-            .and_then(|selected| node.install_pool(&mut i, selected))
+        Node::select_pool(
+            &i.chain,
+            node.miner,
+            &full,
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .and_then(|selected| node.install_pool(&mut i, selected))
     });
     installed.unwrap();
     assert_eq!(pool(&node).0.len(), limit);
@@ -1577,7 +1754,12 @@ fn admission_from_many_sources_stays_within_the_node_wide_selection_budget() {
                 (&OTHER, other_start + round * 4 + source / 2)
             };
             let tx = payment(config, state, secret, nonce, key(), 1, 0);
-            relay_from(&node, &format!("127.0.0.{}", source + 1), vec![tx.clone()], Vec::new());
+            relay_from(
+                &node,
+                &format!("127.0.0.{}", source + 1),
+                vec![tx.clone()],
+                Vec::new(),
+            );
             sent.push(tx);
         }
     }
@@ -1596,18 +1778,29 @@ fn admission_from_many_sources_stays_within_the_node_wide_selection_budget() {
     assert_eq!(ids(&pool(&node).0), ids(&sent));
     SELECTION_CHARGE.with(|charge| charge.set(None));
     // A spent budget refuses public broadcasts until it has refilled.
-    node.admission.unpoisoned().budget.spend(SELECTION_TIME_BURST * 2, Instant::now());
+    node.admission
+        .unpoisoned()
+        .budget
+        .spend(SELECTION_TIME_BURST * 2, Instant::now());
     let wait = node.selection_wait().expect("the budget is spent");
-    assert!(wait > Duration::from_secs(3) && wait <= Duration::from_secs(8), "{wait:?}");
+    assert!(
+        wait > Duration::from_secs(3) && wait <= Duration::from_secs(8),
+        "{wait:?}"
+    );
 }
 
 #[test]
 fn the_admission_queue_keeps_each_source_a_fair_share() {
     let transaction = Transaction {
-        body: unsigned(&configuration(16 * 1024), &SECRET, 0, Operation::Refund {
-            round: 0,
-            proposal: [0; 32],
-        }),
+        body: unsigned(
+            &configuration(16 * 1024),
+            &SECRET,
+            0,
+            Operation::Refund {
+                round: 0,
+                proposal: [0; 32],
+            },
+        ),
         signature: [0; 64],
     };
     let newcomer = |n: u32, source: &str| {
@@ -1657,16 +1850,30 @@ fn a_low_bid_at_a_count_full_pool_is_refused_without_a_selection() {
     let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
     let start = nonce(&node, &key());
     for offset in 0..4 {
-        node.submit_transaction(payment(config, state, &SECRET, start + offset, key(), 1, 10))
-            .unwrap();
+        node.submit_transaction(payment(
+            config,
+            state,
+            &SECRET,
+            start + offset,
+            key(),
+            1,
+            10,
+        ))
+        .unwrap();
     }
     assert_eq!(pool(&node).0.len(), 4, "the selection is count-full");
     selections();
     // A newcomer that does not outbid the weakest entry cannot enter, so it
     // is refused before any selection, relayed or submitted.
     let low = payment(config, state, &OTHER, nonce(&node, &other()), key(), 1, 0);
-    let refused = node.submit_transaction(low.clone()).unwrap_err().to_string();
-    assert!(refused.contains("does not outbid its weakest entry"), "{refused}");
+    let refused = node
+        .submit_transaction(low.clone())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("does not outbid its weakest entry"),
+        "{refused}"
+    );
     relay(&node, vec![low]);
     assert_eq!(selections(), 0);
     // One that does outbid it costs one selection and displaces it.
@@ -1704,7 +1911,10 @@ fn a_waiting_block_submission_goes_ahead_of_queued_admissions() {
     assert!(node.submit_block(block.clone()).unwrap());
     assert_eq!(selections(), 2);
     let (selection, _, tip) = pool(&node);
-    assert_eq!((selection, tip), (vec![newcomer], codec::block_hash(&block)));
+    assert_eq!(
+        (selection, tip),
+        (vec![newcomer], codec::block_hash(&block))
+    );
 }
 
 #[test]
@@ -1717,7 +1927,14 @@ fn block_execution_runs_off_the_node_lock() {
     let node = decision_node(directory.path(), 64 * 1024);
     let view = snapshot(&node);
     let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
-    let trade = decision_trade(config, state, &SECRET, nonce(&node, &key()), Outcome::Fail, 301);
+    let trade = decision_trade(
+        config,
+        state,
+        &SECRET,
+        nonce(&node, &key()),
+        Outcome::Fail,
+        301,
+    );
     node.submit_transaction(trade.clone()).unwrap();
     let block = Chain::mine(node.template().unwrap(), 1_000_000).unwrap();
     let (submission, resume) = parked_submission(&node, block.clone());
@@ -1736,7 +1953,10 @@ fn block_execution_runs_off_the_node_lock() {
     let template = node.template();
     let status = node.status();
     drop(resume);
-    assert!(submission.join().unwrap().unwrap(), "the block became the tip");
+    assert!(
+        submission.join().unwrap().unwrap(),
+        "the block became the tip"
+    );
     assert!(free, "block execution held the node lock");
     admitted.unwrap();
     let template = template.unwrap();
@@ -1756,9 +1976,15 @@ fn concurrently_validated_siblings_commit_as_tip_and_side_branch() {
     let (a, resume_a) = parked_submission(&node, first.clone());
     let (b, resume_b) = parked_submission(&node, second.clone());
     drop(resume_a);
-    assert!(a.join().unwrap().unwrap(), "the first to finish becomes the tip");
+    assert!(
+        a.join().unwrap().unwrap(),
+        "the first to finish becomes the tip"
+    );
     drop(resume_b);
-    assert!(!b.join().unwrap().unwrap(), "its sibling is stored on a side branch");
+    assert!(
+        !b.join().unwrap().unwrap(),
+        "its sibling is stored on a side branch"
+    );
     let check = |node: &Node| {
         let i = node.locked().unwrap();
         let (one, two) = (codec::block_hash(&first), codec::block_hash(&second));
@@ -1801,7 +2027,10 @@ fn a_side_branch_flood_from_one_source_spends_only_its_own_share() {
     let other = &siblings[count - 1];
     relay_from(&node, "127.0.0.2", Vec::new(), vec![other.clone()]);
     assert!(stored(&node, other));
-    assert_eq!(snapshot(&node).chain.tip_hash(), codec::block_hash(&siblings[0]));
+    assert_eq!(
+        snapshot(&node).chain.tip_hash(),
+        codec::block_hash(&siblings[0])
+    );
 }
 
 #[test]
@@ -1866,7 +2095,10 @@ fn a_spend_from_an_account_a_pending_transfer_creates_waits_for_its_funding() {
     // Without a pending transfer creating its account, a spend is refused.
     let stranger = payment(config, state, &[79; 32], 0, key(), 1, 0);
     let refused = node.submit_transaction(stranger).unwrap_err().to_string();
-    assert!(refused.contains("sender account does not exist"), "{refused}");
+    assert!(
+        refused.contains("sender account does not exist"),
+        "{refused}"
+    );
     // The funding confirms first; the spend then enters the pool and
     // confirms in the next block.
     assert_eq!(node.mine(1_000_000).unwrap().transactions, vec![funding]);
@@ -1900,7 +2132,15 @@ fn spends_awaiting_funding_are_bounded_and_expire() {
         node.submit_transaction(payment(config, state, &fresh, nonce, key(), 1, 0))
             .unwrap();
     }
-    let beyond = payment(config, state, &fresh, AWAITING_PER_SENDER as u64, key(), 1, 0);
+    let beyond = payment(
+        config,
+        state,
+        &fresh,
+        AWAITING_PER_SENDER as u64,
+        key(),
+        1,
+        0,
+    );
     assert!(node.submit_transaction(beyond).is_err());
     assert_eq!(awaiting(&node).len(), AWAITING_PER_SENDER);
     // Blocks that leave the funding pending: the spends wait AWAITING_TIPS

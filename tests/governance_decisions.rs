@@ -279,7 +279,10 @@ fn the_largest_grant_leaves_both_outcomes_tradeable() {
         let bought = s.account(&key(&DEFENDER), Some(outcome)).unwrap();
         let sold = s.account(&key(&ATTACKER), Some(outcome)).unwrap();
         assert!(bought.shares > buyer.shares, "{outcome:?} buy filled");
-        assert!(sold.ordinary + 4u32 > seller.ordinary, "{outcome:?} sale paid");
+        assert!(
+            sold.ordinary + 4u32 > seller.ordinary,
+            "{outcome:?} sale paid"
+        );
     }
 }
 
@@ -424,7 +427,10 @@ fn leaders_cancelled_after_a_capacity_drop_do_not_restart_the_lead_they_took() {
     );
     s = step(&c, &s, &[sale]);
     for id in [first_id, second_id] {
-        assert_eq!(s.proposals.get(&id).unwrap().refund_height, Some(s.height + 1));
+        assert_eq!(
+            s.proposals.get(&id).unwrap().refund_height,
+            Some(s.height + 1)
+        );
     }
     assert_eq!(leader(&s), (Some(honest_id), since));
     while s.decision_id().is_none() {

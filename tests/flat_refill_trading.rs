@@ -207,11 +207,22 @@ fn exact_side_fills_whatever_the_other_sides_rounding_on_flat_worlds() {
         let mut offered = 0;
         for n in 0..1 + rng.below(4) as u8 {
             let any = 1 + rng.below(6 * u.max(v));
-            buys.push(order(n, if exact == 0 { u * (1 + rng.below(6)) } else { any }));
+            buys.push(order(
+                n,
+                if exact == 0 {
+                    u * (1 + rng.below(6))
+                } else {
+                    any
+                },
+            ));
         }
         for n in 0..1 + rng.below(4) as u8 {
             let any = 1 + rng.below(6 * u.max(v));
-            let amount = if exact == 1 { v * (1 + rng.below(6)) } else { any };
+            let amount = if exact == 1 {
+                v * (1 + rng.below(6))
+            } else {
+                any
+            };
             if offered + amount < v * k {
                 offered += amount;
                 sells.push(order(100 + n, amount));
@@ -228,7 +239,11 @@ fn exact_side_fills_whatever_the_other_sides_rounding_on_flat_worlds() {
             _ => continue,
         };
         for (fill, o) in fills.iter().zip(side) {
-            assert_eq!(fill.input, o.amount, "R={} S={} bps={bps}", w.reserve, w.shares);
+            assert_eq!(
+                fill.input, o.amount,
+                "R={} S={} bps={bps}",
+                w.reserve, w.shares
+            );
             assert_eq!(fill.output, &o.amount * scale.0 / scale.1);
         }
     }

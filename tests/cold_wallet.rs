@@ -273,7 +273,11 @@ async fn network_changes_invalidate_review_and_persist_across_key_changes() {
     let refused = signer.post("review", envelope.clone()).await;
     assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     assert!(
-        refused.text().await.unwrap().contains("Select this signer's network"),
+        refused
+            .text()
+            .await
+            .unwrap()
+            .contains("Select this signer's network"),
         "review without a selected network must explain the requirement"
     );
     let session: Value = signer
@@ -899,9 +903,13 @@ async fn relabelled_exports_are_signed_for_the_selected_network_only() {
     unsigned.as_object_mut().unwrap().remove("fee_quote");
     unsigned["chain_id"] = json!(hex::encode(selected));
     let reviewed = signer.ok("review", unsigned).await;
-    assert!(reviewed["fields"].as_array().unwrap().iter().any(|f| {
-        f["label"] == "Network · signed" && f["value"] == hex::encode(selected)
-    }));
+    assert!(
+        reviewed["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| { f["label"] == "Network · signed" && f["value"] == hex::encode(selected) })
+    );
     let signed = signer
         .ok("sign", json!({"review_token":reviewed["review_token"]}))
         .await;
@@ -1156,7 +1164,10 @@ async fn generated_keys_are_random_return_one_backup_and_sign() {
         .json()
         .await
         .unwrap();
-    assert!(session.get("backup").is_none(), "status never carries the private key");
+    assert!(
+        session.get("backup").is_none(),
+        "status never carries the private key"
+    );
     assert_eq!(session["public_key"], hex::encode(sender));
     assert_eq!(session["backup_pending"], true);
     assert!(session["address"].is_null() && session["watch"].is_null());
@@ -1167,16 +1178,29 @@ async fn generated_keys_are_random_return_one_backup_and_sign() {
     assert!(refused.text().await.unwrap().contains("backup"));
     // Any local process can read the session token, so the backup is never
     // served again: /api/backup only records the operator's confirmation.
-    for request in [json!({}), json!({"saved":false}), json!({"saved":true,"x":1})] {
+    for request in [
+        json!({}),
+        json!({"saved":false}),
+        json!({"saved":true,"x":1}),
+    ] {
         let response = signer.post("backup", request).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(!response.text().await.unwrap().contains(&hex::encode(secret)));
+        assert!(
+            !response
+                .text()
+                .await
+                .unwrap()
+                .contains(&hex::encode(secret))
+        );
     }
     let saved = signer.ok("backup", json!({"saved":true})).await;
     assert!(saved.get("backup").is_none());
     assert_eq!(saved["backup_pending"], false);
     assert_eq!(saved["public_key"], hex::encode(sender));
-    assert_eq!(saved["address"], address::encode(&sender, &[9; 32]).unwrap());
+    assert_eq!(
+        saved["address"],
+        address::encode(&sender, &[9; 32]).unwrap()
+    );
     assert_eq!(saved["watch"]["format"], "hashstash-watch-v2");
     assert_eq!(
         signer.post("backup", json!({"saved":true})).await.status(),
@@ -1237,7 +1261,8 @@ async fn long_lifetimes_need_explicit_confirmation_before_signing() {
             .await;
         assert_eq!(review["confirm_lifetime"], true);
         assert!(review["fields"].as_array().unwrap().iter().any(|f| {
-            f["label"] == "Lifetime warning" && f["value"].as_str().unwrap().contains(&lifetime.to_string())
+            f["label"] == "Lifetime warning"
+                && f["value"].as_str().unwrap().contains(&lifetime.to_string())
         }));
         for unconfirmed in [
             json!({"review_token":review["review_token"]}),
@@ -1336,7 +1361,10 @@ async fn review_requests_have_a_finite_configurable_limit() {
         .json()
         .await
         .unwrap();
-    assert_eq!(session["max_review_bytes"], cold::DEFAULT_MAX_REVIEW_REQUEST);
+    assert_eq!(
+        session["max_review_bytes"],
+        cold::DEFAULT_MAX_REVIEW_REQUEST
+    );
     assert_eq!(
         session["max_review_payments"],
         cold::DEFAULT_MAX_REVIEW_PAYMENTS
@@ -1449,7 +1477,10 @@ async fn proposal_review_reports_whether_text_matches_the_signed_description() {
         support: 1u32.into(),
     };
     for (description, verdict) in [
-        (Sha256::digest(text.as_bytes()).into(), "Matches the description hash"),
+        (
+            Sha256::digest(text.as_bytes()).into(),
+            "Matches the description hash",
+        ),
         ([3; 32], "Does not match the description hash"),
     ] {
         let mut expected = body(sender, proposal(description));
@@ -1560,12 +1591,7 @@ async fn session_token_reaches_only_the_launcher_and_idle_wallets_lock() {
     // The signer also wipes a forgotten key while no request arrives at all.
     signer.unlock(PHRASE).await;
     tokio::time::sleep(idle * 3).await;
-    let text = signer
-        .post("review", envelope)
-        .await
-        .text()
-        .await
-        .unwrap();
+    let text = signer.post("review", envelope).await.text().await.unwrap();
     assert!(text.contains("locked after a period without use"), "{text}");
     signer.server.stop().await;
 }

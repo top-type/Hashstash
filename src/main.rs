@@ -451,8 +451,7 @@ fn calibrate_initial_target(config: &mut Config, hashrate: &str) -> Result<()> {
     // The easiest target stays within 2^CALIBRATED_LIMIT_RANGE_BITS of the
     // calibration, so neither a stall nor a backdated first block can make
     // blocks practically free; the shift keeps the compact form exact.
-    config.limit_bits =
-        math::bits_from_target(&limit.min(initial << CALIBRATED_LIMIT_RANGE_BITS));
+    config.limit_bits = math::bits_from_target(&limit.min(initial << CALIBRATED_LIMIT_RANGE_BITS));
     config.validate()?;
     Ok(())
 }
@@ -1014,8 +1013,18 @@ fn verify_automatic_fee(
         "invalid account creation weight quote"
     );
     let weight = base_weight
-        .checked_add(if creates_account { fees::ACCOUNT_WEIGHT } else { 0 })
-        .and_then(|n| n.checked_add(if creates_record { fees::RECORD_WEIGHT } else { 0 }))
+        .checked_add(if creates_account {
+            fees::ACCOUNT_WEIGHT
+        } else {
+            0
+        })
+        .and_then(|n| {
+            n.checked_add(if creates_record {
+                fees::RECORD_WEIGHT
+            } else {
+                0
+            })
+        })
         .context("transaction weight overflow")?;
     let charge = |created: bool| {
         if created {
@@ -1220,9 +1229,8 @@ impl Prepared {
             self.anchor_height.saturating_add(self.body.expiry_blocks)
         )];
         if self.anchor_confirmed {
-            notes.push(
-                "Anchor check: a canonical block of this network at --anchor-url".to_owned(),
-            );
+            notes
+                .push("Anchor check: a canonical block of this network at --anchor-url".to_owned());
         } else if !client.is_loopback() {
             notes.push(
                 "warning: only this remote endpoint vouches for the anchor block; a dishonest one can anchor it where it never confirms. Add --anchor-url with a second endpoint, or prepare through a loopback node".to_owned(),
@@ -1427,11 +1435,7 @@ async fn broadcast_signed(
 ) -> Result<Value> {
     let id = hex::encode(hashstash::codec::transaction_id(transaction));
     let result = client
-        .call(
-            "broadcasttransaction",
-            json!({"raw":raw}),
-            RpcLimits::SMALL,
-        )
+        .call("broadcasttransaction", json!({"raw":raw}), RpcLimits::SMALL)
         .await?;
     ensure!(
         result["transaction_id"].as_str() == Some(id.as_str()),
@@ -2674,7 +2678,11 @@ mod tests {
         assert_eq!(early.len(), 1);
         assert!(early[0].contains("defer block 1"), "{early:?}");
         let stale = genesis_warnings(&Config::devnet(), CLOCK_FLOOR - 1);
-        assert!(stale.iter().any(|w| w.contains("earlier than this release")));
+        assert!(
+            stale
+                .iter()
+                .any(|w| w.contains("earlier than this release"))
+        );
     }
 
     #[test]
@@ -2714,7 +2722,10 @@ mod tests {
         assert!(node::easy_proof_of_work(&uncalibrated));
         assert!(flagged(&uncalibrated));
         let warning = proof_of_work_warning(&uncalibrated).unwrap();
-        assert!(warning.contains("needs only 2 expected hashes"), "{warning}");
+        assert!(
+            warning.contains("needs only 2 expected hashes"),
+            "{warning}"
+        );
         let mut dev = initial_config(InitPreset::Dev, None, false, Some(1_800_000_000)).unwrap();
         dev.test_work = false;
         assert!(flagged(&dev));
@@ -2819,7 +2830,10 @@ mod tests {
     #[test]
     fn identity_publication_falls_back_where_hard_links_are_unsupported() {
         let directory = tempfile::tempdir().unwrap();
-        let (temporary, path) = (directory.path().join("new.tmp"), directory.path().join("key"));
+        let (temporary, path) = (
+            directory.path().join("new.tmp"),
+            directory.path().join("key"),
+        );
         type Link = fn(&Path, &Path) -> std::io::Result<()>;
         let unsupported: Link = |_, _| Err(std::io::ErrorKind::Unsupported.into());
         let existing: Link = |_, _| Err(std::io::ErrorKind::AlreadyExists.into());
@@ -2853,7 +2867,11 @@ mod tests {
             ),
             ("mismatch", json!({"secret":s,"public":o}), false),
             ("format", json!({"format":"other","private_key":s}), false),
-            ("field", json!({"format":"hashstash-private-v1","secret":s}), false),
+            (
+                "field",
+                json!({"format":"hashstash-private-v1","secret":s}),
+                false,
+            ),
             ("short", json!({"secret":hex::encode([19u8; 31])}), false),
             ("text", json!({"secret":"zz".repeat(32)}), false),
             ("type", json!({"secret":7}), false),
@@ -2903,7 +2921,10 @@ mod tests {
             "Recipient receives: 5 atoms".to_owned(),
             "Total debit: 25 atoms".to_owned(),
             "Nonce: 4".to_owned(),
-            format!("Recipient: {}", address::encode(&recipient, &chain).unwrap()),
+            format!(
+                "Recipient: {}",
+                address::encode(&recipient, &chain).unwrap()
+            ),
             format!("Network · signed: {}", hex::encode(chain)),
             "Data bytes: 200".to_owned(),
             format!("Data hex: {}...", "ab".repeat(64)),

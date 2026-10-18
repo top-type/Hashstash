@@ -582,7 +582,14 @@ impl AddressBook {
             .entries
             .values()
             .filter(|e| !e.busy && e.next_attempt <= at)
-            .map(|e| (e.last_attempt, self.rank(e.address), e.address, e.last_success > 0))
+            .map(|e| {
+                (
+                    e.last_attempt,
+                    self.rank(e.address),
+                    e.address,
+                    e.last_success > 0,
+                )
+            })
             .collect::<Vec<_>>();
         candidates.sort();
         let mut selected = Vec::new();
@@ -911,7 +918,10 @@ mod tests {
         )
         .unwrap();
         assert!(book.load_error.as_ref().unwrap().contains("byte limit"));
-        assert_eq!(book.entries().map(|e| e.address).collect::<Vec<_>>(), [configured]);
+        assert_eq!(
+            book.entries().map(|e| e.address).collect::<Vec<_>>(),
+            [configured]
+        );
         assert!(!path.exists());
         assert_eq!(
             fs::read(invalid_path(&path)).unwrap().len(),
@@ -1039,9 +1049,15 @@ mod tests {
         assert_eq!(loaded.entries().next().unwrap().address, addr);
         // An unchanged book is not rewritten.
         assert!(loaded.pending_save().unwrap().is_none());
-        let other =
-            AddressBook::open(path.clone(), [2; 32], opts, "0.0.0.0:9".parse().unwrap(), &[], 102)
-                .unwrap();
+        let other = AddressBook::open(
+            path.clone(),
+            [2; 32],
+            opts,
+            "0.0.0.0:9".parse().unwrap(),
+            &[],
+            102,
+        )
+        .unwrap();
         assert!(other.load_error.as_ref().unwrap().contains("another chain"));
         assert_eq!(other.entries().count(), 0);
         assert!(invalid_path(&path).is_file());
@@ -1087,7 +1103,11 @@ mod tests {
         known.sort();
         assert_eq!(known, [peer, learned]);
         assert_eq!(
-            corrected.entries().find(|e| e.address == peer).unwrap().last_success,
+            corrected
+                .entries()
+                .find(|e| e.address == peer)
+                .unwrap()
+                .last_success,
             1_000
         );
     }
@@ -1281,7 +1301,9 @@ mod tests {
     fn interrupted_save_temporaries_are_removed_on_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("node.peers-ab.json");
-        let stale = dir.path().join(format!("node.peers-ab.{}.tmp", "0f".repeat(16)));
+        let stale = dir
+            .path()
+            .join(format!("node.peers-ab.{}.tmp", "0f".repeat(16)));
         let unrelated = dir.path().join("node.peers-ab.notes.tmp");
         fs::write(&stale, b"partial").unwrap();
         fs::write(&unrelated, b"kept").unwrap();

@@ -192,9 +192,21 @@ fn plain_http_is_limited_to_loopback_literals_without_an_explicit_opt_in() {
     assert!(!insecure.is_loopback());
     assert!(RpcClient::new("http://user@203.0.113.5/rpc", true).is_err());
     assert!(RpcClient::new("http://203.0.113.5/rpc?x=1", true).is_err());
-    assert!(RpcClient::new("http://127.0.0.1/rpc", false).unwrap().is_loopback());
-    assert!(RpcClient::new("http://[::1]/rpc", false).unwrap().is_loopback());
-    assert!(!RpcClient::new("https://127.0.0.1.example/rpc", false).unwrap().is_loopback());
+    assert!(
+        RpcClient::new("http://127.0.0.1/rpc", false)
+            .unwrap()
+            .is_loopback()
+    );
+    assert!(
+        RpcClient::new("http://[::1]/rpc", false)
+            .unwrap()
+            .is_loopback()
+    );
+    assert!(
+        !RpcClient::new("https://127.0.0.1.example/rpc", false)
+            .unwrap()
+            .is_loopback()
+    );
 }
 
 #[tokio::test]
@@ -208,12 +220,20 @@ async fn legacy_call_rpc_applies_the_same_transport_policy() {
 #[tokio::test]
 async fn redirects_are_refused_instead_of_reposting_the_request() {
     let target = mock(Duration::ZERO, |_, _| result(json!({"redirected":true}))).await;
-    for status in ["307 Temporary Redirect", "308 Permanent Redirect", "302 Found"] {
+    for status in [
+        "307 Temporary Redirect",
+        "308 Permanent Redirect",
+        "302 Found",
+    ] {
         let location = format!("Location: {}\r\n", target.url());
         let redirecting = mock(Duration::ZERO, move |_, _| http(status, &location, b"")).await;
         let client = RpcClient::new(&redirecting.url(), false).unwrap();
         let error = client
-            .call("broadcasttransaction", json!({"raw":"00"}), RpcLimits::SMALL)
+            .call(
+                "broadcasttransaction",
+                json!({"raw":"00"}),
+                RpcLimits::SMALL,
+            )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("redirect"), "{status}: {error}");
@@ -246,7 +266,10 @@ async fn environment_proxies_never_intercept_the_named_endpoint() {
     let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(reply, json!({"from":"endpoint"}));
     assert_eq!(endpoint.methods(), ["status"]);
-    assert!(proxy.methods().is_empty(), "the CLI used an environment proxy");
+    assert!(
+        proxy.methods().is_empty(),
+        "the CLI used an environment proxy"
+    );
 }
 
 #[test]
@@ -283,7 +306,10 @@ async fn small_replies_are_bounded_by_bytes_and_json_values() {
             .call(method, json!({}), RpcLimits::SMALL)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("RPC response"), "{method}: {error}");
+        assert!(
+            error.to_string().contains("RPC response"),
+            "{method}: {error}"
+        );
         // A caller that asked for an arbitrary method still gets the full frame.
         client
             .call(method, json!({}), RpcLimits::FRAME)
@@ -298,9 +324,7 @@ async fn pending_nonce_discovery_counts_only_signed_rows_and_is_bounded() {
     let sender = crypto::public_key(&secret).unwrap();
     let own = [signed_transfer(secret, 4), signed_transfer(secret, 3)];
     let other = signed_transfer([22; 32], 9);
-    let row = |tx: &hashstash::types::Transaction| {
-        json!({"txid":hex::encode(hashstash::codec::transaction_id(tx)),"raw":wallet::signed_hex(tx)})
-    };
+    let row = |tx: &hashstash::types::Transaction| json!({"txid":hex::encode(hashstash::codec::transaction_id(tx)),"raw":wallet::signed_hex(tx)});
     let rows = vec![row(&own[0]), row(&other), row(&own[1])];
     let honest = mock(Duration::ZERO, move |method, params| match method {
         "account" => result(json!({"account":{"nonce":3}})),
@@ -467,9 +491,7 @@ fn remote(mock: &Mock) -> RpcClient {
 async fn a_remote_pending_nonce_above_the_account_needs_consecutive_signed_rows() {
     let secret = [35u8; 32];
     let sender = crypto::public_key(&secret).unwrap();
-    let row = |tx: &hashstash::types::Transaction| {
-        json!({"txid":hex::encode(hashstash::codec::transaction_id(tx)),"raw":wallet::signed_hex(tx)})
-    };
+    let row = |tx: &hashstash::types::Transaction| json!({"txid":hex::encode(hashstash::codec::transaction_id(tx)),"raw":wallet::signed_hex(tx)});
     let endpoint = |claimed: u64, rows: Vec<Value>| {
         mock(Duration::ZERO, move |method, params| match method {
             "account" => result(json!({"account":{"nonce":3},"pending_nonce":claimed})),
@@ -492,7 +514,10 @@ async fn a_remote_pending_nonce_above_the_account_needs_consecutive_signed_rows(
             .await
             .is_err()
     );
-    let consecutive = vec![row(&signed_transfer(secret, 4)), row(&signed_transfer(secret, 3))];
+    let consecutive = vec![
+        row(&signed_transfer(secret, 4)),
+        row(&signed_transfer(secret, 3)),
+    ];
     let justified = endpoint(5, consecutive.clone()).await;
     assert_eq!(
         remote(&justified)
@@ -712,7 +737,11 @@ async fn sign_reviews_bodies_and_unsigned_exports_on_stderr() {
     };
     // The operator names the network: it is never taken from the export, and
     // an export prepared for another network is refused.
-    for (input, network) in [(&export, None), (&raw_body, None), (&export, Some([29; 32]))] {
+    for (input, network) in [
+        (&export, None),
+        (&raw_body, None),
+        (&export, Some([29; 32])),
+    ] {
         let out = directory.path().join("refused.json");
         let output = cli(&sign(input, &out, network), &[]).await;
         assert!(!output.status.success(), "{output:?}");
@@ -731,7 +760,10 @@ async fn sign_reviews_bodies_and_unsigned_exports_on_stderr() {
             "Valid for · blocks: 500",
             "warning: lifetime of 500 blocks",
         ] {
-            assert!(review.contains(expected), "{expected} missing from {review}");
+            assert!(
+                review.contains(expected),
+                "{expected} missing from {review}"
+            );
         }
         assert!(review.contains(&hashstash::address::encode(&recipient, &chain).unwrap()));
         assert!(review.contains(&format!("Network · signed: {}", hex::encode(chain))));
@@ -813,7 +845,11 @@ async fn an_empty_stratum_password_file_is_refused_before_the_node_opens() {
 async fn shared_networks_need_calibration_before_untrusted_peers_reach_them() {
     let directory = tempfile::tempdir().unwrap();
     let path = |name: &str| directory.path().join(name).to_str().unwrap().to_owned();
-    let slow = cli(&args(&["init", "--config", &path("slow.json"), "--preset", "slow"]), &[]).await;
+    let slow = cli(
+        &args(&["init", "--config", &path("slow.json"), "--preset", "slow"]),
+        &[],
+    )
+    .await;
     assert!(!slow.status.success());
     assert!(String::from_utf8_lossy(&slow.stderr).contains("--hashrate"));
     assert!(!directory.path().join("slow.json").exists());
@@ -941,7 +977,10 @@ mod funded {
             "Nonce source: account nonce 0 reported by the endpoint, pending nonce 0".into(),
             format!("Network · signed: {}", hex::encode(chain_id)),
         ] {
-            assert!(review.contains(&expected), "{expected} missing from {review}");
+            assert!(
+                review.contains(&expected),
+                "{expected} missing from {review}"
+            );
         }
 
         let operation = serde_json::to_string(&Operation::TransferExact {
@@ -1004,9 +1043,8 @@ mod funded {
         );
 
         // A second endpoint must hold the anchor on its canonical chain of this network.
-        let (_, review) = successful(
-            &cli(&prepare("anchored.json", &["--anchor-url", &url]), &[]).await,
-        );
+        let (_, review) =
+            successful(&cli(&prepare("anchored.json", &["--anchor-url", &url]), &[]).await);
         assert!(
             review.contains("Anchor check: a canonical block of this network at --anchor-url"),
             "{review}"

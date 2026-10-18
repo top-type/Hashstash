@@ -122,10 +122,17 @@ CORS only for the exact configured website origins. POST also requires that
 Origin and JSON content type. It stores keyed subnet digests, not literal IPs.
 HTTP concurrency, request duration, and request-body size are bounded: 16
 requests run at once, and one client network may hold at most four of them.
-At most 64 connections are served at once; another is closed as soon as it is
-accepted, before anything is read. Each connection must send every request
-head within five seconds of opening or of its previous response, so a partial
-head or an idle keep-alive connection is closed unanswered.
+At most 64 connections are served at once. Each connection must send every
+request head within five seconds of opening or of its previous response, so a
+partial head or an idle keep-alive connection is closed unanswered. At the
+limit a new connection takes the place of the one that has waited longest for
+its next request, which is closed; only when all 64 are handling requests is
+the new one closed as soon as it is accepted, before anything is read. A
+request beyond the 16 that run at once is answered immediately, so few
+connections stay busy for long, and connections held open, idle or with
+partial heads, never keep the proxy out. A local program sending requests
+without pause on every connection can still crowd it out, at the cost of
+continuous work for itself and the faucet.
 
 Status never waits for payments or node lookups. It answers from the state the
 latest refresh or reservation published, reading cooldowns and claims through

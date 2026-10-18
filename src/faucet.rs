@@ -46,7 +46,8 @@ const SCAN_BLOCKS_PER_REFRESH: u64 = 64;
 const RECEIPT_REPAIRS_PER_REFRESH: usize = 8;
 /// Concurrent HTTP requests one client network may hold.
 const CLIENT_SESSIONS: usize = 4;
-/// HTTP connections served at once; further ones are closed unread.
+/// HTTP connections served at once; a further one replaces the one idle
+/// longest.
 const HTTP_CONNECTIONS: usize = 64;
 /// The usual pause between refreshes.
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -4914,7 +4915,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_connections_must_send_heads_promptly_and_are_capped() {
+    async fn http_connections_must_send_heads_promptly_and_idle_ones_give_way() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let dir = TempDir::new().unwrap();
         let server = serve(config(&dir)).await.unwrap();
@@ -4923,22 +4924,34 @@ mod tests {
         for _ in 0..HTTP_CONNECTIONS {
             held.push(tokio::net::TcpStream::connect(server.address).await.unwrap());
         }
-        // One connection over the cap is closed before anything is read.
-        let mut refused = tokio::net::TcpStream::connect(server.address).await.unwrap();
+        // Connections held open never keep another out: one more takes the
+        // place of the one idle longest, which is closed unanswered.
+        let mut newer = tokio::net::TcpStream::connect(server.address).await.unwrap();
         let mut byte = [0; 1];
-        let closed = tokio::time::timeout(Duration::from_secs(2), refused.read(&mut byte))
+        let closed = tokio::time::timeout(Duration::from_secs(2), held[0].read(&mut byte))
             .await
-            .expect("a connection over the cap was held");
+            .expect("the connection idle longest was kept");
         assert!(matches!(closed, Ok(0) | Err(_)));
         assert!(opened.elapsed() < crate::local_http::HEAD_TIMEOUT);
+        newer
+            .write_all(b"GET /faucet/status HTTP/1.1\r\nHost: faucet.example\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), newer.read_to_end(&mut answer))
+            .await
+            .unwrap()
+            .unwrap();
+        // Without the proxy's client address it is refused, but answered.
+        assert!(answer.starts_with(b"HTTP/1.1 403"));
         // A partial request head is closed unanswered at the head deadline.
-        held[0]
+        held[1]
             .write_all(b"GET /faucet/status HTTP/1.1\r\nHost: faucet.example\r\n")
             .await
             .unwrap();
         let closed = tokio::time::timeout(
             crate::local_http::HEAD_TIMEOUT + Duration::from_secs(3),
-            held[0].read(&mut byte),
+            held[1].read(&mut byte),
         )
         .await
         .expect("a partial head was held past the deadline");

@@ -438,7 +438,7 @@ async fn signer_binds_only_to_loopback() {
 }
 
 #[tokio::test]
-async fn loopback_connections_must_send_heads_promptly_and_are_capped() {
+async fn loopback_connections_must_send_heads_promptly_and_idle_ones_give_way() {
     use std::time::{Duration, Instant};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -450,29 +450,53 @@ async fn loopback_connections_must_send_heads_promptly_and_are_capped() {
     for _ in 0..cold::MAX_CONNECTIONS {
         held.push(TcpStream::connect(server.address).await.unwrap());
     }
-    // Another local process's connection over the cap is closed unread.
-    let mut refused = TcpStream::connect(server.address).await.unwrap();
+    // Another local process holding every connection open does not keep the
+    // browser out: a new connection takes the place of the one idle longest.
+    let mut browser = TcpStream::connect(server.address).await.unwrap();
     let mut byte = [0; 1];
-    let closed = tokio::time::timeout(Duration::from_secs(2), refused.read(&mut byte))
+    let closed = tokio::time::timeout(Duration::from_secs(2), held[0].read(&mut byte))
         .await
-        .expect("a connection over the cap was held");
+        .expect("the connection idle longest was kept");
     assert!(matches!(closed, Ok(0) | Err(_)));
     assert!(opened.elapsed() < hashstash::local_http::HEAD_TIMEOUT);
+    // Without the session token a request is refused before its body is
+    // read, and the connection then closes rather than wait for that body,
+    // so a slowly sent body never holds a connection either.
+    browser
+        .write_all(
+            format!(
+                "POST /api/review HTTP/1.1\r\nHost: {0}\r\nOrigin: http://{0}\r\nContent-Type: application/json\r\nContent-Length: 1000000\r\n\r\n{{",
+                server.address
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut answer = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut buffer = [0; 1024];
+        while let Ok(read @ 1..) = browser.read(&mut buffer).await {
+            answer.extend_from_slice(&buffer[..read]);
+        }
+    })
+    .await
+    .expect("an unauthorized request body was awaited");
+    assert!(answer.starts_with(b"HTTP/1.1 403"));
     // A connection that never completes its request head is closed unanswered.
-    held[0]
+    held[1]
         .write_all(format!("GET / HTTP/1.1\r\nHost: {}\r\n", server.address).as_bytes())
         .await
         .unwrap();
     let closed = tokio::time::timeout(
         hashstash::local_http::HEAD_TIMEOUT + Duration::from_secs(3),
-        held[0].read(&mut byte),
+        held[1].read(&mut byte),
     )
     .await
     .expect("a partial head was held past the deadline");
     assert!(matches!(closed, Ok(0) | Err(_)));
     // The silent connections were closed by the same deadline.
     server.stop().await;
-    for stream in &mut held[1..] {
+    for stream in &mut held[2..] {
         let closed = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
             .await
             .unwrap();

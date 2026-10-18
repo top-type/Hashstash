@@ -199,7 +199,9 @@ async fn p2p_late_transaction_failures_are_atomic_on_disk_then_valid_sync_and_re
         let expected = match case {
             0 => {
                 transaction.signature[0] ^= 1;
-                crypto::verify(&chain_id, transaction).unwrap_err().to_string()
+                crypto::verify(&chain_id, transaction)
+                    .unwrap_err()
+                    .to_string()
             }
             1 => {
                 transaction.body.nonce += 1;

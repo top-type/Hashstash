@@ -103,7 +103,10 @@ fn snapshot_reports_the_selected_senders_pending_nonce() {
     assert_eq!(snapshot["account"]["pending_nonce"], "2");
     let rows = snapshot["sender_mempool"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
-    assert!(rows.iter().all(|row| row["body"]["nonce"].as_u64().unwrap() < 2));
+    assert!(
+        rows.iter()
+            .all(|row| row["body"]["nonce"].as_u64().unwrap() < 2)
+    );
     // preparetransaction requires exactly the reported value.
     let operation = Operation::TransferExact {
         recipient: recipient(),

@@ -131,7 +131,10 @@ impl std::error::Error for HeaderDeferred {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeaderParent {
     /// A validated block: its height and branch work.
-    Stored { height: u64, work: Amount },
+    Stored {
+        height: u64,
+        work: Amount,
+    },
     /// A held header: its height, the work its held chain claims, and
     /// whether that chain claimed more work than the tip.
     Held {
@@ -179,7 +182,10 @@ pub type SubmissionBudget<'a> = &'a mut dyn FnMut(bool) -> Result<Option<usize>>
 struct StaleReplay;
 impl std::fmt::Display for StaleReplay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "retained state replay no longer matches the active chain")
+        write!(
+            f,
+            "retained state replay no longer matches the active chain"
+        )
     }
 }
 impl std::error::Error for StaleReplay {}
@@ -200,7 +206,10 @@ fn permanent(error: anyhow::Error) -> anyhow::Error {
 pub struct TemplateStale;
 impl std::fmt::Display for TemplateStale {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "template build abandoned: its parent is no longer the tip")
+        write!(
+            f,
+            "template build abandoned: its parent is no longer the tip"
+        )
     }
 }
 impl std::error::Error for TemplateStale {}
@@ -628,11 +637,7 @@ impl HeldHeaders {
     fn admit(&mut self, hash: &Hash) -> Vec<Hash> {
         let mut marked = Vec::new();
         let mut cursor = *hash;
-        while self
-            .headers
-            .get(&cursor)
-            .is_some_and(|held| !held.admitted)
-        {
+        while self.headers.get(&cursor).is_some_and(|held| !held.admitted) {
             self.reclassify(&cursor, |held| held.admitted = true);
             marked.push(cursor);
             cursor = self.previous(&cursor).expect("held header");
@@ -1369,9 +1374,7 @@ impl Chain {
         }
         self.db
             .execute("DELETE FROM canonical_index WHERE height>?1", [height])?;
-        self.tip_block = self
-            .load_block(&hash)?
-            .context("checkpoint block absent")?;
+        self.tip_block = self.load_block(&hash)?.context("checkpoint block absent")?;
         self.tip = hash;
         self.tip_entry = entry;
         self.tip_state = state;
@@ -2198,7 +2201,8 @@ impl Chain {
             self.branches.insert(hash, BranchLeaf::of(entry));
         } else if entry.header.previous != previous.0 && previous.0 != hash {
             // A tip has no stored children, so the previous tip is now a leaf.
-            self.branches.insert(previous.0, BranchLeaf::of(&previous.1));
+            self.branches
+                .insert(previous.0, BranchLeaf::of(&previous.1));
         }
     }
     fn refresh_capacity(&mut self) {
@@ -2632,13 +2636,11 @@ impl Chain {
         if self.load_entry(hash)?.is_some() {
             return Ok(Some(*hash));
         }
-        Ok(self.held.headers.get(hash).map(|header| {
-            if header.admitted {
-                header.root
-            } else {
-                *hash
-            }
-        }))
+        Ok(self.held.headers.get(hash).map(
+            |header| {
+                if header.admitted { header.root } else { *hash }
+            },
+        ))
     }
     /// Headers held for presync, admitted or pinned ones included.
     pub fn held_header_count(&self) -> usize {
@@ -2717,7 +2719,11 @@ impl Chain {
                 let (root, contributed, claimed) = match self.held.headers.get(&header.previous) {
                     Some(parent) => {
                         ensure!(parent.height + 1 == height, "held header height mismatch");
-                        (parent.root, parent.contributed.clone(), parent.claimed.clone())
+                        (
+                            parent.root,
+                            parent.contributed.clone(),
+                            parent.claimed.clone(),
+                        )
                     }
                     None => {
                         let parent = self
@@ -2931,8 +2937,7 @@ impl Chain {
         steps: usize,
     ) -> Result<bool> {
         ensure!(steps > 0, "replay budget must be positive");
-        let Some(validation) = self.begin_submission(&block, now, &mut |_| Ok(Some(steps)))?
-        else {
+        let Some(validation) = self.begin_submission(&block, now, &mut |_| Ok(Some(steps)))? else {
             return Ok(false);
         };
         let executed = validation.execute(&block);
@@ -3014,9 +3019,7 @@ impl Chain {
         if self.load_entry(&hash)?.is_some() {
             return Ok(false);
         }
-        let bytes = validation
-            .bytes
-            .unwrap_or_else(|| codec::encode(&block));
+        let bytes = validation.bytes.unwrap_or_else(|| codec::encode(&block));
         let ExecutedBlock { entry, state } = match executed {
             Ok(executed) => executed,
             Err(error) => {
@@ -3268,12 +3271,8 @@ impl Chain {
         transactions: &[&Transaction],
     ) -> Result<Vec<Result<()>>> {
         let target = self.target(&self.tip_entry)?;
-        let execution = consensus::prepare_block(
-            &self.config,
-            &self.tip_state,
-            &miner,
-            &math::work(&target),
-        )?;
+        let execution =
+            consensus::prepare_block(&self.config, &self.tip_state, &miner, &math::work(&target))?;
         Ok(transactions
             .iter()
             .map(|transaction| {
@@ -3406,7 +3405,10 @@ impl Chain {
                 attempted: false,
             });
         }
-        let refs: Vec<_> = pending.iter().map(|candidate| candidate.transaction).collect();
+        let refs: Vec<_> = pending
+            .iter()
+            .map(|candidate| candidate.transaction)
+            .collect();
         let anchor_validity = self.transaction_anchor_results(&self.tip, &refs)?;
         let mut pending: Vec<_> = pending
             .into_iter()
@@ -4236,7 +4238,10 @@ mod cache_tests {
         let count = (0..tip)
             .filter(|height| checkpoint_retained(*height, tip))
             .count();
-        assert!(count <= DENSE_STATE_CHECKPOINTS as usize + 2 * 20 + 1, "{count}");
+        assert!(
+            count <= DENSE_STATE_CHECKPOINTS as usize + 2 * 20 + 1,
+            "{count}"
+        );
         // The sparse enumeration is exactly the deeper retained heights.
         for tip in [1u64, 2, 31, 32, 33, 63, 64, 65, 100, 1_000, 4_097, 70_000] {
             let expected: Vec<u64> = (1..tip.saturating_sub(DENSE_STATE_CHECKPOINTS - 1))
@@ -4248,7 +4253,10 @@ mod cache_tests {
         }
         let deep = sparse_checkpoint_heights((1 << 40) + 7);
         assert!(deep.len() <= 2 * 40, "{}", deep.len());
-        assert!(deep.iter().all(|height| checkpoint_retained(*height, (1 << 40) + 7)));
+        assert!(
+            deep.iter()
+                .all(|height| checkpoint_retained(*height, (1 << 40) + 7))
+        );
     }
     #[test]
     fn deep_reorganizations_promote_every_retained_state_of_the_new_chain() {
@@ -4279,7 +4287,10 @@ mod cache_tests {
         let deeper = sparse_checkpoint_heights(tip);
         assert!(deeper.iter().filter(|height| **height > 100).count() >= 3);
         let checkpoints = main.checkpoints.borrow();
-        for height in deeper.into_iter().chain(tip - DENSE_STATE_CHECKPOINTS + 1..tip) {
+        for height in deeper
+            .into_iter()
+            .chain(tip - DENSE_STATE_CHECKPOINTS + 1..tip)
+        {
             let (hash, state) = checkpoints.get(&height).expect("retained state");
             assert_eq!(Some(*hash), main.hash_at_height(height), "height {height}");
             assert_eq!(state.height, height);
@@ -4333,7 +4344,10 @@ mod cache_tests {
         assert!((0..100).all(|n| held.admitted(&id(1, n))));
         // Admitted headers no longer count against the presync bound.
         assert_eq!(held.evictable, MAX_HELD_HEADERS - 100);
-        assert_eq!(held.tips.iter().map(|(_, hash)| *hash).collect::<Vec<_>>(), [id(1, 99)]);
+        assert_eq!(
+            held.tips.iter().map(|(_, hash)| *hash).collect::<Vec<_>>(),
+            [id(1, 99)]
+        );
         assert_eq!(held.roots.get(&ZERO_HASH), Some(&1));
         // A stored header leaves its descendants linked; an invalid one drops them.
         held.remove(&id(1, 0));
@@ -4343,7 +4357,10 @@ mod cache_tests {
         held.remove_branch(&id(1, 50));
         assert!((50..100).all(|n| !held.headers.contains_key(&id(1, n))));
         assert!((1..50).all(|n| held.headers.contains_key(&id(1, n))));
-        assert_eq!(held.tips.iter().map(|(_, hash)| *hash).collect::<Vec<_>>(), [id(1, 49)]);
+        assert_eq!(
+            held.tips.iter().map(|(_, hash)| *hash).collect::<Vec<_>>(),
+            [id(1, 49)]
+        );
         // A pinned download is not evicted however long, until it is released.
         let mut previous = id(1, 49);
         for n in 0..2 * MAX_HELD_HEADERS as u32 {
@@ -4361,7 +4378,11 @@ mod cache_tests {
         assert!((0..MAX_HELD_HEADERS as u32).all(|n| !held.headers.contains_key(&id(2, n))));
         assert!((0..MAX_HELD_HEADERS as u32).all(|n| held.headers.contains_key(&id(3, n))));
         assert!(!held.headers.contains_key(&id(3, MAX_HELD_HEADERS as u32)));
-        assert!(held.leaves.iter().all(|(_, hash)| held.headers[hash].evictable()));
+        assert!(
+            held.leaves
+                .iter()
+                .all(|(_, hash)| held.headers[hash].evictable())
+        );
     }
     #[test]
     fn held_headers_stay_pinned_until_every_download_holding_them_ends() {
@@ -4427,7 +4448,11 @@ mod cache_tests {
         chain.side_budget = 2;
         let siblings: Vec<_> = (0..3).map(|n| candidate(&sibling, 100 + n)).collect();
         for block in &siblings[..2] {
-            assert!(!chain.submit(block.clone(), block.header.timestamp as u64).unwrap());
+            assert!(
+                !chain
+                    .submit(block.clone(), block.header.timestamp as u64)
+                    .unwrap()
+            );
         }
         let refused = chain
             .submit(siblings[2].clone(), siblings[2].header.timestamp as u64)
@@ -4437,9 +4462,17 @@ mod cache_tests {
         assert_eq!(chain.held_header_count(), 1);
         // A new active-chain block refills the budget.
         let next = candidate(&chain, 9);
-        assert!(chain.submit(next.clone(), next.header.timestamp as u64).unwrap());
+        assert!(
+            chain
+                .submit(next.clone(), next.header.timestamp as u64)
+                .unwrap()
+        );
         assert_eq!(chain.side_budget, SIDE_BRANCH_BLOCKS_PER_TIP);
-        assert!(!chain.submit(siblings[2].clone(), siblings[2].header.timestamp as u64).unwrap());
+        assert!(
+            !chain
+                .submit(siblings[2].clone(), siblings[2].header.timestamp as u64)
+                .unwrap()
+        );
         assert_eq!(chain.held_header_count(), 0);
     }
     /// How [prune_at_startup] starts the chain again.
@@ -4494,23 +4527,35 @@ mod cache_tests {
         let mut early = Chain::open(&directory.path().join("early.db"), config.clone()).unwrap();
         let first = candidate(&chain, 0);
         for target in [&mut chain, &mut early] {
-            target.submit(first.clone(), first.header.timestamp as u64).unwrap();
+            target
+                .submit(first.clone(), first.header.timestamp as u64)
+                .unwrap();
         }
         // An early losing branch of three on-schedule blocks.
         let mut stale = Vec::new();
         for n in 0..3 {
             let block = candidate(&early, 50 + n);
-            early.submit(block.clone(), block.header.timestamp as u64).unwrap();
+            early
+                .submit(block.clone(), block.header.timestamp as u64)
+                .unwrap();
             stale.push(block);
         }
         let block = candidate(&chain, 1);
-        chain.submit(block.clone(), block.header.timestamp as u64).unwrap();
+        chain
+            .submit(block.clone(), block.header.timestamp as u64)
+            .unwrap();
         for _ in 0..2 {
             let block = candidate(&chain, 2 + chain.tip_height());
-            chain.submit(block.clone(), block.header.timestamp as u64).unwrap();
+            chain
+                .submit(block.clone(), block.header.timestamp as u64)
+                .unwrap();
         }
         for block in &stale {
-            assert!(!chain.submit(block.clone(), block.header.timestamp as u64).unwrap());
+            assert!(
+                !chain
+                    .submit(block.clone(), block.header.timestamp as u64)
+                    .unwrap()
+            );
         }
         // One-second blocks make the active chain's next block more than 64
         // times the work a child of the stale branch would carry.
@@ -4523,7 +4568,8 @@ mod cache_tests {
         let mut near = Chain::open(&directory.path().join("near.db"), config.clone()).unwrap();
         for height in 1..chain.tip_height() {
             let block = chain.block(&chain.hash_at_height(height).unwrap()).unwrap();
-            near.submit(block.clone(), block.header.timestamp as u64).unwrap();
+            near.submit(block.clone(), block.header.timestamp as u64)
+                .unwrap();
         }
         let time = chain.tip_block().header.timestamp;
         let mut sibling = near.template(miner, vec![], time).unwrap();
@@ -4558,7 +4604,12 @@ mod cache_tests {
         assert_eq!(validated as u64, expected, "{restart:?}");
         for block in &stale {
             assert!(chain.block(&codec::block_hash(block)).is_none());
-            assert!(chain.block_height(&codec::block_hash(block)).unwrap().is_none());
+            assert!(
+                chain
+                    .block_height(&codec::block_hash(block))
+                    .unwrap()
+                    .is_none()
+            );
         }
         assert!(chain.block(&codec::block_hash(&sibling)).is_some());
         drop(chain);
@@ -4740,7 +4791,11 @@ mod cache_tests {
         // A losing block at height 11, stored while it is competitive.
         let losing = candidate(&early, 500);
         extend(&mut chain, 50, 100);
-        assert!(!chain.submit(losing.clone(), losing.header.timestamp as u64).unwrap());
+        assert!(
+            !chain
+                .submit(losing.clone(), losing.header.timestamp as u64)
+                .unwrap()
+        );
         // Every 8 heights once the state 31 below the tip passes the first
         // interval; only the newest two stay.
         assert_eq!(saved_heights(&chain), [16, 24]);
@@ -4759,7 +4814,10 @@ mod cache_tests {
         assert_eq!(chain.restored, Some((29, active[29])));
         chain.tip_state().audit(&chain.config).unwrap();
         // The losing block kept its checked index entry; it was not executed.
-        assert_eq!(chain.block_height(&codec::block_hash(&losing)).unwrap(), Some(11));
+        assert_eq!(
+            chain.block_height(&codec::block_hash(&losing)).unwrap(),
+            Some(11)
+        );
         // Below the restored state only genesis is retained, and the restored
         // state itself stays retained.
         assert!(chain.cached_state(&active[29]).is_some());
@@ -4782,7 +4840,11 @@ mod cache_tests {
                 .unwrap();
         }
         let sibling = candidate(&near, 900);
-        assert!(!chain.submit(sibling.clone(), sibling.header.timestamp as u64).unwrap());
+        assert!(
+            !chain
+                .submit(sibling.clone(), sibling.header.timestamp as u64)
+                .unwrap()
+        );
         assert!(chain.block(&codec::block_hash(&sibling)).is_some());
     }
     #[test]
@@ -4850,7 +4912,9 @@ mod cache_tests {
         sql("INSERT INTO entry_index(hash,bytes) VALUES(zeroblob(32),x'00')");
         assert!(start(None).is_empty());
         // A saved tip that the checkpoint's descendants cannot reach.
-        sql("UPDATE metadata SET value=(SELECT hash FROM canonical_index WHERE height=10) WHERE key='tip'");
+        sql(
+            "UPDATE metadata SET value=(SELECT hash FROM canonical_index WHERE height=10) WHERE key='tip'",
+        );
         assert!(start(None).is_empty());
         // The last fallback's stop saved a checkpoint that serves again.
         assert_eq!(start(Some(14)), [14]);
@@ -4919,7 +4983,11 @@ mod cache_tests {
             salt += 1;
         }
         // Save the decision state at the tip itself.
-        let (height, hash, root) = (chain.tip_height(), chain.tip_hash(), chain.tip_state().root());
+        let (height, hash, root) = (
+            chain.tip_height(),
+            chain.tip_hash(),
+            chain.tip_state().root(),
+        );
         let build = build_identity().unwrap();
         Chain::write_saved_state(&chain.db, height, &hash, &build, chain.tip_state()).unwrap();
         // The records both worlds share are saved once, not once per world.
@@ -5004,7 +5072,10 @@ mod cache_tests {
             .submit(branch[0].clone(), branch[0].header.timestamp as u64)
             .unwrap_err();
         assert!(refused.is::<SideBranchRefused>(), "{refused:#}");
-        assert!(refused.to_string().contains("restored at startup"), "{refused:#}");
+        assert!(
+            refused.to_string().contains("restored at startup"),
+            "{refused:#}"
+        );
         for block in &branch[1..] {
             let held = chain
                 .submit(block.clone(), block.header.timestamp as u64)

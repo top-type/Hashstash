@@ -155,12 +155,20 @@ fn ordinary_batches_never_reach_the_clearing_work_limit() {
             w.reserve,
             w.shares,
             w.curve_mass,
-            buys.iter().map(|o| o.amount.to_string()).collect::<Vec<_>>(),
-            sells.iter().map(|o| o.amount.to_string()).collect::<Vec<_>>(),
+            buys.iter()
+                .map(|o| o.amount.to_string())
+                .collect::<Vec<_>>(),
+            sells
+                .iter()
+                .map(|o| o.amount.to_string())
+                .collect::<Vec<_>>(),
         );
         (most, total, cases) = (most.max(work), total + work, cases + 1);
     }
-    println!("random batches: {cases}, most work {most}, mean work {}", total / cases);
+    println!(
+        "random batches: {cases}, most work {most}, mean work {}",
+        total / cases
+    );
 }
 
 #[test]
@@ -187,7 +195,11 @@ fn exhausted_work_keeps_valid_conservative_results() {
         // A shorter search keeps a wider proven bracket around the same price,
         // so the same inputs can only receive less.
         let fills = |r: &Clearing| r.buys.iter().chain(&r.sells).cloned().collect::<Vec<_>>();
-        if fills(&r).iter().zip(fills(&full)).all(|(a, b)| a.input == b.input) {
+        if fills(&r)
+            .iter()
+            .zip(fills(&full))
+            .all(|(a, b)| a.input == b.input)
+        {
             for (cut, whole) in fills(&r).iter().zip(fills(&full)) {
                 assert!(cut.output <= whole.output);
             }

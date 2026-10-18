@@ -43,7 +43,10 @@ async fn main() -> Result<()> {
         None
     };
     if let Some(action) = maintenance {
-        println!("{}", serde_json::to_string_pretty(&maintain(&config, action)?)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&maintain(&config, action)?)?
+        );
         return Ok(());
     }
     let server = serve(config).await?;

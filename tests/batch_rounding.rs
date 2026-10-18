@@ -21,7 +21,10 @@ fn curve(reserve: u64, shares: u64, mass: u64) -> World {
 }
 
 fn order(id: u8, amount: Amount) -> Order {
-    Order { id: [id; 32], amount }
+    Order {
+        id: [id; 32],
+        amount,
+    }
 }
 
 fn next(w: &World, r: &Clearing) -> World {
@@ -57,8 +60,7 @@ fn consensus_mass_matches_the_math_helpers_in_both_directions() {
             let sale = Amount::from(n).min(&w.shares - 1u32);
             let sell = batch::clear(&c, &w, &[], &[order(2, sale)], u64::MAX).unwrap();
             if !sell.sells[0].input.is_zero() {
-                let mass =
-                    math::remaining_mass(&w.reserve, &w.curve_mass, &sell.reserve).unwrap();
+                let mass = math::remaining_mass(&w.reserve, &w.curve_mass, &sell.reserve).unwrap();
                 assert_eq!(sell.curve_mass, mass);
             }
         }

@@ -194,13 +194,18 @@ fn independent_v2_passphrase_vectors_are_stretched_and_network_specific() {
         wallet::derive_secret(phrase).unwrap();
     }
     assert!(wallet::derive_secret_v2("", &chain).is_err());
-    assert!(wallet::derive_secret_v2(&"a".repeat(wallet::MIN_PASSPHRASE_V2_BYTES - 1), &chain).is_err());
+    assert!(
+        wallet::derive_secret_v2(&"a".repeat(wallet::MIN_PASSPHRASE_V2_BYTES - 1), &chain).is_err()
+    );
     assert!(wallet::derive_secret_v2(&"é".repeat(8), &chain).is_err());
     for byte in [0x1f, 0x7f, 0x80] {
         let mut phrase = "a".repeat(wallet::MIN_PASSPHRASE_V2_BYTES).into_bytes();
         phrase[3] = byte;
         let phrase = String::from_utf8_lossy(&phrase).into_owned();
-        assert!(wallet::derive_secret_v2(&phrase, &chain).is_err(), "byte {byte:#x}");
+        assert!(
+            wallet::derive_secret_v2(&phrase, &chain).is_err(),
+            "byte {byte:#x}"
+        );
     }
     assert!(wallet::derive_secret_v2(&"~ !".repeat(6), &chain).is_ok());
     assert!(
@@ -452,7 +457,10 @@ fn every_operation_roundtrips_and_reviews_every_signed_field_exactly() {
         let raw = wallet::signed_hex(&signed);
         let decoded = decode_signed(&raw).unwrap();
         assert_eq!(decoded, signed);
-        assert!(wallet::decode_signed(&raw, &[40; 32]).is_err(), "another network accepted it");
+        assert!(
+            wallet::decode_signed(&raw, &[40; 32]).is_err(),
+            "another network accepted it"
+        );
         assert_eq!(
             codec::transaction_id(&decoded),
             codec::transaction_id(&signed)
@@ -738,8 +746,5 @@ fn offline_wallet_round_trips_transactions_larger_than_the_initial_block() {
         codec::encode(&signed).len(),
         codec::encode(&largest).len() + 64
     );
-    assert_eq!(
-        decode_signed(&wallet::signed_hex(&signed)).unwrap(),
-        signed
-    );
+    assert_eq!(decode_signed(&wallet::signed_hex(&signed)).unwrap(), signed);
 }

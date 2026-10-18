@@ -721,8 +721,11 @@ fn cancel(s: &mut State, a: &mut Auction, id: &Hash) -> Result<()> {
 /// proposals are forgotten, so a cancelled leader never counts as having
 /// taken the lead from the proposal it displaced.
 fn displaced_incumbent(s: &State, a: &mut Auction) -> Option<Hash> {
-    a.displaced
-        .retain(|(id, _)| s.proposals.get(id).is_some_and(|p| p.refund_height.is_none()));
+    a.displaced.retain(|(id, _)| {
+        s.proposals
+            .get(id)
+            .is_some_and(|p| p.refund_height.is_none())
+    });
     a.displaced.last().map(|(id, _)| *id)
 }
 fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
@@ -1910,7 +1913,10 @@ mod reserve_model_tests {
         assert!(grant_reserve(&c, &mut world, &(&capacity + 1u32)).is_err());
         assert_eq!(before, world.root());
         grant_reserve(&c, &mut world, &capacity).unwrap();
-        assert_eq!(world.reserve, &s.world.reserve - (&s.world.reserve >> 1usize));
+        assert_eq!(
+            world.reserve,
+            &s.world.reserve - (&s.world.reserve >> 1usize)
+        );
         let reserved = world.root();
         assert!(grant_reserve(&c, &mut world, &1u32.into()).is_err());
         assert_eq!(reserved, world.root());

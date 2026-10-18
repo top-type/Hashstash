@@ -343,7 +343,12 @@ async fn other_loopback_addresses_share_one_rpc_budget() {
     // The operator's own requests wait for that refill, without a cooldown.
     tokio::time::sleep(Duration::from_secs(1)).await;
     let status = json!({"jsonrpc":"2.0","id":1,"method":"status","params":{}});
-    let served = reqwest::Client::new().post(&rpc).json(&status).send().await.unwrap();
+    let served = reqwest::Client::new()
+        .post(&rpc)
+        .json(&status)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(served.status(), 200);
     server.stop().await;
 }

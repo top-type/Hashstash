@@ -533,7 +533,10 @@ async fn duplicate_protection_survives_job_eviction_and_connection_reuse() {
     // Thirteen jobs were issued: the oldest five are retired, the newest eight remain.
     let retired = &issued[issued.len() - 9];
     let share = reporting_share(retired, &worker, [19; 4]);
-    assert_eq!(worker.submit(retired, &share, [19; 4]).await["error"][0], 21);
+    assert_eq!(
+        worker.submit(retired, &share, [19; 4]).await["error"][0],
+        21
+    );
     let oldest_retained = &issued[issued.len() - 8];
     let bits = header(oldest_retained, &worker.extra, [0; 4]).bits;
     let block = math::target_from_bits(bits).unwrap();
@@ -944,7 +947,9 @@ async fn worker_capacity_is_enforced_at_registration_without_penalty() {
     let reply = extra.call("mining.subscribe", json!(["capacity/1"])).await;
     assert!(reply["error"].is_null(), "{reply}");
     let name = extra.name.clone();
-    let reply = extra.call("mining.authorize", json!([name, PASSWORD])).await;
+    let reply = extra
+        .call("mining.authorize", json!([name, PASSWORD]))
+        .await;
     assert!(
         reply["error"][1].as_str().unwrap().contains("capacity"),
         "{reply}"
@@ -955,8 +960,7 @@ async fn worker_capacity_is_enforced_at_registration_without_penalty() {
         .expect("capacity failure left the session open");
     drop(workers.pop());
     for _ in 0..100 {
-        if node.rpc("mining", json!({})).unwrap()["workers_connected"]
-            == node::MAX_CONNECTIONS - 1
+        if node.rpc("mining", json!({})).unwrap()["workers_connected"] == node::MAX_CONNECTIONS - 1
         {
             break;
         }

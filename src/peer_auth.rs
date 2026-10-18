@@ -83,7 +83,11 @@ impl Identity {
         let mut aux = Zeroizing::new([0u8; 32]);
         let signature = getrandom::fill(aux.as_mut())
             .map_err(|e| anyhow::anyhow!("peer randomness unavailable: {e}"))
-            .map(|()| *context.sign_schnorr_with_aux_rand(&message, &pair, &aux).as_ref());
+            .map(|()| {
+                *context
+                    .sign_schnorr_with_aux_rand(&message, &pair, &aux)
+                    .as_ref()
+            });
         pair.non_secure_erase();
         signature
     }
@@ -706,9 +710,10 @@ mod tests {
                 )
                 .await
             };
-            let (left, right) = timeout(Duration::from_secs(2), async { tokio::join!(left, right) })
-                .await
-                .unwrap();
+            let (left, right) =
+                timeout(Duration::from_secs(2), async { tokio::join!(left, right) })
+                    .await
+                    .unwrap();
             assert_eq!(left.is_ok(), accepted);
             assert_eq!(right.is_ok(), accepted);
         }

@@ -91,7 +91,10 @@ fn quotes_charge_for_all_data_and_offline_exports_sign_the_quoted_bytes() {
         weight.div_ceil(fees::FEE_SCALE).to_string()
     );
     let raw = wallet::signed_hex(&tx);
-    assert_eq!(wallet::decode_signed(&raw, &config().chain_id()).unwrap(), tx);
+    assert_eq!(
+        wallet::decode_signed(&raw, &config().chain_id()).unwrap(),
+        tx
+    );
     assert_eq!(
         node.status().unwrap(),
         before,

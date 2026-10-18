@@ -284,7 +284,10 @@ fn grant_draws_at_most_half_of_a_live_reserve() {
     assert_eq!(capacity, &s.world.revenue + (&s.world.reserve >> 1usize));
     let mut world = s.world.clone();
     consensus::grant_reserve(&c, &mut world, &capacity).unwrap();
-    assert_eq!(world.reserve, &s.world.reserve - (&s.world.reserve >> 1usize));
+    assert_eq!(
+        world.reserve,
+        &s.world.reserve - (&s.world.reserve >> 1usize)
+    );
     world.validate(&c, &s.issued, &s.auction_escrow).unwrap();
     let before = world.root();
     assert!(consensus::grant_reserve(&c, &mut world, &1u32.into()).is_err());

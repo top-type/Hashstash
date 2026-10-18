@@ -318,7 +318,11 @@ impl Explorer {
             if self.backed_off(hash, chain) {
                 return Ok(None);
             }
-            return Ok(Some(Update::Rebuild(height, hash, checkpoints(chain, height)?)));
+            return Ok(Some(Update::Rebuild(
+                height,
+                hash,
+                checkpoints(chain, height)?,
+            )));
         }
         let replay = state.height < self.height;
         if replay && chain.hash_at_height(self.height) != self.tip {
@@ -404,7 +408,9 @@ impl Explorer {
             }
             Update::Rebuild(height, hash, states) => {
                 ensure!(
-                    states.back().is_some_and(|(_, state)| state.height <= height),
+                    states
+                        .back()
+                        .is_some_and(|(_, state)| state.height <= height),
                     "explorer checkpoint above common ancestor"
                 );
                 let transaction = db.transaction()?;
@@ -832,9 +838,9 @@ impl Explorer {
                 result["pending"] = pending(
                     mempool
                         .iter()
-                        .filter(
-                            |t| t.body.sender == key || recipient(&t.body.operation) == Some(key)
-                        )
+                        .filter(|t| {
+                            t.body.sender == key || recipient(&t.body.operation) == Some(key)
+                        })
                         .take(limit as usize)
                         .map(|t| tx_value(c, s, t, None, None, None)),
                     &mut budget,
@@ -1077,9 +1083,7 @@ fn scan_after(
         "{label} scan anchor is no longer canonical; blocks above height {unchanged} were replaced"
     );
     ensure!(
-        h <= unchanged
-            && h <= u32::MAX as u64
-            && (n <= position_limit(c) || n == i64::MAX as u64),
+        h <= unchanged && h <= u32::MAX as u64 && (n <= position_limit(c) || n == i64::MAX as u64),
         "invalid cursor bounds"
     );
     Ok((h as i64, n as i64))
@@ -1351,19 +1355,16 @@ mod page_capacity_tests {
         }
         let mut query = db.prepare("SELECT record,height,position FROM items WHERE height<?1 ORDER BY height DESC LIMIT 50").unwrap();
         let (first, cursor) =
-            paged_with_budget(&mut query, [4], 50, 3, false, &mut Budget::with_bytes(100))
-                .unwrap();
+            paged_with_budget(&mut query, [4], 50, 3, false, &mut Budget::with_bytes(100)).unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0]["height"], 3);
         assert_eq!(cursor, "3:0");
         let (second, cursor) =
-            paged_with_budget(&mut query, [3], 50, 3, true, &mut Budget::with_bytes(100))
-                .unwrap();
+            paged_with_budget(&mut query, [3], 50, 3, true, &mut Budget::with_bytes(100)).unwrap();
         assert_eq!(second[0]["height"], 2);
         assert_eq!(cursor, "2:0");
         let (last, cursor) =
-            paged_with_budget(&mut query, [2], 50, 3, true, &mut Budget::with_bytes(100))
-                .unwrap();
+            paged_with_budget(&mut query, [2], 50, 3, true, &mut Budget::with_bytes(100)).unwrap();
         assert_eq!(last[0]["height"], 1);
         assert!(cursor.is_null());
     }
@@ -1731,11 +1732,10 @@ fn index_block(
         // change that record, so read it from the block's opening state. The
         // signer's event is then a credit, recorded with the recipient role.
         if let Operation::Refund { round, proposal } = &t.body.operation
-            && let Some(support) = opening.supports.get(&crate::state::support_key(
-                *round,
-                proposal,
-                &t.body.sender,
-            ))
+            && let Some(support) =
+                opening
+                    .supports
+                    .get(&crate::state::support_key(*round, proposal, &t.body.sender))
         {
             value["amount"] = json!(support.amount.to_str_radix(10));
             value["asset"] = json!("hash");
@@ -2840,7 +2840,10 @@ mod worker_tests {
         let mut index = Explorer::open(&path, &chain).unwrap();
         assert_eq!(index.tip, chain.hash_at_height(700));
         let (hash, state) = index.states.back().unwrap();
-        assert_eq!((Some(*hash), state.height), (chain.hash_at_height(512), 512));
+        assert_eq!(
+            (Some(*hash), state.height),
+            (chain.hash_at_height(512), 512)
+        );
         let kinds = drain(&mut index, &chain);
         assert_eq!(kinds[..188], ["replay"; 188]);
         assert!(kinds[188..].iter().all(|kind| *kind == "advance"));
@@ -2925,14 +2928,7 @@ mod worker_tests {
         let chain = Chain::open(&path, c.clone()).unwrap();
         let index = Explorer::open(&path, &chain).unwrap();
         let query = |method, params| {
-            index.rpc(
-                method,
-                params,
-                &c,
-                chain.tip_state(),
-                chain.tip_hash(),
-                &[],
-            )
+            index.rpc(method, params, &c, chain.tip_state(), chain.tip_hash(), &[])
         };
         for (method, field) in [
             ("explorer_transactions", "before"),

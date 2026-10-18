@@ -160,7 +160,12 @@ fn deep_ancestor_reconstruction_costs_its_depth_not_the_chain_height() {
     );
     for depth in [40u64, 150, 280] {
         let height = chain.tip_height() - depth;
-        let fork = fork_at(directory.path(), &format!("fork-{depth}.sqlite"), &chain, height);
+        let fork = fork_at(
+            directory.path(),
+            &format!("fork-{depth}.sqlite"),
+            &chain,
+            height,
+        );
         let competitor = mine_at(&fork, vec![], next_time(&fork), 0x5eed + depth);
         // The parent state is reachable within a budget of its depth; replaying
         // from genesis or a recent-only cache would need the full height.
@@ -168,7 +173,10 @@ fn deep_ancestor_reconstruction_costs_its_depth_not_the_chain_height() {
         assert!(chain.tip_height() - depth > budget as u64);
         let (best, deferred) = submit_budgeted(&mut chain, &competitor, budget);
         assert!(!best);
-        assert_eq!(deferred, 0, "depth {depth} needed more than {budget} replays");
+        assert_eq!(
+            deferred, 0,
+            "depth {depth} needed more than {budget} replays"
+        );
         assert_eq!(chain.tip_hash(), tip);
         assert!(chain.block(&codec::block_hash(&competitor)).is_some());
     }
@@ -191,20 +199,32 @@ fn fork_point_state_survives_side_branch_and_replay_cache_churn() {
     // active-chain reconstructions, the cheap eviction tools in the finding.
     churn(&mut chain, &near, 2 * MAX_CACHED_STATES as u64, 1_000);
     for height in [5, 90, 150] {
-        assert!(chain.state_at(&chain.hash_at_height(height).unwrap()).is_some());
+        assert!(
+            chain
+                .state_at(&chain.hash_at_height(height).unwrap())
+                .is_some()
+        );
     }
     assert_eq!(chain.cached_state_count(), MAX_CACHED_STATES);
     // The competing block and its child validate at once: the fork point is a
     // retained active-chain checkpoint, so no reconstruction is needed.
     let mut honest = honest;
     let sibling = mine_at(&honest, vec![], next_time(&honest), 77);
-    assert!(honest.submit(sibling.clone(), sibling.header.timestamp as u64).unwrap());
+    assert!(
+        honest
+            .submit(sibling.clone(), sibling.header.timestamp as u64)
+            .unwrap()
+    );
     let child = mine_at(&honest, vec![], next_time(&honest), 78);
     let time = sibling.header.timestamp as u64;
     assert!(!chain.submit_with_replay_budget(sibling, time, 1).unwrap());
     assert_eq!(chain.tip_hash(), tip);
     let time = child.header.timestamp as u64;
-    assert!(chain.submit_with_replay_budget(child.clone(), time, 1).unwrap());
+    assert!(
+        chain
+            .submit_with_replay_budget(child.clone(), time, 1)
+            .unwrap()
+    );
     assert_eq!(chain.tip_hash(), codec::block_hash(&child));
 }
 
@@ -220,12 +240,24 @@ fn deferred_side_branch_reconstruction_resumes_across_cache_churn() {
     let mut branch = fork_at(directory.path(), "branch.sqlite", &chain, fork_height);
     for n in 0..199 {
         let block = append(&mut branch, vec![], 9_000 + n);
-        assert!(!chain.submit(block, branch.tip_block().header.timestamp as u64).unwrap());
+        assert!(
+            !chain
+                .submit(block, branch.tip_block().header.timestamp as u64)
+                .unwrap()
+        );
     }
-    let near = fork_at(directory.path(), "near.sqlite", &chain, chain.tip_height() - 2);
+    let near = fork_at(
+        directory.path(),
+        "near.sqlite",
+        &chain,
+        chain.tip_height() - 2,
+    );
     // Evict every side-branch state, then keep evicting between retries.
     churn(&mut chain, &near, MAX_CACHED_STATES as u64 + 1, 20_000);
-    let overtaking = [append(&mut branch, vec![], 9_500), append(&mut branch, vec![], 9_501)];
+    let overtaking = [
+        append(&mut branch, vec![], 9_500),
+        append(&mut branch, vec![], 9_501),
+    ];
     let mut deferred = 0;
     let mut round = 0;
     for block in &overtaking {
@@ -237,7 +269,12 @@ fn deferred_side_branch_reconstruction_resumes_across_cache_churn() {
                     deferred += 1;
                     assert!(deferred < 16, "replay progress was lost to cache churn");
                     round += 1;
-                    churn(&mut chain, &near, MAX_CACHED_STATES as u64 + 1, 30_000 + 1_000 * round);
+                    churn(
+                        &mut chain,
+                        &near,
+                        MAX_CACHED_STATES as u64 + 1,
+                        30_000 + 1_000 * round,
+                    );
                 }
                 Err(error) => panic!("{error:#}"),
             }
@@ -281,7 +318,9 @@ fn cheap_side_blocks_are_refused_before_validation_and_storage() {
     let mut rival = fork_at(directory.path(), "rival.sqlite", &chain, 35);
     for n in 0..6 {
         let block = append(&mut rival, vec![], 500 + n);
-        chain.submit(block, rival.tip_block().header.timestamp as u64).unwrap();
+        chain
+            .submit(block, rival.tip_block().header.timestamp as u64)
+            .unwrap();
     }
     assert_eq!(chain.tip_hash(), rival.tip_hash());
 }
@@ -299,7 +338,12 @@ fn branches_that_cannot_catch_up_are_refused() {
     let allowance = SIDE_BRANCH_CATCH_UP_BLOCKS as u64 / 32;
     for (depth, admitted) in [(allowance + 72, false), (allowance - 28, true)] {
         let height = chain.tip_height() - depth;
-        let mut fork = fork_at(directory.path(), &format!("fork-{depth}.sqlite"), &chain, height);
+        let mut fork = fork_at(
+            directory.path(),
+            &format!("fork-{depth}.sqlite"),
+            &chain,
+            height,
+        );
         // A first block 4,500 seconds late eases its children by 2^5.
         let late = next_time(&fork) + 4_500;
         let first = mine_at(&fork, vec![], late, depth);
@@ -387,14 +431,18 @@ fn a_reorganization_beneath_deferred_replay_restarts_it() {
     let parent = fork_at(directory.path(), "side.sqlite", &chain, 250);
     let side = mine_at(&parent, vec![], next_time(&parent), 1);
     let time = side.header.timestamp as u64;
-    let error = chain.submit_with_replay_budget(side.clone(), time, 1).unwrap_err();
+    let error = chain
+        .submit_with_replay_budget(side.clone(), time, 1)
+        .unwrap_err();
     assert!(error.is::<ValidationDeferred>(), "{error:#}");
     // The active chain now forks at 245, above the retained progress but
     // below the replay's target, so the parent is on a losing branch.
     let mut rival = fork_at(directory.path(), "rival.sqlite", &chain, 245);
     while chain.tip_hash() != rival.tip_hash() {
         let block = append(&mut rival, vec![], 2);
-        chain.submit(block, rival.tip_block().header.timestamp as u64).unwrap();
+        chain
+            .submit(block, rival.tip_block().header.timestamp as u64)
+            .unwrap();
     }
     // Resuming used to replay the new branch up to height 250 and fail with
     // an error that was neither invalidity nor deferral.
@@ -442,7 +490,11 @@ fn deep_side_branch_anchors_resolve_through_skip_links() {
     deep.anchor = anchors[2];
     let deep = crypto::sign(&branch.chain_id(), &deep, &SECRET).unwrap();
     let block = append(&mut branch, vec![deep], 99_000);
-    assert!(!chain.submit(block.clone(), block.header.timestamp as u64).unwrap());
+    assert!(
+        !chain
+            .submit(block.clone(), block.header.timestamp as u64)
+            .unwrap()
+    );
     assert!(chain.block(&codec::block_hash(&block)).is_some());
     // An anchor from the active chain above the fork is not on this branch.
     let nonce = branch.tip_state().account(&key(), None).unwrap().nonce;
@@ -457,5 +509,8 @@ fn deep_side_branch_anchors_resolve_through_skip_links() {
         .submit(invalid, next_time(&branch) as u64)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("not on the candidate parent branch"), "{error}");
+    assert!(
+        error.contains("not on the candidate parent branch"),
+        "{error}"
+    );
 }

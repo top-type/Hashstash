@@ -90,9 +90,7 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 /// and wiped when dropped.
 pub fn read_private(path: &Path, limit: usize) -> Result<Zeroizing<Vec<u8>>> {
     let fits = |metadata: &fs::Metadata| {
-        metadata.is_file()
-            && !metadata.file_type().is_symlink()
-            && metadata.len() <= limit as u64
+        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= limit as u64
     };
     let inspected = fs::symlink_metadata(path)?;
     ensure!(
@@ -154,9 +152,10 @@ pub fn create_private(path: &Path) -> Result<()> {
 
 /// Owner-only access to a file that holds secrets. On Unix: mode 0600, and an
 /// existing, more permissive file is tightened. On Windows: a protected access
-/// list granting only the current account, set with the system's `icacls`.
-/// Where Windows cannot set one (for example on a FAT or exFAT volume) a
-/// warning is printed, because other accounts may then read the file.
+/// list granting only the current account, set with the system's `icacls`;
+/// on a volume that keeps access lists (NTFS, ReFS) any failure to set it is
+/// an error. Only on a volume without them (for example FAT or exFAT) is a
+/// warning printed instead, because other accounts may then read the file.
 pub fn restrict_to_owner(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -168,9 +167,14 @@ pub fn restrict_to_owner(path: &Path) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        if let Err(error) = windows::owner_only(path) {
+        if windows::keeps_access_lists(path)
+            .with_context(|| format!("cannot inspect the volume of {}", path.display()))?
+        {
+            windows::owner_only(path)
+                .with_context(|| format!("cannot restrict {} to this account", path.display()))?;
+        } else {
             eprintln!(
-                "Warning: {} could not be restricted to this account ({error:#}); other accounts on this computer may be able to read it.",
+                "Warning: {} is on a volume without access lists (such as FAT or exFAT); other accounts on this computer may be able to read it.",
                 path.display()
             );
         }
@@ -268,9 +272,64 @@ fn icacls_arguments(path: &Path, sid: &str) -> Vec<OsString> {
 #[cfg(windows)]
 mod windows {
     use super::{Context, OsString, Path, PathBuf, Result, account_sid, icacls_arguments};
-    use std::{os::windows::process::CommandExt, process::Command, sync::OnceLock};
+    use std::{
+        fs,
+        os::windows::{
+            fs::OpenOptionsExt,
+            io::{AsRawHandle, RawHandle},
+            process::CommandExt,
+        },
+        process::Command,
+        ptr,
+        sync::OnceLock,
+    };
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    /// The volume keeps a file's access list (FILE_PERSISTENT_ACLS).
+    const FILE_PERSISTENT_ACLS: u32 = 0x0000_0008;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetVolumeInformationByHandleW(
+            file: RawHandle,
+            volume_name: *mut u16,
+            volume_name_size: u32,
+            serial_number: *mut u32,
+            maximum_component_length: *mut u32,
+            file_system_flags: *mut u32,
+            file_system_name: *mut u16,
+            file_system_name_size: u32,
+        ) -> i32;
+    }
+
+    /// Whether the volume holding `path` keeps access lists, asked of the
+    /// file itself, so mount points and network shares answer for their own
+    /// file system.
+    pub(super) fn keeps_access_lists(path: &Path) -> Result<bool> {
+        let file = fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .open(path)?;
+        let mut flags = 0u32;
+        // SAFETY: the handle stays open for the call, the one output pointer
+        // is a live u32, and every other buffer is null with a zero size.
+        let succeeded = unsafe {
+            GetVolumeInformationByHandleW(
+                file.as_raw_handle(),
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut flags,
+                ptr::null_mut(),
+                0,
+            )
+        };
+        if succeeded == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(flags & FILE_PERSISTENT_ACLS != 0)
+    }
 
     /// A system tool by its full path, so the search path cannot substitute it.
     fn system_tool(name: &str) -> PathBuf {
@@ -444,7 +503,10 @@ mod tests {
             format!("D:PAI(A;;FA;;;{me})"),
             // Inherited from a profile folder.
             format!("D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;{me})"),
-            format!("D:P(A;;FA;;;LA)(A;;FR;;;S-1-5-18)(A;;FA;;;{})", me.to_lowercase()),
+            format!(
+                "D:P(A;;FA;;;LA)(A;;FR;;;S-1-5-18)(A;;FA;;;{})",
+                me.to_lowercase()
+            ),
             // Denials only take access away, here with a condition of its own.
             format!("D:P(D;;FA;;;WD)(XD;;FX;;;WD;(@User.Title==\"x\"))(A;;FA;;;{me})"),
             format!("D:P(A;;FA;;;{me})S:(ML;;NW;;;LW)"),
@@ -546,27 +608,55 @@ mod tests {
         write_private(&path, b"secret").unwrap();
         assert_eq!(read_private(&path, 64).unwrap().as_slice(), b"secret");
         let users = |change: &str, entry: &str| {
-            let arguments: [OsString; 4] =
-                [path.as_path().into(), change.into(), entry.into(), "/q".into()];
+            let arguments: [OsString; 4] = [
+                path.as_path().into(),
+                change.into(),
+                entry.into(),
+                "/q".into(),
+            ];
             windows::run("icacls.exe", &arguments).unwrap();
         };
         users("/grant", "*S-1-5-32-545:R");
         let error = read_private(&path, 64).unwrap_err();
-        assert!(format!("{error:#}").contains("another account"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("another account"),
+            "{error:#}"
+        );
         users("/remove:g", "*S-1-5-32-545");
         assert_eq!(read_private(&path, 64).unwrap().as_slice(), b"secret");
     }
 
-    /// On NTFS, where an access list can be set, it is: restrict_to_owner
-    /// only warns otherwise, so this reads the list back. Every secret file
-    /// path, new or existing, ends with one protected entry granting this
-    /// account full control and nothing inherited from its directory.
+    /// A path that cannot be protected is an error, never a warning.
+    #[test]
+    fn restricting_a_missing_file_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(restrict_to_owner(&directory.path().join("missing.json")).is_err());
+    }
+
+    /// `path`'s access list as SDDL.
+    #[cfg(windows)]
+    fn dacl(path: &Path) -> String {
+        windows::access_list(path).unwrap()
+    }
+
+    /// One protected entry granting this account full control, nothing else.
+    #[cfg(windows)]
+    fn assert_owner_only(path: &Path) {
+        let sid = windows::current_sid().unwrap();
+        let list = dacl(path);
+        let (flags, entries) = list.split_at(list.find('(').unwrap());
+        assert!(flags.starts_with("D:P"), "{}: {list}", path.display());
+        assert_eq!(entries, format!("(A;;FA;;;{sid})"), "{}", path.display());
+    }
+
+    /// On NTFS, where an access list can be set, it is, so this reads the
+    /// list back. Every secret file path, new or existing, ends with one
+    /// protected entry granting this account full control and nothing
+    /// inherited from its directory.
     #[cfg(windows)]
     #[test]
     fn windows_secret_files_list_only_the_current_account() {
         let directory = tempfile::tempdir().unwrap();
-        let sid = windows::current_sid().unwrap();
-        let dacl = |path: &Path| windows::access_list(path).unwrap();
         let written = directory.path().join("written.json");
         write_private(&written, b"secret").unwrap();
         let created = directory.path().join("created.json");
@@ -579,10 +669,46 @@ mod tests {
         );
         restrict_to_owner(&existing).unwrap();
         for path in [&written, &created, &existing] {
-            let list = dacl(path);
-            let (flags, entries) = list.split_at(list.find('(').unwrap());
-            assert!(flags.starts_with("D:P"), "{}: {list}", path.display());
-            assert_eq!(entries, format!("(A;;FA;;;{sid})"), "{}", path.display());
+            assert_owner_only(path);
+        }
+    }
+
+    /// Where the volume keeps access lists, failing to set one is an error,
+    /// not a warning. This file's list leaves its owner, this account, only
+    /// read access (an OWNER RIGHTS entry replaces the owner's implicit right
+    /// to change the list), so icacls cannot restrict it; an account whose
+    /// privileges still let it may succeed, and then the file is owner-only.
+    #[cfg(windows)]
+    #[test]
+    fn windows_access_list_failures_are_errors_on_ntfs() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("locked.json");
+        fs::write(&path, b"secret").unwrap();
+        assert!(
+            windows::keeps_access_lists(&path).unwrap(),
+            "the temporary directory keeps access lists"
+        );
+        let arguments: [OsString; 5] = [
+            path.as_path().into(),
+            "/inheritance:r".into(),
+            "/grant:r".into(),
+            "*S-1-3-4:R".into(),
+            "/q".into(),
+        ];
+        windows::run("icacls.exe", &arguments).unwrap();
+        let locked = dacl(&path);
+        assert!(
+            locked.starts_with("D:P")
+                && locked.ends_with(";;;OW)")
+                && locked.matches('(').count() == 1,
+            "{locked}"
+        );
+        match restrict_to_owner(&path) {
+            Ok(()) => assert_owner_only(&path),
+            Err(error) => assert!(
+                format!("{error:#}").contains("cannot restrict"),
+                "{error:#}"
+            ),
         }
     }
 }

@@ -268,7 +268,11 @@ async fn a_branch_that_raised_capacity_far_behind_is_followed_once_its_headers_c
     append(&mut private, secret, vec![]);
     curved::chain(&mut private, &secret);
     let shared: Vec<_> = (1..=private.tip_height())
-        .map(|height| private.block(&private.hash_at_height(height).unwrap()).unwrap())
+        .map(|height| {
+            private
+                .block(&private.hash_at_height(height).unwrap())
+                .unwrap()
+        })
         .collect();
     // One decision can at most double capacity.
     let capacity = 2 * initial - 173;
@@ -279,14 +283,22 @@ async fn a_branch_that_raised_capacity_far_behind_is_followed_once_its_headers_c
     let victim_path = directory.path().join("victim.sqlite");
     let mut victim = Chain::open(&victim_path, config.clone()).unwrap();
     for block in &shared {
-        assert!(victim.submit(block.clone(), u64::from(block.header.timestamp)).unwrap());
+        assert!(
+            victim
+                .submit(block.clone(), u64::from(block.header.timestamp))
+                .unwrap()
+        );
     }
     let lead = branch.len() + CAPACITY_BRANCH_MARGIN_BLOCKS as usize + 2;
     for _ in 0..lead {
         append(&mut victim, [124; 32], vec![]);
     }
     for block in &branch {
-        assert!(!victim.submit(block.clone(), u64::from(block.header.timestamp)).unwrap());
+        assert!(
+            !victim
+                .submit(block.clone(), u64::from(block.header.timestamp))
+                .unwrap()
+        );
     }
     assert_eq!(victim.max_known_block_bytes(), initial);
     let light_tip = hex::encode(victim.tip_hash());
@@ -316,8 +328,11 @@ async fn a_branch_that_raised_capacity_far_behind_is_followed_once_its_headers_c
         let path = directory.path().join(name);
         let mut copy = Chain::open(&path, config.clone()).unwrap();
         for height in 1..=private.tip_height() {
-            let block = private.block(&private.hash_at_height(height).unwrap()).unwrap();
-            copy.submit(block.clone(), u64::from(block.header.timestamp)).unwrap();
+            let block = private
+                .block(&private.hash_at_height(height).unwrap())
+                .unwrap();
+            copy.submit(block.clone(), u64::from(block.header.timestamp))
+                .unwrap();
         }
         assert_eq!(copy.tip_hash(), private.tip_hash());
         drop(copy);

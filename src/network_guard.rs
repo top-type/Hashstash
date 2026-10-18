@@ -1017,12 +1017,8 @@ impl Session {
     /// line. Bytes are always charged to the address.
     pub fn worker_line(&self, bytes: usize) -> Result<bool> {
         let now = Instant::now();
-        let within = accounting(&self.request_bucket).take(
-            1,
-            SESSION_REQUESTS,
-            SESSION_REQUEST_BURST,
-            now,
-        );
+        let within =
+            accounting(&self.request_bucket).take(1, SESSION_REQUESTS, SESSION_REQUEST_BURST, now);
         if !within {
             let mut overrun = accounting(&self.overrun_bucket);
             ensure!(
@@ -1053,7 +1049,12 @@ impl Session {
             Some((key, aggregate)) => (Some((*key, key.0)), aggregate.map(|a| (a, key.0))),
             None => (None, None),
         };
-        [visitor, visitor_aggregate, Some((self.key, own)), self.aggregate.map(|a| (a, own))]
+        [
+            visitor,
+            visitor_aggregate,
+            Some((self.key, own)),
+            self.aggregate.map(|a| (a, own)),
+        ]
     }
     fn charge_address(
         &self,
@@ -1711,8 +1712,7 @@ impl StratumPending {
             path.display()
         );
         let mut counts = accounting(&self.counts);
-        let mut newer: Vec<(u64, IpAddr)> =
-            counts.trusted.drain().map(|(a, s)| (s, a)).collect();
+        let mut newer: Vec<(u64, IpAddr)> = counts.trusted.drain().map(|(a, s)| (s, a)).collect();
         newer.sort();
         let unsaved = !newer.is_empty();
         for address in saved
@@ -2465,7 +2465,10 @@ mod tests {
         assert!(guard.admit(host(5), Surface::Peer).is_err());
         assert!(
             guard
-                .admit(IpAddr::from([0x2001, 0x4860, 7, 10, 0, 0, 0, 1]), Surface::Peer)
+                .admit(
+                    IpAddr::from([0x2001, 0x4860, 7, 10, 0, 0, 0, 1]),
+                    Surface::Peer
+                )
                 .is_ok()
         );
         for _ in 0..4 {
@@ -2903,15 +2906,29 @@ mod tests {
         drop(late);
         assert!(guard.admit(carved(64), Surface::Rpc).is_ok());
         let other = IpAddr::from([0x2001, 0xdb8, 0x78, 0, 0, 0, 0, 1]);
-        assert!(guard.admit(other, Surface::Rpc).unwrap().work(burst).is_ok());
+        assert!(
+            guard
+                .admit(other, Surface::Rpc)
+                .unwrap()
+                .work(burst)
+                .is_ok()
+        );
         // IPv4 addresses share their /24, and a 6to4 source the /24 its
         // IPv4 host belongs to.
         for host in 1..=3 {
             let address = IpAddr::from([198, 51, 100, host]);
-            guard.admit(address, Surface::Rpc).unwrap().work(burst).unwrap();
+            guard
+                .admit(address, Surface::Rpc)
+                .unwrap()
+                .work(burst)
+                .unwrap();
         }
         let tunnel = ip("2002:c633:6404:7::1");
-        guard.admit(tunnel, Surface::Rpc).unwrap().work(burst).unwrap();
+        guard
+            .admit(tunnel, Surface::Rpc)
+            .unwrap()
+            .work(burst)
+            .unwrap();
         let neighbour = guard.admit(ip("198.51.100.5"), Surface::Rpc).unwrap();
         assert!(neighbour.work(burst / 2).is_err());
         let next = guard.admit(ip("198.51.101.5"), Surface::Rpc).unwrap();
@@ -2926,7 +2943,11 @@ mod tests {
         // On RPC every loopback address, ::1 included, is one local source.
         for host in 2..=5 {
             let local = IpAddr::from([127, 0, 0, host]);
-            guard.admit(local, Surface::Rpc).unwrap().work(burst).unwrap();
+            guard
+                .admit(local, Surface::Rpc)
+                .unwrap()
+                .work(burst)
+                .unwrap();
         }
         for local in ["127.0.0.9", "::1", "127.255.0.1"] {
             let session = guard.admit(ip(local), Surface::Rpc).unwrap();
@@ -2937,9 +2958,17 @@ mod tests {
         let peer_burst = Surface::Peer.policy().work_burst as usize;
         for host in 2..=9 {
             let local = IpAddr::from([127, 0, 0, host]);
-            guard.admit(local, Surface::Peer).unwrap().work(peer_burst).unwrap();
+            guard
+                .admit(local, Surface::Peer)
+                .unwrap()
+                .work(peer_burst)
+                .unwrap();
             let private = IpAddr::from([10, 0, 0, host]);
-            guard.admit(private, Surface::Rpc).unwrap().work(burst).unwrap();
+            guard
+                .admit(private, Surface::Rpc)
+                .unwrap()
+                .work(burst)
+                .unwrap();
         }
         // Connections this node opens are never aggregated.
         for host in 1..=8 {
@@ -2968,13 +2997,21 @@ mod tests {
         let limited = error.downcast::<Limited>().unwrap();
         assert_eq!(limited.reason, "temporary network cooldown");
         assert!(limited.retry_after.unwrap() <= Duration::from_millis(250));
-        assert!(guard.admit("203.0.114.9".parse().unwrap(), Surface::Peer).is_ok());
+        assert!(
+            guard
+                .admit("203.0.114.9".parse().unwrap(), Surface::Peer)
+                .is_ok()
+        );
         // Local software on loopback never cools the operator out of RPC.
         for n in 2..=9 {
             let local = IpAddr::from([127, 0, 0, n]);
             guard.admit(local, Surface::Rpc).unwrap().malformed();
         }
-        assert!(guard.admit("127.0.0.1".parse().unwrap(), Surface::Rpc).is_ok());
+        assert!(
+            guard
+                .admit("127.0.0.1".parse().unwrap(), Surface::Rpc)
+                .is_ok()
+        );
     }
     #[test]
     fn strikes_lapse_a_minute_after_the_last_penalty_however_busy_the_record_stays() {
@@ -3110,7 +3147,9 @@ mod tests {
         const MIB: usize = 1024 * 1024;
         let guard = Arc::new(NetworkGuard::default());
         let baseline = guard.frame_memory_limits();
-        let peer = guard.admit("8.1.1.1".parse().unwrap(), Surface::Peer).unwrap();
+        let peer = guard
+            .admit("8.1.1.1".parse().unwrap(), Surface::Peer)
+            .unwrap();
         guard.set_frame(100 * MIB).unwrap();
         assert!(guard.frame_memory_limits().0 > baseline.0);
         assert_eq!(guard.policy(Surface::Peer).byte_burst, 100 * MIB as u64);
@@ -3123,8 +3162,17 @@ mod tests {
         let error = peer.bytes(base as usize + 1).unwrap_err();
         assert_eq!(error.downcast::<Limited>().unwrap().retry_after, None);
         let records = guard.records.lock().unwrap();
-        assert!(records.values().all(|record| record.bytes.tokens <= 4 * base));
-        let address = (peer.key.0, Surface::Peer, Direction::Inbound, Scope::Address);
+        assert!(
+            records
+                .values()
+                .all(|record| record.bytes.tokens <= 4 * base)
+        );
+        let address = (
+            peer.key.0,
+            Surface::Peer,
+            Direction::Inbound,
+            Scope::Address,
+        );
         assert!(records[&address].bytes.tokens <= base);
         drop(records);
         // A raise extends the burst again, refilling held tokens at once.
@@ -3148,7 +3196,9 @@ mod tests {
             .collect();
         let fifth = guard.admit(group(5), Surface::Peer).unwrap();
         assert!(fifth.reserve_frame(1).unwrap_err().is::<Busy>());
-        let sibling = guard.admit(IpAddr::from([8, 1, 2, 1]), Surface::Peer).unwrap();
+        let sibling = guard
+            .admit(IpAddr::from([8, 1, 2, 1]), Surface::Peer)
+            .unwrap();
         assert!(sibling.reserve_frame(1).unwrap_err().is::<Busy>());
         // Configured and pinned peers still receive one.
         let configured = guard.admit(group(6), Surface::Peer).unwrap().operator();
@@ -3354,8 +3404,16 @@ mod tests {
         assert!(StratumPending::default().load_trusted(&path).is_ok());
         let prefix = |text: &str| text.parse::<TrustedPrefix>();
         assert!(prefix("203.0.113.0/33").is_err() && prefix("x/8").is_err());
-        assert!(prefix("2001:db8::/48").unwrap().contains("2001:db8:0:ffff::1".parse().unwrap()));
-        assert!(!prefix("2001:db8::/48").unwrap().contains("2001:db9::1".parse().unwrap()));
+        assert!(
+            prefix("2001:db8::/48")
+                .unwrap()
+                .contains("2001:db8:0:ffff::1".parse().unwrap())
+        );
+        assert!(
+            !prefix("2001:db8::/48")
+                .unwrap()
+                .contains("2001:db9::1".parse().unwrap())
+        );
         let mapped = prefix("::ffff:203.0.113.5").unwrap();
         assert_eq!(mapped.to_string(), "203.0.113.5/32");
         assert!(mapped.contains("203.0.113.5".parse().unwrap()));

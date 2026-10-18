@@ -214,13 +214,7 @@ fn subnet(value: &str) -> Result<String> {
             // Customers commonly receive a /56. One holder must not obtain a
             // separate allowance for every /64 network it can address.
             let o = v.segments();
-            format!(
-                "{:x}:{:x}:{:x}:{:x}::/56",
-                o[0],
-                o[1],
-                o[2],
-                o[3] & 0xff00
-            )
+            format!("{:x}:{:x}:{:x}:{:x}::/56", o[0], o[1], o[2], o[3] & 0xff00)
         }
     })
 }
@@ -923,7 +917,9 @@ fn poll_wait(refreshed: &Result<()>) -> Duration {
         .err()
         .and_then(|error| error.downcast_ref::<NodeBusy>())
         .and_then(|busy| busy.retry_after)
-        .map_or(POLL_INTERVAL, |wait| wait.clamp(POLL_INTERVAL, MAX_POLL_WAIT))
+        .map_or(POLL_INTERVAL, |wait| {
+            wait.clamp(POLL_INTERVAL, MAX_POLL_WAIT)
+        })
 }
 
 /// The loopback node RPC endpoint, cloned out of the engine so node lookups
@@ -1593,10 +1589,7 @@ impl Engine {
                 {
                     eprintln!(
                         "faucet refresh category={} consecutive_errors={} first_at={} last_at={}",
-                        status.category,
-                        status.consecutive_errors,
-                        status.first_at,
-                        status.last_at
+                        status.category, status.consecutive_errors, status.first_at, status.last_at
                     );
                 }
             }
@@ -1814,7 +1807,9 @@ impl Engine {
         let state_root = self.state_root.context("missing quoted state root")?;
         let settings = self.settings.context("missing governed settings")?;
         let expiry_blocks = self.config.expiry_blocks;
-        let expiry = height.checked_add(expiry_blocks).context("expiry overflow")?;
+        let expiry = height
+            .checked_add(expiry_blocks)
+            .context("expiry overflow")?;
         // Durable claim heights use SQLite signed INTEGERs. Reject before signing
         // instead of truncating a valid u64 lifetime or corrupting the receipt.
         ensure!(
@@ -2316,7 +2311,10 @@ async fn status_handler(
     {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(_)) => failure(StatusCode::BAD_REQUEST, "Invalid test-network address"),
-        Err(_) => failure(StatusCode::SERVICE_UNAVAILABLE, "Faucet status is unavailable"),
+        Err(_) => failure(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Faucet status is unavailable",
+        ),
     }
 }
 async fn claim_handler(
@@ -2628,7 +2626,10 @@ mod tests {
         let large = json!({"result":{"data":"x".repeat(RPC_REPLY_BYTES + 1024)}});
         // Governed snapshot content can exceed the fixed cap for other replies.
         for (method, value) in [
-            ("broadcasttransaction", json!({"result":{"transaction_id":"00"}})),
+            (
+                "broadcasttransaction",
+                json!({"result":{"transaction_id":"00"}}),
+            ),
             ("snapshot", large.clone()),
         ] {
             let (address, task) =
@@ -2652,16 +2653,24 @@ mod tests {
         let bytes = serde_json::to_vec(&snapshot).unwrap();
         assert!(bytes.len() > RPC_REPLY_BYTES);
         let (address, task) = streaming_rpc_reply(bytes, true, None).await;
-        let parsed: NodeSnapshot =
-            node_rpc(&client, &format!("http://{address}/rpc"), "snapshot", json!({}))
-                .await
-                .unwrap();
+        let parsed: NodeSnapshot = node_rpc(
+            &client,
+            &format!("http://{address}/rpc"),
+            "snapshot",
+            json!({}),
+        )
+        .await
+        .unwrap();
         task.await.unwrap();
         assert_eq!(parsed.status.height, 9);
         assert_eq!(parsed.status.settings.block_bytes, 16384);
         assert_eq!(parsed.account.unwrap().account.nonce, 3);
         for (method, body, length) in [
-            ("preparetransaction", serde_json::to_vec(&large).unwrap(), None),
+            (
+                "preparetransaction",
+                serde_json::to_vec(&large).unwrap(),
+                None,
+            ),
             (
                 "snapshot",
                 Vec::new(),
@@ -3278,15 +3287,14 @@ mod tests {
                     .get(&height)
                     .cloned()
                     .unwrap_or_else(|| block(height, vec![]));
-                let included = ids
-                    .iter()
-                    .map(|id| {
-                        block
-                            .transactions
-                            .iter()
-                            .any(|t| hex::encode(codec::transaction_id(t)) == id.as_str().unwrap())
-                    })
-                    .collect::<Vec<_>>();
+                let included =
+                    ids.iter()
+                        .map(|id| {
+                            block.transactions.iter().any(|t| {
+                                hex::encode(codec::transaction_id(t)) == id.as_str().unwrap()
+                            })
+                        })
+                        .collect::<Vec<_>>();
                 let hash = hex::encode(codec::block_hash(&block));
                 let mut result = json!({"height":height,"hash":hash,"included":included});
                 if let Some(checked) = p.get("checked") {
@@ -3429,7 +3437,13 @@ mod tests {
             "pending"
         );
         let next = engine.ledger.pending().unwrap().unwrap();
-        assert_eq!(wallet::decode_signed(&next.raw, &[7; 32]).unwrap().body.nonce, 1);
+        assert_eq!(
+            wallet::decode_signed(&next.raw, &[7; 32])
+                .unwrap()
+                .body
+                .nonce,
+            1
+        );
         assert_eq!(node.lock().await.transactions.len(), 2);
         task.abort();
     }
@@ -3568,7 +3582,13 @@ mod tests {
         engine.claim(&recipient(5), "c").await.unwrap();
         // The next payment reuses the unconsumed nonce, so only one can ever apply.
         let next = engine.ledger.pending().unwrap().unwrap();
-        assert_eq!(wallet::decode_signed(&next.raw, &[7; 32]).unwrap().body.nonce, 0);
+        assert_eq!(
+            wallet::decode_signed(&next.raw, &[7; 32])
+                .unwrap()
+                .body
+                .nonce,
+            0
+        );
         assert_eq!(node.lock().await.transactions.len(), 3);
         task.abort();
     }
@@ -3995,7 +4015,13 @@ mod tests {
         assert_eq!(engine.state().unwrap(), "ready");
         engine.claim(&recipient(4), "b").await.unwrap();
         let next = engine.ledger.pending().unwrap().unwrap();
-        assert_eq!(wallet::decode_signed(&next.raw, &[7; 32]).unwrap().body.nonce, 1);
+        assert_eq!(
+            wallet::decode_signed(&next.raw, &[7; 32])
+                .unwrap()
+                .body
+                .nonce,
+            1
+        );
         task.abort();
     }
 
@@ -4034,7 +4060,13 @@ mod tests {
         );
         engine.claim(&recipient(5), "c").await.unwrap();
         let next = engine.ledger.pending().unwrap().unwrap();
-        assert_eq!(wallet::decode_signed(&next.raw, &[7; 32]).unwrap().body.nonce, 1);
+        assert_eq!(
+            wallet::decode_signed(&next.raw, &[7; 32])
+                .unwrap()
+                .body
+                .nonce,
+            1
+        );
         task.abort();
     }
 
@@ -4080,7 +4112,13 @@ mod tests {
         );
         engine.claim(&recipient(4), "b").await.unwrap();
         let next = engine.ledger.pending().unwrap().unwrap();
-        assert_eq!(wallet::decode_signed(&next.raw, &[7; 32]).unwrap().body.nonce, 0);
+        assert_eq!(
+            wallet::decode_signed(&next.raw, &[7; 32])
+                .unwrap()
+                .body
+                .nonce,
+            0
+        );
         assert_ne!(next.txid, first["txid"]);
         task.abort();
     }
@@ -4152,7 +4190,13 @@ mod tests {
         assert_eq!(engine.ledger.unsettled(0).unwrap().len(), expired);
         engine.claim(&recipient(201), "net-next").await.unwrap();
         let next = engine.ledger.pending().unwrap().unwrap();
-        assert_eq!(wallet::decode_signed(&next.raw, &[7; 32]).unwrap().body.nonce, 1);
+        assert_eq!(
+            wallet::decode_signed(&next.raw, &[7; 32])
+                .unwrap()
+                .body
+                .nonce,
+            1
+        );
         task.abort();
     }
 
@@ -4233,7 +4277,10 @@ mod tests {
         let mut state = crate::state::State::genesis(&chain);
         engine.tip = Some([3; 32]);
         let existing = crypto::public_key(&[10; 32]).unwrap();
-        state.world.put(existing, Default::default(), &chain).unwrap();
+        state
+            .world
+            .put(existing, Default::default(), &chain)
+            .unwrap();
         for (rate, nonce, payout) in [
             (1, 0, "1"),
             (7, 300, "1000000000000"),
@@ -4493,8 +4540,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&c.key_file, std::fs::Permissions::from_mode(0o644))
-                .unwrap();
+            std::fs::set_permissions(&c.key_file, std::fs::Permissions::from_mode(0o644)).unwrap();
             assert!(Engine::open(c.clone()).is_err());
             assert!(maintain(&c, Maintenance::Inspect).is_err());
             owner_only(&c.key_file);
@@ -4584,9 +4630,7 @@ mod tests {
 
     /// The next receipt lookup the mock node answers waits for the second
     /// signal after giving the first.
-    fn gate_receipts(
-        node: &mut MockNode,
-    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+    fn gate_receipts(node: &mut MockNode) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
         let gate = (
             Arc::new(tokio::sync::Notify::new()),
             Arc::new(tokio::sync::Notify::new()),
@@ -4744,7 +4788,13 @@ mod tests {
         assert!(engine.ledger.pending().unwrap().is_none());
         engine.claim(&recipient(5), "c").await.unwrap();
         let next = engine.ledger.pending().unwrap().unwrap();
-        assert_eq!(wallet::decode_signed(&next.raw, &[7; 32]).unwrap().body.nonce, 1);
+        assert_eq!(
+            wallet::decode_signed(&next.raw, &[7; 32])
+                .unwrap()
+                .body
+                .nonce,
+            1
+        );
         task.abort();
     }
 
@@ -4841,7 +4891,10 @@ mod tests {
         let retried = engine.ledger.pending().unwrap().unwrap();
         assert_eq!(retried.txid, first["txid"]);
         assert_eq!(engine.state().unwrap(), "pending");
-        assert_eq!(engine.published.answer(None, "b").unwrap()["state"], "pending");
+        assert_eq!(
+            engine.published.answer(None, "b").unwrap()["state"],
+            "pending"
+        );
         assert_eq!(node.lock().await.transactions.len(), 1);
         task.abort();
     }
@@ -4855,7 +4908,11 @@ mod tests {
         // node were down.
         node.lock().await.refusals.extend([
             ("snapshot", StatusCode::SERVICE_UNAVAILABLE, Some("1")),
-            ("preparetransaction", StatusCode::TOO_MANY_REQUESTS, Some("1")),
+            (
+                "preparetransaction",
+                StatusCode::TOO_MANY_REQUESTS,
+                Some("1"),
+            ),
         ]);
         let started = Instant::now();
         engine.refresh().await.unwrap();
@@ -4917,11 +4974,17 @@ mod tests {
         let opened = Instant::now();
         let mut held = Vec::new();
         for _ in 0..HTTP_CONNECTIONS {
-            held.push(tokio::net::TcpStream::connect(server.address).await.unwrap());
+            held.push(
+                tokio::net::TcpStream::connect(server.address)
+                    .await
+                    .unwrap(),
+            );
         }
         // Connections held open never keep another out: one more takes the
         // place of the one idle longest, which is closed unanswered.
-        let mut newer = tokio::net::TcpStream::connect(server.address).await.unwrap();
+        let mut newer = tokio::net::TcpStream::connect(server.address)
+            .await
+            .unwrap();
         let mut byte = [0; 1];
         let closed = tokio::time::timeout(Duration::from_secs(2), held[0].read(&mut byte))
             .await
@@ -4929,7 +4992,9 @@ mod tests {
         assert!(matches!(closed, Ok(0) | Err(_)));
         assert!(opened.elapsed() < crate::local_http::HEAD_TIMEOUT);
         newer
-            .write_all(b"GET /faucet/status HTTP/1.1\r\nHost: faucet.example\r\nConnection: close\r\n\r\n")
+            .write_all(
+                b"GET /faucet/status HTTP/1.1\r\nHost: faucet.example\r\nConnection: close\r\n\r\n",
+            )
             .await
             .unwrap();
         let mut answer = Vec::new();

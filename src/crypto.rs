@@ -46,12 +46,16 @@ pub fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> Hash {
         block[..key.len()].copy_from_slice(key);
     }
     let mut pad = Zeroizing::new([0u8; 64]);
-    pad.iter_mut().zip(block.iter()).for_each(|(p, k)| *p = k ^ 0x36);
+    pad.iter_mut()
+        .zip(block.iter())
+        .for_each(|(p, k)| *p = k ^ 0x36);
     let mut inner = Sha256::new();
     inner.update(pad.as_slice());
     parts.iter().for_each(|part| inner.update(part));
     let inner = Zeroizing::new(<[u8; 32]>::from(inner.finalize()));
-    pad.iter_mut().zip(block.iter()).for_each(|(p, k)| *p = k ^ 0x5c);
+    pad.iter_mut()
+        .zip(block.iter())
+        .for_each(|(p, k)| *p = k ^ 0x5c);
     let mut outer = Sha256::new();
     outer.update(pad.as_slice());
     outer.update(inner.as_slice());
@@ -280,7 +284,13 @@ mod tests {
             scrypt(password, salt, log_n, r, p, &mut out).unwrap();
             assert_eq!(hex::encode(out), expected, "scrypt N=2^{log_n} r={r} p={p}");
         }
-        for (log_n, r, p) in [(0, 8, 1), (32, 8, 1), (4, 0, 1), (4, 1, 0), (4, 1 << 15, 1 << 15)] {
+        for (log_n, r, p) in [
+            (0, 8, 1),
+            (32, 8, 1),
+            (4, 0, 1),
+            (4, 1, 0),
+            (4, 1 << 15, 1 << 15),
+        ] {
             assert!(scrypt(b"x", b"y", log_n, r, p, &mut out).is_err());
         }
         assert!(pbkdf2_sha256(b"x", b"y", 0, &mut out).is_err());
@@ -388,7 +398,10 @@ mod tests {
             assert!(verify(&changed, &signed).is_err(), "chain byte {byte}");
             changed[byte] ^= 1;
         }
-        assert_eq!(codec::encode(&signed).len(), codec::encode(&body).len() + 64);
+        assert_eq!(
+            codec::encode(&signed).len(),
+            codec::encode(&body).len() + 64
+        );
         // The documented construction, built here without tagged_hash.
         let tag = Sha256::digest(b"Hashstash/chain-bound-transaction");
         let mut expected = Sha256::new();

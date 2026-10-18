@@ -340,13 +340,16 @@ mod tests {
 
     #[tokio::test]
     async fn at_the_cap_a_new_connection_replaces_the_one_idle_longest() {
-        let (address, stop, task, release, mut waiting) =
-            server(2, Duration::from_secs(30)).await;
+        let (address, stop, task, release, mut waiting) = server(2, Duration::from_secs(30)).await;
         // Accepted in order: one connection never sends anything, and the
         // other has finished a request since.
         let mut silent = TcpStream::connect(address).await.unwrap();
         let mut used = TcpStream::connect(address).await.unwrap();
-        assert!(exchange(&mut used, "/").await.starts_with("HTTP/1.1 200 OK"));
+        assert!(
+            exchange(&mut used, "/")
+                .await
+                .starts_with("HTTP/1.1 200 OK")
+        );
         // Holding both open does not keep a third out. It takes the place of
         // the one idle longest, closed unanswered long before the head timeout.
         let mut third = TcpStream::connect(address).await.unwrap();
@@ -354,14 +357,22 @@ mod tests {
             .await
             .expect("the connection idle longest was kept");
         assert!(received.is_empty());
-        assert!(exchange(&mut third, "/").await.starts_with("HTTP/1.1 200 OK"));
+        assert!(
+            exchange(&mut third, "/")
+                .await
+                .starts_with("HTTP/1.1 200 OK")
+        );
         // A keep-alive connection idle since its response gives way the same way.
         let mut fourth = TcpStream::connect(address).await.unwrap();
         let (received, _) = tokio::time::timeout(Duration::from_secs(5), until_closed(&mut used))
             .await
             .expect("the connection idle longest was kept");
         assert!(received.is_empty());
-        assert!(exchange(&mut fourth, "/").await.starts_with("HTTP/1.1 200 OK"));
+        assert!(
+            exchange(&mut fourth, "/")
+                .await
+                .starts_with("HTTP/1.1 200 OK")
+        );
         // While every connection is handling a request, a new one is closed
         // at once instead, and the requests in progress still complete.
         for stream in [&mut third, &mut fourth] {
@@ -377,9 +388,10 @@ mod tests {
                 .unwrap();
         }
         let mut refused = TcpStream::connect(address).await.unwrap();
-        let (received, _) = tokio::time::timeout(Duration::from_secs(5), until_closed(&mut refused))
-            .await
-            .expect("a connection was admitted while every one was busy");
+        let (received, _) =
+            tokio::time::timeout(Duration::from_secs(5), until_closed(&mut refused))
+                .await
+                .expect("a connection was admitted while every one was busy");
         assert!(received.is_empty());
         release.add_permits(2);
         for stream in [&mut third, &mut fourth] {

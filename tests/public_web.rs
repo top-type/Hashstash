@@ -700,7 +700,10 @@ async fn garbage_lists_cost_only_their_bytes_and_wallet_calls_outlast_an_explore
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
-        assert_eq!(response.json::<Value>().await.unwrap()["result"]["height"], 0);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["result"]["height"],
+            0
+        );
     }
     // Sixteen visitors from sixteen networks read explorer accounts at once,
     // 4,160 units each, until each is refused.

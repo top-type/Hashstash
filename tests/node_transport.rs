@@ -427,10 +427,18 @@ async fn version_1_peers_keep_block_synchronization_and_reject_header_requests_c
     use std::sync::{Arc, Mutex};
     let dir = tempfile::tempdir().unwrap();
     let c = Config::devnet();
-    let a = Node::open(&dir.path().join("a.db"), c.clone(), crypto::public_key(&[87; 32]).unwrap())
-        .unwrap();
-    let b = Node::open(&dir.path().join("b.db"), c.clone(), crypto::public_key(&[88; 32]).unwrap())
-        .unwrap();
+    let a = Node::open(
+        &dir.path().join("a.db"),
+        c.clone(),
+        crypto::public_key(&[87; 32]).unwrap(),
+    )
+    .unwrap();
+    let b = Node::open(
+        &dir.path().join("b.db"),
+        c.clone(),
+        crypto::public_key(&[88; 32]).unwrap(),
+    )
+    .unwrap();
     for _ in 0..3 {
         a.mine(100_000).unwrap();
     }
@@ -495,14 +503,20 @@ async fn version_1_peers_keep_block_synchronization_and_reject_header_requests_c
     // A version 2 peer also closes a session it refuses or evicts, so one
     // such session is not taken as proof of version 1.
     let error = node::sync_peer(&b, legacy).await.unwrap_err();
-    assert!(format!("{error:#}").contains("peer transport version 1"), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("peer transport version 1"),
+        "{error:#}"
+    );
     let status = b.rpc("peerstatus", json!({})).unwrap();
     assert_eq!(status["transport_version"], 2);
     assert_eq!(status["version1_peers"], json!([]));
     // A second consecutive one is.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let error = node::sync_peer(&b, legacy).await.unwrap_err();
-    assert!(format!("{error:#}").contains("by blocks only for 600 seconds"), "{error:#}");
+    assert!(
+        format!("{error:#}").contains("by blocks only for 600 seconds"),
+        "{error:#}"
+    );
     let status = b.rpc("peerstatus", json!({})).unwrap();
     assert_eq!(status["version1_peers"], json!([legacy.to_string()]));
     // The next session, once the closed read's short cooldown has passed,
@@ -524,10 +538,18 @@ async fn version_2_peers_that_refuse_a_session_keep_header_synchronization() {
     use std::sync::{Arc, Mutex};
     let dir = tempfile::tempdir().unwrap();
     let c = Config::devnet();
-    let a = Node::open(&dir.path().join("a.db"), c.clone(), crypto::public_key(&[87; 32]).unwrap())
-        .unwrap();
-    let b = Node::open(&dir.path().join("b.db"), c.clone(), crypto::public_key(&[88; 32]).unwrap())
-        .unwrap();
+    let a = Node::open(
+        &dir.path().join("a.db"),
+        c.clone(),
+        crypto::public_key(&[87; 32]).unwrap(),
+    )
+    .unwrap();
+    let b = Node::open(
+        &dir.path().join("b.db"),
+        c.clone(),
+        crypto::public_key(&[88; 32]).unwrap(),
+    )
+    .unwrap();
     a.mine(100_000).unwrap();
     let server = node::serve(a.clone(), options()).await.unwrap();
     // A version 2 server that refuses or evicts every other session after

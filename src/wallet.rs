@@ -625,7 +625,11 @@ mod governance_review_tests {
                 .any(|field| field.label == "Sender"
                     && field.value == hex::encode(transaction.sender))
         );
-        assert!(!without_context.iter().any(|f| f.label.starts_with("Network")));
+        assert!(
+            !without_context
+                .iter()
+                .any(|f| f.label.starts_with("Network"))
+        );
         for malformed in [String::new(), "00".into(), "g".repeat(64), "AA".repeat(32)] {
             let mut changed = first.clone();
             changed.chain_id = malformed;
@@ -754,8 +758,10 @@ mod governance_review_tests {
             outcome: None,
         };
         let fields = review(&transaction, Some(&[42; 32]));
-        assert!(fields.iter().any(|f| f.label == "Lifetime warning"
-            && f.value.contains("fills at that block's price")));
+        assert!(
+            fields.iter().any(|f| f.label == "Lifetime warning"
+                && f.value.contains("fills at that block's price"))
+        );
     }
 
     #[test]
@@ -963,7 +969,9 @@ mod signed_record_tests {
         forged.extend_from_slice(&plain[data + 1..]);
         let error = decode_signed_record(&hex::encode(&forged)).unwrap_err();
         assert!(
-            error.to_string().starts_with("malformed signed transaction"),
+            error
+                .to_string()
+                .starts_with("malformed signed transaction"),
             "{error}"
         );
     }

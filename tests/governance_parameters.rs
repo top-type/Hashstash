@@ -279,7 +279,10 @@ fn parameters_accept_direct_values_and_zero_where_defined() {
         // A step beyond the ASERT half life starves the next target.
         (Parameter::Interval, c.daa_half_life + 1),
         (Parameter::Interval, c.daa_half_life),
-        (Parameter::Interval, c.auction_timeout - 2 * c.initial.lead + 1),
+        (
+            Parameter::Interval,
+            c.auction_timeout - 2 * c.initial.lead + 1,
+        ),
         (Parameter::Interval, 86_400),
         (Parameter::Interval, 1 << 40),
         // One decision at most doubles or halves capacity and block rate.
@@ -509,7 +512,9 @@ fn a_clock_range_shorter_than_the_height_range_still_allows_governance() {
             .parameter_change_at(s, parameter, s.get(parameter), new, 15, 1)
             .unwrap_err();
         assert!(
-            error.to_string().contains("overflow before the height limit"),
+            error
+                .to_string()
+                .contains("overflow before the height limit"),
             "{parameter:?}: {error}"
         );
     }
@@ -535,8 +540,15 @@ fn rest_cannot_reach_the_deadline_overflow_window_after_activation() {
         c.validate_governance_settings_at(&changed, activation)
             .unwrap();
         assert!(
-            c.parameter_change_at(settings, Parameter::Rest, settings.rest, rest, activation, 0)
-                .is_err()
+            c.parameter_change_at(
+                settings,
+                Parameter::Rest,
+                settings.rest,
+                rest,
+                activation,
+                0
+            )
+            .is_err()
         );
     }
     c.parameter_change_at(

@@ -118,8 +118,11 @@ fn failing(chain: &Chain, secret: &[u8; 32], nonce: u64, salt: u64) -> Transacti
 /// Fund the attacker and return the chain with `honest` pending payments.
 fn setup(block_bytes: u64, honest: usize) -> (tempfile::TempDir, Chain, Vec<Transaction>) {
     let directory = tempfile::tempdir().unwrap();
-    let mut chain =
-        Chain::open(&directory.path().join("selection.db"), configuration(block_bytes)).unwrap();
+    let mut chain = Chain::open(
+        &directory.path().join("selection.db"),
+        configuration(block_bytes),
+    )
+    .unwrap();
     for _ in 0..10 {
         append(&mut chain, vec![]);
     }
@@ -280,7 +283,9 @@ fn h9_bad_signature_is_refused_before_selection() {
     // re-verifying every signature before rejecting it.
     let mut bad = node_self_payment(&config, &SECRET, 0);
     bad.signature[0] ^= 1;
-    let before = node.rpc("mempool", serde_json::json!({"format":"hex"})).unwrap();
+    let before = node
+        .rpc("mempool", serde_json::json!({"format":"hex"}))
+        .unwrap();
     let t1 = Instant::now();
     let rejected = node.submit_transaction(bad);
     let bad_elapsed = t1.elapsed();
@@ -289,15 +294,21 @@ fn h9_bad_signature_is_refused_before_selection() {
     println!("mempool size:                         {filled}");
     println!("duplicate resubmit (short-circuit):   {dup_elapsed:?}");
     println!("bad-signature resubmit (one verify):  {bad_elapsed:?}");
-    println!("bad transaction rejected:             {}", rejected.is_err());
+    println!(
+        "bad transaction rejected:             {}",
+        rejected.is_err()
+    );
 
     assert!(filled >= 1, "mempool should have been filled");
     // The forged record is refused by its own authentication, never by a
     // selection over the pool, and the pool is untouched.
-    let error = rejected.expect_err("bad signature must be rejected").to_string();
+    let error = rejected
+        .expect_err("bad signature must be rejected")
+        .to_string();
     assert!(error.contains("invalid transaction signature"), "{error}");
     assert_eq!(
-        node.rpc("mempool", serde_json::json!({"format":"hex"})).unwrap(),
+        node.rpc("mempool", serde_json::json!({"format":"hex"}))
+            .unwrap(),
         before
     );
 }

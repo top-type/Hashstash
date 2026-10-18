@@ -9,7 +9,9 @@ param(
 # Start-ColdWallet.ps1 token hand-off: the launcher chooses the session token,
 # passes it only through the signer's environment and prints it only in the
 # launch URL's fragment; the signer never serves it and requires it for every
-# POST. Uses a public fixture chain ID and stops only the signer it started.
+# POST. Uses a public fixture chain ID and stops only the signer it started:
+# any process of the selected executable that was not running before the
+# launch, even when the launcher fails after starting it.
 # The launcher's Windows Error Reporting exclusion is checked under a test key
 # of this account, removed afterwards, never the real ExcludedApplications key.
 $ErrorActionPreference = 'Stop'
@@ -20,8 +22,9 @@ if (-not $Executable) { $Executable = Join-Path $repository 'target/release/hash
 if (-not $Report) { $Report = Join-Path $repository 'work/cold-launcher-report.json' }
 [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Report))) | Out-Null
 $checks = [Collections.Generic.List[string]]::new()
-$result = [ordered]@{ passed=$false; signer_sha256=$null; port=$Port; checks=$checks; owned_process_stopped=$false; test_key_removed=$false }
+$result = [ordered]@{ passed=$false; signer_sha256=$null; port=$Port; checks=$checks; owned_processes=0; owned_process_stopped=$false; test_key_removed=$false }
 $signer = $null
+$running = $null
 $client = $null
 $testRoot = 'Software\Hashstash-launcher-test-' + [Guid]::NewGuid().ToString('N')
 $testKey = $testRoot + '\ExcludedApplications'
@@ -41,6 +44,10 @@ function Post-Status([string]$Origin, [string]$Path, [string]$Token) {
     try { return [int]$response.StatusCode } finally { $response.Dispose(); $request.Dispose() }
 }
 
+function Get-Signer {
+    $name = [IO.Path]::GetFileNameWithoutExtension($Executable)
+    @(Get-Process -Name $name -ErrorAction SilentlyContinue | Where-Object { try { $_.Path -eq $Executable } catch { $false } })
+}
 function Test-Exclusion([string]$Name) {
     $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($testKey)
     if (-not $key) { return $false }
@@ -70,6 +77,7 @@ try {
     $result.signer_sha256 = (Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash.ToLowerInvariant()
     $client = [Net.Http.HttpClient]::new()
     [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($testRoot)
+    $running = @(Get-Signer | ForEach-Object { $_.Id })
     $output = @(& $launcher -Executable $Executable -ChainId ('27' * 32) -Port $Port -NoBrowser -CrashReportKey $testKey 6>&1 | ForEach-Object { [string]$_ })
     $signerName = [IO.Path]::GetFileName($Executable)
     Check ((Test-Exclusion $signerName) -and @($output | Where-Object { $_ -like "Crash reports: Windows Error Reporting excludes $signerName for this account*added*" }).Count -eq 1) 'The launcher excludes the signer from Windows Error Reporting and says so'
@@ -82,7 +90,7 @@ try {
     $notice = @($output | Where-Object { $_ -match 'Process ID: (\d+)\.' })
     if ($notice.Count -ne 1) { throw 'The launcher did not report the signer process.' }
     $signer = Get-Process -Id ([int]$Matches[1])
-    Check ($signer.Path -eq $Executable) 'The reported process is the selected signer executable'
+    Check ($signer.Path -eq $Executable -and $running -notcontains $signer.Id) 'The reported process is a new instance of the selected signer executable'
     $commandLine = [string](Get-CimInstance Win32_Process -Filter "ProcessId=$($signer.Id)").CommandLine
     Check (-not $commandLine.Contains($token)) 'The token never appears on the signer command line'
     Check ($null -eq $env:HASHSTASH_COLD_TOKEN) 'The launcher leaves no token in its own environment'
@@ -94,9 +102,17 @@ try {
     $result.passed = $true
 } finally {
     if ($client) { $client.Dispose() }
-    if ($signer) {
-        Stop-Process -Id $signer.Id -ErrorAction SilentlyContinue
-        $result.owned_process_stopped = $signer.WaitForExit(10000)
+    # The launcher can start the signer and then fail, before the signer it
+    # reports is known here; stop whatever this launch started.
+    if ($null -ne $running) {
+        $owned = @(Get-Signer | Where-Object { $running -notcontains $_.Id })
+        $result.owned_processes = $owned.Count
+        $stopped = $true
+        foreach ($process in $owned) {
+            Stop-Process -Id $process.Id -ErrorAction SilentlyContinue
+            $stopped = $process.WaitForExit(10000) -and $stopped
+        }
+        $result.owned_process_stopped = $stopped
     }
     [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($testRoot, $false)
     $result.test_key_removed = $null -eq [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($testRoot)

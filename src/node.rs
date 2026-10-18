@@ -12,8 +12,7 @@ use crate::{
     explorer::Explorer,
     fees, math,
     network_guard::{
-        self, NetworkGuard, PeerClass, PeerSlots, Session, StratumPending, Surface,
-        TrustedPrefix,
+        self, NetworkGuard, PeerClass, PeerSlots, Session, StratumPending, Surface, TrustedPrefix,
     },
     peer_auth::{Channel as PeerChannel, Policy as PeerPolicy},
     peer_discovery::{self, AddressBook, Options as DiscoveryOptions},
@@ -600,7 +599,8 @@ trait Unpoisoned<T> {
 }
 impl<T> Unpoisoned<T> for Mutex<T> {
     fn unpoisoned(&self) -> std::sync::MutexGuard<'_, T> {
-        self.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -844,7 +844,8 @@ impl AdmissionQueue {
                 break;
             }
             let share = |held: &(usize, usize)| if by_bytes { held.1 } else { held.0 };
-            let Some((&largest, most)) = self.held.iter().max_by_key(|(_, held)| share(held)) else {
+            let Some((&largest, most)) = self.held.iter().max_by_key(|(_, held)| share(held))
+            else {
                 return;
             };
             if share(&own) >= share(most) {
@@ -935,7 +936,11 @@ fn replaces(config: &Config, state: &State, new: &Transaction, old: &Transaction
     ) else {
         return true;
     };
-    raises(state, (&new.body.fee, quoted.weight), (&old.body.fee, pending.weight))
+    raises(
+        state,
+        (&new.body.fee, quoted.weight),
+        (&old.body.fee, pending.weight),
+    )
 }
 /// Whether a signed fee and weight raise the fee per weight unit of another
 /// by the replacement rule's margins (see [replaces]).
@@ -1003,7 +1008,10 @@ impl Room {
     fn after(chain: &Chain, miner: PublicKey, selection: &SelectionResult) -> Result<Self> {
         let state = chain.tip_state();
         let limit = mempool_limit(&chain.config).min(chain.config.max_signatures);
-        let height = state.height.checked_add(1).context("candidate height overflow")?;
+        let height = state
+            .height
+            .checked_add(1)
+            .context("candidate height overflow")?;
         let (prefix, suffix) = codec::coinbase_parts(height, &miner, &ZERO_HASH);
         let system = prefix.len() + 8 + suffix.len();
         let mut room = Self {
@@ -1026,8 +1034,11 @@ impl Room {
         };
         for tx in &selection.transactions {
             let bytes = codec::encode(tx).len();
-            room.used_bytes = room.used_bytes.saturating_add(compact_size_len(bytes) + bytes);
-            let weight = fees::quote(&chain.config, state, tx).map_or(u64::MAX, |quote| quote.weight);
+            room.used_bytes = room
+                .used_bytes
+                .saturating_add(compact_size_len(bytes) + bytes);
+            let weight =
+                fees::quote(&chain.config, state, tx).map_or(u64::MAX, |quote| quote.weight);
             room.used_weight = room.used_weight.saturating_add(weight);
             let nonce = room.next.entry(tx.body.sender).or_insert(0);
             *nonce = tx.body.nonce.saturating_add(1).max(*nonce);
@@ -1035,13 +1046,17 @@ impl Room {
         Ok(room)
     }
     fn fits(&self, bytes: usize, weight: u64) -> bool {
-        self.used_bytes.saturating_add(compact_size_len(bytes) + bytes) <= self.byte_limit
+        self.used_bytes
+            .saturating_add(compact_size_len(bytes) + bytes)
+            <= self.byte_limit
             && self.used_weight.saturating_add(weight) <= self.weight_limit
     }
     /// The nonce after `sender`'s selected entries, or its account nonce.
     fn start(&self, state: &State, sender: &PublicKey) -> u64 {
         self.next.get(sender).copied().unwrap_or_else(|| {
-            state.account(sender, None).map_or(0, |account| account.nonce)
+            state
+                .account(sender, None)
+                .map_or(0, |account| account.nonce)
         })
     }
     fn undecided(&self, sender: &PublicKey) -> bool {
@@ -1206,16 +1221,16 @@ fn compact_size_len(n: usize) -> usize {
     }
 }
 
+#[cfg(test)]
+mod explorer_worker_tests;
 #[doc(hidden)]
 pub mod fuzz;
 #[cfg(test)]
+mod local_rpc_tests;
+#[cfg(test)]
 mod pool_tests;
 #[cfg(test)]
-mod explorer_worker_tests;
-#[cfg(test)]
 mod proposal_index_tests;
-#[cfg(test)]
-mod local_rpc_tests;
 #[cfg(test)]
 thread_local! {
     /// Pool selections run on this thread, and the signatures they checked.
@@ -1838,7 +1853,12 @@ impl ProposalIndex {
             return None;
         }
         let mut rounds = BTreeMap::<u64, Vec<(&Amount, Hash)>>::new();
-        for id in base.open.values().flat_map(|ids| ids.iter()).chain(registered) {
+        for id in base
+            .open
+            .values()
+            .flat_map(|ids| ids.iter())
+            .chain(registered)
+        {
             let proposal = s.proposals.get(id)?;
             if proposal.round < base.open_from {
                 return None;
@@ -2286,15 +2306,9 @@ impl Node {
         // One block at the genesis signature limit, with a full loose batch and
         // pool (selection plus backlog) reselection, must always fit a single
         // peer work burst.
-        guard.allow_work(
-            inner
-                .chain
-                .config
-                .max_signatures
-                .saturating_add(
-                    1 + peer_wire::MAX_TRANSACTIONS + MAX_ADAPTIVE_MEMPOOL + MAX_BACKLOG,
-                ),
-        )?;
+        guard.allow_work(inner.chain.config.max_signatures.saturating_add(
+            1 + peer_wire::MAX_TRANSACTIONS + MAX_ADAPTIVE_MEMPOOL + MAX_BACKLOG,
+        ))?;
         let explorer_config = inner.chain.config.clone();
         let discovery_path = peer_discovery::path_for(path, inner.chain.chain_id());
         let mut discovery_id = [0; 32];
@@ -2384,7 +2398,8 @@ impl Node {
             "peer identity must be separate from the mining/spending account"
         );
         // Saved, seeded and later imported wallet accounts must differ as well.
-        self.wallets_locked()?.reserve_peer_identity(policy.public_key())?;
+        self.wallets_locked()?
+            .reserve_peer_identity(policy.public_key())?;
         self.peer_auth = Some(policy);
         Ok(self)
     }
@@ -2524,7 +2539,10 @@ impl Node {
     fn peer_limits(&self) -> Result<peer_wire::Limits> {
         let view = self.read_view()?;
         let capacity = self.known_block_bytes.load(Ordering::Acquire);
-        Ok(peer_wire::Limits::for_capacity(&view.chain.config, capacity))
+        Ok(peer_wire::Limits::for_capacity(
+            &view.chain.config,
+            capacity,
+        ))
     }
     fn peer_exchange_timeout(&self) -> Result<Duration> {
         // A peer may be validating the block we just sent before it answers.
@@ -2733,7 +2751,10 @@ impl Node {
         let mut nonces = BTreeMap::<PublicKey, BTreeSet<u64>>::new();
         let mut pending = BTreeMap::new();
         for tx in i.pending() {
-            nonces.entry(tx.body.sender).or_default().insert(tx.body.nonce);
+            nonces
+                .entry(tx.body.sender)
+                .or_default()
+                .insert(tx.body.nonce);
             pending.insert((tx.body.sender, tx.body.nonce), tx);
         }
         let judged = (i.chain.tip_hash(), i.pool_revision);
@@ -2750,9 +2771,8 @@ impl Node {
                 ));
             } else if !operator.contains(&id)
                 && let Some((fee, weight)) = i.invalid_nonces.refused(judged, tx)
-                && fees::quote(&i.chain.config, state, tx).is_ok_and(|quote| {
-                    !raises(state, (&tx.body.fee, quote.weight), (fee, *weight))
-                })
+                && fees::quote(&i.chain.config, state, tx)
+                    .is_ok_and(|quote| !raises(state, (&tx.body.fee, quote.weight), (fee, *weight)))
             {
                 screened.outbid.push((
                     id,
@@ -2773,7 +2793,10 @@ impl Node {
         for ((id, tx), opening) in replacing.into_iter().zip(opening) {
             match opening {
                 Ok(()) => {
-                    nonces.entry(tx.body.sender).or_default().insert(tx.body.nonce);
+                    nonces
+                        .entry(tx.body.sender)
+                        .or_default()
+                        .insert(tx.body.nonce);
                     payable.push((id, tx));
                 }
                 Err(error) => screened.unpayable.push((id, error)),
@@ -2785,7 +2808,9 @@ impl Node {
         for (id, tx) in payable {
             let sender = tx.body.sender;
             let next = *reachable.entry(sender).or_insert_with(|| {
-                let mut next = state.account(&sender, None).map_or(0, |account| account.nonce);
+                let mut next = state
+                    .account(&sender, None)
+                    .map_or(0, |account| account.nonce);
                 while nonces[&sender].contains(&next) {
                     next = next.saturating_add(1);
                 }
@@ -2888,7 +2913,8 @@ impl Node {
                     Err(error) => format!("transaction not valid in next block: {error}"),
                 }
             };
-            self.rejected_locked().refuse(id, Refusal::Tip(tip), &message);
+            self.rejected_locked()
+                .refuse(id, Refusal::Tip(tip), &message);
             outcomes[position] = Some(Err(anyhow!(message)));
         }
         if !checked.is_empty() {
@@ -2937,8 +2963,12 @@ impl Node {
                     &retained,
                     &authenticated,
                 )?;
-                let accepted: HashSet<_> =
-                    pool.0.iter().chain(&pool.1).map(codec::transaction_id).collect();
+                let accepted: HashSet<_> = pool
+                    .0
+                    .iter()
+                    .chain(&pool.1)
+                    .map(codec::transaction_id)
+                    .collect();
                 self.install_pool(i, pool)?;
                 // A newcomer that lost this selection is reconsidered once the
                 // tip or the pool changes, for example after a competing chain
@@ -3104,7 +3134,9 @@ impl Node {
             entry.tips += 1;
             if entry.tips <= AWAITING_TIPS
                 && funding.contains(&sender)
-                && i.chain.validate_transaction_anchor(&entry.transaction).is_ok()
+                && i.chain
+                    .validate_transaction_anchor(&entry.transaction)
+                    .is_ok()
             {
                 i.awaiting.push(entry);
             }
@@ -3130,7 +3162,9 @@ impl Node {
     /// budget reserved for public broadcasts.
     fn charge_selection(&self, spent: Duration, public: bool) {
         #[cfg(test)]
-        let spent = SELECTION_CHARGE.with(|charge| charge.get()).unwrap_or(spent);
+        let spent = SELECTION_CHARGE
+            .with(|charge| charge.get())
+            .unwrap_or(spent);
         let mut admission = self.admission.unpoisoned();
         let budget = if public {
             &mut admission.public
@@ -3544,9 +3578,9 @@ impl Node {
         let id = newcomer.id;
         // A refused identity is answered from the refusal cache, without the
         // node lock or a selection, as a relayed copy is.
-        if let Some(reason) = self
-            .rejected_locked()
-            .refusal(&id, &view.chain.tip_hash(), view.pool_revision)
+        if let Some(reason) =
+            self.rejected_locked()
+                .refusal(&id, &view.chain.tip_hash(), view.pool_revision)
         {
             bail!("{reason}");
         }
@@ -3558,8 +3592,7 @@ impl Node {
             bail!(message);
         }
         drop(view);
-        self.admit_now(public, |_| Ok(newcomer))
-            .map(|(id, _)| id)
+        self.admit_now(public, |_| Ok(newcomer)).map(|(id, _)| id)
     }
     fn wallet_submit(&self, request: HotWalletRequest) -> Result<Hash> {
         let sender = parse_account(
@@ -4541,17 +4574,19 @@ impl Node {
             }
         }
         let chain_id = view.chain.chain_id();
-        fresh.retain(|newcomer| match Self::screen_signed(&chain_id, &newcomer.transaction) {
-            Ok(()) => true,
-            Err(error) => {
-                self.rejected_locked().refuse(
-                    newcomer.id,
-                    Refusal::Permanent,
-                    &format!("transaction not valid in next block: {error:#}"),
-                );
-                false
-            }
-        });
+        fresh.retain(
+            |newcomer| match Self::screen_signed(&chain_id, &newcomer.transaction) {
+                Ok(()) => true,
+                Err(error) => {
+                    self.rejected_locked().refuse(
+                        newcomer.id,
+                        Refusal::Permanent,
+                        &format!("transaction not valid in next block: {error:#}"),
+                    );
+                    false
+                }
+            },
+        );
         // Newcomers wait for the node-wide selection budget and for block
         // submissions in a queue, which one selection drains.
         self.queue_admissions(fresh, view.chain.tip_state().settings.block_bytes);
@@ -5199,7 +5234,10 @@ impl Node {
     ) -> Result<Value> {
         if crate::explorer::METHODS.contains(&method) {
             let view = self.read_view()?;
-            charge(admission, explorer_state_work(method, view.chain.tip_state()))?;
+            charge(
+                admission,
+                explorer_state_work(method, view.chain.tip_state()),
+            )?;
             return Explorer::read(
                 &self.explorer_path,
                 method,
@@ -5320,8 +5358,8 @@ impl Node {
                         .chain
                         .hash_at_height(height)
                         .context("unknown active height")?;
-                    let checked_canonical = checked
-                        .map(|(at, hash)| i.chain.hash_at_height(at) == Some(hash));
+                    let checked_canonical =
+                        checked.map(|(at, hash)| i.chain.hash_at_height(at) == Some(hash));
                     // Without IDs the canonical index answers; no body is loaded.
                     let block = if ids.is_empty() {
                         None
@@ -6126,7 +6164,10 @@ pub async fn serve(mut node: Node, options: ServerOptions) -> Result<Server> {
     // operator trusts, keep reserved Stratum slots from the first connection.
     node.stratum_pending.allow(&options.stratum_trusted);
     if options.stratum_enabled {
-        let (pending, path) = (node.stratum_pending.clone(), node.stratum_trusted_path.clone());
+        let (pending, path) = (
+            node.stratum_pending.clone(),
+            node.stratum_trusted_path.clone(),
+        );
         let loaded = tokio::task::spawn_blocking(move || pending.load_trusted(&path))
             .await
             .context("Stratum trusted address reader failed")?;
@@ -6336,8 +6377,14 @@ pub async fn serve(mut node: Node, options: ServerOptions) -> Result<Server> {
         }));
     }
     if node.discovery_options.enabled {
-        tasks.push(service_task("peer discovery", discovery_loop(node.clone(), rx.clone())));
-        tasks.push(service_task("discovery seed", discovery_seed_loop(node.clone(), rx.clone())));
+        tasks.push(service_task(
+            "peer discovery",
+            discovery_loop(node.clone(), rx.clone()),
+        ));
+        tasks.push(service_task(
+            "discovery seed",
+            discovery_seed_loop(node.clone(), rx.clone()),
+        ));
     }
     if options.stratum_enabled {
         tasks.push(service_task(
@@ -6568,24 +6615,25 @@ async fn persist_stratum_trusted(node: &Node) {
 /// Serialize under the discovery lock only when the persisted form changed;
 /// the file write and its fsync run on a blocking worker without the lock.
 async fn persist_address_book(node: &Node) {
-    let pending = node.discovery.unpoisoned().as_mut().and_then(|book| {
-        match book.pending_save() {
+    let pending = node
+        .discovery
+        .unpoisoned()
+        .as_mut()
+        .and_then(|book| match book.pending_save() {
             Ok(pending) => pending.map(|bytes| (book.path().to_path_buf(), bytes)),
             Err(error) => {
                 book.last_error = Some(format!("address book save failed: {error}"));
                 None
             }
-        }
-    });
+        });
     let Some((path, bytes)) = pending else {
         return;
     };
-    let result = tokio::task::spawn_blocking(move || {
-        AddressBook::persist(&path, &bytes).map(|()| bytes)
-    })
-    .await
-    .map_err(|error| anyhow!("address book worker failed: {error}"))
-    .and_then(|result| result);
+    let result =
+        tokio::task::spawn_blocking(move || AddressBook::persist(&path, &bytes).map(|()| bytes))
+            .await
+            .map_err(|error| anyhow!("address book worker failed: {error}"))
+            .and_then(|result| result);
     if let Some(book) = node.discovery.unpoisoned().as_mut() {
         match result {
             Ok(bytes) => {
@@ -6602,10 +6650,9 @@ async fn discover_peer(node: &Node, peer: SocketAddr) -> Result<()> {
     // and a discovery worker, for at most one exchange allowance. Expiry
     // drops the exchange without a cooldown and is reported by the caller.
     let deadline = tokio::time::Instant::now() + node.peer_exchange_timeout()?;
-    let _permit =
-        tokio::time::timeout_at(deadline, node.outbound_sessions.clone().acquire_owned())
-            .await
-            .map_err(|_| anyhow!("outbound peer slots remained busy"))??;
+    let _permit = tokio::time::timeout_at(deadline, node.outbound_sessions.clone().acquire_owned())
+        .await
+        .map_err(|_| anyhow!("outbound peer slots remained busy"))??;
     tokio::time::timeout_at(deadline, discover_peer_steps(node, peer))
         .await
         .map_err(|_| anyhow!("peer discovery exceeded its overall deadline"))?
@@ -7028,7 +7075,15 @@ async fn sync_peer_steps(node: &Node, peer: SocketAddr) -> Result<()> {
     // Transport version 2: headers come first, so a branch is learned from
     // its headers whatever its blocks' size or its distance from the tip.
     if node.speaks_headers(peer) {
-        header_rounds(node, peer, &mut read, &mut write, &admission, &mut transport).await?;
+        header_rounds(
+            node,
+            peer,
+            &mut read,
+            &mut write,
+            &admission,
+            &mut transport,
+        )
+        .await?;
     }
     write_peer(
         node,
@@ -7270,10 +7325,7 @@ fn scheduled_change(
         return None;
     };
     let (parameter, new) = rest.pending?;
-    if !matches!(
-        parameter,
-        Parameter::MinimumFeeRate | Parameter::BlockBytes
-    ) {
+    if !matches!(parameter, Parameter::MinimumFeeRate | Parameter::BlockBytes) {
         return None;
     }
     // The first block whose scheduled clock reaches the deadline activates it.
@@ -7849,9 +7901,7 @@ fn rpc_reply(
     let mut body = serde_json::to_vec(&response)?;
     drop(response);
     if body.len() > limit {
-        body = serde_json::to_vec(&rpc_error(
-            "RPC response exceeds the local response limit",
-        ))?;
+        body = serde_json::to_vec(&rpc_error("RPC response exceeds the local response limit"))?;
     }
     Ok((body, refusal))
 }
@@ -8254,38 +8304,38 @@ async fn http_session(
     // A valid record may need more than the fixed service frame once
     // governance raises capacity; the frame then follows that capacity.
     let limit = response_frame;
-    let (mut body, refusal, admission) = if value.get("jsonrpc") != Some(&Value::String("2.0".into()))
-    {
-        let (body, refusal) = rpc_reply(&id, Err(anyhow!("jsonrpc must be 2.0")), limit)?;
-        (body, refusal, admission)
-    } else {
-        let slots = if method == "mine" {
-            node.dev_mining.clone()
-        } else if mutation {
-            http.mutations.clone()
+    let (mut body, refusal, admission) =
+        if value.get("jsonrpc") != Some(&Value::String("2.0".into())) {
+            let (body, refusal) = rpc_reply(&id, Err(anyhow!("jsonrpc must be 2.0")), limit)?;
+            (body, refusal, admission)
         } else {
-            http.workers.clone()
-        };
-        let Ok(permit) = timeout(IO_TIMEOUT, slots.acquire_owned()).await else {
-            let busy = HttpRefusal::busy("RPC workers busy");
-            return busy.send(&mut write, &rpc_error(&busy.message)).await;
-        };
-        let permit = permit?;
-        let id = id.clone();
-        // The reply is serialized, and its JSON tree freed, on this worker:
-        // a page may hold millions of values, too many for a runtime thread.
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let result = if public {
-                node.public_rpc(&method, params, &admission)
+            let slots = if method == "mine" {
+                node.dev_mining.clone()
+            } else if mutation {
+                http.mutations.clone()
             } else {
-                node.rpc_with_admission(&method, params, Some(&admission))
+                http.workers.clone()
             };
-            rpc_reply(&id, result, limit).map(|(body, refusal)| (body, refusal, admission))
-        })
-        .await
-        .context("RPC worker failed")??
-    };
+            let Ok(permit) = timeout(IO_TIMEOUT, slots.acquire_owned()).await else {
+                let busy = HttpRefusal::busy("RPC workers busy");
+                return busy.send(&mut write, &rpc_error(&busy.message)).await;
+            };
+            let permit = permit?;
+            let id = id.clone();
+            // The reply is serialized, and its JSON tree freed, on this worker:
+            // a page may hold millions of values, too many for a runtime thread.
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let result = if public {
+                    node.public_rpc(&method, params, &admission)
+                } else {
+                    node.rpc_with_admission(&method, params, Some(&admission))
+                };
+                rpc_reply(&id, result, limit).map(|(body, refusal)| (body, refusal, admission))
+            })
+            .await
+            .context("RPC worker failed")??
+        };
     let explorer_work = if explorer {
         body.len() / EXPLORER_REPLY_BYTES_PER_WORK
     } else {
@@ -8506,7 +8556,10 @@ mod capacity_work_tests {
             MAX_MEMPOOL + 1 + 1000
         );
         let signed = json!({"transaction":{"body":params}});
-        assert_eq!(rpc_cost("submittransaction", &signed), MAX_MEMPOOL + 1 + 1000);
+        assert_eq!(
+            rpc_cost("submittransaction", &signed),
+            MAX_MEMPOOL + 1 + 1000
+        );
         // Methods that never decode an operation or a raw transaction ignore
         // such fields, so a visitor's garbage list there costs the base price.
         assert_eq!(rpc_cost("status", &params), 8);
@@ -8796,22 +8849,26 @@ mod read_admission_tests {
             "1001".to_owned(),
             ((Amount::from(1u32) << 512usize) - 1u32).to_str_radix(10),
         ] {
-            let error =
-                Node::read_rpc(&curved_view, "quote", json!({"kind":"deposit","amount":amount}))
-                    .unwrap_err();
+            let error = Node::read_rpc(
+                &curved_view,
+                "quote",
+                json!({"kind":"deposit","amount":amount}),
+            )
+            .unwrap_err();
             assert!(error.to_string().contains("account cash"), "{error}");
         }
         let deposit = json!({"kind":"deposit","amount":"10"});
         assert!(Node::read_rpc(&curved_view, "quote", deposit.clone()).is_ok());
-        let error = Node::read_rpc_metered(&curved_view, "quote", deposit.clone(), Some(&drained()))
-            .unwrap_err();
+        let error =
+            Node::read_rpc_metered(&curved_view, "quote", deposit.clone(), Some(&drained()))
+                .unwrap_err();
         assert!(error.to_string().contains("budget"), "{error}");
         let stash = json!({"key":hex::encode(key()),"kind":"redeem","amount":"1"});
         let account = json!({"key":hex::encode(key())});
         for (method, params) in [("stash_quote", stash), ("account", account)] {
             assert!(Node::read_rpc(&curved_view, method, params.clone()).is_ok());
-            let error = Node::read_rpc_metered(&curved_view, method, params, Some(&drained()))
-                .unwrap_err();
+            let error =
+                Node::read_rpc_metered(&curved_view, method, params, Some(&drained())).unwrap_err();
             assert!(error.to_string().contains("budget"), "{method}: {error}");
         }
         // A flat curve has no size-dependent search and remains cheap.
@@ -8859,8 +8916,8 @@ mod read_admission_tests {
             signature: [0; 64],
         };
         let view = view(s, vec![pending]);
-        let error = Node::read_rpc_metered(&view, "governance", json!({}), Some(&drained()))
-            .unwrap_err();
+        let error =
+            Node::read_rpc_metered(&view, "governance", json!({}), Some(&drained())).unwrap_err();
         assert!(error.to_string().contains("budget"), "{error}");
         let payments = |value: &Value| {
             value["phase"]["Governance"]["proposal"]["Grant"]["payments"]
@@ -8874,10 +8931,16 @@ mod read_admission_tests {
             full["decision_grant"],
             json!({"payment_count":4096,"payment_total":"4096","truncated":false})
         );
-        assert_eq!(full["state_root"], hex::encode(view.chain.tip_state().root()));
+        assert_eq!(
+            full["state_root"],
+            hex::encode(view.chain.tip_state().root())
+        );
         // A complete projection is built per paid call and never retained.
         assert!(view.cache.governance.get().is_none());
-        assert_eq!(Node::read_rpc(&view, "governance", json!({})).unwrap(), full);
+        assert_eq!(
+            Node::read_rpc(&view, "governance", json!({})).unwrap(),
+            full
+        );
         // Wallet polling carries one bounded summary per tip, of the decision
         // and of its proposal row alike.
         let snapshot = Node::read_rpc(&view, "snapshot", json!({})).unwrap();
@@ -8923,9 +8986,8 @@ mod read_admission_tests {
             session
         };
         for method in ["governance", "proposals"] {
-            let error =
-                Node::read_rpc_metered(&view, method, json!({"round":0}), Some(&budget()))
-                    .unwrap_err();
+            let error = Node::read_rpc_metered(&view, method, json!({"round":0}), Some(&budget()))
+                .unwrap_err();
             assert!(error.to_string().contains("budget"), "{method}: {error}");
         }
         let polled = Node::read_rpc_metered(&view, "snapshot", json!({}), Some(&budget()));
@@ -9007,17 +9069,27 @@ mod read_admission_tests {
         let auction = view(s.clone(), vec![]);
         let round = Node::read_rpc(&auction, "proposals", json!({"round":0})).unwrap();
         assert_eq!(ids(&round), hex_ids(&[4, 2, 3, 1]));
-        let page = Node::read_rpc(&auction, "proposals", json!({"round":0,"offset":1,"limit":2}))
-            .unwrap();
+        let page = Node::read_rpc(
+            &auction,
+            "proposals",
+            json!({"round":0,"offset":1,"limit":2}),
+        )
+        .unwrap();
         assert_eq!(ids(&page), hex_ids(&[2, 3]));
         // Support order changes between tips, so a listing paged across
         // blocks could skip a row; naming the first page's tip refuses that.
         let tip = hex::encode(auction.chain.tip_hash());
         let bound = json!({"round":0,"offset":1,"limit":2,"tip":tip});
-        assert_eq!(ids(&Node::read_rpc(&auction, "proposals", bound).unwrap()), hex_ids(&[2, 3]));
+        assert_eq!(
+            ids(&Node::read_rpc(&auction, "proposals", bound).unwrap()),
+            hex_ids(&[2, 3])
+        );
         let stale = json!({"round":0,"offset":1,"tip":hex::encode([8; 32])});
         let error = Node::read_rpc(&auction, "proposals", stale).unwrap_err();
-        assert!(error.to_string().contains("restart from offset 0"), "{error}");
+        assert!(
+            error.to_string().contains("restart from offset 0"),
+            "{error}"
+        );
         assert!(
             Node::read_rpc(&auction, "proposals", json!({"round":0,"offset":9}))
                 .unwrap()
@@ -9117,8 +9189,12 @@ mod read_admission_tests {
         assert_eq!(account["account"]["nonce"], 0);
         // A decimal string, which a keyed snapshot's account read repeats.
         assert_eq!(account["pending_nonce"], "2");
-        let snapshot = Node::read_rpc(&view, "snapshot", json!({"key":hex::encode(key())})).unwrap();
-        assert_eq!(snapshot["account"]["pending_nonce"], account["pending_nonce"]);
+        let snapshot =
+            Node::read_rpc(&view, "snapshot", json!({"key":hex::encode(key())})).unwrap();
+        assert_eq!(
+            snapshot["account"]["pending_nonce"],
+            account["pending_nonce"]
+        );
         assert_eq!(response_frame_bytes(16 * 1024).unwrap(), MAX_RESPONSE_FRAME);
         let governed = 200 * 1024 * 1024;
         assert!(response_frame_bytes(governed).unwrap() > 2 * governed);
@@ -9243,12 +9319,19 @@ mod read_admission_tests {
         let valid = parse(&post("/rpc", "Content-Length: 2\r\n", "{}"), None)
             .await
             .unwrap();
-        assert_eq!((valid.method.as_str(), valid.body.as_slice()), ("POST", &b"{}"[..]));
+        assert_eq!(
+            (valid.method.as_str(), valid.body.as_slice()),
+            ("POST", &b"{}"[..])
+        );
         for length in ["+2", " 2,2", "0x2", "-0", ""] {
             let raw = post("/rpc", &format!("Content-Length: {length}\r\n"), "{}");
             assert!(parse(&raw, None).await.is_err(), "{length:?}");
         }
-        for line in ["POST  /rpc HTTP/1.1", "POST\t/rpc HTTP/1.1", "POST /rpc HTTP/1.1 "] {
+        for line in [
+            "POST  /rpc HTTP/1.1",
+            "POST\t/rpc HTTP/1.1",
+            "POST /rpc HTTP/1.1 ",
+        ] {
             let raw = format!("{line}\r\nHost: 127.0.0.1:18480\r\nContent-Length: 0\r\n\r\n");
             let error = parse(raw.as_bytes(), None).await.err().unwrap();
             assert_eq!(error.to_string(), "invalid HTTP request line", "{line:?}");
@@ -9537,7 +9620,9 @@ impl RpcClient {
                         },
                     )
                     .await
-                    .context("pending transaction scan failed or exceeded its byte budget; pass --nonce")?;
+                    .context(
+                        "pending transaction scan failed or exceeded its byte budget; pass --nonce",
+                    )?;
                 bytes_left -= bytes;
                 let page = page.as_array().context("invalid mempool response")?;
                 ensure!(page.len() <= 128, "mempool page exceeds requested limit");
@@ -9987,10 +10072,28 @@ async fn stratum_session(
     floor: f64,
     extra: [u8; 4],
     admission: Session,
+    pending: Option<network_guard::PendingSlot>,
+) -> Result<()> {
+    let (read, write) = stream.into_split();
+    stratum_lines(
+        node, read, write, password, floor, extra, admission, pending,
+    )
+    .await
+}
+/// A Stratum session over any byte stream: the listener's TCP halves, or the
+/// fuzz harness's in-memory input and reply buffer (see [fuzz]).
+#[allow(clippy::too_many_arguments)]
+async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    node: Node,
+    read: R,
+    mut write: W,
+    password: Option<String>,
+    floor: f64,
+    extra: [u8; 4],
+    admission: Session,
     mut pending: Option<network_guard::PendingSlot>,
 ) -> Result<()> {
     let admission = Arc::new(admission);
-    let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
     let mut subscribed = false;
     let mut authorized = false;
@@ -11575,14 +11678,22 @@ mod tests {
                 "stash_quote",
                 json!({"key":hex::encode(key),"kind":"redeem","amount":"1","outcome":"fail"}),
             ),
-            ("quote", json!({"kind":"deposit","amount":"10","outcome":"fail"})),
+            (
+                "quote",
+                json!({"kind":"deposit","amount":"10","outcome":"fail"}),
+            ),
         ] {
-            assert!(closed(Node::read_rpc(&view, method, params).unwrap_err()), "{method}");
+            assert!(
+                closed(Node::read_rpc(&view, method, params).unwrap_err()),
+                "{method}"
+            );
         }
         for operation in [deposit.clone(), redeem.clone()] {
             let fee = json!({"sender":hex::encode(key),"operation":operation});
             assert!(closed(Node::read_rpc(&view, "fee_quote", fee).unwrap_err()));
-            assert!(closed(Node::prepare_view(&view, key, request(operation)).unwrap_err()));
+            assert!(closed(
+                Node::prepare_view(&view, key, request(operation)).unwrap_err()
+            ));
         }
         // Operations common to both outcomes still execute in that block.
         let recipient = crypto::public_key(&[2; 32]).unwrap();
@@ -11880,9 +11991,12 @@ mod tests {
             (1, "mining.subscribe", json!([])),
             (2, "mining.authorize", json!(["patient.worker", "x"])),
         ] {
-            write_json(&mut write, &json!({"id":id,"method":method,"params":params}))
-                .await
-                .unwrap();
+            write_json(
+                &mut write,
+                &json!({"id":id,"method":method,"params":params}),
+            )
+            .await
+            .unwrap();
         }
         let solve = |job: &Value, extra2: [u8; 4]| {
             let p = &job["params"];
@@ -11910,7 +12024,13 @@ mod tests {
             while math::check_pow(&header, &target).is_err() {
                 header.nonce += 1;
             }
-            json!(["patient.worker",p[0],hex::encode(extra2),format!("{:08x}",header.timestamp),format!("{:08x}",header.nonce)])
+            json!([
+                "patient.worker",
+                p[0],
+                hex::encode(extra2),
+                format!("{:08x}", header.timestamp),
+                format!("{:08x}", header.nonce)
+            ])
         };
         // Both mining workers are busy, as with two sessions waiting for
         // template builds: a solved block never waits for them.
@@ -12228,7 +12348,9 @@ mod peer_tests {
         let branch = |name: &str, seed: u8, length: usize| {
             node_on(&dir.path().join(name), &config, |chain| {
                 for block in &prefix {
-                    chain.submit(block.clone(), block.header.timestamp as u64).unwrap();
+                    chain
+                        .submit(block.clone(), block.header.timestamp as u64)
+                        .unwrap();
                 }
                 for _ in 0..length {
                     advance(chain, crypto::public_key(&[seed; 32]).unwrap());
@@ -12266,7 +12388,9 @@ mod peer_tests {
         // instead, then its bodies are fetched again and it is adopted.
         let first = {
             let i = sender.locked().unwrap();
-            i.chain.hash_at_height(1).and_then(|hash| i.chain.block(&hash))
+            i.chain
+                .hash_at_height(1)
+                .and_then(|hash| i.chain.block(&hash))
         }
         .unwrap();
         let error = receiver.submit_block(first).unwrap_err();
@@ -12299,7 +12423,11 @@ mod peer_tests {
             panic!("not a header reply")
         };
         let headers = &headers[..keep.min(headers.len())];
-        (target.receive_headers(peer, headers).unwrap(), locator, capacity)
+        (
+            target.receive_headers(peer, headers).unwrap(),
+            locator,
+            capacity,
+        )
     }
     /// Version 2 synchronization in process: header rounds, then one block
     /// reply within the declared capacity, until the tips agree.
@@ -12353,26 +12481,40 @@ mod peer_tests {
         // Half of the branch, delivered alone, is only counted: nothing is held.
         let (more, locator, _) = header_round(&sender, &receiver, branch / 2);
         assert!(!more);
-        assert_eq!(locator.len(), Node::locator(&receiver.locked().unwrap().chain).len());
+        assert_eq!(
+            locator.len(),
+            Node::locator(&receiver.locked().unwrap().chain).len()
+        );
         assert_eq!(held_counts(&receiver), (0, 0));
         // The next request continues after the last counted header, and the
         // count passes the tip's work: still nothing is held.
         let (more, locator, _) = header_round(&sender, &receiver, usize::MAX);
         assert!(more);
-        let counted = sender.locked().unwrap().chain.hash_at_height(branch as u64 / 2);
+        let counted = sender
+            .locked()
+            .unwrap()
+            .chain
+            .hash_at_height(branch as u64 / 2);
         assert_eq!(Some(locator[0]), counted);
         assert_eq!(held_counts(&receiver), (0, 0));
         // The branch is fetched again from genesis and held: admitted once it
         // claims more work than the tip, which the last header does.
         let (more, locator, _) = header_round(&sender, &receiver, usize::MAX);
         assert!(!more);
-        assert_eq!(Some(locator[0]), receiver.locked().unwrap().chain.hash_at_height(0));
+        assert_eq!(
+            Some(locator[0]),
+            receiver.locked().unwrap().chain.hash_at_height(0)
+        );
         assert_eq!(held_counts(&receiver), (branch, branch));
         let tip = receiver.read_view().unwrap().chain.tip_hash();
         // Admitted headers are persisted and restored on restart.
         drop(receiver);
-        let receiver = Node::open(&path, config.clone(), crypto::public_key(&[66; 32]).unwrap())
-            .unwrap();
+        let receiver = Node::open(
+            &path,
+            config.clone(),
+            crypto::public_key(&[66; 32]).unwrap(),
+        )
+        .unwrap();
         assert_eq!(held_counts(&receiver), (branch, branch));
         assert_eq!(receiver.read_view().unwrap().chain.tip_hash(), tip);
         // Its blocks, first of all the one the tip's work declines, now bypass
@@ -12418,14 +12560,18 @@ mod peer_tests {
         while held_counts(&receiver).0 < crate::chain::MAX_HELD_HEADERS && rounds < 2 * branch {
             let request = receiver.peer_snapshot(None).unwrap();
             let reply = sender.peer_snapshot(Some(&request.locator)).unwrap();
-            receiver.receive_peer(&reply, "8.1.1.2".parse().unwrap()).unwrap();
+            receiver
+                .receive_peer(&reply, "8.1.1.2".parse().unwrap())
+                .unwrap();
             rounds += 1;
         }
         assert_eq!(held_counts(&receiver), (crate::chain::MAX_HELD_HEADERS, 0));
         for _ in 0..4 {
             let request = receiver.peer_snapshot(None).unwrap();
             let reply = sender.peer_snapshot(Some(&request.locator)).unwrap();
-            receiver.receive_peer(&reply, "8.1.1.2".parse().unwrap()).unwrap();
+            receiver
+                .receive_peer(&reply, "8.1.1.2".parse().unwrap())
+                .unwrap();
         }
         assert_eq!(held_counts(&receiver), (crate::chain::MAX_HELD_HEADERS, 0));
         // Header downloads count the whole branch, then hold all of it.
@@ -12510,7 +12656,11 @@ mod peer_tests {
         };
         let commits = || HELD_COMMITS.with(std::cell::Cell::get);
         let first = branch(1, 2 * peer_wire::MAX_HEADERS + 1);
-        assert!(!receiver.receive_headers(peer, &first[..peer_wire::MAX_HEADERS]).unwrap());
+        assert!(
+            !receiver
+                .receive_headers(peer, &first[..peer_wire::MAX_HEADERS])
+                .unwrap()
+        );
         assert_eq!(held_counts(&receiver), (2, 2));
         // Its best header is extended, and one reply commits once, not once
         // per admitted header.
@@ -12603,7 +12753,11 @@ mod peer_tests {
             assert_eq!(cursor(peer), genesis);
         };
         // Counting survives a pause longer than the holding idle limit.
-        assert!(receiver.receive_headers(a, replies().next().unwrap()).unwrap());
+        assert!(
+            receiver
+                .receive_headers(a, replies().next().unwrap())
+                .unwrap()
+        );
         pause(a);
         let counted = header_hash(&branch[peer_wire::MAX_HEADERS - 1]);
         assert_eq!(cursor(a), counted);
@@ -12628,7 +12782,11 @@ mod peer_tests {
         // A resume point dropped meanwhile restarts holding at the stored
         // root rather than failing the session.
         let dropped = header_hash(&branch[1500]);
-        receiver.locked().unwrap().chain.forget_held_header(&dropped);
+        receiver
+            .locked()
+            .unwrap()
+            .chain
+            .forget_held_header(&dropped);
         assert_eq!(cursor(b), header_hash(&branch[peer_wire::MAX_HEADERS - 1]));
         let second = &branch[peer_wire::MAX_HEADERS..2 * peer_wire::MAX_HEADERS];
         assert!(receiver.receive_headers(b, second).unwrap());
@@ -12793,9 +12951,7 @@ mod peer_tests {
             .unwrap();
         assert!(
             session
-                .work(
-                    100_001 + peer_wire::MAX_TRANSACTIONS + MAX_ADAPTIVE_MEMPOOL + MAX_BACKLOG
-                )
+                .work(100_001 + peer_wire::MAX_TRANSACTIONS + MAX_ADAPTIVE_MEMPOOL + MAX_BACKLOG)
                 .is_ok()
         );
     }
@@ -12874,7 +13030,8 @@ mod peer_tests {
         );
         // A linked reply of known active blocks marks where its sender's
         // chain continues, but never displaces a competing-branch cursor.
-        node.receive_peer(&message(&known[..MAX_BATCH]), attacker).unwrap();
+        node.receive_peer(&message(&known[..MAX_BATCH]), attacker)
+            .unwrap();
         assert_eq!(downloads(), held);
         // The honest source resending a stored side block, as after a
         // restart, still records its own cursor for it.
@@ -12957,14 +13114,23 @@ mod peer_tests {
             feeder.abort();
             (result, started.elapsed(), session)
         };
-        let admit = |a: u8| guard.admit(IpAddr::from([8, a, 1, 1]), Surface::Peer).unwrap();
+        let admit = |a: u8| {
+            guard
+                .admit(IpAddr::from([8, a, 1, 1]), Surface::Peer)
+                .unwrap()
+        };
         let (stalled, small, steady) = tokio::join!(
             // 2 MiB of a declared 8 MiB frame, then nothing.
             read(admit(1), 8 * 1024 * KIB, 2 * 1024 * KIB, vec![]),
             // A frame holding less than 1 MiB may stall until its allowance.
             read(admit(2), 1024 * KIB, 512 * KIB, vec![]),
             // A large frame that keeps arriving at 128 KiB/s completes.
-            read(admit(3), 1100 * KIB + 640 * KIB, 1100 * KIB, vec![128 * KIB; 5]),
+            read(
+                admit(3),
+                1100 * KIB + 640 * KIB,
+                1100 * KIB,
+                vec![128 * KIB; 5]
+            ),
         );
         let (result, elapsed, session) = stalled;
         let error = result.unwrap_err();
@@ -13173,9 +13339,9 @@ mod peer_tests {
             Duration::from_millis(1000)
         );
         assert!(sync_completed(&Ok(())));
-        assert!(sync_completed(&Err(
-            crate::chain::ValidationDeferred.into()
-        )));
+        assert!(sync_completed(
+            &Err(crate::chain::ValidationDeferred.into())
+        ));
         assert!(!sync_completed(&Err(anyhow!("peer closed"))));
     }
 

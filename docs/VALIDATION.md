@@ -79,8 +79,9 @@ Each parser of hostile input has a fuzz target in [`fuzz/src/lib.rs`](../fuzz/sr
 | `signed_record`, `unsigned_envelope` | Signed hexadecimal records and the unsigned exports a cold signer reviews |
 | `mail_envelope`, `plain_text` | Encrypted-mail envelopes, chat text and proposal rationale in transaction data |
 | `address_book` | Discovery gossip into the peer address book, and the book's saved form |
+| `stratum_session` | Everything a miner sends on one mining connection: line framing, subscribe and authorize, `mining.configure` with version rolling and minimum difficulty, difficulty suggestions and share submissions, on a fixture node. Replies must be JSON lines, and a closed session must leave no worker registered |
 
-The ordinary Rust suite runs each target from fixed seeds for a fixed number of mutated inputs ([stable runner](../tests/fuzz_parsers.rs)), keeping inputs whose outcome is new, replays every input kept under `fuzz/regressions/`, and sends mutated Stratum lines and HTTP requests through live listeners. A longer run on the stable toolchain:
+The ordinary Rust suite runs each target from its fixed seeds and kept regressions for a fixed number of mutated inputs ([stable runner](../tests/fuzz_parsers.rs)), keeping inputs whose outcome is new, replays every input kept under `fuzz/regressions/`, and sends mutated Stratum lines and HTTP requests through live listeners. It never reads a libFuzzer corpus, which is local and untracked, so its runs are the same on every machine. A longer run on the stable toolchain, which also starts from any corpus under `HASHSTASH_FUZZ_CORPUS` (default `fuzz/corpus`):
 
 ```text
 HASHSTASH_FUZZ_SECONDS=600 cargo test --release --features test-fixtures --test fuzz_parsers -- --ignored --nocapture fuzz_for_a_bounded_time
@@ -109,35 +110,37 @@ A run that finds nothing shows only that the inputs it tried passed. Mutation fr
 
 ## Windows checks
 
-On Windows the library tests also read back the access list of each secret file written on NTFS with `icacls`: one protected entry granting the current account full control, nothing inherited. They also check that the key reader refuses a key whose list lets the Users group read it, and that a symbolic link to a peer identity is refused; creating the link needs Developer Mode or administrator rights, and the check reports itself skipped without them. [`scripts/test_cold_launcher.ps1`](../scripts/test_cold_launcher.ps1) starts `Start-ColdWallet.ps1` for a fixture chain and checks the token hand-off: the token reaches the signer only through its environment, never its command line or `/api/session`, and every POST needs it. It stops only the signer it started. It also checks the launcher's Windows Error Reporting exclusion of the signer under a test key of the current account, which it removes, never the real `ExcludedApplications` key; `-RegistryOnly` runs just that check, without a signer build.
+On Windows the library tests also read back the access list of each secret file written on NTFS with `icacls`: one protected entry granting the current account full control, nothing inherited. Where the volume keeps access lists, failing to set one is an error rather than a warning; a test gives a file a list that its owner cannot change and requires the restriction to fail, or, for an account whose privileges still allow the change, to leave the file owner-only. Only a volume without access lists, such as FAT or exFAT, produces a warning. The library tests also check that the key reader refuses a key whose list lets the Users group read it, and that a symbolic link to a peer identity is refused; creating the link needs Developer Mode or administrator rights, and the check reports itself skipped without them. [`scripts/test_cold_launcher.ps1`](../scripts/test_cold_launcher.ps1) starts `Start-ColdWallet.ps1` for a fixture chain and checks the token hand-off: the token reaches the signer only through its environment, never its command line or `/api/session`, and every POST needs it. It stops only the signer it started: any process of the selected executable that was not running before the launch, also when the launcher fails after starting it. It also checks the launcher's Windows Error Reporting exclusion of the signer under a test key of the current account, which it removes, never the real `ExcludedApplications` key; `-RegistryOnly` runs just that check, without a signer build.
 
 ## Continuous integration
 
-[`ci.yml`](../.github/workflows/ci.yml) runs on every push and pull request: formatting and both Clippy configurations; on Linux the release build, both Rust suites, the frontend checks, Python unittest discovery and the wallet, address and mail programs on disposable nodes; on Windows both Clippy configurations, the fixture suite, the checks above and the frontend checks; and one minute of libFuzzer per target. A nightly schedule fuzzes each target for 15 minutes, runs the stable runner for 10, and runs the live network suites on disposable three-node networks with [`ci_network_suites.sh`](../scripts/ci_network_suites.sh), the Linux counterpart of `Start-Testnet.ps1 -Fresh -SeedWallets`. The workflow runs both Rust suites with `--release`: the shipped profile keeps overflow checks and the code has no debug-only assertions, so the checks are the same as the commands above and finish sooner.
+[`ci.yml`](../.github/workflows/ci.yml) runs on every push and pull request: formatting and the two Clippy configurations, as separate jobs; on Linux the release build, both Rust suites, the frontend checks, Python unittest discovery and the wallet, address and mail programs on disposable nodes; on Windows the fixture suite, the checks above, the frontend checks and both Clippy configurations; and one minute of libFuzzer per target. Within a job, every check runs once the build it needs succeeded, even after another check failed, so one run reports every failing check.
+
+A nightly schedule gives each fuzz target its own job: 15 minutes of libFuzzer, then 10 minutes of the stable runner from the same corpus. Each job minimizes its target's corpus with `cargo fuzz cmin` and keeps it, and a final job saves the corpora in the Actions cache, where every later run, nightly or per push, starts from them; a target whose job kept none keeps its previous corpus. A failing input is kept as a `fuzz-artifacts-<target>` artifact, also when the job fails or is cancelled. The nightly schedule also runs the live network suites on disposable three-node networks with [`ci_network_suites.sh`](../scripts/ci_network_suites.sh), the Linux counterpart of `Start-Testnet.ps1 -Fresh -SeedWallets`. The workflow runs both Rust suites with `--release`: the shipped profile keeps overflow checks and the code has no debug-only assertions, so the checks are the same as the commands above and finish sooner.
 
 ## Recorded results
 
-The latest full run of this guide, before the parallel audit workstreams were merged:
+The latest full run of this guide, with every audit workstream merged:
 
 | Item | Record |
 | --- | --- |
-| Source | `audit-fixes` at `cd21d49` plus the validation-gate, Windows-check and fuzzing commits of findings R15 and R34 |
+| Source | `audit-fixes` at `233a795` (all workstreams merged) plus the R15 and R34 review commits through the formatting-only commit `742233e`; this record changes only this file |
 | Platform | Windows 11 Home 10.0.26200 x86-64, with Ubuntu under WSL 2 for the Linux builds |
 | Toolchains | rustc, Cargo and Clippy 1.97.1 (2026-07-14) for x86_64-unknown-linux-gnu; rustfmt 1.9.0 of the same release on Windows; Node.js 24.20.0 on Windows; Python 3.14.4 under WSL |
 
 | Check | Result |
 | --- | --- |
 | `cargo build --release --locked --bins` | Passed |
-| `cargo test --all-targets --locked` | 382 passed, 47 ignored |
-| The same with `test-fixtures` | 721 passed, 7 ignored (debug, about 16 minutes); also with `--release` |
+| `cargo test --all-targets --locked` | 440 passed, 56 ignored (debug, about 5 minutes) |
+| The same with `test-fixtures` | 796 passed, 8 ignored (`--release`; the merged tree before these commits: 793 passed, 8 ignored) |
 | Both Clippy commands | Passed |
-| `cargo fmt --check` | Failed: files throughout the repository predate formatting. The files these commits add or rewrite are formatted; one formatting-only commit (`cargo fmt`) after the merge completes the gate |
-| Frontend runner and mail property check | 24 suites passed; 117 shared vectors and 20,000 mutations, plus 300,000 mutations at seed 12345 |
+| `cargo fmt --check` | Passed, as does `rustfmt --check --edition 2024 fuzz/src/lib.rs fuzz/fuzz_targets/*.rs` |
+| Frontend runner and mail property check | 24 suites passed; 117 shared vectors and 20,000 mutations |
 | Python unittest discovery | 210 tests passed with `HASHSTASH_TEST_BINARY` set to the fixture build |
 | Wallet CLI, wallet manager, addresses, wallet adversarial, mail wire | 16, 8, 4, 53 and 15 checks passed on disposable nodes (fixture build) |
-| Live network suites | `ci_network_suites.sh` with the fixture build: `test_network`, `test_economic_adversarial` and `test_load` (twelve 64-transaction waves, no refusals) passed on one fresh three-node network, `test_reserve_network` on another |
-| Windows, natively | 280 library unit tests (1 ignored, six consecutive runs) and 26 command-line unit tests passed, including the access-list and link checks; the in-process fuzz targets and listener tests passed; `test_cold_launcher.ps1` passed under Windows PowerShell 5.1. These were cross-built for x86_64-pc-windows-gnu with Rust 1.96.0 and MinGW-w64. Integration tests that embed build-host paths cannot run from such a build, and Clippy did not run for Windows; the Windows CI job covers both |
-| Fuzzing | The stable runner for 480 seconds per target (300 for `address_book`) and libFuzzer builds (stable toolchain, SanitizerCoverage, no address sanitizer) for 300 seconds per target. Found and fixed: a panic when `fee_quote` or `transfer_quote` received non-object parameters, and the browser opening a byte-order-mark-prefixed envelope that the node does not index as mail |
+| Live network suites | With the fixture build: `test_network`, `test_economic_adversarial` and `test_load` (twelve 64-transaction waves, no refusals) passed on one fresh three-node network, and `test_reserve_network` through `ci_network_suites.sh` on another; `test_stratum_wire.py`: 201 assertions passed |
+| Windows, natively | 333 library unit tests (1 ignored) and 30 command-line unit tests passed, including the access-list, fail-closed and link checks; the in-process fuzz targets, `stratum_session` included, and the listener tests passed; `test_cold_launcher.ps1` passed under Windows PowerShell 5.1 and, with a stand-in signer that never became ready, stopped that signer. These were cross-built for x86_64-pc-windows-gnu with Rust 1.96.0 and MinGW-w64. Integration tests that embed build-host paths cannot run from such a build, and Clippy did not run for Windows; the Windows CI job covers both |
+| Fuzzing | `stratum_session` under libFuzzer (stable toolchain, SanitizerCoverage, no address sanitizer) for 300 seconds, 2.1 million inputs, then the stable runner for 120 seconds from that corpus: no failures. The earlier run of the other targets (the stable runner for 480 seconds per target, libFuzzer for 300) found and fixed a panic when `fee_quote` or `transfer_quote` received non-object parameters, and the browser opening a byte-order-mark-prefixed envelope that the node does not index as mail |
 
 ## Isolated process and network scenarios
 

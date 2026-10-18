@@ -187,12 +187,7 @@ fn proportional(orders: &[Order], budget: &Amount, total: &Amount) -> Vec<Amount
 /// Directed logarithm bounds decide most comparisons; exact small-rational
 /// curves settle the rest with integer powers. The search deliberately retains
 /// unresolved comparisons, and every curve evaluation spends clearing work.
-fn price(
-    w: &World,
-    cash: &Amount,
-    sold: &Amount,
-    work: &Work,
-) -> Result<(Amount, Amount, Amount)> {
+fn price(w: &World, cash: &Amount, sold: &Amount, work: &Work) -> Result<(Amount, Amount, Amount)> {
     let (low, high, scale) = search_price(w, cash, sold, work)?;
     *work.last_price.borrow_mut() = Some(((&low + &high) >> 1usize, scale.clone()));
     Ok((low, high, scale))

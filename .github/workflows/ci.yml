@@ -1,6 +1,8 @@
 # The validation gate of docs/VALIDATION.md on Linux and Windows, plus
 # bounded fuzzing of the parsers that read hostile input. Every job uses
-# disposable local processes and OS-chosen or job-local ports only.
+# disposable local processes and OS-chosen or job-local ports only. Within a
+# job, each check runs once the build it needs succeeded, even after another
+# check failed, so one run reports every failing check.
 name: CI
 
 on:
@@ -31,23 +33,35 @@ env:
   PYTHON_VERSION: '3.12'
 
 jobs:
-  lint:
-    name: Format and Clippy
+  format:
+    name: Formatting
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: rustfmt, clippy
+          components: rustfmt
+      - name: Repository crate
+        run: cargo fmt --check
+      - name: Fuzz crate
+        if: ${{ !cancelled() }}
+        run: rustfmt --check --edition 2024 fuzz/src/lib.rs fuzz/fuzz_targets/*.rs
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Formatting
-        run: |
-          cargo fmt --check
-          rustfmt --check --edition 2024 fuzz/src/lib.rs fuzz/fuzz_targets/*.rs
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Clippy with test fixtures
+        if: ${{ !cancelled() }}
         run: cargo clippy --all-targets --locked --features test-fixtures --target-dir target/fixtures -- -D warnings
 
   linux:
@@ -67,22 +81,28 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Build
+        id: build
         run: |
           cargo build --release --locked --bins
           cargo build --release --locked --bins --features test-fixtures --target-dir target/fixtures
       - name: Rust tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: cargo test --release --all-targets --locked
       - name: Rust tests with test fixtures
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: cargo test --release --all-targets --locked --features test-fixtures --target-dir target/fixtures
       - name: Frontend suites
+        if: ${{ !cancelled() }}
         run: |
           node scripts/test_all_frontend.cjs
           node fuzz/js/mail_envelope.cjs
       - name: Python unit tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           HASHSTASH_TEST_BINARY: ${{ github.workspace }}/target/release/hashstash
         run: python3 -B -m unittest discover -s scripts -p 'test_*.py'
       - name: Python wallet, address and mail programs on disposable nodes
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           fixtures=target/fixtures/release
           mkdir -p work/reports
@@ -113,24 +133,31 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-      - name: Clippy, including the Windows-only access-list code
-        run: |
-          cargo clippy --all-targets --locked -- -D warnings
-          cargo clippy --all-targets --locked --features test-fixtures --target-dir target/fixtures -- -D warnings
       - name: Build
+        id: build
         run: cargo build --release --locked --bins
       - name: Rust tests with test fixtures
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: cargo test --release --all-targets --locked --features test-fixtures --target-dir target/fixtures
       - name: Owner-only secret files on NTFS
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         # Reads each secret file's access list back with icacls.
         run: cargo test --release --locked --lib --target-dir target/fixtures --features test-fixtures windows_ -- --nocapture
       - name: Cold signer launcher token hand-off
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: pwsh
         run: .\scripts\test_cold_launcher.ps1 -Executable .\target\release\hashstash-cold.exe -Port 21980 -Report work\cold-launcher-report.json
       - name: Frontend suites
+        if: ${{ !cancelled() }}
         run: |
           node scripts/test_all_frontend.cjs
           node fuzz/js/mail_envelope.cjs
+      - name: Clippy, including the Windows-only access-list code
+        if: ${{ !cancelled() }}
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Clippy with test fixtures
+        if: ${{ !cancelled() }}
+        run: cargo clippy --all-targets --locked --features test-fixtures --target-dir target/fixtures -- -D warnings
       - name: Keep reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -140,12 +167,20 @@ jobs:
           if-no-files-found: ignore
 
   fuzz:
-    name: Fuzz (libFuzzer)
+    # Every push and pull request fuzzes all targets in one job, one minute
+    # each. The nightly and manual runs give each target its own job, time
+    # limit and corpus, so one target's time or failure never cuts another's.
+    name: Fuzz (${{ matrix.target }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every target in fuzz/Cargo.toml; tests/fuzz_parsers.rs checks this list.
+        target: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["peer_wire","peer_channel","codec_transaction","codec_block","json","http_request","rpc_params","address","signed_record","unsigned_envelope","mail_envelope","plain_text","address_book","stratum_session"]' || '["all"]') }}
     env:
-      # One minute per target per push; longer on the nightly schedule.
       FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || (github.event_name == 'schedule' && '900' || '60') }}
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -159,36 +194,99 @@ jobs:
             fuzz -> target
       - name: Install cargo-fuzz
         run: cargo +nightly install cargo-fuzz --locked
+      - name: Restore the corpus the last nightly run kept
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
       - name: Seed corpora from the shared targets
         env:
           HASHSTASH_FUZZ_CORPUS: ${{ github.workspace }}/fuzz/corpus
         run: cargo +${{ env.RUST_TOOLCHAIN }} test --release --locked --features test-fixtures --test fuzz_parsers -- --ignored write_seed_corpus
-      - name: Fuzz every target
+      - name: libFuzzer
         run: |
           # Shared dependencies resolve to the versions the node ships with.
           cp Cargo.lock fuzz/Cargo.lock
-          cargo +nightly fuzz build --release
+          if [ "$TARGET" = all ]; then
+            cargo +nightly fuzz build --release
+            targets=$(cargo +nightly fuzz list)
+          else
+            cargo +nightly fuzz build --release "$TARGET"
+            targets=$TARGET
+          fi
           # The RPC target's fixture node lives for the whole process by design,
           # so leak detection is left to the sanitizer's ordinary error checks.
-          for target in $(cargo +nightly fuzz list); do
+          for target in $targets; do
             echo "::group::$target"
             cargo +nightly fuzz run --release "$target" "fuzz/corpus/$target" -- \
               -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=4096 -timeout=30 -detect_leaks=0 -print_final_stats=1
             echo "::endgroup::"
           done
-      - name: Keep failing inputs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuzz-artifacts
-          path: fuzz/artifacts
-          if-no-files-found: ignore
-      - name: Seeded stable runner, bounded time
-        if: github.event_name == 'schedule'
+      - name: Seeded stable runner from the same corpus, bounded time
+        if: matrix.target != 'all'
         env:
           HASHSTASH_FUZZ_SECONDS: '600'
+          HASHSTASH_FUZZ_TARGETS: ${{ matrix.target }}
+          HASHSTASH_FUZZ_CORPUS: ${{ github.workspace }}/fuzz/corpus
           HASHSTASH_FUZZ_ARTIFACTS: ${{ github.workspace }}/fuzz/artifacts/stable
         run: cargo +${{ env.RUST_TOOLCHAIN }} test --release --locked --features test-fixtures --test fuzz_parsers -- --ignored --nocapture fuzz_for_a_bounded_time
+      - name: Minimize the corpus
+        if: matrix.target != 'all'
+        run: cargo +nightly fuzz cmin --release "$TARGET" "fuzz/corpus/$TARGET" -- -rss_limit_mb=4096 -timeout=30 -detect_leaks=0
+      - name: Keep the corpus for the next runs
+        # Also after a failure: the inputs that found it are kept separately.
+        if: ${{ !cancelled() && matrix.target != 'all' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Keep failing inputs
+        # Last, so it also keeps what the stable runner found.
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
+  fuzz-corpus:
+    # The next runs, nightly and per push, start from each target's corpus as
+    # the last nightly run left it; a target whose job kept none keeps its
+    # previous corpus.
+    name: Keep the nightly fuzz corpora
+    needs: fuzz
+    if: ${{ always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Restore the previous corpora
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: Collect the corpora this run kept
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fuzz-corpus-*
+          path: kept
+      - name: Replace each kept target's corpus
+        run: |
+          mkdir -p fuzz/corpus
+          for kept in kept/fuzz-corpus-*; do
+            [ -d "$kept" ] || continue
+            target=${kept#kept/fuzz-corpus-}
+            rm -rf "fuzz/corpus/$target"
+            mv "$kept" "fuzz/corpus/$target"
+          done
+          du -sh fuzz/corpus/* || true
+      - name: Save the corpora
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
 
   network:
     name: Live fixture network suites
@@ -205,10 +303,12 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Build the fixture executable
+        id: build
         run: cargo build --release --locked --bins --features test-fixtures --target-dir target/fixtures
       - name: Network, adversarial-economics and load suites on one funded network
         run: bash scripts/ci_network_suites.sh target/fixtures/release/hashstash work/network/funded 38480
       - name: Reserve suite on a fresh network
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: bash scripts/ci_network_suites.sh target/fixtures/release/hashstash work/network/reserve 38480 test_reserve_network
       - name: Keep reports and node logs
         if: always()

@@ -2498,13 +2498,8 @@ mod tests {
     }
 
     fn owner_only(path: &Path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        #[cfg(not(unix))]
-        let _ = path;
+        // Mode 0600 on Unix, an owner-only access list on Windows.
+        crate::local_files::restrict_to_owner(path).unwrap();
     }
     fn config(dir: &TempDir) -> FaucetConfig {
         let secret = [41; 32];

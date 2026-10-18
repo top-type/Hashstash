@@ -83,8 +83,11 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 /// still be that file: on Unix it must have the inspected device and inode,
 /// and on Windows the path is opened without following a symbolic link or
 /// junction, which the handle check then refuses, so a path swapped for a
-/// link in between fails. On Unix the file must also be owner-only. The bytes
-/// land in one buffer allocated up front and wiped when dropped.
+/// link in between fails. The file must also be owner-only: on Unix no group
+/// or other permission bits, and on Windows an access list that lets in no
+/// account but this one, SYSTEM and Administrators (see
+/// `owner_only_access_list`). The bytes land in one buffer allocated up front
+/// and wiped when dropped.
 pub fn read_private(path: &Path, limit: usize) -> Result<Zeroizing<Vec<u8>>> {
     let fits = |metadata: &fs::Metadata| {
         metadata.is_file()
@@ -122,6 +125,12 @@ pub fn read_private(path: &Path, limit: usize) -> Result<Zeroizing<Vec<u8>>> {
             opened.permissions().mode() & 0o077 == 0,
             "key file must be owner-only (mode 0600)"
         );
+    }
+    #[cfg(windows)]
+    {
+        // icacls reads the list by path, after the handle checks above.
+        let list = windows::access_list(path)?;
+        owner_only_access_list(&list, windows::current_sid()?)?;
     }
     // Preallocated, so reading never leaves a reallocated copy of the secret.
     let mut bytes = Zeroizing::new(Vec::with_capacity(limit.saturating_add(1)));
@@ -186,6 +195,63 @@ fn account_sid(output: &str) -> Option<String> {
     valid.then(|| sid.to_owned())
 }
 
+/// Checks a secret file's access list, in the SDDL form `icacls /save` writes
+/// (`D:` flags, then one parenthesized entry per grant or denial). Every entry
+/// that grants access must name `sid`, the current account, or SYSTEM, the
+/// Administrators group or its built-in Administrator account, which can read
+/// any file anyway; this mirrors the Unix rule of no group or other permission
+/// bits. Deny entries only take access away. A null list, which lets every
+/// account in, is refused, and so is anything unrecognized. Inherited entries
+/// count like explicit ones, so a key in a profile folder passes and one in a
+/// folder that lets Users read does not.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn owner_only_access_list(sddl: &str, sid: &str) -> Result<()> {
+    let list = sddl
+        .trim()
+        .strip_prefix("D:")
+        .context("unrecognized key file access list")?;
+    let (flags, mut entries) = list.split_at(list.find('(').unwrap_or(list.len()));
+    // P (protected), AI and AR (inheritance); NO_ACCESS_CONTROL is a null list.
+    ensure!(
+        flags.chars().all(|c| matches!(c, 'P' | 'A' | 'I' | 'R')),
+        "key file has no access list, so every account can read it"
+    );
+    while let Some(rest) = entries.strip_prefix('(') {
+        // A conditional entry nests parentheses of its own.
+        let mut depth = 1usize;
+        let end = rest
+            .char_indices()
+            .find_map(|(at, c)| {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                (depth == 0).then_some(at)
+            })
+            .context("unrecognized key file access list")?;
+        // type;flags;rights;object;inherited object;account[;condition]
+        let fields: Vec<&str> = rest[..end].splitn(7, ';').collect();
+        entries = &rest[end + 1..];
+        ensure!(fields.len() >= 6, "unrecognized key file access list");
+        if matches!(fields[0], "D" | "OD" | "XD") {
+            continue;
+        }
+        let account = fields[5];
+        ensure!(
+            account.eq_ignore_ascii_case(sid)
+                || matches!(account, "SY" | "BA" | "LA" | "S-1-5-18" | "S-1-5-32-544"),
+            "key file must be owner-only: its access list lets in another account ({account})"
+        );
+    }
+    // Anything after the list is another section, such as the system list.
+    ensure!(
+        entries.is_empty() || entries.starts_with("S:"),
+        "unrecognized key file access list"
+    );
+    Ok(())
+}
+
 /// `icacls` arguments leaving `sid`'s full control as the only entry: the
 /// inherited entries are removed and the grant replaces its explicit ones.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -247,6 +313,35 @@ mod windows {
         let sid = current_sid()?;
         let path = std::path::absolute(path)?;
         run("icacls.exe", &icacls_arguments(&path, sid)).map(drop)
+    }
+
+    /// A file's access list as SDDL, which names accounts by SID and so reads
+    /// the same in every display language, unlike icacls's listing. `icacls
+    /// /save` writes it to a file in UTF-16: the file's name, then its list.
+    pub(super) fn access_list(path: &Path) -> Result<String> {
+        let path = std::path::absolute(path)?;
+        let mut name = [0u8; 16];
+        getrandom::fill(&mut name).map_err(|error| anyhow::anyhow!("OS randomness: {error}"))?;
+        let saved = std::env::temp_dir().join(format!("hashstash-acl-{}", hex::encode(name)));
+        let arguments: [OsString; 4] = [
+            path.into(),
+            "/save".into(),
+            saved.clone().into(),
+            "/q".into(),
+        ];
+        let read = run("icacls.exe", &arguments)
+            .and_then(|_| std::fs::read(&saved).context("cannot read the saved access list"));
+        let _ = std::fs::remove_file(&saved);
+        let units: Vec<u16> = read?
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        String::from_utf16(&units)?
+            .lines()
+            .map(|line| line.trim_matches('\u{feff}').trim())
+            .find(|line| line.starts_with("D:"))
+            .map(str::to_owned)
+            .context("icacls reported no access list")
     }
 }
 
@@ -339,6 +434,43 @@ mod tests {
         );
     }
 
+    /// Runs everywhere; Windows reads key files' lists this way.
+    #[test]
+    fn windows_key_access_lists_let_in_only_this_account_system_and_administrators() {
+        let me = "S-1-5-21-1004336348-1177238915-682003330-1001";
+        for private in [
+            // What write_private and keygen set.
+            format!("D:P(A;;FA;;;{me})"),
+            format!("D:PAI(A;;FA;;;{me})"),
+            // Inherited from a profile folder.
+            format!("D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;{me})"),
+            format!("D:P(A;;FA;;;LA)(A;;FR;;;S-1-5-18)(A;;FA;;;{})", me.to_lowercase()),
+            // Denials only take access away, here with a condition of its own.
+            format!("D:P(D;;FA;;;WD)(XD;;FX;;;WD;(@User.Title==\"x\"))(A;;FA;;;{me})"),
+            format!("D:P(A;;FA;;;{me})S:(ML;;NW;;;LW)"),
+            "D:P".to_owned(),
+        ] {
+            owner_only_access_list(&private, me).unwrap_or_else(|e| panic!("{private}: {e}"));
+        }
+        for shared in [
+            // A folder that lets Users read, or Authenticated Users change.
+            format!("D:AI(A;ID;FA;;;SY)(A;ID;0x1200a9;;;BU)(A;ID;FA;;;{me})"),
+            format!("D:AI(A;ID;0x1301bf;;;AU)(A;ID;FA;;;{me})"),
+            format!("D:P(A;;FA;;;{me})(A;;FR;;;S-1-5-21-1004336348-1177238915-682003330-1002)"),
+            format!("D:P(A;;FA;;;{me})(XA;;FR;;;WD;(@User.Title==\"x\"))"),
+            // A null list lets every account in.
+            "D:NO_ACCESS_CONTROL".to_owned(),
+            // Anything unrecognized.
+            String::new(),
+            format!("O:BAD:P(A;;FA;;;{me})"),
+            format!("D:P(A;;FA;;;{me}"),
+            "D:P(A;;FA)".to_owned(),
+            format!("D:P(A;;FA;;;{me})x"),
+        ] {
+            assert!(owner_only_access_list(&shared, me).is_err(), "{shared}");
+        }
+    }
+
     #[test]
     fn private_files_are_created_owner_only_and_never_overwritten() {
         let directory = tempfile::tempdir().unwrap();
@@ -404,6 +536,27 @@ mod tests {
         }
     }
 
+    /// A key another account can read is refused, as group or other
+    /// permission bits are on Unix, until that access is removed again.
+    #[cfg(windows)]
+    #[test]
+    fn windows_key_files_other_accounts_can_read_are_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("key.json");
+        write_private(&path, b"secret").unwrap();
+        assert_eq!(read_private(&path, 64).unwrap().as_slice(), b"secret");
+        let users = |change: &str, entry: &str| {
+            let arguments: [OsString; 4] =
+                [path.as_path().into(), change.into(), entry.into(), "/q".into()];
+            windows::run("icacls.exe", &arguments).unwrap();
+        };
+        users("/grant", "*S-1-5-32-545:R");
+        let error = read_private(&path, 64).unwrap_err();
+        assert!(format!("{error:#}").contains("another account"), "{error:#}");
+        users("/remove:g", "*S-1-5-32-545");
+        assert_eq!(read_private(&path, 64).unwrap().as_slice(), b"secret");
+    }
+
     /// On NTFS, where an access list can be set, it is: restrict_to_owner
     /// only warns otherwise, so this reads the list back. Every secret file
     /// path, new or existing, ends with one protected entry granting this
@@ -413,33 +566,7 @@ mod tests {
     fn windows_secret_files_list_only_the_current_account() {
         let directory = tempfile::tempdir().unwrap();
         let sid = windows::current_sid().unwrap();
-        let dacl = |path: &Path| -> String {
-            let saved = directory.path().join("saved-acl");
-            let _ = fs::remove_file(&saved);
-            windows::run(
-                "icacls.exe",
-                &[
-                    path.into(),
-                    "/save".into(),
-                    saved.as_path().into(),
-                    "/q".into(),
-                ],
-            )
-            .unwrap();
-            // A UTF-16 file: the file name, then its access list as SDDL.
-            let units: Vec<u16> = fs::read(&saved)
-                .unwrap()
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-                .collect();
-            String::from_utf16(&units)
-                .unwrap()
-                .lines()
-                .map(|line| line.trim_matches('\u{feff}').trim())
-                .find(|line| line.starts_with("D:"))
-                .unwrap()
-                .to_owned()
-        };
+        let dacl = |path: &Path| windows::access_list(path).unwrap();
         let written = directory.path().join("written.json");
         write_private(&written, b"secret").unwrap();
         let created = directory.path().join("created.json");

@@ -46,12 +46,9 @@ fn dedicated_key(dir: &TempDir) -> (std::path::PathBuf, PublicKey) {
         .unwrap(),
     )
     .unwrap();
-    // The faucet accepts only an owner-only key file, as `hashstash keygen` writes.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    }
+    // The faucet accepts only an owner-only key file, as `hashstash keygen`
+    // writes: mode 0600 on Unix, an owner-only access list on Windows.
+    hashstash::local_files::restrict_to_owner(&path).unwrap();
     (path, public)
 }
 

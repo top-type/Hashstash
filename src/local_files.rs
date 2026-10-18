@@ -1,10 +1,10 @@
 //! Files a node keeps beside its chain database, and owner-only protection
 //! for the files that hold secrets.
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use std::{
     ffi::OsString,
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 use zeroize::Zeroizing;
@@ -70,6 +70,58 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
+}
+
+/// Reads a small secret file of at most `limit` bytes through one handle. The
+/// path must name a regular file, never a symbolic link, and the handle must
+/// still be that file: on Unix it must have the inspected device and inode,
+/// and on Windows the path is opened without following a symbolic link or
+/// junction, which the handle check then refuses, so a path swapped for a
+/// link in between fails. On Unix the file must also be owner-only. The bytes
+/// land in one buffer allocated up front and wiped when dropped.
+pub fn read_private(path: &Path, limit: usize) -> Result<Zeroizing<Vec<u8>>> {
+    let fits = |metadata: &fs::Metadata| {
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.len() <= limit as u64
+    };
+    let inspected = fs::symlink_metadata(path)?;
+    ensure!(
+        fits(&inspected),
+        "key file must be a regular file of at most {limit} bytes, not a link"
+    );
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT opens a symbolic link or junction
+        // itself rather than its target, so the handle check refuses it.
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(path)?;
+    let opened = file.metadata()?;
+    ensure!(
+        fits(&opened),
+        "key file must be a regular file of at most {limit} bytes, not a link"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        ensure!(
+            opened.dev() == inspected.dev() && opened.ino() == inspected.ino(),
+            "key file changed while it was opened"
+        );
+        ensure!(
+            opened.permissions().mode() & 0o077 == 0,
+            "key file must be owner-only (mode 0600)"
+        );
+    }
+    // Preallocated, so reading never leaves a reallocated copy of the secret.
+    let mut bytes = Zeroizing::new(Vec::with_capacity(limit.saturating_add(1)));
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= limit, "key file is too large");
+    Ok(bytes)
 }
 
 /// Creates `path` if it is missing, without truncating it, and restricts it
@@ -268,5 +320,35 @@ mod tests {
         assert_eq!(fs::read(&adopted).unwrap(), b"identity", "an existing sidecar wins");
         adopt_legacy_secret(&directory.path().join("chain.sqlite"), "peer-key.json").unwrap();
         assert!(!directory.path().join("chain.peer-key.json").exists());
+    }
+
+    #[test]
+    fn private_reads_accept_only_small_owner_only_regular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("key.json");
+        write_private(&path, b"secret").unwrap();
+        assert_eq!(read_private(&path, 6).unwrap().as_slice(), b"secret");
+        assert!(read_private(&path, 5).is_err(), "larger than the limit");
+        assert!(read_private(directory.path(), 4096).is_err(), "a directory");
+        assert!(read_private(&directory.path().join("missing"), 4096).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let link = directory.path().join("link.json");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(read_private(&link, 4096).is_err(), "a symbolic link");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+            assert!(read_private(&path, 4096).is_err(), "readable by the group");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(read_private(&path, 4096).is_ok());
+        }
+        #[cfg(windows)]
+        {
+            // Creating a symbolic link needs a privilege or developer mode.
+            let link = directory.path().join("link.json");
+            if std::os::windows::fs::symlink_file(&path, &link).is_ok() {
+                assert!(read_private(&link, 4096).is_err(), "a symbolic link");
+            }
+        }
     }
 }

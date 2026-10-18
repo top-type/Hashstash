@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{Read, Write},
+    io::Write,
     net::{IpAddr, SocketAddr},
     path::Path,
     str::FromStr,
@@ -240,43 +240,8 @@ impl Drop for KeyFile {
     }
 }
 fn read_key(path: &Path) -> Result<[u8; 32]> {
-    let metadata = fs::symlink_metadata(path)?;
-    ensure!(
-        metadata.is_file() && metadata.len() <= 512,
-        "invalid peer key file"
-    );
-    // Read through one handle, and require that handle to be the regular file
-    // inspected above: a path swapped for a symbolic link in between fails.
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // FILE_FLAG_OPEN_REPARSE_POINT opens a symbolic link or junction
-        // itself rather than its target, so the checks below reject it.
-        options.custom_flags(0x0020_0000);
-    }
-    let file = options.open(path)?;
-    let opened = file.metadata()?;
-    ensure!(
-        opened.is_file() && !opened.file_type().is_symlink() && opened.len() <= 512,
-        "invalid peer key file"
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        ensure!(
-            opened.dev() == metadata.dev() && opened.ino() == metadata.ino(),
-            "peer key file changed while it was opened"
-        );
-        ensure!(
-            opened.permissions().mode() & 0o077 == 0,
-            "peer key file must be owner-only (0600)"
-        );
-    }
-    let mut bytes = Zeroizing::new(Vec::new());
-    file.take(513).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= 512, "peer key file too large");
+    // A regular, owner-only file read through the one handle that was checked.
+    let bytes = crate::local_files::read_private(path, 512).context("invalid peer key file")?;
     let key: KeyFile = serde_json::from_slice(&bytes).context("invalid peer identity file")?;
     ensure!(
         key.format == KEY_FORMAT,

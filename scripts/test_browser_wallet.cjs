@@ -172,7 +172,7 @@ async function run() {
     equal(b.api.verifySigned(signed.raw,{...signedFields(intent),txid:signed.transaction_id}).operation.Propose.proposal.Parameter.new,String(percent));
     const bad=JSON.parse(JSON.stringify(intent));bad.operation.Propose.proposal.Parameter.new='101';throws(()=>b.api.verifyUnsigned(envelope,bad),/0 to 100/);
   }
-  const parameterCases={BlockBytes:[[1024n,1537n],[33554432n,33554433n],[1024n,(1n<<64n)-1n]],Interval:[[15n,61n],[61n,(1n<<64n)-1n]],Lead:[[0n,17n],[17n,0n],[0n,(1n<<64n)-1n]],Rest:[[0n,19n],[19n,0n],[0n,(1n<<64n)-1n]],DecisionBlocks:[[60n,1n],[1n,(1n<<64n)-1n]],MaxPriceChangeBps:[[1000n,0n],[0n,10000n],[10000n,(1n<<64n)-1n]],PassMarginBps:[[0n,15001n],[15001n,0n],[0n,(1n<<64n)-1n]],MinimumFeeRate:[[0n,1n],[1n,0n],[3n,1n],[2n,3n],[(1n<<64n)-1n,0n],[0n,(1n<<64n)-1n]]};
+  const parameterCases={BlockBytes:[[4096n,8192n],[8193n,4096n],[33554432n,67108864n],[67108864n,33554432n]],Interval:[[15n,30n],[15n,7n],[(1n<<64n)-1n,(1n<<63n)-1n]],Lead:[[0n,17n],[17n,0n],[0n,(1n<<64n)-1n]],Rest:[[0n,19n],[19n,0n],[0n,(1n<<64n)-1n]],DecisionBlocks:[[60n,1n],[1n,(1n<<64n)-1n]],MaxPriceChangeBps:[[1000n,1n],[0n,9999n],[(1n<<64n)-1n,9999n]],PassMarginBps:[[0n,15001n],[15001n,0n],[0n,(1n<<64n)-1n]],MinimumFeeRate:[[0n,1n],[1n,2n],[3n,1n],[2n,3n],[(1n<<64n)-1n,1n],[(1n<<63n)-1n,(1n<<64n)-2n]]};
   const parameterNames=['BlockBytes','Interval','Lead','Rest','DecisionBlocks','MinerFeePercent','PassMarginBps','MinimumFeeRate','MaxPriceChangeBps'];
   for(const [parameter,pairs] of Object.entries(parameterCases)) for(const [oldValue,newValue] of pairs) {
     const intent={...expected,data_hex:'',operation:{Propose:{round:'0',description:'44'.repeat(32),proposal:{Parameter:{parameter,old:String(oldValue),new:String(newValue)}},support:'1'}}};
@@ -186,9 +186,21 @@ async function run() {
     if(['BlockBytes','Interval','DecisionBlocks'].includes(parameter)) {
       const bad={...intent,operation:{Propose:{...intent.operation.Propose,proposal:{Parameter:{parameter,old:String(oldValue),new:'0'}}}}};throws(()=>b.api.verifyUnsigned(envelope,bad),/positive/i);
     }
-    if(parameter==='BlockBytes') {
-      const bad={...intent,operation:{Propose:{...intent.operation.Propose,proposal:{Parameter:{parameter,old:String(oldValue),new:'1023'}}}}};throws(()=>b.api.verifyUnsigned(envelope,bad),/1,024 weight/i);
-    }
+  }
+  // Governed bounds that follow from the old value refuse signing, as in
+  // consensus: the capacity floor and ceiling, one halving or doubling of
+  // capacity and interval, a positive fee rate that at most doubles, and a
+  // price bound below 100%.
+  for(const [parameter,oldValue,newValue,message] of [
+    ['BlockBytes',8192n,4095n,/4,096 weight/],['BlockBytes',4096n,1024n,/4,096 weight/],['BlockBytes',2048n,4096n,/4,096 weight/],
+    ['BlockBytes',67108864n,67108865n,/67,108,864/],['BlockBytes',(1n<<64n)-1n,67108864n,/67,108,864/],
+    ['BlockBytes',16384n,8191n,/halve or double/],['BlockBytes',16384n,32769n,/halve or double/],
+    ['Interval',15n,6n,/halve or double/],['Interval',15n,31n,/halve or double/],['Interval',1n,3n,/halve or double/],
+    ['MinimumFeeRate',1n,0n,/positive/],['MinimumFeeRate',2n,5n,/double/],['MinimumFeeRate',0n,2n,/zero to one/],['MinimumFeeRate',(1n<<64n)-1n,0n,/positive/],
+    ['MaxPriceChangeBps',1000n,0n,/99\.99%/],['MaxPriceChangeBps',1000n,10000n,/99\.99%/],['MaxPriceChangeBps',10000n,(1n<<64n)-1n,/99\.99%/]
+  ]) {
+    const bad={...expected,data_hex:'',operation:{Propose:{round:'0',description:'44'.repeat(32),proposal:{Parameter:{parameter,old:String(oldValue),new:String(newValue)}},support:'1'}}};
+    throws(()=>b.api.verifyUnsigned(f.envelope,bad),message);
   }
   // Exercise every operation layout using a separately authored byte oracle.
   const hash=value=>Buffer.from(value,'hex'), decision='55'.repeat(32), proposal='66'.repeat(32);

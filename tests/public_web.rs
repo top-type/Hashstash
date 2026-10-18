@@ -449,10 +449,12 @@ async fn proxy_named_visitors_cannot_spend_the_shared_public_budget() {
             .json(&body)
             .send()
     };
-    // Each request costs about half of one visitor's eighth of the shared
-    // 1,048,576-unit work burst, so the third is refused for that visitor.
+    // A visitor's work burst is an eighth of the shared 1,048,576 units,
+    // raised to the 197,632 units that one largest (193 MiB) reply pays.
+    // Each request costs about a third of it, so the fourth is refused for
+    // that visitor.
     let expensive = priced_quote(65_000);
-    for _ in 0..2 {
+    for _ in 0..3 {
         let response = send("192.0.2.10", expensive.clone()).await.unwrap();
         assert_eq!(response.status(), 200);
     }

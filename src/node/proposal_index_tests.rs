@@ -253,7 +253,6 @@ fn a_new_tip_reads_its_snapshot_and_round_pages_without_walking_history() {
     let polled = Node::read_rpc(&parent, "snapshot", json!({})).unwrap();
     assert_eq!(builds(), before + 1);
     assert_eq!(polled["proposals_total"], 5);
-    assert!(parent.cache.proposal_ids.get().is_none());
 
     // The next block registers one proposal, adds support and changes leader.
     let added = mint(&mut s, 4, 3);
@@ -338,5 +337,44 @@ fn unfiltered_pages_list_every_proposal_in_key_order() {
         .map(|row| row["id"].as_str().unwrap().to_owned())
         .collect();
     assert_eq!(ids, [1u8, 2, 3].map(|id| hex::encode([id; 32])).to_vec());
-    assert_eq!(v.cache.proposal_ids.get().map(Vec::len), Some(3));
+}
+
+#[test]
+fn unfiltered_pages_cost_their_rows_not_the_history_before_them() {
+    let mut s = State::genesis(&Config::devnet());
+    for n in 0..64 * 600u32 {
+        let id = crypto::tagged_hash("unfiltered-page", &n.to_le_bytes());
+        register(&mut s, id, u64::from(n % 7), 1);
+    }
+    let all: Vec<String> = s
+        .proposals
+        .iter()
+        .map(|(key, _)| hex::encode(key))
+        .collect();
+    let v = view(s, TipCache::default());
+    // A session with 50 work units left. Charging the history before a page
+    // (600 units here) could never fit; once proposals outgrow a whole burst
+    // the first unfiltered page of every tip was refused. Stratum's bucket
+    // refills one unit per millisecond, so the test cannot outwait it.
+    let session = Arc::new(NetworkGuard::default())
+        .admit("127.0.0.1".parse().unwrap(), Surface::Stratum)
+        .unwrap();
+    session.work(8192 - 50).unwrap();
+    for offset in [0, 1, 20_000, all.len() - 3, all.len(), all.len() + 9] {
+        let page = Node::read_rpc_metered(
+            &v,
+            "proposals",
+            json!({"offset":offset,"limit":5}),
+            Some(&session),
+        )
+        .unwrap();
+        let ids: Vec<_> = page
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap().to_owned())
+            .collect();
+        let end = all.len().min(offset + 5);
+        assert_eq!(ids, all[offset.min(end)..end], "offset {offset}");
+    }
 }

@@ -1430,9 +1430,6 @@ struct TipCache {
     /// An ancestor's index and the proposals registered since, when this tip
     /// extends the previously published one; its index derives from them.
     proposal_base: Option<ProposalBase>,
-    /// Every proposal ID in consensus key order, only for unfiltered pages,
-    /// which pay for the walk when they build it.
-    proposal_ids: std::sync::OnceLock<Vec<Hash>>,
 }
 impl TipCache {
     /// The cache of a tip whose block extends the tip `parent` was published
@@ -1740,21 +1737,6 @@ impl ReadView {
                     .unwrap_or_else(|| ProposalIndex::build(s)),
             )
         })
-    }
-    /// Every proposal ID in key order. The first unfiltered page of a tip
-    /// walks them all, so it pays one work unit per 64 proposals.
-    fn proposal_ids(&self, meter: Option<&Session>) -> Result<&[Hash]> {
-        if let Some(ids) = self.cache.proposal_ids.get() {
-            return Ok(ids);
-        }
-        let s = self.chain.tip_state();
-        charge(meter, s.proposals.len() / 64)?;
-        Ok(self.cache.proposal_ids.get_or_init(|| {
-            s.proposals
-                .iter()
-                .filter_map(|(key, _)| Hash::try_from(key).ok())
-                .collect()
-        }))
     }
     /// The governance projection with a large decision grant summarized, so
     /// the retained copy stays bounded however many payments the grant has.
@@ -4251,12 +4233,25 @@ impl Node {
                         "proposal pages changed with a new tip; restart from offset 0"
                     );
                 }
-                let ids = match round {
-                    Some(round) => i.proposal_index().round(round),
-                    None => i.proposal_ids(meter)?,
+                let ids: Vec<Hash> = match round {
+                    Some(round) => {
+                        let ids = i.proposal_index().round(round);
+                        let ids = ids.get(offset..).unwrap_or_default();
+                        ids[..ids.len().min(limit)].to_vec()
+                    }
+                    // Key order is the map's own: the offset is found by
+                    // subtree size, so a page reads only its rows however
+                    // many proposals history holds.
+                    None => i
+                        .chain
+                        .tip_state()
+                        .proposals
+                        .iter_from(offset)
+                        .take(limit)
+                        .filter_map(|(key, _)| Hash::try_from(key).ok())
+                        .collect(),
                 };
-                let ids = ids.get(offset..).unwrap_or_default();
-                proposal_page(i, &ids[..ids.len().min(limit)], false, meter)
+                proposal_page(i, &ids, false, meter)
             }
             "support" => {
                 let key = parse_account(required_str(&params, "key")?, &chain_id)?;

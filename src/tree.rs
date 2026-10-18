@@ -511,6 +511,33 @@ impl<V> Map<V> {
         it
     }
 
+    /// Entries in key order from the `skip`-th on. Subtree sizes locate it
+    /// along one path, so the entries before it are never visited.
+    pub fn iter_from(&self, mut skip: usize) -> Iter<'_, V> {
+        let mut it = Iter { stack: Vec::new() };
+        let mut next = self.index.as_deref();
+        while let Some(n) = next {
+            let left = size(&n.left);
+            match skip.cmp(&left) {
+                // The entry lies in the left subtree; this node follows it.
+                Ordering::Less => {
+                    it.stack.push(n);
+                    next = n.left.as_deref();
+                }
+                Ordering::Equal => {
+                    it.stack.push(n);
+                    break;
+                }
+                // This node and its left subtree come before the entry.
+                Ordering::Greater => {
+                    skip -= left + 1;
+                    next = n.right.as_deref();
+                }
+            }
+        }
+        it
+    }
+
     /// An inclusion proof commits to a value, not to a particular serialization
     /// of an in-memory tree. The caller supplies the independently trusted root.
     /// Its length is the key's depth in the trie.
@@ -748,6 +775,37 @@ mod tests {
         assert_eq!(map.get(&key(600)), None);
         check(&map);
         assert_eq!(map.last(), map.iter().last());
+    }
+
+    #[test]
+    fn iteration_from_an_offset_matches_skipping() {
+        let mut map = Map::new();
+        let mut random = 29u64;
+        for i in 0..1500u64 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let k = key((random >> 32) as u32 % 700);
+            if random & 3 == 0 {
+                map.remove(&k);
+            } else {
+                map.insert(k, i);
+            }
+            if i % 50 == 0 {
+                // Removals and rotations leave every shape of subtree sizes.
+                for skip in (0..=map.len() + 2)
+                    .step_by(7)
+                    .chain([map.len().saturating_sub(1)])
+                {
+                    assert!(
+                        map.iter_from(skip).eq(map.iter().skip(skip)),
+                        "skip {skip} of {}",
+                        map.len()
+                    );
+                }
+            }
+        }
+        assert!(map.len() > 300);
+        assert_eq!(Map::<u64>::new().iter_from(0).next(), None);
+        assert_eq!(map.iter_from(usize::MAX).next(), None);
     }
 
     #[test]

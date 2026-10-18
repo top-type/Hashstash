@@ -1,0 +1,3 @@
+# transfer_quote (selector 5, private RPC) with params "x": the same panic
+# through the other quote method, with a string instead of an array.
+05227822

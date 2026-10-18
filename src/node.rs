@@ -632,6 +632,8 @@ fn compact_size_len(n: usize) -> usize {
     }
 }
 
+#[doc(hidden)]
+pub mod fuzz;
 #[cfg(test)]
 mod pool_tests;
 #[cfg(test)]
@@ -3251,14 +3253,20 @@ impl Node {
             }
             "fee_quote" | "transfer_quote" => {
                 let i = self.read_view()?;
-                let mut params = params;
+                // Omitted parameters are no fields. Any other non-object is
+                // refused: indexing a JSON array or scalar by name panics.
+                let mut params = if params.is_null() { json!({}) } else { params };
                 if params.get("sender").is_none() {
                     let session = self.wallets_locked()?.status();
-                    params["sender"] = session
+                    let sender = session
                         .get("public_key")
                         .filter(|key| key.is_string())
                         .cloned()
                         .unwrap_or_else(|| json!(hex::encode(self.miner)));
+                    params
+                        .as_object_mut()
+                        .context("expected quote fields")?
+                        .insert("sender".into(), sender);
                 }
                 Self::read_rpc_metered(&i, method, params, admission)
             }

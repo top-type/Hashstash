@@ -166,6 +166,56 @@ async function run(){
   ok(requests.every(p=>Object.hasOwn(p,'after')),'mail at or below the fork is not rescanned');
  }
  {
+  // A wallet locked by its passphrase cannot open mail. It says so, and a
+  // lock racing a scan stops the page without advancing or clearing the cache.
+  const h=await setup(),m=await h.message();await h.publish([m]);eq(h.get('mail-list').children.length,1);
+  const before=[...h.savedMail.entries()].find(([name])=>name.startsWith('hashstash-mail-scan-3:'))[1],real=h.decryptMail;
+  h.currentSession={...h.currentSession,wallet_locked:true,wallet_encrypted:true};await h.refresh();
+  eq(h.get('mail-list').children.length,0,'locking hides opened mail');ok(h.get('mail-empty').textContent.startsWith('Locked'),h.get('mail-empty').textContent);
+  const locked=()=>{const error=new Error('Unlock this browser wallet with its passphrase first.');error.walletLocked=true;throw error;};
+  h.decryptMail=locked;h.currentSession={...h.currentSession,wallet_locked:false};const later=await h.message({height:m.height+1});await h.publish([later]);
+  eq(h.get('mail-list').children.length,0,'nothing is shown while the key cannot open');ok(h.get('mail-error').textContent.includes('Unlock'),h.get('mail-error').textContent);
+  eq([...h.savedMail.entries()].find(([name])=>name.startsWith('hashstash-mail-scan-3:'))[1],before,'the checkpoint and cached mail are kept');
+  h.decryptMail=real;await h.reload();eq(h.get('mail-list').children.length,2,'once open, the cache restores and the scan continues');
+ }
+ {
+  // A second reorganization reported during the same scan rewinds again,
+  // rather than discarding the saved scan and starting from genesis.
+  const h=await setup(),first=await h.message();await h.publish([first]);
+  const second=await h.message({height:first.height+1});await h.publish([second]);
+  const third=await h.message({height:second.height+1});await h.publish([third]);eq(h.get('mail-list').children.length,3);
+  const end=height=>`${height}:9223372036854775807`,oldAnchor=h.currentSnapshot.status.tip,good=h.handlers.explorer_mail,before=h.calls.length;
+  h.history=h.history.filter(entry=>entry.height<=first.height);h.currentSnapshot.status.tip='df'.repeat(32);
+  h.handlers.explorer_mail=p=>p.anchor!==oldAnchor||p.after===end(first.height)?good(p):response({error:{message:`Mail scan anchor is no longer canonical; blocks above height ${p.after===end(second.height)?first.height:second.height} were replaced`}});
+  await h.refresh();await h.drain();
+  eq(h.get('mail-list').children.length,1,'both rewinds drop the mail above their fork heights');eq(h.get('mail-error').textContent,'');
+  const requests=h.calls.slice(before).filter(x=>x.body.method==='explorer_mail').map(x=>x.body.params);
+  eq(requests.map(p=>p.after),[end(third.height),end(second.height),end(first.height)],'each fork height rewinds the cursor further');
+  ok(requests.every(p=>p.anchor===oldAnchor),'every rewind keeps the anchor the node relates to its fork');
+ }
+ {
+  // An anchor error without a fork height resumes from the newest earlier
+  // checkpoint, keeping the messages at or below it.
+  const h=await setup(),early=await h.message();await h.publish([early]);const kept=h.currentSnapshot.status.tip,keptCursor=`${early.height}:9223372036854775807`;
+  const late=await h.message({height:early.height+1});await h.publish([late]);eq(h.get('mail-list').children.length,2);
+  const saved=()=>JSON.parse([...h.savedMail.entries()].find(([name])=>name.startsWith('hashstash-mail-scan-3:'))[1]);
+  eq(saved().checkpoints[0],{cursor:keptCursor,anchor:kept},'the checkpoint before the latest anchor is saved');
+  const unknown=h.currentSnapshot.status.tip,good=h.handlers.explorer_mail,before=h.calls.length;let attempts=0;const real=h.decryptMail;h.decryptMail=(...args)=>{attempts++;return real(...args);};
+  h.handlers.explorer_mail=p=>p.anchor===unknown?response({error:{message:'Mail scan anchor is no longer canonical'}}):good(p);
+  h.currentSnapshot.status.tip='d0'.repeat(32);await h.refresh();await h.drain();
+  eq(h.get('mail-list').children.length,2,'the earlier message is kept and the later one found again');eq(h.get('mail-error').textContent,'');
+  const requests=h.calls.slice(before).filter(x=>x.body.method==='explorer_mail').map(x=>x.body.params);
+  eq(requests.map(p=>[p.after,p.anchor]),[[`${late.height}:9223372036854775807`,unknown],[keptCursor,kept]],'the scan resumes from the earlier checkpoint');
+  eq(attempts,1,'only the mail above that checkpoint is opened again');
+  eq(saved().cursor,`${late.height}:9223372036854775807`);eq(saved().entries.length,2);
+  // When no earlier checkpoint is accepted either, the scan still restarts.
+  h.handlers.explorer_mail=p=>p.anchor?response({error:{message:'Mail scan anchor is no longer canonical'}}):good(p);
+  h.currentSnapshot.status.tip='d1'.repeat(32);const restart=h.calls.length;await h.refresh();await h.drain();
+  const retried=h.calls.slice(restart).filter(x=>x.body.method==='explorer_mail').map(x=>x.body.params);
+  ok(!Object.hasOwn(retried.at(-1),'after'),'with every checkpoint refused the scan starts from genesis');eq(retried.length,retried.filter(p=>p.anchor).length+1);
+  eq(h.get('mail-list').children.length,2,'and rediscovers the canonical mail');
+ }
+ {
   const h=await setup(),m=await h.message();await h.publish([m]);const good=h.handlers.explorer_mail;
   h.handlers.explorer_mail=()=>response({error:{message:'Temporarily unavailable'}});h.currentSnapshot.status.tip='dc'.repeat(32);h.currentSnapshot.status.height++;await h.refresh();await h.drain();
   eq(h.get('mail-list').children.length,0,'unverified new tip hides previously decrypted messages');ok(h.get('mail-scan-status').textContent.includes('Verification pending'));ok(h.get('mail-error').textContent.includes('Temporarily unavailable'));
@@ -210,7 +260,7 @@ async function run(){
  }
  {
   const h=await setup(),m=await h.message();await h.publish([m]);
-  const restored=await setup({savedMail:h.savedMail,initialSnapshot:h.currentSnapshot,history:[],invalidAnchor:true});eq(restored.get('mail-list').children.length,0,'persisted reorged history is cleared before any cached plaintext is rendered');eq(restored.calls.filter(x=>x.body.method==='explorer_mail').length,2,'stale persisted anchor triggers canonical full scan');
+  const restored=await setup({savedMail:h.savedMail,initialSnapshot:h.currentSnapshot,history:[],invalidAnchor:true});eq(restored.get('mail-list').children.length,0,'persisted reorged history is cleared before any cached plaintext is rendered');eq(restored.calls.filter(x=>x.body.method==='explorer_mail').length,3,'a stale persisted anchor, then its saved earlier checkpoint, are refused before a canonical full scan');
  }
  {
   const h=await setup(),m=await h.message();await h.publish([m]);

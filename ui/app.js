@@ -58,7 +58,7 @@
     let quoteTimer, toastTimer, sendTimer, rpcId = 0, sendVersion = 0, sessionVersion = 0;
     let privateBackup = null, importedPublic = null, browserWallet = null, walletChain = null, unsubscribeWallet = null, walletStorageError = "";
     const walletBalanceNodes = new Map;
-    const proposalExplanations = new Map, explanationRequests = new Set;
+    const proposalExplanations = new Map, explanationRequests = new Set, explanationMisses = new Map;
     const feeForms = [ "trade", "send", "propose", "support", "refund", "mail" ];
     const feeQuotes = new Map, feeBuilders = new Map, feeTimers = new Map, feeVersions = new Map;
     const pendingFeeRefresh = new Set;
@@ -588,10 +588,35 @@
         const a = BigInt(passCash), b = BigInt(failCash);
         return (a < b ? a : b).toString();
     }
+    // During a decision every fee is prepaid from cash already held in both
+    // outcomes; unsettled trade proceeds cannot pay it. Name an account that
+    // cannot pay any fee, and what unlocks it before the drained outcome loses.
+    function drainedOutcomes(pass, fail, fee) {
+        return pass < fee && fail < fee ? "PASS and FAIL" : pass < fee ? "PASS" : "FAIL";
+    }
+    function outcomeLock() {
+        if (!state.ready || !key() || !activeDecision() || !state.pass?.account || !state.fail?.account) return "";
+        try {
+            const policy = state.status.fee_policy, rate = BigInt(policy.minimum_fee_rate), scale = BigInt(policy.fee_scale);
+            const fee = weight => (rate * weight + scale - 1n) / scale;
+            const pass = BigInt(outcomeCash(state.pass)), fail = BigInt(outcomeCash(state.fail)), least = pass < fail ? pass : fail;
+            // Every signed transaction carries at least its sender, block
+            // reference and signature, so no fee is below that weight's.
+            const floor = fee(128n);
+            if (scale <= 0n || least >= floor) return "";
+            // The fee for 1,024 weight covers a small transaction, such as a sale.
+            const needed = fee(1024n) - least;
+            return `${address()} can send nothing until this decision ends, including selling its Stash: every fee needs hashes already held in both outcomes, and its ${drainedOutcomes(pass, fail, floor)} cash cannot pay one. A transfer of ${formatExactHash(needed > 0n ? needed : 1n)} or more to it from any other account unlocks it.`;
+        } catch {
+            return "";
+        }
+    }
     function checkOutcomeFunds(operation, exactFee) {
         if (!activeDecision()) return;
         if (!state.pass?.account || !state.fail?.account) throw new Error("Outcome balances are unavailable. Refresh before spending.");
         const fee = BigInt(exactFee), [kind, value] = Object.entries(operation)[0];
+        const pass = BigInt(state.pass.account.ordinary), fail = BigInt(state.fail.account.ordinary), least = pass < fail ? pass : fail;
+        if (least < fee) throw new Error(`${drainedOutcomes(pass, fail, fee)} balance cannot pay this ${formatExactHash(fee)} fee: fees need hashes already held in both outcomes, and unsettled trade proceeds cannot pay them. A transfer of ${formatExactHash(fee - least)} or more to ${address()} from any other account covers it.`);
         if (![ "TransferExact", "Deposit", "Redeem" ].includes(kind)) return;
         for (const [name, data] of [ [ "Pass", state.pass ], [ "Fail", state.fail ] ]) {
             let available = BigInt(data.account.ordinary), debit = fee;
@@ -890,6 +915,10 @@
         const expiry = transactionExpiry(form);
         if (!expiry) throw new Error("Transaction expiry must be greater than zero.");
         const identity = submissionIdentity(form), hot = state.session.wallet_enabled, dataFields = transactionData(form);
+        if (hot && state.session.wallet_locked) {
+            openUnlock("Unlock this browser wallet to sign.");
+            throw new Error("Unlock this browser wallet to sign.");
+        }
         const nonce = nextNonce();
         const expiryHeight = BigInt(state.status.height) + BigInt(expiry);
         if (expiryHeight > 18446744073709551615n) throw new Error("Transaction lifetime overflows the block height.");
@@ -1241,7 +1270,11 @@
             selectedWallet && balance !== null ? number("governance-common-cash", balance) : text("governance-common-cash", "—");
             activeDecision() && ($("governance-common-cash").title = `${balance === null ? "Unavailable" : formatExactHash(balance)}. ${paymentHelp}`);
         }
-        const decisionActive = !!activeDecision();
+        const decisionActive = !!activeDecision(), lock = outcomeLock();
+        for (const id of [ "overview-lock-notice", "governance-lock-notice" ]) {
+            text(id, lock);
+            $(id).hidden = !lock;
+        }
         $("overview-stash-row").hidden = decisionActive;
         $("overview-total").hidden = decisionActive;
         $("overview-total-outcomes").hidden = !decisionActive;
@@ -1801,34 +1834,47 @@
             typeof name === "string" && name.startsWith("hashstash-description-") && localStorage.removeItem(name);
         }
     } catch {/* Cleanup of the retired draft cache is optional. */}
+    // Only verified texts are cached, and anyone can register proposals whose
+    // text is never published. A proposal without one is asked about again
+    // only after a growing back-off, or once its description hash is known or
+    // changes; each refresh starts a few lookups, the active decision first.
+    const EXPLANATION_LOOKUPS = 4, EXPLANATION_RETRY_MS = 30e3, EXPLANATION_RETRY_MAX_MS = 600e3;
+    function explanationMissed(miss) {
+        const delay = Math.min(2 * (explanationMisses.get(miss)?.delay || EXPLANATION_RETRY_MS / 2), EXPLANATION_RETRY_MAX_MS);
+        explanationMisses.delete(miss);
+        explanationMisses.set(miss, {retryAt: Date.now() + delay, delay: delay});
+        explanationMisses.size > 200 && explanationMisses.delete(explanationMisses.keys().next().value);
+    }
     function refreshExplanations() {
         if (typeof HashstashProposalData !== "object" || !state.ready || location.hash.split("?")[0] !== "#governance") return;
-        const chain = state.status.chain_id;
+        const chain = state.status.chain_id, now = Date.now();
         const activeId = hex(activeDecision()?.proposal_id);
         const known = proposalRecords();
         const activeRecord = activeId && (known.find(record => hex(record.id) === activeId) || { id: activeId, proposal: {} });
         const records = activeRecord ? [activeRecord, ...known.filter(record => hex(record.id) !== activeId)] : known;
+        let started = 0;
         for (const record of records.slice(0, 40)) {
-            const id = hex(record.id), cache = `${chain}:${id}`, request = `${cache}:${state.status.tip}`;
-            if (proposalExplanations.has(cache) || explanationRequests.has(request)) continue;
-            explanationRequests.add(request);
+            if (started >= EXPLANATION_LOOKUPS) break;
+            const id = hex(record.id), cache = `${chain}:${id}`, miss = `${cache}:${hex(record.proposal.description ?? "")}`;
+            if (proposalExplanations.has(cache) || explanationRequests.has(cache) || explanationMisses.get(miss)?.retryAt > now) continue;
+            explanationRequests.add(cache);
+            started++;
             rpc("explorer_governance", {
                 proposal: id,
                 limit: 1
             }).then(result => {
-                if (result.chain_id !== chain) return;
-                const p = result.proposals?.find(p => p.id === id);
-                const verified = HashstashProposalData.verifiedText(p?.description_text, hex(record.proposal.description ?? p?.description));
-                if (verified) {
-                    proposalExplanations.set(cache, verified);
-                    proposalExplanations.size > 200 && proposalExplanations.delete(proposalExplanations.keys().next().value);
-                }
+                const p = result.chain_id === chain ? result.proposals?.find(p => p.id === id) : null;
+                const verified = p && HashstashProposalData.verifiedText(p.description_text, hex(record.proposal.description ?? p.description));
+                if (!verified) return explanationMissed(miss);
+                explanationMisses.delete(miss);
+                proposalExplanations.set(cache, verified);
+                proposalExplanations.size > 200 && proposalExplanations.delete(proposalExplanations.keys().next().value);
                 if (state.ready && state.status.chain_id === chain) {
                     renderProposals();
                     renderDecisionMessage();
                 }
-            }).catch(() => {}).finally(() => {
-                explanationRequests.size > 200 && explanationRequests.clear();
+            }).catch(() => explanationMissed(miss)).finally(() => {
+                explanationRequests.delete(cache);
             });
         }
     }
@@ -2212,6 +2258,10 @@
                     resetContext();
                     state.managing || state.submitting || refresh();
                 });
+                // Locking changes no saved wallet, so it keeps the context.
+                browserWallet.onLockChange?.(() => {
+                    state.managing || state.submitting || refresh();
+                });
             } catch (error) {
                 walletStorageError = error.message;
             }
@@ -2352,7 +2402,8 @@
                 address: address(),
                 wallet_id: state.session?.wallet_id,
                 wallet_revision: state.session?.wallet_revision,
-                can_decrypt: !!state.session?.wallet_enabled
+                can_decrypt: !!state.session?.wallet_enabled && !state.session?.wallet_locked,
+                locked: !!state.session?.wallet_locked
             });
             !$("trade-amount").value || state.submitting || state.managing || !changedState && !state.quoteFailed || quoteSoon(true);
             $("send-form").elements.recipient.value && $("send-form").elements.amount.value && !state.submitting && !state.managing && (changedState || state.sendFailed) && sendSoon(true);
@@ -2622,10 +2673,61 @@
         }
         try {
             await navigator.clipboard.writeText(address());
+            forgetCopiedSecret();
             toast("Address copied.");
         } catch {
             toast("Copy the address shown in Payments.");
             location.hash = "send";
+        }
+    }
+    // A private key copied to the clipboard is cleared after 30 seconds,
+    // unless this page can see that the clipboard now holds something else.
+    // Writing needs a focused page, so an unfocused one clears on return.
+    const CLIPBOARD_CLEAR_MS = 30e3;
+    let copiedSecret = null, clipboardTimer;
+    function forgetCopiedSecret() {
+        copiedSecret = null;
+        clearTimeout(clipboardTimer);
+    }
+    async function clearCopiedSecret() {
+        const copied = copiedSecret;
+        if (!copied) return;
+        clearTimeout(clipboardTimer);
+        let current = null;
+        try {
+            // Reading is attempted only with permission already granted, so
+            // the page never prompts for it.
+            const permission = await navigator.permissions?.query?.({
+                name: "clipboard-read"
+            });
+            if (permission?.state === "granted") current = await navigator.clipboard.readText();
+        } catch {
+            current = null;
+        }
+        if (copiedSecret !== copied) return;
+        if (current !== null && current !== copied) return forgetCopiedSecret();
+        try {
+            await navigator.clipboard.writeText("");
+            copiedSecret === copied && (copiedSecret = null);
+            toast("The private key was cleared from the clipboard.");
+        } catch {
+            window.addEventListener("focus", clearCopiedSecret, {
+                once: true
+            });
+        }
+    }
+    // The backup file is encoded into bytes that are wiped once the browser
+    // holds its own copy, with no other string of the whole document. The key
+    // string itself cannot be wiped.
+    function downloadBackup(backup) {
+        const encoder = new TextEncoder, parts = [ '{\n  "format": "hashstash-private-v1",\n  "private_key": "', backup.private_key, '",\n  "public_key": "', backup.public_key, '"\n}\n' ];
+        const bytes = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
+        let offset = 0;
+        for (const part of parts) offset += encoder.encodeInto(part, bytes.subarray(offset)).written;
+        try {
+            downloadText("hashstash-private-key.json", bytes);
+        } finally {
+            bytes.fill(0);
         }
     }
     function downloadText(name, content) {
@@ -2750,12 +2852,43 @@
         walletSelectorBalancesView();
         walletBalancesView($("account-balances"), key());
         selector.title = address();
-        text("wallet-kind", key() ? session.wallet_enabled ? "Hot wallet" : "Watch only" : "");
+        text("wallet-kind", key() ? session.wallet_enabled ? session.wallet_locked ? "Hot wallet · locked" : "Hot wallet" : "Watch only" : "");
         text("wallet-public", address());
         $("wallet-public").title = address();
         $("wallet-explore").href = `#explorer?account=${encodeURIComponent(address())}`;
         $("export-private").hidden = !session.wallet_enabled;
+        securityView();
         modeButtons();
+    }
+    // An optional passphrase seals the private keys saved in this browser.
+    // Keys open only in this page's memory, until the idle lock or a reload.
+    function securityView() {
+        const session = state.session, encrypted = !!session?.wallet_encrypted, locked = !!session?.wallet_locked;
+        $("wallet-security").hidden = !session || !browserWallet || !!walletStorageError || !(encrypted || session.wallets?.some(wallet => wallet.can_sign));
+        text("wallet-lock-state", encrypted ? locked ? "Locked" : "Unlocked" : "Not encrypted");
+        const minutes = Math.max(1, Math.round((session?.wallet_idle_lock_seconds || 300) / 60)), plain = session?.wallet_plaintext_keys || 0;
+        text("wallet-security-status", !encrypted ? "Private keys in this browser are saved unencrypted: anyone who can read this browser profile can take them. Set a passphrase to encrypt them." : locked ? `Private keys are encrypted with your passphrase. Unlock to sign, back up a key or read mail.${plain ? ` ${plain} key${plain === 1 ? " saved without encryption is" : "s saved without encryption are"} sealed when you unlock.` : ""}` : `Unlocked in this page. It locks after ${minutes} minute${minutes === 1 ? "" : "s"} without use, and when the page closes.`);
+        $("wallet-unlock").hidden = !encrypted || !locked;
+        $("wallet-lock").hidden = !encrypted || locked;
+        $("wallet-passphrase-open").hidden = encrypted && locked;
+        text("wallet-passphrase-open", encrypted ? "Change passphrase" : "Set passphrase");
+        const remove = $("wallet-passphrase-remove");
+        remove.hidden = !encrypted || locked;
+        if (remove.hidden && remove.dataset.confirm) {
+            delete remove.dataset.confirm;
+            text("wallet-passphrase-remove", "Remove passphrase");
+        }
+        if (encrypted && locked) $("wallet-passphrase-form").hidden = true;
+    }
+    function openUnlock(message = "") {
+        if (!state.session?.wallet_locked) return;
+        $("unlock-passphrase").value = "";
+        feedback($("unlock-form"), message);
+        $("unlock-dialog").open || $("unlock-dialog").showModal();
+    }
+    // A locked passphrase stopped the action; offer to unlock.
+    function lockedPrompt(error) {
+        error?.walletLocked && openUnlock(error.message);
     }
     function walletMessage(message, failed = false) {
         text("wallet-feedback", message);
@@ -2793,7 +2926,11 @@
             } else if (action === "import") {
                 if (values.public_key && HashstashBrowserWallet.publicKey(values.private_key) !== values.public_key) throw new Error("Backup public key does not match.");
                 result = await browserWallet.importPrivate(values.private_key, guard);
-            } else if (action === "watch") result = await browserWallet.watch(values.public_key, guard); else if (action === "select") result = await browserWallet.select(values.id, guard); else {
+            } else if (action === "watch") result = await browserWallet.watch(values.public_key, guard); else if (action === "select") result = await browserWallet.select(values.id, guard);
+            else if (action === "unlock") result = await browserWallet.unlock(values.passphrase);
+            else if (action === "lock") result = browserWallet.lock();
+            else if (action === "passphrase") result = await browserWallet.setPassphrase(values.passphrase, guard);
+            else if (action === "remove-passphrase") result = await browserWallet.removePassphrase(guard); else {
                 if (action !== "export") throw new Error("Unknown wallet action.");
                 result = {
                     format: "hashstash-private-v1",
@@ -2828,6 +2965,7 @@
             walletMessage("Wallet created in this browser. Back up its private key.");
         } catch (error) {
             walletMessage(error.message, true);
+            lockedPrompt(error);
         }
     });
     $("wallet-import-form").addEventListener("submit", async event => {
@@ -2848,6 +2986,7 @@
             walletMessage("Wallet imported into this browser. Keep your backup.");
         } catch (error) {
             feedback(form, error.message, true);
+            lockedPrompt(error);
         }
     });
     $("import-private-key").addEventListener("input", () => {
@@ -2927,6 +3066,7 @@
         }, null, 2) + "\n");
     });
     $("export-private").addEventListener("click", async () => {
+        if (state.session?.wallet_locked) return openUnlock("Unlock this browser wallet to back up its key.");
         try {
             clearBackup();
             const expected = key(), result = await manageWallet("export", {
@@ -2938,6 +3078,7 @@
             $("backup-dialog").showModal();
         } catch (error) {
             walletMessage(error.message, true);
+            lockedPrompt(error);
         }
     });
     $("backup-close").addEventListener("click", clearBackup);
@@ -2949,13 +3090,88 @@
         try {
             if (!privateBackup) return;
             await navigator.clipboard.writeText(privateBackup.private_key);
-            toast("Private key copied.");
+            copiedSecret = privateBackup.private_key;
+            clearTimeout(clipboardTimer);
+            clipboardTimer = setTimeout(clearCopiedSecret, CLIPBOARD_CLEAR_MS);
+            toast(`Private key copied. The clipboard is cleared in ${CLIPBOARD_CLEAR_MS / 1e3} seconds.`);
         } catch {
             toast("Select and copy the private key.");
         }
     });
     $("backup-download").addEventListener("click", () => {
-        privateBackup && downloadText("hashstash-private-key.json", JSON.stringify(privateBackup, null, 2) + "\n");
+        privateBackup && downloadBackup(privateBackup);
+    });
+    $("unlock-close").addEventListener("click", () => $("unlock-dialog").close());
+    $("unlock-dialog").addEventListener("close", () => {
+        $("unlock-passphrase").value = "";
+    });
+    $("unlock-form").addEventListener("submit", async event => {
+        event.preventDefault();
+        const form = $("unlock-form"), passphrase = form.elements.passphrase.value;
+        form.elements.passphrase.value = "";
+        try {
+            feedback(form, "Unlocking…");
+            await manageWallet("unlock", {
+                passphrase: passphrase
+            });
+            feedback(form, "");
+            $("unlock-dialog").close();
+            walletMessage("Wallet unlocked in this page.");
+            toast("Wallet unlocked.");
+        } catch (error) {
+            feedback(form, error.message, true);
+        }
+    });
+    $("wallet-unlock").addEventListener("click", () => openUnlock());
+    $("wallet-lock").addEventListener("click", async () => {
+        try {
+            await manageWallet("lock");
+            walletMessage("Wallet locked.");
+        } catch (error) {
+            walletMessage(error.message, true);
+        }
+    });
+    function closePassphraseForm(hidden) {
+        const form = $("wallet-passphrase-form");
+        form.elements.passphrase.value = form.elements.confirm.value = "";
+        feedback(form, "");
+        form.hidden = hidden;
+    }
+    $("wallet-passphrase-open").addEventListener("click", () => closePassphraseForm(!$("wallet-passphrase-form").hidden));
+    $("wallet-passphrase-cancel").addEventListener("click", () => closePassphraseForm(true));
+    $("wallet-passphrase-form").addEventListener("submit", async event => {
+        event.preventDefault();
+        const form = $("wallet-passphrase-form"), passphrase = form.elements.passphrase.value, repeated = form.elements.confirm.value, changing = !!state.session?.wallet_encrypted;
+        form.elements.passphrase.value = form.elements.confirm.value = "";
+        try {
+            if (passphrase !== repeated) throw new Error("The two passphrases differ.");
+            feedback(form, "Encrypting keys…");
+            await manageWallet("passphrase", {
+                passphrase: passphrase
+            });
+            closePassphraseForm(true);
+            walletMessage(changing ? "Passphrase changed." : "Private keys in this browser are now encrypted with your passphrase. It cannot be recovered, so keep your key backups.");
+        } catch (error) {
+            feedback(form, error.message, true);
+            lockedPrompt(error);
+        }
+    });
+    $("wallet-passphrase-remove").addEventListener("click", async () => {
+        const button = $("wallet-passphrase-remove");
+        if (!button.dataset.confirm) {
+            button.dataset.confirm = "true";
+            text("wallet-passphrase-remove", "Confirm: save keys unencrypted");
+            return;
+        }
+        delete button.dataset.confirm;
+        text("wallet-passphrase-remove", "Remove passphrase");
+        try {
+            await manageWallet("remove-passphrase");
+            walletMessage("Passphrase removed. Private keys in this browser are saved unencrypted again.");
+        } catch (error) {
+            walletMessage(error.message, true);
+            lockedPrompt(error);
+        }
     });
     $("broadcast-form").addEventListener("submit", async event => {
         event.preventDefault();
@@ -3013,6 +3229,7 @@
     $("unsigned-copy").addEventListener("click", async () => {
         try {
             await navigator.clipboard.writeText($("unsigned-output").value);
+            forgetCopiedSecret();
             toast("Unsigned transaction copied.");
         } catch {
             toast("Select and copy the transaction text.");

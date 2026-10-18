@@ -390,7 +390,8 @@ impl WalletStore {
         );
         Ok(())
     }
-    pub fn manage(&mut self, request: ManageRequest) -> Result<Value> {
+    /// Applies one wallet action and returns its JSON response body.
+    pub fn manage(&mut self, request: ManageRequest) -> Result<Zeroizing<Vec<u8>>> {
         self.check_revision(request.revision())?;
         match &request {
             ManageRequest::Create { name, .. } => {
@@ -462,14 +463,11 @@ impl WalletStore {
                     .secret
                     .as_ref()
                     .context("watch-only wallets have no private key")?;
-                // The exported hex leaves through the response; it is not wiped.
-                return Ok(
-                    json!({"format":"hashstash-private-v1","private_key":hex::encode(secret.as_slice()),"public_key":hex::encode(entry.public)}),
-                );
+                return Ok(backup_body(secret, &entry.public));
             }
         }
         self.fresh = false;
-        Ok(self.status())
+        Ok(Zeroizing::new(serde_json::to_vec(&self.status())?))
     }
     fn add_select(&mut self, entry: Entry) -> Result<()> {
         ensure!(
@@ -534,6 +532,26 @@ impl WalletStore {
         Ok(())
     }
 }
+const BACKUP_PREFIX: &[u8] = br#"{"format":"hashstash-private-v1","private_key":""#;
+const BACKUP_MIDDLE: &[u8] = br#"","public_key":""#;
+const BACKUP_SUFFIX: &[u8] = br#""}"#;
+const BACKUP_BYTES: usize = BACKUP_PREFIX.len() + 64 + BACKUP_MIDDLE.len() + 64 + BACKUP_SUFFIX.len();
+/// The `hashstash-private-v1` backup, the one response that carries a key.
+/// Its JSON is written straight into a buffer reserved at its exact size, so
+/// no reallocation leaves a copy behind, and wiped on drop after the node
+/// writes it to the client. No `Value` or `String` holds the hex.
+fn backup_body(secret: &[u8; 32], public: &PublicKey) -> Zeroizing<Vec<u8>> {
+    let mut encoded = Zeroizing::new([0u8; 64]);
+    hex::encode_to_slice(secret, encoded.as_mut()).expect("64 bytes hold a hex-encoded key");
+    let mut body = Zeroizing::new(Vec::with_capacity(BACKUP_BYTES));
+    body.extend_from_slice(BACKUP_PREFIX);
+    body.extend_from_slice(encoded.as_ref());
+    body.extend_from_slice(BACKUP_MIDDLE);
+    body.extend_from_slice(hex::encode(public).as_bytes());
+    body.extend_from_slice(BACKUP_SUFFIX);
+    debug_assert_eq!(body.len(), BACKUP_BYTES);
+    body
+}
 fn check_name(name: &str) -> Result<String> {
     let name = name.trim();
     ensure!(
@@ -561,9 +579,32 @@ mod tests {
 
     fn manage(store: &mut WalletStore, mut request: Value) -> Value {
         request["revision"] = json!(store.revision);
-        store
+        let body = store
             .manage(serde_json::from_value(request).unwrap())
-            .unwrap()
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[test]
+    fn exported_backups_are_built_in_one_wiped_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = WalletStore::open(&dir.path().join("chain.sqlite"), [1; 32]).unwrap();
+        let status = manage(&mut store, json!({"action":"import","private_key":hex::encode([3;32])}));
+        let request = json!({"action":"export","id":status["wallet_id"],"revision":store.revision});
+        let body: Zeroizing<Vec<u8>> = store
+            .manage(serde_json::from_value(request).unwrap())
+            .unwrap();
+        // The exact reserved size was enough, so the buffer never moved.
+        assert_eq!(body.len(), BACKUP_BYTES);
+        assert!(body.capacity() >= BACKUP_BYTES);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"format":"hashstash-private-v1","private_key":hex::encode([3;32]),
+                "public_key":hex::encode(crypto::public_key(&[3;32]).unwrap())})
+        );
+        let watch = manage(&mut store, json!({"action":"watch","public_key":hex::encode(crypto::public_key(&[4;32]).unwrap())}));
+        let refused = json!({"action":"export","id":watch["wallet_id"],"revision":store.revision});
+        assert!(store.manage(serde_json::from_value(refused).unwrap()).is_err());
     }
 
     #[test]

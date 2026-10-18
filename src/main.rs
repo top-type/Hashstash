@@ -1225,7 +1225,7 @@ impl Prepared {
             );
         } else if !client.is_loopback() {
             notes.push(
-                "Anchor check: only this endpoint reports the anchor block; --anchor-url confirms it with a second endpoint".to_owned(),
+                "warning: only this remote endpoint vouches for the anchor block; a dishonest one can anchor it where it never confirms. Add --anchor-url with a second endpoint, or prepare through a loopback node".to_owned(),
             );
         }
         notes.push(match &self.nonce {
@@ -2496,6 +2496,50 @@ mod tests {
         assert!(note.contains("capacity falls to 2 from block 12"), "{note}");
         assert!(scheduled_change_note(&change("MinimumFeeRate", true)).is_none());
         assert!(scheduled_change_note(&json!({})).is_none());
+    }
+
+    #[test]
+    fn prepared_notes_warn_when_only_a_remote_endpoint_vouches_for_the_anchor() {
+        // A single remote endpoint is trusted for the anchor: remind the user
+        // of --anchor-url or a loopback node, and only in that case.
+        let body = TransactionBody {
+            sender: crypto::public_key(&[7; 32]).unwrap(),
+            nonce: 0,
+            anchor: [38; 32],
+            expiry_blocks: 2,
+            fee: 1u32.into(),
+            operation: Operation::TransferExact {
+                recipient: crypto::public_key(&[6; 32]).unwrap(),
+                amount: 1u32.into(),
+            },
+            data: vec![],
+        };
+        let notes = |client: &RpcClient, anchor_confirmed| {
+            Prepared {
+                envelope: wallet::unsigned(&body, &[9; 32]),
+                body: body.clone(),
+                chain_id: [9; 32],
+                anchor_height: 20,
+                anchor_confirmed,
+                nonce: NonceSource::Requested(0),
+                fee: None,
+                scheduled_change: None,
+            }
+            .notes(client)
+        };
+        let warnings = |notes: Vec<String>| {
+            notes
+                .into_iter()
+                .filter(|note| note.starts_with("warning:") && note.contains("--anchor-url"))
+                .collect::<Vec<_>>()
+        };
+        let remote = RpcClient::new("http://localhost:9/rpc", true).unwrap();
+        let local = RpcClient::new("http://127.0.0.1:9/rpc", false).unwrap();
+        let reminder = warnings(notes(&remote, false));
+        assert_eq!(reminder.len(), 1, "{reminder:?}");
+        assert!(reminder[0].contains("loopback node"), "{reminder:?}");
+        assert!(warnings(notes(&remote, true)).is_empty());
+        assert!(warnings(notes(&local, false)).is_empty());
     }
 
     #[test]

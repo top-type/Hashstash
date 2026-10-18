@@ -123,6 +123,10 @@ small { font-size:12px; }
 .wallet-current .wallet-balance-outcome { letter-spacing:0; font-size:11px; }
 .wallet-address { border-top:1px solid var(--line); padding-top:18px; margin-top:20px; }
 .wallet-current .faucet { margin-top:18px; padding-top:16px; }
+.wallet-security .section-heading { margin-bottom:12px; }
+.wallet-security .wallet-tools { align-items:center; gap:10px 20px; margin:12px 0 0; }
+.wallet-security form { margin-top:16px; }
+.notice.outcome-lock-notice { margin:14px 0 0; }
 #backup-private { overflow-wrap:anywhere; word-break:break-all; }
 .topbar-right,.live-label { display:flex; align-items:center; gap:7px; }
 .topbar-right { margin-left:auto; }

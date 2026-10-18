@@ -27,7 +27,7 @@ async function harness(initialChain = null, maxReview = undefined, server = {}) 
   const elements = new Map([...html.matchAll(/id="([^"]+)"/g)].map(match=>[match[1],new Element()]));
   const get = id => { assert.ok(elements.has(id),`Missing DOM element ${id}`);return elements.get(id); };
   get('import-method').value='passphrase';
-  const calls = [], copied = [], downloads = [], blobs = new Map();
+  const calls = [], copied = [], downloads = [], blobs = new Map(), blobParts = [];
   const review = {fields:null,error:null,body:'abcdef',confirmLifetime:false,maxReview};
   // Mirrors the signer: v2 keys need and belong to the selected network, and
   // reviews never adopt the export's unsigned network context.
@@ -47,7 +47,7 @@ async function harness(initialChain = null, maxReview = undefined, server = {}) 
     history:{replaceState(state,title,url){replaced.push(url);location.hash='';}},
     sessionStorage:storage,
     document:{getElementById:get,querySelectorAll:()=>[...elements.values()],createDocumentFragment:()=>new Element(),createElement:()=>Object.assign(new Element(),{click(){downloads.push({name:this.download,blob:blobs.get(this.href)});}})},
-    navigator:{clipboard:{writeText:async text=>copied.push(text)}},setTimeout(){},Blob,
+    navigator:{clipboard:{writeText:async text=>copied.push(text)}},setTimeout(){},Blob:class extends Blob{constructor(parts,options){super(parts,options);blobParts.push(parts);}},TextEncoder,Uint8Array,
     URL:{createObjectURL(blob){const id='blob:'+blobs.size;blobs.set(id,blob);return id;},revokeObjectURL(){}},
     async fetch(url,options={}) {
       const body = options.body ? JSON.parse(options.body) : null;
@@ -90,7 +90,7 @@ async function harness(initialChain = null, maxReview = undefined, server = {}) 
   vm.runInNewContext(source,context); await settle();
   // The signer locks a wallet left unused for its idle period.
   const idle = () => { if (serverPublic) { serverPublic = null; derivedFor = null; idleLocked = true; } };
-  return {get,calls,copied,downloads,review,location,replaced,storage,idle};
+  return {get,calls,copied,downloads,blobParts,review,location,replaced,storage,idle};
 }
 async function run() {
   let checks=0;
@@ -213,6 +213,7 @@ async function run() {
     assert.equal(h.get('unsigned-panel').hidden,true,'no review before the backup is confirmed');checks++;
     await h.get('download-backup').fire('click');
     assert.deepEqual(JSON.parse(await h.downloads[0].blob.text()),{format:'hashstash-private-v1',private_key:privateKey,public_key:publicKey});checks++;
+    assert.ok(h.blobParts.at(-1).every(part=>part instanceof Uint8Array&&part.every(byte=>byte===0)),'the backup bytes are wiped once the file holds its copy');checks++;
     assert.equal(h.downloads[0].name,'hashstash-private-key.json');checks++;
     await h.get('backup-done').fire('click');
     assert.deepEqual(h.calls.find(call=>call.url==='/api/backup').body,{saved:true},'the signer records the saved backup');checks++;

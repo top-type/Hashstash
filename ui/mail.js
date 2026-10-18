@@ -67,7 +67,7 @@
     });
   }
   function create({rpc,getIdentity,recipientKey,decrypt,verifySigned,encodeAddress,onDraftChange=()=>{},document=root.document,location=root.location,cache=createCache()}){
-    const $=id=>document.getElementById(id),form=$('mail-form');let context={},sequence=0,prepared=null,preparing=null,checkedTip='',verifiedTip='',cursor=null,anchor=null,checkpoints=[],opened=new Map(),lastWallet='',loading=false,paused=false,scanned=0,visibleCount=50,rendered='',cacheLoaded=false,restoreEntries=[],storageNote='',omitted=0,start=null;
+    const $=id=>document.getElementById(id),form=$('mail-form');let context={},sequence=0,prepared=null,preparing=null,checkedTip='',verifiedTip='',cursor=null,anchor=null,checkpoints=[],opened=new Map(),lastWallet='',lastReadable=false,draftAccount='',loading=false,paused=false,scanned=0,visibleCount=50,rendered='',cacheLoaded=false,restoreEntries=[],storageNote='',omitted=0,start=null;
     const active=()=>location.hash.split('?')[0]==='#mail',eligible=()=>active()&&context.ready&&context.available&&context.key&&context.can_decrypt;
     const add=(p,t,c,text)=>{const n=document.createElement(t);n.className=c;if(text!==undefined)n.textContent=text;p.appendChild(n);return n;};
     const identity=()=>getIdentity(),yieldTask=()=>new Promise(resolve=>root.setTimeout(resolve,0));
@@ -83,7 +83,9 @@
       checkpoints=checkpoints.filter(point=>compareCursor(point.cursor,target)<0);
       cursor=target;anchor=base;verifiedTip='';render();
     }
-    function blank(){invalidate();resetScan();paused=false;cacheLoaded=false;restoreEntries=[];storageNote='';start=null;}
+    // Forget what the scan read, keeping the encrypted draft.
+    function forget(){resetScan();paused=false;cacheLoaded=false;restoreEntries=[];storageNote='';start=null;}
+    function blank(){invalidate();forget();}
     // Begin a scan without a checkpoint at this account's start, if it has one.
     function fromStart(){if(start){cursor=`${start.height}:${END}`;anchor=start.anchor;}}
     function startNote(text,failed=false){const node=$('mail-start-feedback');if(node){node.textContent=text;node.classList.toggle('error',failed);}}
@@ -248,9 +250,16 @@
       data(){if(!prepared||prepared.id!==draftId())throw Error('Wait for the encrypted message and fee quote.');return prepared.data;},
       sent(){invalidate();form.elements.subject.value='';form.elements.message.value='';checkedTip='';load();},
       update(value){
-        const stamp=JSON.stringify([value.chain_id,value.key,value.wallet_id,value.wallet_revision,value.can_decrypt,value.node_id]);
-        if(stamp!==lastWallet){sequence++;loading=false;blank();if(lastWallet){form.elements.subject.value='';form.elements.message.value='';}lastWallet=stamp;}
+        // Locking or unlocking changes what this page can read, not the
+        // wallet: it hides opened mail and restarts the scan, but keeps the
+        // encrypted draft. An unsent draft belongs to its sending account, so
+        // only another account clears it, never a lock or a failed refresh.
+        const stamp=JSON.stringify([value.chain_id,value.key,value.wallet_id,value.wallet_revision,value.node_id]),readable=!!value.can_decrypt;
+        if(stamp!==lastWallet){sequence++;loading=false;blank();lastWallet=stamp;}
+        else if(readable!==lastReadable){sequence++;loading=false;forget();}
         else if(context.tip!==value.tip){sequence++;loading=false;}
+        lastReadable=readable;
+        if(value.chain_id&&value.key){const account=`${value.chain_id}:${value.key}`;if(draftAccount&&draftAccount!==account){form.elements.subject.value='';form.elements.message.value='';}draftAccount=account;}
         context=value;if(!value.ready||!value.available){sequence++;loading=false;blank();}
         render();if(eligible()&&checkedTip!==value.tip)load();
       },

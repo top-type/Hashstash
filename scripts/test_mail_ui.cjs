@@ -179,6 +179,35 @@ async function run(){
   h.decryptMail=real;await h.reload();eq(h.get('mail-list').children.length,2,'once open, the cache restores and the scan continues');
  }
  {
+  // An unsent draft belongs to its sending account: locking, unlocking or a
+  // failed refresh keeps it, with its encryption; another account clears it.
+  const h=await setup(),f=await h.compose(),draft=()=>[f.elements.subject.value,f.elements.message.value],typed=['Fixture subject','Secret fixture body'];
+  h.currentSession={...h.currentSession,wallet_locked:true,wallet_encrypted:true};await h.refresh();eq(draft(),typed,'locking keeps the draft');
+  h.currentSession={...h.currentSession,wallet_locked:false};await h.refresh();eq(draft(),typed,'unlocking keeps the draft');
+  await f.requestSubmit();eq(h.wallet.length,1,f.feedback?.textContent);eq(Buffer.from(h.wallet[0].data_hex,'hex').toString().startsWith('hashstash.mail/2'),true,'the kept encrypted draft is sent');
+  const g=await h.compose(),good=h.handlers.snapshot;h.handlers.snapshot=()=>response({error:{message:'Temporarily unavailable'}});await h.refresh();
+  eq(h.get('connection-label').textContent,'Offline');delete h.handlers.snapshot;if(good)h.handlers.snapshot=good;await h.refresh();
+  eq([g.elements.subject.value,g.elements.message.value],typed,'a failed refresh keeps the draft');
+  h.selectSession({id:'hot:'+h.other,public_key:h.other,mode:'hot'});await h.refresh();eq([g.elements.subject.value,g.elements.message.value],['',''],'another account clears it');
+ }
+ {
+  // With the real wallet: a mail written while locked survives the unlock its
+  // Send asks for, and is then prepared from the same encrypted draft.
+  const h=await setup({realWallet:true,publicWeb:true}),phrase='correct horse battery staple';
+  await h.navigate('#wallet');h.get('import-private-key').value=a;await h.get('wallet-import-form').requestSubmit();await settle();
+  await h.get('wallet-passphrase-open').click();const lock=h.get('wallet-passphrase-form');lock.elements.passphrase.value=lock.elements.confirm.value=phrase;await lock.requestSubmit();await settle();
+  eq(h.get('wallet-lock-state').textContent,'Unlocked',h.get('wallet-feedback').textContent);
+  await h.get('wallet-lock').click();await settle();eq(h.get('wallet-lock-state').textContent,'Locked');
+  await h.navigate('#mail');const f=await h.compose(),draft=()=>[f.elements.subject.value,f.elements.message.value],typed=['Fixture subject','Secret fixture body'];
+  const quoted=h.calls.filter(x=>x.body.method==='fee_quote').at(-1).body.params.data_hex;
+  await f.requestSubmit();await settle();eq(h.get('unlock-dialog').open,true,'Send asks for the passphrase');eq(draft(),typed);
+  ok(!h.calls.some(x=>x.body.method==='preparetransaction'),'nothing is prepared while locked');
+  const unlock=h.get('unlock-form');unlock.elements.passphrase.value=phrase;await unlock.requestSubmit();await settle();
+  eq(h.get('unlock-dialog').open,false,unlock.querySelector().textContent);eq(draft(),typed,'unlocking keeps the subject and message');
+  await f.requestSubmit();await settle();
+  const prepared=h.calls.filter(x=>x.body.method==='preparetransaction');eq(prepared.length,1,f.querySelector().textContent);eq(prepared[0].body.params.data_hex,quoted,'Send uses the reviewed encrypted draft');
+ }
+ {
   // A second reorganization reported during the same scan rewinds again,
   // rather than discarding the saved scan and starting from genesis.
   const h=await setup(),first=await h.message();await h.publish([first]);

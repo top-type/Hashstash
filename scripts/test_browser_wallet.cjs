@@ -492,6 +492,14 @@ async function passphraseLock(f) {
     const bytes=await a.context.HashstashMailCrypto.encrypt({subject:'Sealed fixture',body:'Opened with the passphrase key'},identity);
     equal((await legacy.decryptMail(bytes,identity,expected)).body,'Opened with the passphrase key');
     legacy.lock();await lockedError(()=>legacy.decryptMail(bytes,identity,expected),/Unlock/);
+    // A sealed key reaches mail decryption as bytes, wiped after each
+    // envelope, never as another hex string of the key.
+    const spied=browser(a.profile),real=spied.context.HashstashMailCrypto,given=[];
+    spied.context.HashstashMailCrypto={...real,decrypt:(data,context,key)=>{given.push(key);return real.decrypt(data,context,key);}};
+    const opener=spied.api.createStore(chain);await opener.unlock(changedPhrase);
+    equal((await opener.decryptMail(bytes,identity,expected)).body,'Opened with the passphrase key');
+    equal(given.length,1);ok(typeof given[0]!=='string'&&ArrayBuffer.isView(given[0])&&given[0].length===32,'the key is passed as bytes');
+    ok(given[0].every(byte=>byte===0),'and wiped once the envelope is opened');
   }
   // An unused open key is dropped after the idle period, by its timer or on
   // the next use if a background page's timer is late.

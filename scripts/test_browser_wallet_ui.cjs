@@ -247,6 +247,21 @@ async function run() {
     assert.equal(r.get('unlock-dialog').open,false,unlock.querySelector().textContent);checks++;
     assert.equal(r.get('wallet-lock-state').textContent,'Unlocked');checks++;assert.equal(unlock.elements.passphrase.value,'');checks++;
     f=await fill(r,alice);await f.requestSubmit();assert.equal(broadcasts(r).length,1,f.querySelector().textContent);checks++;
+    // The idle lock can expire after the last session snapshot, as in a
+    // background tab whose refresh is late: Send still asks to unlock.
+    r.wallClock+=5*60*1000;assert.equal(r.get('wallet-lock-state').textContent,'Unlocked','the last snapshot predates the lock');checks++;
+    const prepares=()=>r.calls.filter(call=>call.body.method==='preparetransaction').length,before=prepares();
+    f=await fill(r,alice);await f.requestSubmit();
+    assert.equal(r.get('unlock-dialog').open,true,'a lock that expired since the last snapshot opens the dialog');checks++;
+    assert.equal(prepares(),before,'and nothing is prepared');checks++;assert.equal(r.get('wallet-lock-state').textContent,'Locked');checks++;
+    unlock.elements.passphrase.value=phrase;await unlock.requestSubmit();assert.equal(r.get('unlock-dialog').open,false);checks++;
+    // So does a lock that expires while the transaction is being prepared.
+    const preparing=r.handlers.preparetransaction;r.handlers.preparetransaction=p=>{r.wallClock+=5*60*1000;return preparing(p);};
+    f=await fill(r,alice);await f.requestSubmit();r.handlers.preparetransaction=preparing;
+    assert.equal(r.get('unlock-dialog').open,true,'a lock reported by signing opens the dialog');checks++;
+    assert.match(f.querySelector().textContent,/Unlock/);checks++;assert.equal(broadcasts(r).length,1,'nothing is signed');checks++;
+    unlock.elements.passphrase.value=phrase;await unlock.requestSubmit();
+    f=await fill(r,alice);await f.requestSubmit();assert.equal(broadcasts(r).length,2,f.querySelector().textContent);checks++;
     // A copied key leaves the clipboard after 30 seconds.
     await r.get('export-private').click();assert.equal(r.get('backup-private').value,bobSecret);checks++;
     await r.get('backup-copy').click();assert.equal(r.clipboard.at(-1),bobSecret);checks++;
@@ -259,8 +274,19 @@ async function run() {
     await r.get('backup-copy').click();await r.get('copy-key').click();await r.timersDue(30000);assert.equal(r.clipboard.at(-1),addr(bob),'a later copy from this page replaces the key and is kept');checks++;
     const write=r.navigator.clipboard.writeText;await r.get('backup-copy').click();
     r.navigator.clipboard.writeText=async value=>{if(value==='')throw new Error('Document is not focused.');return write(value);};
+    assert.equal(r.get('clipboard-notice').hidden,true);checks++;
     await r.timersDue(30000);assert.equal(r.clipboard.at(-1),bobSecret);checks++;
+    assert.equal(r.get('clipboard-notice').hidden,false,'a refused clear says the key is still on the clipboard');checks++;
     r.navigator.clipboard.writeText=write;await r.windowEvents.get('focus')();await settle();assert.equal(r.clipboard.at(-1),'','an unfocused page clears the key on return');checks++;
+    assert.equal(r.get('clipboard-notice').hidden,true);checks++;assert.equal(r.windowEvents.has('pointerdown'),false,'and stops retrying');checks++;
+    // Firefox and Safari write the clipboard only during a user action: the
+    // next click or key press in the page clears it.
+    for(const action of ['pointerdown','keydown']) {
+      await r.get('backup-copy').click();r.navigator.clipboard.writeText=async value=>{if(value==='')throw new Error('Clipboard write was blocked due to lack of user activation.');return write(value);};
+      await r.timersDue(30000);assert.equal(r.clipboard.at(-1),bobSecret);checks++;assert.equal(r.get('clipboard-notice').hidden,false);checks++;
+      r.navigator.clipboard.writeText=write;await r.windowEvents.get(action)();await settle();
+      assert.equal(r.clipboard.at(-1),'',`the next ${action} clears the key`);checks++;assert.equal(r.get('clipboard-notice').hidden,true);checks++;
+    }
     await r.get('backup-download').click();assert.deepEqual(JSON.parse(r.downloads.at(-1)),{format:'hashstash-private-v1',private_key:bobSecret,public_key:bob});checks++;
     assert.ok(r.blobParts.at(-1).every(part=>part instanceof Uint8Array&&part.every(byte=>byte===0)),'the backup bytes are wiped once the file holds its copy');checks++;
     await r.get('backup-close').click();
@@ -276,6 +302,21 @@ async function run() {
     await r.get('wallet-passphrase-remove').click();assert.equal(r.get('wallet-lock-state').textContent,'Not encrypted',r.get('wallet-feedback').textContent);checks++;
     assert.ok(saved().includes(bobSecret),'removing the passphrase saves the key unencrypted again');checks++;
     for(const h of [c,r]){assert.equal(JSON.stringify(h.calls).includes(phrase),false,'the passphrase never leaves the page');checks++;}
+  }
+  // A passphrase covers this network's keys only. Keys the site keeps
+  // unencrypted for another network, as after a network reset, are counted.
+  {
+    const other='5c'.repeat(32),saved=new Map(),key=a.browserApi.publicKey(bobSecret);
+    saved.set(`hashstash.browser-wallet.v1.${other}`,JSON.stringify({version:1,chain_id:other,revision:'0',selected:key,wallets:[{id:key,public_key:key,private_key:bobSecret,backed_up:false}]}));
+    const c=await setup({savedStorage:saved}),status=()=>c.get('wallet-security-status').textContent;
+    assert.equal(c.get('wallet-security').hidden,false,'the panel shows the other network’s keys');checks++;
+    assert.match(status(),/also keeps 1 private key unencrypted for another network/);checks++;
+    c.get('import-private-key').value='0'.repeat(63)+'5';await c.get('wallet-import-form').requestSubmit();
+    await c.get('wallet-passphrase-open').click();const form=c.get('wallet-passphrase-form');form.elements.passphrase.value=form.elements.confirm.value='correct horse battery staple';await form.requestSubmit();
+    assert.match(c.get('wallet-feedback').textContent,/for this network are now encrypted/);checks++;
+    assert.match(c.get('wallet-feedback').textContent,/create a new key now and move your funds/,'migrated keys are not promised full protection');checks++;
+    assert.match(status(),/which this network's passphrase does not cover/);checks++;
+    assert.ok(saved.get(`hashstash.browser-wallet.v1.${other}`).includes(bobSecret),'the other network’s store is left unchanged');checks++;
   }
   console.log(`Browser wallet UI: ${checks} integration assertions passed.`);
 }

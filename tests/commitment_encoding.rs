@@ -10,11 +10,12 @@ use num_bigint::BigUint;
 /// independent, top-down Python model of that text, not from this crate.
 #[test]
 fn map_roots_match_independent_trie_vectors() {
+    type Entries = Vec<(Vec<u8>, u64)>;
     let wide: Vec<u8> = (0..40).collect();
-    let sixteen: Vec<(Vec<u8>, u64)> = (0..16u32)
+    let sixteen: Entries = (0..16u32)
         .map(|n| (n.to_be_bytes().to_vec(), u64::from(n) * 3))
         .collect();
-    let cases: [(Vec<(Vec<u8>, u64)>, &str); 5] = [
+    let cases: [(Entries, &str); 5] = [
         (
             vec![],
             "a20de3994c6f9d7b04da9ca1dfbf5267eeabfe589c286822c002e5fc98e94af0",

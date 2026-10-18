@@ -1302,7 +1302,7 @@ struct Preparation {
 enum ClaimStart {
     /// A pending or cooling-down claim answers a repeated request.
     Answered(Value),
-    Prepare(Preparation),
+    Prepare(Box<Preparation>),
 }
 
 struct Engine {
@@ -1821,7 +1821,7 @@ impl Engine {
             amount: self.payout.clone(),
         };
         let params = json!({"sender":hex::encode(self.sender),"operation":operation,"nonce":self.nonce,"anchor":hex::encode(anchor),"expiry_blocks":expiry_blocks,"extra_fee":"0"});
-        Ok(ClaimStart::Prepare(Preparation {
+        Ok(ClaimStart::Prepare(Box::new(Preparation {
             canonical,
             client_subnet: client_subnet.to_owned(),
             operation,
@@ -1833,7 +1833,7 @@ impl Engine {
             settings,
             expiry_blocks,
             expiry,
-        }))
+        })))
     }
     /// Verifies the node's preparation against the claim, signs it and
     /// reserves it durably. Returns the signed bytes and the claim's answer.
@@ -1977,22 +1977,20 @@ impl Hold for Shared {
 /// payment cannot change while the node prepares the transfer.
 struct Held(Option<OwnedMutexGuard<Engine>>);
 impl Hold for Held {
-    fn step<R, F>(&mut self, work: F) -> impl Future<Output = Result<R>> + Send
+    async fn step<R, F>(&mut self, work: F) -> Result<R>
     where
         R: Send + 'static,
         F: FnOnce(&mut Engine) -> Result<R> + Send + 'static,
     {
-        async move {
-            let mut engine = self.0.take().context("faucet engine released")?;
-            let (engine, result) = tokio::task::spawn_blocking(move || {
-                let result = work(&mut engine);
-                (engine, result)
-            })
-            .await
-            .context("faucet engine step failed")?;
-            self.0 = Some(engine);
-            result
-        }
+        let mut engine = self.0.take().context("faucet engine released")?;
+        let (engine, result) = tokio::task::spawn_blocking(move || {
+            let result = work(&mut engine);
+            (engine, result)
+        })
+        .await
+        .context("faucet engine step failed")?;
+        self.0 = Some(engine);
+        result
     }
     fn release(&mut self) {
         self.0 = None;
@@ -2079,7 +2077,7 @@ async fn claim_with(
         .await?
     {
         ClaimStart::Answered(answer) => return Ok(answer),
-        ClaimStart::Prepare(preparation) => preparation,
+        ClaimStart::Prepare(preparation) => *preparation,
     };
     let prepared: Value = node
         .call("preparetransaction", preparation.params.clone())

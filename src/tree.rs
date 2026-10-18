@@ -208,7 +208,7 @@ fn trie_remove<V>(root: &Trie<V>, entry: &Entry<V>) -> Option<Trie<V>> {
 /// Builds the trie of entries in one pass, hashing each branch once. `None`
 /// when two paths are equal, which needs a SHA-256 collision.
 fn build_trie<V>(mut entries: Vec<Arc<Entry<V>>>) -> Option<Option<Trie<V>>> {
-    entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    entries.sort_unstable_by_key(|entry| entry.path);
     let mut entries = entries.into_iter();
     let Some(first) = entries.next() else {
         return Some(None);

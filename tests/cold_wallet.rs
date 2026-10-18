@@ -438,6 +438,49 @@ async fn signer_binds_only_to_loopback() {
 }
 
 #[tokio::test]
+async fn loopback_connections_must_send_heads_promptly_and_are_capped() {
+    use std::time::{Duration, Instant};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+    let server = cold::serve("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let opened = Instant::now();
+    let mut held = Vec::new();
+    for _ in 0..cold::MAX_CONNECTIONS {
+        held.push(TcpStream::connect(server.address).await.unwrap());
+    }
+    // Another local process's connection over the cap is closed unread.
+    let mut refused = TcpStream::connect(server.address).await.unwrap();
+    let mut byte = [0; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(2), refused.read(&mut byte))
+        .await
+        .expect("a connection over the cap was held");
+    assert!(matches!(closed, Ok(0) | Err(_)));
+    assert!(opened.elapsed() < hashstash::local_http::HEAD_TIMEOUT);
+    // A connection that never completes its request head is closed unanswered.
+    held[0]
+        .write_all(format!("GET / HTTP/1.1\r\nHost: {}\r\n", server.address).as_bytes())
+        .await
+        .unwrap();
+    let closed = tokio::time::timeout(
+        hashstash::local_http::HEAD_TIMEOUT + Duration::from_secs(3),
+        held[0].read(&mut byte),
+    )
+    .await
+    .expect("a partial head was held past the deadline");
+    assert!(matches!(closed, Ok(0) | Err(_)));
+    // The silent connections were closed by the same deadline.
+    server.stop().await;
+    for stream in &mut held[1..] {
+        let closed = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .unwrap();
+        assert!(matches!(closed, Ok(0) | Err(_)));
+    }
+}
+
+#[tokio::test]
 async fn local_api_requires_host_origin_and_session_and_limits_input() {
     let signer = Signer::start().await;
     let good = signer.client.get(&signer.base).send().await.unwrap();

@@ -512,6 +512,8 @@ dependencies = [
  "clap",
  "getrandom 0.3.4",
  "hex",
+ "hyper",
+ "hyper-util",
  "num-bigint",
  "num-traits",
  "reqwest",

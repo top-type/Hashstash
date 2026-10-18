@@ -32,6 +32,11 @@ zeroize = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 axum = "0.8"
+# The faucet and cold signer serve connections through hyper directly, with a
+# timer so request heads and keep-alive idling are bounded; axum::serve sets
+# none. These are the versions and features axum already builds.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "http1", "service", "tokio"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]

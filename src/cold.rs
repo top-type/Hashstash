@@ -39,6 +39,9 @@ const IDLE_LOCKED: &str = "Wallet locked after a period without use; open it aga
 /// address-encoded and shown as two fields, so bytes alone do not bound the
 /// work; `hashstash-cold --max-review-payments` raises it.
 pub const DEFAULT_MAX_REVIEW_PAYMENTS: usize = 4096;
+/// Connections served at once. A browser opens at most six to one origin;
+/// further connections, from anything else on loopback, are closed unread.
+pub const MAX_CONNECTIONS: usize = 16;
 
 /// Local bounds on one offline review.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -394,11 +397,16 @@ pub async fn serve_with_options(address: SocketAddr, options: ColdOptions) -> Re
         .with_state(app.clone());
     let (shutdown, receive) = oneshot::channel();
     let task = tokio::spawn(async move {
-        let _ = axum::serve(listener, routes)
-            .with_graceful_shutdown(async {
+        crate::local_http::serve(
+            listener,
+            routes,
+            MAX_CONNECTIONS,
+            crate::local_http::HEAD_TIMEOUT,
+            async {
                 let _ = receive.await;
-            })
-            .await;
+            },
+        )
+        .await;
         if let Ok(mut state) = app.wallet.lock() {
             *state = WalletState::default();
         }

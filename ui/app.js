@@ -57,6 +57,12 @@
     };
     let quoteTimer, toastTimer, sendTimer, rpcId = 0, sendVersion = 0, sessionVersion = 0;
     let privateBackup = null, importedPublic = null, browserWallet = null, walletChain = null, unsubscribeWallet = null, walletStorageError = "";
+    // Unencrypted keys this site keeps for other networks, outside this
+    // network's passphrase; counted when the store opens and after key changes.
+    let walletElsewhere = {
+        networks: 0,
+        keys: 0
+    };
     const walletBalanceNodes = new Map;
     const proposalExplanations = new Map, explanationRequests = new Set, explanationMisses = new Map;
     const feeForms = [ "trade", "send", "propose", "support", "refund", "mail" ];
@@ -590,7 +596,8 @@
     }
     // During a decision every fee is prepaid from cash already held in both
     // outcomes; unsettled trade proceeds cannot pay it. Name an account that
-    // cannot pay any fee, and what unlocks it before the drained outcome loses.
+    // cannot pay any fee, and the credit that unlocks it. The decision's end
+    // unlocks it only if the drained outcome loses, never when both are.
     function drainedOutcomes(pass, fail, fee) {
         return pass < fee && fail < fee ? "PASS and FAIL" : pass < fee ? "PASS" : "FAIL";
     }
@@ -605,8 +612,9 @@
             const floor = fee(128n);
             if (scale <= 0n || least >= floor) return "";
             // The fee for 1,024 weight covers a small transaction, such as a sale.
-            const needed = fee(1024n) - least;
-            return `${address()} can send nothing until this decision ends, including selling its Stash: every fee needs hashes already held in both outcomes, and its ${drainedOutcomes(pass, fail, floor)} cash cannot pay one. A transfer of ${formatExactHash(needed > 0n ? needed : 1n)} or more to it from any other account unlocks it.`;
+            const needed = fee(1024n) - least, drained = drainedOutcomes(pass, fail, floor);
+            const resolution = pass < floor && fail < floor ? "" : ` The decision's end clears this only if ${drained} loses.`;
+            return `${address()} can send nothing, including selling its Stash, until it receives a credit: every fee needs hashes already held in both outcomes, and its ${drained} cash cannot pay one.${resolution} A transfer of ${formatExactHash(needed > 0n ? needed : 1n)} or more to it from any other account unlocks it.`;
         } catch {
             return "";
         }
@@ -915,9 +923,10 @@
         const expiry = transactionExpiry(form);
         if (!expiry) throw new Error("Transaction expiry must be greater than zero.");
         const identity = submissionIdentity(form), hot = state.session.wallet_enabled, dataFields = transactionData(form);
-        if (hot && state.session.wallet_locked) {
-            openUnlock("Unlock this browser wallet to sign.");
-            throw new Error("Unlock this browser wallet to sign.");
+        if (hot && walletLockedNow()) {
+            const error = new Error("Unlock this browser wallet to sign.");
+            error.walletLocked = true;
+            throw error;
         }
         const nonce = nextNonce();
         const expiryHeight = BigInt(state.status.height) + BigInt(expiry);
@@ -1029,6 +1038,7 @@
                 await submit(form, operation);
             } catch (error) {
                 feedback(form, error.message, true);
+                lockedPrompt(error);
             } finally {
                 form.dataset.preparing = "false";
             }
@@ -2272,6 +2282,7 @@
                 browserWallet.onLockChange?.(() => {
                     state.managing || state.submitting || refresh();
                 });
+                countWalletsElsewhere();
             } catch (error) {
                 walletStorageError = error.message;
             }
@@ -2692,12 +2703,19 @@
     }
     // A private key copied to the clipboard is cleared after 30 seconds,
     // unless this page can see that the clipboard now holds something else.
-    // Writing needs a focused page, so an unfocused one clears on return.
-    const CLIPBOARD_CLEAR_MS = 30e3;
+    // Browsers let a page write the clipboard only while it has focus, and
+    // Firefox and Safari only during a click or key press. A refused clear
+    // says the key is still there and retries at the next one, or on focus.
+    const CLIPBOARD_CLEAR_MS = 30e3, CLIPBOARD_RETRY = [ "pointerdown", "pointerup", "keydown", "focus" ];
     let copiedSecret = null, clipboardTimer;
+    function clipboardRetry(waiting) {
+        $("clipboard-notice").hidden = !waiting;
+        for (const name of CLIPBOARD_RETRY) waiting ? window.addEventListener(name, clearCopiedSecret) : window.removeEventListener(name, clearCopiedSecret);
+    }
     function forgetCopiedSecret() {
         copiedSecret = null;
         clearTimeout(clipboardTimer);
+        clipboardRetry(false);
     }
     async function clearCopiedSecret() {
         const copied = copiedSecret;
@@ -2718,12 +2736,10 @@
         if (current !== null && current !== copied) return forgetCopiedSecret();
         try {
             await navigator.clipboard.writeText("");
-            copiedSecret === copied && (copiedSecret = null);
+            if (copiedSecret === copied) forgetCopiedSecret();
             toast("The private key was cleared from the clipboard.");
         } catch {
-            window.addEventListener("focus", clearCopiedSecret, {
-                once: true
-            });
+            copiedSecret === copied && clipboardRetry(true);
         }
     }
     // The backup file is encoded into bytes that are wiped once the browser
@@ -2870,14 +2886,29 @@
         securityView();
         modeButtons();
     }
-    // An optional passphrase seals the private keys saved in this browser.
-    // Keys open only in this page's memory, until the idle lock or a reload.
+    function countWalletsElsewhere() {
+        try {
+            walletElsewhere = browserWallet?.otherNetworks?.() || {
+                networks: 0,
+                keys: 0
+            };
+        } catch {
+            walletElsewhere = {
+                networks: 0,
+                keys: 0
+            };
+        }
+    }
+    // An optional passphrase seals the private keys saved in this browser for
+    // this network. Keys open only in this page's memory, until the idle lock
+    // or a reload.
     function securityView() {
-        const session = state.session, encrypted = !!session?.wallet_encrypted, locked = !!session?.wallet_locked;
-        $("wallet-security").hidden = !session || !browserWallet || !!walletStorageError || !(encrypted || session.wallets?.some(wallet => wallet.can_sign));
+        const session = state.session, encrypted = !!session?.wallet_encrypted, locked = !!session?.wallet_locked, elsewhere = walletElsewhere;
+        $("wallet-security").hidden = !session || !browserWallet || !!walletStorageError || !(encrypted || elsewhere.keys || session.wallets?.some(wallet => wallet.can_sign));
         text("wallet-lock-state", encrypted ? locked ? "Locked" : "Unlocked" : "Not encrypted");
         const minutes = Math.max(1, Math.round((session?.wallet_idle_lock_seconds || 300) / 60)), plain = session?.wallet_plaintext_keys || 0;
-        text("wallet-security-status", !encrypted ? "Private keys in this browser are saved unencrypted: anyone who can read this browser profile can take them. Set a passphrase to encrypt them." : locked ? `Private keys are encrypted with your passphrase. Unlock to sign, back up a key or read mail.${plain ? ` ${plain} key${plain === 1 ? " saved without encryption is" : "s saved without encryption are"} sealed when you unlock.` : ""}` : `Unlocked in this page. It locks after ${minutes} minute${minutes === 1 ? "" : "s"} without use, and when the page closes.`);
+        const other = elsewhere.keys ? ` This browser also keeps ${elsewhere.keys} private key${elsewhere.keys === 1 ? "" : "s"} unencrypted for ${elsewhere.networks === 1 ? "another network" : `${elsewhere.networks} other networks`} on this site, which this network's passphrase does not cover.` : "";
+        text("wallet-security-status", (!encrypted ? "Private keys in this browser for this network are saved unencrypted: anyone who can read this browser profile can take them. Set a passphrase to encrypt them." : locked ? `Private keys for this network are encrypted with your passphrase. Unlock to sign, back up a key or read mail.${plain ? ` ${plain} key${plain === 1 ? " saved without encryption is" : "s saved without encryption are"} sealed when you unlock.` : ""}` : `Unlocked in this page. It locks after ${minutes} minute${minutes === 1 ? "" : "s"} without use, and when the page closes.`) + other);
         $("wallet-unlock").hidden = !encrypted || !locked;
         $("wallet-lock").hidden = !encrypted || locked;
         $("wallet-passphrase-open").hidden = encrypted && locked;
@@ -2896,9 +2927,28 @@
         feedback($("unlock-form"), message);
         $("unlock-dialog").open || $("unlock-dialog").showModal();
     }
-    // A locked passphrase stopped the action; offer to unlock.
+    // The idle lock can expire after the last session snapshot, for example
+    // in a background tab whose refresh is late, so ask the store itself.
+    function walletLockedNow() {
+        if (state.session?.wallet_locked) return true;
+        try {
+            return !!browserWallet?.snapshot().wallet_locked;
+        } catch {
+            return false;
+        }
+    }
+    // A locked passphrase stopped the action; offer to unlock. The store
+    // reported the lock, even if the last session snapshot predates it.
     function lockedPrompt(error) {
-        error?.walletLocked && openUnlock(error.message);
+        if (!error?.walletLocked || !state.session) return;
+        if (!state.session.wallet_locked) {
+            state.session = {
+                ...state.session,
+                wallet_locked: true
+            };
+            walletView();
+        }
+        openUnlock(error.message);
     }
     function walletMessage(message, failed = false) {
         text("wallet-feedback", message);
@@ -3101,6 +3151,7 @@
             if (!privateBackup) return;
             await navigator.clipboard.writeText(privateBackup.private_key);
             copiedSecret = privateBackup.private_key;
+            clipboardRetry(false);
             clearTimeout(clipboardTimer);
             clipboardTimer = setTimeout(clearCopiedSecret, CLIPBOARD_CLEAR_MS);
             toast(`Private key copied. The clipboard is cleared in ${CLIPBOARD_CLEAR_MS / 1e3} seconds.`);
@@ -3160,7 +3211,11 @@
                 passphrase: passphrase
             });
             closePassphraseForm(true);
-            walletMessage(changing ? "Passphrase changed." : "Private keys in this browser are now encrypted with your passphrase. It cannot be recovered, so keep your key backups.");
+            countWalletsElsewhere();
+            securityView();
+            // The earlier unencrypted copies are overwritten, not erased:
+            // storage files and earlier profile backups can still hold them.
+            walletMessage(changing ? "Passphrase changed." : "Private keys in this browser for this network are now encrypted with your passphrase. It cannot be recovered, so keep your key backups. Copies saved before encryption may remain in the browser's storage files and in earlier backups of this profile: for full protection, create a new key now and move your funds to it.");
         } catch (error) {
             feedback(form, error.message, true);
             lockedPrompt(error);

@@ -1,4 +1,6 @@
 //! Bounded local RPC, fork-aware peer synchronization and solo Stratum V1.
+/// The `run --wallet-passphrase-file` passphrase that seals node hot keys.
+pub use crate::wallet_store::WalletPassphrase;
 use crate::{
     address,
     chain::{
@@ -2231,6 +2233,16 @@ impl Drop for SessionId {
 }
 impl Node {
     pub fn open(path: &Path, config: Config, miner: PublicKey) -> Result<Self> {
+        Self::open_with_wallet_passphrase(path, config, miner, None)
+    }
+    /// Opens with the passphrase that locks this node's wallet storage: its
+    /// hot keys are then saved only encrypted (see `WalletStore`).
+    pub fn open_with_wallet_passphrase(
+        path: &Path,
+        config: Config,
+        miner: PublicKey,
+        wallet_passphrase: Option<&WalletPassphrase>,
+    ) -> Result<Self> {
         ensure!(crypto::valid_key(&miner), "invalid miner public key");
         // The wallet sidecar cannot be rebuilt and fails closed. Check it before
         // the full history replay, so a damaged file stops startup immediately.
@@ -2240,7 +2252,7 @@ impl Node {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let wallets = WalletStore::open_unrecorded(path, config.chain_id())?;
+        let wallets = WalletStore::open_unrecorded(path, config.chain_id(), wallet_passphrase)?;
         let chain = Chain::open(path, config)?;
         // Only a launch whose chain database accepted this network records it,
         // so a mistaken network choice leaves the wallet store unchanged.

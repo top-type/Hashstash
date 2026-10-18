@@ -534,7 +534,7 @@ async function harness(options = {}) {
 
     },
 
-    window: { addEventListener(name,fn) {windowEvents.set(name,fn);}, scrollTo() {} },
+    window: { addEventListener(name,fn) {windowEvents.set(name,fn);}, removeEventListener(name,fn) {if(windowEvents.get(name)===fn)windowEvents.delete(name);}, scrollTo() {} },
 
     FormData: class { constructor(form) { this.form = form; } *[Symbol.iterator]() { for (const [name, input] of Object.entries(this.form.elements)) yield [name, input.value]; } },
 
@@ -587,7 +587,7 @@ async function harness(options = {}) {
   }
   if (options.realWallet) {
     const saved = options.savedStorage || new Map(); h.savedStorage = saved;
-    context.localStorage = {getItem:key=>saved.get(key) ?? null,setItem:(key,value)=>saved.set(key,value),removeItem:key=>saved.delete(key)};
+    context.localStorage = {getItem:key=>saved.get(key) ?? null,setItem:(key,value)=>saved.set(key,value),removeItem:key=>saved.delete(key),get length(){return saved.size;},key:index=>[...saved.keys()][index] ?? null};
     context.isSecureContext = true;
     Object.assign(context.location, {hostname:'wallet.example',protocol:'https:'});
     context.navigator.locks = {request:async (_name,callback)=>callback()};

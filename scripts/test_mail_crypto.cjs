@@ -18,6 +18,12 @@ const obj=x=>JSON.parse(JSON.stringify(x));
 async function run(){
   const envelope=await api.encrypt(plain,identity),e=api.parse(envelope);
   eq(obj(await api.decrypt(envelope,publicContext,b)),expected);eq(obj(await api.decrypt(envelope,publicContext,a)),expected);
+  // A key in 32 bytes opens it too, so a wallet need not make a hex string;
+  // the caller's bytes are its own to wipe.
+  {
+    const raw=bytes(b);eq(obj(await api.decrypt(envelope,publicContext,raw)),expected);eq(Buffer.from(raw).toString('hex'),b);
+    for(const bad of [bytes(b).subarray(1),new Uint16Array(32),[...bytes(b)],null])await fail(()=>api.decrypt(envelope,publicContext,bad),/Invalid private key/);
+  }
   // The alternate representative n-d has the same BIP340 x-only identity.
   eq(obj(await api.decrypt(envelope,publicContext,key(order-6n))),expected);eq(obj(await api.decrypt(envelope,publicContext,key(order-1n))),expected);
   for(const i of [1n,2n,3n,4n,5n,6n,7n,8n,17n,31n]){

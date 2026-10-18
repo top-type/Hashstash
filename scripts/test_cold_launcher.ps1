@@ -2,24 +2,30 @@
 param(
     [string]$Executable,
     [ValidateRange(1024,65535)][int]$Port = 21980,
-    [string]$Report
+    [string]$Report,
+    # Check only the launcher's crash-report exclusion, which needs no signer.
+    [switch]$RegistryOnly
 )
 # Start-ColdWallet.ps1 token hand-off: the launcher chooses the session token,
 # passes it only through the signer's environment and prints it only in the
 # launch URL's fragment; the signer never serves it and requires it for every
 # POST. Uses a public fixture chain ID and stops only the signer it started.
+# The launcher's Windows Error Reporting exclusion is checked under a test key
+# of this account, removed afterwards, never the real ExcludedApplications key.
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repository = Split-Path -Parent $PSScriptRoot
+$launcher = Join-Path $repository 'Start-ColdWallet.ps1'
 if (-not $Executable) { $Executable = Join-Path $repository 'target/release/hashstash-cold.exe' }
 if (-not $Report) { $Report = Join-Path $repository 'work/cold-launcher-report.json' }
 [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Report))) | Out-Null
-$Executable = (Resolve-Path -LiteralPath $Executable).Path
 $checks = [Collections.Generic.List[string]]::new()
-$result = [ordered]@{ passed=$false; signer_sha256=(Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash.ToLowerInvariant(); port=$Port; checks=$checks; owned_process_stopped=$false }
+$result = [ordered]@{ passed=$false; signer_sha256=$null; port=$Port; checks=$checks; owned_process_stopped=$false; test_key_removed=$false }
 $signer = $null
+$client = $null
+$testRoot = 'Software\Hashstash-launcher-test-' + [Guid]::NewGuid().ToString('N')
+$testKey = $testRoot + '\ExcludedApplications'
 Add-Type -AssemblyName System.Net.Http
-$client = [Net.Http.HttpClient]::new()
 
 function Check([bool]$Condition, [string]$Description) {
     if (-not $Condition) { throw $Description }
@@ -35,9 +41,38 @@ function Post-Status([string]$Origin, [string]$Path, [string]$Token) {
     try { return [int]$response.StatusCode } finally { $response.Dispose(); $request.Dispose() }
 }
 
+function Test-Exclusion([string]$Name) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($testKey)
+    if (-not $key) { return $false }
+    try { return ($key.GetValueNames() -contains $Name) -and $key.GetValueKind($Name) -eq [Microsoft.Win32.RegistryValueKind]::DWord -and [int]$key.GetValue($Name) -eq 1 }
+    finally { $key.Dispose() }
+}
+
 try {
-    $launcher = Join-Path $repository 'Start-ColdWallet.ps1'
-    $output = @(& $launcher -Executable $Executable -ChainId ('27' * 32) -Port $Port -NoBrowser 6>&1 | ForEach-Object { [string]$_ })
+    # The launcher's own registration function, taken from its source.
+    $syntax = [Management.Automation.Language.Parser]::ParseFile($launcher, [ref]$null, [ref]$null)
+    $definition = $syntax.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Register-CrashReportExclusion' }, $true)
+    if (-not $definition) { throw 'The launcher defines no crash-report exclusion.' }
+    . ([ScriptBlock]::Create($definition.Extent.Text))
+    $existing = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($testKey)
+    try {
+        $existing.SetValue('other-program.exe', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+        $existing.SetValue('hashstash-cold.exe', 0, [Microsoft.Win32.RegistryValueKind]::DWord)
+    } finally { $existing.Dispose() }
+    Check ((Register-CrashReportExclusion 'hashstash-cold.exe' $testKey) -eq 'added' -and (Test-Exclusion 'hashstash-cold.exe')) 'A disabled exclusion is set to DWORD 1'
+    Check ((Register-CrashReportExclusion 'hashstash-cold.exe' $testKey) -eq 'found') 'An existing exclusion is reported, not rewritten'
+    Check (Test-Exclusion 'other-program.exe') 'Other excluded programs are kept'
+    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($testRoot)
+    Check ((Register-CrashReportExclusion 'hashstash-cold.exe' $testKey) -eq 'added' -and (Test-Exclusion 'hashstash-cold.exe')) 'A missing key is created with the exclusion'
+    if ($RegistryOnly) { $result.passed = $true; return }
+
+    $Executable = (Resolve-Path -LiteralPath $Executable).Path
+    $result.signer_sha256 = (Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash.ToLowerInvariant()
+    $client = [Net.Http.HttpClient]::new()
+    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($testRoot)
+    $output = @(& $launcher -Executable $Executable -ChainId ('27' * 32) -Port $Port -NoBrowser -CrashReportKey $testKey 6>&1 | ForEach-Object { [string]$_ })
+    $signerName = [IO.Path]::GetFileName($Executable)
+    Check ((Test-Exclusion $signerName) -and @($output | Where-Object { $_ -like "Crash reports: Windows Error Reporting excludes $signerName for this account*added*" }).Count -eq 1) 'The launcher excludes the signer from Windows Error Reporting and says so'
     $launch = @($output | Where-Object { $_ -like 'Cold signer: *' })
     Check ($launch.Count -eq 1) 'The launcher prints one launch address'
     if ($launch[0] -notmatch '^Cold signer: (http://127\.0\.0\.1:(\d+))/#token=([0-9a-f]{64})$') { throw "Unexpected launch address: $($launch[0])" }
@@ -58,10 +93,12 @@ try {
     Check ((Post-Status $origin '/api/lock' $token) -eq 200) 'The launch token authorizes the signer'
     $result.passed = $true
 } finally {
-    $client.Dispose()
+    if ($client) { $client.Dispose() }
     if ($signer) {
         Stop-Process -Id $signer.Id -ErrorAction SilentlyContinue
         $result.owned_process_stopped = $signer.WaitForExit(10000)
     }
+    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($testRoot, $false)
+    $result.test_key_removed = $null -eq [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($testRoot)
     $result | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Report -Encoding utf8
 }

@@ -4,10 +4,26 @@ param(
     [string]$Executable,
     [string]$Config,
     [string]$ChainId,
-    [switch]$NoBrowser
+    [switch]$NoBrowser,
+    # Registry key, under HKEY_CURRENT_USER, listing the programs Windows Error
+    # Reporting leaves alone. Tests name another key.
+    [string]$CrashReportKey = 'Software\Microsoft\Windows\Windows Error Reporting\ExcludedApplications'
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+# Windows Error Reporting can save a crash dump of a failing signer, holding
+# any key it has loaded. Exclude the signer's file name for this account, as
+# WerAddExcludedApplication would: a DWORD value of 1 named after the file.
+# Other values under the key are left as they are.
+function Register-CrashReportExclusion([string]$Name, [string]$SubKey) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($SubKey)
+    try {
+        if ($key.GetValueNames() -contains $Name -and $key.GetValueKind($Name) -eq [Microsoft.Win32.RegistryValueKind]::DWord -and [int]$key.GetValue($Name) -eq 1) { return 'found' }
+        $key.SetValue($Name, 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+        return 'added'
+    } finally { $key.Dispose() }
+}
 if (-not $Executable) {
     $Executable = Join-Path $PSScriptRoot 'target/release/hashstash-cold.exe'
     if (-not (Test-Path -LiteralPath $Executable)) { $Executable = Join-Path $PSScriptRoot 'bin/hashstash-cold.exe' }
@@ -40,6 +56,13 @@ try {
     $signerListener.Server.ExclusiveAddressUse = $true
     $signerListener.Start()
 } finally { $signerListener.Stop() }
+$signerName = [IO.Path]::GetFileName($signerPath)
+try {
+    $crashReports = Register-CrashReportExclusion $signerName $CrashReportKey
+    Write-Host "Crash reports: Windows Error Reporting excludes $signerName for this account (DWORD $signerName = 1 under HKCU\$CrashReportKey, $crashReports)."
+} catch {
+    Write-Warning "Windows Error Reporting could not exclude $signerName ($($_.Exception.Message)); a crash dump of the signer may hold its key."
+}
 # Loopback is shared by every local account, so the signer never serves its
 # session token. Choose it here and pass it through this process's environment,
 # which other accounts cannot read, then only in the launch URL's fragment.

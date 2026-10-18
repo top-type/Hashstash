@@ -153,13 +153,15 @@ async function run(){
   const h=await setup('1000','0'),s=h.currentSnapshot,own=addr(h.currentSession.public_key),notice=h.get('overview-lock-notice');
   eq(notice.hidden,false,'a drained outcome shows the lock');ok(notice.textContent.startsWith(own),'the notice names the locked address');
   ok(notice.textContent.includes('FAIL cash cannot pay one'),'and the drained outcome');ok(notice.textContent.includes(`${amounts.formatHash('1')} or more`),'one atom unlocks it at the minimum fee rate');
+  ok(notice.textContent.includes('until it receives a credit'),'a credit is what unlocks it');ok(!notice.textContent.includes('until this decision ends'),'waiting for the decision is not promised to be enough');
+  ok(notice.textContent.includes("The decision's end clears this only if FAIL loses."),notice.textContent);
   eq(h.get('governance-lock-notice').textContent,notice.textContent,'the Governance page shows the same lock');eq(h.get('governance-lock-notice').hidden,false);
   const f=await h.trade('1','Pass'),signed=h.wallet.length;await f.requestSubmit();
   eq(h.wallet.length,signed,'a transaction whose fee the drained outcome cannot pay is not signed');
   const reason=h.get('trade-fee-error').textContent;ok(reason.startsWith('FAIL balance cannot pay this')&&reason.includes(`A transfer of ${amounts.formatHash('1')} or more to ${own}`),reason);
   s.fail.account.ordinary='1';await h.refresh();eq(notice.hidden,true,'any credit that covers a fee unlocks the account');eq(h.get('governance-lock-notice').hidden,true);
   s.fail.account.ordinary='0';s.status.fee_policy={...s.status.fee_policy,minimum_fee_rate:'3'};await h.refresh();ok(notice.textContent.includes(`${amounts.formatHash('3')} or more`),'a higher fee rate needs a larger credit');
-  s.pass.account.ordinary='0';await h.refresh();ok(notice.textContent.includes('PASS and FAIL cash'));
+  s.pass.account.ordinary='0';await h.refresh();ok(notice.textContent.includes('PASS and FAIL cash'));ok(!notice.textContent.includes("decision's end"),'with both outcomes drained the decision never ends the lock');
   s.status.fee_policy={...s.status.fee_policy,minimum_fee_rate:'0'};await h.refresh();eq(notice.hidden,true,'without a fee nothing is locked');
   s.status.fee_policy={...s.status.fee_policy,minimum_fee_rate:'1'};s.governance.phase={Rest:{until:780,pending:null}};s.governance.pass=null;s.pass=s.fail=null;await h.refresh();
   eq(notice.hidden,true,'resolution ends the lock');

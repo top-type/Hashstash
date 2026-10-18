@@ -519,9 +519,29 @@
       try { for(const w of data.wallets) if(w.private_key || w.sealed_key) opened.push([w,await secretOf(data,w)]); return opened; }
       catch(error) { for(const [,secret] of opened) secret.fill(0); throw error; }
     }
+    // Stores this origin keeps for other chain IDs, for example after a
+    // network reset, lie outside this store's passphrase. Count the ones that
+    // still hold unencrypted keys, without keeping any of their contents.
+    function otherNetworks() {
+      let networks=0,keys=0;
+      try {
+        const storage=root.localStorage,count=storage.length;
+        for(let i=0;i<count;i++) {
+          const name=storage.key(i);
+          if(typeof name!=='string' || !name.startsWith('hashstash.browser-wallet.v1.') || name===storageKey) continue;
+          const text=storage.getItem(name);
+          if(typeof text!=='string' || text.length>1024*1024) continue;
+          let data; try { data=JSON.parse(text); } catch { continue; }
+          const found=Array.isArray(data?.wallets) ? data.wallets.filter(w=>typeof w?.private_key==='string' && w.private_key.length>0).length : 0;
+          if(found) { networks++; keys+=found; }
+        }
+      } catch { /* storage that cannot be listed reports none */ }
+      return {networks,keys};
+    }
     const onStorage=e=>{if(e.key===storageKey || e.key===null) { invalidateMetadata(); notify(); }}; root.addEventListener?.('storage',onStorage);
     return Object.freeze({
       snapshot,
+      otherNetworks,
       subscribe(callback) { if(typeof callback!=='function') fail('Invalid wallet subscriber.'); callbacks.add(callback); return ()=>callbacks.delete(callback); },
       // Locking and unlocking change no saved data, so they notify separately.
       onLockChange(callback) { if(typeof callback!=='function') fail('Invalid wallet subscriber.'); lockCallbacks.add(callback); return ()=>lockCallbacks.delete(callback); },
@@ -600,9 +620,11 @@
         if(!w?.private_key && !w?.sealed_key) fail('Import this account’s private key locally to open encrypted mail.');
         if(!root.HashstashMailCrypto) fail('Encrypted mail is unavailable.');
         // Background mail scanning does not count as use for the idle lock.
+        // A sealed key opens into bytes wiped after each envelope, never into
+        // another string.
         const secret=w.sealed_key ? await secretOf(data,w) : null;
         try {
-          const result=await root.HashstashMailCrypto.decrypt(dataHex,identity,w.private_key ?? hex(secret));
+          const result=await root.HashstashMailCrypto.decrypt(dataHex,identity,secret ?? w.private_key);
           guard(read(),expected);
           return result;
         } finally { secret?.fill(0); }

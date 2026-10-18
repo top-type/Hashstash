@@ -210,6 +210,9 @@ enum Command {
         /// Seed a wallet store that holds no wallets with this public key. Without wallet flags the store starts empty.
         #[arg(long)]
         watch_key: Option<String>,
+        /// Owner-only file holding a passphrase that encrypts the wallet store's hot keys. The first start with it encrypts the saved keys; afterwards the store opens only with it.
+        #[arg(long)]
+        wallet_passphrase_file: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:18480")]
         rpc: SocketAddr,
         /// Optional restricted website and public RPC; never exposes server wallets.
@@ -1759,6 +1762,7 @@ async fn main() -> Result<()> {
             miner,
             wallet_key,
             watch_key,
+            wallet_passphrase_file,
             rpc,
             public_web,
             p2p,
@@ -1809,6 +1813,10 @@ async fn main() -> Result<()> {
             let watch = watch_key
                 .map(|public| node::parse_account(&public, &chain_id))
                 .transpose()?;
+            let wallet_passphrase = wallet_passphrase_file
+                .as_deref()
+                .map(node::WalletPassphrase::read)
+                .transpose()?;
             let password = stratum_password_file
                 .map(fs::read_to_string)
                 .transpose()?
@@ -1825,7 +1833,14 @@ async fn main() -> Result<()> {
                 println!("Run options are valid. No database opened and no listeners started.");
                 return Ok(());
             }
-            let mut node = Node::open(&data, c, node::parse_account(&miner, &chain_id)?)?;
+            let mut node = Node::open_with_wallet_passphrase(
+                &data,
+                c,
+                node::parse_account(&miner, &chain_id)?,
+                wallet_passphrase.as_ref(),
+            )?;
+            // The derived key stays with the wallet store; the passphrase goes.
+            drop(wallet_passphrase);
             let wallet_public = wallet.as_ref().map(|(_, public)| *public);
             if peer_discovery {
                 let options = hashstash::peer_discovery::Options {

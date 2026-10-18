@@ -67,8 +67,11 @@
       const result=hex(utf8.encode(PREFIX+JSON.stringify(e)));parse(result);return result;
     }finally{ephemeral?.fill(0);contentSecret?.fill(0);plaintext?.fill(0);}
   }
-  async function decrypt(dataHex,identity,privateHex){
-    secure();const e=parse(dataHex),c=context(identity,e.ephemeral_key),secret=bytes(privateHex,32);let contentSecret,decoded;
+  // The private key is 64 hex characters or 32 bytes; this copy is wiped.
+  async function decrypt(dataHex,identity,privateKey){
+    secure();const e=parse(dataHex),c=context(identity,e.ephemeral_key);let contentSecret,decoded;
+    if(typeof privateKey!=='string'&&!(ArrayBuffer.isView(privateKey)&&privateKey.BYTES_PER_ELEMENT===1&&privateKey.length===32))throw Error('Invalid private key.');
+    const secret=typeof privateKey==='string'?bytes(privateKey,32):Uint8Array.from(privateKey);
     try{
       const own=hex(root.HashstashNoble.schnorr.getPublicKey(secret));
       const role=own===identity.sender?'sender':'recipient';

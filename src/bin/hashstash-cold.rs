@@ -45,6 +45,10 @@ const TOKEN_VARIABLE: &str = "HASHSTASH_COLD_TOKEN";
 #[tokio::main]
 async fn main() -> Result<()> {
     let options = Options::parse();
+    // Before any key can be loaded.
+    if let Err(error) = hashstash::cold::suppress_core_dumps() {
+        eprintln!("warning: {error:#}; a crash dump of this signer may hold its key");
+    }
     let chain: Option<Hash> = if let Some(path) = options.config {
         ensure!(
             std::fs::metadata(&path)?.len() <= 128 * 1024,

@@ -492,21 +492,82 @@ async fn version_1_peers_keep_block_synchronization_and_reject_header_requests_c
             });
         }
     });
+    // A version 2 peer also closes a session it refuses or evicts, so one
+    // such session is not taken as proof of version 1.
     let error = node::sync_peer(&b, legacy).await.unwrap_err();
     assert!(format!("{error:#}").contains("peer transport version 1"), "{error:#}");
     let status = b.rpc("peerstatus", json!({})).unwrap();
     assert_eq!(status["transport_version"], 2);
+    assert_eq!(status["version1_peers"], json!([]));
+    // A second consecutive one is.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let error = node::sync_peer(&b, legacy).await.unwrap_err();
+    assert!(format!("{error:#}").contains("by blocks only for 600 seconds"), "{error:#}");
+    let status = b.rpc("peerstatus", json!({})).unwrap();
     assert_eq!(status["version1_peers"], json!([legacy.to_string()]));
     // The next session, once the closed read's short cooldown has passed,
     // uses block synchronization only, and succeeds.
     tokio::time::sleep(Duration::from_millis(300)).await;
     node::sync_peer(&b, legacy).await.unwrap();
     assert_eq!(b.status().unwrap()["tip"], a.status().unwrap()["tip"]);
-    assert_eq!(*tags.lock().unwrap(), [4, 0]);
+    assert_eq!(*tags.lock().unwrap(), [4, 4, 0]);
     // A version 2 server answers header requests directly.
     a.mine(100_000).unwrap();
     node::sync_peer(&b, server.p2p).await.unwrap();
     assert_eq!(b.status().unwrap()["tip"], a.status().unwrap()["tip"]);
+    proxy.abort();
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn version_2_peers_that_refuse_a_session_keep_header_synchronization() {
+    use std::sync::{Arc, Mutex};
+    let dir = tempfile::tempdir().unwrap();
+    let c = Config::devnet();
+    let a = Node::open(&dir.path().join("a.db"), c.clone(), crypto::public_key(&[87; 32]).unwrap())
+        .unwrap();
+    let b = Node::open(&dir.path().join("b.db"), c.clone(), crypto::public_key(&[88; 32]).unwrap())
+        .unwrap();
+    a.mine(100_000).unwrap();
+    let server = node::serve(a.clone(), options()).await.unwrap();
+    // A version 2 server that refuses or evicts every other session after
+    // reading its first request, as when its peer slots are full.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let busy = listener.local_addr().unwrap();
+    let tags = Arc::new(Mutex::new(Vec::new()));
+    let seen = tags.clone();
+    let upstream = server.p2p;
+    let proxy = tokio::spawn(async move {
+        for session in 0.. {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let Some(first) = read_frame(&mut client).await else {
+                continue;
+            };
+            seen.lock().unwrap().push(first[8]);
+            if session % 2 == 0 {
+                continue;
+            }
+            let mut server = TcpStream::connect(upstream).await.unwrap();
+            let mut framed = (first.len() as u32).to_be_bytes().to_vec();
+            framed.extend(first);
+            server.write_all(&framed).await.unwrap();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+            });
+        }
+    });
+    for round in 0..3 {
+        // The refused session fails; the next one still opens with a header
+        // request, which the server answers, and succeeds.
+        assert!(node::sync_peer(&b, busy).await.is_err());
+        let status = b.rpc("peerstatus", json!({})).unwrap();
+        assert_eq!(status["version1_peers"], json!([]));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        node::sync_peer(&b, busy).await.unwrap();
+        assert_eq!(b.status().unwrap()["tip"], a.status().unwrap()["tip"]);
+        assert_eq!(*tags.lock().unwrap(), [4, 4].repeat(round + 1));
+        a.mine(100_000).unwrap();
+    }
     proxy.abort();
     server.stop().await;
 }

@@ -227,10 +227,21 @@ fn relay_selects_and_publishes_only_for_new_admissible_entries() {
             .to_string()
             .contains("opening balance does not cover")
     );
-    // A lower bid at the pooled nonce needs a selection, then loses it.
+    // A lower bid at the pooled nonce cannot replace it: refused at once.
     let outbid = payment(config, state, &SECRET, start, other(), 1, 0);
-    assert_eq!(deliver(vec![outbid.clone()]), 1, "one selection for one new candidate");
+    assert_eq!(deliver(vec![outbid.clone()]), 0, "a replacement must raise the fee rate");
     assert_eq!(published(&node), revision, "an unchanged selection does not publish");
+    // A newcomer only execution refuses costs one selection, then loses it.
+    let support = Operation::Support {
+        round: 0,
+        proposal: [9; 32],
+        amount: 1u32.into(),
+    };
+    let body = unsigned(config, &OTHER, nonce(&node, &other()), support);
+    let lost = exact(config, state, &OTHER, body, 0);
+    assert_eq!(deliver(vec![lost.clone()]), 1, "one selection for one new candidate");
+    assert_eq!(published(&node), revision, "an unchanged selection does not publish");
+    assert_eq!(deliver(vec![lost]), 0, "a lost selection is remembered");
     for _ in 0..3 {
         assert_eq!(
             deliver(vec![forged.clone(), used.clone(), unpayable.clone(), outbid.clone()]),
@@ -240,11 +251,16 @@ fn relay_selects_and_publishes_only_for_new_admissible_entries() {
     }
     assert_eq!(published(&node), revision);
     assert_eq!(snapshot(&node).mempool, vec![pooled.clone()]);
-    // A pool change ends a lost-selection refusal, never a stale-state one.
+    // A pool change ends a pool-scoped refusal, never a stale-state one; the
+    // underbid replacement is refused again by its rule alone.
     let other_payment = payment(config, state, &OTHER, nonce(&node, &other()), key(), 1, 0);
     node.submit_transaction(other_payment).unwrap();
-    assert_eq!(deliver(vec![used, unpayable, outbid.clone()]), 1);
+    assert_eq!(deliver(vec![used, unpayable, outbid.clone()]), 0);
     assert!(!ids(&snapshot(&node).mempool).contains(&codec::transaction_id(&outbid)));
+    // An RPC resubmission of a refused identity is answered from the cache.
+    selections();
+    assert!(node.submit_transaction(outbid).is_err());
+    assert_eq!(selections(), 0);
 }
 
 #[test]
@@ -992,68 +1008,74 @@ fn admission_spends_no_curve_work_under_the_node_lock() {
 }
 
 #[test]
-fn equal_rate_replacement_churn_clears_only_when_a_template_is_built() {
+fn equal_rate_replacement_churn_is_refused_without_a_selection() {
     let directory = tempfile::tempdir().unwrap();
     let node = decision_node(directory.path(), 64 * 1024);
     let view = snapshot(&node);
     let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
     let start = nonce(&node, &key());
     // Same nonce, fee and weight: only the data byte differs. Equal bids go
-    // to the smaller txid, so in descending txid order each one replaces the
-    // last without any fee bump and changes the included trade set.
-    let mut variants: Vec<_> = (0..32u8)
-        .map(|salt| {
-            let operation = Operation::Deposit {
-                amount: 201u32.into(),
-                decision: state.decision_id(),
-                outcome: Some(Outcome::Fail),
-            };
-            let mut body = unsigned(config, &SECRET, start, operation);
-            body.data = vec![salt];
-            exact(config, state, &SECRET, body, 0)
-        })
-        .collect();
+    // to the smaller txid, so in descending txid order each one used to
+    // replace the last without any fee bump, each costing a selection, a
+    // publication and a template rebuild that clears a different trade set.
+    let variant = |salt: u8, extra: u64| {
+        let operation = Operation::Deposit {
+            amount: 201u32.into(),
+            decision: state.decision_id(),
+            outcome: Some(Outcome::Fail),
+        };
+        let mut body = unsigned(config, &SECRET, start, operation);
+        body.data = vec![salt];
+        exact(config, state, &SECRET, body, extra)
+    };
+    // A voluntary extra fee leaves room for raises below an eighth.
+    let base = 1000;
+    let mut variants: Vec<_> = (0..32u8).map(|salt| variant(salt, base)).collect();
     assert!(variants.iter().all(|tx| tx.body.fee == variants[0].body.fee));
     variants.sort_by_key(|tx| std::cmp::Reverse(codec::transaction_id(tx)));
     let revision = published(&node);
     selections();
     let mut churn = Cost::default();
-    let mut most = Cost::default();
     for tx in &variants {
         let ((), cost) = metered(|| relay(&node, vec![tx.clone()]));
-        assert_eq!(snapshot(&node).mempool, vec![tx.clone()], "each variant is accepted");
         churn.evaluations += cost.evaluations;
         churn.under_lock += cost.under_lock;
         churn.held += cost.held;
-        most.under_lock = most.under_lock.max(cost.under_lock);
-        most.held = most.held.max(cost.held);
     }
     let selected = selections();
-    let (block, template) = metered(|| node.template().unwrap());
-    let (_, repeat) = metered(|| node.template().unwrap());
     eprintln!(
-        "32 equal-rate replacements: {selected} selections, {} publishes; curve evaluations {} (under the node lock {}, at most {} per message); lock held {:?} in all, {:?} at most",
+        "32 equal-rate replacements: {selected} selections, {} publishes, lock held {:?} in all",
         published(&node) - revision,
-        churn.evaluations,
-        churn.under_lock,
-        most.under_lock,
-        churn.held,
-        most.held
+        churn.held
     );
-    eprintln!(
-        "then one template: curve evaluations {} (under the node lock {}); a repeat: {}",
-        template.evaluations, template.under_lock, repeat.evaluations
-    );
-    assert_eq!(selected, 32);
-    assert_eq!(published(&node), revision + 32, "every replacement is published");
-    assert_eq!(churn.under_lock, 0);
-    assert_eq!(churn.evaluations, 0);
-    assert_eq!(block.transactions, vec![variants[31].clone()]);
+    // Only the first entered the pool; every equal-rate replacement was
+    // refused before any selection, and is not reconsidered when resent.
+    assert_eq!(selected, 1);
+    assert_eq!(published(&node), revision + 1);
+    assert_eq!(snapshot(&node).mempool, vec![variants[0].clone()]);
+    assert_eq!((churn.under_lock, churn.evaluations), (0, 0));
+    relay(&node, variants[1..].to_vec());
+    assert!(node.submit_transaction(variants[1].clone()).is_err());
+    assert_eq!(selections(), 0);
+    let (block, template) = metered(|| node.template().unwrap());
+    assert_eq!(block.transactions, vec![variants[0].clone()]);
     assert!(template.evaluations > 0);
     assert_eq!(template.under_lock, 0);
-    assert_eq!(repeat.evaluations, 0, "an unchanged selection reuses its template");
+    // A replacement raising the fee rate by less than an eighth is refused
+    // too; one raising it by an eighth and the minimum fee rate replaces.
+    let fee = variants[0].body.fee.to_u64().unwrap();
+    let small = variant(40, base + fee / 16);
+    assert!(!replaces(config, state, &small, &variants[0]));
+    assert!(node.submit_transaction(small).is_err());
+    assert_eq!(selections(), 0);
+    let raised = variant(41, base + fee / 8 + 2);
+    assert!(replaces(config, state, &raised, &variants[0]));
+    node.submit_transaction(raised.clone()).unwrap();
+    assert_eq!(selections(), 1);
+    assert_eq!(snapshot(&node).mempool, vec![raised.clone()]);
+    let (block, _) = metered(|| node.template().unwrap());
+    assert_eq!(block.transactions, vec![raised]);
 }
-
 #[test]
 fn template_clearing_runs_off_the_node_lock() {
     let directory = tempfile::tempdir().unwrap();
@@ -1376,4 +1398,409 @@ fn admission_lock_hold_at_full_pool() {
             .all(|cost| cost.evaluations == 0)
     );
     assert_eq!(template.under_lock, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Scheduling the node lock: the node-wide admission budget, block validation
+// outside the lock, template builds and spends awaiting their funding.
+
+fn relay_from(node: &Node, source: &str, transactions: Vec<Transaction>, blocks: Vec<Block>) {
+    node.receive_peer(
+        &PeerMessage {
+            chain: snapshot(node).chain.chain_id(),
+            locator: Vec::new(),
+            blocks,
+            transactions,
+        },
+        source.parse().unwrap(),
+    )
+    .unwrap();
+}
+fn queued(node: &Node) -> usize {
+    node.admission.unpoisoned().queue.entries.len()
+}
+fn awaiting(node: &Node) -> Vec<Hash> {
+    node.locked()
+        .unwrap()
+        .awaiting
+        .iter()
+        .map(|entry| entry.id)
+        .collect()
+}
+fn stored(node: &Node, block: &Block) -> bool {
+    let hash = codec::block_hash(block);
+    let i = node.locked().unwrap();
+    i.chain.block_height(&hash).unwrap().is_some()
+}
+/// A mined child of the tip, distinguished by `salt`.
+fn child(node: &Node, salt: u64) -> Block {
+    let mut candidate = {
+        let i = node.locked().unwrap();
+        i.chain
+            .template(node.miner, Vec::new(), Node::timestamp(&i.chain))
+            .unwrap()
+    };
+    candidate.extranonce = salt.to_le_bytes();
+    candidate.header.merkle_root = codec::merkle_root(&candidate).unwrap();
+    Chain::mine(candidate, 1_000_000).unwrap()
+}
+/// Submit `block` on another thread whose execution of it pauses until the
+/// returned sender is used or dropped.
+fn parked_submission(
+    node: &Node,
+    block: Block,
+) -> (std::thread::JoinHandle<Result<bool>>, mpsc::Sender<()>) {
+    let (paused, pause) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel::<()>();
+    let submitter = node.clone();
+    let thread = std::thread::spawn(move || {
+        crate::chain::BLOCK_EXECUTION_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let _ = paused.send(());
+                let _ = resumed.recv();
+            }));
+        });
+        submitter.submit_block(block)
+    });
+    pause
+        .recv_timeout(Duration::from_secs(10))
+        .expect("block execution started");
+    (thread, resume)
+}
+
+#[test]
+fn admission_from_many_sources_stays_within_the_node_wide_selection_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 64 * 1024);
+    fund_other(&node);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let (start, other_start) = (nonce(&node, &key()), nonce(&node, &other()));
+    // Charge every admission 400 ms of the one-second burst, whatever it took.
+    SELECTION_CHARGE.with(|charge| charge.set(Some(Duration::from_millis(400))));
+    selections();
+    // Eight sources each relay four newcomers, one per message, at once.
+    let mut sent = Vec::new();
+    for round in 0..4u64 {
+        for source in 0..8u64 {
+            let (secret, nonce) = if source % 2 == 0 {
+                (&SECRET, start + round * 4 + source / 2)
+            } else {
+                (&OTHER, other_start + round * 4 + source / 2)
+            };
+            let tx = payment(config, state, secret, nonce, key(), 1, 0);
+            relay_from(&node, &format!("127.0.0.{}", source + 1), vec![tx.clone()], Vec::new());
+            sent.push(tx);
+        }
+    }
+    // Three admissions spent the burst; the other 29 newcomers wait, costing
+    // nothing, however many sources sent them.
+    assert_eq!(selections(), 3);
+    assert_eq!(queued(&node), 29);
+    assert_eq!(pool(&node).0.len(), 3);
+    // Once the budget has refilled, the next message admits all of them
+    // with one selection.
+    node.admission.unpoisoned().budget =
+        TimeBudget::new(SELECTION_TIME_PER_SECOND, SELECTION_TIME_BURST);
+    relay_from(&node, "127.0.0.9", Vec::new(), Vec::new());
+    assert_eq!(selections(), 1);
+    assert_eq!(queued(&node), 0);
+    assert_eq!(ids(&pool(&node).0), ids(&sent));
+    SELECTION_CHARGE.with(|charge| charge.set(None));
+    // A spent budget refuses public broadcasts until it has refilled.
+    node.admission.unpoisoned().budget.spend(SELECTION_TIME_BURST * 2, Instant::now());
+    let wait = node.selection_wait().expect("the budget is spent");
+    assert!(wait > Duration::from_secs(3) && wait <= Duration::from_secs(8), "{wait:?}");
+}
+
+#[test]
+fn the_admission_queue_keeps_each_source_a_fair_share() {
+    let transaction = Transaction {
+        body: unsigned(&configuration(16 * 1024), &SECRET, 0, Operation::Refund {
+            round: 0,
+            proposal: [0; 32],
+        }),
+        signature: [0; 64],
+    };
+    let newcomer = |n: u32, source: &str| {
+        let mut id = [0; 32];
+        id[..4].copy_from_slice(&n.to_le_bytes());
+        Newcomer {
+            id,
+            transaction: transaction.clone(),
+            source: Some(source.parse().unwrap()),
+            authenticated: true,
+        }
+    };
+    let mut queue = AdmissionQueue::default();
+    for n in 0..MAX_QUEUED_ADMISSIONS as u32 {
+        queue.push(newcomer(n, "127.0.0.1"));
+    }
+    assert_eq!(queue.entries.len(), MAX_QUEUED_ADMISSIONS);
+    // The flooding source cannot add more; another source displaces its
+    // oldest entry, and a repeated identity is ignored.
+    queue.push(newcomer(5_000, "127.0.0.1"));
+    assert!(!queue.ids.contains(&newcomer(5_000, "127.0.0.1").id));
+    queue.push(newcomer(6_000, "127.0.0.2"));
+    assert!(queue.ids.contains(&newcomer(6_000, "127.0.0.2").id));
+    assert!(!queue.ids.contains(&newcomer(0, "127.0.0.1").id));
+    queue.push(newcomer(6_000, "127.0.0.3"));
+    assert_eq!(queue.entries.len(), MAX_QUEUED_ADMISSIONS);
+    assert_eq!(queue.held[&Some("127.0.0.2".parse().unwrap())], 1);
+    assert_eq!(queue.take().len(), MAX_QUEUED_ADMISSIONS);
+    assert!(queue.is_empty() && queue.held.is_empty());
+}
+
+#[test]
+fn a_low_bid_at_a_count_full_pool_is_refused_without_a_selection() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = configuration(64 * 1024);
+    config.max_signatures = 4;
+    let node = Node::open(&directory.path().join("node.sqlite"), config, key()).unwrap();
+    for _ in 0..8 {
+        node.mine(1_000_000).unwrap();
+    }
+    fund_other(&node);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let start = nonce(&node, &key());
+    for offset in 0..4 {
+        node.submit_transaction(payment(config, state, &SECRET, start + offset, key(), 1, 10))
+            .unwrap();
+    }
+    assert_eq!(pool(&node).0.len(), 4, "the selection is count-full");
+    selections();
+    // A newcomer that does not outbid the weakest entry cannot enter, so it
+    // is refused before any selection, relayed or submitted.
+    let low = payment(config, state, &OTHER, nonce(&node, &other()), key(), 1, 0);
+    let refused = node.submit_transaction(low.clone()).unwrap_err().to_string();
+    assert!(refused.contains("does not outbid its weakest entry"), "{refused}");
+    relay(&node, vec![low]);
+    assert_eq!(selections(), 0);
+    // One that does outbid it costs one selection and displaces it.
+    let high = payment(config, state, &OTHER, nonce(&node, &other()), key(), 1, 100);
+    node.submit_transaction(high.clone()).unwrap();
+    assert_eq!(selections(), 1);
+    let (selection, backlog, _) = pool(&node);
+    assert!(ids(&selection).contains(&codec::transaction_id(&high)));
+    assert_eq!(selection.len(), 4);
+    assert_eq!(backlog.len(), 1, "the displaced entry waits for capacity");
+}
+
+#[test]
+fn a_waiting_block_submission_goes_ahead_of_queued_admissions() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let newcomer = payment(config, state, &SECRET, nonce(&node, &key()), key(), 1, 0);
+    // As if a block submission were waiting for the node lock.
+    node.blocks_waiting.fetch_add(1, Ordering::AcqRel);
+    selections();
+    relay(&node, vec![newcomer.clone()]);
+    assert_eq!(selections(), 0, "admission yields to the block");
+    assert_eq!(queued(&node), 1);
+    assert!(pool(&node).0.is_empty());
+    node.blocks_waiting.fetch_sub(1, Ordering::AcqRel);
+    // The block is stored first; the newcomer then enters the new tip's
+    // pool, once its recovery selection has run.
+    let block = empty_block(&node);
+    assert!(node.submit_block(block.clone()).unwrap());
+    assert_eq!(selections(), 2);
+    let (selection, _, tip) = pool(&node);
+    assert_eq!((selection, tip), (vec![newcomer], codec::block_hash(&block)));
+}
+
+#[test]
+fn block_execution_runs_off_the_node_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = decision_node(directory.path(), 64 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let trade = decision_trade(config, state, &SECRET, nonce(&node, &key()), Outcome::Fail, 301);
+    node.submit_transaction(trade.clone()).unwrap();
+    let block = Chain::mine(node.template().unwrap(), 1_000_000).unwrap();
+    let (submission, resume) = parked_submission(&node, block.clone());
+    // While the block executes, the node lock is free: admission, template
+    // capture and status reads complete. (The explorer worker may hold it
+    // briefly.)
+    let free = (0..100).any(|_| {
+        let free = node.inner.try_lock().is_ok();
+        if !free {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        free
+    });
+    let paid = payment(config, state, &OTHER, nonce(&node, &other()), key(), 1, 0);
+    let admitted = node.submit_transaction(paid.clone());
+    let template = node.template();
+    let status = node.status();
+    drop(resume);
+    assert!(submission.join().unwrap().unwrap(), "the block became the tip");
+    assert!(free, "block execution held the node lock");
+    admitted.unwrap();
+    let template = template.unwrap();
+    assert_eq!(template.header.previous, view.chain.tip_hash());
+    assert_eq!(ids(&template.transactions), ids(&[trade, paid.clone()]));
+    assert_eq!(status.unwrap()["tip"], hex::encode(view.chain.tip_hash()));
+    assert_eq!(snapshot(&node).chain.tip_hash(), codec::block_hash(&block));
+    assert_eq!(pool(&node).0, vec![paid]);
+}
+
+#[test]
+fn concurrently_validated_siblings_commit_as_tip_and_side_branch() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let (first, second) = (child(&node, 1), child(&node, 2));
+    // Both pass their checks against the same tip, then execute at once.
+    let (a, resume_a) = parked_submission(&node, first.clone());
+    let (b, resume_b) = parked_submission(&node, second.clone());
+    drop(resume_a);
+    assert!(a.join().unwrap().unwrap(), "the first to finish becomes the tip");
+    drop(resume_b);
+    assert!(!b.join().unwrap().unwrap(), "its sibling is stored on a side branch");
+    let check = |node: &Node| {
+        let i = node.locked().unwrap();
+        let (one, two) = (codec::block_hash(&first), codec::block_hash(&second));
+        let stored = (i.chain.tip_hash(), i.chain.block_height(&two).unwrap());
+        let active = i.chain.hash_at_height(second.height);
+        drop(i);
+        assert_eq!(stored, (one, Some(second.height)));
+        assert_eq!(active, Some(one));
+    };
+    check(&node);
+    // Startup replay reconstructs the same history.
+    drop(node);
+    let node = Node::open(
+        &directory.path().join("node.sqlite"),
+        configuration(16 * 1024),
+        key(),
+    )
+    .unwrap();
+    check(&node);
+}
+
+#[test]
+fn a_side_branch_flood_from_one_source_spends_only_its_own_share() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    // Children of one parent: the first becomes the tip, and each later one
+    // is a side block of equal work.
+    let count = SIDE_SOURCE_BLOCKS as usize + 3;
+    let siblings: Vec<Block> = (0..count as u64).map(|salt| child(&node, salt)).collect();
+    assert!(node.submit_block(siblings[0].clone()).unwrap());
+    let flood = &siblings[1..count - 1];
+    for blocks in flood.chunks(MAX_BATCH) {
+        relay_from(&node, "127.0.0.1", Vec::new(), blocks.to_vec());
+    }
+    let (kept, declined) = flood.split_at(SIDE_SOURCE_BLOCKS as usize);
+    assert!(kept.iter().all(|block| stored(&node, block)));
+    assert!(declined.iter().all(|block| !stored(&node, block)));
+    // The flooding source spent only its own share: another source's side
+    // block is still validated and stored.
+    let other = &siblings[count - 1];
+    relay_from(&node, "127.0.0.2", Vec::new(), vec![other.clone()]);
+    assert!(stored(&node, other));
+    assert_eq!(snapshot(&node).chain.tip_hash(), codec::block_hash(&siblings[0]));
+}
+
+#[test]
+fn a_new_tip_template_never_waits_for_a_build_of_the_old_tip() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 64 * 1024);
+    let (paused, pause) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel::<()>();
+    let builder = node.clone();
+    let building = std::thread::spawn(move || {
+        crate::chain::TEMPLATE_BUILD_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let _ = paused.send(());
+                let _ = resumed.recv();
+            }));
+        });
+        builder.template_shared(Freshness::Throttled)
+    });
+    pause
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the template build started");
+    // A new tip arrives while that build is paused. Its template is built
+    // at once, without waiting for the old build.
+    assert!(node.submit_block(empty_block(&node)).unwrap());
+    let tip = snapshot(&node).chain.tip_hash();
+    let (block, retry) = node.template_shared(Freshness::Throttled).unwrap();
+    assert_eq!((block.header.previous, retry), (tip, None));
+    // The old build stops at its next step, and that request is served the
+    // new tip's template too.
+    drop(resume);
+    let (served, _) = building.join().unwrap().unwrap();
+    assert!(Arc::ptr_eq(&served, &block));
+}
+
+#[test]
+fn a_spend_from_an_account_a_pending_transfer_creates_waits_for_its_funding() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let fresh = [78; 32];
+    let funding = payment(
+        config,
+        state,
+        &SECRET,
+        nonce(&node, &key()),
+        crypto::public_key(&fresh).unwrap(),
+        5_000,
+        0,
+    );
+    node.submit_transaction(funding.clone()).unwrap();
+    // The spend cannot share a block with its funding, so it is held rather
+    // than refused, and not relayed.
+    let spend = payment(config, state, &fresh, 0, key(), 1, 0);
+    let id = node.submit_transaction(spend.clone()).unwrap();
+    assert_eq!(awaiting(&node), vec![id]);
+    assert_eq!(snapshot(&node).mempool, vec![funding.clone()]);
+    // Without a pending transfer creating its account, a spend is refused.
+    let stranger = payment(config, state, &[79; 32], 0, key(), 1, 0);
+    let refused = node.submit_transaction(stranger).unwrap_err().to_string();
+    assert!(refused.contains("sender account does not exist"), "{refused}");
+    // The funding confirms first; the spend then enters the pool and
+    // confirms in the next block.
+    assert_eq!(node.mine(1_000_000).unwrap().transactions, vec![funding]);
+    assert!(awaiting(&node).is_empty());
+    assert_eq!(pool(&node).0, vec![spend.clone()]);
+    assert_eq!(node.mine(1_000_000).unwrap().transactions, vec![spend]);
+}
+
+#[test]
+fn spends_awaiting_funding_are_bounded_and_expire() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let fresh = [80; 32];
+    let funding = payment(
+        config,
+        state,
+        &SECRET,
+        nonce(&node, &key()),
+        crypto::public_key(&fresh).unwrap(),
+        5_000,
+        0,
+    );
+    node.submit_transaction(funding).unwrap();
+    for nonce in 0..AWAITING_PER_SENDER as u64 {
+        node.submit_transaction(payment(config, state, &fresh, nonce, key(), 1, 0))
+            .unwrap();
+    }
+    let beyond = payment(config, state, &fresh, AWAITING_PER_SENDER as u64, key(), 1, 0);
+    assert!(node.submit_transaction(beyond).is_err());
+    assert_eq!(awaiting(&node).len(), AWAITING_PER_SENDER);
+    // Blocks that leave the funding pending: the spends wait AWAITING_TIPS
+    // new tips, then are dropped.
+    for _ in 0..AWAITING_TIPS {
+        assert!(node.submit_block(empty_block(&node)).unwrap());
+    }
+    assert_eq!(awaiting(&node).len(), AWAITING_PER_SENDER);
+    assert!(node.submit_block(empty_block(&node)).unwrap());
+    assert!(awaiting(&node).is_empty());
 }

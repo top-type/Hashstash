@@ -106,12 +106,32 @@ fn permanent(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// A template build stopped at a step boundary because the caller no longer
+/// wants it, as when its parent stopped being the tip. Nothing was built.
+#[derive(Debug)]
+pub struct TemplateStale;
+impl std::fmt::Display for TemplateStale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "template build abandoned: its parent is no longer the tip")
+    }
+}
+impl std::error::Error for TemplateStale {}
+fn unless_stale(stale: &dyn Fn() -> bool) -> Result<()> {
+    if stale() {
+        return Err(TemplateStale.into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 thread_local! {
     /// Fail block finishing on this thread for accepted sets longer than this.
     pub(crate) static FAIL_FINISH_ABOVE: Cell<Option<usize>> = const { Cell::new(None) };
     /// Run on this thread when a template build starts, before any clearing.
     pub(crate) static TEMPLATE_BUILD_HOOK: RefCell<Option<Box<dyn FnMut()>>> =
+        const { RefCell::new(None) };
+    /// Run on this thread when a received block's execution starts.
+    pub(crate) static BLOCK_EXECUTION_HOOK: RefCell<Option<Box<dyn FnMut()>>> =
         const { RefCell::new(None) };
 }
 
@@ -1458,6 +1478,21 @@ impl Chain {
         now: u64,
         admission: bool,
     ) -> Result<(Entry, Arc<State>)> {
+        let validation = self.check_block(block, now, admission, None)?;
+        let executed = validation.execute(block)?;
+        Ok((executed.entry, executed.state))
+    }
+    /// Every check of a block that needs this chain: its header against the
+    /// stored parent and that parent's required target, proof of work and
+    /// Merkle root, the side-branch admission policy, transaction anchors and
+    /// the parent state. Executing the block needs only the returned capture.
+    fn check_block(
+        &self,
+        block: &Block,
+        now: u64,
+        admission: bool,
+        bytes: Option<Vec<u8>>,
+    ) -> Result<BlockValidation> {
         let parent = self
             .load_entry(&block.header.previous)?
             .context("unknown parent")?;
@@ -1503,61 +1538,27 @@ impl Chain {
         }
         self.validate_transaction_anchors(&block.header.previous, &block.transactions)
             .map_err(permanent)?;
-        let parent_state = self.load_state(&block.header.previous)?;
-        // Disk/reconstruction failures above are transient local failures and are
+        // The skip link depends only on the block's own branch, whichever
+        // branch is active when the block is stored.
+        let mut ancestry = Some((block.header.previous, parent.clone()));
+        let skip = self
+            .branch_ancestor(&mut ancestry, skip_height(block.height))
+            .map_err(permanent)?;
+        // Disk/reconstruction failures here are transient local failures and are
         // never entered into the cache of permanently invalid block messages.
-        (|| -> Result<(Entry, Arc<State>)> {
-            ensure!(
-                codec::body_size(block)? as u64 <= parent_state.settings.block_bytes,
-                "block body exceeds byte limit"
-            );
-            let state = consensus::execute(
-                &self.config,
-                &parent_state,
-                &block.header.previous,
-                &block.miner,
-                &work,
-                &block.transactions,
-            )?;
-            ensure!(
-                state.root() == block.state_root,
-                "incorrect post-state commitment"
-            );
-            let clock = parent
-                .clock
-                .checked_add(parent_state.settings.interval)
-                .context("expected timestamp schedule overflow")?;
-            let (anchor_timestamp, anchor_clock) = match parent.height {
-                0 => (block.header.timestamp, clock),
-                // The first block cannot backdate its branch's schedule: the
-                // anchor is at least the second timestamp less one interval.
-                1 => {
-                    let floor = u64::from(block.header.timestamp)
-                        .saturating_sub(parent_state.settings.interval);
-                    (
-                        parent.anchor_timestamp.max(u32::try_from(floor)?),
-                        parent.anchor_clock,
-                    )
-                }
-                _ => (parent.anchor_timestamp, parent.anchor_clock),
-            };
-            let mut ancestry = Some((block.header.previous, parent.clone()));
-            let skip = self.branch_ancestor(&mut ancestry, skip_height(block.height))?;
-            Ok((
-                Entry {
-                    header: block.header.clone(),
-                    height: block.height,
-                    clock,
-                    anchor_timestamp,
-                    anchor_clock,
-                    work: &parent.work + work,
-                    skip,
-                    capacity: parent.capacity.max(state.settings.block_bytes),
-                },
-                Arc::new(state),
-            ))
-        })()
-        .map_err(permanent)
+        let parent_state = self.load_state(&block.header.previous)?;
+        let extends = &parent.work + &work > self.tip_entry.work;
+        Ok(BlockValidation {
+            config: self.config.clone(),
+            hash: codec::block_hash(block),
+            bytes,
+            parent,
+            parent_state,
+            work,
+            skip,
+            admitted: !admission,
+            extends,
+        })
     }
 
     /// Budget only reconstruction of already validated historical states.
@@ -1569,17 +1570,38 @@ impl Chain {
         steps: usize,
     ) -> Result<bool> {
         ensure!(steps > 0, "replay budget must be positive");
-        self.replay_budget.set(Some(steps));
-        let result = self.submit(block, now);
-        self.replay_budget.set(None);
-        result
+        let Some(validation) = self.begin_submission(&block, now, Some(steps))? else {
+            return Ok(false);
+        };
+        let executed = validation.execute(&block);
+        self.finish_submission(validation, block, executed, now)
     }
     pub fn submit(&mut self, block: Block, now: u64) -> Result<bool> {
-        let hash = codec::block_hash(&block);
-        if self.load_entry(&hash)?.is_some() {
+        let Some(validation) = self.begin_submission(&block, now, None)? else {
             return Ok(false);
+        };
+        let executed = validation.execute(&block);
+        self.finish_submission(validation, block, executed, now)
+    }
+    /// The checks of [Chain::submit] that need this chain, with the replay of
+    /// a historical parent state limited to `steps` replayed blocks when
+    /// given (see [Chain::submit_with_replay_budget]). None for a block that
+    /// is already stored. The returned capture executes the block without
+    /// the chain, so a node runs execution, which may clear batch trades for
+    /// seconds, outside its chain lock; [Chain::finish_submission] then
+    /// stores the result, which is exactly what [Chain::submit] would give
+    /// at the time it finishes.
+    pub fn begin_submission(
+        &mut self,
+        block: &Block,
+        now: u64,
+        steps: Option<usize>,
+    ) -> Result<Option<BlockValidation>> {
+        let hash = codec::block_hash(block);
+        if self.load_entry(&hash)?.is_some() {
+            return Ok(None);
         }
-        let bytes = codec::encode(&block);
+        let bytes = codec::encode(block);
         // A header digest alone cannot identify an invalid body: a peer may send
         // another payload carrying the same valid header. Hash the whole record.
         let identity = crypto::sha256d(&bytes);
@@ -1588,35 +1610,62 @@ impl Chain {
             anyhow::bail!("cached invalid block: {error}");
         }
         if self.held.headers.contains_key(&block.header.previous) {
-            self.hold_child(&block, now)?;
+            self.hold_child(block, now)?;
             return Err(SideBranchRefused("parent is a held side-branch header").into());
         }
         // A held chain that claimed more work than the tip is not declined again.
         let admitted = self.held.admitted(&hash);
-        let (entry, state) = match self.validate_block(&block, now, !admitted) {
-            Ok(valid) => valid,
+        self.replay_budget.set(steps);
+        let checked = self.check_block(block, now, !admitted, Some(bytes));
+        self.replay_budget.set(None);
+        checked.map(Some).inspect_err(|error| {
+            if error.is::<SideBranchRefused>() {
+                self.decline(block);
+            } else if error.downcast_ref::<PermanentBlockError>().is_some() {
+                self.reject(block, identity, error);
+            }
+        })
+    }
+    /// Store a block that [Chain::begin_submission] checked and that was then
+    /// executed, returning whether it became the tip. Other blocks may have
+    /// been stored meanwhile: one this block's submission raced and lost is
+    /// reported as not selected, and a block that no longer extends the tip
+    /// passes the side-branch admission policy against the current tip, as
+    /// if it had only now arrived. None of its checks depended on the tip.
+    pub fn finish_submission(
+        &mut self,
+        validation: BlockValidation,
+        block: Block,
+        executed: Result<ExecutedBlock>,
+        now: u64,
+    ) -> Result<bool> {
+        let hash = validation.hash;
+        if self.load_entry(&hash)?.is_some() {
+            return Ok(false);
+        }
+        let bytes = validation
+            .bytes
+            .unwrap_or_else(|| codec::encode(&block));
+        let ExecutedBlock { entry, state } = match executed {
+            Ok(executed) => executed,
             Err(error) => {
-                if error.is::<SideBranchRefused>() {
-                    // The header checks passed against the stored parent, so
-                    // the block's compact target is exactly its required one.
-                    let parent = self
-                        .load_entry(&block.header.previous)?
-                        .context("unknown parent")?;
-                    let work = math::work(&math::target_from_bits(block.header.bits)?);
-                    let claimed = &parent.work + &work;
-                    self.hold(&block, block.header.previous, work, claimed);
-                } else if error.downcast_ref::<PermanentBlockError>().is_some() {
-                    self.remember_invalid(identity, &error);
-                    // Only a body its header commits to proves the header
-                    // invalid; any other body disqualifies just itself.
-                    if codec::merkle_root(&block).ok() == Some(block.header.merkle_root) {
-                        self.held.remove_branch(&hash);
-                    }
+                if error.downcast_ref::<PermanentBlockError>().is_some() {
+                    self.reject(&block, crypto::sha256d(&bytes), &error);
                 }
                 return Err(error);
             }
         };
         let best = entry.work > self.tip_entry.work;
+        let admitted = validation.admitted;
+        if !best
+            && !admitted
+            && let Err(error) = self.admit_branch(&validation.parent, &validation.work)
+        {
+            if error.is::<SideBranchRefused>() {
+                self.decline(&block);
+            }
+            return Err(error);
+        }
         let transaction = self.db.transaction()?;
         transaction.execute(
             "INSERT INTO blocks(hash,bytes,accepted_at) VALUES(?1,?2,?3)",
@@ -1637,6 +1686,36 @@ impl Chain {
         self.held.remove(&hash);
         self.record(hash, block, Arc::new(entry), state, best);
         Ok(best)
+    }
+    /// Hold the header of a block that [Chain::begin_submission] checked but
+    /// that local policy declined to execute for `reason`, as the side-branch
+    /// admission policy holds one, and return that refusal.
+    pub fn decline_checked(&mut self, block: &Block, reason: &'static str) -> anyhow::Error {
+        self.decline(block);
+        SideBranchRefused(reason).into()
+    }
+    /// Hold the header of a block the side-branch admission policy declined.
+    /// Its header checks passed against the stored parent, so the block's
+    /// compact target is exactly its required one.
+    fn decline(&mut self, block: &Block) {
+        let Ok(Some(parent)) = self.load_entry(&block.header.previous) else {
+            return;
+        };
+        let Ok(target) = math::target_from_bits(block.header.bits) else {
+            return;
+        };
+        let work = math::work(&target);
+        let claimed = &parent.work + &work;
+        self.hold(block, block.header.previous, work, claimed);
+    }
+    /// Remember a permanently invalid block message. Only a body its header
+    /// commits to proves the header invalid; any other body disqualifies just
+    /// itself.
+    fn reject(&mut self, block: &Block, identity: Hash, error: &anyhow::Error) {
+        self.remember_invalid(identity, error);
+        if codec::merkle_root(block).ok() == Some(block.header.merkle_root) {
+            self.held.remove_branch(&codec::block_hash(block));
+        }
     }
     pub fn template(
         &self,
@@ -1842,7 +1921,8 @@ impl Chain {
         let state = match finisher.finish(execution, accepted) {
             Ok(state) => state,
             Err(error) => {
-                let Some((length, state)) = finisher.prefix(&result.transactions) else {
+                let Some((length, state)) = finisher.prefix(&result.transactions, &|| false)?
+                else {
                     return Err(error);
                 };
                 eprintln!("Selection kept {length} of {accepted} transactions: {error:#}");
@@ -2118,8 +2198,13 @@ impl Finisher<'_> {
     }
     /// Selection is local policy: if the accepted set cannot finish as a block,
     /// keep the longest prefix found by bisection, down to an empty block.
-    /// A chain-level failure that also rejects the empty block is returned.
-    fn prefix(&self, accepted: &[Transaction]) -> Option<(usize, State)> {
+    /// None for a chain-level failure that also rejects the empty block. The
+    /// search stops with [TemplateStale] between attempts once `stale` holds.
+    fn prefix(
+        &self,
+        accepted: &[Transaction],
+        stale: &dyn Fn() -> bool,
+    ) -> Result<Option<(usize, State)>> {
         let finish = |length: usize| -> Result<State> {
             let mut execution =
                 consensus::prepare_block(self.config, self.parent, self.miner, self.block_work)?;
@@ -2128,16 +2213,20 @@ impl Finisher<'_> {
             }
             self.finish(execution, length)
         };
-        let mut best = (0, finish(0).ok()?);
+        let Ok(empty) = finish(0) else {
+            return Ok(None);
+        };
+        let mut best = (0, empty);
         let mut failed = accepted.len();
         while failed - best.0 > 1 {
+            unless_stale(stale)?;
             let middle = best.0 + (failed - best.0) / 2;
             match finish(middle) {
                 Ok(state) => best = (middle, state),
                 Err(_) => failed = middle,
             }
         }
-        Some(best)
+        Ok(Some(best))
     }
 }
 
@@ -2214,12 +2303,21 @@ impl TemplateJob {
         self.header.previous
     }
     pub fn build(&self) -> Result<TemplateBuild> {
+        self.build_unless(&|| false)
+    }
+    /// [TemplateJob::build], abandoned with [TemplateStale] once `stale`
+    /// holds at a step boundary: between applied transactions, before the
+    /// block is finished, and between the finishing attempts of a prefix
+    /// search. One finishing attempt, which clears the included trades,
+    /// always runs to its end.
+    pub fn build_unless(&self, stale: &dyn Fn() -> bool) -> Result<TemplateBuild> {
         #[cfg(test)]
         TEMPLATE_BUILD_HOOK.with(|hook| {
             if let Some(hook) = hook.borrow_mut().as_mut() {
                 hook();
             }
         });
+        unless_stale(stale)?;
         let finisher = Finisher {
             config: &self.config,
             parent: &self.parent,
@@ -2234,6 +2332,7 @@ impl TemplateJob {
         // apply, the block keeps the prefix before it.
         let mut applied = 0;
         for transaction in &self.transactions {
+            unless_stale(stale)?;
             if execution
                 .apply_verified_transaction(&self.config, transaction)
                 .is_err()
@@ -2242,10 +2341,11 @@ impl TemplateJob {
             }
             applied += 1;
         }
+        unless_stale(stale)?;
         let (kept, state) = match finisher.finish(execution, applied) {
             Ok(state) => (applied, state),
             Err(error) => {
-                let Some(kept) = finisher.prefix(&self.transactions[..applied]) else {
+                let Some(kept) = finisher.prefix(&self.transactions[..applied], stale)? else {
                     return Err(error);
                 };
                 eprintln!(
@@ -2269,6 +2369,103 @@ impl TemplateJob {
             state.root(),
         )?;
         Ok(TemplateBuild { block, kept })
+    }
+}
+
+/// A received block that passed every check needing the chain, captured by
+/// [Chain::begin_submission]. Executing it is a pure function of this capture
+/// and the block, the same execution [Chain::submit] runs, so a node runs it
+/// on its own worker without holding its chain lock.
+pub struct BlockValidation {
+    config: Config,
+    hash: Hash,
+    /// The canonical block message, once a submission encoded it.
+    bytes: Option<Vec<u8>>,
+    parent: Arc<Entry>,
+    parent_state: Arc<State>,
+    work: Amount,
+    skip: Hash,
+    /// Part of a held chain that claimed more work than the tip, so exempt
+    /// from the side-branch admission policy.
+    admitted: bool,
+    /// The block's branch claimed more work than the tip when it was checked.
+    extends: bool,
+}
+/// The execution of a [BlockValidation], for [Chain::finish_submission].
+pub struct ExecutedBlock {
+    entry: Entry,
+    state: Arc<State>,
+}
+impl BlockValidation {
+    /// Whether the block would have become the tip when it was checked;
+    /// otherwise it is stored, if at all, on a side branch.
+    pub fn extends_tip(&self) -> bool {
+        self.extends
+    }
+    /// Whether the side-branch admission policy did not apply to it.
+    pub fn admitted(&self) -> bool {
+        self.admitted
+    }
+    /// Apply the block's transactions to its parent state and check the
+    /// committed result. Failures are permanent for this block message.
+    pub fn execute(&self, block: &Block) -> Result<ExecutedBlock> {
+        #[cfg(test)]
+        BLOCK_EXECUTION_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+        let (parent, parent_state, work) = (&self.parent, &self.parent_state, &self.work);
+        (|| -> Result<ExecutedBlock> {
+            ensure!(
+                codec::body_size(block)? as u64 <= parent_state.settings.block_bytes,
+                "block body exceeds byte limit"
+            );
+            let state = consensus::execute(
+                &self.config,
+                parent_state,
+                &block.header.previous,
+                &block.miner,
+                work,
+                &block.transactions,
+            )?;
+            ensure!(
+                state.root() == block.state_root,
+                "incorrect post-state commitment"
+            );
+            let clock = parent
+                .clock
+                .checked_add(parent_state.settings.interval)
+                .context("expected timestamp schedule overflow")?;
+            let (anchor_timestamp, anchor_clock) = match parent.height {
+                0 => (block.header.timestamp, clock),
+                // The first block cannot backdate its branch's schedule: the
+                // anchor is at least the second timestamp less one interval.
+                1 => {
+                    let floor = u64::from(block.header.timestamp)
+                        .saturating_sub(parent_state.settings.interval);
+                    (
+                        parent.anchor_timestamp.max(u32::try_from(floor)?),
+                        parent.anchor_clock,
+                    )
+                }
+                _ => (parent.anchor_timestamp, parent.anchor_clock),
+            };
+            Ok(ExecutedBlock {
+                entry: Entry {
+                    header: block.header.clone(),
+                    height: block.height,
+                    clock,
+                    anchor_timestamp,
+                    anchor_clock,
+                    work: &parent.work + work,
+                    skip: self.skip,
+                    capacity: parent.capacity.max(state.settings.block_bytes),
+                },
+                state: Arc::new(state),
+            })
+        })()
+        .map_err(permanent)
     }
 }
 

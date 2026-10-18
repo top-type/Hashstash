@@ -29,6 +29,14 @@ values.set([...values.keys()][0],JSON.stringify({...JSON.parse(full),omitted:-1}
 eq(cache.write(chain,wallet,{...state(),cursor:'0:1'}).saved,false,'entries beyond checkpoint are invalid');eq(cache.write(chain,wallet,{...state(),entries:[row(),row()]}).saved,false,'duplicate rows are invalid');
 eq(cache.write(chain,wallet,{...state(),entries:[{...row(),height:-1}]}).saved,false);eq(cache.write(chain,wallet,{...state(),anchor:'bad'}).saved,false);
 eq(cache.write(chain,wallet,{...state(),entries:[{...row(),raw:undefined}]}).saved,false,'unsigned records cannot enter the signed cache');
+// Earlier checkpoints, newest first and strictly below the current cursor,
+// let a scan resume when its latest anchor is unknown to the node.
+{const points=[{cursor:'1:5',anchor:id(5)},{cursor:'0:9223372036854775807',anchor:id(6)}];
+ eq(cache.read(chain,other).value.checkpoints,[],'a checkpoint saved without earlier ones reads as none');
+ eq(cache.write(chain,wallet,{...state(),checkpoints:points}),{saved:true});eq(cache.read(chain,wallet).value.checkpoints,points);
+ for(const bad of [[points[1],points[0]],[{cursor:'1:9223372036854775807',anchor:id(5)}],[points[0],points[0]],[{cursor:'1:5',anchor:'bad'}],[{cursor:'x',anchor:id(5)}],Array.from({length:5},(_,i)=>({cursor:`0:${10-i}`,anchor:id(5)})),'not a list'])
+  eq(cache.write(chain,wallet,{...state(),checkpoints:bad}).saved,false,'checkpoints must be valid and strictly below the cursor');
+ eq(cache.read(chain,wallet).value.checkpoints,points,'a refused write keeps the saved checkpoints');}
 eq(cache.clear(chain,wallet),{cleared:true});eq(cache.read(chain,wallet),{value:null});eq(cache.read(chain,other).value.entries.length,1,'clearing one cache preserves another wallet');
 const brokenKey=[...values.keys()][0];values.set(brokenKey,'{bad json');ok(cache.read(chain,other).error.includes('beginning'),'malformed local data starts full history scan');
 values.set(brokenKey,JSON.stringify({...state(),version:999}));eq(cache.read(chain,other).value,null,'unknown schema is never reused');

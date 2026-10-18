@@ -12,6 +12,10 @@
   // chosen in Mail settings) is kept apart from the checkpoint, so clearing
   // the saved scan returns to it rather than to genesis.
   const CACHE_PREFIX='hashstash-mail-scan-3:',START_PREFIX='hashstash-mail-start-1:',CACHE_LIMIT=256,CACHE_BYTES=2*1024*1024,SCAN_BUDGET=100,SCAN_REST_MS=250,END='9223372036854775807';
+  // A scan keeps this many earlier checkpoints, and rewinds at most this
+  // many times in one pass before it restarts from the beginning.
+  const CHECKPOINTS=4,MAX_REWINDS=4;
+  const entryCursor=entry=>`${entry.height}:${entry.position??entry.tx_position??0}`;
   function cacheEntry(entry){
     const position=entry.position??entry.tx_position??0;
     if(!validId(entry.txid)||!Number.isSafeInteger(entry.height)||entry.height<0||!Number.isSafeInteger(position)||position<0||typeof entry.raw!=='string'||entry.raw.length>CACHE_BYTES||!/^(?:[0-9a-f]{2})+$/.test(entry.raw))throw Error('Invalid cached mail.');
@@ -29,10 +33,13 @@
       return {version:1,height:value.height,anchor:value.anchor,origin:value.origin};
     };
     const validate=value=>{
-      const omitted=value?.omitted??0;
-      if(!value||value.version!==3||!validCursor(value.cursor)||!validId(value.anchor)||!Number.isSafeInteger(value.scanned)||value.scanned<0||!Number.isSafeInteger(omitted)||omitted<0||!Array.isArray(value.entries)||value.entries.length>CACHE_LIMIT)throw Error('Invalid cached mail.');
+      const omitted=value?.omitted??0,points=value?.checkpoints??[];
+      if(!value||value.version!==3||!validCursor(value.cursor)||!validId(value.anchor)||!Number.isSafeInteger(value.scanned)||value.scanned<0||!Number.isSafeInteger(omitted)||omitted<0||!Array.isArray(value.entries)||value.entries.length>CACHE_LIMIT||!Array.isArray(points)||points.length>CHECKPOINTS)throw Error('Invalid cached mail.');
       const entries=value.entries.map(cacheEntry);if(new Set(entries.map(e=>e.txid)).size!==entries.length||entries.some(e=>compareCursor(`${e.height}:${e.position}`,value.cursor)>0))throw Error('Invalid cached mail.');
-      return {version:3,cursor:value.cursor,anchor:value.anchor,scanned:value.scanned,omitted,entries};
+      // Earlier checkpoints lie strictly below the current one, newest first.
+      const checkpoints=points.map(point=>{if(!validCursor(point?.cursor)||!validId(point.anchor))throw Error('Invalid cached mail.');return {cursor:point.cursor,anchor:point.anchor};});
+      if(checkpoints.some((point,i)=>compareCursor(point.cursor,i?checkpoints[i-1].cursor:value.cursor)>=0))throw Error('Invalid cached mail.');
+      return {version:3,cursor:value.cursor,anchor:value.anchor,scanned:value.scanned,omitted,entries,checkpoints};
     };
     // Keep the newest entries that fit the count and byte bounds. A signed
     // carrier too large to cache on its own is left out, not a reason to stop.
@@ -60,14 +67,22 @@
     });
   }
   function create({rpc,getIdentity,recipientKey,decrypt,verifySigned,encodeAddress,onDraftChange=()=>{},document=root.document,location=root.location,cache=createCache()}){
-    const $=id=>document.getElementById(id),form=$('mail-form');let context={},sequence=0,prepared=null,preparing=null,checkedTip='',verifiedTip='',cursor=null,anchor=null,opened=new Map(),lastWallet='',loading=false,paused=false,scanned=0,visibleCount=50,rendered='',cacheLoaded=false,restoreEntries=[],storageNote='',omitted=0,start=null;
+    const $=id=>document.getElementById(id),form=$('mail-form');let context={},sequence=0,prepared=null,preparing=null,checkedTip='',verifiedTip='',cursor=null,anchor=null,checkpoints=[],opened=new Map(),lastWallet='',loading=false,paused=false,scanned=0,visibleCount=50,rendered='',cacheLoaded=false,restoreEntries=[],storageNote='',omitted=0,start=null;
     const active=()=>location.hash.split('?')[0]==='#mail',eligible=()=>active()&&context.ready&&context.available&&context.key&&context.can_decrypt;
     const add=(p,t,c,text)=>{const n=document.createElement(t);n.className=c;if(text!==undefined)n.textContent=text;p.appendChild(n);return n;};
     const identity=()=>getIdentity(),yieldTask=()=>new Promise(resolve=>root.setTimeout(resolve,0));
     const draftId=()=>JSON.stringify([identity(),form.elements.recipient.value,recipientKey(form.elements.recipient.value),form.elements.subject.value,form.elements.message.value]);
     function invalidate(){prepared=null;preparing=null;}
     function error(message){$('mail-error').textContent=message;$('mail-error').hidden=!message;}
-    function resetScan(){opened.clear();cursor=null;anchor=null;checkedTip='';verifiedTip='';scanned=0;omitted=0;visibleCount=50;rendered='';$('mail-list').replaceChildren();error('');}
+    function resetScan(){opened.clear();cursor=null;anchor=null;checkpoints=[];checkedTip='';verifiedTip='';scanned=0;omitted=0;visibleCount=50;rendered='';$('mail-list').replaceChildren();error('');}
+    // Continue from an earlier position: drop what was found above it, and
+    // the checkpoints there, whose history may have been replaced.
+    function rewindTo(target,base){
+      for(const [txid,value] of opened)if(compareCursor(entryCursor(value.entry),target)>0)opened.delete(txid);
+      restoreEntries=restoreEntries.filter(entry=>compareCursor(entryCursor(entry),target)<=0);
+      checkpoints=checkpoints.filter(point=>compareCursor(point.cursor,target)<0);
+      cursor=target;anchor=base;verifiedTip='';render();
+    }
     function blank(){invalidate();resetScan();paused=false;cacheLoaded=false;restoreEntries=[];storageNote='';start=null;}
     // Begin a scan without a checkpoint at this account's start, if it has one.
     function fromStart(){if(start){cursor=`${start.height}:${END}`;anchor=start.anchor;}}
@@ -102,8 +117,8 @@
     }
     async function load(){
       if(!eligible()||loading||paused)return;
-      loading=true;const version=++sequence,stamp=lastWallet;let restarted=false,truncated=false,checkedThisPass=0;
-      if(!cacheLoaded){cacheLoaded=true;const saved=cache.read(context.chain_id,context.key);storageNote=saved.error||'';start=cache.readStart(context.chain_id,context.key);if(saved.value){cursor=saved.value.cursor;anchor=saved.value.anchor;scanned=saved.value.scanned;omitted=saved.value.omitted;restoreEntries=saved.value.entries;}else fromStart();}
+      loading=true;const version=++sequence,stamp=lastWallet;let restarted=false,rewinds=0,checkedThisPass=0;
+      if(!cacheLoaded){cacheLoaded=true;const saved=cache.read(context.chain_id,context.key);storageNote=saved.error||'';start=cache.readStart(context.chain_id,context.key);if(saved.value){cursor=saved.value.cursor;anchor=saved.value.anchor;checkpoints=saved.value.checkpoints;scanned=saved.value.scanned;omitted=saved.value.omitted;restoreEntries=saved.value.entries;}else fromStart();}
       const current=()=>version===sequence&&stamp===lastWallet&&eligible()&&!paused;render();
       try{
         do{
@@ -112,12 +127,21 @@
           catch(e){
             if(!current())return;
             // A reorganization above part of the scan keeps what was found at
-            // or below the reported fork height and continues from there once.
-            const fork=/blocks above height (\d{1,16}) were replaced/.exec(String(e.message)),forkCursor=fork&&`${fork[1]}:9223372036854775807`;
-            if(forkCursor&&!truncated&&!restarted&&cursor&&compareCursor(forkCursor,cursor)<0){const height=Number(fork[1]);truncated=true;for(const [txid,value] of opened)if(value.entry.height>height)opened.delete(txid);restoreEntries=restoreEntries.filter(entry=>entry.height<=height);cursor=forkCursor;verifiedTip='';render();continue;}
-            // Without a fork height, rescan from genesis. The start's anchor
-            // may be the unknown one, so the start is dropped as well.
-            if(String(e.message).includes('Mail scan anchor is no longer canonical')&&!restarted){resetScan();restoreEntries=[];const cleared=cache.clear(context.chain_id,context.key);storageNote=cleared.error||'';if(start){cache.clearStart(context.chain_id,context.key);start=null;}restarted=true;render();continue;}
+            // or below the reported fork height and continues from there with
+            // the same anchor. Each rewind moves the cursor strictly down, and a
+            // pass allows only a few, so a second fork during a scan rewinds too.
+            const message=String(e.message),fork=/blocks above height (\d{1,16}) were replaced/.exec(message),forkCursor=fork&&`${fork[1]}:${END}`;
+            if(forkCursor&&rewinds<MAX_REWINDS&&cursor&&compareCursor(forkCursor,cursor)<0){rewinds++;rewindTo(forkCursor,anchor);continue;}
+            if(message.includes('Mail scan anchor is no longer canonical')){
+              // Without a fork height (an anchor the node does not know, or one
+              // replaced too deeply), resume from the newest earlier checkpoint
+              // below the cursor. The node checks its anchor in turn.
+              const earlier=cursor&&checkpoints.find(point=>compareCursor(point.cursor,cursor)<0);
+              if(earlier&&rewinds<MAX_REWINDS){rewinds++;rewindTo(earlier.cursor,earlier.anchor);continue;}
+              // With none left, rescan from genesis. The start's anchor may be
+              // the unknown one, so the start is dropped as well.
+              if(!restarted){resetScan();restoreEntries=[];const cleared=cache.clear(context.chain_id,context.key);storageNote=cleared.error||'';if(start){cache.clearStart(context.chain_id,context.key);start=null;}restarted=true;render();continue;}
+            }
             throw e;
           }
           if(!current())return;
@@ -174,8 +198,12 @@
           // Commit the cursor and authenticated messages together. A cancelled
           // page is retried rather than silently skipping its remaining mail.
           for(const value of found)opened.set(value.entry.txid,value);
+          // The node just accepted the previous position and anchor. Keep it as
+          // an earlier checkpoint when the anchor moves on, for an anchor error
+          // that later arrives without a fork height.
+          if(cursor&&anchor&&anchor!==result.anchor&&compareCursor(cursor,result.scan_cursor)<0)checkpoints=[{cursor,anchor},...checkpoints.filter(point=>compareCursor(point.cursor,cursor)<0)].slice(0,CHECKPOINTS);
           restoreEntries=[];verifiedTip=result.tip;scanned+=result.messages.length;checkedThisPass+=result.messages.length;cursor=result.scan_cursor;anchor=result.anchor;error('');
-          const saved=cache.write(context.chain_id,context.key,{cursor,anchor,scanned,omitted,entries:[...opened.values()].map(v=>v.entry)});storageNote=saved.error||'';
+          const saved=cache.write(context.chain_id,context.key,{cursor,anchor,checkpoints,scanned,omitted,entries:[...opened.values()].map(v=>v.entry)});storageNote=saved.error||'';
           if(result.next_cursor==null){checkedTip=context.tip;break;}
           // Rest after each budget instead of waiting for a click, so a long
           // history (or envelope spam) costs time, not repeated user action.

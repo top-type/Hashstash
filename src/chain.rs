@@ -47,11 +47,22 @@ pub const SIDE_BRANCH_BLOCKS_PER_TIP: u64 = 4;
 /// presync. Eviction drops the leaf whose held chain claims the least work.
 /// Headers of a chain that claimed more work than the tip, and headers a
 /// header download fetches again after counting that much work, are not
-/// counted or evicted: their storage is bounded by that work instead.
+/// counted or evicted: MAX_SYNC_HEADERS bounds them instead.
 pub const MAX_HELD_HEADERS: usize = 32_768;
+/// Held headers that are admitted or pinned by a header download, together,
+/// at about 1 KiB of memory each. A header after a held parent needs only its
+/// own proof of work within the network limit, which is the initial target
+/// on every preset, so the work such headers claim does not bound their
+/// number. A hold that would exceed this is refused instead, and ends the
+/// download that asked for it: a branch that needs more headers than this
+/// before it claims more work than the tip is not followed.
+pub const MAX_SYNC_HEADERS: usize = 2 * MAX_HELD_HEADERS;
 /// A held chain that already claims more work than the tip by this many
 /// next-block works needs no further headers until its blocks arrive.
 pub const HELD_LEAD_BLOCKS: u32 = 16;
+/// Nor does an admitted chain extended by this many headers since it was
+/// admitted or restored: cheap headers can claim little work each.
+pub const HELD_LEAD_HEADERS: u32 = 2_048;
 /// A losing branch raises the peer capacity allowance only while it stays within
 /// this many next-block works of the tip, with at least 1/CAPACITY_BRANCH_WORK_RATIO
 /// of that work in its leaf block.
@@ -140,8 +151,11 @@ pub enum HeaderHold {
     /// Held, and its chain claimed more work than the tip: its blocks are
     /// validated without the side-branch admission policy.
     Admitted,
-    /// Not held: its chain already leads the tip by HELD_LEAD_BLOCKS.
+    /// Not held: its chain already leads the tip by HELD_LEAD_BLOCKS, or
+    /// by HELD_LEAD_HEADERS headers since it was admitted.
     Ahead,
+    /// Not held: admitted and pinned headers already number MAX_SYNC_HEADERS.
+    Full,
 }
 /// Local admission policy declined to validate or store a block that would
 /// not become the tip. The block is not invalid and is never cached as such.
@@ -205,6 +219,8 @@ thread_local! {
     /// Run on this thread when a received block's execution starts.
     pub(crate) static BLOCK_EXECUTION_HOOK: RefCell<Option<Box<dyn FnMut()>>> =
         const { RefCell::new(None) };
+    /// Commits of admitted held headers on this thread.
+    pub(crate) static HELD_COMMITS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Digest of the running executable. A saved checkpoint is used only by the
@@ -437,22 +453,29 @@ struct HeldHeader {
     /// validated without the side-branch admission policy, and the header
     /// is persisted.
     admitted: bool,
-    /// The header download holding this header after counting that its
-    /// branch claims more work than the tip, or zero.
-    pin: u64,
+    /// Header downloads holding this header after counting that its branch
+    /// claims more work than the tip (see `HeldHeaders::pinned`).
+    pins: u32,
+    /// Headers held after an admitted parent since its chain was admitted
+    /// or restored, this one included; zero for others.
+    lead: u32,
 }
 impl HeldHeader {
     fn evictable(&self) -> bool {
-        !self.admitted && self.pin == 0
+        !self.admitted && self.pins == 0
     }
 }
 /// Header presync for branches the admission policy declined or that a
 /// header download proved heavier than the tip. Evictable headers are
-/// bounded by count; admitted and pinned ones by the work they claim.
+/// bounded by MAX_HELD_HEADERS, admitted and pinned ones by MAX_SYNC_HEADERS.
 #[derive(Default)]
 struct HeldHeaders {
     headers: BTreeMap<Hash, HeldHeader>,
     children: BTreeMap<Hash, BTreeSet<Hash>>,
+    /// The held headers of each header download, by its pin. Several
+    /// downloads of one branch share its headers; each keeps them until it
+    /// ends, whichever ends first.
+    pinned: BTreeMap<u64, BTreeSet<Hash>>,
     /// Evictable held headers without held children, by contributed work.
     leaves: BTreeSet<(Amount, Hash)>,
     /// Number of evictable held headers.
@@ -508,14 +531,14 @@ impl HeldHeaders {
             _ => {}
         }
     }
-    /// Insert a new non-admitted header whose parent is stored or held.
-    /// Eviction is left to `evict`, so a header about to be admitted is never
-    /// evicted first.
+    /// Insert a new non-admitted, unpinned header whose parent is stored or
+    /// held. Eviction is left to `evict`, so a header about to be admitted
+    /// or pinned is never evicted first.
     fn insert(&mut self, hash: Hash, held: HeldHeader) -> bool {
         if self.headers.contains_key(&hash) {
             return false;
         }
-        debug_assert!(!held.admitted);
+        debug_assert!(!held.admitted && held.pins == 0);
         let previous = held.header.previous;
         if let Some(parent) = self.headers.get(&previous)
             && parent.evictable()
@@ -546,6 +569,11 @@ impl HeldHeaders {
         if held.evictable() {
             self.evictable -= 1;
             self.leaves.remove(&(held.contributed.clone(), *hash));
+        }
+        if held.pins > 0 {
+            for pinned in self.pinned.values_mut() {
+                pinned.remove(hash);
+            }
         }
         if held.admitted {
             self.tips.remove(&(held.claimed.clone(), *hash));
@@ -619,16 +647,43 @@ impl HeldHeaders {
     fn admitted(&self, hash: &Hash) -> bool {
         self.headers.get(hash).is_some_and(|header| header.admitted)
     }
-    /// Release a header download's pin: its headers become evictable.
+    /// An admitted header without admitted children: where its chain is extended.
+    fn admitted_tip(&self, hash: &Hash) -> bool {
+        self.headers
+            .get(hash)
+            .is_some_and(|held| held.admitted && !self.has_admitted_child(hash))
+    }
+    /// Held headers that are admitted or pinned, which are never evicted.
+    fn fixed(&self) -> usize {
+        self.headers.len() - self.evictable
+    }
+    /// Held headers that admitting `hash`'s chain would make fixed: it and
+    /// its held ancestors down to an admitted one, those not yet pinned.
+    fn admission_cost(&self, hash: &Hash) -> usize {
+        let mut cost = 0;
+        let mut cursor = *hash;
+        while let Some(held) = self.headers.get(&cursor)
+            && !held.admitted
+        {
+            cost += usize::from(held.evictable());
+            cursor = held.header.previous;
+        }
+        cost
+    }
+    /// Pin a held header to a header download, once per download.
+    fn pin(&mut self, hash: Hash, pin: u64) {
+        if pin != 0
+            && self.headers.contains_key(&hash)
+            && self.pinned.entry(pin).or_default().insert(hash)
+        {
+            self.reclassify(&hash, |held| held.pins += 1);
+        }
+    }
+    /// Release a header download's pin. Its headers that no other download
+    /// pins and that were not admitted become evictable.
     fn unpin(&mut self, pin: u64) {
-        let pinned: Vec<Hash> = self
-            .headers
-            .iter()
-            .filter(|(_, held)| held.pin == pin)
-            .map(|(hash, _)| *hash)
-            .collect();
-        for hash in pinned {
-            self.reclassify(&hash, |held| held.pin = 0);
+        for hash in self.pinned.remove(&pin).unwrap_or_default() {
+            self.reclassify(&hash, |held| held.pins -= 1);
         }
         self.evict();
     }
@@ -671,6 +726,8 @@ pub struct Chain {
     held: HeldHeaders,
     // Last identifier handed to a header download for its pinned headers.
     next_pin: u64,
+    // Headers admitted inside `hold_batch`, persisted when it ends.
+    held_batch: Option<Vec<Hash>>,
     // Remaining side-branch admissions and the active height that last refilled them.
     side_budget: u64,
     side_budget_height: u64,
@@ -805,6 +862,7 @@ impl Chain {
             known_block_bytes: genesis_entry.capacity,
             held: HeldHeaders::default(),
             next_pin: 0,
+            held_batch: None,
             side_budget: SIDE_BRANCH_BURST,
             side_budget_height: 0,
             restored: None,
@@ -2290,21 +2348,62 @@ impl Chain {
     /// Hold a header without its block, so its branch can still be presynced
     /// from peers. Held headers are never executed. A chain that claims more
     /// work than the tip is admitted, proven by proof of work alone; its
-    /// headers are persisted and its bodies validated when they arrive.
-    fn hold(&mut self, hash: Hash, held: HeldHeader) -> Result<HeaderHold> {
+    /// headers are persisted and its bodies validated when they arrive. A
+    /// nonzero `pin` keeps the header for that header download. A header
+    /// that would make more than MAX_SYNC_HEADERS pinned or admitted is not
+    /// held.
+    fn hold(&mut self, hash: Hash, held: HeldHeader, pin: u64) -> Result<HeaderHold> {
         let overtakes = held.claimed > self.tip_entry.work;
+        let cost = usize::from(pin != 0 || overtakes)
+            + if overtakes {
+                self.held.admission_cost(&held.header.previous)
+            } else {
+                0
+            };
+        if cost > 0 && self.held.fixed() + cost > MAX_SYNC_HEADERS {
+            return Ok(HeaderHold::Full);
+        }
         self.held.insert(hash, held);
+        self.held.pin(hash, pin);
         let hold = if overtakes {
             let marked = self.held.admit(&hash);
-            self.persist_held(&marked)?;
-            // Its stored root may raise the capacity allowance.
-            self.refresh_capacity();
+            match &mut self.held_batch {
+                Some(batch) => batch.extend(marked),
+                None => {
+                    self.persist_held(&marked)?;
+                    // Its stored root may raise the capacity allowance.
+                    self.refresh_capacity();
+                }
+            }
             HeaderHold::Admitted
         } else {
             HeaderHold::Held
         };
         self.held.evict();
         Ok(hold)
+    }
+    /// Run `hold`, holding headers, with the headers it admits persisted in
+    /// one savepoint at its end and the capacity allowance refreshed once:
+    /// a header reply then commits once, not once per admitted header.
+    pub fn hold_batch<T>(&mut self, hold: impl FnOnce(&mut Self) -> T) -> Result<T> {
+        if self.held_batch.is_some() {
+            // An enclosing batch persists these too.
+            return Ok(hold(self));
+        }
+        self.held_batch = Some(Vec::new());
+        let result = hold(self);
+        let marked: Vec<Hash> = self
+            .held_batch
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|hash| self.held.admitted(hash))
+            .collect();
+        if !marked.is_empty() {
+            self.persist_held(&marked)?;
+            self.refresh_capacity();
+        }
+        Ok(result)
     }
     /// Write newly admitted held headers, so a restart keeps them.
     fn persist_held(&mut self, hashes: &[Hash]) -> Result<()> {
@@ -2327,6 +2426,8 @@ impl Chain {
             }
         }
         transaction.commit()?;
+        #[cfg(test)]
+        HELD_COMMITS.with(|count| count.set(count.get() + 1));
         Ok(())
     }
     /// Delete removed held headers that were persisted: the admitted ones.
@@ -2413,10 +2514,12 @@ impl Chain {
         Ok(math::work(&target))
     }
     /// Hold a header whose parent is stored or held, after `check_header`.
-    /// A nonzero `pin` keeps it from eviction until released: a header
-    /// download fetches a branch again only after counting that it claims
-    /// more work than the tip. A chain already leading the tip by
-    /// HELD_LEAD_BLOCKS next-block works is not extended.
+    /// A nonzero `pin` keeps it from eviction until that pin is released: a
+    /// header download fetches a branch again only after counting that it
+    /// claims more work than the tip. An admitted chain already leading the
+    /// tip by HELD_LEAD_BLOCKS next-block works, or extended by
+    /// HELD_LEAD_HEADERS headers, is not extended. Nothing is pinned or
+    /// admitted beyond MAX_SYNC_HEADERS.
     pub fn hold_header(&mut self, header: Header, now: u64, pin: u64) -> Result<HeaderHold> {
         let hash = crypto::sha256d(&codec::header_bytes(&header));
         if self.load_entry(&hash)?.is_some() {
@@ -2426,38 +2529,44 @@ impl Chain {
             if held.admitted {
                 return Ok(HeaderHold::Admitted);
             }
-            if pin != 0 {
-                self.held.reclassify(&hash, |held| held.pin = pin);
+            if pin != 0 && held.evictable() && self.held.fixed() >= MAX_SYNC_HEADERS {
+                return Ok(HeaderHold::Full);
             }
+            self.held.pin(hash, pin);
             return Ok(HeaderHold::Held);
         }
-        let (height, root, contributed, claimed) = match self.held.headers.get(&header.previous) {
-            Some(parent) => {
-                if parent.admitted {
-                    let next = math::work(&self.target(&self.tip_entry)?);
-                    if parent.claimed > &self.tip_entry.work + next * HELD_LEAD_BLOCKS {
-                        return Ok(HeaderHold::Ahead);
+        let (height, root, contributed, claimed, lead) =
+            match self.held.headers.get(&header.previous) {
+                Some(parent) => {
+                    if parent.admitted {
+                        let next = math::work(&self.target(&self.tip_entry)?);
+                        if parent.claimed > &self.tip_entry.work + next * HELD_LEAD_BLOCKS
+                            || parent.lead >= HELD_LEAD_HEADERS
+                        {
+                            return Ok(HeaderHold::Ahead);
+                        }
                     }
+                    (
+                        parent.height + 1,
+                        parent.root,
+                        parent.contributed.clone(),
+                        parent.claimed.clone(),
+                        if parent.admitted { parent.lead + 1 } else { 0 },
+                    )
                 }
-                (
-                    parent.height + 1,
-                    parent.root,
-                    parent.contributed.clone(),
-                    parent.claimed.clone(),
-                )
-            }
-            None => {
-                let parent = self
-                    .load_entry(&header.previous)?
-                    .context("held header parent unknown")?;
-                (
-                    parent.height + 1,
-                    header.previous,
-                    Amount::zero(),
-                    parent.work.clone(),
-                )
-            }
-        };
+                None => {
+                    let parent = self
+                        .load_entry(&header.previous)?
+                        .context("held header parent unknown")?;
+                    (
+                        parent.height + 1,
+                        header.previous,
+                        Amount::zero(),
+                        parent.work.clone(),
+                        0,
+                    )
+                }
+            };
         let work = self.check_header(&header, height, now)?;
         self.hold(
             hash,
@@ -2468,9 +2577,16 @@ impl Chain {
                 contributed: contributed + &work,
                 claimed: claimed + work,
                 admitted: false,
-                pin,
+                pins: 0,
+                lead,
             },
+            pin,
         )
+    }
+    /// Whether `hash` is an admitted held header without admitted children,
+    /// the only place a peer may extend an admitted chain.
+    pub fn admitted_header_tip(&self, hash: &Hash) -> bool {
+        self.held.admitted_tip(hash)
     }
     /// A new identifier for a header download's pinned headers.
     pub fn new_header_pin(&mut self) -> u64 {
@@ -2529,6 +2645,19 @@ impl Chain {
             .filter(|held| held.admitted)
             .count()
     }
+    /// Held headers that at least one header download pins.
+    pub fn pinned_header_count(&self) -> usize {
+        self.held
+            .headers
+            .values()
+            .filter(|held| held.pins > 0)
+            .count()
+    }
+    /// Drop a held header and its held descendants, as a failed body does.
+    #[cfg(test)]
+    pub(crate) fn forget_held_header(&mut self, hash: &Hash) {
+        self.held.remove_branch(hash);
+    }
     /// Drop admitted held chains whose best header now claims less work than
     /// the tip by more than CAPACITY_BRANCH_MARGIN_BLOCKS next-block works:
     /// they no longer compete, so they neither raise the capacity allowance
@@ -2558,9 +2687,9 @@ impl Chain {
         }
         Ok(())
     }
-    /// Restore the admitted held headers a previous run persisted. Each must
-    /// still follow a stored block or a restored header and meet its own
-    /// proof of work; others are deleted.
+    /// Restore the admitted held headers a previous run persisted, at most
+    /// MAX_SYNC_HEADERS. Each must still follow a stored block or a restored
+    /// header and meet its own proof of work; others are deleted.
     fn load_held(&mut self) -> Result<()> {
         let rows: Vec<(Vec<u8>, Vec<u8>, u64)> = self
             .db
@@ -2603,12 +2732,14 @@ impl Chain {
                         contributed: contributed + &work,
                         claimed: claimed + work,
                         admitted: false,
-                        pin: 0,
+                        pins: 0,
+                        lead: 0,
                     },
                 )))
             })();
             match restored {
-                Ok(Some((hash, held))) => {
+                // Rows past the bound on admitted headers are not restored.
+                Ok(Some((hash, held))) if self.held.fixed() < MAX_SYNC_HEADERS => {
                     self.held.insert(hash, held);
                     self.held.admit(&hash);
                 }
@@ -2945,8 +3076,10 @@ impl Chain {
                 contributed: work,
                 claimed,
                 admitted: false,
-                pin: 0,
+                pins: 0,
+                lead: 0,
             },
+            0,
         )?;
         Ok(())
     }
@@ -4135,9 +4268,8 @@ mod cache_tests {
             assert_eq!(state.height, height);
         }
     }
-    #[test]
-    fn held_headers_evict_the_weakest_leaf_and_keep_chains_linked() {
-        let header = |previous: Hash, height: u64, contributed: u32, pin: u64| HeldHeader {
+    fn held_header(previous: Hash, height: u64, contributed: u32) -> HeldHeader {
+        HeldHeader {
             header: Header {
                 version: codec::HEADER_VERSION,
                 previous,
@@ -4151,25 +4283,31 @@ mod cache_tests {
             contributed: contributed.into(),
             claimed: contributed.into(),
             admitted: false,
-            pin,
-        };
-        let id = |prefix: u8, n: u32| {
-            let mut hash = [prefix; 32];
-            hash[..4].copy_from_slice(&n.to_le_bytes());
-            hash
-        };
+            pins: 0,
+            lead: 0,
+        }
+    }
+    fn held_id(prefix: u8, n: u32) -> Hash {
+        let mut hash = [prefix; 32];
+        hash[..4].copy_from_slice(&n.to_le_bytes());
+        hash
+    }
+    #[test]
+    fn held_headers_evict_the_weakest_leaf_and_keep_chains_linked() {
+        let header = held_header;
+        let id = held_id;
         let mut held = HeldHeaders::default();
         // One long presync chain, each header adding work to its branch.
         let mut previous = ZERO_HASH;
         for n in 0..100 {
-            held.insert(id(1, n), header(previous, n as u64 + 1, 10 * (n + 1), 0));
+            held.insert(id(1, n), header(previous, n as u64 + 1, 10 * (n + 1)));
             held.evict();
             previous = id(1, n);
         }
         assert_eq!(held.leaves.len(), 1);
         // A flood of cheap single headers fills the store and evicts itself.
         for n in 0..MAX_HELD_HEADERS as u32 {
-            held.insert(id(2, n), header(ZERO_HASH, 1, 5, 0));
+            held.insert(id(2, n), header(ZERO_HASH, 1, 5));
             held.evict();
         }
         assert_eq!(held.headers.len(), MAX_HELD_HEADERS);
@@ -4192,7 +4330,8 @@ mod cache_tests {
         // A pinned download is not evicted however long, until it is released.
         let mut previous = id(1, 49);
         for n in 0..2 * MAX_HELD_HEADERS as u32 {
-            held.insert(id(3, n), header(previous, 51 + n as u64, 1_000_000 + n, 7));
+            held.insert(id(3, n), header(previous, 51 + n as u64, 1_000_000 + n));
+            held.pin(id(3, n), 7);
             held.evict();
             previous = id(3, n);
         }
@@ -4206,6 +4345,47 @@ mod cache_tests {
         assert!((0..MAX_HELD_HEADERS as u32).all(|n| held.headers.contains_key(&id(3, n))));
         assert!(!held.headers.contains_key(&id(3, MAX_HELD_HEADERS as u32)));
         assert!(held.leaves.iter().all(|(_, hash)| held.headers[hash].evictable()));
+    }
+    #[test]
+    fn held_headers_stay_pinned_until_every_download_holding_them_ends() {
+        let mut held = HeldHeaders::default();
+        let mut previous = ZERO_HASH;
+        for n in 0..10 {
+            held.insert(held_id(1, n), held_header(previous, n as u64 + 1, 1));
+            held.pin(held_id(1, n), 1);
+            previous = held_id(1, n);
+        }
+        // A second download of the same branch holds the same headers; a
+        // repeated pin of one download counts once.
+        for n in 0..10 {
+            held.pin(held_id(1, n), 2);
+            held.pin(held_id(1, n), 2);
+        }
+        assert!(held.headers.values().all(|header| header.pins == 2));
+        assert_eq!((held.fixed(), held.evictable), (10, 0));
+        // The second download ends first: the first still holds every header,
+        // so none of them, its resume point included, can be evicted.
+        held.unpin(2);
+        assert_eq!((held.fixed(), held.evictable), (10, 0));
+        assert!(held.leaves.is_empty());
+        // A header dropped while pinned leaves no pin behind.
+        held.remove_branch(&held_id(1, 5));
+        assert_eq!(held.pinned[&1].len(), 5);
+        held.unpin(1);
+        assert_eq!((held.fixed(), held.evictable), (0, 5));
+        assert!(held.pinned.is_empty());
+        assert_eq!(held.leaves.len(), 1);
+        // Admitting a chain fixes its evictable headers, not its pinned ones,
+        // down to its first admitted ancestor.
+        held.pin(held_id(1, 2), 3);
+        assert_eq!(held.admission_cost(&held_id(1, 4)), 4);
+        held.admit(&held_id(1, 1));
+        assert_eq!(held.admission_cost(&held_id(1, 4)), 2);
+        assert_eq!(held.admission_cost(&held_id(1, 1)), 0);
+        assert!(held.admitted_tip(&held_id(1, 1)));
+        held.admit(&held_id(1, 4));
+        assert!(!held.admitted_tip(&held_id(1, 1)) && held.admitted_tip(&held_id(1, 4)));
+        assert_eq!((held.fixed(), held.evictable), (5, 0));
     }
     #[test]
     fn side_branch_admissions_are_budgeted_by_active_chain_growth() {

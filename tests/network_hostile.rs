@@ -652,7 +652,8 @@ async fn p2p_admission_saturation_does_not_starve_rpc_or_a_different_peer() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     // A fifth address takes over the newest session of the most represented
     // source instead of waiting for one to end; that session closes at once.
-    // Each source's oldest and the longest-connected others stay.
+    // The oldest sessions of up to four sources and the four longest-connected
+    // others stay.
     let mut newcomer = connect(server.p2p, 6, 5).await;
     let mut evicted = held.pop().unwrap();
     assert!(

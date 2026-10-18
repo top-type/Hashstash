@@ -43,6 +43,9 @@ pub const MAX_HELD_HEADERS: usize = 32_768;
 pub const CAPACITY_BRANCH_MARGIN_BLOCKS: u32 = 6;
 pub const CAPACITY_BRANCH_WORK_RATIO: u32 = 4;
 const MAX_CAPACITY_BRANCHES: usize = 256;
+/// One stored block row: the greatest valid body plus generous room for its
+/// header and record framing.
+pub const MAX_BLOCK_ROW_BYTES: u64 = crate::config::MAX_GOVERNED_BLOCK_BYTES + (1 << 20);
 /// Blocks replayed per committed batch of the startup index rebuild. Unit tests
 /// use small batches so reopening their short chains crosses batch boundaries.
 const INDEX_REBUILD_BATCH: u64 = if cfg!(test) { 7 } else { 4096 };
@@ -361,6 +364,15 @@ impl Chain {
         }
         let db = Connection::open(path)?;
         db.busy_timeout(Duration::from_secs(2))?;
+        // zeroblob is refused above SQLite's row length limit without being
+        // allocated. A build that could not store every valid block would
+        // reject one that its peers accept, so it fails here instead.
+        db.query_row(
+            "SELECT length(zeroblob(?1))",
+            [MAX_BLOCK_ROW_BYTES],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("this SQLite build cannot store the largest valid block")?;
         // The journal limit returns WAL space after checkpoints of the batched
         // startup index rebuild instead of keeping the log at its peak size.
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_size_limit=67108864; CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value BLOB NOT NULL); CREATE TABLE IF NOT EXISTS blocks(seq INTEGER PRIMARY KEY AUTOINCREMENT, hash BLOB NOT NULL UNIQUE, bytes BLOB NOT NULL, accepted_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS rejected_blocks(hash BLOB PRIMARY KEY, bytes BLOB NOT NULL, accepted_at INTEGER NOT NULL, reason TEXT NOT NULL);")?;

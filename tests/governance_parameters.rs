@@ -1,64 +1,226 @@
 //! Genesis has arithmetic/construction bounds, not policy grids. Governed
 //! changes add only the bounds that keep a passed change reversible.
 use hashstash::{
+    codec,
     config::{
-        Config, MAX_GOVERNED_DURATION, MIN_GOVERNED_BLOCK_BYTES, MIN_GOVERNED_DECISION_BLOCKS,
+        Config, MAX_GOVERNED_BLOCK_BYTES, MAX_GOVERNED_DURATION, MAX_GOVERNED_PRICE_CHANGE_BPS,
+        MAX_MINIMAL_PROPOSE_BYTES, MIN_GOVERNED_BLOCK_BYTES, MIN_GOVERNED_DECISION_BLOCKS,
     },
-    consensus, crypto, math,
-    state::{Phase, State},
-    types::Parameter,
+    consensus, crypto, fees, math,
+    state::{Phase, State, proposal_id},
+    types::{Amount, Operation, Parameter, Proposal, PublicKey, Transaction, TransactionBody},
 };
 
 #[test]
-fn block_capacity_has_only_account_work_and_representation_bounds() {
+fn block_capacity_stays_within_the_proposal_floor_and_storage_ceiling() {
+    // Audit R01/R05: the old 1,024 floor admitted capacities that no Propose
+    // could fit, and the old ceiling (isize::MAX) admitted blocks no peer
+    // frame or SQLite row could carry.
     let c = Config::testnet();
-    let mut settings = c.initial.clone();
-    for capacity in [
-        MIN_GOVERNED_BLOCK_BYTES,
-        1_025,
-        12_345,
-        64 * 1024 * 1024,
-        isize::MAX as u64,
+    for (old, new) in [
+        (MIN_GOVERNED_BLOCK_BYTES * 2, MIN_GOVERNED_BLOCK_BYTES),
+        (MIN_GOVERNED_BLOCK_BYTES + 1, MIN_GOVERNED_BLOCK_BYTES),
+        (MIN_GOVERNED_BLOCK_BYTES, MIN_GOVERNED_BLOCK_BYTES * 2),
+        (16_384, 12_345),
+        (MAX_GOVERNED_BLOCK_BYTES / 2, MAX_GOVERNED_BLOCK_BYTES),
+        (MAX_GOVERNED_BLOCK_BYTES, MAX_GOVERNED_BLOCK_BYTES / 2),
     ] {
-        c.parameter_change(
-            &settings,
-            Parameter::BlockBytes,
-            settings.block_bytes,
-            capacity,
-        )
-        .unwrap();
-        settings.block_bytes = capacity;
-        assert_eq!(c.transaction_bytes(&settings), capacity as usize);
+        let mut settings = c.initial.clone();
+        settings.block_bytes = old;
+        c.parameter_change(&settings, Parameter::BlockBytes, old, new)
+            .unwrap();
+        settings.block_bytes = new;
+        assert_eq!(c.transaction_bytes(&settings), new as usize);
     }
-    for capacity in [0, MIN_GOVERNED_BLOCK_BYTES - 1, u64::MAX] {
+    for (old, new) in [
+        // Below the floor, even within one halving.
+        (MIN_GOVERNED_BLOCK_BYTES, MIN_GOVERNED_BLOCK_BYTES / 2),
+        (MIN_GOVERNED_BLOCK_BYTES + 1, MIN_GOVERNED_BLOCK_BYTES - 1),
+        (MIN_GOVERNED_BLOCK_BYTES, 2_300),
+        (MIN_GOVERNED_BLOCK_BYTES, 1_100),
+        (MIN_GOVERNED_BLOCK_BYTES, 0),
+        // Above the ceiling, even within one doubling.
+        (MAX_GOVERNED_BLOCK_BYTES, MAX_GOVERNED_BLOCK_BYTES + 1),
+        (MAX_GOVERNED_BLOCK_BYTES, isize::MAX as u64),
+        (MAX_GOVERNED_BLOCK_BYTES, u64::MAX),
+        // More than one doubling or halving.
+        (16_384, 32_769),
+        (16_384, 8_191),
+        (16_384, MAX_GOVERNED_BLOCK_BYTES),
+    ] {
+        let mut settings = c.initial.clone();
+        settings.block_bytes = old;
         assert!(
-            c.parameter_change(
-                &settings,
-                Parameter::BlockBytes,
-                settings.block_bytes,
-                capacity
-            )
-            .is_err()
+            c.parameter_change(&settings, Parameter::BlockBytes, old, new)
+                .is_err(),
+            "{old} -> {new} must be rejected"
         );
     }
+    let settings = &c.initial;
     assert!(
-        c.parameter_change(&settings, Parameter::BlockBytes, 2_048, 4_096)
+        c.parameter_change(settings, Parameter::BlockBytes, 8_192, 16_384)
             .is_err()
     );
     assert!(
         c.parameter_change(
-            &settings,
+            settings,
             Parameter::BlockBytes,
             settings.block_bytes,
             settings.block_bytes
         )
         .is_err()
     );
+    // Genesis has the same floor and ceiling.
+    for (bytes, valid) in [
+        (MIN_GOVERNED_BLOCK_BYTES - 1, false),
+        (MIN_GOVERNED_BLOCK_BYTES, true),
+        (MAX_GOVERNED_BLOCK_BYTES, true),
+        (MAX_GOVERNED_BLOCK_BYTES + 1, false),
+    ] {
+        let mut config = c.clone();
+        config.initial.block_bytes = bytes;
+        assert_eq!(config.validate().is_ok(), valid, "{bytes}");
+    }
     let mut config = c;
     config.max_signatures = usize::MAX;
     config.validate().unwrap();
     config.max_signatures = 0;
     config.validate().unwrap();
+}
+
+/// The largest data-free Support: compact u64 nonce, expiry and round at 9
+/// bytes, fee and support amounts at 64 bytes plus their lengths, the
+/// proposal hash and the fixed signature.
+const MAX_MINIMAL_SUPPORT_BYTES: u64 = 32 + 9 + 65 + 32 + 9 + (1 + 9 + 32 + 65) + 1 + 64;
+
+/// Sign an executable transaction padded with data to a worst-case size.
+fn padded(s: &State, secret: &[u8; 32], operation: Operation, encoded_bytes: u64) -> Transaction {
+    let sender = crypto::public_key(secret).unwrap();
+    let mut body = TransactionBody {
+        sender,
+        nonce: s.account(&sender, None).unwrap().nonce,
+        fee: 100u32.into(),
+        anchor: [0; 32],
+        expiry_blocks: 100,
+        operation,
+        data: Vec::new(),
+    };
+    let size = |body: &TransactionBody| {
+        codec::encode(&Transaction {
+            body: body.clone(),
+            signature: [0; 64],
+        })
+        .len() as u64
+    };
+    body.data = vec![0; usize::try_from(encoded_bytes - size(&body)).unwrap()];
+    // Data beyond 250 bytes takes a wider length prefix.
+    let excess = size(&body) - encoded_bytes;
+    body.data
+        .truncate(body.data.len() - usize::try_from(excess).unwrap());
+    let tx = crypto::sign(&s.chain_id, &body, secret).unwrap();
+    assert_eq!(codec::encode(&tx).len() as u64, encoded_bytes);
+    tx
+}
+
+#[test]
+fn a_floor_capacity_block_holds_the_heaviest_minimal_proposal_and_support_with_a_new_miner() {
+    // Audit R01: below about 2,400 weight a block that reserved its new
+    // miner's account had no room left for any Propose, so one passed
+    // decision lowering capacity there (the old floor was 1,024) could never
+    // be undone. The floor now covers the heaviest data-free Propose.
+    let mut c = Config::testnet();
+    c.initial.block_bytes = MIN_GOVERNED_BLOCK_BYTES;
+    c.initial.rest = 0;
+    c.validate().unwrap();
+    let key = |secret: &[u8; 32]| -> PublicKey { crypto::public_key(secret).unwrap() };
+    let (proposer, supporter, miner) = ([41; 32], [42; 32], key(&[43; 32]));
+    let subsidy = Amount::from(1_000_000u32);
+    let mut s = State::genesis(&c);
+    for funded in [&proposer, &supporter] {
+        s = consensus::execute(&c, &s, &s.root(), &key(funded), &subsidy, &[]).unwrap();
+    }
+    let round = s.auction_round().unwrap();
+    let proposal = Proposal::Parameter {
+        parameter: Parameter::BlockBytes,
+        old: MIN_GOVERNED_BLOCK_BYTES,
+        new: MIN_GOVERNED_BLOCK_BYTES * 2,
+    };
+    let operation = Operation::Propose {
+        round,
+        description: [44; 32],
+        proposal: proposal.clone(),
+        support: 10u32.into(),
+    };
+    let propose = padded(&s, &proposer, operation.clone(), MAX_MINIMAL_PROPOSE_BYTES);
+    let id = proposal_id(&s.chain_id, round, &key(&proposer), &[44; 32], &proposal);
+    let support = padded(
+        &s,
+        &supporter,
+        Operation::Support {
+            round,
+            proposal: id,
+            amount: 10u32.into(),
+        },
+        MAX_MINIMAL_SUPPORT_BYTES,
+    );
+    let mut proposed = s.clone();
+    consensus::apply_transaction(&c, &mut proposed, &propose).unwrap();
+    let propose_weight = fees::quote(&c, &s, &propose).unwrap().weight;
+    assert_eq!(
+        propose_weight,
+        MAX_MINIMAL_PROPOSE_BYTES + fees::RECORD_WEIGHT
+    );
+    assert_eq!(
+        fees::quote(&c, &proposed, &support).unwrap().weight,
+        MAX_MINIMAL_SUPPORT_BYTES + fees::RECORD_WEIGHT
+    );
+    assert!(s.account(&miner, None).is_none());
+    // Each alone, and both together, beside the new miner's account.
+    for (parent, transactions) in [
+        (&s, vec![propose.clone()]),
+        (&proposed, vec![support.clone()]),
+        (&s, vec![propose.clone(), support]),
+    ] {
+        let next = consensus::execute(&c, parent, &parent.root(), &miner, &subsidy, &transactions)
+            .unwrap();
+        next.audit(&c).unwrap();
+        assert!(next.account(&miner, None).is_some());
+        assert!(next.proposals.get(&id).is_some());
+    }
+    // The remaining room is exact: a Propose filling it with data still fits
+    // beside the new miner account, and one byte more does not.
+    let room = MIN_GOVERNED_BLOCK_BYTES.saturating_sub(fees::RECORD_WEIGHT + fees::ACCOUNT_WEIGHT);
+    assert!(room > MAX_MINIMAL_PROPOSE_BYTES);
+    for (bytes, fits) in [(room, true), (room + 1, false)] {
+        let tx = padded(&s, &proposer, operation.clone(), bytes);
+        let result = consensus::execute(&c, &s, &s.root(), &miner, &subsidy, &[tx]);
+        if fits {
+            result.unwrap();
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("weighted capacity")
+            );
+        }
+    }
+}
+
+#[test]
+fn sqlite_rows_hold_the_largest_valid_block_record() {
+    // Audit R05: a block above SQLite's row length limit would fail to store
+    // even on the node that mined it. Chain::open runs this probe, which
+    // checks the limit without allocating the blob.
+    let db = rusqlite::Connection::open_in_memory().unwrap();
+    let probe = |bytes: u64| {
+        db.query_row("SELECT length(zeroblob(?1))", [bytes], |row| {
+            row.get::<_, i64>(0)
+        })
+    };
+    let largest = hashstash::chain::MAX_BLOCK_ROW_BYTES;
+    assert_eq!(probe(largest).unwrap(), largest as i64);
+    assert!(probe(1_000_000_001).is_err());
 }
 
 #[test]
@@ -79,13 +241,13 @@ fn parameters_accept_direct_values_and_zero_where_defined() {
             Parameter::DecisionBlocks,
             MAX_GOVERNED_DURATION / c.initial.interval,
         ),
-        (Parameter::Interval, 61),
-        // The longest interval that still leaves the 60-second lead room.
-        (Parameter::Interval, c.auction_timeout - 2 * c.initial.lead),
-        (Parameter::MinimumFeeRate, 0),
+        (Parameter::Interval, 30),
+        (Parameter::Interval, 7),
+        (Parameter::BlockBytes, 32_768),
+        (Parameter::BlockBytes, 8_192),
         (Parameter::MinimumFeeRate, 2),
         (Parameter::MaxPriceChangeBps, 1),
-        (Parameter::MaxPriceChangeBps, u64::MAX),
+        (Parameter::MaxPriceChangeBps, MAX_GOVERNED_PRICE_CHANGE_BPS),
     ] {
         c.parameter_change(&c.initial, parameter, c.initial.get(parameter), next)
             .unwrap();
@@ -120,11 +282,25 @@ fn parameters_accept_direct_values_and_zero_where_defined() {
         (Parameter::Interval, c.auction_timeout - 2 * c.initial.lead + 1),
         (Parameter::Interval, 86_400),
         (Parameter::Interval, 1 << 40),
-        // Pinned prices can never produce a PASS lead.
+        // One decision at most doubles or halves capacity and block rate.
+        (Parameter::Interval, 31),
+        (Parameter::Interval, 6),
+        (Parameter::Interval, 1),
+        (Parameter::BlockBytes, 32_769),
+        (Parameter::BlockBytes, 8_191),
+        // Pinned prices can never produce a PASS lead, and an unbounded fall
+        // lets one holder empty a world and suppress PASS leads.
         (Parameter::MaxPriceChangeBps, 0),
-        // One decision cannot price every account out of transacting.
+        (
+            Parameter::MaxPriceChangeBps,
+            MAX_GOVERNED_PRICE_CHANGE_BPS + 1,
+        ),
+        (Parameter::MaxPriceChangeBps, u64::MAX),
+        // One decision cannot price every account out of transacting, and a
+        // zero rate makes permanent account and record state free.
         (Parameter::MinimumFeeRate, 3),
         (Parameter::MinimumFeeRate, u64::MAX),
+        (Parameter::MinimumFeeRate, 0),
     ] {
         assert!(
             c.parameter_change(&c.initial, parameter, c.initial.get(parameter), next)
@@ -151,6 +327,76 @@ fn parameters_accept_direct_values_and_zero_where_defined() {
     );
     lead.lead = u64::MAX;
     assert!(c.validate_governance_settings(&lead).is_err());
+}
+
+#[test]
+fn fee_rate_increases_stop_at_a_bounded_multiple_of_genesis_and_revert_in_one_decision() {
+    // Audit R05: doublings compounded without limit, until the Propose that
+    // would revert them was unaffordable.
+    for genesis in [0, 1, 7] {
+        let mut c = Config::testnet();
+        c.initial.minimum_fee_rate = genesis;
+        c.validate().unwrap();
+        let ceiling = c.max_governed_fee_rate();
+        assert_eq!(ceiling, genesis.max(1) << 16);
+        let mut settings = c.initial.clone();
+        let mut decisions = 0;
+        while settings.minimum_fee_rate < ceiling {
+            let old = settings.minimum_fee_rate;
+            let next = old.saturating_mul(2).clamp(1, ceiling);
+            c.parameter_change(&settings, Parameter::MinimumFeeRate, old, next)
+                .unwrap();
+            settings.minimum_fee_rate = next;
+            decisions += 1;
+        }
+        assert!(decisions >= 16);
+        assert!(
+            c.parameter_change(&settings, Parameter::MinimumFeeRate, ceiling, ceiling + 1)
+                .is_err()
+        );
+        // One decision returns all the way down, but never to a free rate.
+        for back in [genesis.max(1), 1] {
+            c.parameter_change(&settings, Parameter::MinimumFeeRate, ceiling, back)
+                .unwrap();
+        }
+        assert!(
+            c.parameter_change(&settings, Parameter::MinimumFeeRate, ceiling, 0)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn governed_intervals_move_by_one_doubling_or_halving_above_a_quarter_of_genesis() {
+    // Audit R05: one decision could select one-second blocks, multiplying
+    // chain growth, orphan risk and per-block state churn fifteen times.
+    let c = Config::testnet();
+    assert_eq!(c.min_governed_interval(), c.initial.interval / 4);
+    let mut settings = c.initial.clone();
+    settings.interval = 5;
+    c.parameter_change(&settings, Parameter::Interval, 5, 3)
+        .unwrap();
+    for below in [2, 1] {
+        assert!(
+            c.parameter_change(&settings, Parameter::Interval, 5, below)
+                .is_err()
+        );
+    }
+    // A one-second genesis interval keeps a one-second floor.
+    let mut fast = Config::testnet();
+    fast.initial.interval = 1;
+    fast.validate().unwrap();
+    assert_eq!(fast.min_governed_interval(), 1);
+    fast.parameter_change(&fast.initial, Parameter::Interval, 1, 2)
+        .unwrap();
+    // The lead room still bounds an increase within one doubling.
+    settings.interval = 181;
+    c.parameter_change(&settings, Parameter::Interval, 181, 360)
+        .unwrap();
+    assert!(
+        c.parameter_change(&settings, Parameter::Interval, 181, 361)
+            .is_err()
+    );
 }
 
 #[test]
@@ -182,11 +428,11 @@ fn interval_increases_recheck_the_lead_and_decision_bounds() {
         }
         // A shorter interval only helps, so settings outside the bounds can
         // still move back toward them.
-        c.parameter_change(settings, Parameter::Interval, interval, 1)
+        c.parameter_change(settings, Parameter::Interval, interval, interval / 2)
             .unwrap();
     }
     // The same longer interval is fine with the default lead and decision.
-    c.parameter_change(&c.initial, Parameter::Interval, interval, 900)
+    c.parameter_change(&c.initial, Parameter::Interval, interval, interval + 2)
         .unwrap();
 }
 

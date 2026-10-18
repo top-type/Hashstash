@@ -494,6 +494,13 @@ fn genesis_warnings(config: &Config, now: u64) -> Vec<String> {
     warnings
 }
 
+/// Everything `init` reports about a configuration it is about to write.
+fn config_warnings(config: &Config, now: u64) -> Vec<String> {
+    let mut warnings = config.sanity_warnings();
+    warnings.extend(genesis_warnings(config, now));
+    warnings
+}
+
 /// Render Unix seconds as proleptic Gregorian UTC, without a time-zone database.
 fn utc_text(seconds: u64) -> String {
     let (days, rest) = (seconds / 86_400, seconds % 86_400);
@@ -1424,7 +1431,7 @@ async fn main() -> Result<()> {
             genesis_time,
         } => {
             let c = initial_config(preset, hashrate.as_deref(), genesis_time)?;
-            for warning in genesis_warnings(&c, node::now()) {
+            for warning in config_warnings(&c, node::now()) {
                 eprintln!("warning: {warning}");
             }
             write_new(&config, &c, false)?;
@@ -1670,6 +1677,10 @@ async fn main() -> Result<()> {
             stratum_password_file,
         } => {
             let c: Config = serde_json::from_value(read_json(&config)?)?;
+            // A hand-edited genesis can be valid yet unsafe to operate.
+            for warning in c.sanity_warnings() {
+                eprintln!("warning: {warning}");
+            }
             let chain_id = c.chain_id();
             // Check wallet seeds and the password before opening the database.
             let wallet = match &wallet_key {
@@ -2542,6 +2553,24 @@ mod tests {
         assert!(early[0].contains("defer block 1"), "{early:?}");
         let stale = genesis_warnings(&Config::devnet(), CLOCK_FLOOR - 1);
         assert!(stale.iter().any(|w| w.contains("earlier than this release")));
+    }
+
+    #[test]
+    fn init_reports_unsafe_but_valid_genesis_fields_with_its_clock_warnings() {
+        let now = 1_800_000_000u64;
+        for preset in [InitPreset::Dev, InitPreset::Slow] {
+            let c = initial_config(preset, Some("100T"), Some(now as u32)).unwrap();
+            assert!(config_warnings(&c, now).is_empty());
+        }
+        // Audit F116/R31: genesis stays representability-only, so a
+        // hand-edited value still validates and is only reported.
+        let mut c = initial_config(InitPreset::Dev, None, Some(now as u32)).unwrap();
+        c.max_signatures = 0;
+        c.validate().unwrap();
+        let warnings = config_warnings(&c, now - u64::from(c.future_seconds) - 1);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("max_signatures is 0"));
+        assert!(warnings[1].contains("defer block 1"));
     }
 
     #[test]

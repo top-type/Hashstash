@@ -80,7 +80,8 @@ fn losing_branch_capacity_counts_only_while_the_branch_is_competitive() {
     let shared: Vec<_> = (1..=private.tip_height())
         .map(|height| private.block(&private.hash_at_height(height).unwrap()).unwrap())
         .collect();
-    let capacity = 1024 * 1024 + 173;
+    // One decision can at most double capacity.
+    let capacity = 2 * initial - 173;
     let proposal = signed(
         &private,
         &secret,

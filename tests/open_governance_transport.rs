@@ -58,6 +58,10 @@ async fn large_governed_block_relays_compactly_and_survives_reopen() {
     config.initial.rest = 30;
     config.initial.lead = 15;
     config.initial.decision_blocks = 4;
+    // Enact the larger, deliberately non-power-of-two capacity through the
+    // real auction and outcome trades. One decision can at most double it.
+    let capacity: u64 = 40 * 1024 * 1024 + 173;
+    config.initial.block_bytes = capacity.div_ceil(2);
     config.validate().unwrap();
 
     // Build and fund directly, avoiding repeated mempool-prefix validation.
@@ -76,10 +80,8 @@ async fn large_governed_block_relays_compactly_and_survives_reopen() {
     let shared: Vec<_> = (1..=chain.tip_height())
         .map(|height| chain.block(&chain.hash_at_height(height).unwrap()).unwrap())
         .collect();
-    // Enact the larger, deliberately non-power-of-two capacity through the
-    // real auction and outcome trades. A lagging peer must learn this change
-    // before it receives a block above its previous admission allowance.
-    let capacity = 40 * 1024 * 1024 + 173;
+    // A lagging peer must learn this change before it receives a block above
+    // its previous admission allowance.
     let proposal = signed(
         &chain,
         &secret,

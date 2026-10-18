@@ -1,10 +1,52 @@
-use crate::{codec, crypto, math, types::*};
+use crate::{
+    codec, crypto,
+    fees::{ACCOUNT_WEIGHT, RECORD_WEIGHT},
+    math,
+    types::*,
+};
 use anyhow::{Context, Result, ensure};
 use num_traits::{One, Zero};
 use serde::{Deserialize, Serialize};
 
-/// An empty block must be able to create its miner account.
-pub const MIN_GOVERNED_BLOCK_BYTES: u64 = crate::fees::ACCOUNT_WEIGHT;
+/// Encoded bytes of the largest Parameter Propose without data: every compact
+/// u64 (nonce, expiry, round, old, new) at its 9-byte maximum, fee and support
+/// amounts at the 512-bit monetary maximum (64 bytes plus a 1-byte length),
+/// one-byte operation, proposal and parameter tags, an empty data vector and
+/// the fixed 64-byte signature. Its weight adds RECORD_WEIGHT.
+pub const MAX_MINIMAL_PROPOSE_BYTES: u64 =
+    32 + 9 + 65 + 32 + 9 + (1 + 9 + 32 + 1 + 1 + 9 + 9 + 65) + 1 + 64;
+
+/// Raising capacity needs a Propose, so every capacity must admit the
+/// heaviest minimal Parameter Propose and its record weight in a block that
+/// also reserves its miner's new account. A smaller passed capacity would
+/// leave no way to raise it again.
+pub const MIN_GOVERNED_BLOCK_BYTES: u64 = 4096;
+const _: () =
+    assert!(MAX_MINIMAL_PROPOSE_BYTES + RECORD_WEIGHT + ACCOUNT_WEIGHT <= MIN_GOVERNED_BLOCK_BYTES);
+
+/// Every valid block and transaction stays within the peer frame (u32), the
+/// HTTP response limit for a hexadecimal record (193 MiB), the Explorer's
+/// stored-record bound (about 96 MiB) and SQLite's 1e9-byte row limit, so a
+/// valid block can always be stored, relayed and served.
+pub const MAX_GOVERNED_BLOCK_BYTES: u64 = 64 * 1024 * 1024;
+const _: () = assert!(MAX_GOVERNED_BLOCK_BYTES <= i32::MAX as u64);
+
+/// A governed fee rate stays within this factor of the genesis rate (or of
+/// one, from a free genesis), bounding what reverting an increase can cost.
+pub const MAX_GOVERNED_FEE_RATE_FACTOR: u64 = 1 << 16;
+
+/// A governed interval stays at or above this fraction of the genesis
+/// interval, bounding chain growth, orphan risk and per-block state churn.
+pub const MIN_GOVERNED_INTERVAL_DIVISOR: u64 = 4;
+
+/// A governed price bound at or above 10,000 basis points permits full
+/// redemption, which lets one holder empty a world and suppress PASS leads.
+pub const MAX_GOVERNED_PRICE_CHANGE_BPS: u64 = 9_999;
+
+/// Operator warnings, not consensus bounds: genesis fields stay
+/// representability-only.
+pub const MAX_SANE_TIMESTAMP_WINDOW: usize = 1024;
+pub const MAX_SANE_SIGNATURES: usize = 65_535;
 
 /// One spendable monetary atom represents one petahash of expected work.
 pub const WORK_PER_ATOM: u64 = 1_000_000_000_000_000;
@@ -171,9 +213,11 @@ impl Config {
         );
         Ok(())
     }
+    /// Genesis and governed capacity share these bounds: the floor keeps
+    /// governance usable and the ceiling keeps every block storable and
+    /// transmissible.
     pub fn valid_block_bytes(&self, bytes: u64) -> bool {
-        bytes >= MIN_GOVERNED_BLOCK_BYTES
-            && usize::try_from(bytes).is_ok_and(|value| value <= isize::MAX as usize)
+        (MIN_GOVERNED_BLOCK_BYTES..=MAX_GOVERNED_BLOCK_BYTES).contains(&bytes)
     }
     /// A transaction may occupy the current block capacity. Its weighted work
     /// and the complete block body's framing are checked separately at admission.
@@ -197,7 +241,7 @@ impl Config {
         ensure!(settings.pass_margin_bps.is_some(), "missing PASS margin");
         ensure!(
             self.valid_block_bytes(settings.block_bytes),
-            "block capacity cannot cover mandatory account creation or fit this implementation"
+            "block capacity must be from {MIN_GOVERNED_BLOCK_BYTES} (a minimal proposal and a new miner account) through {MAX_GOVERNED_BLOCK_BYTES} bytes"
         );
         ensure!(
             settings.decision_blocks > 0,
@@ -263,6 +307,17 @@ impl Config {
             + settings.rest
             + interval * 2u32)
     }
+    /// The shortest interval a decision may select.
+    pub fn min_governed_interval(&self) -> u64 {
+        (self.initial.interval / MIN_GOVERNED_INTERVAL_DIVISOR).max(1)
+    }
+    /// The highest fee rate a decision may select.
+    pub fn max_governed_fee_rate(&self) -> u64 {
+        self.initial
+            .minimum_fee_rate
+            .max(1)
+            .saturating_mul(MAX_GOVERNED_FEE_RATE_FACTOR)
+    }
     /// Bounds on values that only governance selects. Genesis may choose any
     /// representable value, but a passed change has no other path back, so it
     /// must keep phases finite, difficulty stable, transactions affordable
@@ -278,6 +333,9 @@ impl Config {
         // mature before the configured timeout.
         let lead_limit = self.auction_timeout.saturating_sub(changed.interval) / 2;
         let decision_length = changed.decision_blocks.saturating_mul(changed.interval);
+        // Capacity and block rate move at most by a factor of two per
+        // decision, so each step stays within what the previous one allowed.
+        let one_step = new <= old.saturating_mul(2) && new >= old / 2;
         match p {
             // ASERT keeps its genesis half life; a longer scheduled step
             // would demand more than a halving of the next target.
@@ -285,6 +343,14 @@ impl Config {
                 ensure!(
                     new <= self.daa_half_life,
                     "governed block interval exceeds the difficulty half life"
+                );
+                ensure!(
+                    one_step,
+                    "governed block interval can at most double or halve"
+                );
+                ensure!(
+                    new >= self.min_governed_interval(),
+                    "governed block interval is below a quarter of the genesis interval"
                 );
                 // A longer interval also lengthens every decision and leaves
                 // less of the auction for a lead; a shorter one only helps.
@@ -315,14 +381,33 @@ impl Config {
                 );
             }
             Parameter::MaxPriceChangeBps => {
-                ensure!(new > 0, "governed price bound must allow price movement")
+                ensure!(new > 0, "governed price bound must allow price movement");
+                ensure!(
+                    new <= MAX_GOVERNED_PRICE_CHANGE_BPS,
+                    "governed price bound must keep a nonzero lower price limit"
+                );
             }
-            // Repeated increases each need their own decision.
-            Parameter::MinimumFeeRate => ensure!(
-                new <= old.saturating_mul(2).max(1),
-                "governed fee rate can at most double"
-            ),
-            Parameter::BlockBytes | Parameter::MinerFeePercent | Parameter::PassMarginBps => {}
+            // Repeated increases each need their own decision. A zero rate
+            // would make permanent account and record state free.
+            Parameter::MinimumFeeRate => {
+                ensure!(new > 0, "governed fee rate must stay positive");
+                ensure!(
+                    new <= old.saturating_mul(2).max(1),
+                    "governed fee rate can at most double"
+                );
+                ensure!(
+                    new <= self.max_governed_fee_rate(),
+                    "governed fee rate exceeds 2^16 times the genesis rate"
+                );
+            }
+            // Its floor and ceiling are checked with every other setting.
+            Parameter::BlockBytes => {
+                ensure!(
+                    one_step,
+                    "governed block capacity can at most double or halve"
+                )
+            }
+            Parameter::MinerFeePercent | Parameter::PassMarginBps => {}
         }
         // PASS must lead the last floor(N/2)+1 observations. The earliest of
         // them reflects ceil(N/2)-1 traded blocks, each bounded by bps.
@@ -408,6 +493,49 @@ impl Config {
         );
         Ok(())
     }
+    /// Representable genesis values that are still unsafe to operate. They
+    /// stay consensus-valid like every other genesis choice; the CLI reports
+    /// them so an operator notices before a network depends on them.
+    pub fn sanity_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if !(1..=MAX_SANE_TIMESTAMP_WINDOW).contains(&self.timestamp_window) {
+            warnings.push(format!(
+                "timestamp_window {} is outside 1 to {MAX_SANE_TIMESTAMP_WINDOW}; every block reads that many ancestors for its median time",
+                self.timestamp_window
+            ));
+        }
+        if self.max_signatures == 0 {
+            warnings.push("max_signatures is 0, so no block can include a transaction".into());
+        } else if self.max_signatures > MAX_SANE_SIGNATURES {
+            warnings.push(format!(
+                "max_signatures {} exceeds {MAX_SANE_SIGNATURES}; one block can demand that many signature checks and raises every peer's work allowance",
+                self.max_signatures
+            ));
+        }
+        if self.daa_half_life < self.initial.interval {
+            warnings.push(format!(
+                "daa_half_life {} is shorter than the {}-second block interval; one early or late block can more than halve or double the difficulty",
+                self.daa_half_life, self.initial.interval
+            ));
+        } else if self.daa_half_life > MAX_GOVERNED_DURATION {
+            warnings.push(format!(
+                "daa_half_life {} exceeds 2^22 seconds (about 48.5 days); difficulty would take weeks to follow a change in hashrate",
+                self.daa_half_life
+            ));
+        }
+        // ASERT eases the next target by 2^(timestamp error / half life).
+        if self.future_seconds == 0 {
+            warnings.push(
+                "future_seconds is 0; any clock difference between nodes defers blocks".into(),
+            );
+        } else if u64::from(self.future_seconds) > self.daa_half_life {
+            warnings.push(format!(
+                "future_seconds {} exceeds daa_half_life {}; one future-dated block can more than halve the next block's difficulty",
+                self.future_seconds, self.daa_half_life
+            ));
+        }
+        warnings
+    }
     pub fn consensus_bytes(&self) -> Vec<u8> {
         codec::encode(self)
     }
@@ -449,6 +577,7 @@ impl Config {
 #[cfg(test)]
 mod capacity_tests {
     use super::*;
+    use crate::fees;
 
     #[test]
     fn transaction_capacity_tracks_governed_capacity_without_transport_policy() {
@@ -456,19 +585,61 @@ mod capacity_tests {
         let mut settings = c.initial.clone();
         for bytes in [
             MIN_GOVERNED_BLOCK_BYTES,
-            1_025,
+            MIN_GOVERNED_BLOCK_BYTES + 1,
             16_384,
             65_536,
-            64 * 1024 * 1024,
-            isize::MAX as u64,
+            MAX_GOVERNED_BLOCK_BYTES,
         ] {
             settings.block_bytes = bytes;
             c.validate_governance_settings(&settings).unwrap();
             assert_eq!(c.transaction_bytes(&settings), bytes as usize);
         }
-        for bytes in [0, MIN_GOVERNED_BLOCK_BYTES - 1, u64::MAX] {
+        for bytes in [
+            0,
+            fees::ACCOUNT_WEIGHT,
+            MIN_GOVERNED_BLOCK_BYTES - 1,
+            MAX_GOVERNED_BLOCK_BYTES + 1,
+            isize::MAX as u64,
+            u64::MAX,
+        ] {
             settings.block_bytes = bytes;
             assert!(c.validate_governance_settings(&settings).is_err());
         }
+    }
+
+    #[test]
+    fn the_capacity_floor_is_derived_from_the_heaviest_minimal_propose() {
+        // Every variable-width field at its maximum. Wider amounts fail the
+        // 512-bit monetary range, and data is empty in a minimal proposal.
+        let widest = (Amount::one() << 512usize) - 1u32;
+        let propose = Transaction {
+            body: TransactionBody {
+                sender: [0xff; 32],
+                nonce: u64::MAX,
+                fee: widest.clone(),
+                anchor: [0xff; 32],
+                expiry_blocks: u64::MAX,
+                operation: Operation::Propose {
+                    round: u64::MAX,
+                    description: [0xff; 32],
+                    proposal: Proposal::Parameter {
+                        parameter: Parameter::MaxPriceChangeBps,
+                        old: u64::MAX,
+                        new: u64::MAX,
+                    },
+                    support: widest,
+                },
+                data: Vec::new(),
+            },
+            signature: [0xff; 64],
+        };
+        let bytes = codec::encode(&propose).len() as u64;
+        assert_eq!(bytes, MAX_MINIMAL_PROPOSE_BYTES);
+        let mut c = Config::devnet();
+        c.money_bits = 512;
+        c.validate().unwrap();
+        c.check_amount(&propose.body.fee).unwrap();
+        // The proposal, its record and a new miner account fit the floor.
+        assert!(bytes + fees::RECORD_WEIGHT + fees::ACCOUNT_WEIGHT <= MIN_GOVERNED_BLOCK_BYTES);
     }
 }

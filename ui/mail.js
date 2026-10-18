@@ -90,7 +90,7 @@
     function render(){
       const verified=verifiedTip===context.tip;
       $('mail-empty').hidden=verified&&opened.size>0;
-      $('mail-empty').textContent=!context.key?'Select a wallet.':!context.can_decrypt?'Watch-only · import the private key to read mail.':!context.available?'Mail unavailable.':loading?'Checking messages…':paused?'Scan paused.':!verified&&checkedTip?'Verifying latest blocks…':'No messages found.';
+      $('mail-empty').textContent=!context.key?'Select a wallet.':!context.can_decrypt?(context.locked?'Locked · unlock this browser wallet to read mail.':'Watch-only · import the private key to read mail.'):!context.available?'Mail unavailable.':loading?'Checking messages…':paused?'Scan paused.':!verified&&checkedTip?'Verifying latest blocks…':'No messages found.';
       $('mail-scan-status').textContent=context.key&&context.can_decrypt?(loading?`Scanning · ${scanned} checked · ${opened.size} found`:paused?`Paused · ${scanned} checked`:!verified&&checkedTip?'Verification pending':verified?`${scanned} checked · ${opened.size} found`:''):'';
       if(context.key&&context.can_decrypt&&storageNote)$('mail-scan-status').textContent+=' · '+storageNote;
       if(context.key&&context.can_decrypt&&omitted)$('mail-scan-status').textContent+=` · ${omitted} earlier message${omitted===1?' is':'s are'} not kept in this browser; clear the saved scan to show ${omitted===1?'it':'them'} again`;
@@ -177,8 +177,10 @@
               throw Error('Mail transaction signature or details could not be verified.');
             }
             // Decryption failure alone is normal: most envelopes are not ours.
+            // A wallet locked by its passphrase opened nothing, so the page
+            // stops without advancing the checkpoint or dropping the cache.
             let clear=null;
-            try{root.HashstashMailCrypto.parse(claimed.data_hex);clear=await decrypt(claimed.data_hex,{chain_id:context.chain_id,sender:claimed.sender,nonce:claimed.nonce},identity());}catch(_){}
+            try{root.HashstashMailCrypto.parse(claimed.data_hex);clear=await decrypt(claimed.data_hex,{chain_id:context.chain_id,sender:claimed.sender,nonce:claimed.nonce},identity());}catch(e){if(e?.walletLocked)throw e;}
             if(!current())return;
             if(validId(clear?.recipient)&&typeof clear.subject==='string'&&typeof clear.body==='string'&&(claimed.sender===context.key||clear.recipient===context.key)){
               let signed=claimed.signed;

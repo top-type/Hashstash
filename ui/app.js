@@ -915,6 +915,10 @@
         const expiry = transactionExpiry(form);
         if (!expiry) throw new Error("Transaction expiry must be greater than zero.");
         const identity = submissionIdentity(form), hot = state.session.wallet_enabled, dataFields = transactionData(form);
+        if (hot && state.session.wallet_locked) {
+            openUnlock("Unlock this browser wallet to sign.");
+            throw new Error("Unlock this browser wallet to sign.");
+        }
         const nonce = nextNonce();
         const expiryHeight = BigInt(state.status.height) + BigInt(expiry);
         if (expiryHeight > 18446744073709551615n) throw new Error("Transaction lifetime overflows the block height.");
@@ -2254,6 +2258,10 @@
                     resetContext();
                     state.managing || state.submitting || refresh();
                 });
+                // Locking changes no saved wallet, so it keeps the context.
+                browserWallet.onLockChange?.(() => {
+                    state.managing || state.submitting || refresh();
+                });
             } catch (error) {
                 walletStorageError = error.message;
             }
@@ -2394,7 +2402,8 @@
                 address: address(),
                 wallet_id: state.session?.wallet_id,
                 wallet_revision: state.session?.wallet_revision,
-                can_decrypt: !!state.session?.wallet_enabled
+                can_decrypt: !!state.session?.wallet_enabled && !state.session?.wallet_locked,
+                locked: !!state.session?.wallet_locked
             });
             !$("trade-amount").value || state.submitting || state.managing || !changedState && !state.quoteFailed || quoteSoon(true);
             $("send-form").elements.recipient.value && $("send-form").elements.amount.value && !state.submitting && !state.managing && (changedState || state.sendFailed) && sendSoon(true);
@@ -2664,10 +2673,61 @@
         }
         try {
             await navigator.clipboard.writeText(address());
+            forgetCopiedSecret();
             toast("Address copied.");
         } catch {
             toast("Copy the address shown in Payments.");
             location.hash = "send";
+        }
+    }
+    // A private key copied to the clipboard is cleared after 30 seconds,
+    // unless this page can see that the clipboard now holds something else.
+    // Writing needs a focused page, so an unfocused one clears on return.
+    const CLIPBOARD_CLEAR_MS = 30e3;
+    let copiedSecret = null, clipboardTimer;
+    function forgetCopiedSecret() {
+        copiedSecret = null;
+        clearTimeout(clipboardTimer);
+    }
+    async function clearCopiedSecret() {
+        const copied = copiedSecret;
+        if (!copied) return;
+        clearTimeout(clipboardTimer);
+        let current = null;
+        try {
+            // Reading is attempted only with permission already granted, so
+            // the page never prompts for it.
+            const permission = await navigator.permissions?.query?.({
+                name: "clipboard-read"
+            });
+            if (permission?.state === "granted") current = await navigator.clipboard.readText();
+        } catch {
+            current = null;
+        }
+        if (copiedSecret !== copied) return;
+        if (current !== null && current !== copied) return forgetCopiedSecret();
+        try {
+            await navigator.clipboard.writeText("");
+            copiedSecret === copied && (copiedSecret = null);
+            toast("The private key was cleared from the clipboard.");
+        } catch {
+            window.addEventListener("focus", clearCopiedSecret, {
+                once: true
+            });
+        }
+    }
+    // The backup file is encoded into bytes that are wiped once the browser
+    // holds its own copy, with no other string of the whole document. The key
+    // string itself cannot be wiped.
+    function downloadBackup(backup) {
+        const encoder = new TextEncoder, parts = [ '{\n  "format": "hashstash-private-v1",\n  "private_key": "', backup.private_key, '",\n  "public_key": "', backup.public_key, '"\n}\n' ];
+        const bytes = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
+        let offset = 0;
+        for (const part of parts) offset += encoder.encodeInto(part, bytes.subarray(offset)).written;
+        try {
+            downloadText("hashstash-private-key.json", bytes);
+        } finally {
+            bytes.fill(0);
         }
     }
     function downloadText(name, content) {
@@ -2792,12 +2852,43 @@
         walletSelectorBalancesView();
         walletBalancesView($("account-balances"), key());
         selector.title = address();
-        text("wallet-kind", key() ? session.wallet_enabled ? "Hot wallet" : "Watch only" : "");
+        text("wallet-kind", key() ? session.wallet_enabled ? session.wallet_locked ? "Hot wallet · locked" : "Hot wallet" : "Watch only" : "");
         text("wallet-public", address());
         $("wallet-public").title = address();
         $("wallet-explore").href = `#explorer?account=${encodeURIComponent(address())}`;
         $("export-private").hidden = !session.wallet_enabled;
+        securityView();
         modeButtons();
+    }
+    // An optional passphrase seals the private keys saved in this browser.
+    // Keys open only in this page's memory, until the idle lock or a reload.
+    function securityView() {
+        const session = state.session, encrypted = !!session?.wallet_encrypted, locked = !!session?.wallet_locked;
+        $("wallet-security").hidden = !session || !browserWallet || !!walletStorageError || !(encrypted || session.wallets?.some(wallet => wallet.can_sign));
+        text("wallet-lock-state", encrypted ? locked ? "Locked" : "Unlocked" : "Not encrypted");
+        const minutes = Math.max(1, Math.round((session?.wallet_idle_lock_seconds || 300) / 60)), plain = session?.wallet_plaintext_keys || 0;
+        text("wallet-security-status", !encrypted ? "Private keys in this browser are saved unencrypted: anyone who can read this browser profile can take them. Set a passphrase to encrypt them." : locked ? `Private keys are encrypted with your passphrase. Unlock to sign, back up a key or read mail.${plain ? ` ${plain} key${plain === 1 ? " saved without encryption is" : "s saved without encryption are"} sealed when you unlock.` : ""}` : `Unlocked in this page. It locks after ${minutes} minute${minutes === 1 ? "" : "s"} without use, and when the page closes.`);
+        $("wallet-unlock").hidden = !encrypted || !locked;
+        $("wallet-lock").hidden = !encrypted || locked;
+        $("wallet-passphrase-open").hidden = encrypted && locked;
+        text("wallet-passphrase-open", encrypted ? "Change passphrase" : "Set passphrase");
+        const remove = $("wallet-passphrase-remove");
+        remove.hidden = !encrypted || locked;
+        if (remove.hidden && remove.dataset.confirm) {
+            delete remove.dataset.confirm;
+            text("wallet-passphrase-remove", "Remove passphrase");
+        }
+        if (encrypted && locked) $("wallet-passphrase-form").hidden = true;
+    }
+    function openUnlock(message = "") {
+        if (!state.session?.wallet_locked) return;
+        $("unlock-passphrase").value = "";
+        feedback($("unlock-form"), message);
+        $("unlock-dialog").open || $("unlock-dialog").showModal();
+    }
+    // A locked passphrase stopped the action; offer to unlock.
+    function lockedPrompt(error) {
+        error?.walletLocked && openUnlock(error.message);
     }
     function walletMessage(message, failed = false) {
         text("wallet-feedback", message);
@@ -2835,7 +2926,11 @@
             } else if (action === "import") {
                 if (values.public_key && HashstashBrowserWallet.publicKey(values.private_key) !== values.public_key) throw new Error("Backup public key does not match.");
                 result = await browserWallet.importPrivate(values.private_key, guard);
-            } else if (action === "watch") result = await browserWallet.watch(values.public_key, guard); else if (action === "select") result = await browserWallet.select(values.id, guard); else {
+            } else if (action === "watch") result = await browserWallet.watch(values.public_key, guard); else if (action === "select") result = await browserWallet.select(values.id, guard);
+            else if (action === "unlock") result = await browserWallet.unlock(values.passphrase);
+            else if (action === "lock") result = browserWallet.lock();
+            else if (action === "passphrase") result = await browserWallet.setPassphrase(values.passphrase, guard);
+            else if (action === "remove-passphrase") result = await browserWallet.removePassphrase(guard); else {
                 if (action !== "export") throw new Error("Unknown wallet action.");
                 result = {
                     format: "hashstash-private-v1",
@@ -2870,6 +2965,7 @@
             walletMessage("Wallet created in this browser. Back up its private key.");
         } catch (error) {
             walletMessage(error.message, true);
+            lockedPrompt(error);
         }
     });
     $("wallet-import-form").addEventListener("submit", async event => {
@@ -2890,6 +2986,7 @@
             walletMessage("Wallet imported into this browser. Keep your backup.");
         } catch (error) {
             feedback(form, error.message, true);
+            lockedPrompt(error);
         }
     });
     $("import-private-key").addEventListener("input", () => {
@@ -2969,6 +3066,7 @@
         }, null, 2) + "\n");
     });
     $("export-private").addEventListener("click", async () => {
+        if (state.session?.wallet_locked) return openUnlock("Unlock this browser wallet to back up its key.");
         try {
             clearBackup();
             const expected = key(), result = await manageWallet("export", {
@@ -2980,6 +3078,7 @@
             $("backup-dialog").showModal();
         } catch (error) {
             walletMessage(error.message, true);
+            lockedPrompt(error);
         }
     });
     $("backup-close").addEventListener("click", clearBackup);
@@ -2991,13 +3090,88 @@
         try {
             if (!privateBackup) return;
             await navigator.clipboard.writeText(privateBackup.private_key);
-            toast("Private key copied.");
+            copiedSecret = privateBackup.private_key;
+            clearTimeout(clipboardTimer);
+            clipboardTimer = setTimeout(clearCopiedSecret, CLIPBOARD_CLEAR_MS);
+            toast(`Private key copied. The clipboard is cleared in ${CLIPBOARD_CLEAR_MS / 1e3} seconds.`);
         } catch {
             toast("Select and copy the private key.");
         }
     });
     $("backup-download").addEventListener("click", () => {
-        privateBackup && downloadText("hashstash-private-key.json", JSON.stringify(privateBackup, null, 2) + "\n");
+        privateBackup && downloadBackup(privateBackup);
+    });
+    $("unlock-close").addEventListener("click", () => $("unlock-dialog").close());
+    $("unlock-dialog").addEventListener("close", () => {
+        $("unlock-passphrase").value = "";
+    });
+    $("unlock-form").addEventListener("submit", async event => {
+        event.preventDefault();
+        const form = $("unlock-form"), passphrase = form.elements.passphrase.value;
+        form.elements.passphrase.value = "";
+        try {
+            feedback(form, "Unlocking…");
+            await manageWallet("unlock", {
+                passphrase: passphrase
+            });
+            feedback(form, "");
+            $("unlock-dialog").close();
+            walletMessage("Wallet unlocked in this page.");
+            toast("Wallet unlocked.");
+        } catch (error) {
+            feedback(form, error.message, true);
+        }
+    });
+    $("wallet-unlock").addEventListener("click", () => openUnlock());
+    $("wallet-lock").addEventListener("click", async () => {
+        try {
+            await manageWallet("lock");
+            walletMessage("Wallet locked.");
+        } catch (error) {
+            walletMessage(error.message, true);
+        }
+    });
+    function closePassphraseForm(hidden) {
+        const form = $("wallet-passphrase-form");
+        form.elements.passphrase.value = form.elements.confirm.value = "";
+        feedback(form, "");
+        form.hidden = hidden;
+    }
+    $("wallet-passphrase-open").addEventListener("click", () => closePassphraseForm(!$("wallet-passphrase-form").hidden));
+    $("wallet-passphrase-cancel").addEventListener("click", () => closePassphraseForm(true));
+    $("wallet-passphrase-form").addEventListener("submit", async event => {
+        event.preventDefault();
+        const form = $("wallet-passphrase-form"), passphrase = form.elements.passphrase.value, repeated = form.elements.confirm.value, changing = !!state.session?.wallet_encrypted;
+        form.elements.passphrase.value = form.elements.confirm.value = "";
+        try {
+            if (passphrase !== repeated) throw new Error("The two passphrases differ.");
+            feedback(form, "Encrypting keys…");
+            await manageWallet("passphrase", {
+                passphrase: passphrase
+            });
+            closePassphraseForm(true);
+            walletMessage(changing ? "Passphrase changed." : "Private keys in this browser are now encrypted with your passphrase. It cannot be recovered, so keep your key backups.");
+        } catch (error) {
+            feedback(form, error.message, true);
+            lockedPrompt(error);
+        }
+    });
+    $("wallet-passphrase-remove").addEventListener("click", async () => {
+        const button = $("wallet-passphrase-remove");
+        if (!button.dataset.confirm) {
+            button.dataset.confirm = "true";
+            text("wallet-passphrase-remove", "Confirm: save keys unencrypted");
+            return;
+        }
+        delete button.dataset.confirm;
+        text("wallet-passphrase-remove", "Remove passphrase");
+        try {
+            await manageWallet("remove-passphrase");
+            walletMessage("Passphrase removed. Private keys in this browser are saved unencrypted again.");
+        } catch (error) {
+            walletMessage(error.message, true);
+            lockedPrompt(error);
+        }
     });
     $("broadcast-form").addEventListener("submit", async event => {
         event.preventDefault();
@@ -3055,6 +3229,7 @@
     $("unsigned-copy").addEventListener("click", async () => {
         try {
             await navigator.clipboard.writeText($("unsigned-output").value);
+            forgetCopiedSecret();
             toast("Unsigned transaction copied.");
         } catch {
             toast("Select and copy the transaction text.");

@@ -344,12 +344,84 @@
     if (!root.crypto?.getRandomValues) fail('Secure randomness is unavailable.');
   }
   function random(size) { requireSecure(); return root.crypto.getRandomValues(new Uint8Array(size)); }
-  function createStore(chainId) {
+  // Optional passphrase lock for saved private keys, hashstash-browser-lock-v1.
+  // PBKDF2-HMAC-SHA256 over the NFC-normalized passphrase and a random 16-byte
+  // salt derives a non-extractable AES-256-GCM key. Each sealed key is bound to
+  // the network and its public key as authenticated data. A sealed empty check
+  // value, bound to the network and salt, identifies the passphrase.
+  const LOCK_FORMAT = 'hashstash-browser-lock-v1', LOCK_KDF = 'PBKDF2-HMAC-SHA256', LOCK_ITERATIONS = 600000;
+  const IDLE_LOCK_MS = 5 * 60 * 1000, MIN_LOCK_PASSPHRASE = 8;
+  function subtle() { requireSecure(); if (!root.crypto?.subtle) fail('Browser encryption is unavailable. Use a current browser.'); return root.crypto.subtle; }
+  function canonicalHex(value, size) { return typeof value === 'string' && value.length === size * 2 && /^[0-9a-f]*$/.test(value); }
+  function sealedShape(value, size, label) {
+    fields(value, ['iv','data'], label);
+    if (!canonicalHex(value.iv, 12) || !canonicalHex(value.data, size)) fail(`${label} is invalid. Existing data was preserved.`);
+  }
+  function lockShape(lock) {
+    fields(lock, ['format','kdf','iterations','salt','check'], 'Wallet passphrase');
+    if (lock.format !== LOCK_FORMAT || lock.kdf !== LOCK_KDF || lock.iterations !== LOCK_ITERATIONS || !canonicalHex(lock.salt, 16)) fail('Unsupported wallet passphrase. Existing data was preserved.');
+    sealedShape(lock.check, 16, 'Wallet passphrase');
+  }
+  // The thrown error says the lock, not the data, stopped the operation.
+  function lockedFail(message) { const error = new Error(message); error.walletLocked = true; throw error; }
+  async function lockKey(passphrase, salt) {
+    if (typeof passphrase !== 'string') fail('Enter the wallet passphrase.');
+    const phrase = passphraseBytes(passphrase.normalize('NFC'));
+    try {
+      const base = await subtle().importKey('raw', phrase, 'PBKDF2', false, ['deriveKey']);
+      return await subtle().deriveKey({name:'PBKDF2', hash:'SHA-256', salt, iterations:LOCK_ITERATIONS}, base, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
+    } finally { phrase.fill(0); }
+  }
+  async function seal(key, plain, additionalData) {
+    const iv = random(12);
+    return {iv:hex(iv), data:hex(new Uint8Array(await subtle().encrypt({name:'AES-GCM', iv, additionalData, tagLength:128}, key, plain)))};
+  }
+  // The plaintext, or null when the key or authenticated data does not match.
+  async function unseal(key, sealed, additionalData) {
+    try { return new Uint8Array(await subtle().decrypt({name:'AES-GCM', iv:fromHex(sealed.iv, 12), additionalData, tagLength:128}, key, fromHex(sealed.data))); }
+    catch { return null; }
+  }
+  function createStore(chainId, options = {}) {
     requireSecure(); chainId = hex(bytes32(chainId,'Chain ID'));
-    const storageKey = `hashstash.browser-wallet.v1.${chainId}`, hrp = 'hsh' + chainId.slice(0,16), callbacks = new Set();
-    let cachedFingerprint, cachedMetadata;
+    const idleLock = options.idleLockMs ?? IDLE_LOCK_MS;
+    if (!Number.isSafeInteger(idleLock) || idleLock <= 0) fail('Invalid idle lock.');
+    const storageKey = `hashstash.browser-wallet.v1.${chainId}`, hrp = 'hsh' + chainId.slice(0,16), callbacks = new Set(), lockCallbacks = new Set();
+    let cachedFingerprint, cachedMetadata, cachedLock, unlocked = null, idleTimer;
     const empty = () => ({version:1,chain_id:chainId,revision:'0',selected:null,wallets:[]});
-    const invalidateMetadata = () => { cachedFingerprint = cachedMetadata = undefined; };
+    const invalidateMetadata = () => { cachedFingerprint = cachedMetadata = cachedLock = undefined; };
+    const keyData = publicKey => concat(utf8.encode('Hashstash/browser-wallet-key/v1\0'), fromHex(chainId, 32), fromHex(publicKey, 32));
+    const checkData = salt => concat(utf8.encode('Hashstash/browser-wallet-lock/v1\0'), fromHex(chainId, 32), salt);
+    const lockId = lock => lock ? `${lock.salt}:${lock.check.data}` : null;
+    // The passphrase key lives only in this page's memory. It opens only the
+    // lock it was derived for, so a passphrase changed in another tab locks
+    // this one, and it is dropped after a period without explicit use even
+    // when a background tab's timer is late.
+    function relock() { unlocked = null; root.clearTimeout?.(idleTimer); idleTimer = undefined; }
+    function session(lock) {
+      if (unlocked && Date.now() - unlocked.used >= idleLock) relock();
+      return unlocked && unlocked.lock === lockId(lock) ? unlocked.key : null;
+    }
+    function lockChanged() { for (const callback of lockCallbacks) { try { callback(snapshot()); } catch { /* listeners cannot interrupt locking */ } } }
+    function expire() {
+      if (!unlocked) return;
+      const left = idleLock - (Date.now() - unlocked.used);
+      if (left > 0) { idleTimer = root.setTimeout?.(expire, left); return; }
+      relock(); lockChanged();
+    }
+    function touch() {
+      if (!unlocked) return;
+      unlocked.used = Date.now(); root.clearTimeout?.(idleTimer); idleTimer = root.setTimeout?.(expire, idleLock);
+    }
+    // A saved key's secret bytes, checked against its address. Callers wipe them.
+    async function secretOf(data, w) {
+      if (w.private_key) return secretBytes(w.private_key);
+      if (!w.sealed_key) fail('This wallet has no private key.');
+      const key = session(data.lock);
+      if (!key) lockedFail('Unlock this browser wallet with its passphrase first.');
+      const secret = await unseal(key, w.sealed_key, keyData(w.public_key));
+      if (!secret || secret.length !== 32 || !noble.validSecret(secret) || hex(noble.schnorr.getPublicKey(secret)) !== w.public_key) { secret?.fill(0); fail('Saved private key does not match its address. Existing data was preserved.'); }
+      return secret;
+    }
     function storedText() {
       let text; try { text = root.localStorage.getItem(storageKey); } catch { fail('Browser wallet storage is unavailable.'); }
       if (text != null && text.length > 1024*1024) fail('Browser wallet data is too large. Export existing keys before changing storage.');
@@ -358,22 +430,31 @@
     function read(text = storedText()) {
       if (text == null) return empty();
       let data; try { data=JSON.parse(text); } catch { fail('Browser wallet data cannot be read. Existing data was preserved.'); }
-      fields(data,['version','chain_id','revision','selected','wallets'],'Wallet data');
+      // An optional `lock` and per-wallet `sealed_key` hold passphrase-encrypted
+      // keys. Data without them keeps the original unencrypted layout.
+      fields(data,['version','chain_id','revision','selected','wallets','lock'],'Wallet data');
       if (data.version !== 1 || data.chain_id !== chainId || typeof data.revision !== 'string' || !Array.isArray(data.wallets) || data.wallets.length > 1000) fail('Invalid browser wallet data. Existing data was preserved.');
+      if (data.lock !== undefined) lockShape(data.lock);
       const seen=new Set();
       for(const w of data.wallets) {
-        fields(w,['id','public_key','private_key','backed_up'],'Wallet');
+        fields(w,['id','public_key','private_key','backed_up','sealed_key'],'Wallet');
         if(w.id !== w.public_key || seen.has(w.id) || hex(publicBytes(w.public_key)) !== w.public_key || typeof w.backed_up !== 'boolean') fail('Invalid saved wallet. Existing data was preserved.');
         seen.add(w.id);
+        if(w.sealed_key !== undefined) { if (!data.lock || w.private_key != null) fail('Invalid saved wallet. Existing data was preserved.'); sealedShape(w.sealed_key, 48, 'Saved private key'); }
         if(w.private_key != null && publicKey(w.private_key) !== w.public_key) fail('Saved private key does not match its address. Existing data was preserved.');
       }
       if(data.selected !== null && !seen.has(data.selected)) fail('Selected wallet is unavailable. Existing data was preserved.');
       return data;
     }
     function metadata(data) {
-      const wallets=data.wallets.map(w=>({id:w.id,public_key:w.public_key,address:addresses.encode(w.public_key,hrp),mode:w.private_key?'hot':'watch',can_sign:!!w.private_key,backed_up:w.backed_up}));
+      const wallets=data.wallets.map(w=>{const hot=!!(w.private_key||w.sealed_key);return {id:w.id,public_key:w.public_key,address:addresses.encode(w.public_key,hrp),mode:hot?'hot':'watch',can_sign:hot,encrypted:!!w.sealed_key,backed_up:w.backed_up};});
       const selected=wallets.find(w=>w.id===data.selected);
-      return {wallets,wallet_id:selected?.id??null,wallet_revision:data.revision,public_key:selected?.public_key??null,address:selected?.address??null,wallet_enabled:!!selected?.can_sign,wallet_mode:selected?.mode??'none',chain_id:chainId};
+      return {wallets,wallet_id:selected?.id??null,wallet_revision:data.revision,public_key:selected?.public_key??null,address:selected?.address??null,wallet_enabled:!!selected?.can_sign,wallet_mode:selected?.mode??'none',chain_id:chainId,
+        wallet_encrypted:!!data.lock,wallet_plaintext_keys:data.wallets.filter(w=>w.private_key).length,wallet_idle_lock_seconds:Math.ceil(idleLock/1000)};
+    }
+    // Lock state lives in memory, so it joins the cached public view here.
+    function view(meta, lock) {
+      return {...meta,wallet_locked:meta.wallet_encrypted&&!session(lock),wallets:meta.wallets.map(wallet=>({...wallet}))};
     }
     function snapshot() {
       requireSecure();
@@ -388,33 +469,56 @@
       finally { bytes?.fill(0); }
       if (!cachedMetadata || fingerprint !== cachedFingerprint) {
         invalidateMetadata();
-        cachedMetadata = metadata(read(text)); cachedFingerprint = fingerprint;
+        const data = read(text);
+        cachedMetadata = metadata(data); cachedLock = data.lock; cachedFingerprint = fingerprint;
       }
       // Callers must not be able to mutate the cached view.
-      return {...cachedMetadata,wallets:cachedMetadata.wallets.map(wallet=>({...wallet}))};
+      return view(cachedMetadata, cachedLock);
     }
     function guard(data, expected) { if(expected?.wallet_revision !== undefined && expected.wallet_revision !== data.revision) fail('Wallet selection changed. Try again.'); }
     function notify() { for(const callback of callbacks) { try { callback(snapshot()); } catch { /* callbacks cannot interrupt persistence */ } } }
     async function locked(fn) { requireSecure(); if(!root.navigator?.locks?.request) fail('This browser does not support safe wallet storage. Use a current browser.'); return root.navigator.locks.request(storageKey,fn); }
+    // The storage lock is held across any encryption the change awaits.
     async function change(fn,expected) {
-      return locked(()=>{ const data=read(); guard(data,expected); fn(data); data.revision=hex(random(16));
+      return locked(async()=>{ const data=read(); guard(data,expected); await fn(data); data.revision=hex(random(16));
         try { root.localStorage.setItem(storageKey,JSON.stringify(data)); } catch { fail('Wallet could not be saved. Existing wallets were preserved.'); }
         invalidateMetadata();
-        notify(); return metadata(data);
+        notify(); return view(metadata(data), data.lock);
       });
     }
+    // With a passphrase, a new private key is saved only sealed, so adding one
+    // needs the unlocked passphrase key.
     async function add(public_key,private_key,expected) {
-      return change(data=>{let existing=data.wallets.find(w=>w.id===public_key);
-        if(existing) { if(private_key && !existing.private_key) { existing.private_key=private_key; existing.backed_up=false; } }
-        else { if(data.wallets.length >= 1000) fail('Too many saved wallets.'); data.wallets.push({id:public_key,public_key,private_key:private_key??null,backed_up:false}); }
-        data.selected=public_key;
+      let keyAdded = false;
+      const result = await change(async data=>{let existing=data.wallets.find(w=>w.id===public_key);
+        const needsKey=!!private_key && !(existing?.private_key || existing?.sealed_key);
+        let sealed=null;
+        if(needsKey && data.lock) {
+          const key=session(data.lock);
+          if(!key) lockedFail('Unlock this browser wallet with its passphrase to add a private key.');
+          const secret=secretBytes(private_key);
+          try { sealed=await seal(key,secret,keyData(public_key)); } finally { secret.fill(0); }
+        }
+        if(existing) { if(needsKey) { if(sealed) existing.sealed_key=sealed; else existing.private_key=private_key; existing.backed_up=false; } }
+        else { if(data.wallets.length >= 1000) fail('Too many saved wallets.'); const entry={id:public_key,public_key,private_key:sealed?null:private_key??null,backed_up:false}; if(sealed) entry.sealed_key=sealed; data.wallets.push(entry); }
+        data.selected=public_key; keyAdded=!!sealed;
       },expected);
+      keyAdded && touch();
+      return result;
+    }
+    // Every saved key, opened for resealing. Callers wipe the secrets.
+    async function openAll(data) {
+      const opened=[];
+      try { for(const w of data.wallets) if(w.private_key || w.sealed_key) opened.push([w,await secretOf(data,w)]); return opened; }
+      catch(error) { for(const [,secret] of opened) secret.fill(0); throw error; }
     }
     const onStorage=e=>{if(e.key===storageKey || e.key===null) { invalidateMetadata(); notify(); }}; root.addEventListener?.('storage',onStorage);
     return Object.freeze({
       snapshot,
       subscribe(callback) { if(typeof callback!=='function') fail('Invalid wallet subscriber.'); callbacks.add(callback); return ()=>callbacks.delete(callback); },
-      destroy() { root.removeEventListener?.('storage',onStorage); callbacks.clear(); invalidateMetadata(); },
+      // Locking and unlocking change no saved data, so they notify separately.
+      onLockChange(callback) { if(typeof callback!=='function') fail('Invalid wallet subscriber.'); lockCallbacks.add(callback); return ()=>lockCallbacks.delete(callback); },
+      destroy() { root.removeEventListener?.('storage',onStorage); callbacks.clear(); lockCallbacks.clear(); relock(); invalidateMetadata(); },
       async create(expected) { let secret; do { secret=random(32); } while(!noble.validSecret(secret)); try { return await add(hex(noble.schnorr.getPublicKey(secret)),hex(secret),expected); } finally { secret.fill(0); } },
       importPrivate(privateHex,expected) { const key=publicKey(privateHex); return add(key,privateHex.toLowerCase(),expected); },
       // The scheme is explicit: v2 for passphrase accounts, v1 only to restore legacy ones.
@@ -424,32 +528,94 @@
       },
       watch(value,expected) { const key=typeof value==='string' && value.length===78 ? addresses.decode(value,hrp) : hex(publicBytes(value)); publicBytes(key); return add(key,null,expected); },
       select(id,expected) { return change(data=>{if(!data.wallets.some(w=>w.id===id)) fail('Wallet not found.'); data.selected=id;},expected); },
-      exportPrivate(id,expected) { return locked(()=>{const data=read();guard(data,expected);const w=data.wallets.find(w=>w.id===id);if(!w?.private_key)fail('This wallet has no private key.');return w.private_key;}); },
+      exportPrivate(id,expected) {
+        return locked(async()=>{const data=read();guard(data,expected);const w=data.wallets.find(w=>w.id===id);if(!w?.private_key && !w?.sealed_key)fail('This wallet has no private key.');
+          if(w.private_key)return w.private_key;
+          const secret=await secretOf(data,w);try{touch();return hex(secret);}finally{secret.fill(0);}});
+      },
       acknowledgeBackup(id,expected) { return change(data=>{const w=data.wallets.find(w=>w.id===id);if(!w)fail('Wallet not found.');w.backed_up=true;},expected); },
+      // Seal every saved key under a new passphrase: the migration from
+      // unencrypted storage, or a passphrase change, which needs the current
+      // lock open. Derivation runs before the storage lock is taken.
+      async setPassphrase(passphrase,expected) {
+        requireSecure();
+        if(typeof passphrase!=='string' || [...passphrase.normalize('NFC')].length < MIN_LOCK_PASSPHRASE) fail(`Choose a wallet passphrase of at least ${MIN_LOCK_PASSPHRASE} characters.`);
+        const salt=random(16), key=await lockKey(passphrase,salt);
+        let lock;
+        const result=await change(async data=>{
+          if(data.lock && !session(data.lock)) lockedFail('Unlock this browser wallet before changing its passphrase.');
+          const opened=await openAll(data);
+          try {
+            lock={format:LOCK_FORMAT,kdf:LOCK_KDF,iterations:LOCK_ITERATIONS,salt:hex(salt),check:await seal(key,new Uint8Array(0),checkData(salt))};
+            const sealed=[];for(const [w,secret] of opened) sealed.push([w,await seal(key,secret,keyData(w.public_key))]);
+            for(const [w,value] of sealed) { w.private_key=null; w.sealed_key=value; }
+            data.lock=lock;
+          } finally { for(const [,secret] of opened) secret.fill(0); }
+        },expected);
+        unlocked={lock:lockId(lock),key,used:Date.now()};touch();lockChanged();
+        return {...result,wallet_locked:false};
+      },
+      // Return every key to unencrypted storage; the lock must be open.
+      async removePassphrase(expected) {
+        const result=await change(async data=>{
+          if(!data.lock) fail('This browser wallet has no passphrase.');
+          if(!session(data.lock)) lockedFail('Unlock this browser wallet before removing its passphrase.');
+          const opened=await openAll(data);
+          try { for(const [w,secret] of opened) { w.private_key=hex(secret); delete w.sealed_key; } delete data.lock; }
+          finally { for(const [,secret] of opened) secret.fill(0); }
+        },expected);
+        relock();lockChanged();
+        return result;
+      },
+      // Opens the lock for this page only. A key saved unencrypted beside the
+      // lock, by older software for example, is sealed at the first unlock.
+      async unlock(passphrase) {
+        requireSecure();
+        const data=read();if(!data.lock) fail('This browser wallet has no passphrase.');
+        const salt=fromHex(data.lock.salt,16),key=await lockKey(passphrase,salt);
+        if(await unseal(key,data.lock.check,checkData(salt))===null) fail('Wrong passphrase.');
+        const id=lockId(data.lock);
+        unlocked={lock:id,key,used:Date.now()};touch();
+        if(data.wallets.some(w=>w.private_key)) {
+          await change(async current=>{
+            if(lockId(current.lock)!==id) lockedFail('The wallet passphrase changed in another tab. Unlock again.');
+            for(const w of current.wallets) if(w.private_key) { const secret=secretBytes(w.private_key); try { w.sealed_key=await seal(key,secret,keyData(w.public_key)); w.private_key=null; } finally { secret.fill(0); } }
+          });
+        }
+        lockChanged();
+        return snapshot();
+      },
+      lock() { relock(); lockChanged(); return snapshot(); },
       async decryptMail(dataHex,identity,expected) {
         requireSecure(); const data=read(); guard(data,expected);
         if(!expected || expected.wallet_revision===undefined || expected.wallet_id!==data.selected || expected.chain_id!==chainId || identity.chain_id!==chainId) fail('Wallet context changed. Try again.');
         const w=data.wallets.find(w=>w.id===data.selected);
-        if(!w?.private_key) fail('Import this account’s private key locally to open encrypted mail.');
+        if(!w?.private_key && !w?.sealed_key) fail('Import this account’s private key locally to open encrypted mail.');
         if(!root.HashstashMailCrypto) fail('Encrypted mail is unavailable.');
-        const result=await root.HashstashMailCrypto.decrypt(dataHex,identity,w.private_key);
-        guard(read(),expected);
-        return result;
+        // Background mail scanning does not count as use for the idle lock.
+        const secret=w.sealed_key ? await secretOf(data,w) : null;
+        try {
+          const result=await root.HashstashMailCrypto.decrypt(dataHex,identity,w.private_key ?? hex(secret));
+          guard(read(),expected);
+          return result;
+        } finally { secret?.fill(0); }
       },
-      signUnsigned(envelope,expected) {
+      async signUnsigned(envelope,expected) {
         requireSecure(); const data=read(); guard(data,expected);
         if(!expected || expected.wallet_revision===undefined || expected.wallet_id!==data.selected || hex(bytes32(expected.chain_id))!==chainId) fail('Wallet context changed. Try again.');
         const w=data.wallets.find(w=>w.id===data.selected);
-        if(!w?.private_key) fail('Use the offline signer for this watch-only wallet.');
+        if(!w?.private_key && !w?.sealed_key) fail('Use the offline signer for this watch-only wallet.');
         if(hex(publicBytes(expected.sender))!==w.public_key) fail('Selected wallet does not authorize this sender.');
         verifyUnsigned(envelope,expected);
-        const secret=secretBytes(w.private_key), aux=random(32);
+        const secret=await secretOf(data,w);let aux;
         try {
+          aux=random(32);
           const body=fromHex(envelope.body), signature=noble.schnorr.sign(signingMessage(fromHex(chainId,32),body),secret,aux);
           const raw=concat(body,signature);
           guard(read(),expected);
+          touch();
           return {raw:hex(raw),transaction_id:hex(noble.sha256(noble.sha256(raw)))};
-        } finally {secret.fill(0);aux.fill(0);}
+        } finally {secret.fill(0);aux?.fill(0);}
       }
     });
   }

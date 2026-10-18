@@ -128,7 +128,7 @@ async function run() {
   assert.equal(reloaded.browserStore.snapshot().wallets.length,2);checks++;
   assert.equal(reloaded.browserStore.snapshot().wallet_enabled,false);checks++;
   // A watch export can be signed in the other independent browser holding its key.
-  const local=b.browserStore.snapshot(),signed=b.browserStore.signUnsigned(watchEnvelope,{chain_id:b.currentSnapshot.status.chain_id,sender:bob,nonce:'0',anchor:b.currentSnapshot.status.tip,expiry_blocks:'2',operation:{TransferExact:{recipient:alice,amount:'100'}},fee:'4',data_hex:'00ff80',wallet_id:local.wallet_id,wallet_revision:local.wallet_revision});
+  const local=b.browserStore.snapshot(),signed=await b.browserStore.signUnsigned(watchEnvelope,{chain_id:b.currentSnapshot.status.chain_id,sender:bob,nonce:'0',anchor:b.currentSnapshot.status.tip,expiry_blocks:'2',operation:{TransferExact:{recipient:alice,amount:'100'}},fee:'4',data_hex:'00ff80',wallet_id:local.wallet_id,wallet_revision:local.wallet_revision});
   reloaded.get('broadcast-raw').value=signed.raw;await reloaded.get('broadcast-form').requestSubmit();
   assert.equal(broadcasts(reloaded).length,1);checks++;
   // The watch-only broadcast is followed by sender nonce like the other forms,
@@ -216,6 +216,65 @@ async function run() {
     assert.match(f.querySelector().textContent,/^Pending · /,'the sender page shows the submission pending');checks++;
     c.currentSnapshot.sender_mempool=[];c.currentSnapshot.account={...c.currentSnapshot.account,pending_nonce:0};await c.refresh();await c.refresh();
     assert.match(f.querySelector().textContent,/^No longer pending · /,'a complete sender page detects a dropped submission');checks++;
+  }
+  // Optional passphrase encryption of browser keys, through the page itself.
+  {
+    const c=await setup(),phrase='correct horse battery staple',saved=()=>[...c.savedStorage.values()].join('\n');
+    c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();
+    assert.equal(c.get('wallet-security').hidden,false,'a hot wallet shows its key protection');checks++;
+    assert.equal(c.get('wallet-lock-state').textContent,'Not encrypted');checks++;
+    assert.match(c.get('wallet-security-status').textContent,/saved unencrypted/);checks++;
+    await c.get('wallet-passphrase-open').click();const form=c.get('wallet-passphrase-form');assert.equal(form.hidden,false);checks++;
+    form.elements.passphrase.value=phrase;form.elements.confirm.value=phrase+'!';await form.requestSubmit();
+    assert.match(form.querySelector().textContent,/differ/);checks++;assert.equal(form.elements.passphrase.value,'','passphrase fields are cleared after every attempt');checks++;
+    assert.ok(saved().includes(bobSecret));checks++;
+    form.elements.passphrase.value=form.elements.confirm.value=phrase;await form.requestSubmit();
+    assert.equal(c.get('wallet-lock-state').textContent,'Unlocked',form.querySelector().textContent);checks++;
+    assert.equal(form.hidden,true);checks++;assert.match(c.get('wallet-feedback').textContent,/cannot be recovered/);checks++;
+    assert.equal(saved().includes(bobSecret),false,'the saved key is encrypted');checks++;
+    let f=await fill(c,alice);await f.requestSubmit();assert.equal(broadcasts(c).length,1,f.querySelector().textContent);checks++;
+    // A reload starts locked; signing asks for the passphrase first.
+    const r=await setup({savedStorage:c.savedStorage}),unlock=r.get('unlock-form');
+    assert.equal(r.get('wallet-lock-state').textContent,'Locked');checks++;
+    assert.equal(r.get('wallet-kind').textContent,'Hot wallet · locked');checks++;
+    f=await fill(r,alice);await f.requestSubmit();
+    assert.equal(r.get('unlock-dialog').open,true,'signing asks for the passphrase');checks++;
+    assert.match(f.querySelector().textContent,/Unlock/);checks++;
+    assert.equal(r.calls.some(call=>call.body.method==='preparetransaction'),false,'nothing is prepared while locked');checks++;
+    unlock.elements.passphrase.value='wrong horse battery staple';await unlock.requestSubmit();
+    assert.match(unlock.querySelector().textContent,/Wrong passphrase/);checks++;assert.equal(r.get('unlock-dialog').open,true);checks++;
+    unlock.elements.passphrase.value=phrase;await unlock.requestSubmit();
+    assert.equal(r.get('unlock-dialog').open,false,unlock.querySelector().textContent);checks++;
+    assert.equal(r.get('wallet-lock-state').textContent,'Unlocked');checks++;assert.equal(unlock.elements.passphrase.value,'');checks++;
+    f=await fill(r,alice);await f.requestSubmit();assert.equal(broadcasts(r).length,1,f.querySelector().textContent);checks++;
+    // A copied key leaves the clipboard after 30 seconds.
+    await r.get('export-private').click();assert.equal(r.get('backup-private').value,bobSecret);checks++;
+    await r.get('backup-copy').click();assert.equal(r.clipboard.at(-1),bobSecret);checks++;
+    await r.timersDue(29999);assert.equal(r.clipboard.at(-1),bobSecret);checks++;
+    await r.timersDue(30000);assert.equal(r.clipboard.at(-1),'','a copied key is cleared');checks++;
+    r.navigator.permissions={query:async()=>({state:'granted'})};r.navigator.clipboard.readText=async()=>'copied later';
+    await r.get('backup-copy').click();await r.timersDue(30000);assert.equal(r.clipboard.at(-1),bobSecret,'newer clipboard content the page can read is left alone');checks++;
+    r.navigator.clipboard.readText=async()=>bobSecret;await r.get('backup-copy').click();await r.timersDue(30000);assert.equal(r.clipboard.at(-1),'');checks++;
+    delete r.navigator.permissions;delete r.navigator.clipboard.readText;
+    await r.get('backup-copy').click();await r.get('copy-key').click();await r.timersDue(30000);assert.equal(r.clipboard.at(-1),addr(bob),'a later copy from this page replaces the key and is kept');checks++;
+    const write=r.navigator.clipboard.writeText;await r.get('backup-copy').click();
+    r.navigator.clipboard.writeText=async value=>{if(value==='')throw new Error('Document is not focused.');return write(value);};
+    await r.timersDue(30000);assert.equal(r.clipboard.at(-1),bobSecret);checks++;
+    r.navigator.clipboard.writeText=write;await r.windowEvents.get('focus')();await settle();assert.equal(r.clipboard.at(-1),'','an unfocused page clears the key on return');checks++;
+    await r.get('backup-download').click();assert.deepEqual(JSON.parse(r.downloads.at(-1)),{format:'hashstash-private-v1',private_key:bobSecret,public_key:bob});checks++;
+    await r.get('backup-close').click();
+    // An idle page locks itself; a backup then asks for the passphrase too.
+    r.wallClock+=5*60*1000;await r.timersDue(5*60*1000);await r.refresh();
+    assert.equal(r.get('wallet-lock-state').textContent,'Locked','an idle page locks itself');checks++;
+    await r.get('export-private').click();assert.equal(r.get('unlock-dialog').open,true,'a backup asks for the passphrase');checks++;assert.equal(r.get('backup-dialog').open,false);checks++;
+    unlock.elements.passphrase.value=phrase;await unlock.requestSubmit();assert.equal(r.get('wallet-lock-state').textContent,'Unlocked');checks++;
+    await r.get('wallet-lock').click();assert.equal(r.get('wallet-lock-state').textContent,'Locked','Lock now');checks++;
+    unlock.elements.passphrase.value=phrase;await unlock.requestSubmit();
+    await r.get('wallet-passphrase-remove').click();assert.match(r.get('wallet-passphrase-remove').textContent,/Confirm/);checks++;
+    assert.equal(r.get('wallet-lock-state').textContent,'Unlocked','one click does not remove the passphrase');checks++;
+    await r.get('wallet-passphrase-remove').click();assert.equal(r.get('wallet-lock-state').textContent,'Not encrypted',r.get('wallet-feedback').textContent);checks++;
+    assert.ok(saved().includes(bobSecret),'removing the passphrase saves the key unencrypted again');checks++;
+    for(const h of [c,r]){assert.equal(JSON.stringify(h.calls).includes(phrase),false,'the passphrase never leaves the page');checks++;}
   }
   console.log(`Browser wallet UI: ${checks} integration assertions passed.`);
 }

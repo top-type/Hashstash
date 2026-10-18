@@ -5757,17 +5757,15 @@ async fn http_session(
         })
         .await
         .context("wallet manager worker failed")?;
-        let (status, data) = match result {
-            Ok(data) => (200, data),
-            Err(e) => (400, http_error(&e.to_string())),
+        // A backup body holds a key; it is wiped once written.
+        let (status, body) = match result {
+            Ok(body) => (200, body),
+            Err(e) => (
+                400,
+                Zeroizing::new(serde_json::to_vec(&http_error(&e.to_string()))?),
+            ),
         };
-        return http_response(
-            &mut write,
-            status,
-            "application/json",
-            &serde_json::to_vec(&data)?,
-        )
-        .await;
+        return http_response(&mut write, status, "application/json", &body).await;
     }
     if request.path == "/api/wallet" {
         // Signing and submitting reselects the pending pool with the newcomer.

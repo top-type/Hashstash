@@ -45,7 +45,7 @@ Decision length is a number of blocks. Auction and rest timing use a clock advan
 
 Transactions sign the block reference used to prepare them and expire two blocks later by default. That reference binds the transaction to its chain history, so transactions do not repeat the network ID. A transaction prepared from block 100 can be included in 101 or 102. Longer lifetimes are explicit, and a reorganization that removes the reference block invalidates the transaction.
 
-The browser **Wallet** creates or imports keys, displays balances and signs transactions locally. Back up its keys: browser storage is unencrypted and clearing site data can erase them. A separate cold signer can review and sign exported transactions offline.
+The browser **Wallet** creates or imports keys, displays balances and signs transactions locally. Back up its keys: browser storage is unencrypted unless you set a wallet passphrase, and clearing site data can erase them. A separate cold signer can review and sign exported transactions offline.
 
 **Stash** quotes deposits and withdrawals. **Governance** shows proposals and outcome markets. The **Explorer** provides blocks, transactions, accounts and network details without requiring a wallet.
 

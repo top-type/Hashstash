@@ -467,7 +467,7 @@ async function harness(options = {}) {
           return action === 'export' ? data.private_key : data;
         };
         return {
-          snapshot: () => { const {wallets,wallet_id,wallet_revision,public_key,wallet_enabled,wallet_mode} = h.currentSession; return {wallets,wallet_id,wallet_revision,public_key,wallet_enabled,wallet_mode}; },
+          snapshot: () => { const {wallets,wallet_id,wallet_revision,public_key,wallet_enabled,wallet_mode,wallet_locked,wallet_encrypted} = h.currentSession; return {wallets,wallet_id,wallet_revision,public_key,wallet_enabled,wallet_mode,wallet_locked,wallet_encrypted}; },
           subscribe(callback) { h.emitStoreChange = callback; return () => {}; },
           create: guard => manage('create', {}, guard),
           importPrivate: (private_key, guard) => manage('import', {private_key}, guard),
@@ -497,7 +497,7 @@ async function harness(options = {}) {
 
     },
 
-    Blob: class {constructor(parts) {this.content=parts.join('');}},
+    Blob: class {constructor(parts) {this.content=parts.map(part=>typeof part==='string'?part:new TextDecoder().decode(part)).join('');}},
 
     URL: {createObjectURL(blob) {downloads.push(blob.content);return 'blob:local-test';},revokeObjectURL(){}},
 
@@ -648,6 +648,8 @@ async function harness(options = {}) {
   h.refresh = async () => { await get('refresh-now').fire('click'); await settle(); };
 
   h.location = context.location;
+  h.navigator = context.navigator;
+  h.windowEvents = windowEvents;
 
   h.navigate = async hash => { context.location.hash = hash; windowEvents.get('hashchange')?.(); await settle(); };
 

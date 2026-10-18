@@ -166,6 +166,19 @@ async function run(){
   ok(requests.every(p=>Object.hasOwn(p,'after')),'mail at or below the fork is not rescanned');
  }
  {
+  // A wallet locked by its passphrase cannot open mail. It says so, and a
+  // lock racing a scan stops the page without advancing or clearing the cache.
+  const h=await setup(),m=await h.message();await h.publish([m]);eq(h.get('mail-list').children.length,1);
+  const before=[...h.savedMail.entries()].find(([name])=>name.startsWith('hashstash-mail-scan-3:'))[1],real=h.decryptMail;
+  h.currentSession={...h.currentSession,wallet_locked:true,wallet_encrypted:true};await h.refresh();
+  eq(h.get('mail-list').children.length,0,'locking hides opened mail');ok(h.get('mail-empty').textContent.startsWith('Locked'),h.get('mail-empty').textContent);
+  const locked=()=>{const error=new Error('Unlock this browser wallet with its passphrase first.');error.walletLocked=true;throw error;};
+  h.decryptMail=locked;h.currentSession={...h.currentSession,wallet_locked:false};const later=await h.message({height:m.height+1});await h.publish([later]);
+  eq(h.get('mail-list').children.length,0,'nothing is shown while the key cannot open');ok(h.get('mail-error').textContent.includes('Unlock'),h.get('mail-error').textContent);
+  eq([...h.savedMail.entries()].find(([name])=>name.startsWith('hashstash-mail-scan-3:'))[1],before,'the checkpoint and cached mail are kept');
+  h.decryptMail=real;await h.reload();eq(h.get('mail-list').children.length,2,'once open, the cache restores and the scan continues');
+ }
+ {
   // A second reorganization reported during the same scan rewinds again,
   // rather than discarding the saved scan and starting from genesis.
   const h=await setup(),first=await h.message();await h.publish([first]);

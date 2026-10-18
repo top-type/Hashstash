@@ -20,7 +20,8 @@ the clean build byte for byte. Run
 `node scripts/test_browser_wallet.cjs` from the repository root for official
 BIP340 vectors, Rust transaction/address vectors and wallet isolation checks.
 
-Private keys belong to this browser profile and origin, stored in localStorage.
+Private keys belong to this browser profile and origin, stored in localStorage,
+encrypted there with Web Crypto when a wallet passphrase is set.
 They never enter node requests. Browser storage is not a backup: export the
 private key before clearing site data, changing profiles or moving endpoints.
 This hot wallet trusts the served page code and other code executing on the same

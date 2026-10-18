@@ -28,12 +28,12 @@
 //!
 //!     cargo run --release --example poc_treap_depth -- [N] [STACK_BYTES] [VALID_POINTS] [LEVELS]
 //!
-//! * N            number of ladder keys to grind and insert (default 20000).
-//! * STACK_BYTES  worker-thread stack size (default 2097152 = 2 MiB, the Tokio
-//!                blocking-thread default).
-//! * VALID_POINTS 1 (default) requires each key to be a valid x-only secp256k1
-//!                point, matching the real accounts map; 0 uses arbitrary keys.
-//! * LEVELS       prefix bits to grind against the trie itself (default 20).
+//! * `N`: number of ladder keys to grind and insert (default 20000).
+//! * `STACK_BYTES`: worker-thread stack size (default 2097152 = 2 MiB, the
+//!   Tokio blocking-thread default).
+//! * `VALID_POINTS`: 1 (default) requires each key to be a valid x-only
+//!   secp256k1 point, matching the real accounts map; 0 uses arbitrary keys.
+//! * `LEVELS`: prefix bits to grind against the trie itself (default 20).
 //!
 //! Output: the ladder's grinding cost, the deepest trie path it produced and
 //! the time of updates on that path, then the hashes each extra ground level

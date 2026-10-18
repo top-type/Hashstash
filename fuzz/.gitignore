@@ -1,0 +1,6 @@
+# cargo-fuzz outputs. Kept failing inputs belong in regressions/, as hex.
+/target/
+/corpus/
+/artifacts/
+/coverage/
+/Cargo.lock

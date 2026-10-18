@@ -1,0 +1,128 @@
+# Coverage-guided fuzzing of the parsers that read hostile input. The targets
+# and their invariants live in src/lib.rs, which tests/fuzz_parsers.rs also
+# runs on the stable toolchain; see docs/VALIDATION.md for both workflows.
+#   cargo +nightly fuzz run peer_wire -- -max_total_time=300
+[package]
+name = "hashstash-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# Accelerated test issuance funds the fixture node's miner, so RPC inputs
+# reach quotes and preparation for an account that exists.
+hashstash = { path = "..", features = ["test-fixtures"] }
+hex = "0.4"
+libfuzzer-sys = "0.4"
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "rt", "sync", "time"] }
+
+[lib]
+name = "hashstash_fuzz"
+path = "src/lib.rs"
+
+# The shipped release profile checks arithmetic overflow; so does fuzzing.
+[profile.release]
+debug = 1
+overflow-checks = true
+
+# Not a member of any enclosing workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "peer_wire"
+path = "fuzz_targets/peer_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_transaction"
+path = "fuzz_targets/codec_transaction.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_block"
+path = "fuzz_targets/codec_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json"
+path = "fuzz_targets/json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_request"
+path = "fuzz_targets/http_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_params"
+path = "fuzz_targets/rpc_params.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mail_envelope"
+path = "fuzz_targets/mail_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "plain_text"
+path = "fuzz_targets/plain_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "address"
+path = "fuzz_targets/address.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signed_record"
+path = "fuzz_targets/signed_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unsigned_envelope"
+path = "fuzz_targets/unsigned_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_channel"
+path = "fuzz_targets/peer_channel.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "address_book"
+path = "fuzz_targets/address_book.rs"
+test = false
+doc = false
+bench = false

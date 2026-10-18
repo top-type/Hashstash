@@ -3,7 +3,9 @@
   'use strict';
   const PREFIX='hashstash.mail/2\n', MAX_DATA_BYTES=3072, MAX_PLAIN_BYTES=1152;
   const fields=['ephemeral_key','iv','ciphertext','recipient_iv','recipient_key','sender_iv','sender_key'];
-  const utf8=new TextEncoder(), decoder=new TextDecoder('utf-8',{fatal:true});
+  // A leading byte-order mark is data, as it is to the node: dropping it
+  // would accept a record the node does not index as mail.
+  const utf8=new TextEncoder(), decoder=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true});
   const hex=b=>Array.from(b,v=>v.toString(16).padStart(2,'0')).join('');
   const concat=(...parts)=>{const b=new Uint8Array(parts.reduce((n,p)=>n+p.length,0));let offset=0;for(const p of parts){b.set(p,offset);offset+=p.length;}return b;};
   function bytes(s,length){if(typeof s!=='string'||!/^[0-9a-f]*$/.test(s)||s.length%2||(length!==undefined&&s.length!==length*2))throw Error('Invalid encrypted message.');return Uint8Array.from(s.match(/../g)||[],v=>parseInt(v,16));}

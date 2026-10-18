@@ -358,7 +358,7 @@ fn checkpoint_retained(height: u64, tip: u64) -> bool {
         return true;
     }
     let step = 1u64 << (62 - depth.leading_zeros());
-    height % step == 0
+    height.is_multiple_of(step)
 }
 /// Retained non-genesis heights at least DENSE_STATE_CHECKPOINTS below `tip`:
 /// two per doubling of depth, so a caller can visit them without a scan.
@@ -985,7 +985,7 @@ impl Chain {
             // doubt, so an interrupted rebuild loses nothing; committing in
             // batches keeps the write-ahead log, and the free space it needs,
             // bounded.
-            if replayed % INDEX_REBUILD_BATCH == 0 {
+            if replayed.is_multiple_of(INDEX_REBUILD_BATCH) {
                 self.db.execute_batch("COMMIT; BEGIN IMMEDIATE;")?;
             }
         }
@@ -1808,7 +1808,7 @@ impl Chain {
                 replay.walk = None;
                 break;
             }
-            if steps % WALK_STEPS_PER_REPLAY_STEP == 0 {
+            if steps.is_multiple_of(WALK_STEPS_PER_REPLAY_STEP) {
                 self.charge_replay()?;
             }
             steps += 1;
@@ -2532,7 +2532,7 @@ impl Chain {
                 .prepare_cached("DELETE FROM entry_index WHERE hash=?1")?
                 .execute([hash.as_slice()])?;
             pruned += 1;
-            if pruned % INDEX_REBUILD_BATCH == 0 {
+            if pruned.is_multiple_of(INDEX_REBUILD_BATCH) {
                 self.db.execute_batch("COMMIT; BEGIN IMMEDIATE;")?;
             }
         }

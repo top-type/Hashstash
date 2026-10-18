@@ -1,0 +1,3 @@
+# fee_quote (selector 4, private RPC) with params [] once panicked while
+# naming the default sender: serde_json panics when an array is indexed by key.
+045b5d

@@ -17,6 +17,7 @@
 //!     directed 2048-bit series per evaluation), the most expensive evaluation;
 //!   * nearly flat curves (mass = reserve + 1) take about 250 evaluations with
 //!     expensive logarithms.
+//!
 //! Any input of 480 bits or more selects the widest (2048-bit) precision.
 //!
 //! `worst_case_clearing_is_capped` runs in the suite (work counts only). The

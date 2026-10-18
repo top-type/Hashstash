@@ -978,4 +978,20 @@ mod tests {
             assert!(read_key(&path).is_err());
         }
     }
+    /// A symbolic link to a valid identity is refused, not followed. Creating
+    /// one needs Developer Mode or administrator rights; without them the
+    /// check is reported as skipped.
+    #[cfg(windows)]
+    #[test]
+    fn windows_peer_key_links_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer.json");
+        generate_key_file(&path).unwrap();
+        read_key(&path).unwrap();
+        let link = dir.path().join("link.json");
+        match std::os::windows::fs::symlink_file(&path, &link) {
+            Ok(()) => assert!(read_key(&link).is_err()),
+            Err(error) => eprintln!("symbolic link check skipped: {error}"),
+        }
+    }
 }

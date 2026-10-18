@@ -78,6 +78,7 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo clippy --all-targets --locked --features test-fixtures --target-dir target/fixtures -- -D warnings
 cargo fmt --check
 node scripts/test_all_frontend.cjs
+node fuzz/js/mail_envelope.cjs
 ```
 
 Run the Python tests with a freshly built CLI. On PowerShell:

@@ -1,0 +1,219 @@
+# The validation gate of docs/VALIDATION.md on Linux and Windows, plus
+# bounded fuzzing of the parsers that read hostile input. Every job uses
+# disposable local processes and OS-chosen or job-local ports only.
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Nightly: longer fuzzing and the live three-node network suites.
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: Seconds of libFuzzer time per target
+        default: '300'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # The toolchain the gate was last recorded with (docs/VALIDATION.md). Bump
+  # it deliberately: a newer Clippy can add lints the gate denies.
+  RUST_TOOLCHAIN: '1.97.1'
+  NODE_VERSION: '22'
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  lint:
+    name: Format and Clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: |
+          cargo fmt --check
+          rustfmt --check --edition 2024 fuzz/src/lib.rs fuzz/fuzz_targets/*.rs
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Clippy with test fixtures
+        run: cargo clippy --all-targets --locked --features test-fixtures --target-dir target/fixtures -- -D warnings
+
+  linux:
+    name: Tests (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build
+        run: |
+          cargo build --release --locked --bins
+          cargo build --release --locked --bins --features test-fixtures --target-dir target/fixtures
+      - name: Rust tests
+        run: cargo test --release --all-targets --locked
+      - name: Rust tests with test fixtures
+        run: cargo test --release --all-targets --locked --features test-fixtures --target-dir target/fixtures
+      - name: Frontend suites
+        run: |
+          node scripts/test_all_frontend.cjs
+          node fuzz/js/mail_envelope.cjs
+      - name: Python unit tests
+        env:
+          HASHSTASH_TEST_BINARY: ${{ github.workspace }}/target/release/hashstash
+        run: python3 -B -m unittest discover -s scripts -p 'test_*.py'
+      - name: Python wallet, address and mail programs on disposable nodes
+        run: |
+          fixtures=target/fixtures/release
+          mkdir -p work/reports
+          python3 -B scripts/test_wallet_cli.py --node $fixtures/hashstash --cold $fixtures/hashstash-cold --directory work --report work/reports/wallet-cli.json
+          python3 -B scripts/test_wallet_manager.py --node $fixtures/hashstash --cold $fixtures/hashstash-cold --directory work --report work/reports/wallet-manager.json
+          python3 -B scripts/test_addresses.py --node $fixtures/hashstash --cold $fixtures/hashstash-cold --directory work --report work/reports/addresses.json
+          python3 -B scripts/test_wallet_adversarial.py --node $fixtures/hashstash --cold $fixtures/hashstash-cold --directory work/adversarial --base-port 38480 --report work/reports/wallet-adversarial.json
+          python3 -B scripts/test_mail_wire.py --binary $fixtures/hashstash --report work/reports/mail-wire.json
+      - name: Keep reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-reports
+          path: work/reports
+          if-no-files-found: ignore
+
+  windows:
+    name: Tests (Windows)
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Clippy, including the Windows-only access-list code
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo clippy --all-targets --locked --features test-fixtures --target-dir target/fixtures -- -D warnings
+      - name: Build
+        run: cargo build --release --locked --bins
+      - name: Rust tests with test fixtures
+        run: cargo test --release --all-targets --locked --features test-fixtures --target-dir target/fixtures
+      - name: Owner-only secret files on NTFS
+        # Reads each secret file's access list back with icacls.
+        run: cargo test --release --locked --lib --target-dir target/fixtures --features test-fixtures windows_ -- --nocapture
+      - name: Cold signer launcher token hand-off
+        shell: pwsh
+        run: .\scripts\test_cold_launcher.ps1 -Executable .\target\release\hashstash-cold.exe -Port 21980 -Report work\cold-launcher-report.json
+      - name: Frontend suites
+        run: |
+          node scripts/test_all_frontend.cjs
+          node fuzz/js/mail_envelope.cjs
+      - name: Keep reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-reports
+          path: work
+          if-no-files-found: ignore
+
+  fuzz:
+    name: Fuzz (libFuzzer)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      # One minute per target per push; longer on the nightly schedule.
+      FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || (github.event_name == 'schedule' && '900' || '60') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            fuzz -> target
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+      - name: Seed corpora from the shared targets
+        env:
+          HASHSTASH_FUZZ_CORPUS: ${{ github.workspace }}/fuzz/corpus
+        run: cargo +${{ env.RUST_TOOLCHAIN }} test --release --locked --features test-fixtures --test fuzz_parsers -- --ignored write_seed_corpus
+      - name: Fuzz every target
+        run: |
+          # Shared dependencies resolve to the versions the node ships with.
+          cp Cargo.lock fuzz/Cargo.lock
+          cargo +nightly fuzz build --release
+          # The RPC target's fixture node lives for the whole process by design,
+          # so leak detection is left to the sanitizer's ordinary error checks.
+          for target in $(cargo +nightly fuzz list); do
+            echo "::group::$target"
+            cargo +nightly fuzz run --release "$target" "fuzz/corpus/$target" -- \
+              -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=4096 -timeout=30 -detect_leaks=0 -print_final_stats=1
+            echo "::endgroup::"
+          done
+      - name: Keep failing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+      - name: Seeded stable runner, bounded time
+        if: github.event_name == 'schedule'
+        env:
+          HASHSTASH_FUZZ_SECONDS: '600'
+          HASHSTASH_FUZZ_ARTIFACTS: ${{ github.workspace }}/fuzz/artifacts/stable
+        run: cargo +${{ env.RUST_TOOLCHAIN }} test --release --locked --features test-fixtures --test fuzz_parsers -- --ignored --nocapture fuzz_for_a_bounded_time
+
+  network:
+    name: Live fixture network suites
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Build the fixture executable
+        run: cargo build --release --locked --bins --features test-fixtures --target-dir target/fixtures
+      - name: Network, adversarial-economics and load suites on one funded network
+        run: bash scripts/ci_network_suites.sh target/fixtures/release/hashstash work/network/funded 38480
+      - name: Reserve suite on a fresh network
+        run: bash scripts/ci_network_suites.sh target/fixtures/release/hashstash work/network/reserve 38480 test_reserve_network
+      - name: Keep reports and node logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-reports
+          path: work/network
+          if-no-files-found: ignore

@@ -1,0 +1,1293 @@
+{
+  "base": "tests/fixtures/mail-v2.json data_hex",
+  "edit": "[byte offset, bytes deleted, hexadecimal bytes inserted], applied in order",
+  "format": "hashstash-mail-envelope-vectors-v1",
+  "vectors": [
+    {
+      "accepted": true,
+      "edits": [],
+      "name": "canonical fixture"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          0,
+          0,
+          "efbbbf"
+        ]
+      ],
+      "name": "byte-order mark before the prefix"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          17,
+          0,
+          "efbbbf"
+        ]
+      ],
+      "name": "byte-order mark after the prefix"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          15,
+          1,
+          "33"
+        ]
+      ],
+      "name": "version 3 prefix"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          16,
+          0,
+          "0d"
+        ]
+      ],
+      "name": "CRLF after the prefix"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          17,
+          0,
+          "20"
+        ]
+      ],
+      "name": "space before the JSON"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          34,
+          0,
+          "20"
+        ]
+      ],
+      "name": "space after the first colon"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2793,
+          0,
+          "0a"
+        ]
+      ],
+      "name": "trailing newline"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2793,
+          0,
+          "00"
+        ]
+      ],
+      "name": "trailing NUL"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2792,
+          1,
+          ""
+        ]
+      ],
+      "name": "truncated by one byte"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          148,
+          1,
+          "41"
+        ]
+      ],
+      "name": "uppercase ciphertext digit"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          147,
+          1,
+          "5c7530303332"
+        ]
+      ],
+      "name": "escaped ciphertext digit"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          147,
+          1,
+          "ff"
+        ]
+      ],
+      "name": "invalid UTF-8 in the ciphertext"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          147,
+          1,
+          "c0b2"
+        ]
+      ],
+      "name": "overlong UTF-8 digit"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          147,
+          0,
+          "3030"
+        ]
+      ],
+      "name": "ciphertext one byte longer"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          107,
+          2,
+          ""
+        ]
+      ],
+      "name": "iv one byte shorter"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          35,
+          64,
+          "30303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030"
+        ]
+      ],
+      "name": "ephemeral key x = 0"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          35,
+          64,
+          "66666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666656666666666633266"
+        ]
+      ],
+      "name": "ephemeral key x = field prime"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2792,
+          0,
+          "2c226578747261223a22303022"
+        ]
+      ],
+      "name": "extra field"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2792,
+          0,
+          "2c226976223a2230313031303130313031303130313031303130313031303122"
+        ]
+      ],
+      "name": "duplicate iv field"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          107,
+          24,
+          "303330333033303330333033303330333033303330333033"
+        ],
+        [
+          2655,
+          24,
+          "303130313031303130313031303130313031303130313031"
+        ]
+      ],
+      "name": "iv and sender iv exchanged"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          2673,
+          1,
+          "64"
+        ]
+      ],
+      "name": "random byte 0"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          1419,
+          1,
+          "35"
+        ]
+      ],
+      "name": "random byte 1"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          478,
+          1,
+          "64"
+        ]
+      ],
+      "name": "random byte 2"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2011,
+          1,
+          "7f"
+        ]
+      ],
+      "name": "random byte 3"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          754,
+          1,
+          "34"
+        ]
+      ],
+      "name": "random byte 4"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          2225,
+          1,
+          "65"
+        ]
+      ],
+      "name": "random byte 5"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          162,
+          1,
+          "3a"
+        ]
+      ],
+      "name": "random byte 6"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          1585,
+          1,
+          "7b"
+        ]
+      ],
+      "name": "random byte 7"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          1758,
+          1,
+          "ff"
+        ]
+      ],
+      "name": "random byte 8"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          410,
+          1,
+          "62"
+        ]
+      ],
+      "name": "random byte 9"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2008,
+          1,
+          "45"
+        ]
+      ],
+      "name": "random byte 10"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          150,
+          1,
+          "35"
+        ]
+      ],
+      "name": "random byte 11"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          2427,
+          1,
+          "39"
+        ]
+      ],
+      "name": "random byte 12"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          1684,
+          1,
+          "32"
+        ]
+      ],
+      "name": "random byte 13"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          1905,
+          1,
+          "34"
+        ]
+      ],
+      "name": "random byte 14"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2205,
+          1,
+          "43"
+        ]
+      ],
+      "name": "random byte 15"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          241,
+          1,
+          "37"
+        ]
+      ],
+      "name": "random byte 16"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          10,
+          1,
+          "ff"
+        ]
+      ],
+      "name": "random byte 17"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2208,
+          1,
+          "43"
+        ]
+      ],
+      "name": "random byte 18"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          1595,
+          1,
+          "45"
+        ]
+      ],
+      "name": "random byte 19"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          2109,
+          1,
+          "65"
+        ]
+      ],
+      "name": "random byte 20"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          2280,
+          1,
+          "65"
+        ]
+      ],
+      "name": "random byte 21"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          1437,
+          1,
+          "7f"
+        ]
+      ],
+      "name": "random byte 22"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          660,
+          1,
+          "39"
+        ]
+      ],
+      "name": "random byte 23"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          1283,
+          1,
+          "3a"
+        ]
+      ],
+      "name": "random byte 24"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2290,
+          1,
+          "3a"
+        ]
+      ],
+      "name": "random byte 25"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2,
+          1,
+          "42"
+        ]
+      ],
+      "name": "random byte 26"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          1594,
+          1,
+          "5c"
+        ]
+      ],
+      "name": "random byte 27"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          843,
+          1,
+          "80"
+        ]
+      ],
+      "name": "random byte 28"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          523,
+          1,
+          "2c"
+        ]
+      ],
+      "name": "random byte 29"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          1285,
+          1,
+          "30"
+        ]
+      ],
+      "name": "random byte 30"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          560,
+          1,
+          "65"
+        ]
+      ],
+      "name": "random byte 31"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          788,
+          1,
+          "31"
+        ]
+      ],
+      "name": "random byte 32"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2257,
+          1,
+          "7d"
+        ]
+      ],
+      "name": "random byte 33"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          243,
+          1,
+          "20"
+        ]
+      ],
+      "name": "random byte 34"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          1135,
+          1,
+          "36"
+        ]
+      ],
+      "name": "random byte 35"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          732,
+          1,
+          "33"
+        ]
+      ],
+      "name": "random byte 36"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          2206,
+          1,
+          "38"
+        ]
+      ],
+      "name": "random byte 37"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          2329,
+          1,
+          "33"
+        ]
+      ],
+      "name": "random byte 38"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          1450,
+          1,
+          "39"
+        ]
+      ],
+      "name": "random byte 39"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          1232,
+          1,
+          "22"
+        ]
+      ],
+      "name": "random byte 40"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          392,
+          1,
+          "37"
+        ]
+      ],
+      "name": "random byte 41"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          1685,
+          1,
+          "63"
+        ]
+      ],
+      "name": "random byte 42"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          780,
+          1,
+          "20"
+        ]
+      ],
+      "name": "random byte 43"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          467,
+          1,
+          "41"
+        ]
+      ],
+      "name": "random byte 44"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          928,
+          1,
+          "5d"
+        ]
+      ],
+      "name": "random byte 45"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          620,
+          1,
+          "00"
+        ]
+      ],
+      "name": "random byte 46"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          1052,
+          1,
+          "45"
+        ]
+      ],
+      "name": "random byte 47"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2358,
+          1,
+          "45"
+        ]
+      ],
+      "name": "random byte 48"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          18,
+          1,
+          "39"
+        ]
+      ],
+      "name": "random byte 49"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          1943,
+          1,
+          "64"
+        ]
+      ],
+      "name": "random byte 50"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          336,
+          1,
+          "66"
+        ]
+      ],
+      "name": "random byte 51"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          2412,
+          1,
+          "39"
+        ]
+      ],
+      "name": "random byte 52"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          1654,
+          1,
+          "46"
+        ]
+      ],
+      "name": "random byte 53"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          1255,
+          1,
+          "33"
+        ]
+      ],
+      "name": "random byte 54"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          1506,
+          1,
+          "61"
+        ]
+      ],
+      "name": "random byte 55"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          657,
+          1,
+          "3a"
+        ]
+      ],
+      "name": "random byte 56"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          991,
+          1,
+          "5c"
+        ]
+      ],
+      "name": "random byte 57"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          1334,
+          1,
+          "3a"
+        ]
+      ],
+      "name": "random byte 58"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          2470,
+          1,
+          "31"
+        ]
+      ],
+      "name": "random byte 59"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          762,
+          1,
+          "64"
+        ]
+      ],
+      "name": "random byte 60"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2160,
+          1,
+          "ff"
+        ]
+      ],
+      "name": "random byte 61"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          1584,
+          1,
+          "62"
+        ]
+      ],
+      "name": "random byte 62"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          856,
+          1,
+          "2c"
+        ]
+      ],
+      "name": "random byte 63"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          2410,
+          1,
+          "34"
+        ]
+      ],
+      "name": "random byte 64"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          1117,
+          1,
+          "42"
+        ]
+      ],
+      "name": "random byte 65"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          805,
+          1,
+          "31"
+        ]
+      ],
+      "name": "random byte 66"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          2709,
+          1,
+          "34"
+        ]
+      ],
+      "name": "random byte 67"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          1592,
+          1,
+          "0a"
+        ]
+      ],
+      "name": "random byte 68"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          425,
+          1,
+          "30"
+        ]
+      ],
+      "name": "random byte 69"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2530,
+          1,
+          "39"
+        ]
+      ],
+      "name": "random byte 70"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          930,
+          1,
+          "33"
+        ]
+      ],
+      "name": "random byte 71"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          1848,
+          1,
+          "33"
+        ]
+      ],
+      "name": "random byte 72"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          760,
+          1,
+          "36"
+        ]
+      ],
+      "name": "random byte 73"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2073,
+          1,
+          "41"
+        ]
+      ],
+      "name": "random byte 74"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2781,
+          1,
+          "5d"
+        ]
+      ],
+      "name": "random byte 75"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          2619,
+          1,
+          "35"
+        ]
+      ],
+      "name": "random byte 76"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          1979,
+          1,
+          "44"
+        ]
+      ],
+      "name": "random byte 77"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          1168,
+          1,
+          "7d"
+        ]
+      ],
+      "name": "random byte 78"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          1735,
+          1,
+          "43"
+        ]
+      ],
+      "name": "random byte 79"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2559,
+          1,
+          "2c"
+        ]
+      ],
+      "name": "random byte 80"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2263,
+          1,
+          "3a"
+        ]
+      ],
+      "name": "random byte 81"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          2259,
+          1,
+          "65"
+        ]
+      ],
+      "name": "random byte 82"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2582,
+          1,
+          "0a"
+        ]
+      ],
+      "name": "random byte 83"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          856,
+          1,
+          "66"
+        ]
+      ],
+      "name": "random byte 84"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          1072,
+          1,
+          "7b"
+        ]
+      ],
+      "name": "random byte 85"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          287,
+          1,
+          "ff"
+        ]
+      ],
+      "name": "random byte 86"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          801,
+          1,
+          "0a"
+        ]
+      ],
+      "name": "random byte 87"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          2475,
+          1,
+          "36"
+        ]
+      ],
+      "name": "random byte 88"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          189,
+          1,
+          "5d"
+        ]
+      ],
+      "name": "random byte 89"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          2168,
+          1,
+          "0a"
+        ]
+      ],
+      "name": "random byte 90"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          85,
+          1,
+          "5d"
+        ]
+      ],
+      "name": "random byte 91"
+    },
+    {
+      "accepted": true,
+      "edits": [
+        [
+          2769,
+          1,
+          "34"
+        ]
+      ],
+      "name": "random byte 92"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          317,
+          1,
+          "3a"
+        ]
+      ],
+      "name": "random byte 93"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          1710,
+          1,
+          "7b"
+        ]
+      ],
+      "name": "random byte 94"
+    },
+    {
+      "accepted": false,
+      "edits": [
+        [
+          124,
+          1,
+          "7b"
+        ]
+      ],
+      "name": "random byte 95"
+    }
+  ]
+}

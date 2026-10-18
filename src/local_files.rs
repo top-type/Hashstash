@@ -14,7 +14,10 @@ use zeroize::Zeroizing;
 /// The two forms never coincide, so two chain databases never share a
 /// sidecar (`net.db` and `net.sqlite` once both used `net.<suffix>`).
 pub fn sidecar(chain: &Path, suffix: &str) -> PathBuf {
-    if chain.extension().is_some_and(|extension| extension == "sqlite") {
+    if chain
+        .extension()
+        .is_some_and(|extension| extension == "sqlite")
+    {
         return chain.with_extension(suffix);
     }
     let mut name = chain.file_name().map(OsString::from).unwrap_or_default();
@@ -63,9 +66,12 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("create {} (existing files are not overwritten)", path.display()))?;
+    let mut file = options.open(path).with_context(|| {
+        format!(
+            "create {} (existing files are not overwritten)",
+            path.display()
+        )
+    })?;
     restrict_to_owner(path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
@@ -169,7 +175,10 @@ pub fn restrict_to_owner(path: &Path) -> Result<()> {
 /// quoted field is the SID.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn account_sid(output: &str) -> Option<String> {
-    let line = output.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let line = output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
     let sid = line.rsplit(',').next()?.trim().trim_matches('"');
     let valid = sid.strip_prefix("S-1-").is_some_and(|rest| {
         !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit() || b == b'-')
@@ -205,7 +214,7 @@ mod windows {
         )
     }
 
-    fn run(tool: &str, arguments: &[OsString]) -> Result<String> {
+    pub(super) fn run(tool: &str, arguments: &[OsString]) -> Result<String> {
         let output = Command::new(system_tool(tool))
             .args(arguments)
             .creation_flags(CREATE_NO_WINDOW)
@@ -221,18 +230,21 @@ mod windows {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    pub(super) fn owner_only(path: &Path) -> Result<()> {
+    pub(super) fn current_sid() -> Result<&'static str> {
         static SID: OnceLock<Option<String>> = OnceLock::new();
-        let sid = SID
-            .get_or_init(|| {
-                let arguments: [OsString; 4] =
-                    ["/user".into(), "/fo".into(), "csv".into(), "/nh".into()];
-                run("whoami.exe", &arguments)
-                    .ok()
-                    .and_then(|output| account_sid(&output))
-            })
-            .as_deref()
-            .context("cannot identify the current account")?;
+        SID.get_or_init(|| {
+            let arguments: [OsString; 4] =
+                ["/user".into(), "/fo".into(), "csv".into(), "/nh".into()];
+            run("whoami.exe", &arguments)
+                .ok()
+                .and_then(|output| account_sid(&output))
+        })
+        .as_deref()
+        .context("cannot identify the current account")
+    }
+
+    pub(super) fn owner_only(path: &Path) -> Result<()> {
+        let sid = current_sid()?;
         let path = std::path::absolute(path)?;
         run("icacls.exe", &icacls_arguments(&path, sid)).map(drop)
     }
@@ -253,17 +265,36 @@ mod tests {
             sidecar(&directory.join("net.db"), "wallets.sqlite"),
             directory.join("net.db-wallets.sqlite")
         );
-        assert_eq!(legacy_sidecar(&directory.join("chain.sqlite"), "peer-key.json"), None);
+        assert_eq!(
+            legacy_sidecar(&directory.join("chain.sqlite"), "peer-key.json"),
+            None
+        );
         assert_eq!(
             legacy_sidecar(&directory.join("net.db"), "peer-key.json"),
             Some(directory.join("net.peer-key.json"))
         );
         let chains = [
-            "net", "net.sqlite", "net.db", "net.SQLITE", "net.db.sqlite", "net-db", "net.testnet",
-            "net.devnet", ".sqlite", "net.explorer",
+            "net",
+            "net.sqlite",
+            "net.db",
+            "net.SQLITE",
+            "net.db.sqlite",
+            "net-db",
+            "net.testnet",
+            "net.devnet",
+            ".sqlite",
+            "net.explorer",
         ];
-        for suffix in ["explorer.sqlite", "wallets.sqlite", "peer-key.json", "session-token"] {
-            let names: Vec<_> = chains.iter().map(|c| sidecar(&directory.join(c), suffix)).collect();
+        for suffix in [
+            "explorer.sqlite",
+            "wallets.sqlite",
+            "peer-key.json",
+            "session-token",
+        ] {
+            let names: Vec<_> = chains
+                .iter()
+                .map(|c| sidecar(&directory.join(c), suffix))
+                .collect();
             let distinct: std::collections::BTreeSet<_> = names.iter().collect();
             assert_eq!(distinct.len(), chains.len(), "{suffix}: {names:?}");
             for name in &names {
@@ -275,19 +306,36 @@ mod tests {
     #[test]
     fn windows_access_lists_name_only_the_current_account() {
         assert_eq!(
-            account_sid("\"desktop-1\\taata\",\"S-1-5-21-1004336348-1177238915-682003330-1001\"\r\n")
-                .as_deref(),
+            account_sid(
+                "\"desktop-1\\taata\",\"S-1-5-21-1004336348-1177238915-682003330-1001\"\r\n"
+            )
+            .as_deref(),
             Some("S-1-5-21-1004336348-1177238915-682003330-1001")
         );
-        assert_eq!(account_sid("\"nt authority\\system\",\"S-1-5-18\"").as_deref(), Some("S-1-5-18"));
-        for invalid in ["", "\"user\",\"\"", "\"user\",\"S-1-\"", "\"user\",\"S-1-5 /grant\"", "S-1-5-18;x"] {
+        assert_eq!(
+            account_sid("\"nt authority\\system\",\"S-1-5-18\"").as_deref(),
+            Some("S-1-5-18")
+        );
+        for invalid in [
+            "",
+            "\"user\",\"\"",
+            "\"user\",\"S-1-\"",
+            "\"user\",\"S-1-5 /grant\"",
+            "S-1-5-18;x",
+        ] {
             assert_eq!(account_sid(invalid), None, "{invalid}");
         }
         let arguments = icacls_arguments(Path::new("C:\\data\\chain.wallets.sqlite"), "S-1-5-18");
         assert_eq!(
             arguments,
-            ["C:\\data\\chain.wallets.sqlite", "/inheritance:r", "/grant:r", "*S-1-5-18:F", "/q"]
-                .map(OsString::from)
+            [
+                "C:\\data\\chain.wallets.sqlite",
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:F",
+                "/q"
+            ]
+            .map(OsString::from)
         );
     }
 
@@ -317,7 +365,11 @@ mod tests {
         assert_eq!(fs::read(&adopted).unwrap(), b"identity");
         fs::write(directory.path().join("net.peer-key.json"), b"changed").unwrap();
         adopt_legacy_secret(&chain, "peer-key.json").unwrap();
-        assert_eq!(fs::read(&adopted).unwrap(), b"identity", "an existing sidecar wins");
+        assert_eq!(
+            fs::read(&adopted).unwrap(),
+            b"identity",
+            "an existing sidecar wins"
+        );
         adopt_legacy_secret(&directory.path().join("chain.sqlite"), "peer-key.json").unwrap();
         assert!(!directory.path().join("chain.peer-key.json").exists());
     }
@@ -349,6 +401,61 @@ mod tests {
             if std::os::windows::fs::symlink_file(&path, &link).is_ok() {
                 assert!(read_private(&link, 4096).is_err(), "a symbolic link");
             }
+        }
+    }
+
+    /// On NTFS, where an access list can be set, it is: restrict_to_owner
+    /// only warns otherwise, so this reads the list back. Every secret file
+    /// path, new or existing, ends with one protected entry granting this
+    /// account full control and nothing inherited from its directory.
+    #[cfg(windows)]
+    #[test]
+    fn windows_secret_files_list_only_the_current_account() {
+        let directory = tempfile::tempdir().unwrap();
+        let sid = windows::current_sid().unwrap();
+        let dacl = |path: &Path| -> String {
+            let saved = directory.path().join("saved-acl");
+            let _ = fs::remove_file(&saved);
+            windows::run(
+                "icacls.exe",
+                &[
+                    path.into(),
+                    "/save".into(),
+                    saved.as_path().into(),
+                    "/q".into(),
+                ],
+            )
+            .unwrap();
+            // A UTF-16 file: the file name, then its access list as SDDL.
+            let units: Vec<u16> = fs::read(&saved)
+                .unwrap()
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect();
+            String::from_utf16(&units)
+                .unwrap()
+                .lines()
+                .map(|line| line.trim_matches('\u{feff}').trim())
+                .find(|line| line.starts_with("D:"))
+                .unwrap()
+                .to_owned()
+        };
+        let written = directory.path().join("written.json");
+        write_private(&written, b"secret").unwrap();
+        let created = directory.path().join("created.json");
+        create_private(&created).unwrap();
+        let existing = directory.path().join("existing.json");
+        fs::write(&existing, b"secret").unwrap();
+        assert!(
+            dacl(&existing).contains("(A;ID;"),
+            "temporary files inherit entries"
+        );
+        restrict_to_owner(&existing).unwrap();
+        for path in [&written, &created, &existing] {
+            let list = dacl(path);
+            let (flags, entries) = list.split_at(list.find('(').unwrap());
+            assert!(flags.starts_with("D:P"), "{}: {list}", path.display());
+            assert_eq!(entries, format!("(A;;FA;;;{sid})"), "{}", path.display());
         }
     }
 }

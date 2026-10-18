@@ -14,9 +14,12 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo clippy --all-targets --locked --features test-fixtures --target-dir target/fixtures -- -D warnings
 cargo fmt --check
 node scripts/test_all_frontend.cjs
+node fuzz/js/mail_envelope.cjs
 ```
 
-The Rust command runs library, binary and integration tests. Some tests launch temporary local nodes or exercise large grant lists and can take several minutes. Keep the complete output: a total from one test executable is not the total for the all-target run.
+The Rust command runs library, binary and integration tests. Some tests launch temporary local nodes or exercise large grant lists and can take several minutes. Keep the complete output: a total from one test executable is not the total for the all-target run. Unit tests that need accelerated test funding are reported as ignored without `test-fixtures`, and fixture-only integration tests are skipped; the second command runs them.
+
+Formatting needs the `rustfmt` component and Clippy the `clippy` component of the same toolchain. A newer Clippy can add lints that `-D warnings` denies, so record the toolchain with the results; continuous integration pins the one the gate was last recorded with.
 
 The frontend runner discovers the maintained JavaScript suites and fails if its suite list is incomplete. It covers address and amount handling, signing, transaction review, wallet state, governance views, fees, quote refreshes, Explorer, Chat, Mail and faucet interfaces. Browser mocks and cryptographic fixtures exercise logic; they do not replace a manual browser check of layout and interaction.
 
@@ -60,6 +63,82 @@ The frontend checks include direct proposals for all nine settings, exact u64 va
 
 The executable tests and their assertions define the coverage. Public fixture keys are deterministic test inputs and must never hold real funds. Test vectors prove agreement on specific inputs; they do not by themselves establish interoperability with every external implementation.
 
+## Fuzzing
+
+Each parser of hostile input has a fuzz target in [`fuzz/src/lib.rs`](../fuzz/src/lib.rs). Besides the absence of panics, each target checks invariants: one encoding per decoded value, agreement between the peer preflight and the consensus codec, agreement between the bounded JSON parsers, the discovery address book's bounds, and that read-only RPC methods leave the node unchanged.
+
+| Target | Input |
+| --- | --- |
+| `peer_wire` | Peer messages, directly and behind the plain transport's length prefix |
+| `peer_channel` | Unauthenticated peer hellos, then any frame a pinned peer sends after a genuine handshake |
+| `codec_transaction`, `codec_block` | Canonical consensus records, which the peer wire must also relay |
+| `json` | The generic, `/rpc` and hot-wallet JSON body parsers; Stratum lines use the generic one |
+| `http_request` | Request heads and bodies on the private and public-web listeners |
+| `rpc_params` | JSON-RPC methods and parameters, private and public, on a fixture node |
+| `address` | Bech32m addresses, hexadecimal keys and hashes |
+| `signed_record`, `unsigned_envelope` | Signed hexadecimal records and the unsigned exports a cold signer reviews |
+| `mail_envelope`, `plain_text` | Encrypted-mail envelopes, chat text and proposal rationale in transaction data |
+| `address_book` | Discovery gossip into the peer address book, and the book's saved form |
+
+The ordinary Rust suite runs each target from fixed seeds for a fixed number of mutated inputs ([stable runner](../tests/fuzz_parsers.rs)), keeping inputs whose outcome is new, replays every input kept under `fuzz/regressions/`, and sends mutated Stratum lines and HTTP requests through live listeners. A longer run on the stable toolchain:
+
+```text
+HASHSTASH_FUZZ_SECONDS=600 cargo test --release --features test-fixtures --test fuzz_parsers -- --ignored --nocapture fuzz_for_a_bounded_time
+```
+
+`HASHSTASH_FUZZ_TARGETS` selects targets by name, separated by commas, and `HASHSTASH_FUZZ_SEED` repeats a run. A failing input is saved in hexadecimal under `HASHSTASH_FUZZ_ARTIFACTS`, by default in the system temporary directory. Once its cause is fixed, keep the input as `fuzz/regressions/<target>/<name>.hex`, with a `#` comment saying what it found, and add a named regression test.
+
+Coverage-guided fuzzing uses cargo-fuzz and libFuzzer on a nightly toolchain. Copying the lockfile keeps shared dependencies at the versions the node ships with; the stable runner writes the seed corpora:
+
+```text
+cp Cargo.lock fuzz/Cargo.lock
+HASHSTASH_FUZZ_CORPUS="$PWD/fuzz/corpus" cargo test --release --features test-fixtures --test fuzz_parsers -- --ignored write_seed_corpus
+cargo +nightly fuzz run peer_wire fuzz/corpus/peer_wire -- -max_total_time=600
+```
+
+Without nightly, the same libFuzzer binaries build on stable with the SanitizerCoverage flags cargo-fuzz passes, less its address sanitizer. Run each binary in `fuzz/target/x86_64-unknown-linux-gnu/release/` with its corpus directory and libFuzzer options, such as `-max_total_time=600`:
+
+```text
+RUSTFLAGS='-Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=4 -Cllvm-args=-sanitizer-coverage-inline-8bit-counters -Cllvm-args=-sanitizer-coverage-pc-table -Cllvm-args=-sanitizer-coverage-trace-compares --cfg fuzzing -Cdebug-assertions -Coverflow-checks' \
+  cargo build --release --manifest-path fuzz/Cargo.toml --target x86_64-unknown-linux-gnu --bins
+```
+
+The browser's mail envelope parser has its own property check, `node fuzz/js/mail_envelope.cjs [iterations] [seed]`. It also requires the browser to reach the node's verdict on each vector in [`fuzz/mail-envelope-vectors.json`](../fuzz/mail-envelope-vectors.json), which the Rust suite checks against the node. Regenerate the vectors with the ignored `write_mail_envelope_vectors` test and review every changed verdict: it changes what counts as mail.
+
+A run that finds nothing shows only that the inputs it tried passed. Mutation from seeds without coverage feedback reaches less code than libFuzzer, and neither replaces the targeted regression tests.
+
+## Windows checks
+
+On Windows the library tests also read back the access list of each secret file written on NTFS with `icacls`: one protected entry granting the current account full control, nothing inherited. They also check that a symbolic link to a peer identity is refused; creating the link needs Developer Mode or administrator rights, and the check reports itself skipped without them. [`scripts/test_cold_launcher.ps1`](../scripts/test_cold_launcher.ps1) starts `Start-ColdWallet.ps1` for a fixture chain and checks the token hand-off: the token reaches the signer only through its environment, never its command line or `/api/session`, and every POST needs it. It stops only the signer it started.
+
+## Continuous integration
+
+[`ci.yml`](../.github/workflows/ci.yml) runs on every push and pull request: formatting and both Clippy configurations; on Linux the release build, both Rust suites, the frontend checks, Python unittest discovery and the wallet, address and mail programs on disposable nodes; on Windows both Clippy configurations, the fixture suite, the checks above and the frontend checks; and one minute of libFuzzer per target. A nightly schedule fuzzes each target for 15 minutes, runs the stable runner for 10, and runs the live network suites on disposable three-node networks with [`ci_network_suites.sh`](../scripts/ci_network_suites.sh), the Linux counterpart of `Start-Testnet.ps1 -Fresh -SeedWallets`. The workflow runs both Rust suites with `--release`: the shipped profile keeps overflow checks and the code has no debug-only assertions, so the checks are the same as the commands above and finish sooner.
+
+## Recorded results
+
+The latest full run of this guide, before the parallel audit workstreams were merged:
+
+| Item | Record |
+| --- | --- |
+| Source | `audit-fixes` at `cd21d49` plus the validation-gate, Windows-check and fuzzing commits of findings R15 and R34 |
+| Platform | Windows 11 Home 10.0.26200 x86-64, with Ubuntu under WSL 2 for the Linux builds |
+| Toolchains | rustc, Cargo and Clippy 1.97.1 (2026-07-14) for x86_64-unknown-linux-gnu; rustfmt 1.9.0 of the same release on Windows; Node.js 24.20.0 on Windows; Python 3.14.4 under WSL |
+
+| Check | Result |
+| --- | --- |
+| `cargo build --release --locked --bins` | Passed |
+| `cargo test --all-targets --locked` | 382 passed, 47 ignored |
+| The same with `test-fixtures` | 721 passed, 7 ignored (debug, about 16 minutes); also with `--release` |
+| Both Clippy commands | Passed |
+| `cargo fmt --check` | Failed: files throughout the repository predate formatting. The files these commits add or rewrite are formatted; one formatting-only commit (`cargo fmt`) after the merge completes the gate |
+| Frontend runner and mail property check | 24 suites passed; 117 shared vectors and 20,000 mutations, plus 300,000 mutations at seed 12345 |
+| Python unittest discovery | 210 tests passed with `HASHSTASH_TEST_BINARY` set to the fixture build |
+| Wallet CLI, wallet manager, addresses, wallet adversarial, mail wire | 16, 8, 4, 53 and 15 checks passed on disposable nodes (fixture build) |
+| Live network suites | `ci_network_suites.sh` with the fixture build: `test_network`, `test_economic_adversarial` and `test_load` (twelve 64-transaction waves, no refusals) passed on one fresh three-node network, `test_reserve_network` on another |
+| Windows, natively | 280 library unit tests (1 ignored, six consecutive runs) and 26 command-line unit tests passed, including the access-list and link checks; the in-process fuzz targets and listener tests passed; `test_cold_launcher.ps1` passed under Windows PowerShell 5.1. These were cross-built for x86_64-pc-windows-gnu with Rust 1.96.0 and MinGW-w64. Integration tests that embed build-host paths cannot run from such a build, and Clippy did not run for Windows; the Windows CI job covers both |
+| Fuzzing | The stable runner for 480 seconds per target (300 for `address_book`) and libFuzzer builds (stable toolchain, SanitizerCoverage, no address sanitizer) for 300 seconds per target. Found and fixed: a panic when `fee_quote` or `transfer_quote` received non-object parameters, and the browser opening a byte-order-mark-prefixed envelope that the node does not index as mail |
+
 ## Isolated process and network scenarios
 
 The [local testnet guide](TESTNET.md) describes creating a disposable three-node network with its own configuration, databases, keys and ports. Use the manifest from that fixture for scripts that accept a manifest. These scripts deliberately submit transactions, mine easy-target blocks or create competing branches; never point them at a live chain.
@@ -72,6 +151,8 @@ The [local testnet guide](TESTNET.md) describes creating a disposable three-node
 | [test_load.py](../scripts/test_load.py) | Transaction waves, occupancy and conservation; takes a fixture manifest, required report path and bounded workload options |
 | [test_stratum_wire.py](../scripts/test_stratum_wire.py) | Stratum protocol scenarios using an explicitly selected node executable and report path |
 | [test_wallet_adversarial.py](../scripts/test_wallet_adversarial.py) | Wallet and cold-signer rejection scenarios; select the rebuilt executables, disposable directory, unused ports and report path |
+| [test_wallet_cli.py](../scripts/test_wallet_cli.py), [test_wallet_manager.py](../scripts/test_wallet_manager.py), [test_addresses.py](../scripts/test_addresses.py) | CLI preparation, cold signing, wallet management and address round trips on their own disposable nodes; select the fixture executables, a disposable directory and report path; ports are chosen by the system |
+| [test_mail_wire.py](../scripts/test_mail_wire.py) | End-to-end encrypted mail on one disposable chain; select the fixture executable and report path |
 
 Read each program's `--help` before running it. Pass explicit paths for generated reports and fixture directories. Use a fresh fixture for independent scenarios whose setup expects an empty chain. Stop test nodes through their owning launcher and manifest when finished.
 

@@ -87,6 +87,10 @@ name = "exact_wallet"
 required-features = ["test-fixtures"]
 
 [[test]]
+name = "f006_worst_case"
+required-features = ["test-fixtures"]
+
+[[test]]
 name = "explorer"
 required-features = ["test-fixtures"]
 
@@ -112,6 +116,10 @@ required-features = ["test-fixtures"]
 
 [[test]]
 name = "governance_arithmetic"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "governance_decisions"
 required-features = ["test-fixtures"]
 
 [[test]]
@@ -156,6 +164,10 @@ required-features = ["test-fixtures"]
 
 [[test]]
 name = "open_governance_transport"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "peer_catch_up_capacity"
 required-features = ["test-fixtures"]
 
 [[test]]
@@ -212,6 +224,10 @@ required-features = ["test-fixtures"]
 
 [[test]]
 name = "transaction_data_wallet"
+required-features = ["test-fixtures"]
+
+[[test]]
+name = "wallet_feed_rpc"
 required-features = ["test-fixtures"]
 
 [[test]]

@@ -1226,6 +1226,65 @@ fn deferred_stratum_refreshes_wait_for_the_interval_and_the_template_throttle() 
 }
 
 #[test]
+fn same_parent_changes_wait_while_a_stratum_refresh_is_scheduled() {
+    let (tip, next) = ([1; 32], [2; 32]);
+    let job = Some((tip, [3; 32]));
+    let late = STRATUM_REFRESH_INTERVAL + Duration::from_secs(1);
+    // Within the interval, a same-parent change always waits.
+    assert!(stratum_defers(job, tip, false, Duration::ZERO));
+    assert!(!stratum_defers(job, tip, false, late));
+    // After it, a change still waits while a refresh is scheduled, as when
+    // the last template lagged: that refresh fetches the latest template
+    // once the node may rebuild it, so each change need not ask again.
+    assert!(stratum_defers(job, tip, true, late));
+    // A new tip, or a connection without work, is served at once.
+    assert!(!stratum_defers(job, next, true, Duration::ZERO));
+    assert!(!stratum_defers(None, tip, true, Duration::ZERO));
+}
+
+#[test]
+fn a_template_request_builds_at_most_three_times_while_the_tip_moves() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 64 * 1024);
+    // A new tip arrives during each of the first seven builds.
+    let builds = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    let (counter, mover) = (builds.clone(), node.clone());
+    crate::chain::TEMPLATE_BUILD_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            counter.set(counter.get() + 1);
+            if counter.get() <= 7 {
+                assert!(mover.submit_block(empty_block(&mover)).unwrap());
+            }
+        }));
+    });
+    let tip = || snapshot(&node).chain.tip_hash();
+    let height = || snapshot(&node).chain.tip_height();
+    let stored = || node.locked().unwrap().template.is_some();
+    // Each build was overtaken by a new tip. The third is returned for its
+    // own parent, a sibling of the tip, as if the tip had moved just after it
+    // was served, rather than rebuilding for as long as the tip moves.
+    let block = node.template().unwrap();
+    assert_eq!(builds.get(), 3);
+    assert_ne!(block.header.previous, tip());
+    assert_eq!(block.height, height());
+    // Stratum is told to ask again at once. Nothing is stored.
+    let (block, retry) = node.template_shared(Freshness::Throttled).unwrap();
+    assert_eq!(builds.get(), 6);
+    assert_ne!(block.header.previous, tip());
+    assert!(retry.is_some_and(|retry| retry <= Instant::now()));
+    assert!(!stored());
+    // A build overtaken once is rebuilt for the new tip and stored.
+    let (block, retry) = node.template_shared(Freshness::Throttled).unwrap();
+    assert_eq!(builds.get(), 8);
+    assert_eq!((block.header.previous, retry), (tip(), None));
+    assert!(stored());
+    let (again, _) = node.template_shared(Freshness::Throttled).unwrap();
+    assert!(Arc::ptr_eq(&again, &block));
+    assert_eq!(builds.get(), 8);
+    crate::chain::TEMPLATE_BUILD_HOOK.with(|hook| hook.borrow_mut().take());
+}
+
+#[test]
 #[ignore = "benchmark: cargo test --release --features test-fixtures --lib admission_lock_hold -- --ignored --nocapture"]
 fn admission_lock_hold_at_full_pool() {
     let directory = tempfile::tempdir().unwrap();

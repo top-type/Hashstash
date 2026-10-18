@@ -739,6 +739,8 @@ enum Freshness {
     /// tip is always built at once.
     Throttled,
 }
+/// Template builds one request runs while new tips keep overtaking them.
+const TEMPLATE_BUILD_ATTEMPTS: u32 = 3;
 /// A stored side-branch block whose descendants a peer may still provide,
 /// and the source that delivered it (see `network_guard::peer_source`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1801,8 +1803,8 @@ impl Node {
     /// installed selection. Finishing a block clears its batch trades, so the
     /// build runs outside the node lock, one at a time; the lock is held only
     /// to capture the selection and to store the result. The instant
-    /// returned with a Throttled template that lags the selection is when to
-    /// ask again.
+    /// returned with a template that lags the selection or the tip is when
+    /// to ask again; only Throttled templates lag the selection.
     fn template_shared(&self, freshness: Freshness) -> Result<(Arc<Block>, Option<Instant>)> {
         let served = |i: &Inner| -> Option<(Arc<Block>, Option<Instant>)> {
             let entry = i.template.as_ref()?;
@@ -1821,7 +1823,9 @@ impl Node {
             return Ok(served);
         }
         let _build = self.template_build.unpoisoned();
+        let mut attempt = 0;
         loop {
+            attempt += 1;
             let (job, selection) = {
                 let mut i = self.locked()?;
                 // Another build may have finished while this one waited.
@@ -1841,9 +1845,18 @@ impl Node {
             let finished = Instant::now();
             let block = Arc::new(built.block);
             let mut i = self.locked()?;
-            // A new tip needs proof of work, so a repeat is rare.
             if i.chain.tip_hash() != job.previous() {
-                continue;
+                // A new tip needs proof of work, so a repeat is rare. While
+                // the tip keeps moving, as during catch-up, a request stops
+                // after TEMPLATE_BUILD_ATTEMPTS builds rather than holding
+                // the build slot, and a Stratum worker, until it rests. The
+                // last build is served unstored, for its own parent, as if
+                // the tip had moved just after it was served; Stratum
+                // connections ask again when the new tip is published.
+                if attempt < TEMPLATE_BUILD_ATTEMPTS {
+                    continue;
+                }
+                return Ok((block, Some(Instant::now())));
             }
             // Current only if the selection did not change meanwhile.
             i.template = Some(TemplateEntry {
@@ -7403,6 +7416,20 @@ fn stratum_refresh_at(
     let interval = last_job + STRATUM_REFRESH_INTERVAL;
     retry.map_or(interval, |retry| interval.max(retry))
 }
+/// Whether a published change leaves the connection's work on `fingerprint`
+/// (parent, Merkle root) to its next scheduled refresh: a same-parent change
+/// within STRATUM_REFRESH_INTERVAL of the last job, or while a refresh is
+/// already scheduled (`deferred`), which then fetches the latest template.
+/// A new tip is served at once.
+fn stratum_defers(
+    fingerprint: Option<(Hash, Hash)>,
+    tip: Hash,
+    deferred: bool,
+    since_job: Duration,
+) -> bool {
+    fingerprint.is_some_and(|(parent, _)| parent == tip)
+        && (deferred || since_job < STRATUM_REFRESH_INTERVAL)
+}
 #[allow(clippy::too_many_arguments)]
 async fn new_job<W: AsyncWrite + Unpin>(
     node: &Node,
@@ -7778,9 +7805,10 @@ async fn stratum_session(
                 if authorized {
                     // A new tip replaces work at once. Same-parent template changes
                     // are coalesced so transaction churn cannot retire retained
-                    // jobs faster than one per STRATUM_REFRESH_INTERVAL.
+                    // jobs faster than one per STRATUM_REFRESH_INTERVAL, nor ask
+                    // for a template again while a refresh is already scheduled.
                     let tip = node.read_view()?.chain.tip_hash();
-                    if fingerprint.is_some_and(|(parent,_)| parent == tip) && last_job.elapsed() < STRATUM_REFRESH_INTERVAL {
+                    if stratum_defers(fingerprint, tip, deferred, last_job.elapsed()) {
                         deferred = true;
                     } else {
                         let (block, lagging) = template_async(&node).await?;

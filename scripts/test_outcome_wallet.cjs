@@ -146,6 +146,24 @@ async function run(){
   await preview();eq(h.get(`${channel}-submit`).disabled,true,`${channel} cannot bypass min-both payment limit`);ok(h.get(channel==='send'?'send-cost':`${channel}-fee-error`).textContent.includes('FAIL balance'),`${channel} explains insufficient other-outcome exact fee`);await f.fire('submit');eq(h.wallet.length,0);
   s.fail.account.ordinary=channel==='mail'?'2':'1001';s.status.tip='f'.repeat(64);await h.refresh();await preview();eq(h.get(`${channel}-submit`).disabled,false,`${channel} payment plus exact fee fits both`);await f.requestSubmit();eq(h.wallet.at(-1).operation.TransferExact.amount,channel==='mail'?'1':'1000');ok(h.wallet.at(-1).data_hex.length>0);
  }
+ {
+  // Spending the last cash in one outcome locks the account out of every
+  // transaction, including selling its Stash, until it is credited or that
+  // outcome loses. The wallet names the account and what unlocks it.
+  const h=await setup('1000','0'),s=h.currentSnapshot,own=addr(h.currentSession.public_key),notice=h.get('overview-lock-notice');
+  eq(notice.hidden,false,'a drained outcome shows the lock');ok(notice.textContent.startsWith(own),'the notice names the locked address');
+  ok(notice.textContent.includes('FAIL cash cannot pay one'),'and the drained outcome');ok(notice.textContent.includes(`${amounts.formatHash('1')} or more`),'one atom unlocks it at the minimum fee rate');
+  eq(h.get('governance-lock-notice').textContent,notice.textContent,'the Governance page shows the same lock');eq(h.get('governance-lock-notice').hidden,false);
+  const f=await h.trade('1','Pass'),signed=h.wallet.length;await f.requestSubmit();
+  eq(h.wallet.length,signed,'a transaction whose fee the drained outcome cannot pay is not signed');
+  const reason=h.get('trade-fee-error').textContent;ok(reason.startsWith('FAIL balance cannot pay this')&&reason.includes(`A transfer of ${amounts.formatHash('1')} or more to ${own}`),reason);
+  s.fail.account.ordinary='1';await h.refresh();eq(notice.hidden,true,'any credit that covers a fee unlocks the account');eq(h.get('governance-lock-notice').hidden,true);
+  s.fail.account.ordinary='0';s.status.fee_policy={...s.status.fee_policy,minimum_fee_rate:'3'};await h.refresh();ok(notice.textContent.includes(`${amounts.formatHash('3')} or more`),'a higher fee rate needs a larger credit');
+  s.pass.account.ordinary='0';await h.refresh();ok(notice.textContent.includes('PASS and FAIL cash'));
+  s.status.fee_policy={...s.status.fee_policy,minimum_fee_rate:'0'};await h.refresh();eq(notice.hidden,true,'without a fee nothing is locked');
+  s.status.fee_policy={...s.status.fee_policy,minimum_fee_rate:'1'};s.governance.phase={Rest:{until:780,pending:null}};s.governance.pass=null;s.pass=s.fail=null;await h.refresh();
+  eq(notice.hidden,true,'resolution ends the lock');
+ }
  console.log(`Automatic outcome wallet: ${checks} checks passed`);
 }
 if(require.main===module)run().catch(error=>{console.error(error);process.exitCode=1;});

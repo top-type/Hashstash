@@ -588,10 +588,35 @@
         const a = BigInt(passCash), b = BigInt(failCash);
         return (a < b ? a : b).toString();
     }
+    // During a decision every fee is prepaid from cash already held in both
+    // outcomes; unsettled trade proceeds cannot pay it. Name an account that
+    // cannot pay any fee, and what unlocks it before the drained outcome loses.
+    function drainedOutcomes(pass, fail, fee) {
+        return pass < fee && fail < fee ? "PASS and FAIL" : pass < fee ? "PASS" : "FAIL";
+    }
+    function outcomeLock() {
+        if (!state.ready || !key() || !activeDecision() || !state.pass?.account || !state.fail?.account) return "";
+        try {
+            const policy = state.status.fee_policy, rate = BigInt(policy.minimum_fee_rate), scale = BigInt(policy.fee_scale);
+            const fee = weight => (rate * weight + scale - 1n) / scale;
+            const pass = BigInt(outcomeCash(state.pass)), fail = BigInt(outcomeCash(state.fail)), least = pass < fail ? pass : fail;
+            // Every signed transaction carries at least its sender, block
+            // reference and signature, so no fee is below that weight's.
+            const floor = fee(128n);
+            if (scale <= 0n || least >= floor) return "";
+            // The fee for 1,024 weight covers a small transaction, such as a sale.
+            const needed = fee(1024n) - least;
+            return `${address()} can send nothing until this decision ends, including selling its Stash: every fee needs hashes already held in both outcomes, and its ${drainedOutcomes(pass, fail, floor)} cash cannot pay one. A transfer of ${formatExactHash(needed > 0n ? needed : 1n)} or more to it from any other account unlocks it.`;
+        } catch {
+            return "";
+        }
+    }
     function checkOutcomeFunds(operation, exactFee) {
         if (!activeDecision()) return;
         if (!state.pass?.account || !state.fail?.account) throw new Error("Outcome balances are unavailable. Refresh before spending.");
         const fee = BigInt(exactFee), [kind, value] = Object.entries(operation)[0];
+        const pass = BigInt(state.pass.account.ordinary), fail = BigInt(state.fail.account.ordinary), least = pass < fail ? pass : fail;
+        if (least < fee) throw new Error(`${drainedOutcomes(pass, fail, fee)} balance cannot pay this ${formatExactHash(fee)} fee: fees need hashes already held in both outcomes, and unsettled trade proceeds cannot pay them. A transfer of ${formatExactHash(fee - least)} or more to ${address()} from any other account covers it.`);
         if (![ "TransferExact", "Deposit", "Redeem" ].includes(kind)) return;
         for (const [name, data] of [ [ "Pass", state.pass ], [ "Fail", state.fail ] ]) {
             let available = BigInt(data.account.ordinary), debit = fee;
@@ -1241,7 +1266,11 @@
             selectedWallet && balance !== null ? number("governance-common-cash", balance) : text("governance-common-cash", "—");
             activeDecision() && ($("governance-common-cash").title = `${balance === null ? "Unavailable" : formatExactHash(balance)}. ${paymentHelp}`);
         }
-        const decisionActive = !!activeDecision();
+        const decisionActive = !!activeDecision(), lock = outcomeLock();
+        for (const id of [ "overview-lock-notice", "governance-lock-notice" ]) {
+            text(id, lock);
+            $(id).hidden = !lock;
+        }
         $("overview-stash-row").hidden = decisionActive;
         $("overview-total").hidden = decisionActive;
         $("overview-total-outcomes").hidden = !decisionActive;

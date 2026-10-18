@@ -206,6 +206,10 @@ async fn hot_wallet_data_reaches_peer_mempool_mined_block_and_reopened_database(
     let client = reqwest::Client::new();
     let session: Value = client
         .get(format!("{base}/api/session"))
+        .header(
+            "X-Hashstash-Token",
+            std::fs::read_to_string(&server.session_token_file).unwrap(),
+        )
         .send()
         .await
         .unwrap()

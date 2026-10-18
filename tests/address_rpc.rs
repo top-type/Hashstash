@@ -18,8 +18,12 @@ fn options() -> ServerOptions {
         ..Default::default()
     }
 }
-async fn session(url: &str) -> Value {
-    reqwest::get(format!("{url}/api/session"))
+/// Server wallets are listed only to a holder of the session token.
+async fn session(url: &str, token: &str) -> Value {
+    reqwest::Client::new()
+        .get(format!("{url}/api/session"))
+        .header("X-Hashstash-Token", token)
+        .send()
         .await
         .unwrap()
         .json()
@@ -37,8 +41,8 @@ async fn session_wallet_metadata_and_watch_import_use_chain_checked_addresses() 
     let node = Node::open(&dir.path().join("node.sqlite"), config, public).unwrap();
     let server = node::serve(node.clone(), options()).await.unwrap();
     let base = format!("http://{}", server.rpc);
-    let empty = session(&base).await;
     let token = std::fs::read_to_string(&server.session_token_file).unwrap();
+    let empty = session(&base, &token).await;
     assert!(empty["address"].is_null());
     assert_eq!(empty["address_hrp"], address::hrp(&chain));
     let client = reqwest::Client::new();
@@ -60,12 +64,12 @@ async fn session_wallet_metadata_and_watch_import_use_chain_checked_addresses() 
     assert_eq!(watched["public_key"], hex::encode(public));
     assert_eq!(watched["wallets"][0]["address"], encoded);
     assert_eq!(watched["wallets"][0]["public_key"], hex::encode(public));
-    let after = session(&base).await;
+    let after = session(&base, &token).await;
     let wrong_chain = [99; 32];
     let wrong = address::encode(&public, &wrong_chain).unwrap();
     let rejected = client.post(format!("{base}/api/wallet/manage")).header("X-Hashstash-Token",&token).json(&json!({"action":"watch","name":"Wrong network","public_key":wrong,"revision":watched["wallet_revision"]})).send().await.unwrap();
     assert_eq!(rejected.status(), 400);
-    assert_eq!(session(&base).await, after);
+    assert_eq!(session(&base, &token).await, after);
     let duplicate: Value = client.post(format!("{base}/api/wallet/manage")).header("X-Hashstash-Token",&token).json(&json!({"action":"watch","name":"Raw duplicate","public_key":hex::encode(public),"revision":watched["wallet_revision"]})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
     assert_eq!(duplicate, watched);
     server.stop().await;

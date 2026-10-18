@@ -44,7 +44,8 @@ try {
     $watchFile = $directory + '.watch.json'
     [IO.File]::WriteAllText($watchFile, ($descriptor | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
     $first = & (Join-Path $fixture 'Start-WatchOnly.ps1') -WatchFile $watchFile -Config $Config -Executable $Executable -DataDirectory $directory -BasePort $BasePort -NoBrowser -PassThru
-    $session = Invoke-RestMethod -Uri ($first.url + 'api/session') -TimeoutSec 5
+    # Server wallets are listed only to a caller presenting the node's session token.
+    $session = Invoke-RestMethod -Uri ($first.url + 'api/session') -Headers @{'X-Hashstash-Token'=(Get-Content -LiteralPath (Join-Path $directory 'chain.session-token') -Raw)} -TimeoutSec 5
     Check ($session.wallet_mode -eq 'watch' -and $session.public_key -eq $publicKey -and $session.miner -eq $publicKey -and $session.address -eq $address) 'Fresh copied launcher imports a v2 descriptor with the correct address, watch account, and miner'
     $alias = & (Join-Path $fixture 'Start-WatchOnly.ps1') -Address $address -Config $Config -Executable $Executable -DataDirectory $directory -BasePort $BasePort -NoBrowser -PassThru
     Check ([int]$alias.pid -eq [int]$first.pid) 'Address alias resolves to the same existing watch account and process'
@@ -82,7 +83,7 @@ try {
     & (Join-Path $fixture 'Stop-WatchOnly.ps1') -RecordPath $recordPath
     Check ($null -eq (Get-Process -Id $oldProcess -ErrorAction SilentlyContinue)) 'First owned node process stops before restart'
     $second = & (Join-Path $fixture 'Start-WatchOnly.ps1') -PublicKey $publicKey -Config $Config -Executable $Executable -DataDirectory $directory -BasePort $BasePort -NoBrowser -PassThru
-    $restored = Invoke-RestMethod -Uri ($second.url + 'api/session') -TimeoutSec 5
+    $restored = Invoke-RestMethod -Uri ($second.url + 'api/session') -Headers @{'X-Hashstash-Token'=(Get-Content -LiteralPath (Join-Path $directory 'chain.session-token') -Raw)} -TimeoutSec 5
     Check ($restored.wallet_mode -eq 'hot' -and $restored.wallet_enabled -and $restored.public_key -eq $selected -and $restored.wallet_id -eq $selectedId) 'Restart with the original watch argument preserves the saved hot selection and passes readiness'
     Check ($restored.miner -eq $publicKey -and $second.public_key -eq $publicKey) 'Saved wallet selection does not change the mining recipient or launcher identity'
     $again = & (Join-Path $fixture 'Start-WatchOnly.ps1') -PublicKey $publicKey -Config $Config -Executable $Executable -DataDirectory $directory -BasePort $BasePort -NoBrowser -PassThru

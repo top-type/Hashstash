@@ -554,6 +554,29 @@ pub fn parse_account(s: &str, chain_id: &Hash) -> Result<PublicKey> {
     }
 }
 
+/// Expected hashes per block below which proof of work gates nothing: about
+/// a second of one GPU, and far less of any ASIC.
+pub const EASY_LIMIT_WORK: u64 = 1 << 32;
+/// Expected hashes of one block at the network's easiest permitted target.
+pub fn limit_work(config: &Config) -> Result<Amount> {
+    Ok(math::work(&math::target_from_bits(config.limit_bits)?))
+}
+/// Whether the easiest permitted target makes blocks practically free, as the
+/// presets' development limit (0x207fffff, about two hashes per block) does
+/// until `init --hashrate` calibrates it. Side-branch admission, header
+/// presync and the other proof-of-work-gated defences then cost an attacker
+/// nothing whenever difficulty eases to that limit.
+pub fn easy_proof_of_work(config: &Config) -> bool {
+    limit_work(config).is_ok_and(|work| work < Amount::from(EASY_LIMIT_WORK))
+}
+/// A disposable development network: fixture issuance, or proof of work
+/// that a CPU mines at once. Only there may local processes mine through RPC.
+pub fn development_network(config: &Config) -> bool {
+    config.test_work || easy_proof_of_work(config)
+}
+/// Mining attempts charged as one work unit by the `mine` RPC.
+const MINE_ATTEMPTS_PER_WORK: u64 = 4096;
+
 /// A panic while shared node state was held may have left it half updated.
 /// Exit so a supervisor restarts from durable storage instead of keeping a live
 /// process that can no longer validate, mine or accept mutations.
@@ -638,6 +661,8 @@ mod pool_tests;
 mod explorer_worker_tests;
 #[cfg(test)]
 mod proposal_index_tests;
+#[cfg(test)]
+mod local_rpc_tests;
 #[cfg(test)]
 thread_local! {
     /// Pool selections run on this thread, and the signatures they checked.
@@ -1282,6 +1307,13 @@ pub struct Node {
     stratum_parsers: Arc<Semaphore>,
     rpc_workers: Arc<Semaphore>,
     rpc_mutations: Arc<Semaphore>,
+    /// Held only by server-wallet sends and management, which also take a
+    /// free `rpc_mutations` worker if one frees first.
+    wallet_mutations: Arc<Semaphore>,
+    /// The one development `mine` call that may run, apart from mutations.
+    dev_mining: Arc<Semaphore>,
+    /// `run --dev-rpc`: allow `mine` on a network that is not a development one.
+    dev_rpc: bool,
     peer_workers: Arc<Semaphore>,
     stratum_workers: Arc<Semaphore>,
     guard: Arc<NetworkGuard>,
@@ -1425,6 +1457,9 @@ impl Node {
             stratum_parsers: Arc::new(Semaphore::new(2)),
             rpc_workers: Arc::new(Semaphore::new(4)),
             rpc_mutations: Arc::new(Semaphore::new(2)),
+            wallet_mutations: Arc::new(Semaphore::new(1)),
+            dev_mining: Arc::new(Semaphore::new(1)),
+            dev_rpc: false,
             peer_workers: Arc::new(Semaphore::new(2)),
             stratum_workers: Arc::new(Semaphore::new(2)),
             guard,
@@ -1463,6 +1498,31 @@ impl Node {
         options.validate()?;
         self.discovery_options = options;
         Ok(self)
+    }
+    /// Allow the development `mine` RPC on a network that is not a
+    /// development one (see `development_network`).
+    pub fn with_dev_rpc(mut self) -> Self {
+        self.dev_rpc = true;
+        self
+    }
+    /// A worker for a server-wallet send or management call: the reserved
+    /// one, or a shared mutation worker if that frees first, so RPC reads and
+    /// submissions holding every shared worker cannot hold off the operator's
+    /// wallet. None when neither frees within the I/O deadline.
+    async fn wallet_worker(&self) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        let (reserved, shared) = (self.wallet_mutations.clone(), self.rpc_mutations.clone());
+        let permit = timeout(IO_TIMEOUT, async move {
+            tokio::select! {
+                biased;
+                permit = reserved.acquire_owned() => permit,
+                permit = shared.acquire_owned() => permit,
+            }
+        })
+        .await;
+        Ok(match permit {
+            Ok(permit) => Some(permit?),
+            Err(_) => None,
+        })
     }
     pub fn peer_status(&self) -> Result<Value> {
         let at = now();
@@ -3560,6 +3620,13 @@ impl Node {
                 Ok(json!({"hash":hex::encode(hash),"selected":self.submit_block(b)?}))
             }
             "mine" => {
+                // Any local process can reach the private listener. On a real
+                // network this would let it burn the node's CPU and pick the
+                // payout; only an explicit operator flag allows that.
+                ensure!(
+                    self.dev_rpc || development_network(&self.read_view()?.chain.config),
+                    "mine is a development method and this network's proof of work is not a development target; start the node with --dev-rpc to allow it"
+                );
                 let recipient = params
                     .get("recipient")
                     .map(|v| {
@@ -3578,13 +3645,19 @@ impl Node {
                     .get("attempts")
                     .and_then(Value::as_u64)
                     .unwrap_or(1_000_000);
+                ensure!(
+                    (1..=100_000_000).contains(&attempts),
+                    "attempts must be 1..100000000"
+                );
                 let mut hashes = Vec::new();
                 for _ in 0..count {
                     if let Some(admission) = admission {
                         // Recheck each block's current queue. Charging an entire
                         // batch as 4096-transaction blocks rejects even empty
-                        // batches beyond the admission bucket's capacity.
-                        let work = pool_change_work(self.read_view()?.mempool.len());
+                        // batches beyond the admission bucket's capacity. The
+                        // attempts are charged too: one unit per 4,096 hashes.
+                        let work = pool_change_work(self.read_view()?.mempool.len())
+                            .saturating_add(attempts.div_ceil(MINE_ATTEMPTS_PER_WORK) as usize);
                         if let Err(error) = admission.work(work) {
                             // Only a batch refused before its first block is a
                             // refusal a client may simply resend.
@@ -5828,11 +5901,18 @@ async fn http_session(
             let chain_id = node.read_view()?.chain.chain_id();
             // Loopback is shared by every local account and service, so the
             // session token is never served here. Clients that may use server
-            // wallets read it from the owner-only session token file.
-            let mut data = if http.public {
-                json!({"address_hrp":address::hrp(&chain_id)})
-            } else {
+            // wallets read it from the owner-only session token file and
+            // present it to see them: their names and addresses would link
+            // the operator's accounts for any other local process.
+            let wallets = !http.public
+                && token_matches(
+                    request.token.as_deref(),
+                    http.session_token.as_deref().unwrap_or(""),
+                );
+            let mut data = if wallets {
                 node.wallet_read(WalletStore::status).await?
+            } else {
+                json!({"address_hrp":address::hrp(&chain_id)})
             };
             data["browser_wallet"] = json!(true);
             data["public_web"] = json!(http.public);
@@ -5938,13 +6018,11 @@ async fn http_session(
         if let Err(e) = admission.work(1) {
             return refuse_request(&mut write, e, http_error).await;
         }
-        let Ok(permit) = timeout(IO_TIMEOUT, node.rpc_mutations.clone().acquire_owned()).await
-        else {
+        let Some(permit) = node.wallet_worker().await? else {
             return HttpRefusal::busy("wallet workers busy")
                 .send_error(&mut write)
                 .await;
         };
-        let permit = permit?;
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let request: ManageRequest = serde_json::from_value(value)?;
@@ -5969,13 +6047,11 @@ async fn http_session(
         if let Err(e) = admission.work(pool_change_work(node.read_view()?.mempool.len())) {
             return refuse_request(&mut write, e, http_error).await;
         }
-        let Ok(permit) = timeout(IO_TIMEOUT, node.rpc_mutations.clone().acquire_owned()).await
-        else {
+        let Some(permit) = node.wallet_worker().await? else {
             return HttpRefusal::busy("wallet workers busy")
                 .send_error(&mut write)
                 .await;
         };
-        let permit = permit?;
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             node.wallet_submit(serde_json::from_value::<HotWalletRequest>(value)?)
@@ -6029,10 +6105,11 @@ async fn http_session(
             .await;
         }
     }
+    // Development mining has its own single worker, so looping `mine` calls
+    // never hold the mutation workers that sends and the faucet need.
     let mutation = matches!(
         method.as_str(),
-        "mine"
-            | "template"
+        "template"
             | "submitblock"
             | "submittransaction"
             | "getblock"
@@ -6061,7 +6138,9 @@ async fn http_session(
     let (result, admission) = if value.get("jsonrpc") != Some(&Value::String("2.0".into())) {
         (Err(anyhow!("jsonrpc must be 2.0")), admission)
     } else {
-        let slots = if mutation {
+        let slots = if method == "mine" {
+            node.dev_mining.clone()
+        } else if mutation {
             http.mutations.clone()
         } else {
             http.workers.clone()

@@ -131,7 +131,9 @@ try {
         if ($null -eq (Find-WatchProcess $record)) { throw "Watch node exited. Read $DataDirectory\stderr.log." }
         # Only startup request failures are retried; the identity check below is not swallowed.
         try {
-            $session = Invoke-RestMethod -Uri ($record.url + 'api/session') -TimeoutSec 2
+            # The node lists its wallets only to a caller presenting its owner-only session token.
+            $token = Get-Content -LiteralPath (Join-Path $DataDirectory 'chain.session-token') -Raw
+            $session = Invoke-RestMethod -Uri ($record.url + 'api/session') -Headers @{'X-Hashstash-Token'=$token} -TimeoutSec 2
             $status = Invoke-RestMethod -Uri ($record.url + 'rpc') -Method Post -ContentType 'application/json' -Body '{"jsonrpc":"2.0","id":1,"method":"status","params":{}}' -TimeoutSec 2
             # The saved manager selection may have changed through the Wallet page.
             if ($session.miner -eq $PublicKey -and $session.wallet_id -and $status.result.chain_id) {

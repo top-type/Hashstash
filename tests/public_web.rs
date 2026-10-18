@@ -54,8 +54,10 @@ async fn public_session_and_routes_never_expose_or_control_server_wallet() {
     let private = format!("http://{}", server.rpc);
     let public = format!("http://{}", server.public_web.unwrap());
     let client = reqwest::Client::new();
+    let token = std::fs::read_to_string(&server.session_token_file).unwrap();
     let local: Value = client
         .get(format!("{private}/api/session"))
+        .header("X-Hashstash-Token", &token)
         .send()
         .await
         .unwrap()
@@ -65,7 +67,6 @@ async fn public_session_and_routes_never_expose_or_control_server_wallet() {
     assert_eq!(local["public_key"], hex::encode(server_key));
     assert_eq!(local["public_web"], false);
     assert!(local.get("token").is_none());
-    let token = std::fs::read_to_string(&server.session_token_file).unwrap();
     let exposed: Value = client
         .get(format!("{public}/api/session"))
         .send()
@@ -79,6 +80,17 @@ async fn public_session_and_routes_never_expose_or_control_server_wallet() {
     assert_eq!(exposed["chain_id"], node.status().unwrap()["chain_id"]);
     assert_eq!(exposed["miner"], hex::encode(miner));
     assert_eq!(exposed.as_object().unwrap().len(), 5);
+    // The private token opens no wallet listing on the public listener.
+    let presented: Value = client
+        .get(format!("{public}/api/session"))
+        .header("X-Hashstash-Token", &token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(presented, exposed);
     for field in [
         "token",
         "wallets",
@@ -135,6 +147,7 @@ async fn public_session_and_routes_never_expose_or_control_server_wallet() {
     assert_eq!(node.status().unwrap()["mempool"], 0);
     let unchanged: Value = client
         .get(format!("{private}/api/session"))
+        .header("X-Hashstash-Token", &token)
         .send()
         .await
         .unwrap()

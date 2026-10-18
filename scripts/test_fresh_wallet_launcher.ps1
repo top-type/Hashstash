@@ -30,7 +30,8 @@ function Check([bool]$Condition, [string]$Description) {
     Write-Host ('PASS: ' + $Description)
 }
 function Sessions($Manifest) {
-    return @($Manifest.nodes | ForEach-Object {Invoke-RestMethod -Uri "http://127.0.0.1:$($_.rpc_port)/api/session" -TimeoutSec 5})
+    # Server wallets are listed only to a caller presenting the node's session token.
+    return @($Manifest.nodes | ForEach-Object {Invoke-RestMethod -Uri "http://127.0.0.1:$($_.rpc_port)/api/session" -Headers @{'X-Hashstash-Token'=(Get-Content -LiteralPath ([IO.Path]::ChangeExtension([string]$_.data_file, 'session-token')) -Raw)} -TimeoutSec 5})
 }
 function Call-Node($Record, [string]$Method, $Parameters=@{}) {
     $result = Invoke-RestMethod -Uri "http://127.0.0.1:$($Record.rpc_port)/rpc" -Method Post -ContentType 'application/json' -Body (@{jsonrpc='2.0';id=1;method=$Method;params=$Parameters}|ConvertTo-Json -Depth 10) -TimeoutSec 10

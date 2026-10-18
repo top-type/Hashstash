@@ -42,8 +42,13 @@ enum Command {
         #[arg(long)]
         hashrate: Option<String>,
         /// Development block counts, or longer block counts for interactive use.
+        /// The slow preset is for shared networks and requires --hashrate.
         #[arg(long, value_enum, default_value = "dev")]
         preset: InitPreset,
+        /// Keep the presets' development proof-of-work limit (about two hashes
+        /// per block) for a slow network that never leaves trusted peers.
+        #[arg(long, conflicts_with = "hashrate")]
+        uncalibrated: bool,
         /// Genesis Unix time in seconds; defaults to this computer's clock.
         /// Block 1 must be later, so a fast clock delays every node's first block.
         #[arg(long)]
@@ -250,6 +255,14 @@ enum Command {
         /// File containing the optional Stratum password; no spending key is needed by the node.
         #[arg(long)]
         stratum_password_file: Option<PathBuf>,
+        /// Accept untrusted peers (a non-loopback --p2p or --peer-discovery) on a
+        /// network whose easiest target makes blocks practically free.
+        #[arg(long)]
+        allow_easy_target: bool,
+        /// Allow the development `mine` RPC although this network's proof of
+        /// work is not a development target.
+        #[arg(long)]
+        dev_rpc: bool,
     },
     /// Call a JSON-RPC method. Params may be inline JSON or a JSON file.
     /// Replies are bounded only by the response frame; query endpoints you trust.
@@ -263,6 +276,7 @@ enum Command {
         params_file: Option<PathBuf>,
     },
     /// CPU-mine a bounded number of development blocks through a running node.
+    /// The node refuses this outside a development network unless run with --dev-rpc.
     Mine {
         #[command(flatten)]
         endpoint: Endpoint,
@@ -445,8 +459,15 @@ const CALIBRATED_LIMIT_RANGE_BITS: usize = 8;
 fn initial_config(
     preset: InitPreset,
     hashrate: Option<&str>,
+    uncalibrated: bool,
     genesis_time: Option<u32>,
 ) -> Result<Config> {
+    // The slow preset's longer rounds are for a shared network, which needs a
+    // proof-of-work limit calibrated to its miners rather than the presets'.
+    ensure!(
+        hashrate.is_some() || uncalibrated || matches!(preset, InitPreset::Dev),
+        "--preset slow needs --hashrate with the network's expected hashrate, or --uncalibrated to keep the development proof-of-work limit"
+    );
     let mut config = match preset {
         InitPreset::Dev => Config::devnet(),
         InitPreset::Slow => Config::slow_testnet(),
@@ -491,7 +512,42 @@ fn genesis_warnings(config: &Config, now: u64) -> Vec<String> {
             utc_text(now)
         ));
     }
+    warnings.extend(proof_of_work_warning(config));
     warnings
+}
+
+/// How cheap the easiest permitted target is, for a genesis whose limit
+/// makes blocks practically free, such as the presets' uncalibrated one.
+/// Fixture networks need a test build and are never shared: never flagged.
+fn easy_limit(config: &Config) -> Option<String> {
+    if config.test_work || !node::easy_proof_of_work(config) {
+        return None;
+    }
+    let work = node::limit_work(config).map_or_else(|_| "?".to_owned(), |work| work.to_string());
+    Some(format!(
+        "the easiest permitted target needs only {work} expected hashes per block: after a stall or a backdated start, blocks and every proof-of-work-gated defence cost practically nothing"
+    ))
+}
+
+fn proof_of_work_warning(config: &Config) -> Option<String> {
+    easy_limit(config).map(|limit| {
+        format!("{limit}; use init --hashrate for a network that untrusted peers can reach")
+    })
+}
+
+/// Why `run` would expose an easy-target network to untrusted peers: through
+/// discovery or a listener beyond loopback. None for a calibrated or fixture
+/// network, or one that only loopback and configured peers can reach.
+fn easy_target_exposure(config: &Config, p2p: SocketAddr, peer_discovery: bool) -> Option<String> {
+    let limit = easy_limit(config)?;
+    let how = if peer_discovery {
+        "--peer-discovery".to_owned()
+    } else if !p2p.ip().is_loopback() {
+        format!("--p2p {p2p}")
+    } else {
+        return None;
+    };
+    Some(format!("{how} accepts untrusted peers, but {limit}"))
 }
 
 /// Render Unix seconds as proleptic Gregorian UTC, without a time-zone database.
@@ -1421,9 +1477,10 @@ async fn main() -> Result<()> {
             config,
             hashrate,
             preset,
+            uncalibrated,
             genesis_time,
         } => {
-            let c = initial_config(preset, hashrate.as_deref(), genesis_time)?;
+            let c = initial_config(preset, hashrate.as_deref(), uncalibrated, genesis_time)?;
             for warning in genesis_warnings(&c, node::now()) {
                 eprintln!("warning: {warning}");
             }
@@ -1668,8 +1725,19 @@ async fn main() -> Result<()> {
             peer_key_file,
             peer_pin,
             stratum_password_file,
+            allow_easy_target,
+            dev_rpc,
         } => {
             let c: Config = serde_json::from_value(read_json(&config)?)?;
+            // Refused before the database opens: the operator chose the
+            // listener, so this is a configuration error, not a runtime one.
+            if let Some(exposure) = easy_target_exposure(&c, p2p, peer_discovery) {
+                ensure!(
+                    allow_easy_target,
+                    "{exposure}; create the network with init --hashrate, or pass --allow-easy-target to run it anyway"
+                );
+                eprintln!("warning: {exposure}");
+            }
             let chain_id = c.chain_id();
             // Check wallet seeds and the password before opening the database.
             let wallet = match &wallet_key {
@@ -1731,6 +1799,9 @@ async fn main() -> Result<()> {
             drop(wallet);
             if let Some(public) = watch {
                 node = node.with_watch_key(public)?;
+            }
+            if dev_rpc {
+                node = node.with_dev_rpc();
             }
             if let Some(address) = public_web.filter(|address| !address.ip().is_loopback()) {
                 eprintln!(
@@ -2498,13 +2569,13 @@ mod tests {
 
     #[test]
     fn calibrated_networks_have_timestamp_target_and_fresh_identity() {
-        let first = initial_config(InitPreset::Slow, Some("100T"), None).unwrap();
-        let second = initial_config(InitPreset::Slow, Some("100T"), None).unwrap();
+        let first = initial_config(InitPreset::Slow, Some("100T"), false, None).unwrap();
+        let second = initial_config(InitPreset::Slow, Some("100T"), false, None).unwrap();
         assert!(first.network.starts_with("hashstash-private-"));
         assert_ne!(first.chain_id(), second.chain_id());
         assert_eq!(first.initial.interval, 15);
         assert!(first.genesis_time > 1_770_000_000);
-        let ordinary = initial_config(InitPreset::Dev, None, None).unwrap();
+        let ordinary = initial_config(InitPreset::Dev, None, false, None).unwrap();
         assert_eq!(ordinary.initial.interval, 15);
     }
 
@@ -2515,7 +2586,7 @@ mod tests {
         let original = Config::devnet();
         write_new(&path, &original, false).unwrap();
         let before = fs::read(&path).unwrap();
-        let calibrated = initial_config(InitPreset::Slow, Some("100T"), None).unwrap();
+        let calibrated = initial_config(InitPreset::Slow, Some("100T"), false, None).unwrap();
         assert!(write_new(&path, &calibrated, false).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
     }
@@ -2531,9 +2602,11 @@ mod tests {
         ] {
             assert_eq!(utc_text(seconds), text);
         }
-        let pinned = initial_config(InitPreset::Dev, None, Some(1_800_000_000)).unwrap();
+        // Calibrated, so only the clock can be flagged in every build.
+        let pinned =
+            initial_config(InitPreset::Dev, Some("100T"), false, Some(1_800_000_000)).unwrap();
         assert_eq!(pinned.genesis_time, 1_800_000_000);
-        assert!(initial_config(InitPreset::Dev, None, Some(u32::MAX)).is_err());
+        assert!(initial_config(InitPreset::Dev, None, false, Some(u32::MAX)).is_err());
         let now = 1_800_000_000u64;
         assert!(genesis_warnings(&pinned, now).is_empty());
         assert!(genesis_warnings(&pinned, now - u64::from(pinned.future_seconds)).is_empty());
@@ -2542,6 +2615,69 @@ mod tests {
         assert!(early[0].contains("defer block 1"), "{early:?}");
         let stale = genesis_warnings(&Config::devnet(), CLOCK_FLOOR - 1);
         assert!(stale.iter().any(|w| w.contains("earlier than this release")));
+    }
+
+    #[test]
+    fn shared_presets_need_calibration_and_an_easy_limit_is_flagged() {
+        let refused = initial_config(InitPreset::Slow, None, false, None).unwrap_err();
+        assert!(refused.to_string().contains("--hashrate"), "{refused}");
+        let now = 1_800_000_000;
+        let flagged = |config: &Config| {
+            genesis_warnings(config, now)
+                .iter()
+                .any(|warning| warning.contains("practically nothing"))
+        };
+        // Outside fixture builds a preset is a production-denominated network.
+        let mut uncalibrated =
+            initial_config(InitPreset::Slow, None, true, Some(1_800_000_000)).unwrap();
+        uncalibrated.test_work = false;
+        assert_eq!(uncalibrated.limit_bits, 0x207fffff);
+        assert!(node::easy_proof_of_work(&uncalibrated));
+        assert!(flagged(&uncalibrated));
+        let warning = proof_of_work_warning(&uncalibrated).unwrap();
+        assert!(warning.contains("needs only 2 expected hashes"), "{warning}");
+        let mut dev = initial_config(InitPreset::Dev, None, false, Some(1_800_000_000)).unwrap();
+        dev.test_work = false;
+        assert!(flagged(&dev));
+        // Fixture networks need a test build and are never flagged.
+        dev.test_work = true;
+        assert!(!flagged(&dev));
+        let mut calibrated =
+            initial_config(InitPreset::Slow, Some("100T"), false, Some(1_800_000_000)).unwrap();
+        calibrated.test_work = false;
+        assert!(!node::easy_proof_of_work(&calibrated) && !flagged(&calibrated));
+        // The boundary: a limit just below 2^32 expected hashes is easy.
+        let mut boundary = calibrated.clone();
+        boundary.limit_bits = math::bits_from_target(&((Amount::one() << 224usize) - 1u32));
+        assert!(!node::easy_proof_of_work(&boundary));
+        boundary.limit_bits = math::bits_from_target(&(Amount::one() << 225usize));
+        assert!(node::easy_proof_of_work(&boundary));
+    }
+
+    #[test]
+    fn run_refuses_untrusted_peers_on_an_easy_target() {
+        let mut easy = Config::slow_testnet();
+        easy.test_work = false;
+        let loopback: SocketAddr = "127.0.0.1:18481".parse().unwrap();
+        let any: SocketAddr = "0.0.0.0:18481".parse().unwrap();
+        let lan: SocketAddr = "[fd00::1]:18481".parse().unwrap();
+        // Loopback with configured peers only stays a private network.
+        assert!(easy_target_exposure(&easy, loopback, false).is_none());
+        for (p2p, discovery, how) in [
+            (loopback, true, "--peer-discovery"),
+            (any, false, "--p2p 0.0.0.0:18481"),
+            (lan, false, "--p2p [fd00::1]:18481"),
+        ] {
+            let exposure = easy_target_exposure(&easy, p2p, discovery).unwrap();
+            assert!(exposure.starts_with(how), "{exposure}");
+            assert!(exposure.contains("practically nothing"), "{exposure}");
+        }
+        let mut calibrated = easy.clone();
+        calibrate_initial_target(&mut calibrated, "100T").unwrap();
+        assert!(easy_target_exposure(&calibrated, any, true).is_none());
+        let mut fixture = easy;
+        fixture.test_work = true;
+        assert!(easy_target_exposure(&fixture, any, true).is_none());
     }
 
     #[test]

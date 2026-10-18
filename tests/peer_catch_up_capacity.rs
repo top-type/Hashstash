@@ -270,7 +270,8 @@ async fn a_branch_that_raised_capacity_far_behind_is_followed_once_its_headers_c
     let shared: Vec<_> = (1..=private.tip_height())
         .map(|height| private.block(&private.hash_at_height(height).unwrap()).unwrap())
         .collect();
-    let capacity = 1024 * 1024 + 173;
+    // One decision can at most double capacity.
+    let capacity = 2 * initial - 173;
     let branch = enact(&mut private, &secret, capacity);
 
     // The victim stores that branch while its own chain is further ahead

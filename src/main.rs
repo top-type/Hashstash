@@ -250,6 +250,9 @@ enum Command {
         /// File containing the optional Stratum password; no spending key is needed by the node.
         #[arg(long)]
         stratum_password_file: Option<PathBuf>,
+        /// Address or CIDR prefix of the operator's miners, which always keep reserved Stratum slots.
+        #[arg(long, conflicts_with = "no_stratum")]
+        stratum_trusted: Vec<hashstash::network_guard::TrustedPrefix>,
     },
     /// Call a JSON-RPC method. Params may be inline JSON or a JSON file.
     /// Replies are bounded only by the response frame; query endpoints you trust.
@@ -1675,6 +1678,7 @@ async fn main() -> Result<()> {
             peer_key_file,
             peer_pin,
             stratum_password_file,
+            stratum_trusted,
         } => {
             let c: Config = serde_json::from_value(read_json(&config)?)?;
             // A hand-edited genesis can be valid yet unsafe to operate.
@@ -1760,6 +1764,7 @@ async fn main() -> Result<()> {
                     stratum_advertise,
                     peers: peer,
                     stratum_password: password,
+                    stratum_trusted,
                 },
             )
             .await?;

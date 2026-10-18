@@ -11,6 +11,7 @@ use crate::{
     fees, math,
     network_guard::{
         self, NetworkGuard, PeerClass, PeerSlots, Session, StratumPending, Surface,
+        TrustedPrefix,
     },
     peer_auth::{Channel as PeerChannel, Policy as PeerPolicy},
     peer_discovery::{self, AddressBook, Options as DiscoveryOptions},
@@ -1680,6 +1681,8 @@ pub struct Node {
     explorer: Arc<ExplorerWorker>,
     explorer_path: Arc<PathBuf>,
     session_token_path: Arc<PathBuf>,
+    /// Owner-only sidecar with the Stratum addresses that recently authorized.
+    stratum_trusted_path: Arc<PathBuf>,
     miner: PublicKey,
     wallets: Arc<Mutex<WalletStore>>,
     startup_wallet_mode: Option<&'static str>,
@@ -1848,6 +1851,10 @@ impl Node {
             explorer,
             explorer_path: Arc::new(crate::local_files::sidecar(path, "explorer.sqlite")),
             session_token_path: Arc::new(session_token_path(path)),
+            stratum_trusted_path: Arc::new(crate::local_files::sidecar(
+                path,
+                "stratum-trusted.json",
+            )),
             miner,
             wallets: Arc::new(Mutex::new(wallets)),
             startup_wallet_mode: None,
@@ -1953,13 +1960,15 @@ impl Node {
     }
     /// Validation may change the greatest competitive capacity on any branch,
     /// including without a tip change. Record it for transport tasks and
-    /// admission. It falls again when a competing branch is left behind;
-    /// callers hold the node lock, so the latest chain value wins.
+    /// admission. It falls again when a competing branch is left behind or
+    /// governance lowers it, and admission's byte bursts and frame memory
+    /// follow it down; callers hold the node lock, so the latest chain value
+    /// wins. Nothing else sets the private guard's frame allowance.
     fn note_capacity(&self, chain: &Chain) -> Result<()> {
         let capacity = chain.max_known_block_bytes();
         self.known_block_bytes.store(capacity, Ordering::Release);
         self.guard
-            .allow_frame(admission_frame_bytes(&chain.config, capacity)?)
+            .set_frame(admission_frame_bytes(&chain.config, capacity)?)
     }
     fn publish(&self, inner: &Inner) -> Result<()> {
         self.note_capacity(&inner.chain)?;
@@ -1993,10 +2002,7 @@ impl Node {
     fn peer_limits(&self) -> Result<peer_wire::Limits> {
         let view = self.read_view()?;
         let capacity = self.known_block_bytes.load(Ordering::Acquire);
-        let limits = peer_wire::Limits::for_capacity(&view.chain.config, capacity);
-        self.guard
-            .allow_frame(admission_frame_bytes(&view.chain.config, capacity)?)?;
-        Ok(limits)
+        Ok(peer_wire::Limits::for_capacity(&view.chain.config, capacity))
     }
     fn peer_exchange_timeout(&self) -> Result<Duration> {
         // A peer may be validating the block we just sent before it answers.
@@ -5063,11 +5069,8 @@ async fn read_peer_packet<R: AsyncBufRead + Unpin>(
     }
     let result = match transport {
         PeerTransport::Signed(channel) => {
-            match tokio::time::timeout_at(read_by, channel.receive(r, maximum, admission))
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|v| v)
-            {
+            let receive = tokio::time::timeout_at(read_by, channel.receive(r, maximum, admission));
+            match keep_frame_progress(admission, receive).await {
                 Ok(frame) => {
                     channel
                         .open(frame, admission, node.peer_parsers.clone())
@@ -5077,10 +5080,8 @@ async fn read_peer_packet<R: AsyncBufRead + Unpin>(
             }
         }
         PeerTransport::Plain => {
-            tokio::time::timeout_at(read_by, read_peer_frame(r, maximum, admission))
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|v| v)
+            let read = tokio::time::timeout_at(read_by, read_peer_frame(r, maximum, admission));
+            keep_frame_progress(admission, read).await
         }
         PeerTransport::Failed => Err(anyhow!("peer transport failed closed")),
     };
@@ -5149,6 +5150,44 @@ async fn read_peer_packet<R: AsyncBufRead + Unpin>(
             admission.malformed();
             Err(error)
         }
+    }
+}
+/// Await one frame's bytes from the peer. A frame that started in this read
+/// and holds more than `FRAME_PROGRESS_HOLD` of shared frame memory must
+/// receive `FRAME_PROGRESS_BYTES` more in every `FRAME_PROGRESS_WINDOW`;
+/// otherwise the read ends as `Busy`, which releases the memory with the
+/// session and starts no cooldown. Configured and pinned peers, and
+/// connections this node opened, are exempt.
+async fn keep_frame_progress<T>(
+    admission: &Session,
+    read: impl std::future::Future<Output = Result<Result<T>, tokio::time::error::Elapsed>>,
+) -> Result<T> {
+    let Some((started, _)) = admission.frame_progress() else {
+        return read.await.map_err(anyhow::Error::from).and_then(|v| v);
+    };
+    let stalled = async {
+        let mut previous = None;
+        loop {
+            tokio::time::sleep(network_guard::FRAME_PROGRESS_WINDOW).await;
+            let Some((frame, held)) = admission.frame_progress() else {
+                continue;
+            };
+            if frame == started {
+                continue;
+            }
+            if let Some((seen, before)) = previous
+                && seen == frame
+                && held > network_guard::FRAME_PROGRESS_HOLD
+                && held < before + network_guard::FRAME_PROGRESS_BYTES
+            {
+                return network_guard::Busy("peer frame stalled while holding shared frame memory");
+            }
+            previous = Some((frame, held));
+        }
+    };
+    tokio::select! {
+        result = read => result.map_err(anyhow::Error::from).and_then(|v| v),
+        stalled = stalled => Err(stalled.into()),
     }
 }
 async fn read_peer<R: AsyncBufRead + Unpin>(
@@ -5221,6 +5260,9 @@ pub struct ServerOptions {
     pub stratum_password: Option<String>,
     pub stratum_share_difficulty: f64,
     pub stratum_advertise: Option<String>,
+    /// Prefixes whose Stratum sources always count as recently authorized,
+    /// so the operator's miners keep reserved pre-authorization slots.
+    pub stratum_trusted: Vec<TrustedPrefix>,
 }
 impl Default for ServerOptions {
     fn default() -> Self {
@@ -5234,6 +5276,7 @@ impl Default for ServerOptions {
             stratum_password: None,
             stratum_share_difficulty: DEFAULT_STRATUM_SHARE_DIFFICULTY,
             stratum_advertise: None,
+            stratum_trusted: Vec::new(),
         }
     }
 }
@@ -5337,6 +5380,18 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
             .map(network_guard::admission_address)
             .collect(),
     );
+    // Addresses whose miners authorized before a restart, and prefixes the
+    // operator trusts, keep reserved Stratum slots from the first connection.
+    node.stratum_pending.allow(&options.stratum_trusted);
+    if options.stratum_enabled {
+        let (pending, path) = (node.stratum_pending.clone(), node.stratum_trusted_path.clone());
+        let loaded = tokio::task::spawn_blocking(move || pending.load_trusted(&path))
+            .await
+            .context("Stratum trusted address reader failed")?;
+        if let Err(error) = loaded {
+            eprintln!("Saved Stratum trusted addresses ignored: {error:#}");
+        }
+    }
     let rpc = TcpListener::bind(options.rpc).await?;
     let p2p = TcpListener::bind(options.p2p).await?;
     let stratum = if options.stratum_enabled {
@@ -5522,10 +5577,12 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
                         (admission, SessionCapacity::Http(permit), None)
                     };
                     let extranonce = match &capacity { SessionCapacity::Mining(id) => id.1, _ => 0 };
+                    // A newcomer may take over a general peer slot; this session then closes.
+                    let evicted = match &capacity { SessionCapacity::Peer(slot) => Some(slot.eviction()), _ => None };
                     let node = n.clone(); let password = password.clone(); let http=http.clone();
                     clients.spawn(async move { let _permit = permit; let _capacity = capacity; let _ = stream.set_nodelay(true);
                         let reporter = node.clone();
-                        let result = match kind { 0|3 => http_session(node, stream, http, admission).await, 1 => peer_session(node, stream, admission).await, _ => stratum_session(node, stream, password, share_difficulty, extranonce.to_le_bytes(), admission, pending).await };
+                        let result = match kind { 0|3 => http_session(node, stream, http, admission).await, 1 => peer_session(node, stream, admission, evicted).await, _ => stratum_session(node, stream, password, share_difficulty, extranonce.to_le_bytes(), admission, pending).await };
                         // Peer data is untrusted; individual failures close only that connection.
                         // Only P2P failures enter the peer diagnostics ring, so web and
                         // mining clients cannot push synchronization errors out of it.
@@ -5539,6 +5596,12 @@ pub async fn serve(node: Node, options: ServerOptions) -> Result<Server> {
     if node.discovery_options.enabled {
         tasks.push(service_task("peer discovery", discovery_loop(node.clone(), rx.clone())));
         tasks.push(service_task("discovery seed", discovery_seed_loop(node.clone(), rx.clone())));
+    }
+    if options.stratum_enabled {
+        tasks.push(service_task(
+            "Stratum trusted addresses",
+            stratum_trusted_loop(node.clone(), rx.clone()),
+        ));
     }
     for peer in options
         .peers
@@ -5731,6 +5794,35 @@ async fn discovery_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
     while workers.join_next().await.is_some() {}
     persist_address_book(&node).await;
 }
+/// Stratum addresses that authorized are saved at most once per this interval,
+/// and when the server stops, so they keep reserved slots after a restart.
+const STRATUM_TRUSTED_SAVE: Duration = Duration::from_secs(10);
+async fn stratum_trusted_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            _ = tokio::time::sleep(STRATUM_TRUSTED_SAVE) => {}
+        }
+        persist_stratum_trusted(&node).await;
+    }
+    persist_stratum_trusted(&node).await;
+}
+/// The file write and its fsync run on a blocking worker; a failed save is
+/// retried at the next interval.
+async fn persist_stratum_trusted(node: &Node) {
+    let Some(bytes) = node.stratum_pending.unsaved_trusted() else {
+        return;
+    };
+    let path = node.stratum_trusted_path.clone();
+    let saved = tokio::task::spawn_blocking(move || StratumPending::persist_trusted(&path, &bytes))
+        .await
+        .map_err(|error| anyhow!("Stratum trusted address writer failed: {error}"))
+        .and_then(|result| result);
+    if let Err(error) = saved {
+        eprintln!("Stratum trusted addresses not saved: {error:#}");
+        node.stratum_pending.save_failed();
+    }
+}
 /// Serialize under the discovery lock only when the persisted form changed;
 /// the file write and its fsync run on a blocking worker without the lock.
 async fn persist_address_book(node: &Node) {
@@ -5763,7 +5855,20 @@ async fn persist_address_book(node: &Node) {
     }
 }
 async fn discover_peer(node: &Node, peer: SocketAddr) -> Result<()> {
-    let _permit = timeout(IO_TIMEOUT, node.outbound_sessions.clone().acquire_owned()).await??;
+    // As for synchronization, one deadline covers the wait for an outbound
+    // slot and the whole exchange, so a slow-walking endpoint holds a slot,
+    // and a discovery worker, for at most one exchange allowance. Expiry
+    // drops the exchange without a cooldown and is reported by the caller.
+    let deadline = tokio::time::Instant::now() + node.peer_exchange_timeout()?;
+    let _permit =
+        tokio::time::timeout_at(deadline, node.outbound_sessions.clone().acquire_owned())
+            .await
+            .map_err(|_| anyhow!("outbound peer slots remained busy"))??;
+    tokio::time::timeout_at(deadline, discover_peer_steps(node, peer))
+        .await
+        .map_err(|_| anyhow!("peer discovery exceeded its overall deadline"))?
+}
+async fn discover_peer_steps(node: &Node, peer: SocketAddr) -> Result<()> {
     let policy = node
         .peer_auth
         .as_ref()
@@ -5823,16 +5928,31 @@ async fn discover_peer(node: &Node, peer: SocketAddr) -> Result<()> {
         _ => bail!("unexpected peer discovery response"),
     }
 }
-async fn peer_session(node: Node, stream: TcpStream, admission: Session) -> Result<()> {
+async fn peer_session(
+    node: Node,
+    stream: TcpStream,
+    admission: Session,
+    evicted: Option<Arc<tokio::sync::Notify>>,
+) -> Result<()> {
     // An absolute deadline bounds how long one connection holds an inbound
     // slot, however each individual step is paced. It also covers waits for
     // local workers and validation, so expiry closes without a cooldown;
     // each peer read has its own allowance, and a peer that misses it is
     // penalized there.
     let deadline = node.peer_exchange_timeout()?.saturating_mul(2);
-    timeout(deadline, peer_session_steps(&node, stream, &admission))
-        .await
-        .map_err(|_| anyhow!("peer session exceeded its overall deadline"))?
+    let steps = timeout(deadline, peer_session_steps(&node, stream, &admission));
+    // A newcomer that took over this general slot ends the session at once,
+    // also without a cooldown: it did nothing wrong.
+    let evicted = async {
+        match evicted {
+            Some(evicted) => evicted.notified().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        result = steps => result.map_err(|_| anyhow!("peer session exceeded its overall deadline"))?,
+        () = evicted => Err(anyhow!("peer session evicted for a newcomer")),
+    }
 }
 async fn peer_session_steps(node: &Node, mut stream: TcpStream, admission: &Session) -> Result<()> {
     let remote = stream.peer_addr()?;
@@ -5969,14 +6089,26 @@ async fn receive_peer_async(
     source: IpAddr,
 ) -> Result<PeerMessage> {
     let permit = timeout(IO_TIMEOUT, node.peer_workers.clone().acquire_owned()).await??;
-    let node = node.clone();
-    tokio::task::spawn_blocking(move || {
+    let before = node.read_view()?;
+    let worker = node.clone();
+    let message = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        node.receive_peer(&message, source)?;
-        Ok(message)
+        worker.receive_peer(&message, source)?;
+        anyhow::Ok(message)
     })
     .await
-    .context("peer validation worker failed")?
+    .context("peer validation worker failed")??;
+    // A source whose message became the tip, or changed the pool, delivered
+    // something new; its inbound sessions are then kept from eviction.
+    let after = node.read_view()?;
+    let tip = after.chain.tip_hash();
+    if (tip != before.chain.tip_hash()
+        && message.blocks.iter().any(|b| codec::block_hash(b) == tip))
+        || (after.pool_revision != before.pool_revision && !message.transactions.is_empty())
+    {
+        node.peer_sessions.delivered(source);
+    }
+    Ok(message)
 }
 async fn peer_snapshot_async(
     node: &Node,
@@ -6902,15 +7034,29 @@ async fn refuse_http(stream: TcpStream, refusal: HttpRefusal) {
 /// Like peer replies, public-web replies spend the byte budget without
 /// penalty: the node chose their size, so an exhausted budget only asks the
 /// client to retry. The public byte burst covers the whole response frame, so
-/// one maximal valid reply waits for refill instead of never fitting.
-fn charge_public_reply(
-    guard: &NetworkGuard,
-    admission: &Session,
-    bytes: usize,
-    frame: usize,
-) -> Result<()> {
-    guard.allow_frame(frame)?;
-    admission.outgoing(bytes, 0)
+/// one maximal valid reply waits for refill instead of never fitting. An
+/// explorer reply, whose method price is flat, also pays `work` for the bytes
+/// it built.
+fn charge_public_reply(admission: &Session, bytes: usize, work: usize) -> Result<()> {
+    admission.outgoing(bytes, work)
+}
+/// Explorer replies pay one work unit per this many bytes they return, once
+/// they are built, in addition to their method price.
+const EXPLORER_REPLY_BYTES_PER_WORK: usize = 1024;
+/// Public calls a wallet needs to show its balance and to prepare, price and
+/// broadcast a transaction. Only these may spend the reserve that the public
+/// website's shared budget keeps; explorer and other reads must leave it.
+fn public_rpc_essential(method: &str) -> bool {
+    matches!(
+        method,
+        "status"
+            | "snapshot"
+            | "account"
+            | "fee_quote"
+            | "transfer_quote"
+            | "preparetransaction"
+            | "broadcasttransaction"
+    )
 }
 
 /// One JSON-RPC answer's bytes, built where the result was computed. A
@@ -6967,8 +7113,8 @@ async fn http_session(
     if http.public {
         // The public guard never sees the private capacity updates. Its byte
         // burst admits one response frame, so a large valid reply waits for
-        // refill instead of never fitting.
-        http.guard.allow_frame(response_frame)?;
+        // refill instead of never fitting, and it follows a lower capacity.
+        http.guard.set_frame(response_frame)?;
     }
     let request = match timeout(
         IO_TIMEOUT,
@@ -7330,9 +7476,13 @@ async fn http_session(
         };
         return refuse_request(&mut write, busy.into(), rpc_error).await;
     }
+    if public && !public_rpc_essential(&method) {
+        admission.nonessential();
+    }
     if let Err(e) = admission.work(cost) {
         return refuse_request(&mut write, e, rpc_error).await;
     }
+    let explorer = crate::explorer::METHODS.contains(&method.as_str());
     // A valid record may need more than the fixed service frame once
     // governance raises capacity; the frame then follows that capacity.
     let limit = response_frame;
@@ -7366,7 +7516,12 @@ async fn http_session(
         .await
         .context("RPC worker failed")??
     };
-    if public && charge_public_reply(&http.guard, &admission, body.len(), limit).is_err() {
+    let explorer_work = if explorer {
+        body.len() / EXPLORER_REPLY_BYTES_PER_WORK
+    } else {
+        0
+    };
+    if public && charge_public_reply(&admission, body.len(), explorer_work).is_err() {
         // Never a cooldown: the node chose the reply's size. The request has
         // already run, so this is no admission refusal and keeps the status
         // its result had: 429 and 503 promise that nothing ran, and a
@@ -7426,21 +7581,35 @@ fn rpc_cost(method: &str, params: &Value) -> usize {
         }
         _ => 1,
     };
-    let recipients = [
-        "/operation/Propose/proposal/Grant/payments",
-        "/body/operation/Propose/proposal/Grant/payments",
-        "/transaction/body/operation/Propose/proposal/Grant/payments",
-    ]
-    .iter()
-    .filter_map(|path| params.pointer(path).and_then(Value::as_array))
-    .map(Vec::len)
-    .max()
-    .unwrap_or(0);
-    let raw_work = params.get("raw").and_then(Value::as_str).map_or(0, |raw| {
+    // Only a method that decodes an operation or a signed transaction from
+    // its parameters pays for the grant recipients or raw bytes it may
+    // validate. Other methods never read such fields, so a list there costs
+    // only the request bytes it took to send.
+    let paths: &[&str] = match method {
+        "preparetransaction" | "fee_quote" | "transfer_quote" => {
+            &["/operation/Propose/proposal/Grant/payments"]
+        }
+        "submittransaction" => &[
+            "/body/operation/Propose/proposal/Grant/payments",
+            "/transaction/body/operation/Propose/proposal/Grant/payments",
+        ],
+        _ => &[],
+    };
+    let recipients = paths
+        .iter()
+        .filter_map(|path| params.pointer(path).and_then(Value::as_array))
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0);
+    let raw_work = match method {
         // A raw grant may carry one key validation per 34 encoded bytes.
         // Ordinary large data pays the same bounded parsing-work allowance.
-        raw.len() / (2 * 34)
-    });
+        "broadcasttransaction" => params
+            .get("raw")
+            .and_then(Value::as_str)
+            .map_or(0, |raw| raw.len() / (2 * 34)),
+        _ => 0,
+    };
     base.saturating_add(recipients).saturating_add(raw_work)
 }
 
@@ -7566,6 +7735,17 @@ mod capacity_work_tests {
             rpc_cost("broadcasttransaction", &json!({"raw":"00".repeat(34_000)})),
             MAX_MEMPOOL + 1 + 1000
         );
+        let signed = json!({"transaction":{"body":params}});
+        assert_eq!(rpc_cost("submittransaction", &signed), MAX_MEMPOOL + 1 + 1000);
+        // Methods that never decode an operation or a raw transaction ignore
+        // such fields, so a visitor's garbage list there costs the base price.
+        assert_eq!(rpc_cost("status", &params), 8);
+        assert_eq!(rpc_cost("snapshot", &params), 48);
+        assert_eq!(
+            rpc_cost("explorer_block", &json!({"raw":"00".repeat(34_000)})),
+            128
+        );
+        assert_eq!(rpc_cost("grant_quote", &params), 4096);
     }
 
     #[test]
@@ -8199,10 +8379,12 @@ mod read_admission_tests {
         let reply = 100 * 1024 * 1024;
         let frame = http_response_frame(16 * 1024, 48 * 1024 * 1024).unwrap();
         assert!(reply <= frame);
-        charge_public_reply(&guard, &session, reply, frame).unwrap();
+        guard.set_frame(frame).unwrap();
+        charge_public_reply(&session, reply, 0).unwrap();
         // The next one exceeds the remaining budget: a refusal that says when
         // the budget has refilled, never a cooldown for a size the node chose.
-        let refused = charge_public_reply(&guard, &session, reply, frame).unwrap_err();
+        // The 7 MiB it lacks refill at a visitor's eighth of 32 MiB/s.
+        let refused = charge_public_reply(&session, reply, 0).unwrap_err();
         let limited = refused
             .downcast_ref::<network_guard::Limited>()
             .expect("a quota refusal");
@@ -8210,7 +8392,10 @@ mod read_admission_tests {
         assert!(
             limited
                 .retry_after
-                .is_some_and(|wait| wait <= Duration::from_secs(4))
+                .is_some_and(|wait| wait > Duration::from_millis(1500)
+                    && wait <= Duration::from_millis(1750)),
+            "{:?}",
+            limited.retry_after
         );
         session.request().unwrap();
         drop(guard.admit(remote, Surface::Rpc).unwrap());
@@ -11757,6 +11942,108 @@ mod peer_tests {
         drop(session);
         assert_eq!(guard.frame_memory_in_use(), 0);
         drop(writer);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_frame_that_stops_arriving_while_holding_shared_memory_ends_without_a_cooldown() {
+        const KIB: usize = 1024;
+        let guard = Arc::new(NetworkGuard::default());
+        let read = |session: Session, declared: usize, sent: usize, then: Vec<usize>| async move {
+            let (mut writer, reader) = tokio::io::duplex(4 * 1024 * KIB);
+            let mut reader = BufReader::new(reader);
+            writer
+                .write_all(&(declared as u32).to_be_bytes())
+                .await
+                .unwrap();
+            writer.write_all(&vec![0; sent]).await.unwrap();
+            let feeder = tokio::spawn(async move {
+                for chunk in then {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    writer.write_all(&vec![0; chunk]).await.unwrap();
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(writer);
+            });
+            let started = Instant::now();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(7);
+            let frame = tokio::time::timeout_at(
+                deadline,
+                read_peer_frame(&mut reader, 16 * 1024 * KIB, &session),
+            );
+            let result = keep_frame_progress(&session, frame).await.map(|f| f.len());
+            feeder.abort();
+            (result, started.elapsed(), session)
+        };
+        let admit = |a: u8| guard.admit(IpAddr::from([8, a, 1, 1]), Surface::Peer).unwrap();
+        let (stalled, small, steady) = tokio::join!(
+            // 2 MiB of a declared 8 MiB frame, then nothing.
+            read(admit(1), 8 * 1024 * KIB, 2 * 1024 * KIB, vec![]),
+            // A frame holding less than 1 MiB may stall until its allowance.
+            read(admit(2), 1024 * KIB, 512 * KIB, vec![]),
+            // A large frame that keeps arriving at 128 KiB/s completes.
+            read(admit(3), 1100 * KIB + 640 * KIB, 1100 * KIB, vec![128 * KIB; 5]),
+        );
+        let (result, elapsed, session) = stalled;
+        let error = result.unwrap_err();
+        assert!(error.is::<network_guard::Busy>(), "{error}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        drop(session);
+        let (result, elapsed, small) = small;
+        assert!(result.unwrap_err().is::<tokio::time::error::Elapsed>());
+        assert!(elapsed >= Duration::from_secs(6), "{elapsed:?}");
+        drop(small);
+        let (result, _, steady) = steady;
+        assert_eq!(result.unwrap(), 1740 * KIB);
+        drop(steady);
+        // The stalled frame's memory returned with its session; the others'
+        // with theirs.
+        assert_eq!(guard.frame_memory_in_use(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_discovery_exchange_that_stalls_after_its_handshake_ends_within_one_allowance() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        let node = Node::open(
+            &dir.path().join("node.db"),
+            config.clone(),
+            crypto::public_key(&[68; 32]).unwrap(),
+        )
+        .unwrap()
+        .with_peer_auth(Policy::discovery([69; 32], vec![]).unwrap())
+        .unwrap();
+        let server = Policy::discovery([70; 32], vec![]).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let chain = config.chain_id();
+        // The endpoint takes most of an allowance to answer the handshake,
+        // completes it, and then never answers the address request.
+        let stall = tokio::spawn(async move {
+            let (mut stream, remote) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let guard = Arc::new(NetworkGuard::default());
+            let admission = guard.admit(remote.ip(), Surface::Peer).unwrap();
+            let channel = PeerChannel::accept(&mut stream, &server, remote.ip(), chain, &admission)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop((channel, stream));
+        });
+        let started = Instant::now();
+        let error = discover_peer(&node, endpoint).await.unwrap_err();
+        let elapsed = started.elapsed();
+        // Each step used to have its own 15-second allowance, so this took 25
+        // seconds and could take far longer; one allowance now bounds the
+        // whole exchange, including the wait for an outbound slot.
+        let allowance = node.peer_exchange_timeout().unwrap();
+        assert!(error.to_string().contains("overall deadline"), "{error}");
+        assert!(
+            elapsed + Duration::from_millis(100) >= allowance
+                && elapsed < allowance + Duration::from_secs(2),
+            "{elapsed:?}"
+        );
+        assert_eq!(node.outbound_sessions.available_permits(), 2);
+        stall.abort();
     }
 
     #[test]

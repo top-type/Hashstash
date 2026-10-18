@@ -410,12 +410,14 @@ async fn public_connections_and_malformed_cooldowns_do_not_exhaust_private_rpc()
     server.stop().await;
 }
 
-/// Visitor-chosen cost: every list element under a grant-payments path is one
-/// work unit, before the method checks its parameters.
-fn priced_status(units: usize) -> Value {
-    json!({"jsonrpc":"2.0","id":1,"method":"status","params":{
-        "operation":{"Propose":{"proposal":{"Grant":{"payments":vec![0; units]}}}}
-    }})
+/// A grant-payments list of `units` elements under an operation.
+fn payments(units: usize) -> Value {
+    json!({"operation":{"Propose":{"proposal":{"Grant":{"payments":vec![0; units]}}}}})
+}
+/// Visitor-chosen cost: a method that decodes an operation pays one work unit
+/// per grant payment, before it checks its parameters.
+fn priced_quote(units: usize) -> Value {
+    json!({"jsonrpc":"2.0","id":1,"method":"fee_quote","params":payments(units)})
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -436,7 +438,7 @@ async fn proxy_named_visitors_cannot_spend_the_shared_public_budget() {
     };
     // Each request costs about half of one visitor's eighth of the shared
     // 1,048,576-unit work burst, so the third is refused for that visitor.
-    let expensive = priced_status(65_000);
+    let expensive = priced_quote(65_000);
     for _ in 0..2 {
         let response = send("192.0.2.10", expensive.clone()).await.unwrap();
         assert_eq!(response.status(), 200);
@@ -453,12 +455,12 @@ async fn proxy_named_visitors_cannot_spend_the_shared_public_budget() {
     let refused: Value = refused.json().await.unwrap();
     assert_eq!(refused["id"], 1);
     assert_eq!(refused["error"]["message"], "network rate budget exhausted");
-    // Another visitor, and unnamed local tools, keep the shared budget.
+    // Another visitor, and unnamed local tools, keep the shared budget. The
+    // quote itself runs and fails: the public listener needs its sender.
     let response = send("192.0.2.11", expensive).await.unwrap();
-    assert_eq!(
-        response.json::<Value>().await.unwrap()["result"]["height"],
-        0
-    );
+    assert_eq!(response.status(), 200);
+    let reply: Value = response.json().await.unwrap();
+    assert_ne!(reply["error"]["message"], "network rate budget exhausted");
     let response = request(&client, &public, "status", json!({})).await;
     assert_eq!(response.status(), 200);
     let invalid = send("not-an-address", json!({})).await.unwrap();
@@ -657,5 +659,88 @@ async fn public_web_is_opt_in_and_admin_rpc_cannot_bind_publicly() {
     local.public_web = None;
     let server = node::serve(node, local).await.unwrap();
     assert!(server.public_web.is_none());
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn garbage_lists_cost_only_their_bytes_and_wallet_calls_outlast_an_explorer_flood() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = crypto::public_key(&[113; 32]).unwrap();
+    let node = Node::open(&directory.path().join("chain.sqlite"), config(), key).unwrap();
+    let server = node::serve(node, options()).await.unwrap();
+    let rpc = format!("http://{}/rpc", server.public_web.unwrap());
+    let client = reqwest::Client::new();
+    let call = |visitor: String, method: &'static str, params: Value| {
+        client
+            .post(&rpc)
+            .header("X-Real-IP", visitor)
+            .json(&json!({"jsonrpc":"2.0","id":3,"method":method,"params":params}))
+            .send()
+    };
+    // A method that never decodes an operation ignores a grant-payments
+    // list: a 75,000-element one used to cost about 75,000 units, so a
+    // visitor's share admitted one such status poll; now each costs 8.
+    for _ in 0..10 {
+        let response = call("198.51.100.7".into(), "status", payments(75_000))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.json::<Value>().await.unwrap()["result"]["height"], 0);
+    }
+    // Sixteen visitors from sixteen networks read explorer accounts at once,
+    // 4,160 units each, until each is refused.
+    let account = json!({"account":hex::encode(key)});
+    let floods: Vec<_> = (1..=16u8)
+        .map(|n| {
+            let (client, rpc, account) = (client.clone(), rpc.clone(), account.clone());
+            tokio::spawn(async move {
+                let read = json!({
+                    "jsonrpc":"2.0","id":4,"method":"explorer_account","params":account
+                });
+                let mut admitted = 0;
+                loop {
+                    let response = client
+                        .post(&rpc)
+                        .header("X-Real-IP", format!("203.0.{n}.1"))
+                        .json(&read)
+                        .send()
+                        .await
+                        .unwrap();
+                    match response.status().as_u16() {
+                        200 => admitted += 1,
+                        429 => break admitted,
+                        status => panic!("visitor {n}: status {status}"),
+                    }
+                    assert!(admitted < 64, "visitor {n} was never refused");
+                }
+            })
+        })
+        .collect();
+    let mut admitted = 0;
+    for flood in floods {
+        admitted += flood.await.unwrap();
+    }
+    // They spent the shared budget outside the wallet reserve: about 189
+    // such reads, and what refilled meanwhile.
+    assert!(admitted >= 180, "{admitted}");
+    // A seventeenth visitor's quote for a large grant costs far more than
+    // refills meanwhile, but it runs from the reserve, as do its wallet poll
+    // and broadcast. Each then fails for its content.
+    let late = || "203.0.17.1".to_string();
+    let quote = call(late(), "fee_quote", payments(50_000)).await.unwrap();
+    assert_eq!(quote.status(), 200);
+    let reply: Value = quote.json().await.unwrap();
+    assert!(reply["error"]["message"].is_string(), "{reply}");
+    assert_ne!(reply["error"]["message"], "network rate budget exhausted");
+    let snapshot = call(late(), "snapshot", json!({})).await.unwrap();
+    assert_eq!(snapshot.status(), 200);
+    assert!(snapshot.json::<Value>().await.unwrap()["result"].is_object());
+    let broadcast = call(late(), "broadcasttransaction", json!({"raw":"00"}))
+        .await
+        .unwrap();
+    assert_eq!(broadcast.status(), 200);
+    let reply: Value = broadcast.json().await.unwrap();
+    assert!(reply["error"]["message"].is_string(), "{reply}");
+    assert_ne!(reply["error"]["message"], "network rate budget exhausted");
     server.stop().await;
 }

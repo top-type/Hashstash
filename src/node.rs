@@ -1,7 +1,9 @@
 //! Bounded local RPC, fork-aware peer synchronization and solo Stratum V1.
 use crate::{
     address,
-    chain::{Chain, MAX_SELECTION_CANDIDATES, SelectionResult},
+    chain::{
+        Chain, HeaderDeferred, HeaderHold, HeaderParent, MAX_SELECTION_CANDIDATES, SelectionResult,
+    },
     codec,
     config::Config,
     crypto,
@@ -709,6 +711,8 @@ struct Inner {
     template: Option<TemplateEntry>,
     // Download progress is independent of which branch currently has greatest work.
     downloads: VecDeque<Download>,
+    /// Header downloads by outbound peer, at most MAX_CONNECTIONS.
+    header_syncs: BTreeMap<SocketAddr, HeaderSync>,
     relay_cursor: usize,
 }
 impl Inner {
@@ -748,6 +752,45 @@ struct Download {
     hash: Hash,
     source: IpAddr,
 }
+/// A header download from one outbound peer (transport version 2). Presync
+/// counts the work the peer's branch claims without holding its headers;
+/// once that exceeds the tip, the branch is fetched again from where it
+/// leaves validated history and held. An unproven branch therefore costs no
+/// storage however long it is, and a proven one is bounded by its work.
+struct HeaderSync {
+    /// Stored block where the branch leaves validated history: its hash,
+    /// height and branch work.
+    root: (Hash, u64, Amount),
+    /// Last header counted, its height and the work its chain claims.
+    last: (Hash, u64, Amount),
+    /// Last header fetched again and held; holding resumes after it.
+    held: Option<(Hash, u64, Amount)>,
+    /// Counting first passed the tip's work at this header and height; the
+    /// headers up to it are fetched again and held.
+    proof: Option<(Hash, u64)>,
+    /// Keeps this download's held headers from eviction until it ends.
+    pin: u64,
+    touched: Instant,
+}
+impl HeaderSync {
+    /// Where holding resumes: the last held header, or the stored root.
+    fn resume(&self) -> (Hash, u64, Amount) {
+        self.held.clone().unwrap_or_else(|| self.root.clone())
+    }
+    /// The header the next request continues after.
+    fn cursor(&self) -> Hash {
+        match self.proof {
+            Some(_) => self.resume().0,
+            None => self.last.0,
+        }
+    }
+}
+/// A header download without a new header for this long ends.
+const HEADER_SYNC_IDLE: Duration = Duration::from_secs(600);
+/// A peer that closed the connection on a header request is synchronized
+/// by blocks only for this long before a header request is tried again.
+const LEGACY_PEER_RETRY: Duration = Duration::from_secs(600);
+const MAX_LEGACY_PEERS: usize = 256;
 /// Record that `source` delivered `hash`, a child of `previous`. Each source
 /// advances only its own cursor for a branch and never moves or removes one
 /// another source contributed, even for the same block. When the list is
@@ -773,6 +816,185 @@ fn note_download(downloads: &mut VecDeque<Download>, hash: Hash, previous: Hash,
             downloads.remove(oldest);
         }
     }
+}
+/// Follow one header reply from `peer` (see `HeaderSync`). The reply must
+/// continue the request: after the download's cursor, an admitted held
+/// chain or a block of this node's active chain. Returns whether another
+/// request can continue the download.
+fn follow_headers(
+    chain: &mut Chain,
+    syncs: &mut BTreeMap<SocketAddr, HeaderSync>,
+    downloads: &mut VecDeque<Download>,
+    peer: SocketAddr,
+    headers: &[Header],
+    now: u64,
+) -> Result<bool> {
+    let start = headers[0].previous;
+    let mut sync = match syncs.remove(&peer) {
+        // Headers that extend the active tip are not held: ordinary
+        // synchronization fetches their blocks.
+        previous if start == chain.tip_hash() => {
+            if let Some(previous) = previous {
+                chain.release_header_pin(previous.pin);
+            }
+            return Ok(false);
+        }
+        Some(sync) if sync.cursor() == start => sync,
+        previous => {
+            if let Some(previous) = previous {
+                chain.release_header_pin(previous.pin);
+            }
+            match chain.header_parent(&start)? {
+                HeaderParent::Stored { height, work } => HeaderSync {
+                    root: (start, height, work.clone()),
+                    last: (start, height, work),
+                    held: None,
+                    proof: None,
+                    pin: chain.new_header_pin(),
+                    touched: Instant::now(),
+                },
+                // The peer continues an admitted chain, which is extended
+                // while it leads the tip by less than HELD_LEAD_BLOCKS.
+                HeaderParent::Held { admitted: true, .. } => {
+                    for header in headers {
+                        match chain.hold_header(header.clone(), now, 0) {
+                            Ok(HeaderHold::Ahead) => return Ok(false),
+                            Ok(_) => {}
+                            Err(error) if error.is::<HeaderDeferred>() => return Ok(false),
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    return Ok(headers.len() == peer_wire::MAX_HEADERS);
+                }
+                _ => bail!("peer headers do not follow the request locator"),
+            }
+        }
+    };
+    sync.touched = Instant::now();
+    let step = advance_headers(chain, &mut sync, headers, now);
+    if !matches!(step, Ok(HeaderStep::Continue(_))) {
+        // Every other ending releases the download's pinned headers.
+        chain.release_header_pin(sync.pin);
+    }
+    match step? {
+        HeaderStep::Continue(more) => {
+            // One download per outbound peer; the least recently active gives way.
+            if syncs.len() >= MAX_CONNECTIONS
+                && let Some(oldest) = syncs.iter().min_by_key(|(_, s)| s.touched).map(|(p, _)| *p)
+                && let Some(old) = syncs.remove(&oldest)
+            {
+                chain.release_header_pin(old.pin);
+            }
+            syncs.insert(peer, sync);
+            Ok(more)
+        }
+        HeaderStep::Admitted => {
+            // The branch's blocks are requested from its stored root on, and
+            // validated without the side-branch admission policy.
+            note_download(
+                downloads,
+                sync.root.0,
+                sync.root.0,
+                network_guard::peer_source(peer.ip()),
+            );
+            Ok(false)
+        }
+        HeaderStep::Ended => Ok(false),
+    }
+}
+/// How one header reply left a header download.
+enum HeaderStep {
+    /// Still counting or holding; whether another request can continue it.
+    Continue(bool),
+    /// Its held chain claims more work than the tip.
+    Admitted,
+    /// It reached the active tip, or the peer now serves another branch.
+    Ended,
+}
+fn advance_headers(
+    chain: &mut Chain,
+    sync: &mut HeaderSync,
+    headers: &[Header],
+    now: u64,
+) -> Result<HeaderStep> {
+    let tip_work = chain.chain_work().clone();
+    // The reply's headers from where holding resumes, when all are in hand.
+    let mut since = (sync.proof.is_none() && sync.last.0 == sync.resume().0).then_some(0);
+    for (index, header) in headers.iter().enumerate() {
+        let hash = crypto::sha256d(&codec::header_bytes(header));
+        let (cursor, height, claimed) = match sync.proof {
+            Some(_) => sync.resume(),
+            None => sync.last.clone(),
+        };
+        ensure!(header.previous == cursor, "peer headers are not linked");
+        // Validated history: the branch leaves it at this block instead.
+        if let HeaderParent::Stored { height, work } = chain.header_parent(&hash)? {
+            if hash == chain.tip_hash() {
+                // The rest extends the active tip.
+                return Ok(HeaderStep::Ended);
+            }
+            sync.root = (hash, height, work.clone());
+            sync.held = None;
+            if sync.proof.is_none_or(|(proof, _)| proof == hash) {
+                sync.proof = None;
+                sync.last = (hash, height, work);
+                since = Some(index + 1);
+            }
+            continue;
+        }
+        let work = match chain.check_header(header, height + 1, now) {
+            Ok(work) => work,
+            // It may become eligible later; the peer is not at fault.
+            Err(error) if error.is::<HeaderDeferred>() => return Ok(HeaderStep::Continue(false)),
+            Err(error) => return Err(error),
+        };
+        let (height, claimed) = (height + 1, claimed + work);
+        match sync.proof {
+            None => {
+                sync.last = (hash, height, claimed.clone());
+                if claimed <= tip_work {
+                    continue;
+                }
+                if let Some(from) = since {
+                    // The whole branch since its resume point is in hand.
+                    let mut hold = HeaderHold::Held;
+                    for header in &headers[from..=index] {
+                        hold = chain.hold_header(header.clone(), now, sync.pin)?;
+                        // Already held well past the tip by another download.
+                        if hold == HeaderHold::Ahead {
+                            break;
+                        }
+                    }
+                    if matches!(hold, HeaderHold::Admitted | HeaderHold::Ahead) {
+                        return Ok(HeaderStep::Admitted);
+                    }
+                }
+                // Fetch the counted branch again from its resume point.
+                sync.proof = Some((hash, height));
+                return Ok(HeaderStep::Continue(true));
+            }
+            Some((proof, proof_height)) => {
+                let hold = chain.hold_header(header.clone(), now, sync.pin)?;
+                sync.held = Some((hash, height, claimed.clone()));
+                // Done once this header itself claims more work than the
+                // tip; a shared prefix another download admitted may not.
+                if matches!(hold, HeaderHold::Admitted | HeaderHold::Ahead) && claimed > tip_work {
+                    return Ok(HeaderStep::Admitted);
+                }
+                if height == proof_height {
+                    if hash != proof {
+                        // The peer now serves another branch than it counted.
+                        return Ok(HeaderStep::Ended);
+                    }
+                    // The tip grew past the counted work: count on from here.
+                    sync.proof = None;
+                    sync.last = (hash, height, claimed);
+                    since = Some(index + 1);
+                }
+            }
+        }
+    }
+    Ok(HeaderStep::Continue(headers.len() == peer_wire::MAX_HEADERS))
 }
 struct PublishedChain {
     config: Arc<Config>,
@@ -1104,6 +1326,9 @@ pub struct Node {
     listener_health: Arc<Mutex<HashMap<&'static str, ListenerHealth>>>,
     peer_auth: Option<Arc<PeerPolicy>>,
     peer_health: Arc<Mutex<HashMap<SocketAddr, PeerHealth>>>,
+    /// Outbound peers that closed the connection on a header request, as a
+    /// transport version 1 peer does, and when.
+    legacy_peers: Arc<Mutex<HashMap<SocketAddr, Instant>>>,
     discovery_options: DiscoveryOptions,
     discovery: Arc<Mutex<Option<AddressBook>>>,
     discovery_path: PathBuf,
@@ -1180,6 +1405,7 @@ impl Node {
             backlog: Vec::new(),
             template: None,
             downloads: VecDeque::new(),
+            header_syncs: BTreeMap::new(),
             relay_cursor: 0,
         };
         // A derived index failure never makes chain validation unavailable.
@@ -1247,6 +1473,7 @@ impl Node {
             listener_health: Arc::new(Mutex::new(HashMap::new())),
             peer_auth: None,
             peer_health: Arc::new(Mutex::new(HashMap::new())),
+            legacy_peers: Arc::new(Mutex::new(HashMap::new())),
             discovery_options: DiscoveryOptions::default(),
             discovery: Arc::new(Mutex::new(None)),
             discovery_path,
@@ -1297,6 +1524,13 @@ impl Node {
         };
         drop(discovery);
         let listeners = json!(*self.listener_health.unpoisoned());
+        // Peers that closed a header request are synchronized by blocks only.
+        let mut legacy: Vec<String> = {
+            let mut legacy = self.legacy_peers.unpoisoned();
+            legacy.retain(|_, at| at.elapsed() < LEGACY_PEER_RETRY);
+            legacy.keys().map(|peer| peer.to_string()).collect()
+        };
+        legacy.sort();
         let view = self.read_view()?;
         // The tip heuristic follows the governed block interval, never below 180 s.
         let stall_after = view
@@ -1311,6 +1545,8 @@ impl Node {
             "public_key":self.peer_auth.as_ref().map(|p|hex::encode(p.public_key())), "peers":peers,
             "discovery":discovery_status, "listeners":listeners,
             "observed_at":at, "encrypted":false,
+            "transport_version":peer_wire::TRANSPORT_VERSION, "version1_peers":legacy,
+            "capacity_allowance":self.known_block_bytes.load(Ordering::Acquire),
             "chain_height":view.chain.tip_height(),
             "seconds_without_new_tip":at.saturating_sub(self.last_tip_change.load(Ordering::Relaxed)),
             "chain_stalled":at.saturating_sub(self.last_tip_change.load(Ordering::Relaxed)) >= stall_after}),
@@ -2219,10 +2455,16 @@ impl Node {
     }
     /// Blocks after the best canonical locator match, the recipient's minimum
     /// admission limits, and the framed block bytes.
+    #[cfg(test)]
     fn blocks_after(
         chain: &Chain,
         locator: &[Hash],
     ) -> Result<(Vec<Block>, peer_wire::Limits, usize)> {
+        Self::blocks_within(chain, locator, None)
+    }
+    /// Each locator entry's height on this node's active chain, if any, and
+    /// the highest of them.
+    fn locator_heights(chain: &Chain, locator: &[Hash]) -> Result<(Vec<Option<u64>>, u64)> {
         ensure!(
             !locator.is_empty() && locator.len() <= 128,
             "invalid locator length"
@@ -2248,16 +2490,30 @@ impl Node {
             .max()
             .copied()
             .context("no common ancestor")?;
+        Ok((canonical, height))
+    }
+    /// As `blocks_after`, for a recipient that declared its block capacity
+    /// allowance (transport version 2): every block, the first included, fits
+    /// that allowance, so the reply never exceeds what it can receive.
+    fn blocks_within(
+        chain: &Chain,
+        locator: &[Hash],
+        declared: Option<u64>,
+    ) -> Result<(Vec<Block>, peer_wire::Limits, usize)> {
+        let (canonical, height) = Self::locator_heights(chain, locator)?;
         // The recipient's admission allowance covers the genesis capacity and
         // the branch capacity of every block on its own active chain, which
         // the index records for the highest one this node shares. The next
         // active body also fits the common ancestor's capacity. Later blocks
         // stop before one requiring a larger capacity, so the recipient can
         // first validate a governed increase and raise its allowance on the
-        // next synchronization.
+        // next synchronization. A declared allowance replaces this estimate,
+        // within this node's own.
         let tip = chain.tip_height();
         let mut capacity = chain.config.initial.block_bytes;
-        if let Some(hash) = Self::shared_active_tip(locator, &canonical) {
+        if let Some(declared) = declared {
+            capacity = declared.min(chain.max_known_block_bytes());
+        } else if let Some(hash) = Self::shared_active_tip(locator, &canonical) {
             capacity = capacity.max(
                 chain
                     .block_capacity(&hash)?
@@ -2275,7 +2531,7 @@ impl Node {
             let b = chain
                 .block(&chain.hash_at_height(h).context("active height missing")?)
                 .context("active block missing")?;
-            if out.is_empty() {
+            if out.is_empty() && declared.is_none() {
                 capacity = capacity.max(u64::try_from(codec::body_size(&b)?)?);
                 limits = peer_wire::Limits::for_capacity(&chain.config, capacity);
             }
@@ -2294,6 +2550,12 @@ impl Node {
             let next_work = work.saturating_add(b.transactions.len() + 1);
             if out.is_empty() {
                 if record > limits.block_bytes || bytes > block_budget {
+                    // A version 2 recipient learns this branch from its
+                    // headers, and raises its declared allowance once the
+                    // branch claims more work than its tip.
+                    if declared.is_some() {
+                        break;
+                    }
                     bail!(
                         "valid block exceeds local peer wire capacity; import requires a larger transport representation"
                     );
@@ -2310,10 +2572,34 @@ impl Node {
         }
         Ok((out, limits, size))
     }
+    /// Headers of the active chain after the best canonical locator match,
+    /// from the header index without any block body.
+    fn headers_after(chain: &Chain, locator: &[Hash]) -> Result<Vec<Header>> {
+        let (_, height) = Self::locator_heights(chain, locator)?;
+        let last = chain
+            .tip_height()
+            .min(height.saturating_add(peer_wire::MAX_HEADERS as u64));
+        (height + 1..=last)
+            .map(|h| {
+                let hash = chain.hash_at_height(h).context("active height missing")?;
+                chain.block_header(&hash)?.context("active header missing")
+            })
+            .collect()
+    }
+    #[cfg(test)]
     fn peer_snapshot(&self, locator: Option<&[Hash]>) -> Result<PeerMessage> {
+        self.peer_snapshot_within(locator, None)
+    }
+    /// A synchronization message whose blocks fit `declared`, the capacity
+    /// allowance a version 2 recipient declared, when there is one.
+    fn peer_snapshot_within(
+        &self,
+        locator: Option<&[Hash]>,
+        declared: Option<u64>,
+    ) -> Result<PeerMessage> {
         let mut i = self.locked()?;
         let (blocks, peer_limits, blocks_bytes) = match locator {
-            Some(l) => Self::blocks_after(&i.chain, l)?,
+            Some(l) => Self::blocks_within(&i.chain, l, declared)?,
             None => (
                 Vec::new(),
                 peer_wire::Limits::from_config(&i.chain.config),
@@ -2400,6 +2686,99 @@ impl Node {
             transactions,
         })
     }
+    /// A header request to `peer`: the cursor of its header download, the
+    /// best admitted held chains, then this node's active chain locator,
+    /// with this node's block capacity allowance.
+    fn header_request(&self, peer: SocketAddr) -> Result<PeerPacket> {
+        let mut guard = self.locked()?;
+        let Inner {
+            chain,
+            header_syncs,
+            ..
+        } = &mut *guard;
+        // An idle download ends; its pinned headers become evictable.
+        header_syncs.retain(|_, sync| {
+            let live = sync.touched.elapsed() < HEADER_SYNC_IDLE;
+            if !live {
+                chain.release_header_pin(sync.pin);
+            }
+            live
+        });
+        let mut locator: Vec<Hash> = header_syncs
+            .get(&peer)
+            .map(HeaderSync::cursor)
+            .into_iter()
+            .collect();
+        locator.extend(chain.admitted_header_tips(8));
+        locator.extend(Self::locator(chain));
+        // Keep genesis as the final fallback even for the largest supported height.
+        if locator.len() > peer_wire::MAX_LOCATORS {
+            let genesis = chain.hash_at_height(0).expect("genesis exists");
+            locator.truncate(peer_wire::MAX_LOCATORS - 1);
+            locator.push(genesis);
+        }
+        Ok(PeerPacket::GetHeaders {
+            chain: chain.chain_id(),
+            version: peer_wire::TRANSPORT_VERSION,
+            capacity: chain.max_known_block_bytes(),
+            locator,
+        })
+    }
+    /// Answer a header request from this node's active chain.
+    fn headers_reply(&self, locator: &[Hash], version: u8) -> Result<PeerPacket> {
+        let i = self.locked()?;
+        Ok(PeerPacket::Headers {
+            chain: i.chain.chain_id(),
+            version: version.min(peer_wire::TRANSPORT_VERSION),
+            headers: Self::headers_after(&i.chain, locator)?,
+        })
+    }
+    /// Follow a header reply from `peer`, an outbound peer this node asked.
+    /// Returns whether another request can continue the download.
+    fn receive_headers(&self, peer: SocketAddr, headers: &[Header]) -> Result<bool> {
+        ensure!(
+            headers.len() <= peer_wire::MAX_HEADERS,
+            "peer header limit exceeded"
+        );
+        let mut guard = self.locked()?;
+        if headers.is_empty() {
+            // The peer's branch ends at the cursor; its download stays
+            // current while the peer keeps answering.
+            if let Some(sync) = guard.header_syncs.get_mut(&peer) {
+                sync.touched = Instant::now();
+            }
+            return Ok(false);
+        }
+        let Inner {
+            chain,
+            header_syncs,
+            downloads,
+            ..
+        } = &mut *guard;
+        let result = follow_headers(chain, header_syncs, downloads, peer, headers, now());
+        // An admitted chain can raise the capacity allowance without a new block.
+        if let Err(error) = self.note_capacity(chain) {
+            eprintln!("Peer capacity allowance unchanged: {error:#}");
+        }
+        result
+    }
+    /// Whether to open a session with `peer` by header requests: unless it
+    /// recently closed the connection on one, as a version 1 peer does.
+    fn speaks_headers(&self, peer: SocketAddr) -> bool {
+        let mut legacy = self.legacy_peers.unpoisoned();
+        legacy.retain(|_, at| at.elapsed() < LEGACY_PEER_RETRY);
+        !legacy.contains_key(&peer)
+    }
+    fn note_legacy_peer(&self, peer: SocketAddr) {
+        let mut legacy = self.legacy_peers.unpoisoned();
+        if legacy.len() >= MAX_LEGACY_PEERS
+            && !legacy.contains_key(&peer)
+            && let Some(oldest) = legacy.iter().min_by_key(|(_, at)| **at).map(|(p, _)| *p)
+        {
+            legacy.remove(&oldest);
+        }
+        legacy.insert(peer, Instant::now());
+    }
     /// Accept a peer message from `source`, the address that sent it.
     fn receive_peer(&self, msg: &PeerMessage, source: IpAddr) -> Result<()> {
         ensure!(
@@ -2445,8 +2824,15 @@ impl Node {
                 match self.submit_block(b.clone()) {
                     Ok(_) => {}
                     // A declined side block's header is held for presync, so
-                    // the rest of its branch is still downloaded after it.
-                    Err(error) if error.is::<crate::chain::SideBranchRefused>() => {}
+                    // the rest of its branch is still downloaded after it. A
+                    // full presync bound may evict that header at once; the
+                    // reply's later blocks then have no known parent, which
+                    // is not the sender's fault, so its blocks end here.
+                    Err(error) if error.is::<crate::chain::SideBranchRefused>() => {
+                        if self.locked()?.chain.header_parent(&hash)? == HeaderParent::Unknown {
+                            break;
+                        }
+                    }
                     Err(error) => return Err(error),
                 }
             }
@@ -3661,11 +4047,13 @@ enum PeerTransport {
 /// The expected message and read allowance for one peer frame.
 #[derive(Clone, Copy, PartialEq)]
 enum PeerRead {
-    /// A connection's first message: a locator request or address request.
+    /// A connection's first message: a locator, address or header request.
+    /// After a header reply, the next header request or locator request.
     Request,
     Sync,
     Ack,
     Addresses,
+    Headers,
 }
 /// A write allows the ordinary deadline plus one second per whole MiB sent.
 fn peer_write_timeout(bytes: usize) -> Duration {
@@ -3688,8 +4076,10 @@ async fn write_peer<W: AsyncWrite + Unpin>(
                     .sum::<usize>()
         }
         PeerPacket::Ack => 1,
-        PeerPacket::GetAddresses { .. } => 1,
+        PeerPacket::GetAddresses { .. } | PeerPacket::GetHeaders { .. } => 1,
         PeerPacket::Addresses { addresses, .. } => addresses.len().max(1),
+        // A header costs a block without a body.
+        PeerPacket::Headers { headers, .. } => headers.len().max(1),
     };
     // This node chose the reply. Its budget bounds amplification, but an
     // exhausted budget never penalizes the recipient's address.
@@ -3773,6 +4163,7 @@ async fn read_peer_packet<R: AsyncBufRead + Unpin>(
         PeerRead::Sync => limits.frame_bytes(),
         PeerRead::Ack => peer_wire::ACK_BYTES,
         PeerRead::Addresses => peer_wire::DISCOVERY_BYTES,
+        PeerRead::Headers => peer_wire::HEADERS_BYTES,
     };
     let exchange_timeout = if kind == PeerRead::Addresses {
         IO_TIMEOUT
@@ -3829,10 +4220,13 @@ async fn read_peer_packet<R: AsyncBufRead + Unpin>(
                 (kind, &packet),
                 (
                     PeerRead::Request,
-                    PeerPacket::Sync(_) | PeerPacket::GetAddresses { .. }
+                    PeerPacket::Sync(_)
+                        | PeerPacket::GetAddresses { .. }
+                        | PeerPacket::GetHeaders { .. }
                 ) | (PeerRead::Sync, PeerPacket::Sync(_))
                     | (PeerRead::Ack, PeerPacket::Ack)
                     | (PeerRead::Addresses, PeerPacket::Addresses { .. })
+                    | (PeerRead::Headers, PeerPacket::Headers { .. })
             );
             ensure!(expected, "unexpected peer message type");
             if kind == PeerRead::Request
@@ -3857,8 +4251,9 @@ async fn read_peer_packet<R: AsyncBufRead + Unpin>(
                     incoming.saturating_add(existing)
                 }
                 PeerPacket::Ack => 1,
-                PeerPacket::GetAddresses { .. } => 1,
+                PeerPacket::GetAddresses { .. } | PeerPacket::GetHeaders { .. } => 1,
                 PeerPacket::Addresses { addresses, .. } => addresses.len().max(1),
+                PeerPacket::Headers { headers, .. } => headers.len().max(1),
             };
             admission.work(work.max(1))?;
             Ok(packet)
@@ -4578,7 +4973,7 @@ async fn peer_session_steps(node: &Node, mut stream: TcpStream, admission: &Sess
     };
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
-    let request = read_peer_packet(
+    let mut request = read_peer_packet(
         &mut read,
         node,
         admission,
@@ -4587,13 +4982,46 @@ async fn peer_session_steps(node: &Node, mut stream: TcpStream, admission: &Sess
         Some(first),
     )
     .await?;
+    // A version 2 client opens with header requests. The block capacity
+    // allowance it declares bounds the blocks this session replies with.
+    let mut declared = None;
+    let mut rounds = 0;
+    while let PeerPacket::GetHeaders {
+        chain,
+        version,
+        capacity,
+        locator,
+    } = request
+    {
+        ensure!(
+            chain == node.read_view()?.chain.chain_id(),
+            "different genesis configuration"
+        );
+        rounds += 1;
+        if rounds > peer_wire::MAX_HEADER_ROUNDS {
+            admission.malformed();
+            bail!("too many header requests in one peer session");
+        }
+        declared = Some(capacity);
+        let reply = headers_reply_async(node, locator, version).await?;
+        write_peer(node, &mut write, reply, admission, &mut transport).await?;
+        request = read_peer_packet(
+            &mut read,
+            node,
+            admission,
+            &mut transport,
+            PeerRead::Request,
+            None,
+        )
+        .await?;
+    }
     let hello = match request {
         PeerPacket::Sync(hello) => hello,
         PeerPacket::GetAddresses {
             chain,
             node: identity,
             advertise,
-        } => {
+        } if declared.is_none() => {
             ensure!(
                 chain == node.read_view()?.chain.chain_id(),
                 "discovery chain mismatch"
@@ -4617,7 +5045,7 @@ async fn peer_session_steps(node: &Node, mut stream: TcpStream, admission: &Sess
         _ => bail!("unexpected first peer message"),
     };
     let hello = receive_peer_async(node, hello, remote.ip()).await?;
-    let reply = peer_snapshot_async(node, Some(hello.locator)).await?;
+    let reply = peer_snapshot_async(node, Some(hello.locator), declared).await?;
     write_peer(
         node,
         &mut write,
@@ -4663,15 +5091,120 @@ async fn receive_peer_async(
     .await
     .context("peer validation worker failed")?
 }
-async fn peer_snapshot_async(node: &Node, locator: Option<Vec<Hash>>) -> Result<PeerMessage> {
+async fn peer_snapshot_async(
+    node: &Node,
+    locator: Option<Vec<Hash>>,
+    declared: Option<u64>,
+) -> Result<PeerMessage> {
     let permit = timeout(IO_TIMEOUT, node.peer_workers.clone().acquire_owned()).await??;
     let node = node.clone();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        node.peer_snapshot(locator.as_deref())
+        node.peer_snapshot_within(locator.as_deref(), declared)
     })
     .await
     .context("peer snapshot worker failed")?
+}
+async fn header_request_async(node: &Node, peer: SocketAddr) -> Result<PeerPacket> {
+    let permit = timeout(IO_TIMEOUT, node.peer_workers.clone().acquire_owned()).await??;
+    let node = node.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        node.header_request(peer)
+    })
+    .await
+    .context("peer header worker failed")?
+}
+async fn headers_reply_async(node: &Node, locator: Vec<Hash>, version: u8) -> Result<PeerPacket> {
+    let permit = timeout(IO_TIMEOUT, node.peer_workers.clone().acquire_owned()).await??;
+    let node = node.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        node.headers_reply(&locator, version)
+    })
+    .await
+    .context("peer header worker failed")?
+}
+async fn receive_headers_async(
+    node: &Node,
+    peer: SocketAddr,
+    headers: Vec<Header>,
+) -> Result<bool> {
+    let permit = timeout(IO_TIMEOUT, node.peer_workers.clone().acquire_owned()).await??;
+    let node = node.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        node.receive_headers(peer, &headers)
+    })
+    .await
+    .context("peer header worker failed")?
+}
+/// The peer ended the connection: an end of stream, reset or broken pipe.
+fn closed_by_peer(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            )
+        })
+    })
+}
+/// Header requests that open a version 2 session, until a reply leaves
+/// nothing more to fetch. A version 1 peer rejects the first request as an
+/// unknown message type and closes the connection; it is then synchronized
+/// by blocks only for LEGACY_PEER_RETRY.
+async fn header_rounds<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+    node: &Node,
+    peer: SocketAddr,
+    read: &mut R,
+    write: &mut W,
+    admission: &Session,
+    transport: &mut PeerTransport,
+) -> Result<()> {
+    for round in 0..peer_wire::MAX_HEADER_ROUNDS {
+        let request = header_request_async(node, peer).await?;
+        let reply = match write_peer(node, write, request, admission, transport).await {
+            Ok(()) => {
+                read_peer_packet(read, node, admission, transport, PeerRead::Headers, None).await
+            }
+            Err(error) => Err(error),
+        };
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(error) if round == 0 && closed_by_peer(&error) => {
+                node.note_legacy_peer(peer);
+                return Err(error.context(format!(
+                    "peer closed the connection on a header request: it may run peer transport version 1, without header synchronization; synchronizing it by blocks only for {} seconds",
+                    LEGACY_PEER_RETRY.as_secs()
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+        let PeerPacket::Headers {
+            chain,
+            version,
+            headers,
+        } = reply
+        else {
+            bail!("unexpected peer header reply");
+        };
+        ensure!(
+            chain == node.read_view()?.chain.chain_id(),
+            "different genesis configuration"
+        );
+        ensure!(
+            version == peer_wire::TRANSPORT_VERSION,
+            "unsupported peer transport version {version}"
+        );
+        if !receive_headers_async(node, peer, headers).await? {
+            break;
+        }
+    }
+    Ok(())
 }
 async fn sync_peer_inner(node: &Node, peer: SocketAddr) -> Result<()> {
     // Keep the former five-stage overall budget, growing with the same
@@ -4712,10 +5245,15 @@ async fn sync_peer_steps(node: &Node, peer: SocketAddr) -> Result<()> {
     };
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
+    // Transport version 2: headers come first, so a branch is learned from
+    // its headers whatever its blocks' size or its distance from the tip.
+    if node.speaks_headers(peer) {
+        header_rounds(node, peer, &mut read, &mut write, &admission, &mut transport).await?;
+    }
     write_peer(
         node,
         &mut write,
-        PeerPacket::Sync(peer_snapshot_async(node, None).await?),
+        PeerPacket::Sync(peer_snapshot_async(node, None, None).await?),
         &admission,
         &mut transport,
     )
@@ -4725,7 +5263,7 @@ async fn sync_peer_steps(node: &Node, peer: SocketAddr) -> Result<()> {
     write_peer(
         node,
         &mut write,
-        PeerPacket::Sync(peer_snapshot_async(node, Some(reply.locator)).await?),
+        PeerPacket::Sync(peer_snapshot_async(node, Some(reply.locator), None).await?),
         &admission,
         &mut transport,
     )
@@ -9809,6 +10347,172 @@ mod peer_tests {
         let invalid = i.chain.cached_invalid_count();
         drop(i);
         assert_eq!((held, invalid), (0, 0));
+    }
+
+    const HEADER_PEER: &str = "8.1.1.1:18481";
+    /// One header request from `target` answered by `source`, its reply cut
+    /// to `keep` headers; whether `target` would ask again, and the request.
+    fn header_round(source: &Node, target: &Node, keep: usize) -> (bool, Vec<Hash>, u64) {
+        let peer = HEADER_PEER.parse().unwrap();
+        let PeerPacket::GetHeaders {
+            locator,
+            version,
+            capacity,
+            ..
+        } = target.header_request(peer).unwrap()
+        else {
+            panic!("not a header request")
+        };
+        assert_eq!(version, peer_wire::TRANSPORT_VERSION);
+        let PeerPacket::Headers { headers, .. } = source.headers_reply(&locator, version).unwrap()
+        else {
+            panic!("not a header reply")
+        };
+        let headers = &headers[..keep.min(headers.len())];
+        (target.receive_headers(peer, headers).unwrap(), locator, capacity)
+    }
+    /// Version 2 synchronization in process: header rounds, then one block
+    /// reply within the declared capacity, until the tips agree.
+    fn converge_headers(source: &Node, target: &Node, limit: usize) -> Option<usize> {
+        for round in 1..=limit {
+            let mut capacity = 0;
+            for _ in 0..peer_wire::MAX_HEADER_ROUNDS {
+                let (more, _, declared) = header_round(source, target, usize::MAX);
+                capacity = declared;
+                if !more {
+                    break;
+                }
+            }
+            let request = target.peer_snapshot(None).unwrap();
+            let reply = source
+                .peer_snapshot_within(Some(&request.locator), Some(capacity))
+                .unwrap();
+            target
+                .receive_peer(&reply, HEADER_PEER.parse::<SocketAddr>().unwrap().ip())
+                .unwrap();
+            if target.read_view().unwrap().chain.tip_hash()
+                == source.read_view().unwrap().chain.tip_hash()
+            {
+                return Some(round);
+            }
+        }
+        None
+    }
+    fn held_counts(node: &Node) -> (usize, usize) {
+        let i = node.locked().unwrap();
+        (i.chain.held_header_count(), i.chain.admitted_header_count())
+    }
+
+    #[test]
+    fn header_presync_counts_a_branch_before_holding_it_and_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        let path = dir.path().join("receiver.db");
+        let receiver = node_on(&path, &config, |chain| {
+            while math::work(&chain.next_target().unwrap()) <= Amount::from(128u32) {
+                rush(chain, crypto::public_key(&[62; 32]).unwrap());
+            }
+        });
+        let work = receiver.locked().unwrap().chain.chain_work().clone();
+        let sender = node_on(&dir.path().join("sender.db"), &config, |chain| {
+            while *chain.chain_work() <= work {
+                rush(chain, crypto::public_key(&[63; 32]).unwrap());
+            }
+        });
+        let branch = sender.read_view().unwrap().chain.tip_height() as usize;
+        // Half of the branch, delivered alone, is only counted: nothing is held.
+        let (more, locator, _) = header_round(&sender, &receiver, branch / 2);
+        assert!(!more);
+        assert_eq!(locator.len(), Node::locator(&receiver.locked().unwrap().chain).len());
+        assert_eq!(held_counts(&receiver), (0, 0));
+        // The next request continues after the last counted header, and the
+        // count passes the tip's work: still nothing is held.
+        let (more, locator, _) = header_round(&sender, &receiver, usize::MAX);
+        assert!(more);
+        let counted = sender.locked().unwrap().chain.hash_at_height(branch as u64 / 2);
+        assert_eq!(Some(locator[0]), counted);
+        assert_eq!(held_counts(&receiver), (0, 0));
+        // The branch is fetched again from genesis and held: admitted once it
+        // claims more work than the tip, which the last header does.
+        let (more, locator, _) = header_round(&sender, &receiver, usize::MAX);
+        assert!(!more);
+        assert_eq!(Some(locator[0]), receiver.locked().unwrap().chain.hash_at_height(0));
+        assert_eq!(held_counts(&receiver), (branch, branch));
+        let tip = receiver.read_view().unwrap().chain.tip_hash();
+        // Admitted headers are persisted and restored on restart.
+        drop(receiver);
+        let receiver = Node::open(&path, config.clone(), crypto::public_key(&[66; 32]).unwrap())
+            .unwrap();
+        assert_eq!(held_counts(&receiver), (branch, branch));
+        assert_eq!(receiver.read_view().unwrap().chain.tip_hash(), tip);
+        // Its blocks, first of all the one the tip's work declines, now bypass
+        // the admission policy: block synchronization alone adopts the branch.
+        assert!(converge(&sender, &receiver, branch / MAX_BATCH + 4).is_some());
+        assert_eq!(held_counts(&receiver), (0, 0));
+        drop(receiver);
+        let receiver = Node::open(&path, config, crypto::public_key(&[66; 32]).unwrap()).unwrap();
+        assert_eq!(held_counts(&receiver), (0, 0));
+        assert_eq!(
+            receiver.read_view().unwrap().chain.tip_hash(),
+            sender.read_view().unwrap().chain.tip_hash()
+        );
+    }
+
+    #[test]
+    fn header_downloads_follow_branches_too_long_for_held_presync() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        let block_work = math::work(&math::target_from_bits(config.initial_bits).unwrap());
+        // On-schedule blocks keep the initial target. A light chain of
+        // one-second blocks raises its work per block, so a branch of
+        // on-schedule blocks needs more headers than presync by held headers
+        // ever holds before it claims more work.
+        let needed = Amount::from(crate::chain::MAX_HELD_HEADERS + 256) * &block_work;
+        let receiver = node_on(&dir.path().join("receiver.db"), &config, |chain| {
+            while *chain.chain_work() <= needed {
+                rush(chain, crypto::public_key(&[62; 32]).unwrap());
+            }
+        });
+        let work = receiver.locked().unwrap().chain.chain_work().clone();
+        let sender = node_on(&dir.path().join("sender.db"), &config, |chain| {
+            while *chain.chain_work() <= work {
+                advance(chain, crypto::public_key(&[63; 32]).unwrap());
+            }
+        });
+        let branch = sender.read_view().unwrap().chain.tip_height() as usize;
+        assert!(branch > crate::chain::MAX_HELD_HEADERS);
+        // Block synchronization alone presyncs by held headers; it stalls at
+        // the bound, and its branch never claims more work than the tip.
+        // Replies past the bound end without failing the exchange.
+        let mut rounds = 0;
+        while held_counts(&receiver).0 < crate::chain::MAX_HELD_HEADERS && rounds < 2 * branch {
+            let request = receiver.peer_snapshot(None).unwrap();
+            let reply = sender.peer_snapshot(Some(&request.locator)).unwrap();
+            receiver.receive_peer(&reply, "8.1.1.2".parse().unwrap()).unwrap();
+            rounds += 1;
+        }
+        assert_eq!(held_counts(&receiver), (crate::chain::MAX_HELD_HEADERS, 0));
+        for _ in 0..4 {
+            let request = receiver.peer_snapshot(None).unwrap();
+            let reply = sender.peer_snapshot(Some(&request.locator)).unwrap();
+            receiver.receive_peer(&reply, "8.1.1.2".parse().unwrap()).unwrap();
+        }
+        assert_eq!(held_counts(&receiver), (crate::chain::MAX_HELD_HEADERS, 0));
+        // Header downloads count the whole branch, then hold all of it.
+        let mut admitted = 0;
+        let limit = 2 * (branch / MAX_BATCH + branch / peer_wire::MAX_HEADERS) + 16;
+        for _ in 0..limit {
+            if converge_headers(&sender, &receiver, 1).is_some() {
+                break;
+            }
+            admitted = admitted.max(held_counts(&receiver).1);
+        }
+        assert!(admitted > crate::chain::MAX_HELD_HEADERS, "{admitted}");
+        assert_eq!(
+            receiver.read_view().unwrap().chain.tip_hash(),
+            sender.read_view().unwrap().chain.tip_hash()
+        );
+        assert_eq!(held_counts(&receiver).1, 0);
     }
 
     #[test]

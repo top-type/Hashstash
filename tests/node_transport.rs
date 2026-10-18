@@ -411,6 +411,106 @@ fn evicted_states_replay_for_deep_reorg_and_restart() {
     assert!(reopened.cached_state_count() <= MAX_CACHED_STATES);
 }
 
+/// Read one unpinned peer frame's payload.
+async fn read_frame<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut length = [0u8; 4];
+    r.read_exact(&mut length).await.ok()?;
+    let mut payload = vec![0; u32::from_be_bytes(length) as usize];
+    r.read_exact(&mut payload).await.ok()?;
+    Some(payload)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn version_1_peers_keep_block_synchronization_and_reject_header_requests_clearly() {
+    use hashstash::peer_wire::{self, Limits, Message, Sync};
+    use std::sync::{Arc, Mutex};
+    let dir = tempfile::tempdir().unwrap();
+    let c = Config::devnet();
+    let a = Node::open(&dir.path().join("a.db"), c.clone(), crypto::public_key(&[87; 32]).unwrap())
+        .unwrap();
+    let b = Node::open(&dir.path().join("b.db"), c.clone(), crypto::public_key(&[88; 32]).unwrap())
+        .unwrap();
+    for _ in 0..3 {
+        a.mine(100_000).unwrap();
+    }
+    let server = node::serve(a.clone(), options()).await.unwrap();
+    let limits = Limits::from_config(&c);
+    let genesis = codec::block_hash(&codec::genesis_block(&c).unwrap());
+
+    // A version 1 client's exchange is unchanged: Sync request, Sync reply,
+    // Sync push, acknowledgment.
+    let mut stream = TcpStream::connect(server.p2p).await.unwrap();
+    let request = |locator| Sync {
+        chain: c.chain_id(),
+        locator,
+        blocks: vec![],
+        transactions: vec![],
+    };
+    let hello = peer_wire::encode(&Message::Sync(request(vec![genesis])), limits).unwrap();
+    stream
+        .write_all(&peer_wire::frame(&hello, limits.frame_bytes()).unwrap())
+        .await
+        .unwrap();
+    let reply = read_frame(&mut stream).await.unwrap();
+    let Message::Sync(reply) = peer_wire::decode(&reply, limits).unwrap() else {
+        panic!("a version 1 request is answered by a synchronization reply")
+    };
+    assert_eq!(reply.blocks.len(), 3);
+    let push = peer_wire::encode(&Message::Sync(request(vec![genesis])), limits).unwrap();
+    stream
+        .write_all(&peer_wire::frame(&push, limits.frame_bytes()).unwrap())
+        .await
+        .unwrap();
+    let ack = read_frame(&mut stream).await.unwrap();
+    assert_eq!(peer_wire::decode(&ack, limits).unwrap(), Message::Ack);
+
+    // A version 1 server closes on the header request's unknown message type.
+    // Simulate one in front of the node: it records each session's first
+    // message type and forwards only the ones version 1 knows.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let legacy = listener.local_addr().unwrap();
+    let tags = Arc::new(Mutex::new(Vec::new()));
+    let seen = tags.clone();
+    let upstream = server.p2p;
+    let proxy = tokio::spawn(async move {
+        loop {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let Some(first) = read_frame(&mut client).await else {
+                continue;
+            };
+            seen.lock().unwrap().push(first[8]);
+            if first[8] > 3 {
+                continue;
+            }
+            let mut server = TcpStream::connect(upstream).await.unwrap();
+            let mut framed = (first.len() as u32).to_be_bytes().to_vec();
+            framed.extend(first);
+            server.write_all(&framed).await.unwrap();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+            });
+        }
+    });
+    let error = node::sync_peer(&b, legacy).await.unwrap_err();
+    assert!(format!("{error:#}").contains("peer transport version 1"), "{error:#}");
+    let status = b.rpc("peerstatus", json!({})).unwrap();
+    assert_eq!(status["transport_version"], 2);
+    assert_eq!(status["version1_peers"], json!([legacy.to_string()]));
+    // The next session, once the closed read's short cooldown has passed,
+    // uses block synchronization only, and succeeds.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    node::sync_peer(&b, legacy).await.unwrap();
+    assert_eq!(b.status().unwrap()["tip"], a.status().unwrap()["tip"]);
+    assert_eq!(*tags.lock().unwrap(), [4, 0]);
+    // A version 2 server answers header requests directly.
+    a.mine(100_000).unwrap();
+    node::sync_peer(&b, server.p2p).await.unwrap();
+    assert_eq!(b.status().unwrap()["tip"], a.status().unwrap()["tip"]);
+    proxy.abort();
+    server.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_legal_loose_transaction_relays_alongside_blocks_without_stalling_cursor() {
     use hashstash::peer_wire::{self, Limits, Message, Sync};

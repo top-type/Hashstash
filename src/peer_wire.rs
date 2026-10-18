@@ -3,18 +3,32 @@
 use crate::{
     codec,
     config::Config,
-    types::{Block, Hash, Transaction},
+    types::{Block, Hash, Header, Transaction},
 };
 use anyhow::{Context, Result, ensure};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 pub const MAGIC: &[u8; 8] = b"HSP2PBIN";
+/// Highest peer transport version this node speaks. Version 1 has only the
+/// synchronization, acknowledgment and address messages. Version 2 adds the
+/// header exchange that may open a synchronization session; a version 1 peer
+/// rejects its messages as an unknown message type.
+pub const TRANSPORT_VERSION: u8 = 2;
 pub const MAX_LOCATORS: usize = 128;
 pub const MAX_BLOCKS: usize = 32;
 pub const MAX_TRANSACTIONS: usize = 256;
+/// Consecutive headers one header reply carries at most.
+pub const MAX_HEADERS: usize = 2000;
+/// Header requests one synchronization session may make before its blocks.
+pub const MAX_HEADER_ROUNDS: usize = 4;
+pub const HEADER_BYTES: usize = 80;
 pub const TRANSACTION_BATCH_BYTES: usize = 512 * 1024;
 pub const ACK_BYTES: usize = 9;
 pub const DISCOVERY_BYTES: usize = 8 + 1 + 32 + 32 + 1 + 32 * 18;
+/// The largest header request: chain, version, capacity and a full locator.
+pub const GET_HEADERS_BYTES: usize = MAGIC.len() + 1 + 32 + 1 + 9 + 9 + MAX_LOCATORS * 32;
+/// The largest header reply: chain, version and a full run of headers.
+pub const HEADERS_BYTES: usize = MAGIC.len() + 1 + 32 + 1 + 9 + MAX_HEADERS * HEADER_BYTES;
 /// Block bytes one synchronization frame carries. A single record of the
 /// validated capacity always fits; smaller blocks share this bounded batch.
 /// This is local transport policy, not a block-validity limit.
@@ -44,6 +58,36 @@ pub enum Message {
         node: Hash,
         addresses: Vec<SocketAddr>,
     },
+    /// Request the headers that follow the best locator match on the
+    /// recipient's active chain. `version` is the highest transport version
+    /// the requester speaks, at least 2; `capacity` is its block capacity
+    /// allowance, which bounds the blocks the same session replies with.
+    GetHeaders {
+        chain: Hash,
+        version: u8,
+        capacity: u64,
+        locator: Vec<Hash>,
+    },
+    /// Consecutive active-chain headers, each the parent of the next; heights
+    /// follow from the first header's parent. `version` is the transport
+    /// version the responder chose: at most the requested one.
+    Headers {
+        chain: Hash,
+        version: u8,
+        headers: Vec<Header>,
+    },
+}
+pub(crate) fn header_from_bytes(bytes: &[u8]) -> Result<Header> {
+    ensure!(bytes.len() == HEADER_BYTES, "truncated peer header");
+    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("fixed width"));
+    Ok(Header {
+        version: word(0),
+        previous: bytes[4..36].try_into()?,
+        merkle_root: bytes[36..68].try_into()?,
+        timestamp: word(68),
+        bits: word(72),
+        nonce: word(76),
+    })
 }
 
 fn push_address(out: &mut Vec<u8>, address: SocketAddr) -> Result<()> {
@@ -167,6 +211,38 @@ pub fn encode(message: &Message, limits: Limits) -> Result<Vec<u8>> {
             out.push(addresses.len() as u8);
             for address in addresses {
                 push_address(&mut out, *address)?;
+            }
+        }
+        Message::GetHeaders {
+            chain,
+            version,
+            capacity,
+            locator,
+        } => {
+            ensure!(*version >= 2, "invalid peer transport version");
+            ensure!(locator.len() <= MAX_LOCATORS, "peer batch limit exceeded");
+            out.push(4);
+            out.extend_from_slice(chain);
+            out.push(*version);
+            out.extend(codec::encode(capacity));
+            out.extend(codec::encode(&(locator.len() as u64)));
+            for hash in locator {
+                out.extend_from_slice(hash);
+            }
+        }
+        Message::Headers {
+            chain,
+            version,
+            headers,
+        } => {
+            ensure!(*version >= 2, "invalid peer transport version");
+            ensure!(headers.len() <= MAX_HEADERS, "peer header limit exceeded");
+            out.push(5);
+            out.extend_from_slice(chain);
+            out.push(*version);
+            out.extend(codec::encode(&(headers.len() as u64)));
+            for header in headers {
+                out.extend_from_slice(&codec::header_bytes(header));
             }
         }
         Message::Sync(sync) => {
@@ -429,6 +505,46 @@ pub fn decode(bytes: &[u8], limits: Limits) -> Result<Message> {
                 addresses,
             }
         }
+        4 => {
+            ensure!(bytes.len() <= GET_HEADERS_BYTES, "header request too large");
+            let chain = r.take(32)?.try_into()?;
+            let version = r.byte()?;
+            ensure!(version >= 2, "invalid peer transport version");
+            let capacity = r.integer()?;
+            let count = r.count(MAX_LOCATORS)?;
+            let locator = r
+                .take(count * 32)?
+                .chunks_exact(32)
+                .map(|h| h.try_into().expect("fixed hash size"))
+                .collect();
+            Message::GetHeaders {
+                chain,
+                version,
+                capacity,
+                locator,
+            }
+        }
+        5 => {
+            ensure!(bytes.len() <= HEADERS_BYTES, "header reply too large");
+            let chain = r.take(32)?.try_into()?;
+            let version = r.byte()?;
+            ensure!(version >= 2, "invalid peer transport version");
+            let count = r.count(MAX_HEADERS)?;
+            // Exact fixed-width count is checked before allocating headers.
+            ensure!(
+                r.bytes.len() - r.at == count * HEADER_BYTES,
+                "truncated or trailing peer headers"
+            );
+            let mut headers = Vec::with_capacity(count);
+            for _ in 0..count {
+                headers.push(header_from_bytes(r.take(HEADER_BYTES)?)?);
+            }
+            Message::Headers {
+                chain,
+                version,
+                headers,
+            }
+        }
         0 => {
             let chain = r.take(32)?.try_into()?;
             let count = r.count(MAX_LOCATORS)?;
@@ -559,6 +675,108 @@ mod tests {
             addresses: vec!["8.8.8.8:1".parse().unwrap(); 33],
         };
         assert!(encode(&too_many, limits).is_err());
+    }
+
+    #[test]
+    fn header_exchange_messages_are_fixed_width_versioned_and_strict() {
+        let limits = Limits::from_config(&Config::devnet());
+        let header = |n: u32| Header {
+            version: codec::HEADER_VERSION | 0x2000,
+            previous: [n as u8; 32],
+            merkle_root: [!n as u8; 32],
+            timestamp: 1_777_777_777 + n,
+            bits: 0x207fffff,
+            nonce: u32::MAX - n,
+        };
+        let full = Message::Headers {
+            chain: [1; 32],
+            version: TRANSPORT_VERSION,
+            headers: (0..MAX_HEADERS as u32).map(header).collect(),
+        };
+        let request = Message::GetHeaders {
+            chain: [1; 32],
+            version: 9,
+            capacity: u64::MAX,
+            locator: vec![[3; 32]; MAX_LOCATORS],
+        };
+        for packet in [
+            request.clone(),
+            full.clone(),
+            Message::Headers {
+                chain: [1; 32],
+                version: TRANSPORT_VERSION,
+                headers: vec![],
+            },
+        ] {
+            let wire = encode(&packet, limits).unwrap();
+            assert_eq!(decode(&wire, limits).unwrap(), packet);
+            for end in 0..wire.len() {
+                assert!(decode(&wire[..end], limits).is_err(), "accepted truncation {end}");
+            }
+            let mut trailing = wire.clone();
+            trailing.push(0);
+            assert!(decode(&trailing, limits).is_err());
+        }
+        // The largest messages define the read allowances.
+        assert_eq!(encode(&full, limits).unwrap().len(), HEADERS_BYTES - 6);
+        assert!(encode(&request, limits).unwrap().len() <= GET_HEADERS_BYTES);
+        assert!(GET_HEADERS_BYTES <= limits.locator_request_bytes());
+        // Header bytes and hashes are the consensus header encoding.
+        let wire = encode(&full, limits).unwrap();
+        let Message::Headers { headers, .. } = decode(&wire, limits).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            headers.iter().map(codec::header_bytes).collect::<Vec<_>>(),
+            (0..MAX_HEADERS as u32).map(|n| codec::header_bytes(&header(n))).collect::<Vec<_>>()
+        );
+        // Version 1 never carries these messages, and limits apply before allocation.
+        for (tag, version) in [(4u8, 1u8), (5, 0)] {
+            let mut wire = [MAGIC.as_slice(), &[tag], &[1; 32], &[version]].concat();
+            wire.extend(codec::encode(&0u64));
+            if tag == 4 {
+                wire.push(0);
+            }
+            assert!(
+                decode(&wire, limits).unwrap_err().to_string().contains("version"),
+                "tag {tag}"
+            );
+        }
+        let mut too_many = [MAGIC.as_slice(), &[5], &[1; 32], &[2]].concat();
+        too_many.extend(codec::encode(&(MAX_HEADERS as u64 + 1)));
+        assert!(decode(&too_many, limits).is_err());
+        let mut declared = [MAGIC.as_slice(), &[5], &[1; 32], &[2]].concat();
+        declared.extend(codec::encode(&2u64));
+        declared.extend([0; HEADER_BYTES]);
+        assert!(
+            decode(&declared, limits)
+                .unwrap_err()
+                .to_string()
+                .contains("truncated or trailing")
+        );
+        assert!(
+            encode(
+                &Message::Headers {
+                    chain: [1; 32],
+                    version: 2,
+                    headers: vec![header(0); MAX_HEADERS + 1]
+                },
+                limits
+            )
+            .is_err()
+        );
+        assert!(
+            encode(
+                &Message::GetHeaders {
+                    chain: [1; 32],
+                    version: 1,
+                    capacity: 0,
+                    locator: vec![]
+                },
+                limits
+            )
+            .is_err()
+        );
     }
 
     fn transaction(operation: Operation, nonce: u64) -> Transaction {

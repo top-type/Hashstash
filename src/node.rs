@@ -30,7 +30,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -578,30 +578,42 @@ impl<T> Unpoisoned<T> for Mutex<T> {
 
 /// How long a relay refusal holds. Shape and signature failures are permanent
 /// for the exact signed bytes. Checks against chain state alone hold for one
-/// tip. A newcomer that lost its selection holds only while both the tip and
-/// the pool it lost against are unchanged.
+/// tip. A newcomer that lost its selection, or that the replacement or
+/// full-pool rule refused, holds only while both the tip and the pool it was
+/// judged against are unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Refusal {
     Permanent,
     Tip(Hash),
     Pool(Hash, u64),
 }
-/// Recently rejected relay identities.
+/// Recently rejected relay and submission identities, with the reason given.
 #[derive(Default)]
 struct RejectedTransactions {
-    entries: HashMap<Hash, Refusal>,
+    entries: HashMap<Hash, (Refusal, String)>,
     order: VecDeque<Hash>,
 }
 impl RejectedTransactions {
     fn contains(&self, id: &Hash, tip: &Hash, pool_revision: u64) -> bool {
-        self.entries.get(id).is_some_and(|refusal| match refusal {
+        self.refusal(id, tip, pool_revision).is_some()
+    }
+    /// Why `id` was refused, while that refusal still holds.
+    fn refusal(&self, id: &Hash, tip: &Hash, pool_revision: u64) -> Option<&str> {
+        let (refusal, reason) = self.entries.get(id)?;
+        match refusal {
             Refusal::Permanent => true,
             Refusal::Tip(at) => at == tip,
             Refusal::Pool(at, revision) => at == tip && *revision == pool_revision,
-        })
+        }
+        .then_some(reason.as_str())
     }
+    #[cfg(test)]
     fn insert(&mut self, id: Hash, scope: Refusal) {
-        if self.entries.insert(id, scope).is_none() {
+        self.refuse(id, scope, "transaction recently refused");
+    }
+    fn refuse(&mut self, id: Hash, scope: Refusal, reason: &str) {
+        let reason = reason.chars().take(256).collect();
+        if self.entries.insert(id, (scope, reason)).is_none() {
             self.order.push_back(id);
         }
         while self.order.len() > MAX_REJECTED_TRANSACTIONS {
@@ -623,6 +635,350 @@ struct Newcomers<'a> {
     unpayable: Vec<(Hash, anyhow::Error)>,
     /// After a missing earlier nonce, which may still arrive on this tip.
     gapped: Vec<Hash>,
+    /// Refused by the replacement or full-pool rule; final for this pool.
+    outbid: Vec<(Hash, anyhow::Error)>,
+}
+
+/// Node-wide wall time that admission work may hold the node lock for, per
+/// second and in a burst: every selection a newcomer causes, from a relay, a
+/// submission or a hot-wallet send, is charged what it took. Relayed
+/// newcomers wait in a queue while it is spent, and public broadcasts are
+/// answered 429; however many sources send, their admission keeps the lock
+/// at most this fraction of the time, plus one selection. The operator's own
+/// private submissions are charged but never refused.
+const SELECTION_TIME_PER_SECOND: Duration = Duration::from_millis(250);
+const SELECTION_TIME_BURST: Duration = Duration::from_secs(1);
+/// Relayed newcomers queued for that budget, admitted together by one selection.
+const MAX_QUEUED_ADMISSIONS: usize = 1024;
+/// A transaction replacing a pending one at the same sender nonce must raise
+/// the signed fee per weight unit by at least 1/REPLACEMENT_RAISE, and by at
+/// least the minimum fee rate.
+const REPLACEMENT_RAISE: u32 = 8;
+/// Executing blocks that would not become the tip: node-wide wall time, and
+/// each relaying source's own share of it, per second and in a burst that
+/// admits one block at the largest benchmarked clearing cost.
+const SIDE_VALIDATION_TIME_PER_SECOND: Duration = Duration::from_millis(250);
+const SIDE_SOURCE_TIME_PER_SECOND: Duration = Duration::from_millis(50);
+const SIDE_VALIDATION_TIME_BURST: Duration = Duration::from_secs(4);
+/// Side-branch blocks one relaying source may have stored, refilled by
+/// SIDE_SOURCE_BLOCKS_PER_TIP per new active-chain height, beside the
+/// node-wide `chain::SIDE_BRANCH_BURST`: one source alone can spend only a
+/// sixteenth of that.
+const SIDE_SOURCE_BLOCKS: u64 = crate::chain::SIDE_BRANCH_BURST / 16;
+const SIDE_SOURCE_BLOCKS_PER_TIP: u64 = 1;
+/// Sources tracked for side-branch shares; fully refilled ones are forgotten.
+const MAX_SIDE_SOURCES: usize = 1024;
+/// Historical state replay one block submission may run, in steps between
+/// which the node lock is released.
+const REPLAY_STEPS_PER_HOLD: usize = 8;
+const REPLAY_HOLDS: usize = 8;
+/// Spends from accounts that a pending transfer creates, held until that
+/// funding confirms: in all, per sender and per source, and the new tips
+/// one may wait for. They also stay within one block's bytes.
+const MAX_AWAITING: usize = MAX_MEMPOOL;
+const AWAITING_PER_SENDER: usize = 16;
+const AWAITING_PER_SOURCE: usize = MAX_AWAITING / 4;
+const AWAITING_TIPS: u32 = 6;
+
+/// A wall-time token bucket. Work is charged after it ran, so the bucket may
+/// fall into debt, at most one burst deep; new work starts only with credit.
+struct TimeBudget {
+    credit: i128,
+    at: Instant,
+    rate: Duration,
+    burst: Duration,
+}
+impl TimeBudget {
+    fn new(rate: Duration, burst: Duration) -> Self {
+        Self {
+            credit: burst.as_nanos() as i128,
+            at: Instant::now(),
+            rate,
+            burst,
+        }
+    }
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.at).as_nanos() as i128;
+        let gained = elapsed.saturating_mul(self.rate.as_nanos() as i128) / 1_000_000_000;
+        self.credit = self
+            .credit
+            .saturating_add(gained)
+            .min(self.burst.as_nanos() as i128);
+        self.at = self.at.max(now);
+    }
+    /// How long until new work may start; zero while credit remains.
+    fn wait(&mut self, now: Instant) -> Duration {
+        self.refill(now);
+        if self.credit > 0 {
+            return Duration::ZERO;
+        }
+        let missing = (1 - self.credit) as u128;
+        let rate = self.rate.as_nanos().max(1);
+        let nanos = (missing * 1_000_000_000).div_ceil(rate);
+        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+    }
+    fn spend(&mut self, spent: Duration, now: Instant) {
+        self.refill(now);
+        self.credit = self
+            .credit
+            .saturating_sub(spent.as_nanos() as i128)
+            .max(-(self.burst.as_nanos() as i128));
+    }
+    fn full(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        self.credit >= self.burst.as_nanos() as i128
+    }
+}
+
+/// A newcomer for admission, and the peer source that relayed it.
+struct Newcomer {
+    id: Hash,
+    transaction: Transaction,
+    source: Option<IpAddr>,
+    /// Its signature was already checked.
+    authenticated: bool,
+}
+/// Where admission put a newcomer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admitted {
+    /// In the selection or its backlog.
+    Pending,
+    /// Held until the transfer that creates its sender's account confirms.
+    Awaiting,
+}
+/// Relayed newcomers waiting for the selection budget or for a block
+/// submission (see `Node::drain_admissions`). Each source keeps a fair
+/// share: a newcomer for a full queue displaces the oldest entry of the
+/// source holding the most, unless its own source holds as many.
+#[derive(Default)]
+struct AdmissionQueue {
+    entries: VecDeque<Newcomer>,
+    ids: HashSet<Hash>,
+    held: BTreeMap<Option<IpAddr>, usize>,
+}
+impl AdmissionQueue {
+    fn push(&mut self, newcomer: Newcomer) {
+        if self.ids.contains(&newcomer.id) {
+            return;
+        }
+        if self.entries.len() >= MAX_QUEUED_ADMISSIONS {
+            let own = self.held.get(&newcomer.source).copied().unwrap_or(0);
+            let Some((&largest, &most)) = self.held.iter().max_by_key(|(_, held)| **held) else {
+                return;
+            };
+            if own >= most {
+                return;
+            }
+            if let Some(oldest) = self.entries.iter().position(|q| q.source == largest)
+                && let Some(evicted) = self.entries.remove(oldest)
+            {
+                self.forget(&evicted);
+            }
+        }
+        *self.held.entry(newcomer.source).or_default() += 1;
+        self.ids.insert(newcomer.id);
+        self.entries.push_back(newcomer);
+    }
+    fn forget(&mut self, newcomer: &Newcomer) {
+        self.ids.remove(&newcomer.id);
+        if let Some(held) = self.held.get_mut(&newcomer.source) {
+            *held -= 1;
+            if *held == 0 {
+                self.held.remove(&newcomer.source);
+            }
+        }
+    }
+    fn take(&mut self) -> Vec<Newcomer> {
+        self.ids.clear();
+        self.held.clear();
+        self.entries.drain(..).collect()
+    }
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+/// The node-wide selection budget and the relayed newcomers queued for it.
+struct Admission {
+    budget: TimeBudget,
+    queue: AdmissionQueue,
+}
+
+/// A spend whose sender has no account yet, though a pending transfer creates
+/// one. Consensus reserves inputs from the block opening, so it can confirm
+/// only in a block after that transfer; it waits here meanwhile.
+struct Awaiting {
+    id: Hash,
+    transaction: Transaction,
+    source: Option<IpAddr>,
+    /// New tips seen while its sender still had no account.
+    tips: u32,
+}
+/// Whether `transaction` creates `account` by paying it.
+fn creates_account(transaction: &Transaction, account: &PublicKey) -> bool {
+    matches!(
+        &transaction.body.operation,
+        Operation::TransferExact { recipient, .. } if recipient == account
+    )
+}
+
+/// Whether `new` may replace `old`, a pending transaction at the same sender
+/// nonce: it raises the signed fee per weight unit by at least an eighth and
+/// by at least the minimum fee rate, so a sender cannot churn the pool with
+/// free replacements. Weights are quoted against the tip state; one that
+/// cannot be quoted is left to the opening screen.
+fn replaces(config: &Config, state: &State, new: &Transaction, old: &Transaction) -> bool {
+    let (Ok(quoted), Ok(pending)) = (
+        fees::quote(config, state, new),
+        fees::quote(config, state, old),
+    ) else {
+        return true;
+    };
+    let (new_weight, old_weight) = (Amount::from(quoted.weight), Amount::from(pending.weight));
+    let offered = &new.body.fee * &old_weight;
+    let held = &old.body.fee * &new_weight;
+    let scale = Amount::from(fees::FEE_SCALE);
+    let increment = Amount::from(state.settings.minimum_fee_rate) * &new_weight * &old_weight;
+    offered > held
+        && &offered * REPLACEMENT_RAISE >= &held * (REPLACEMENT_RAISE + 1)
+        && &offered * &scale >= &held * &scale + increment
+}
+/// The weakest entry of a count-full selection, by the selection's own order:
+/// miner fee per weight unit, then transaction ID.
+#[derive(Clone)]
+struct Weakest {
+    fee: Amount,
+    weight: u64,
+    id: Hash,
+}
+impl Weakest {
+    fn of(config: &Config, state: &State, transaction: &Transaction) -> Option<Self> {
+        let quote = fees::quote(config, state, transaction).ok()?;
+        Some(Self {
+            fee: quote.miner_fee,
+            weight: quote.weight,
+            id: codec::transaction_id(transaction),
+        })
+    }
+    /// Whether `other` ranks before this entry.
+    fn outranked_by(&self, other: &Self) -> bool {
+        (&other.fee * Amount::from(self.weight))
+            .cmp(&(&self.fee * Amount::from(other.weight)))
+            .then_with(|| self.id.cmp(&other.id))
+            == std::cmp::Ordering::Greater
+    }
+}
+
+/// Bounds on executing blocks that would not become the tip (see
+/// `Node::side_permit`).
+struct SideValidation {
+    budget: TimeBudget,
+    sources: BTreeMap<IpAddr, SideSource>,
+}
+/// One relaying source's side-branch share.
+struct SideSource {
+    blocks: u64,
+    /// The active height that last refilled `blocks`.
+    height: u64,
+    time: TimeBudget,
+}
+impl SideSource {
+    fn new(height: u64) -> Self {
+        Self {
+            blocks: SIDE_SOURCE_BLOCKS,
+            height,
+            time: TimeBudget::new(SIDE_SOURCE_TIME_PER_SECOND, SIDE_VALIDATION_TIME_BURST),
+        }
+    }
+    fn refill(&mut self, height: u64) {
+        if height > self.height {
+            self.blocks = (height - self.height)
+                .saturating_mul(SIDE_SOURCE_BLOCKS_PER_TIP)
+                .saturating_add(self.blocks)
+                .min(SIDE_SOURCE_BLOCKS);
+            self.height = height;
+        }
+    }
+}
+
+/// Blocks being validated. A block delivered again meanwhile waits for that
+/// validation rather than repeating it.
+#[derive(Default)]
+struct Validating {
+    blocks: Mutex<HashSet<Hash>>,
+    done: std::sync::Condvar,
+}
+struct ValidatingClaim<'a> {
+    validating: &'a Validating,
+    hash: Hash,
+}
+impl Validating {
+    /// Wait while `hash` is being validated. A block waits only for its own
+    /// earlier copy or for its parent, so waits never form a cycle.
+    fn settle(&self, hash: &Hash) -> std::sync::MutexGuard<'_, HashSet<Hash>> {
+        let mut blocks = self.blocks.unpoisoned();
+        while blocks.contains(hash) {
+            blocks = self
+                .done
+                .wait(blocks)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        blocks
+    }
+    fn claim(&self, hash: Hash) -> ValidatingClaim<'_> {
+        self.settle(&hash).insert(hash);
+        ValidatingClaim {
+            validating: self,
+            hash,
+        }
+    }
+}
+impl Drop for ValidatingClaim<'_> {
+    fn drop(&mut self) {
+        self.validating.blocks.unpoisoned().remove(&self.hash);
+        self.validating.done.notify_all();
+    }
+}
+
+/// Template builds at once. A build for the tip waits only for another build
+/// of that same parent, whose result it then reuses, so a build that a new
+/// tip overtook never delays the new tip's.
+const MAX_TEMPLATE_BUILDS: usize = 2;
+/// Template builds in progress, by the parent each extends.
+#[derive(Default)]
+struct TemplateBuilds {
+    running: Mutex<Vec<Hash>>,
+    done: std::sync::Condvar,
+}
+struct BuildClaim<'a> {
+    builds: &'a TemplateBuilds,
+    parent: Hash,
+}
+impl TemplateBuilds {
+    /// Taken before the node lock, never while holding it.
+    fn claim(&self, parent: Hash) -> BuildClaim<'_> {
+        let mut running = self.running.unpoisoned();
+        while running.contains(&parent) || running.len() >= MAX_TEMPLATE_BUILDS {
+            running = self
+                .done
+                .wait(running)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        running.push(parent);
+        BuildClaim {
+            builds: self,
+            parent,
+        }
+    }
+}
+impl Drop for BuildClaim<'_> {
+    fn drop(&mut self) {
+        let mut running = self.builds.running.unpoisoned();
+        if let Some(position) = running.iter().position(|parent| *parent == self.parent) {
+            running.swap_remove(position);
+        }
+        drop(running);
+        self.builds.done.notify_all();
+    }
 }
 
 fn compact_size_len(n: usize) -> usize {
@@ -647,6 +1003,9 @@ thread_local! {
     /// how long it held that lock in all.
     static CLEARING_UNDER_INNER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static INNER_HELD: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+    /// Charge admission work on this thread this long, whatever it took.
+    static SELECTION_CHARGE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// The node lock. Test builds meter it: a std mutex is held by one thread and
@@ -714,6 +1073,11 @@ struct Inner {
     /// Header downloads by outbound peer, at most MAX_CONNECTIONS.
     header_syncs: BTreeMap<SocketAddr, HeaderSync>,
     relay_cursor: usize,
+    /// Spends waiting for a pending transfer to create their sender's account.
+    awaiting: Vec<Awaiting>,
+    /// The weakest entry of a count-full selection, and the selection
+    /// revision it was found at.
+    weakest: Option<(u64, Option<Weakest>)>,
 }
 impl Inner {
     fn pending(&self) -> impl Iterator<Item = &Transaction> {
@@ -1297,9 +1661,22 @@ fn proposal_page(
 #[derive(Clone)]
 pub struct Node {
     inner: Arc<Mutex<Inner>>,
-    /// Held for each template build, which runs outside `inner`, so at most
-    /// one runs at a time. Taken before `inner`, never while holding it.
-    template_build: Arc<Mutex<()>>,
+    /// Template builds, which run outside `inner`, by the parent each extends.
+    template_builds: Arc<TemplateBuilds>,
+    /// Advances with every new tip, so a build for an older tip stops.
+    tip_generation: Arc<AtomicU64>,
+    /// The node-wide selection budget and relayed newcomers queued for it.
+    admission: Arc<Mutex<Admission>>,
+    /// Held while newcomer admission runs, so one selection for newcomers
+    /// runs at a time. Taken before `inner`, never while holding it.
+    admission_run: Arc<Mutex<()>>,
+    /// Block submissions waiting for `inner`; admission lets them go first.
+    blocks_waiting: Arc<AtomicUsize>,
+    /// Blocks being validated, so a block delivered twice executes once.
+    validating: Arc<Validating>,
+    /// Held while a block that would not become the tip executes.
+    side_running: Arc<Mutex<()>>,
+    side_validation: Arc<Mutex<SideValidation>>,
     explorer: Arc<ExplorerWorker>,
     explorer_path: Arc<PathBuf>,
     session_token_path: Arc<PathBuf>,
@@ -1315,6 +1692,9 @@ pub struct Node {
     rpc_mutations: Arc<Semaphore>,
     peer_workers: Arc<Semaphore>,
     stratum_workers: Arc<Semaphore>,
+    /// Solved Stratum blocks validate on their own permits, never behind
+    /// mining workers or template builds.
+    block_submissions: Arc<Semaphore>,
     guard: Arc<NetworkGuard>,
     published: Arc<RwLock<Arc<ReadView>>>,
     peer_events: Arc<Mutex<VecDeque<Value>>>,
@@ -1407,6 +1787,8 @@ impl Node {
             downloads: VecDeque::new(),
             header_syncs: BTreeMap::new(),
             relay_cursor: 0,
+            awaiting: Vec::new(),
+            weakest: None,
         };
         // A derived index failure never makes chain validation unavailable.
         let explorer = Explorer::open(path, &inner.chain).unwrap_or_else(|error| {
@@ -1446,7 +1828,23 @@ impl Node {
         explorer.notify();
         Ok(Self {
             inner,
-            template_build: Arc::new(Mutex::new(())),
+            template_builds: Arc::default(),
+            tip_generation: Arc::new(AtomicU64::new(0)),
+            admission: Arc::new(Mutex::new(Admission {
+                budget: TimeBudget::new(SELECTION_TIME_PER_SECOND, SELECTION_TIME_BURST),
+                queue: AdmissionQueue::default(),
+            })),
+            admission_run: Arc::new(Mutex::new(())),
+            blocks_waiting: Arc::new(AtomicUsize::new(0)),
+            validating: Arc::default(),
+            side_running: Arc::new(Mutex::new(())),
+            side_validation: Arc::new(Mutex::new(SideValidation {
+                budget: TimeBudget::new(
+                    SIDE_VALIDATION_TIME_PER_SECOND,
+                    SIDE_VALIDATION_TIME_BURST,
+                ),
+                sources: BTreeMap::new(),
+            })),
             explorer,
             explorer_path: Arc::new(crate::local_files::sidecar(path, "explorer.sqlite")),
             session_token_path: Arc::new(session_token_path(path)),
@@ -1462,6 +1860,7 @@ impl Node {
             rpc_mutations: Arc::new(Semaphore::new(2)),
             peer_workers: Arc::new(Semaphore::new(2)),
             stratum_workers: Arc::new(Semaphore::new(2)),
+            block_submissions: Arc::new(Semaphore::new(2)),
             guard,
             published,
             peer_events: Arc::new(Mutex::new(VecDeque::new())),
@@ -1720,6 +2119,15 @@ impl Node {
     /// unused nonce. Selection never includes a sender without an account at
     /// the block opening, so recovered entries need a funded sender as well.
     fn admissible(chain: &Chain, tx: &Transaction) -> Result<()> {
+        ensure!(
+            Self::admissible_or_unfunded(chain, tx)?,
+            "sender account does not exist"
+        );
+        Ok(())
+    }
+    /// [Node::admissible], except that a sender without an account yields
+    /// false instead of a refusal: a pending transfer may still create it.
+    fn admissible_or_unfunded(chain: &Chain, tx: &Transaction) -> Result<bool> {
         let state = chain.tip_state();
         ensure!(
             codec::encode(tx).len() <= chain.config.transaction_bytes(&state.settings),
@@ -1730,35 +2138,87 @@ impl Node {
             "invalid lifetime or nonce"
         );
         chain.validate_transaction_anchor(tx)?;
-        let account = state
-            .account(&tx.body.sender, None)
-            .context("sender account does not exist")?;
+        let Some(account) = state.account(&tx.body.sender, None) else {
+            return Ok(false);
+        };
         ensure!(tx.body.nonce >= account.nonce, "nonce already used");
-        Ok(())
+        Ok(true)
     }
     fn pool_ids(i: &Inner) -> HashSet<Hash> {
         i.pending().map(codec::transaction_id).collect()
     }
+    /// The weakest entry of the installed selection while it holds as many
+    /// entries as a selection may: a newcomer can then enter only by
+    /// displacing one, so a newcomer that does not outrank this entry is
+    /// refused without a selection. Kept for one selection revision.
+    fn pool_floor(i: &mut Inner) -> Option<Weakest> {
+        let config = &i.chain.config;
+        let limit = mempool_limit(config).min(config.max_signatures);
+        if i.mempool.len() < limit || i.pool_tip != i.chain.tip_hash() {
+            return None;
+        }
+        if let Some((revision, weakest)) = &i.weakest
+            && *revision == i.selection_revision
+        {
+            return weakest.clone();
+        }
+        let state = i.chain.tip_state();
+        let mut weakest: Option<Weakest> = None;
+        for tx in &i.mempool {
+            let Some(entry) = Weakest::of(config, state, tx) else {
+                // An entry its own quote no longer prices sets no floor.
+                weakest = None;
+                break;
+            };
+            if weakest.as_ref().is_none_or(|w| entry.outranked_by(w)) {
+                weakest = Some(entry);
+            }
+        }
+        i.weakest = Some((i.selection_revision, weakest.clone()));
+        weakest
+    }
     /// Admissible newcomers sorted by what a selection could do with them,
-    /// without running one: an entry the next block's opening refuses for its
-    /// fee or funds, or one after a missing earlier nonce of its sender, is
-    /// never selected on this tip. A candidate that rebids or extends its own
-    /// sender's backlog chain cannot be selected before that chain, so it may
-    /// wait in the backlog within the same bounds.
+    /// without running one: a replacement that does not raise its pending
+    /// predecessor's fee rate enough, an entry the next block's opening
+    /// refuses for its fee or funds, one after a missing earlier nonce of its
+    /// sender, and, while the selection is count-full, one that does not
+    /// outrank its weakest entry, are never selected on this tip and pool. A
+    /// candidate that rebids or extends its own sender's backlog chain cannot
+    /// be selected before that chain, so it may wait in the backlog within
+    /// the same bounds.
     fn screen_newcomers<'a>(
         &self,
         i: &Inner,
         newcomers: Vec<(Hash, &'a Transaction)>,
+        floor: Option<&Weakest>,
     ) -> Result<Newcomers<'a>> {
-        let transactions: Vec<&Transaction> = newcomers.iter().map(|(_, tx)| *tx).collect();
-        let opening = i.chain.opening_screen(self.miner, &transactions)?;
+        let state = i.chain.tip_state();
         let mut screened = Newcomers::default();
         let mut nonces = BTreeMap::<PublicKey, BTreeSet<u64>>::new();
+        let mut pending = BTreeMap::new();
         for tx in i.pending() {
             nonces.entry(tx.body.sender).or_default().insert(tx.body.nonce);
+            pending.insert((tx.body.sender, tx.body.nonce), tx);
         }
+        let mut replacing = Vec::new();
+        for (id, tx) in newcomers {
+            match pending.get(&(tx.body.sender, tx.body.nonce)) {
+                Some(old) if !replaces(&i.chain.config, state, tx, old) => screened.outbid.push((
+                    id,
+                    anyhow!(
+                        "a pending transaction at this nonce is replaced only by one raising its fee rate by at least an eighth and by the minimum fee rate"
+                    ),
+                )),
+                _ => replacing.push((id, tx)),
+            }
+        }
+        if replacing.is_empty() {
+            return Ok(screened);
+        }
+        let transactions: Vec<&Transaction> = replacing.iter().map(|(_, tx)| *tx).collect();
+        let opening = i.chain.opening_screen(self.miner, &transactions)?;
         let mut payable = Vec::new();
-        for ((id, tx), opening) in newcomers.into_iter().zip(opening) {
+        for ((id, tx), opening) in replacing.into_iter().zip(opening) {
             match opening {
                 Ok(()) => {
                     nonces.entry(tx.body.sender).or_default().insert(tx.body.nonce);
@@ -1768,8 +2228,8 @@ impl Node {
             }
         }
         // The first nonce from the account nonce up that nothing pending holds.
-        let state = i.chain.tip_state();
         let mut reachable = BTreeMap::new();
+        let mut candidates = Vec::new();
         for (id, tx) in payable {
             let sender = tx.body.sender;
             let next = *reachable.entry(sender).or_insert_with(|| {
@@ -1782,7 +2242,7 @@ impl Node {
             if tx.body.nonce > next {
                 screened.gapped.push(id);
             } else {
-                screened.candidates.push((id, tx));
+                candidates.push((id, tx));
             }
         }
         let mut backlog = BTreeMap::<PublicKey, (u64, u64)>::new();
@@ -1793,7 +2253,7 @@ impl Node {
             *low = (*low).min(tx.body.nonce);
             *high = (*high).max(tx.body.nonce);
         }
-        let mut chained: Vec<_> = screened.candidates.iter().collect();
+        let mut chained: Vec<_> = candidates.iter().collect();
         chained.sort_by_key(|(_, tx)| (tx.body.sender, tx.body.nonce));
         for (id, tx) in chained {
             if let Some((low, high)) = backlog.get_mut(&tx.body.sender)
@@ -1803,7 +2263,333 @@ impl Node {
                 screened.waiting.insert(*id);
             }
         }
+        for (id, tx) in candidates {
+            let outranks = || {
+                Weakest::of(&i.chain.config, state, tx)
+                    .is_some_and(|entry| floor.is_some_and(|floor| floor.outranked_by(&entry)))
+            };
+            if floor.is_some() && !screened.waiting.contains(&id) && !outranks() {
+                screened.outbid.push((
+                    id,
+                    anyhow!(
+                        "the pool is full and this transaction does not outbid its weakest entry"
+                    ),
+                ));
+            } else {
+                screened.candidates.push((id, tx));
+            }
+        }
         Ok(screened)
+    }
+    /// Admit authenticated or locally signed newcomers against the current
+    /// tip, with at most one selection for all of them, and say where each
+    /// went. Every refusal is remembered for as long as it holds, so a
+    /// resent identity, relayed or submitted, never reaches a selection.
+    fn admit_locked(
+        &self,
+        i: &mut Inner,
+        newcomers: Vec<Newcomer>,
+    ) -> Result<Vec<Result<Admitted>>> {
+        let tip = i.chain.tip_hash();
+        let mut retained = Self::pool_ids(i);
+        let mut outcomes: Vec<Option<Result<Admitted>>> = newcomers.iter().map(|_| None).collect();
+        let mut index = HashMap::new();
+        let mut checked = Vec::new();
+        for (position, newcomer) in newcomers.iter().enumerate() {
+            let id = newcomer.id;
+            if retained.contains(&id) {
+                outcomes[position] = Some(Ok(Admitted::Pending));
+                continue;
+            }
+            if i.awaiting.iter().any(|entry| entry.id == id) {
+                outcomes[position] = Some(Ok(Admitted::Awaiting));
+                continue;
+            }
+            if let Some(reason) = self.rejected_locked().refusal(&id, &tip, i.pool_revision) {
+                outcomes[position] = Some(Err(anyhow!("{reason}")));
+                continue;
+            }
+            if index.insert(id, position).is_some() {
+                outcomes[position] = Some(Err(anyhow!("transaction repeated in one admission")));
+                continue;
+            }
+            // There is no separate count gate: selection ranks a newcomer
+            // against the whole pool by fee, so a better bid displaces the
+            // weakest entry.
+            let settings = &i.chain.tip_state().settings;
+            let message = if codec::encode(&newcomer.transaction).len()
+                > i.chain.config.transaction_bytes(settings)
+            {
+                "transaction too large".to_owned()
+            } else {
+                let refusal = match Self::admissible_or_unfunded(&i.chain, &newcomer.transaction) {
+                    Ok(true) => {
+                        checked.push((id, &newcomer.transaction));
+                        continue;
+                    }
+                    Ok(false) => match self.hold_unfunded(i, newcomer) {
+                        Ok(()) => {
+                            outcomes[position] = Some(Ok(Admitted::Awaiting));
+                            continue;
+                        }
+                        Err(error) => error,
+                    },
+                    Err(error) => error,
+                };
+                format!("transaction not valid in next block: {refusal}")
+            };
+            self.rejected_locked().refuse(id, Refusal::Tip(tip), &message);
+            outcomes[position] = Some(Err(anyhow!(message)));
+        }
+        if !checked.is_empty() {
+            let floor = Self::pool_floor(i);
+            let screened = self.screen_newcomers(i, checked, floor.as_ref())?;
+            {
+                let mut rejected = self.rejected_locked();
+                for (id, error) in &screened.unpayable {
+                    let message = format!("transaction not valid in next block: {error:#}");
+                    rejected.refuse(*id, Refusal::Tip(tip), &message);
+                    outcomes[index[id]] = Some(Err(anyhow!(message)));
+                }
+                for (id, error) in &screened.outbid {
+                    let message = format!("{error:#}");
+                    rejected.refuse(*id, Refusal::Pool(tip, i.pool_revision), &message);
+                    outcomes[index[id]] = Some(Err(anyhow!(message)));
+                }
+            }
+            // One after a missing earlier nonce is skipped but not
+            // remembered: its predecessor may still arrive on this tip.
+            for id in &screened.gapped {
+                outcomes[index[id]] = Some(Err(anyhow!(
+                    "transaction not valid in next block: an earlier nonce from this sender is not pending"
+                )));
+            }
+            // Reselect only for a new candidate that a selection could include.
+            if !screened.candidates.is_empty() {
+                let mut authenticated = retained.clone();
+                let mut candidates: Vec<Transaction> = i.pending().cloned().collect();
+                for (id, tx) in &screened.candidates {
+                    if newcomers[index[id]].authenticated {
+                        authenticated.insert(*id);
+                    }
+                    candidates.push((*tx).clone());
+                }
+                retained.extend(&screened.waiting);
+                let pool = Self::select_pool(
+                    &i.chain,
+                    self.miner,
+                    &candidates,
+                    &retained,
+                    &authenticated,
+                )?;
+                let accepted: HashSet<_> =
+                    pool.0.iter().chain(&pool.1).map(codec::transaction_id).collect();
+                self.install_pool(i, pool)?;
+                // A newcomer that lost this selection is reconsidered once the
+                // tip or the pool changes, for example after a competing chain
+                // is replaced.
+                let refusal = Refusal::Pool(tip, i.pool_revision);
+                let mut rejected = self.rejected_locked();
+                for (id, _) in &screened.candidates {
+                    if accepted.contains(id) {
+                        outcomes[index[id]] = Some(Ok(Admitted::Pending));
+                        continue;
+                    }
+                    let message = if screened.waiting.contains(id) {
+                        "block capacity exhausted: an earlier transaction from this sender is still waiting for capacity, and this one does not outbid the waiting backlog"
+                    } else {
+                        "transaction not valid in next block or block capacity exhausted"
+                    };
+                    rejected.refuse(*id, refusal, message);
+                    outcomes[index[id]] = Some(Err(anyhow!(message)));
+                }
+            }
+        }
+        Ok(outcomes
+            .into_iter()
+            .map(|outcome| outcome.unwrap_or_else(|| Err(anyhow!("transaction not admitted"))))
+            .collect())
+    }
+    /// Hold a newcomer whose sender has no account, if a pending transfer
+    /// creates that account, within the holding bounds. Its signature was
+    /// checked before it got here, or its detached block checked it.
+    fn hold_unfunded(&self, i: &mut Inner, newcomer: &Newcomer) -> Result<()> {
+        let body = &newcomer.transaction.body;
+        ensure!(
+            i.pending().any(|tx| creates_account(tx, &body.sender)),
+            "sender account does not exist"
+        );
+        ensure!(
+            body.nonce < AWAITING_PER_SENDER as u64,
+            "sender account does not exist, and its pending funding leaves this nonce too far ahead"
+        );
+        let held = |matches: &dyn Fn(&Awaiting) -> bool| {
+            i.awaiting.iter().filter(|entry| matches(entry)).count()
+        };
+        ensure!(
+            held(&|entry| entry.transaction.body.sender == body.sender
+                && entry.transaction.body.nonce == body.nonce)
+                == 0,
+            "sender account does not exist, and another transaction at this nonce waits for its funding"
+        );
+        let bytes = codec::encode(&newcomer.transaction).len();
+        let total: usize = i
+            .awaiting
+            .iter()
+            .map(|entry| codec::encode(&entry.transaction).len())
+            .sum();
+        let limit = usize::try_from(i.chain.tip_state().settings.block_bytes).unwrap_or(usize::MAX);
+        ensure!(
+            i.awaiting.len() < MAX_AWAITING
+                && total.saturating_add(bytes) <= limit
+                && held(&|entry| entry.transaction.body.sender == body.sender) < AWAITING_PER_SENDER
+                && held(&|entry| entry.source == newcomer.source) < AWAITING_PER_SOURCE,
+            "sender account does not exist, and no more spends can wait for their funding"
+        );
+        i.awaiting.push(Awaiting {
+            id: newcomer.id,
+            transaction: newcomer.transaction.clone(),
+            source: newcomer.source,
+            tips: 0,
+        });
+        Ok(())
+    }
+    /// After a new tip: held spends whose sender now has an account go back
+    /// through admission; the rest wait while a pending transfer still
+    /// creates the account, their anchors allow them, and for at most
+    /// AWAITING_TIPS tips.
+    fn reconsider_awaiting(i: &mut Inner) -> Vec<Newcomer> {
+        let funding: HashSet<PublicKey> = i
+            .pending()
+            .filter_map(|tx| match &tx.body.operation {
+                Operation::TransferExact { recipient, .. } => Some(*recipient),
+                _ => None,
+            })
+            .collect();
+        let mut ready = Vec::new();
+        for mut entry in std::mem::take(&mut i.awaiting) {
+            let sender = entry.transaction.body.sender;
+            if i.chain.tip_state().account(&sender, None).is_some() {
+                ready.push(Newcomer {
+                    id: entry.id,
+                    transaction: entry.transaction,
+                    source: entry.source,
+                    authenticated: true,
+                });
+                continue;
+            }
+            entry.tips += 1;
+            if entry.tips <= AWAITING_TIPS
+                && funding.contains(&sender)
+                && i.chain.validate_transaction_anchor(&entry.transaction).is_ok()
+            {
+                i.awaiting.push(entry);
+            }
+        }
+        ready
+    }
+    /// The node lock for block work, announced so that admission yields to it.
+    fn locked_for_block(&self) -> Result<InnerGuard<'_>> {
+        self.blocks_waiting.fetch_add(1, Ordering::AcqRel);
+        let guard = self.locked();
+        self.blocks_waiting.fetch_sub(1, Ordering::AcqRel);
+        guard
+    }
+    /// A direct submission lets block submissions waiting for the node lock
+    /// go first, for up to a second.
+    fn yield_to_blocks(&self) {
+        let until = Instant::now() + Duration::from_secs(1);
+        while self.blocks_waiting.load(Ordering::Acquire) > 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    /// Charge admission work to the node-wide selection budget.
+    fn charge_selection(&self, spent: Duration) {
+        #[cfg(test)]
+        let spent = SELECTION_CHARGE.with(|charge| charge.get()).unwrap_or(spent);
+        self.admission
+            .unpoisoned()
+            .budget
+            .spend(spent, Instant::now());
+    }
+    /// How long until the node-wide selection budget has credit, if it has none.
+    fn selection_wait(&self) -> Option<Duration> {
+        let wait = self.admission.unpoisoned().budget.wait(Instant::now());
+        (!wait.is_zero()).then_some(wait)
+    }
+    /// Admit one newcomer at once, as a direct submission does: after any
+    /// newcomer admission in progress and after waiting block submissions.
+    /// Its lock time is charged to the node-wide selection budget.
+    fn admit_now(
+        &self,
+        prepare: impl FnOnce(&mut Inner) -> Result<Newcomer>,
+    ) -> Result<(Hash, Admitted)> {
+        let outcome = {
+            let _run = self.admission_run.unpoisoned();
+            self.yield_to_blocks();
+            let mut i = self.locked()?;
+            let started = Instant::now();
+            let outcome = prepare(&mut i).and_then(|newcomer| {
+                let id = newcomer.id;
+                let outcome = self.admit_locked(&mut i, vec![newcomer])?.pop();
+                Ok((id, outcome.context("admission outcome missing")??))
+            });
+            drop(i);
+            self.charge_selection(started.elapsed());
+            outcome
+        };
+        if let Err(error) = self.drain_admissions() {
+            eprintln!("Queued transaction admission deferred: {error:#}");
+        }
+        outcome
+    }
+    /// Queue relayed newcomers for admission (see [AdmissionQueue]).
+    fn queue_admissions(&self, newcomers: impl IntoIterator<Item = Newcomer>) {
+        let mut admission = self.admission.unpoisoned();
+        for newcomer in newcomers {
+            admission.queue.push(newcomer);
+        }
+    }
+    /// Admit every queued newcomer with one selection, while the node-wide
+    /// selection budget has credit and no block submission waits for the
+    /// node lock. Admission already running in another thread takes what is
+    /// queued meanwhile, so this returns at once; anything left waits for
+    /// the next drain, which every relay, submission and new tip starts.
+    fn drain_admissions(&self) -> Result<()> {
+        let ready = |admission: &mut Admission| {
+            !admission.queue.is_empty()
+                && self.blocks_waiting.load(Ordering::Acquire) == 0
+                && admission.budget.wait(Instant::now()).is_zero()
+        };
+        loop {
+            {
+                let _run = match self.admission_run.try_lock() {
+                    Ok(run) => run,
+                    Err(std::sync::TryLockError::Poisoned(run)) => run.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+                };
+                loop {
+                    let batch = {
+                        let mut admission = self.admission.unpoisoned();
+                        if !ready(&mut admission) {
+                            break;
+                        }
+                        admission.queue.take()
+                    };
+                    let mut i = self.locked()?;
+                    let started = Instant::now();
+                    let outcome = self.admit_locked(&mut i, batch);
+                    drop(i);
+                    self.charge_selection(started.elapsed());
+                    outcome?;
+                }
+            }
+            // A newcomer queued just before the admission lock was released
+            // found it busy; take it now.
+            if !ready(&mut self.admission.unpoisoned()) {
+                return Ok(());
+            }
+        }
     }
     /// One next-block selection plus its capacity-displaced backlog. Only
     /// `retained` identities, entries already pooled or recovered from detached
@@ -2037,10 +2823,13 @@ impl Node {
     }
     /// The configured miner's template for the current tip, committing to the
     /// installed selection. Finishing a block clears its batch trades, so the
-    /// build runs outside the node lock, one at a time; the lock is held only
-    /// to capture the selection and to store the result. The instant
-    /// returned with a template that lags the selection or the tip is when
-    /// to ask again; only Throttled templates lag the selection.
+    /// build runs outside the node lock; the lock is held only to capture the
+    /// selection and to store the result. A request waits only for a build of
+    /// the same parent, whose result it then reuses (see [TemplateBuilds]),
+    /// and a new tip abandons a build for the old one at its next step, so
+    /// new-tip work never waits for an outdated build. The instant returned
+    /// with a template that lags the selection or the tip is when to ask
+    /// again; only Throttled templates lag the selection.
     fn template_shared(&self, freshness: Freshness) -> Result<(Arc<Block>, Option<Instant>)> {
         let served = |i: &Inner| -> Option<(Arc<Block>, Option<Instant>)> {
             let entry = i.template.as_ref()?;
@@ -2055,14 +2844,18 @@ impl Node {
             (freshness == Freshness::Throttled && Instant::now() < retry)
                 .then(|| (entry.block.clone(), Some(retry)))
         };
-        if let Some(served) = served(&*self.locked()?) {
-            return Ok(served);
-        }
-        let _build = self.template_build.unpoisoned();
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let (job, selection) = {
+            let parent = {
+                let i = self.locked()?;
+                if let Some(served) = served(&i) {
+                    return Ok(served);
+                }
+                i.chain.tip_hash()
+            };
+            let _build = self.template_builds.claim(parent);
+            let (job, selection, generation) = {
                 let mut i = self.locked()?;
                 // Another build may have finished while this one waited.
                 if let Some(served) = served(&i) {
@@ -2074,22 +2867,33 @@ impl Node {
                     i.mempool.clone(),
                     Self::timestamp(&i.chain),
                 )?;
-                (job, i.selection_revision)
+                (
+                    job,
+                    i.selection_revision,
+                    self.tip_generation.load(Ordering::Acquire),
+                )
             };
+            // A new tip needs proof of work, so a repeat is rare. While the
+            // tip keeps moving, as during catch-up, a request stops after
+            // TEMPLATE_BUILD_ATTEMPTS builds rather than holding a build
+            // slot, and a Stratum worker, until it rests. Earlier attempts
+            // stop at the next step once a new tip arrives and start again
+            // on it; the last runs to its end and is served unstored, for its
+            // own parent, as if the tip had moved just after it was served,
+            // and Stratum connections ask again when the new tip is published.
+            let last = attempt >= TEMPLATE_BUILD_ATTEMPTS;
+            let stale = || !last && self.tip_generation.load(Ordering::Acquire) != generation;
             let started = Instant::now();
-            let built = job.build()?;
+            let built = match job.build_unless(&stale) {
+                Ok(built) => built,
+                Err(error) if error.is::<crate::chain::TemplateStale>() => continue,
+                Err(error) => return Err(error),
+            };
             let finished = Instant::now();
             let block = Arc::new(built.block);
             let mut i = self.locked()?;
             if i.chain.tip_hash() != job.previous() {
-                // A new tip needs proof of work, so a repeat is rare. While
-                // the tip keeps moving, as during catch-up, a request stops
-                // after TEMPLATE_BUILD_ATTEMPTS builds rather than holding
-                // the build slot, and a Stratum worker, until it rests. The
-                // last build is served unstored, for its own parent, as if
-                // the tip had moved just after it was served; Stratum
-                // connections ask again when the new tip is published.
-                if attempt < TEMPLATE_BUILD_ATTEMPTS {
+                if !last {
                     continue;
                 }
                 return Ok((block, Some(Instant::now())));
@@ -2106,63 +2910,33 @@ impl Node {
         }
     }
     pub fn submit_transaction(&self, tx: Transaction) -> Result<Hash> {
-        // Authenticate before waiting for chain state.
-        Self::screen_signed(&self.read_view()?.chain.chain_id(), &tx)
-            .map_err(|error| anyhow!("transaction not valid in next block: {error:#}"))?;
-        let mut i = self.locked()?;
-        self.submit_locked(&mut i, tx, true)
-    }
-    /// `screened` newcomers were already authenticated by `screen_signed`.
-    fn submit_locked(&self, i: &mut Inner, tx: Transaction, screened: bool) -> Result<Hash> {
+        let view = self.read_view()?;
         let id = codec::transaction_id(&tx);
-        if i.pending().any(|t| codec::transaction_id(t) == id) {
-            return Ok(id);
+        // A refused identity is answered from the refusal cache, without the
+        // node lock or a selection, as a relayed copy is.
+        if let Some(reason) = self
+            .rejected_locked()
+            .refusal(&id, &view.chain.tip_hash(), view.pool_revision)
+        {
+            bail!("{reason}");
         }
-        // There is no separate count gate: selection ranks a newcomer against
-        // the whole pool by fee, so a better bid displaces the weakest entry.
-        ensure!(
-            codec::encode(&tx).len()
-                <= i.chain
-                    .config
-                    .transaction_bytes(&i.chain.tip_state().settings),
-            "transaction too large"
-        );
-        Self::admissible(&i.chain, &tx)
-            .map_err(|error| anyhow!("transaction not valid in next block: {error}"))?;
-        let (gapped, waits) = {
-            let mut newcomer = self.screen_newcomers(i, vec![(id, &tx)])?;
-            if let Some((_, error)) = newcomer.unpayable.pop() {
-                bail!("transaction not valid in next block: {error:#}");
-            }
-            (!newcomer.gapped.is_empty(), newcomer.waiting.contains(&id))
-        };
-        ensure!(
-            !gapped,
-            "transaction not valid in next block: an earlier nonce from this sender is not pending"
-        );
-        let mut retained = Self::pool_ids(i);
-        let mut authenticated = retained.clone();
-        if screened {
-            authenticated.insert(id);
+        // Authenticate before waiting for chain state.
+        if let Err(error) = Self::screen_signed(&view.chain.chain_id(), &tx) {
+            let message = format!("transaction not valid in next block: {error:#}");
+            self.rejected_locked()
+                .refuse(id, Refusal::Permanent, &message);
+            bail!(message);
         }
-        if waits {
-            retained.insert(id);
-        }
-        let mut candidates: Vec<Transaction> = i.pending().cloned().collect();
-        candidates.push(tx);
-        let pool = Self::select_pool(&i.chain, self.miner, &candidates, &retained, &authenticated)?;
-        let accepted = pool.0.iter().chain(&pool.1).any(|t| codec::transaction_id(t) == id);
-        if !accepted && waits {
-            bail!(
-                "block capacity exhausted: an earlier transaction from this sender is still waiting for capacity, and this one does not outbid the waiting backlog"
-            );
-        }
-        ensure!(
-            accepted,
-            "transaction not valid in next block or block capacity exhausted"
-        );
-        self.install_pool(i, pool)?;
-        Ok(id)
+        drop(view);
+        self.admit_now(|_| {
+            Ok(Newcomer {
+                id,
+                transaction: tx,
+                source: None,
+                authenticated: true,
+            })
+        })
+        .map(|(id, _)| id)
     }
     fn wallet_submit(&self, request: HotWalletRequest) -> Result<Hash> {
         let sender = parse_account(
@@ -2177,22 +2951,29 @@ impl Node {
                 .wallets_locked()?
                 .selected_secret(&sender, request.wallet_revision)?,
         );
-        let mut i = self.locked()?;
-        let body = self.prepare_locked(
-            &mut i,
-            sender,
-            WalletRequest {
-                operation: request.operation,
-                fee: request.fee,
-                extra_fee: request.extra_fee,
-                data_hex: request.data_hex,
-                expiry_blocks: request.expiry_blocks,
-                anchor: request.anchor,
-                nonce: request.nonce,
-            },
-        )?;
-        let chain_id = i.chain.tip_state().chain_id;
-        self.submit_locked(&mut i, crypto::sign(&chain_id, &body, &secret)?, false)
+        self.admit_now(|i| {
+            let body = self.prepare_locked(
+                i,
+                sender,
+                WalletRequest {
+                    operation: request.operation,
+                    fee: request.fee,
+                    extra_fee: request.extra_fee,
+                    data_hex: request.data_hex,
+                    expiry_blocks: request.expiry_blocks,
+                    anchor: request.anchor,
+                    nonce: request.nonce,
+                },
+            )?;
+            let transaction = crypto::sign(&i.chain.tip_state().chain_id, &body, &secret)?;
+            Ok(Newcomer {
+                id: codec::transaction_id(&transaction),
+                transaction,
+                source: None,
+                authenticated: false,
+            })
+        })
+        .map(|(id, _)| id)
     }
     fn prepare_locked(
         &self,
@@ -2265,44 +3046,169 @@ impl Node {
     /// Returns whether the block became the tip. A committed block is reported
     /// as accepted even when the following pool recovery fails.
     pub fn submit_block(&self, block: Block) -> Result<bool> {
-        let mut i = self.locked()?;
+        self.submit_block_from(block, None)
+    }
+    /// [Node::submit_block] for a block that `source` relayed, or that was
+    /// submitted locally. The node lock is held only to check the block
+    /// against the chain, in bounded replay steps between which it is
+    /// released, and to store it: execution, which may clear batch trades
+    /// for seconds, runs without it, so admission, templates and reads go
+    /// on meanwhile. A block that would not become the tip executes only
+    /// within the side-branch bounds (see [Node::side_permit]); otherwise
+    /// its header is held, as the side-branch admission policy holds it.
+    fn submit_block_from(&self, block: Block, source: Option<IpAddr>) -> Result<bool> {
+        // A parent another worker is still validating is stored first.
+        drop(self.validating.settle(&block.header.previous));
+        let _validating = self.validating.claim(codec::block_hash(&block));
+        let mut holds = 0;
+        let (validation, height) = loop {
+            let mut i = self.locked_for_block()?;
+            match i
+                .chain
+                .begin_submission(&block, now(), Some(REPLAY_STEPS_PER_HOLD))
+            {
+                Ok(Some(validation)) => break (validation, i.chain.tip_height()),
+                Ok(None) => return Ok(false),
+                // The replay resumes from its retained progress.
+                Err(error)
+                    if error.is::<crate::chain::ValidationDeferred>()
+                        && holds + 1 < REPLAY_HOLDS =>
+                {
+                    holds += 1
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let side = !validation.extends_tip() && !validation.admitted();
+        let slot = if side {
+            match self.side_permit(source, height) {
+                Ok(slot) => Some(slot),
+                Err(reason) => {
+                    return Err(self
+                        .locked_for_block()?
+                        .chain
+                        .decline_checked(&block, reason));
+                }
+            }
+        } else {
+            None
+        };
+        let started = Instant::now();
+        let executed = validation.execute(&block);
+        if slot.is_some() {
+            self.charge_side(source, started.elapsed());
+        }
+        drop(slot);
+        let mut i = self.locked_for_block()?;
         let old_tip = i.chain.tip_hash();
-        let submitted = i.chain.submit_with_replay_budget(block, now(), 64);
+        let submitted = i
+            .chain
+            .finish_submission(validation, block, executed, now());
         // Validation can change the competitive capacity on any branch.
         if let Err(error) = self.note_capacity(&i.chain) {
             eprintln!("Peer capacity allowance unchanged: {error:#}");
         }
         let changed = submitted?;
-        if changed {
-            i.template = None;
-            i.selection_revision = i.selection_revision.wrapping_add(1);
-            let pending: Vec<Transaction> = i.pending().cloned().collect();
-            // Recovery may need disk access and cannot roll back a committed
-            // block. The new tip is published once, together with its recovered
-            // pool, so no reader sees it without the entries still pending.
-            match self.recover_pool(&mut i, old_tip, &pending) {
-                Ok(true) => {}
-                // An unchanged pool still has a new tip to publish.
-                Ok(false) => {
-                    if let Err(error) = self.publish(&i) {
-                        eprintln!("New tip publication deferred: {error:#}");
-                    }
+        if !changed {
+            return Ok(false);
+        }
+        // A template build for the old tip stops at its next step.
+        self.tip_generation.fetch_add(1, Ordering::AcqRel);
+        i.template = None;
+        i.selection_revision = i.selection_revision.wrapping_add(1);
+        let pending: Vec<Transaction> = i.pending().cloned().collect();
+        // Recovery may need disk access and cannot roll back a committed
+        // block. The new tip is published once, together with its recovered
+        // pool, so no reader sees it without the entries still pending.
+        match self.recover_pool(&mut i, old_tip, &pending) {
+            Ok(true) => {}
+            // An unchanged pool still has a new tip to publish.
+            Ok(false) => {
+                if let Err(error) = self.publish(&i) {
+                    eprintln!("New tip publication deferred: {error:#}");
                 }
-                Err(error) => {
-                    // Keep every earlier entry; the next selection revalidates them.
-                    eprintln!("Pending transaction recovery deferred: {error:#}");
-                    i.mempool = pending;
-                    i.backlog.clear();
-                    i.pool_tip = old_tip;
-                    i.pool_revision = i.pool_revision.wrapping_add(1);
-                    i.selection_revision = i.selection_revision.wrapping_add(1);
-                    if let Err(error) = self.publish(&i) {
-                        eprintln!("Pending transaction publication deferred: {error:#}");
-                    }
+            }
+            Err(error) => {
+                // Keep every earlier entry; the next selection revalidates them.
+                eprintln!("Pending transaction recovery deferred: {error:#}");
+                i.mempool = pending;
+                i.backlog.clear();
+                i.pool_tip = old_tip;
+                i.pool_revision = i.pool_revision.wrapping_add(1);
+                i.selection_revision = i.selection_revision.wrapping_add(1);
+                if let Err(error) = self.publish(&i) {
+                    eprintln!("Pending transaction publication deferred: {error:#}");
                 }
             }
         }
-        Ok(changed)
+        let funded = Self::reconsider_awaiting(&mut i);
+        drop(i);
+        // Spends whose funding just confirmed, and relayed newcomers that
+        // waited for the block, go through admission now.
+        self.queue_admissions(funded);
+        if let Err(error) = self.drain_admissions() {
+            eprintln!("Queued transaction admission deferred: {error:#}");
+        }
+        Ok(true)
+    }
+    /// Admit the execution of a block that would not become the tip: one at
+    /// a time node-wide, while node-wide side-validation time remains, and,
+    /// for a relayed block, within its source's own share of stored side
+    /// blocks and of that time. Execution time is charged after it ran
+    /// ([Node::charge_side]). Local submissions are trusted: they wait for
+    /// the slot. A refused block is not invalid; its header is held, so its
+    /// branch is still followed once it claims more work than the tip.
+    fn side_permit(
+        &self,
+        source: Option<IpAddr>,
+        height: u64,
+    ) -> std::result::Result<std::sync::MutexGuard<'_, ()>, &'static str> {
+        let Some(source) = source else {
+            return Ok(self.side_running.unpoisoned());
+        };
+        let slot = match self.side_running.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::Poisoned(slot)) => slot.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err("another side-branch block is being validated");
+            }
+        };
+        let mut side = self.side_validation.unpoisoned();
+        let now = Instant::now();
+        if !side.budget.wait(now).is_zero() {
+            return Err("side-branch validation time is spent");
+        }
+        if side.sources.len() >= MAX_SIDE_SOURCES && !side.sources.contains_key(&source) {
+            side.sources.retain(|_, share| {
+                share.refill(height);
+                share.blocks < SIDE_SOURCE_BLOCKS || !share.time.full(now)
+            });
+            if side.sources.len() >= MAX_SIDE_SOURCES {
+                return Err("too many sources hold side-branch shares");
+            }
+        }
+        let share = side
+            .sources
+            .entry(source)
+            .or_insert_with(|| SideSource::new(height));
+        share.refill(height);
+        if share.blocks == 0 {
+            return Err("this source's side-branch blocks are spent");
+        }
+        if !share.time.wait(now).is_zero() {
+            return Err("this source's side-branch validation time is spent");
+        }
+        share.blocks -= 1;
+        Ok(slot)
+    }
+    /// Charge a side block's execution time node-wide and to its source.
+    fn charge_side(&self, source: Option<IpAddr>, spent: Duration) {
+        let mut side = self.side_validation.unpoisoned();
+        let now = Instant::now();
+        side.budget.spend(spent, now);
+        if let Some(share) = source.and_then(|source| side.sources.get_mut(&source)) {
+            share.time.spend(spent, now);
+        }
     }
     /// Rebuild the pool for a new tip with one bounded selection, including
     /// transactions from an abandoned branch or same-height fork. Only header
@@ -2310,9 +3216,11 @@ impl Node {
     /// once, oldest first, so nonce predecessors precede their successors.
     /// Anchor, nonce and funded-sender checks drop stale entries before the
     /// selection, which checks no signatures: pending entries were authenticated
-    /// when pooled and detached ones when their blocks executed. Examination
-    /// stops after MAX_RECOVERY_EXAMINED blocks and transactions. Returns
-    /// whether the installed pool changed and was therefore published.
+    /// when pooled and detached ones when their blocks executed. An entry
+    /// whose sender only a recovered transfer creates waits for that transfer
+    /// to confirm (see [Awaiting]). Examination stops after
+    /// MAX_RECOVERY_EXAMINED blocks and transactions. Returns whether the
+    /// installed pool changed and was therefore published.
     fn recover_pool(&self, i: &mut Inner, old_tip: Hash, pending: &[Transaction]) -> Result<bool> {
         #[cfg(test)]
         ensure!(
@@ -2339,10 +3247,18 @@ impl Node {
         }
         let mut ids = HashSet::new();
         let mut candidates = Vec::new();
-        for tx in pending {
-            if ids.insert(codec::transaction_id(tx)) && Self::admissible(&i.chain, tx).is_ok() {
-                candidates.push(tx.clone());
+        let mut unfunded = Vec::new();
+        let mut consider = |chain: &Chain, tx: &Transaction, candidates: &mut Vec<Transaction>| {
+            if ids.insert(codec::transaction_id(tx)) {
+                match Self::admissible_or_unfunded(chain, tx) {
+                    Ok(true) => candidates.push(tx.clone()),
+                    Ok(false) => unfunded.push(tx.clone()),
+                    Err(_) => {}
+                }
             }
+        };
+        for tx in pending {
+            consider(&i.chain, tx, &mut candidates);
         }
         let mut examined = 0usize;
         'blocks: for hash in detached.iter().rev() {
@@ -2357,16 +3273,26 @@ impl Node {
                 {
                     break 'blocks;
                 }
-                if ids.insert(codec::transaction_id(tx)) && Self::admissible(&i.chain, tx).is_ok() {
-                    candidates.push(tx.clone());
-                }
+                consider(&i.chain, tx, &mut candidates);
             }
         }
         candidates.truncate(MAX_SELECTION_CANDIDATES);
         // Each candidate was pooled or included before, so each may wait.
         let retained = candidates.iter().map(codec::transaction_id).collect();
         let pool = Self::select_pool(&i.chain, self.miner, &candidates, &retained, &retained)?;
-        self.install_pool(i, pool)
+        let changed = self.install_pool(i, pool)?;
+        for transaction in unfunded {
+            let newcomer = Newcomer {
+                id: codec::transaction_id(&transaction),
+                transaction,
+                source: None,
+                authenticated: true,
+            };
+            // Beyond the holding bounds, or without a pending transfer that
+            // creates its sender, it can be submitted again once funded.
+            let _ = self.hold_unfunded(i, &newcomer);
+        }
+        Ok(changed)
     }
     /// Also used on runtime workers, so it compares with the published tip.
     /// Submitting a solved block still validates it against the chain itself.
@@ -2398,7 +3324,9 @@ impl Node {
         // candidate without changing the configured miner or its Stratum
         // cache, finished outside the node lock like every template.
         let candidate = {
-            let _build = self.template_build.unpoisoned();
+            let _build = self
+                .template_builds
+                .claim(self.read_view()?.chain.tip_hash());
             let job = {
                 let i = self.locked()?;
                 let candidates: Vec<Transaction> = i.pending().cloned().collect();
@@ -2798,7 +3726,7 @@ impl Node {
         for (index, b) in msg.blocks.iter().enumerate() {
             let hash = codec::block_hash(b);
             let known = {
-                let i = self.locked()?;
+                let i = self.locked_for_block()?;
                 match i.chain.block_height(&hash)? {
                     // A stored active block is never download progress by
                     // itself; only a linked all-active reply is (below).
@@ -2821,7 +3749,7 @@ impl Node {
                     "block target exceeds the network limit"
                 );
                 math::check_pow(&b.header, &target)?;
-                match self.submit_block(b.clone()) {
+                match self.submit_block_from(b.clone(), Some(source)) {
                     Ok(_) => {}
                     // A declined side block's header is held for presync, so
                     // the rest of its branch is still downloaded after it. A
@@ -2829,7 +3757,8 @@ impl Node {
                     // reply's later blocks then have no known parent, which
                     // is not the sender's fault, so its blocks end here.
                     Err(error) if error.is::<crate::chain::SideBranchRefused>() => {
-                        if self.locked()?.chain.header_parent(&hash)? == HeaderParent::Unknown {
+                        let held = self.locked_for_block()?.chain.header_parent(&hash)?;
+                        if held == HeaderParent::Unknown {
                             break;
                         }
                     }
@@ -2841,7 +3770,7 @@ impl Node {
             // sender's preceding cursor for this branch makes normal downloads
             // consume one entry each rather than one per batch.
             // Retain accepted progress even if a later message entry is invalid.
-            let mut i = self.locked()?;
+            let mut i = self.locked_for_block()?;
             note_download(&mut i.downloads, hash, b.header.previous, source);
         }
         if let Some(hash) = shared {
@@ -2883,8 +3812,9 @@ impl Node {
         // Admit the batch together. Revalidating every growing prefix here made
         // one ordinary full-pool relay need tens of thousands of signature checks.
         // Outdated/duplicate entries remain expected during synchronization.
+        // Each message also drains newcomers that earlier ones queued.
         if msg.transactions.is_empty() {
-            return Ok(());
+            return self.drain_admissions();
         }
         // Authenticate unseen entries before taking the node lock. Rejected
         // identities are remembered, so replayed junk never reaches selection.
@@ -2903,69 +3833,26 @@ impl Node {
             }
         }
         let chain_id = view.chain.chain_id();
-        fresh.retain(|(id, tx)| {
-            let authentic = Self::screen_signed(&chain_id, tx).is_ok();
-            if !authentic {
-                self.rejected_locked().insert(*id, Refusal::Permanent);
+        fresh.retain(|(id, tx)| match Self::screen_signed(&chain_id, tx) {
+            Ok(()) => true,
+            Err(error) => {
+                self.rejected_locked().refuse(
+                    *id,
+                    Refusal::Permanent,
+                    &format!("transaction not valid in next block: {error:#}"),
+                );
+                false
             }
-            authentic
         });
-        if fresh.is_empty() {
-            return Ok(());
-        }
-        let mut i = self.locked()?;
-        let tip = i.chain.tip_hash();
-        let mut retained = Self::pool_ids(&i);
-        let mut newcomers = Vec::new();
-        for (id, tx) in fresh {
-            if retained.contains(&id)
-                || self.rejected_locked().contains(&id, &tip, i.pool_revision)
-            {
-                continue;
-            }
-            if Self::admissible(&i.chain, tx).is_err() {
-                self.rejected_locked().insert(id, Refusal::Tip(tip));
-                continue;
-            }
-            newcomers.push((id, tx));
-        }
-        if newcomers.is_empty() {
-            return Ok(());
-        }
-        let screened = self.screen_newcomers(&i, newcomers)?;
-        {
-            let mut rejected = self.rejected_locked();
-            for (id, _) in &screened.unpayable {
-                rejected.insert(*id, Refusal::Tip(tip));
-            }
-        }
-        // Reselect only for a new candidate that a selection could include.
-        // One after a missing earlier nonce is skipped but not remembered:
-        // its predecessor may still arrive on this tip.
-        if screened.candidates.is_empty() {
-            return Ok(());
-        }
-        let mut authenticated = retained.clone();
-        let mut candidates: Vec<Transaction> = i.pending().cloned().collect();
-        for (id, tx) in &screened.candidates {
-            authenticated.insert(*id);
-            candidates.push((*tx).clone());
-        }
-        retained.extend(&screened.waiting);
-        let pool = Self::select_pool(&i.chain, self.miner, &candidates, &retained, &authenticated)?;
-        let accepted: HashSet<_> =
-            pool.0.iter().chain(&pool.1).map(codec::transaction_id).collect();
-        self.install_pool(&mut i, pool)?;
-        // A newcomer that lost this selection is reconsidered once the tip or
-        // the pool changes, for example after a competing chain is replaced.
-        let refusal = Refusal::Pool(tip, i.pool_revision);
-        let mut rejected = self.rejected_locked();
-        for (id, _) in &screened.candidates {
-            if !accepted.contains(id) {
-                rejected.insert(*id, refusal);
-            }
-        }
-        Ok(())
+        // Newcomers wait for the node-wide selection budget and for block
+        // submissions in a queue, which one selection drains.
+        self.queue_admissions(fresh.into_iter().map(|(id, tx)| Newcomer {
+            id,
+            transaction: tx.clone(),
+            source: Some(source),
+            authenticated: true,
+        }));
+        self.drain_admissions()
     }
     #[cfg(test)]
     fn read_rpc(i: &ReadView, method: &str, params: Value) -> Result<Value> {
@@ -6026,6 +6913,38 @@ fn charge_public_reply(
     admission.outgoing(bytes, 0)
 }
 
+/// One JSON-RPC answer's bytes, built where the result was computed. A
+/// metered read, or a mined batch before its first block, refused by the
+/// client's budget did not run: its error carries the refusal status. A body
+/// beyond `limit` is replaced by a short error.
+fn rpc_reply(
+    id: &Value,
+    result: Result<Value>,
+    limit: usize,
+) -> Result<(Vec<u8>, Option<HttpRefusal>)> {
+    let rpc_error =
+        |message: &str| json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":message}});
+    let mut refusal = None;
+    let response = match result {
+        Ok(v) => json!({"jsonrpc":"2.0","id":id,"result":v}),
+        Err(e) => {
+            refusal = HttpRefusal::of(&e);
+            let message = refusal
+                .as_ref()
+                .map_or_else(|| e.to_string(), |r| r.message.clone());
+            rpc_error(&message)
+        }
+    };
+    let mut body = serde_json::to_vec(&response)?;
+    drop(response);
+    if body.len() > limit {
+        body = serde_json::to_vec(&rpc_error(
+            "RPC response exceeds the local response limit",
+        ))?;
+    }
+    Ok((body, refusal))
+}
+
 async fn http_session(
     node: Node,
     stream: TcpStream,
@@ -6397,12 +7316,30 @@ async fn http_session(
 
     let rpc_error =
         |message: &str| json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":message}});
+    let public = http.public;
+    // A public broadcast waits while the node-wide budget for admission
+    // selections is spent, rather than queueing for the node lock. Nothing
+    // ran, so it is answered 429 before its work is charged.
+    if public
+        && method == "broadcasttransaction"
+        && let Some(wait) = node.selection_wait()
+    {
+        let busy = network_guard::Limited {
+            reason: "transaction admission is busy",
+            retry_after: Some(wait),
+        };
+        return refuse_request(&mut write, busy.into(), rpc_error).await;
+    }
     if let Err(e) = admission.work(cost) {
         return refuse_request(&mut write, e, rpc_error).await;
     }
-    let public = http.public;
-    let (result, admission) = if value.get("jsonrpc") != Some(&Value::String("2.0".into())) {
-        (Err(anyhow!("jsonrpc must be 2.0")), admission)
+    // A valid record may need more than the fixed service frame once
+    // governance raises capacity; the frame then follows that capacity.
+    let limit = response_frame;
+    let (mut body, refusal, admission) = if value.get("jsonrpc") != Some(&Value::String("2.0".into()))
+    {
+        let (body, refusal) = rpc_reply(&id, Err(anyhow!("jsonrpc must be 2.0")), limit)?;
+        (body, refusal, admission)
     } else {
         let slots = if mutation {
             http.mutations.clone()
@@ -6414,6 +7351,9 @@ async fn http_session(
             return busy.send(&mut write, &rpc_error(&busy.message)).await;
         };
         let permit = permit?;
+        let id = id.clone();
+        // The reply is serialized, and its JSON tree freed, on this worker:
+        // a page may hold millions of values, too many for a runtime thread.
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let result = if public {
@@ -6421,42 +7361,19 @@ async fn http_session(
             } else {
                 node.rpc_with_admission(&method, params, Some(&admission))
             };
-            (result, admission)
+            rpc_reply(&id, result, limit).map(|(body, refusal)| (body, refusal, admission))
         })
         .await
-        .context("RPC worker failed")?
+        .context("RPC worker failed")??
     };
-    // A metered read, or a mined batch before its first block, refused by
-    // the client's budget did not run: its error carries the refusal status.
-    let mut refusal = None;
-    let response = match result {
-        Ok(v) => json!({"jsonrpc":"2.0","id":id.clone(),"result":v}),
-        Err(e) => {
-            refusal = HttpRefusal::of(&e);
-            let message = refusal
-                .as_ref()
-                .map_or_else(|| e.to_string(), |r| r.message.clone());
-            rpc_error(&message)
-        }
-    };
-    let mut body = serde_json::to_vec(&response)?;
-    drop(response);
-    // A valid record may need more than the fixed service frame once
-    // governance raises capacity; the frame then follows that capacity.
-    let limit = response_frame;
-    let refused = if body.len() > limit {
-        Some("RPC response exceeds the local response limit")
-    } else if public && charge_public_reply(&http.guard, &admission, body.len(), limit).is_err() {
+    if public && charge_public_reply(&http.guard, &admission, body.len(), limit).is_err() {
         // Never a cooldown: the node chose the reply's size. The request has
         // already run, so this is no admission refusal and keeps the status
         // its result had: 429 and 503 promise that nothing ran, and a
         // broadcast whose reply is replaced here may already be relayed.
-        Some("public response byte budget exhausted; try again")
-    } else {
-        None
-    };
-    if let Some(message) = refused {
-        body = serde_json::to_vec(&rpc_error(message))?;
+        body = serde_json::to_vec(&rpc_error(
+            "public response byte budget exhausted; try again",
+        ))?;
     }
     let (status, retry_after) = refusal.map_or((200, None), |r| (r.status, r.retry_after));
     write_http_response(
@@ -6609,6 +7526,36 @@ mod capacity_work_tests {
         );
         // Bounded, fixed-shape answer: no amplification of a tiny request.
         assert!(text.len() < 1024, "{}", text.len());
+    }
+
+    #[test]
+    fn rpc_replies_are_serialized_by_their_worker_within_the_response_limit() {
+        let id = json!(7);
+        let decode = |body: &[u8]| serde_json::from_slice::<Value>(body).unwrap();
+        let (body, refusal) = rpc_reply(&id, Ok(json!({"page":"x".repeat(100)})), 1024).unwrap();
+        assert_eq!(decode(&body)["result"]["page"].as_str().unwrap().len(), 100);
+        assert!(refusal.is_none());
+        // An oversized result becomes the short limit error, keeping its ID.
+        let (body, refusal) = rpc_reply(&id, Ok(json!("x".repeat(2048))), 1024).unwrap();
+        let reply = decode(&body);
+        assert_eq!(reply["id"], 7);
+        assert_eq!(
+            reply["error"]["message"],
+            "RPC response exceeds the local response limit"
+        );
+        assert!(refusal.is_none() && body.len() < 1024);
+        // A refused request keeps its refusal status for the async writer.
+        let limited = anyhow::Error::from(network_guard::Limited {
+            reason: "transaction admission is busy",
+            retry_after: Some(Duration::from_millis(1500)),
+        });
+        let (body, refusal) = rpc_reply(&id, Err(limited), 1024).unwrap();
+        let refusal = refusal.unwrap();
+        assert_eq!((refusal.status, refusal.retry_after), (429, Some(2)));
+        assert_eq!(
+            decode(&body)["error"]["message"],
+            "transaction admission is busy"
+        );
     }
 
     #[test]
@@ -8019,15 +8966,15 @@ async fn new_job<W: AsyncWrite + Unpin>(
     Ok(fingerprint)
 }
 /// A throttled template, and when to ask again if it lags the selection.
+/// Waiting for a template holds no mining worker: the node bounds its own
+/// builds (see [TemplateBuilds]), so jobs, shares and solved blocks never
+/// queue behind a build.
 async fn template_async(node: &Node) -> Result<(Arc<Block>, Option<tokio::time::Instant>)> {
-    let permit = timeout(IO_TIMEOUT, node.stratum_workers.clone().acquire_owned()).await??;
     let node = node.clone();
-    let (block, retry) = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        node.template_shared(Freshness::Throttled)
-    })
-    .await
-    .context("mining template worker failed")??;
+    let (block, retry) =
+        tokio::task::spawn_blocking(move || node.template_shared(Freshness::Throttled))
+            .await
+            .context("mining template worker failed")??;
     Ok((block, retry.map(tokio::time::Instant::from_std)))
 }
 fn stratum_session_expired(authorized: bool, connected: Duration) -> bool {
@@ -8285,8 +9232,10 @@ async fn stratum_session(
                                 // Budgets and worker queues may delay a solved block but
                                 // never discard it: validate first, enforce the budget after.
                                 budget = admission.work(1 + job.block.transactions.len()).err();
-                                // The worker semaphore is never closed; wait without a deadline.
-                                let permit = node.stratum_workers.clone().acquire_owned().await.ok();
+                                // Solved blocks have their own permits, never taken by
+                                // template builds or jobs. The semaphore is never closed;
+                                // wait without a deadline.
+                                let permit = node.block_submissions.clone().acquire_owned().await.ok();
                                 let validator = node.clone();
                                 tokio::task::spawn_blocking(move || -> Result<()> {
                                     let _permit = permit;
@@ -9930,6 +10879,23 @@ mod tests {
                 .expect("mining session closed");
             serde_json::from_slice(&line).unwrap()
         }
+        async fn job<R: AsyncBufRead + Unpin>(read: &mut R) -> Value {
+            loop {
+                let value = message(read).await;
+                assert!(value["error"].is_null(), "{value}");
+                if value["method"] == "mining.notify" {
+                    return value;
+                }
+            }
+        }
+        async fn reply<R: AsyncBufRead + Unpin>(read: &mut R, id: u64) -> Value {
+            loop {
+                let value = message(read).await;
+                if value["id"] == id {
+                    return value;
+                }
+            }
+        }
         let dir = tempfile::tempdir().unwrap();
         let node = Node::open(
             &dir.path().join("node.db"),
@@ -9963,42 +10929,38 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let job = loop {
-            let value = message(&mut read).await;
-            assert!(value["error"].is_null(), "{value}");
-            if value["method"] == "mining.notify" {
-                break value;
+        let solve = |job: &Value, extra2: [u8; 4]| {
+            let p = &job["params"];
+            let word = |value: &Value| u32::from_str_radix(value.as_str().unwrap(), 16).unwrap();
+            let mut coinbase = hex::decode(p[2].as_str().unwrap()).unwrap();
+            coinbase.extend(extra1);
+            coinbase.extend(extra2);
+            coinbase.extend(hex::decode(p[3].as_str().unwrap()).unwrap());
+            let mut previous: Hash = hex::decode(p[1].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            for chunk in previous.chunks_exact_mut(4) {
+                chunk.reverse();
             }
+            let mut header = Header {
+                version: word(&p[5]),
+                previous,
+                merkle_root: crypto::sha256d(&coinbase),
+                timestamp: word(&p[7]),
+                bits: word(&p[6]),
+                nonce: 0,
+            };
+            let target = math::target_from_bits(header.bits).unwrap();
+            while math::check_pow(&header, &target).is_err() {
+                header.nonce += 1;
+            }
+            json!(["patient.worker",p[0],hex::encode(extra2),format!("{:08x}",header.timestamp),format!("{:08x}",header.nonce)])
         };
-        let p = &job["params"];
-        let word = |value: &Value| u32::from_str_radix(value.as_str().unwrap(), 16).unwrap();
-        let extra2 = [7u8; 4];
-        let mut coinbase = hex::decode(p[2].as_str().unwrap()).unwrap();
-        coinbase.extend(extra1);
-        coinbase.extend(extra2);
-        coinbase.extend(hex::decode(p[3].as_str().unwrap()).unwrap());
-        let mut previous: Hash = hex::decode(p[1].as_str().unwrap())
-            .unwrap()
-            .try_into()
-            .unwrap();
-        for chunk in previous.chunks_exact_mut(4) {
-            chunk.reverse();
-        }
-        let mut header = Header {
-            version: word(&p[5]),
-            previous,
-            merkle_root: crypto::sha256d(&coinbase),
-            timestamp: word(&p[7]),
-            bits: word(&p[6]),
-            nonce: 0,
-        };
-        let target = math::target_from_bits(header.bits).unwrap();
-        while math::check_pow(&header, &target).is_err() {
-            header.nonce += 1;
-        }
-        // Occupy every mining worker for longer than the I/O timeout. The
-        // solution must wait for capacity rather than end the session.
-        let held = node
+        // Both mining workers are busy, as with two sessions waiting for
+        // template builds: a solved block never waits for them.
+        let found = solve(&job(&mut read).await, [7; 4]);
+        let busy = node
             .stratum_workers
             .clone()
             .acquire_many_owned(2)
@@ -10006,23 +10968,36 @@ mod tests {
             .unwrap();
         write_json(
             &mut write,
-            &json!({"id":3,"method":"mining.submit","params":["patient.worker",p[0],hex::encode(extra2),format!("{:08x}",header.timestamp),format!("{:08x}",header.nonce)]}),
+            &json!({"id":3,"method":"mining.submit","params":found}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply(&mut read, 3).await["result"], true);
+        assert_eq!(node.status().unwrap()["height"], 1);
+        drop(busy);
+        // Its own permits busy for longer than the I/O timeout, a solution
+        // waits for capacity rather than ending the session.
+        let found = solve(&job(&mut read).await, [8; 4]);
+        let held = node
+            .block_submissions
+            .clone()
+            .acquire_many_owned(2)
+            .await
+            .unwrap();
+        write_json(
+            &mut write,
+            &json!({"id":4,"method":"mining.submit","params":found}),
         )
         .await
         .unwrap();
         tokio::time::sleep(IO_TIMEOUT + Duration::from_secs(1)).await;
         assert!(!session.is_finished(), "busy workers ended the session");
-        assert_eq!(node.status().unwrap()["height"], 0);
-        drop(held);
-        let reply = loop {
-            let value = message(&mut read).await;
-            if value["id"] == 3 {
-                break value;
-            }
-        };
-        assert_eq!(reply["result"], true, "{reply}");
         assert_eq!(node.status().unwrap()["height"], 1);
-        assert_eq!(node.mining_status().unwrap()["blocks_found"], "1");
+        drop(held);
+        let reply = reply(&mut read, 4).await;
+        assert_eq!(reply["result"], true, "{reply}");
+        assert_eq!(node.status().unwrap()["height"], 2);
+        assert_eq!(node.mining_status().unwrap()["blocks_found"], "2");
         write.shutdown().await.unwrap();
         timeout(Duration::from_secs(5), session)
             .await

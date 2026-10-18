@@ -652,6 +652,79 @@ fn pending_nonce_dependencies_survive_equal_work_then_recover_across_detached_bl
     );
 }
 
+#[test]
+fn a_recovered_spend_whose_account_only_a_recovered_transfer_creates_confirms_after_it() {
+    let (_base_dir, base) = funded();
+    let fork_height = base.tip_height();
+    let (_old_dir, mut old) = fork(&base);
+    let (_new_dir, mut new) = fork(&base);
+    // On the old branch a transfer creates an account, which spends in the
+    // next block: consensus reserves inputs from the block opening, so the
+    // two can never share a block.
+    let fresh = [97; 32];
+    let funding = sign(
+        &old,
+        &MINER,
+        Operation::TransferExact {
+            recipient: key(&fresh),
+            amount: 500u32.into(),
+        },
+        1,
+        0,
+    );
+    append(&mut old, vec![funding.clone()], 1);
+    let spend = support::sign_minimum(
+        old.tip_state(),
+        TransactionBody {
+            data: Vec::new(),
+            sender: key(&fresh),
+            nonce: 0,
+            fee: 0u32.into(),
+            anchor: codec::block_hash(&codec::genesis_block(&old.config).unwrap()),
+            expiry_blocks: old.tip_height() + 10_000,
+            operation: Operation::TransferExact {
+                recipient: key(&player(1)),
+                amount: 3u32.into(),
+            },
+        },
+        &fresh,
+        1,
+    );
+    append(&mut old, vec![spend.clone()], 1);
+    let d = tempfile::tempdir().unwrap();
+    let node = Node::open(
+        &d.path().join("node.sqlite"),
+        base.config.clone(),
+        key(&MINER),
+    )
+    .unwrap();
+    node_import(&node, &old, 0);
+    // A heavier branch without either detaches both.
+    empty(&mut new, 3, 2);
+    node_import(&node, &new, fork_height);
+    assert_eq!(node.status().unwrap()["tip"], hex::encode(new.tip_hash()));
+    // The transfer is pending again, and the spend, whose sender has no
+    // account on this branch, waits for it rather than being dropped.
+    assert_eq!(node.template().unwrap().transactions, vec![funding.clone()]);
+    let first = node.mine(1_000_000).unwrap();
+    assert_eq!(first.transactions, vec![funding]);
+    assert_eq!(node.template().unwrap().transactions, vec![spend.clone()]);
+    let second = node.mine(1_000_000).unwrap();
+    assert_eq!(second.transactions, vec![spend]);
+    for block in [first, second] {
+        assert!(new.submit(block.clone(), block.header.timestamp as u64).unwrap());
+    }
+    new.tip_state().audit(&new.config).unwrap();
+    assert_eq!(
+        node.status().unwrap()["state_root"],
+        hex::encode(new.tip_state().root())
+    );
+    assert_eq!(
+        new.tip_state().account(&key(&fresh), None).unwrap().nonce,
+        1
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_batch_peer_reorg_crosses_opposite_resolution_and_rest_then_restarts() {
     let (_base_dir, mut base) = funded();

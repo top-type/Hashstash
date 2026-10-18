@@ -126,3 +126,10 @@ path = "fuzz_targets/address_book.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "stratum_session"
+path = "fuzz_targets/stratum_session.rs"
+test = false
+doc = false
+bench = false

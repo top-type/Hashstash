@@ -13,8 +13,11 @@
 //!   HASHSTASH_FUZZ_SECONDS=300 cargo test --release --features test-fixtures \
 //!     --test fuzz_parsers -- --ignored --nocapture fuzz_for_a_bounded_time
 //! (optionally HASHSTASH_FUZZ_TARGETS=peer_wire,json and HASHSTASH_FUZZ_SEED=N).
-//! A failing input is saved under HASHSTASH_FUZZ_ARTIFACTS (default: the
-//! system temporary directory) as hexadecimal, ready for `fuzz/regressions/`.
+//! They also start from any libFuzzer corpus under HASHSTASH_FUZZ_CORPUS
+//! (default: `fuzz/corpus`); the ordinary runs never read one, because it is
+//! untracked. A failing input is saved under HASHSTASH_FUZZ_ARTIFACTS
+//! (default: the system temporary directory) as hexadecimal, ready for
+//! `fuzz/regressions/`.
 #[allow(dead_code)]
 #[path = "../fuzz/src/lib.rs"]
 mod targets;
@@ -301,13 +304,26 @@ fn execute(
     Ok((label, elapsed))
 }
 
-/// Seeds from the target, plus any libFuzzer corpus and kept regressions.
-fn initial_corpus(target: &Target, node: Option<&Node>) -> Vec<Vec<u8>> {
+/// Seeds from the target and its kept regressions, then the target's inputs
+/// in the libFuzzer corpus directory `local`, if given. Only the long runs
+/// read one: a corpus is local and untracked, so the ordinary suite starts
+/// from tracked inputs alone.
+fn initial_corpus(target: &Target, node: Option<&Node>, local: Option<&Path>) -> Vec<Vec<u8>> {
     let mut corpus = (target.seeds)(node);
-    let fuzz = Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz");
-    corpus.extend(raw_files(&fuzz.join("corpus").join(target.name)));
     corpus.extend(regressions(target.name).into_iter().map(|(_, input)| input));
+    if let Some(local) = local {
+        corpus.extend(raw_files(&local.join(target.name)));
+    }
     corpus
+}
+
+/// The libFuzzer corpus directory: HASHSTASH_FUZZ_CORPUS, as for
+/// `write_seed_corpus`, or cargo-fuzz's `fuzz/corpus`.
+fn libfuzzer_corpus() -> PathBuf {
+    std::env::var_os("HASHSTASH_FUZZ_CORPUS").map_or_else(
+        || Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus"),
+        PathBuf::from,
+    )
 }
 
 fn raw_files(directory: &Path) -> Vec<Vec<u8>> {
@@ -359,20 +375,21 @@ struct Summary {
     slowest: Duration,
 }
 
-/// Mutate from the corpus until `inputs` have run or `until` has passed.
+/// Mutate from the starting corpus until `inputs` have run or `until` has passed.
 fn fuzz(
     target: &Target,
     node: Option<&Node>,
     seed: u64,
     inputs: u64,
     until: Option<Instant>,
+    local: Option<&Path>,
 ) -> Summary {
     let mut rng =
         Rng(seed ^ u64::from_le_bytes(Sha256::digest(target.name)[..8].try_into().unwrap()));
     let mut corpus = Vec::new();
     let mut labels = HashSet::new();
     let mut slowest = Duration::ZERO;
-    for input in initial_corpus(target, node) {
+    for input in initial_corpus(target, node, local) {
         match execute(target, node, &input) {
             Ok((label, elapsed)) => {
                 slowest = slowest.max(elapsed);
@@ -428,6 +445,7 @@ fn bounded(name: &str) {
         node.as_ref(),
         SEED,
         BUDGET / u64::from(target.cost),
+        None,
         None,
     );
     eprintln!(
@@ -489,9 +507,31 @@ fn peer_channel() {
 fn address_book() {
     bounded("address_book");
 }
+#[test]
+fn stratum_session() {
+    bounded("stratum_session");
+}
 
-/// Each target has its own bounded test above, a cargo-fuzz binary and a
-/// manifest entry, and every regression directory names a target.
+/// The ordinary runs start from tracked inputs only, whatever libFuzzer
+/// corpus a machine holds; the long runs add the selected corpus.
+#[test]
+fn only_long_runs_read_a_libfuzzer_corpus() {
+    let target = targets::target("json");
+    let local = tempfile::tempdir().unwrap();
+    std::fs::create_dir(local.path().join(target.name)).unwrap();
+    std::fs::write(local.path().join(target.name).join("found"), b"[\"found\"]").unwrap();
+    let tracked = initial_corpus(target, None, None);
+    let mut expected = (target.seeds)(None);
+    expected.extend(regressions(target.name).into_iter().map(|(_, input)| input));
+    assert_eq!(tracked, expected);
+    let long = initial_corpus(target, None, Some(local.path()));
+    assert_eq!(long.len(), tracked.len() + 1);
+    assert_eq!(long.last().unwrap(), b"[\"found\"]");
+}
+
+/// Each target has its own bounded test above, a cargo-fuzz binary, a
+/// manifest entry and a nightly CI job, and every regression directory names
+/// a target.
 #[test]
 fn every_target_has_a_test_and_a_cargo_fuzz_binary() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -518,6 +558,21 @@ fn every_target_has_a_test_and_a_cargo_fuzz_binary() {
         assert!(text.contains(&format!("fuzz_one(\"{}\", data)", target.name)));
         assert!(manifest.contains(&format!("name = \"{}\"", target.name)));
     }
+    // The nightly matrix: the first JSON list in the fuzz job's target line.
+    let workflow = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    let matrix = workflow
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("target: ${{ fromJSON("))
+        .and_then(|rest| rest.split('\'').find(|piece| piece.starts_with("[\"")))
+        .expect("the fuzz job's nightly matrix");
+    let mut nightly: Vec<String> = serde_json::from_str(matrix).unwrap();
+    nightly.sort();
+    let mut expected: Vec<&str> = names.iter().copied().collect();
+    expected.sort();
+    assert_eq!(
+        nightly, expected,
+        "the nightly fuzz matrix lists each target once"
+    );
     if let Ok(entries) = std::fs::read_dir(root.join("fuzz/regressions")) {
         for entry in entries.flatten().filter(|entry| entry.path().is_dir()) {
             let name = entry.file_name().into_string().unwrap();
@@ -611,11 +666,14 @@ fn fuzz_for_a_bounded_time() {
             .collect(),
         Err(_) => TARGETS.iter().collect(),
     };
+    let corpus = libfuzzer_corpus();
     eprintln!(
-        "fuzzing {} targets for {seconds} s each, seed {seed}",
-        selected.len()
+        "fuzzing {} targets for {seconds} s each, seed {seed}, adding any corpus under {}",
+        selected.len(),
+        corpus.display()
     );
     let until = Instant::now() + Duration::from_secs(seconds);
+    let local = corpus.as_path();
     std::thread::scope(|scope| {
         let runs: Vec<_> = selected
             .iter()
@@ -626,7 +684,14 @@ fn fuzz_for_a_bounded_time() {
                         .then(|| targets::fixture_node(directory.path()));
                     (
                         target.name,
-                        fuzz(target, node.as_ref(), seed, u64::MAX, Some(until)),
+                        fuzz(
+                            target,
+                            node.as_ref(),
+                            seed,
+                            u64::MAX,
+                            Some(until),
+                            Some(local),
+                        ),
                     )
                 })
             })

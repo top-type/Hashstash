@@ -77,3 +77,49 @@ pub fn public_rpc(node: &Node, method: &str, params: Value) -> Result<Value> {
         .admit(IpAddr::from([192, 0, 2, 1]), Surface::Rpc)?;
     node.public_rpc(method, params, &admission)
 }
+
+/// How one in-memory Stratum session went.
+pub struct StratumSession {
+    /// How the session ended once its input ran out, or why it closed earlier.
+    pub ended: Result<()>,
+    /// Every line the session wrote, in order.
+    pub replies: Vec<u8>,
+    /// Mining workers still registered with the node after the session closed.
+    pub workers: usize,
+}
+
+/// One mining connection with extranonce 1, served exactly as the Stratum
+/// listener serves it with `password` and the default share difficulty: the
+/// session reads `raw` as everything the miner sent, then sees it disconnect.
+pub fn stratum_session(node: &Node, raw: &[u8], password: Option<&str>) -> StratumSession {
+    // Sessions hand parsing and templates to a blocking pool, whose threads
+    // a runtime joins when dropped. Joining threads from a thread-local
+    // destructor deadlocks on Windows, so this runtime is never dropped.
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    let runtime = RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("fuzz harness runtime")
+    });
+    let mut replies = Vec::new();
+    let ended = match loopback(NetworkGuard::default(), Surface::Stratum) {
+        Ok(admission) => runtime.block_on(stratum_lines(
+            node.clone(),
+            raw,
+            &mut replies,
+            password.map(str::to_owned),
+            DEFAULT_STRATUM_SHARE_DIFFICULTY,
+            1u32.to_le_bytes(),
+            admission,
+            None,
+        )),
+        Err(error) => Err(error),
+    };
+    let workers = node.mining.unpoisoned().workers.len();
+    StratumSession {
+        ended,
+        replies,
+        workers,
+    }
+}

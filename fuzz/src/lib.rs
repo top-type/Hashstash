@@ -9,8 +9,9 @@
 //! target panics only when the code under test panics or breaks one of the
 //! invariants checked here: canonical decoding (one encoding per value),
 //! agreement between the peer preflight and the consensus codec, agreement
-//! between the bounded JSON parsers, the discovery address book's bounds, and
-//! read-only RPC methods leaving the node unchanged.
+//! between the bounded JSON parsers, the discovery address book's bounds,
+//! read-only RPC methods leaving the node unchanged, and mining sessions
+//! answering in JSON lines and releasing their worker once closed.
 
 use hashstash::{
     address, chat, codec,
@@ -36,7 +37,8 @@ use tokio::io::AsyncWriteExt;
 pub enum Run {
     /// A parser of one byte string.
     Bytes(fn(&[u8]) -> String),
-    /// JSON-RPC dispatch on a disposable fixture node (see `fixture_node`).
+    /// JSON-RPC dispatch or a mining session on a disposable fixture node
+    /// (see `fixture_node`).
     Node(fn(&Node, &[u8]) -> String),
 }
 
@@ -157,6 +159,15 @@ pub const TARGETS: &[Target] = &[
         seeds: address_book_seeds,
         dictionary: BOOK_TOKENS,
         max_len: 4 * 1024,
+        cost: 8,
+    },
+    Target {
+        name: "stratum_session",
+        run: Run::Node(stratum_session),
+        seeds: stratum_seeds,
+        dictionary: STRATUM_TOKENS,
+        // Past the session's 16 KiB line bound.
+        max_len: 20 * 1024,
         cost: 8,
     },
 ];
@@ -1730,4 +1741,146 @@ fn address_book_seeds(_: Option<&Node>) -> Vec<Vec<u8>> {
     v6.push(1);
     v6.extend(v4([10, 0, 0, 1], 18481));
     vec![learn, seed, v6]
+}
+
+// ---------------------------------------------------------------------------
+// Mining sessions.
+
+const STRATUM_PASSWORD: &str = "fuzz-fixture-password";
+/// The identifier of the first job a session is sent: a per-session counter.
+const FIRST_JOB: &str = "0000000000000001";
+
+/// One mining connection to the fixture node: the input is everything the
+/// miner sends, read through the listener's line framing and per-request
+/// parameter handling (subscribe, authorize, configure with version rolling
+/// and minimum difficulty, difficulty suggestions and share submissions),
+/// then it disconnects. The session answers only in lines of JSON and, once
+/// closed, leaves no worker registered. A submission reaches the share and
+/// block checks only with a timestamp between its job's and two minutes past
+/// the clock, which mutation practically never produces, so sessions leave
+/// the fixture chain as it was seeded.
+pub fn stratum_session(node: &Node, data: &[u8]) -> String {
+    let session = node::fuzz::stratum_session(node, data, Some(STRATUM_PASSWORD));
+    assert_eq!(session.workers, 0, "a closed session stayed registered");
+    let mut kinds = std::collections::BTreeSet::new();
+    for line in session.replies.split(|&byte| byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let reply: Value = serde_json::from_slice(line).expect("each reply is a line of JSON");
+        let kind = match (reply.get("method"), reply.get("error")) {
+            (Some(method), _) => method.as_str().unwrap_or("notification").to_owned(),
+            (None, Some(Value::Array(error))) => error
+                .get(1)
+                .and_then(Value::as_str)
+                .unwrap_or("error")
+                .to_owned(),
+            _ => format!("{} result", json_kind(&reply["result"])),
+        };
+        kinds.insert(kind);
+    }
+    let ended = match &session.ended {
+        Ok(()) => "disconnected".to_owned(),
+        Err(error) => format!("closed: {error}"),
+    };
+    let kinds: Vec<_> = kinds.into_iter().collect();
+    format!("{ended}; {}", kinds.join(", "))
+}
+
+const STRATUM_TOKENS: &[&[u8]] = &[
+    b"\n",
+    b"\r\n",
+    b"{\"id\":9,\"method\":\"mining.submit\",\"params\":[]}\n",
+    b"\"mining.subscribe\"",
+    b"\"mining.authorize\"",
+    b"\"mining.configure\"",
+    b"\"mining.submit\"",
+    b"\"mining.suggest_difficulty\"",
+    b"\"mining.extranonce.subscribe\"",
+    b"\"version-rolling\"",
+    b"\"version-rolling.mask\"",
+    b"\"version-rolling.min-bit-count\"",
+    b"\"minimum-difficulty\"",
+    b"\"minimum-difficulty.value\"",
+    b"\"subscribe-extranonce\"",
+    b"\"fuzz.worker\"",
+    b"\"fuzz-fixture-password\"",
+    b"\"0000000000000001\"",
+    b"\"0000000000000002\"",
+    b"\"00000000\"",
+    b"\"ffffffff\"",
+    b"\"1fffe000\"",
+    b"\"e0001fff\"",
+    b"\"0x1fffe000\"",
+    b"1e-12",
+    b"1e18",
+    b"1e999",
+    b"-0",
+    b"0.5",
+    b"4294967296",
+    b"null",
+    b"[]",
+    b"{}",
+];
+
+fn stratum_seeds(_: Option<&Node>) -> Vec<Vec<u8>> {
+    let session = |requests: &[Value]| -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for request in requests {
+            bytes.extend(serde_json::to_vec(request).expect("request"));
+            bytes.push(b'\n');
+        }
+        bytes
+    };
+    let subscribe = json!({"id":1,"method":"mining.subscribe","params":["fuzz/1"]});
+    let authorize =
+        json!({"id":2,"method":"mining.authorize","params":["fuzz.worker",STRATUM_PASSWORD]});
+    let submit = |id: u64, extra: &[&str]| {
+        let mut params = vec![
+            json!("fuzz.worker"),
+            json!(FIRST_JOB),
+            json!("0000abcd"),
+            json!("6553f100"),
+            json!("00000001"),
+        ];
+        params.extend(extra.iter().map(|field| json!(field)));
+        json!({"id":id,"method":"mining.submit","params":params})
+    };
+    let rolling = json!({"id":3,"method":"mining.configure","params":[["version-rolling"],{"version-rolling.mask":"1fffe000","version-rolling.min-bit-count":2}]});
+    let minimum = json!({"id":4,"method":"mining.configure","params":[["minimum-difficulty","subscribe-extranonce"],{"minimum-difficulty.value":0.001}]});
+    let mut partial = session(std::slice::from_ref(&subscribe));
+    partial.extend_from_slice(br#"{"id":2,"method":"mining.authorize","params":["fuzz"#);
+    vec![
+        session(&[
+            subscribe.clone(),
+            authorize.clone(),
+            rolling.clone(),
+            json!({"id":5,"method":"mining.suggest_difficulty","params":[0.5]}),
+            submit(6, &[]),
+            submit(7, &["00002000"]),
+            json!({"id":8,"method":"mining.extranonce.subscribe","params":[]}),
+            json!({"id":9,"method":"unknown.method","params":{}}),
+        ]),
+        session(&[
+            minimum,
+            subscribe.clone(),
+            authorize.clone(),
+            json!({"id":5,"method":"mining.suggest_difficulty","params":[1e18]}),
+            submit(6, &["ffffffff"]),
+            json!({"id":7,"method":"mining.submit","params":["other.worker","0000000000000002","00","00000000","00000000"]}),
+        ]),
+        session(&[
+            rolling,
+            subscribe.clone(),
+            json!({"id":2,"method":"mining.authorize","params":["fuzz.worker","wrong"]}),
+        ]),
+        session(&[
+            authorize.clone(),
+            subscribe,
+            authorize.clone(),
+            authorize,
+            submit(5, &[]),
+        ]),
+        partial,
+    ]
 }

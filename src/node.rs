@@ -9497,10 +9497,28 @@ async fn stratum_session(
     floor: f64,
     extra: [u8; 4],
     admission: Session,
+    pending: Option<network_guard::PendingSlot>,
+) -> Result<()> {
+    let (read, write) = stream.into_split();
+    stratum_lines(
+        node, read, write, password, floor, extra, admission, pending,
+    )
+    .await
+}
+/// A Stratum session over any byte stream: the listener's TCP halves, or the
+/// fuzz harness's in-memory input and reply buffer (see [fuzz]).
+#[allow(clippy::too_many_arguments)]
+async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    node: Node,
+    read: R,
+    mut write: W,
+    password: Option<String>,
+    floor: f64,
+    extra: [u8; 4],
+    admission: Session,
     mut pending: Option<network_guard::PendingSlot>,
 ) -> Result<()> {
     let admission = Arc::new(admission);
-    let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
     let mut subscribed = false;
     let mut authorized = false;

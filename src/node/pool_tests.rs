@@ -1140,8 +1140,19 @@ fn template_clearing_runs_off_the_node_lock() {
         .recv_timeout(Duration::from_secs(10))
         .expect("the template build started");
     // While the build is paused before clearing, the node lock is free and
-    // a relayed trade is admitted.
-    let free = node.inner.try_lock().is_ok();
+    // a relayed trade is admitted. The submission above may have woken the
+    // explorer worker, which holds the lock for a moment, so keep trying for
+    // a while: a build holding the lock would hold it until it resumes.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let free = loop {
+        if node.inner.try_lock().is_ok() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
     relay(&node, vec![newcomer.clone()]);
     resume.send(()).unwrap();
     let (stale, cost) = building.join().unwrap();

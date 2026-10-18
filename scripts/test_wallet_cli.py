@@ -121,7 +121,8 @@ def main():
         status = rpc(base, 'status')
         assert status['time_unit'] == 'seconds'
         check('Default CLI creates a timestamp DAA network with block-count decisions and scheduled-second auction/rest timing')
-        _, session = request(base, '/api/session')
+        # Server wallets are listed only to a caller presenting the session token.
+        _, session = request(base, '/api/session', None, db.with_suffix('.session-token').read_text())
         assert session['wallet_mode'] == 'watch' and session['wallet_enabled'] is False
         assert session['public_key'] == vector['public_key']
         payment = transfer_operation(vector['public_key'])

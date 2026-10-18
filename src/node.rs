@@ -557,6 +557,29 @@ pub fn parse_account(s: &str, chain_id: &Hash) -> Result<PublicKey> {
     }
 }
 
+/// Expected hashes per block below which proof of work gates nothing: about
+/// a second of one GPU, and far less of any ASIC.
+pub const EASY_LIMIT_WORK: u64 = 1 << 32;
+/// Expected hashes of one block at the network's easiest permitted target.
+pub fn limit_work(config: &Config) -> Result<Amount> {
+    Ok(math::work(&math::target_from_bits(config.limit_bits)?))
+}
+/// Whether the easiest permitted target makes blocks practically free, as the
+/// presets' development limit (0x207fffff, about two hashes per block) does
+/// until `init --hashrate` calibrates it. Side-branch admission, header
+/// presync and the other proof-of-work-gated defences then cost an attacker
+/// nothing whenever difficulty eases to that limit.
+pub fn easy_proof_of_work(config: &Config) -> bool {
+    limit_work(config).is_ok_and(|work| work < Amount::from(EASY_LIMIT_WORK))
+}
+/// A disposable development network: fixture issuance, or proof of work
+/// that a CPU mines at once. Only there may local processes mine through RPC.
+pub fn development_network(config: &Config) -> bool {
+    config.test_work || easy_proof_of_work(config)
+}
+/// Mining attempts charged as one work unit by the `mine` RPC.
+const MINE_ATTEMPTS_PER_WORK: u64 = 4096;
+
 /// A panic while shared node state was held may have left it half updated.
 /// Exit so a supervisor restarts from durable storage instead of keeping a live
 /// process that can no longer validate, mine or accept mutations.
@@ -994,6 +1017,12 @@ fn compact_size_len(n: usize) -> usize {
 #[cfg(test)]
 mod pool_tests;
 #[cfg(test)]
+mod explorer_worker_tests;
+#[cfg(test)]
+mod proposal_index_tests;
+#[cfg(test)]
+mod local_rpc_tests;
+#[cfg(test)]
 thread_local! {
     /// Pool selections run on this thread, and the signatures they checked.
     static POOL_SELECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1007,6 +1036,8 @@ thread_local! {
     /// Charge admission work on this thread this long, whatever it took.
     static SELECTION_CHARGE: std::cell::Cell<Option<Duration>> =
         const { std::cell::Cell::new(None) };
+    /// Full proposal index builds, each a walk of every proposal, on this thread.
+    static PROPOSAL_INDEX_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The node lock. Test builds meter it: a std mutex is held by one thread and
@@ -1393,33 +1424,98 @@ struct TipCache {
     root: std::sync::OnceLock<Hash>,
     /// The bounded governance summary; a complete large grant is never kept.
     governance: std::sync::OnceLock<Value>,
-    proposals: std::sync::OnceLock<ProposalIndex>,
+    proposals: std::sync::OnceLock<Arc<ProposalIndex>>,
+    /// An ancestor's index and the proposals registered since, when this tip
+    /// extends the previously published one; its index derives from them.
+    proposal_base: Option<ProposalBase>,
+    /// Every proposal ID in consensus key order, only for unfiltered pages,
+    /// which pay for the walk when they build it.
+    proposal_ids: std::sync::OnceLock<Vec<Hash>>,
+}
+impl TipCache {
+    /// The cache of a tip whose block extends the tip `parent` was published
+    /// for, registering `registered` proposals. Its index derives from the
+    /// parent's or, if no read built that one, from the parent's own base.
+    fn extending(parent: &TipCache, registered: Vec<Hash>) -> Self {
+        let proposal_base = match parent.proposals.get() {
+            Some(index) => Some(ProposalBase {
+                index: index.clone(),
+                registered,
+            }),
+            None => parent.proposal_base.as_ref().and_then(|base| {
+                let total = base.registered.len().checked_add(registered.len())?;
+                (total <= MAX_DERIVED_REGISTRATIONS).then(|| ProposalBase {
+                    index: base.index.clone(),
+                    registered: [&base.registered[..], &registered].concat(),
+                })
+            }),
+        };
+        Self {
+            proposal_base,
+            ..Self::default()
+        }
+    }
+}
+/// Registrations a chain of unread tips may carry before the next read
+/// builds its index in full instead of deriving it.
+const MAX_DERIVED_REGISTRATIONS: usize = 16_384;
+struct ProposalBase {
+    index: Arc<ProposalIndex>,
+    registered: Vec<Hash>,
+}
+/// Proposals a block registers, in the order its transactions run.
+fn registered_proposals(chain_id: &Hash, block: &Block) -> Vec<Hash> {
+    block
+        .transactions
+        .iter()
+        .filter_map(|tx| match &tx.body.operation {
+            Operation::Propose {
+                round,
+                description,
+                proposal,
+                ..
+            } => Some(crate::state::proposal_id(
+                chain_id,
+                *round,
+                &tx.body.sender,
+                description,
+                proposal,
+            )),
+            _ => None,
+        })
+        .collect()
 }
 /// Consensus keys proposals by ID only and never removes them. This local
-/// index is built once per tip, so a round page never walks all history.
+/// index of each round's proposals is maintained from tip to tip: a round no
+/// descendant can change is shared, so a new block re-ranks only the open
+/// round, and neither a snapshot nor a round page walks all history.
+#[derive(Debug, PartialEq, Eq)]
 struct ProposalIndex {
-    /// Every proposal ID in consensus key order, for unfiltered pages.
-    all: Vec<Hash>,
+    /// Rounds before `open_from`. Their proposals, support and winner are
+    /// final on every descendant of this tip.
+    closed: Arc<BTreeMap<u64, Arc<[Hash]>>>,
+    /// Rounds from `open_from` on (the auction round, if any).
+    open: BTreeMap<u64, Arc<[Hash]>>,
+    open_from: u64,
+    /// Proposals indexed; equal to the state's count.
+    count: usize,
+}
+impl ProposalIndex {
+    /// The first round a descendant can still change: only the auction round
+    /// accepts proposals and support, and only it can change its leader. A
+    /// decision's round already records its winner.
+    fn open_from(s: &State) -> u64 {
+        match &s.phase {
+            crate::state::Phase::Auction(a) => a.round,
+            _ if s.rounds.is_empty() => 0,
+            _ => s.last_round.saturating_add(1),
+        }
+    }
     /// Each round's IDs: its leader, decision or winner first, then by
     /// support (highest first) and ID. Cheap spam cannot hide better-backed
     /// proposals behind ground IDs that sort first.
-    rounds: std::collections::BTreeMap<u64, Vec<Hash>>,
-}
-impl ProposalIndex {
-    fn build(s: &State) -> Self {
-        let mut all = Vec::with_capacity(s.proposals.len());
-        let mut rounds = std::collections::BTreeMap::<u64, Vec<(&Amount, Hash)>>::new();
-        for (key, proposal) in s.proposals.iter() {
-            let Ok(id) = Hash::try_from(key) else {
-                continue;
-            };
-            all.push(id);
-            rounds
-                .entry(proposal.round)
-                .or_default()
-                .push((&proposal.support, id));
-        }
-        let first = |round: u64| match &s.phase {
+    fn rank(s: &State, round: u64, mut ids: Vec<(&Amount, Hash)>) -> Arc<[Hash]> {
+        let first = match &s.phase {
             crate::state::Phase::Auction(a) if a.round == round && a.leader.is_some() => a.leader,
             crate::state::Phase::Governance(d) if d.round == round => Some(d.proposal_id),
             _ => match s.rounds.get(&round.to_be_bytes()).map(|r| &r.status) {
@@ -1427,23 +1523,86 @@ impl ProposalIndex {
                 _ => None,
             },
         };
-        let rounds = rounds
-            .into_iter()
-            .map(|(round, mut ids)| {
-                let first = first(round);
-                ids.sort_by(|(a_support, a), (b_support, b)| {
-                    (Some(*b) == first)
-                        .cmp(&(Some(*a) == first))
-                        .then_with(|| b_support.cmp(a_support))
-                        .then_with(|| a.cmp(b))
-                });
-                (round, ids.into_iter().map(|(_, id)| id).collect())
-            })
-            .collect();
-        Self { all, rounds }
+        ids.sort_by(|(a_support, a), (b_support, b)| {
+            (Some(*b) == first)
+                .cmp(&(Some(*a) == first))
+                .then_with(|| b_support.cmp(a_support))
+                .then_with(|| a.cmp(b))
+        });
+        ids.into_iter().map(|(_, id)| id).collect()
+    }
+    fn assemble(
+        s: &State,
+        mut closed: Arc<BTreeMap<u64, Arc<[Hash]>>>,
+        rounds: BTreeMap<u64, Vec<(&Amount, Hash)>>,
+    ) -> Self {
+        let open_from = Self::open_from(s);
+        let mut open = BTreeMap::new();
+        for (round, ids) in rounds {
+            let ranked = Self::rank(s, round, ids);
+            if round < open_from {
+                Arc::make_mut(&mut closed).insert(round, ranked);
+            } else {
+                open.insert(round, ranked);
+            }
+        }
+        Self {
+            closed,
+            open,
+            open_from,
+            count: s.proposals.len(),
+        }
+    }
+    /// Walks every proposal ever recorded: once at startup or after a
+    /// reorganization, not once per tip.
+    fn build(s: &State) -> Self {
+        #[cfg(test)]
+        PROPOSAL_INDEX_BUILDS.with(|builds| builds.set(builds.get() + 1));
+        let mut rounds = BTreeMap::<u64, Vec<(&Amount, Hash)>>::new();
+        for (key, proposal) in s.proposals.iter() {
+            let Ok(id) = Hash::try_from(key) else {
+                continue;
+            };
+            rounds
+                .entry(proposal.round)
+                .or_default()
+                .push((&proposal.support, id));
+        }
+        Self::assemble(s, Arc::default(), rounds)
+    }
+    /// The index of a descendant of `base`'s tip that registered `registered`
+    /// since. Rounds closed at the base are kept; the base's open rounds and
+    /// the new proposals are ranked again. Returns None, for a full build,
+    /// if the counts disagree, which a missed registration would cause.
+    fn derive(base: &Self, registered: &[Hash], s: &State) -> Option<Self> {
+        if Self::open_from(s) < base.open_from
+            || base.count.checked_add(registered.len())? != s.proposals.len()
+        {
+            return None;
+        }
+        let mut rounds = BTreeMap::<u64, Vec<(&Amount, Hash)>>::new();
+        for id in base.open.values().flat_map(|ids| ids.iter()).chain(registered) {
+            let proposal = s.proposals.get(id)?;
+            if proposal.round < base.open_from {
+                return None;
+            }
+            rounds
+                .entry(proposal.round)
+                .or_default()
+                .push((&proposal.support, *id));
+        }
+        Some(Self::assemble(s, base.closed.clone(), rounds))
+    }
+    fn round(&self, round: u64) -> &[Hash] {
+        let rounds = if round < self.open_from {
+            &*self.closed
+        } else {
+            &self.open
+        };
+        rounds.get(&round).map_or(&[][..], |ids| &ids[..])
     }
     fn round_len(&self, round: u64) -> usize {
-        self.rounds.get(&round).map_or(0, Vec::len)
+        self.round(round).len()
     }
 }
 /// The worker owns only a weak node reference. Dropping the last node closes its
@@ -1451,58 +1610,93 @@ impl ProposalIndex {
 struct ExplorerWorker {
     sender: Option<mpsc::SyncSender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Set when a notification first finds the worker gone, so that is logged once.
+    gone: AtomicBool,
 }
 impl ExplorerWorker {
-    fn start(mut explorer: Explorer, inner: Weak<Mutex<Inner>>, config: Config) -> Self {
+    fn start(explorer: Explorer, inner: Weak<Mutex<Inner>>, config: Config) -> Self {
         let (sender, receiver) = mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("hashstash-explorer".into())
             .spawn(move || {
-                'worker: while receiver.recv().is_ok() {
-                    loop {
-                        if matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
-                            break 'worker;
-                        }
-                        let update = (|| -> Result<_> {
-                            let Some(inner) = inner.upgrade() else {
-                                return Ok(None);
-                            };
-                            let guard = lock_inner(&inner);
-                            explorer.capture(&guard.chain)
-                        })();
-                        match update {
-                            Ok(Some(update)) => {
-                                if let Err(error) = explorer.apply_update(&config, update) {
-                                    eprintln!("Explorer index update unavailable: {error}");
-                                    break;
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(error) => {
-                                eprintln!("Explorer capture unavailable: {error}");
-                                break;
-                            }
-                        }
-                    }
+                // An update's own panic only fails that update. Any other
+                // panic unwound through the node lock or this loop; exit like
+                // a service task rather than leave the index frozen unlogged.
+                let worker = std::panic::AssertUnwindSafe(|| {
+                    explorer_worker(explorer, &inner, &config, &receiver)
+                });
+                if std::panic::catch_unwind(worker).is_err() {
+                    eprintln!("fatal: explorer worker panicked; exiting for a supervised restart");
+                    std::process::exit(70);
                 }
             });
         match thread {
             Ok(thread) => Self {
                 sender: Some(sender),
                 thread: Some(thread),
+                gone: AtomicBool::new(false),
             },
             Err(error) => {
                 eprintln!("Explorer worker unavailable: {error}");
                 Self {
                     sender: None,
                     thread: None,
+                    gone: AtomicBool::new(true),
                 }
             }
         }
     }
     fn notify(&self) {
-        if let Some(sender) = &self.sender {
-            let _ = sender.try_send(());
+        if let Some(sender) = &self.sender
+            && let Err(mpsc::TrySendError::Disconnected(())) = sender.try_send(())
+            && !self.gone.swap(true, Ordering::Relaxed)
+        {
+            eprintln!("Explorer worker stopped; the explorer index no longer follows the chain");
+        }
+    }
+}
+/// Index each canonical change as it is notified. After a failed capture or
+/// update the worker also wakes at the retry time, so an idle chain does not
+/// leave the index behind until the next block.
+fn explorer_worker(
+    mut explorer: Explorer,
+    inner: &Weak<Mutex<Inner>>,
+    config: &Config,
+    receiver: &mpsc::Receiver<()>,
+) {
+    loop {
+        let woke = match explorer.retry_at() {
+            Some(at) => !matches!(
+                receiver.recv_timeout(at.saturating_duration_since(Instant::now())),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ),
+            None => receiver.recv().is_ok(),
+        };
+        if !woke {
+            return;
+        }
+        loop {
+            if matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+                return;
+            }
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            let update = explorer.capture(&lock_inner(&inner).chain);
+            drop(inner);
+            match update {
+                Ok(Some(update)) => {
+                    if let Err(error) = explorer.apply_update(config, update) {
+                        eprintln!("Explorer index update unavailable: {error}");
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    eprintln!("Explorer capture unavailable: {error}");
+                    break;
+                }
+            }
         }
     }
 }
@@ -1534,9 +1728,31 @@ impl ReadView {
             .get_or_init(|| self.chain.tip_state().root())
     }
     fn proposal_index(&self) -> &ProposalIndex {
-        self.cache
-            .proposals
-            .get_or_init(|| ProposalIndex::build(self.chain.tip_state()))
+        self.cache.proposals.get_or_init(|| {
+            let s = self.chain.tip_state();
+            Arc::new(
+                self.cache
+                    .proposal_base
+                    .as_ref()
+                    .and_then(|base| ProposalIndex::derive(&base.index, &base.registered, s))
+                    .unwrap_or_else(|| ProposalIndex::build(s)),
+            )
+        })
+    }
+    /// Every proposal ID in key order. The first unfiltered page of a tip
+    /// walks them all, so it pays one work unit per 64 proposals.
+    fn proposal_ids(&self, meter: Option<&Session>) -> Result<&[Hash]> {
+        if let Some(ids) = self.cache.proposal_ids.get() {
+            return Ok(ids);
+        }
+        let s = self.chain.tip_state();
+        charge(meter, s.proposals.len() / 64)?;
+        Ok(self.cache.proposal_ids.get_or_init(|| {
+            s.proposals
+                .iter()
+                .filter_map(|(key, _)| Hash::try_from(key).ok())
+                .collect()
+        }))
     }
     /// The governance projection with a large decision grant summarized, so
     /// the retained copy stays bounded however many payments the grant has.
@@ -1693,6 +1909,13 @@ pub struct Node {
     stratum_parsers: Arc<Semaphore>,
     rpc_workers: Arc<Semaphore>,
     rpc_mutations: Arc<Semaphore>,
+    /// Held only by server-wallet sends and management, which also take a
+    /// free `rpc_mutations` worker if one frees first.
+    wallet_mutations: Arc<Semaphore>,
+    /// The one development `mine` call that may run, apart from mutations.
+    dev_mining: Arc<Semaphore>,
+    /// `run --dev-rpc`: allow `mine` on a network that is not a development one.
+    dev_rpc: bool,
     peer_workers: Arc<Semaphore>,
     stratum_workers: Arc<Semaphore>,
     /// Solved Stratum blocks validate on their own permits, never behind
@@ -1865,6 +2088,9 @@ impl Node {
             stratum_parsers: Arc::new(Semaphore::new(2)),
             rpc_workers: Arc::new(Semaphore::new(4)),
             rpc_mutations: Arc::new(Semaphore::new(2)),
+            wallet_mutations: Arc::new(Semaphore::new(1)),
+            dev_mining: Arc::new(Semaphore::new(1)),
+            dev_rpc: false,
             peer_workers: Arc::new(Semaphore::new(2)),
             stratum_workers: Arc::new(Semaphore::new(2)),
             block_submissions: Arc::new(Semaphore::new(2)),
@@ -1905,6 +2131,31 @@ impl Node {
         options.validate()?;
         self.discovery_options = options;
         Ok(self)
+    }
+    /// Allow the development `mine` RPC on a network that is not a
+    /// development one (see `development_network`).
+    pub fn with_dev_rpc(mut self) -> Self {
+        self.dev_rpc = true;
+        self
+    }
+    /// A worker for a server-wallet send or management call: the reserved
+    /// one, or a shared mutation worker if that frees first, so RPC reads and
+    /// submissions holding every shared worker cannot hold off the operator's
+    /// wallet. None when neither frees within the I/O deadline.
+    async fn wallet_worker(&self) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        let (reserved, shared) = (self.wallet_mutations.clone(), self.rpc_mutations.clone());
+        let permit = timeout(IO_TIMEOUT, async move {
+            tokio::select! {
+                biased;
+                permit = reserved.acquire_owned() => permit,
+                permit = shared.acquire_owned() => permit,
+            }
+        })
+        .await;
+        Ok(match permit {
+            Ok(permit) => Some(permit?),
+            Err(_) => None,
+        })
     }
     pub fn peer_status(&self) -> Result<Value> {
         let at = now();
@@ -1973,12 +2224,21 @@ impl Node {
     fn publish(&self, inner: &Inner) -> Result<()> {
         self.note_capacity(&inner.chain)?;
         let mut next = ReadView::capture(inner);
+        // One block extending the published tip derives its proposal index
+        // from that tip's; a reorganization builds it in full. The caller's
+        // node lock serializes publication, so the tip read here stays current.
+        let block = inner.chain.tip_block();
+        let registered = (block.header.previous == self.read_view()?.chain.tip_hash())
+            .then(|| registered_proposals(&inner.chain.chain_id(), block));
         let mut published = self
             .published
             .write()
             .unwrap_or_else(|_| poisoned("snapshot"));
         if published.chain.tip_hash() != next.chain.tip_hash() {
             self.last_tip_change.store(now(), Ordering::Relaxed);
+            if let Some(registered) = registered {
+                next.cache = Arc::new(TipCache::extending(&published.cache, registered));
+            }
         } else {
             // A mempool-only change keeps the tip's derived read results.
             next.cache = published.cache.clone();
@@ -3989,10 +4249,9 @@ impl Node {
                         "proposal pages changed with a new tip; restart from offset 0"
                     );
                 }
-                let index = i.proposal_index();
                 let ids = match round {
-                    Some(round) => index.rounds.get(&round).map_or(&[][..], Vec::as_slice),
-                    None => &index.all,
+                    Some(round) => i.proposal_index().round(round),
+                    None => i.proposal_ids(meter)?,
                 };
                 let ids = ids.get(offset..).unwrap_or_default();
                 proposal_page(i, &ids[..ids.len().min(limit)], false, meter)
@@ -4344,11 +4603,7 @@ impl Node {
                 // return complete records.
                 let proposals = match round {
                     Some(round) => {
-                        let ids = i
-                            .proposal_index()
-                            .rounds
-                            .get(&round)
-                            .map_or(&[][..], Vec::as_slice);
+                        let ids = i.proposal_index().round(round);
                         proposal_page(i, &ids[..ids.len().min(128)], true, meter)?
                     }
                     None => json!([]),
@@ -4644,6 +4899,13 @@ impl Node {
                 Ok(json!({"hash":hex::encode(hash),"selected":self.submit_block(b)?}))
             }
             "mine" => {
+                // Any local process can reach the private listener. On a real
+                // network this would let it burn the node's CPU and pick the
+                // payout; only an explicit operator flag allows that.
+                ensure!(
+                    self.dev_rpc || development_network(&self.read_view()?.chain.config),
+                    "mine is a development method and this network's proof of work is not a development target; start the node with --dev-rpc to allow it"
+                );
                 let recipient = params
                     .get("recipient")
                     .map(|v| {
@@ -4662,13 +4924,19 @@ impl Node {
                     .get("attempts")
                     .and_then(Value::as_u64)
                     .unwrap_or(1_000_000);
+                ensure!(
+                    (1..=100_000_000).contains(&attempts),
+                    "attempts must be 1..100000000"
+                );
                 let mut hashes = Vec::new();
                 for _ in 0..count {
                     if let Some(admission) = admission {
                         // Recheck each block's current queue. Charging an entire
                         // batch as 4096-transaction blocks rejects even empty
-                        // batches beyond the admission bucket's capacity.
-                        let work = pool_change_work(self.read_view()?.mempool.len());
+                        // batches beyond the admission bucket's capacity. The
+                        // attempts are charged too: one unit per 4,096 hashes.
+                        let work = pool_change_work(self.read_view()?.mempool.len())
+                            .saturating_add(attempts.div_ceil(MINE_ATTEMPTS_PER_WORK) as usize);
                         if let Err(error) = admission.work(work) {
                             // Only a batch refused before its first block is a
                             // refusal a client may simply resend.
@@ -7236,11 +7504,18 @@ async fn http_session(
             let chain_id = node.read_view()?.chain.chain_id();
             // Loopback is shared by every local account and service, so the
             // session token is never served here. Clients that may use server
-            // wallets read it from the owner-only session token file.
-            let mut data = if http.public {
-                json!({"address_hrp":address::hrp(&chain_id)})
-            } else {
+            // wallets read it from the owner-only session token file and
+            // present it to see them: their names and addresses would link
+            // the operator's accounts for any other local process.
+            let wallets = !http.public
+                && token_matches(
+                    request.token.as_deref(),
+                    http.session_token.as_deref().unwrap_or(""),
+                );
+            let mut data = if wallets {
                 node.wallet_read(WalletStore::status).await?
+            } else {
+                json!({"address_hrp":address::hrp(&chain_id)})
             };
             data["browser_wallet"] = json!(true);
             data["public_web"] = json!(http.public);
@@ -7346,13 +7621,11 @@ async fn http_session(
         if let Err(e) = admission.work(1) {
             return refuse_request(&mut write, e, http_error).await;
         }
-        let Ok(permit) = timeout(IO_TIMEOUT, node.rpc_mutations.clone().acquire_owned()).await
-        else {
+        let Some(permit) = node.wallet_worker().await? else {
             return HttpRefusal::busy("wallet workers busy")
                 .send_error(&mut write)
                 .await;
         };
-        let permit = permit?;
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let request: ManageRequest = serde_json::from_value(value)?;
@@ -7377,13 +7650,11 @@ async fn http_session(
         if let Err(e) = admission.work(pool_change_work(node.read_view()?.mempool.len())) {
             return refuse_request(&mut write, e, http_error).await;
         }
-        let Ok(permit) = timeout(IO_TIMEOUT, node.rpc_mutations.clone().acquire_owned()).await
-        else {
+        let Some(permit) = node.wallet_worker().await? else {
             return HttpRefusal::busy("wallet workers busy")
                 .send_error(&mut write)
                 .await;
         };
-        let permit = permit?;
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             node.wallet_submit(serde_json::from_value::<HotWalletRequest>(value)?)
@@ -7437,10 +7708,11 @@ async fn http_session(
             .await;
         }
     }
+    // Development mining has its own single worker, so looping `mine` calls
+    // never hold the mutation workers that sends and the faucet need.
     let mutation = matches!(
         method.as_str(),
-        "mine"
-            | "template"
+        "template"
             | "submitblock"
             | "submittransaction"
             | "getblock"
@@ -7491,7 +7763,9 @@ async fn http_session(
         let (body, refusal) = rpc_reply(&id, Err(anyhow!("jsonrpc must be 2.0")), limit)?;
         (body, refusal, admission)
     } else {
-        let slots = if mutation {
+        let slots = if method == "mine" {
+            node.dev_mining.clone()
+        } else if mutation {
             http.mutations.clone()
         } else {
             http.workers.clone()

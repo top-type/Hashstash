@@ -460,6 +460,15 @@ fn preflight_block(bytes: &[u8], limits: Limits) -> Result<()> {
     r.finish()
 }
 
+/// The same nonallocating walk for one standalone signed transaction record,
+/// such as raw hex from a wallet, before the consensus codec reserves its
+/// collections. A declared grant or data length must fit the actual bytes.
+pub fn preflight_transaction(bytes: &[u8], maximum: usize) -> Result<()> {
+    let mut record = Cursor::new(bytes);
+    record.transaction(maximum)?;
+    record.finish()
+}
+
 pub fn decode(bytes: &[u8], limits: Limits) -> Result<Message> {
     ensure!(bytes.len() <= limits.frame_bytes(), "peer frame too large");
     let mut r = Cursor::new(bytes);
@@ -565,9 +574,7 @@ pub fn decode(bytes: &[u8], limits: Limits) -> Result<Message> {
             let mut transactions = Vec::new();
             for _ in 0..count {
                 let bytes = r.record(limits.transaction_bytes)?;
-                let mut record = Cursor::new(bytes);
-                record.transaction(limits.transaction_bytes)?;
-                record.finish()?;
+                preflight_transaction(bytes, limits.transaction_bytes)?;
                 transactions.push(codec::decode(bytes, limits.transaction_bytes)?);
             }
             Message::Sync(Sync {

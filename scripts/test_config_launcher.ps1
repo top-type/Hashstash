@@ -51,7 +51,8 @@ function Genesis-Parameters([string]$Path) {
     return $value|ConvertTo-Json -Depth 32 -Compress
 }
 function Sessions($Manifest) {
-    return @($Manifest.nodes|ForEach-Object {Invoke-RestMethod -Uri "http://127.0.0.1:$($_.rpc_port)/api/session" -TimeoutSec 5})
+    # Server wallets are listed only to a caller presenting the node's session token.
+    return @($Manifest.nodes|ForEach-Object {Invoke-RestMethod -Uri "http://127.0.0.1:$($_.rpc_port)/api/session" -Headers @{'X-Hashstash-Token'=(Get-Content -LiteralPath ([IO.Path]::ChangeExtension([string]$_.data_file, 'session-token')) -Raw)} -TimeoutSec 5})
 }
 function Statuses($Manifest) {
     return @($Manifest.nodes|ForEach-Object {

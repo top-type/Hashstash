@@ -130,6 +130,36 @@ fn documented_stratum_advertisements_are_bare_endpoints() {
     assert!(checked >= 2, "documented advertisements were not found");
 }
 
+/// Every documented `init` that creates the slow (shared-network) preset
+/// calibrates it, as the command requires; the uncalibrated limit makes
+/// blocks and proof-of-work-gated defences practically free.
+#[test]
+fn documented_shared_network_genesis_is_calibrated() {
+    let mut checked = 0;
+    for entry in fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs")).unwrap() {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        if !name.ends_with(".md") {
+            continue;
+        }
+        let text = repository(&format!("docs/{name}"));
+        for line in text.lines() {
+            for (index, _) in line.match_indices("init ") {
+                let command: String = line[index..].chars().take_while(|c| *c != '`').collect();
+                if command.contains("--preset slow") {
+                    assert!(
+                        command.contains("--hashrate ") || command.contains("--uncalibrated"),
+                        "docs/{name}: {command}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked >= 2, "documented slow-preset genesis commands were not found");
+    let running = repository("docs/RUNNING.md");
+    assert!(running.contains("hashstash init --config network.json --preset slow --hashrate "));
+}
+
 #[test]
 fn public_web_proxy_limits_json_rpc_per_client() {
     let template = repository("deploy/linux/public-web.nginx.template");

@@ -125,6 +125,10 @@ async fn watch_only_http_exports_and_broadcasts_but_never_signs() {
     let client = reqwest::Client::new();
     let session: Value = client
         .get(format!("{base}/api/session"))
+        .header(
+            "X-Hashstash-Token",
+            std::fs::read_to_string(&server.session_token_file).unwrap(),
+        )
         .send()
         .await
         .unwrap()

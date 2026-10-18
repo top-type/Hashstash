@@ -90,9 +90,11 @@ class Audit:
         self.nodes = manifest['nodes']
         self.port = self.nodes[0]['rpc_port']
         self.key = self.nodes[0]['public_key']
-        self.session = http(self.port, '/api/session')
-        # The wallet token is only in the node's owner-only file, never served.
-        self.session['token'] = Path(self.nodes[0]['data_file']).with_suffix('.session-token').read_text()
+        # The wallet token is only in the node's owner-only file, never served;
+        # the session lists server wallets only to a caller presenting it.
+        token = Path(self.nodes[0]['data_file']).with_suffix('.session-token').read_text()
+        self.session = http(self.port, '/api/session', None, {'X-Hashstash-Token': token})
+        self.session['token'] = token
         assert self.session['wallet_enabled'] and self.session['public_key'] == self.key, 'This audit needs a fresh network started with -SeedWallets.'
         self.checks = []
         self.config = rpc(self.port, 'config')

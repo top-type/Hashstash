@@ -84,6 +84,7 @@ async fn the_documented_wallet_load_is_never_refused_by_rpc_admission() {
     let client = reqwest::Client::new();
     let session: Value = client
         .get(format!("{url}/api/session"))
+        .header("X-Hashstash-Token", &token)
         .send()
         .await
         .unwrap()

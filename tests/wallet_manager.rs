@@ -15,8 +15,14 @@ fn options() -> ServerOptions {
         ..Default::default()
     }
 }
-async fn session(base: &str) -> Value {
-    reqwest::get(format!("{base}/api/session"))
+/// The session context, with the server wallets that only a holder of the
+/// owner-only session token may list.
+async fn session(server: &node::Server) -> Value {
+    let token = std::fs::read_to_string(&server.session_token_file).unwrap();
+    reqwest::Client::new()
+        .get(format!("http://{}/api/session", server.rpc))
+        .header("X-Hashstash-Token", token)
+        .send()
         .await
         .unwrap()
         .json()
@@ -56,7 +62,7 @@ async fn wallets_persist_and_failed_imports_preserve_selection_and_chain() {
     let chain_before = node.status().unwrap();
     let server = node::serve(node.clone(), options()).await.unwrap();
     let base = format!("http://{}", server.rpc);
-    let initial = session(&base).await;
+    let initial = session(&server).await;
     let initial_token = std::fs::read_to_string(&server.session_token_file).unwrap();
     let token = initial_token.as_str();
     assert_eq!(initial["wallets"].as_array().unwrap().len(), 0);
@@ -89,7 +95,7 @@ async fn wallets_persist_and_failed_imports_preserve_selection_and_chain() {
         hex::encode(crypto::public_key(&secret).unwrap()),
         backup["public_key"]
     );
-    let normal = session(&base).await;
+    let normal = session(&server).await;
     assert!(
         !normal
             .to_string()
@@ -104,7 +110,7 @@ async fn wallets_persist_and_failed_imports_preserve_selection_and_chain() {
         json!({"action":"create","name":"Extra","secret":"ignored?","revision":created["wallet_revision"]}),
     ] {
         assert_eq!(manage(&base, token, request).await.0, 400);
-        assert_eq!(session(&base).await, normal);
+        assert_eq!(session(&server).await, normal);
     }
     let (code,duplicate) = manage(&base,token,json!({"action":"import","name":"Replacement name","private_key":backup["private_key"],"public_key":backup["public_key"],"revision":created["wallet_revision"]})).await;
     assert_eq!(code, 200);
@@ -124,7 +130,7 @@ async fn wallets_persist_and_failed_imports_preserve_selection_and_chain() {
         .with_wallet([70; 32])
         .unwrap();
     let server = node::serve(reopened, options()).await.unwrap();
-    let restored = session(&format!("http://{}", server.rpc)).await;
+    let restored = session(&server).await;
     for field in [
         "wallet_id",
         "wallet_revision",
@@ -159,7 +165,7 @@ async fn stale_revision_wrong_sender_and_watch_selection_never_sign() {
     }
     let server = node::serve(node.clone(), options()).await.unwrap();
     let base = format!("http://{}", server.rpc);
-    let hot = session(&base).await;
+    let hot = session(&server).await;
     let token = &std::fs::read_to_string(&server.session_token_file).unwrap();
     assert_eq!(
         hot["wallets"].as_array().unwrap().len(),
@@ -230,7 +236,7 @@ async fn stale_revision_wrong_sender_and_watch_selection_never_sign() {
     );
     node.mine(100_000).unwrap();
     for _ in 0..8 {
-        let current = session(&base).await;
+        let current = session(&server).await;
         let (signed, switched) = tokio::join!(
             sign(
                 &base,
@@ -250,7 +256,7 @@ async fn stale_revision_wrong_sender_and_watch_selection_never_sign() {
             assert_eq!(transaction["body"]["sender"], json!(public));
         }
         node.mine(100_000).unwrap();
-        let switched = session(&base).await;
+        let switched = session(&server).await;
         assert_eq!(manage(&base,token,json!({"action":"select","id":hot["wallet_id"],"revision":switched["wallet_revision"]})).await.0,200);
     }
     server.stop().await;
@@ -263,7 +269,7 @@ async fn manager_rejects_missing_token_and_foreign_origin_without_mutation() {
     let node = Node::open(&dir.path().join("chain.sqlite"), Config::devnet(), public).unwrap();
     let server = node::serve(node, options()).await.unwrap();
     let base = format!("http://{}", server.rpc);
-    let before = session(&base).await;
+    let before = session(&server).await;
     let request = json!({"action":"create","name":"Wallet","revision":before["wallet_revision"]});
     assert_eq!(manage(&base, "", request.clone()).await.0, 403);
     let response = reqwest::Client::new()
@@ -278,7 +284,7 @@ async fn manager_rejects_missing_token_and_foreign_origin_without_mutation() {
         .await
         .unwrap();
     assert_eq!(response.status(), 403);
-    assert_eq!(session(&base).await, before);
+    assert_eq!(session(&server).await, before);
     server.stop().await;
 }
 
@@ -297,7 +303,7 @@ async fn empty_store_stays_empty_across_plain_restarts_and_each_first_action_add
             assert!(snapshot[field].is_null());
         }
         let server = node::serve(node, options()).await.unwrap();
-        let initial = session(&format!("http://{}", server.rpc)).await;
+        let initial = session(&server).await;
         assert_eq!(initial["wallets"], json!([]));
         assert_eq!(initial["wallet_revision"], 0);
         server.stop().await;
@@ -305,7 +311,7 @@ async fn empty_store_stays_empty_across_plain_restarts_and_each_first_action_add
         let node = Node::open(&path, Config::devnet(), public).unwrap();
         let server = node::serve(node, options()).await.unwrap();
         let base = format!("http://{}", server.rpc);
-        let empty = session(&base).await;
+        let empty = session(&server).await;
         assert_eq!(empty["wallet_mode"], "none");
         assert_eq!(empty["wallets"], json!([]));
         assert_eq!(empty["wallet_enabled"], false);
@@ -336,7 +342,7 @@ async fn empty_store_stays_empty_across_plain_restarts_and_each_first_action_add
             .with_wallet([74; 32])
             .unwrap();
         let server = node::serve(node, options()).await.unwrap();
-        let restored = session(&format!("http://{}", server.rpc)).await;
+        let restored = session(&server).await;
         for field in [
             "wallet_id",
             "public_key",
@@ -367,7 +373,7 @@ async fn startup_flags_seed_a_store_left_empty_by_an_earlier_start() {
             node.with_watch_key(public).unwrap()
         };
         let server = node::serve(node, options()).await.unwrap();
-        let seeded = session(&format!("http://{}", server.rpc)).await;
+        let seeded = session(&server).await;
         assert_eq!(seeded["wallets"].as_array().unwrap().len(), 1);
         assert_eq!(seeded["public_key"], hex::encode(public));
         assert_eq!(seeded["wallet_mode"], if hot { "hot" } else { "watch" });
@@ -390,14 +396,14 @@ async fn explicit_fresh_hot_and_watch_seeds_remain_available() {
             node.with_watch_key(public).unwrap()
         };
         let server = node::serve(node, options()).await.unwrap();
-        let selected = session(&format!("http://{}", server.rpc)).await;
+        let selected = session(&server).await;
         assert_eq!(selected["wallets"].as_array().unwrap().len(), 1);
         assert_eq!(selected["public_key"], hex::encode(public));
         assert_eq!(selected["wallet_mode"], if hot { "hot" } else { "watch" });
         server.stop().await;
         let node = Node::open(&path, Config::devnet(), public).unwrap();
         let server = node::serve(node, options()).await.unwrap();
-        let restored = session(&format!("http://{}", server.rpc)).await;
+        let restored = session(&server).await;
         assert_eq!(restored["wallets"], selected["wallets"]);
         assert_eq!(restored["wallet_id"], selected["wallet_id"]);
         server.stop().await;
@@ -501,7 +507,7 @@ async fn peer_identity_is_never_a_saved_seeded_or_imported_server_wallet() {
     let server = node::serve(node.clone(), options()).await.unwrap();
     let base = format!("http://{}", server.rpc);
     let token = std::fs::read_to_string(&server.session_token_file).unwrap();
-    let empty = session(&base).await;
+    let empty = session(&server).await;
     for request in [
         json!({"action":"import","private_key":hex::encode(peer_secret),"revision":empty["wallet_revision"]}),
         json!({"action":"watch","public_key":hex::encode(peer),"revision":empty["wallet_revision"]}),
@@ -509,7 +515,7 @@ async fn peer_identity_is_never_a_saved_seeded_or_imported_server_wallet() {
         let (code, reply) = manage(&base, &token, request).await;
         assert_eq!(code, 400, "{reply}");
     }
-    assert_eq!(session(&base).await, empty);
+    assert_eq!(session(&server).await, empty);
     let (code, _) = manage(
         &base,
         &token,

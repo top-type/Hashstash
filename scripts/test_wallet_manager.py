@@ -81,10 +81,14 @@ def main():
         def node_arguments(address='127.0.0.1:0'):
             return ['run', '--config', configuration_path, '--data', chain_path, '--miner', primary['public_key'], '--rpc', address, '--p2p', '127.0.0.1:0', '--stratum', '127.0.0.1:0']
         node_process, base = start(args.node, node_arguments(), 'node', 'RPC: (http://127\\.0\\.0\\.1:\\d+)/rpc')
-        _, session = request(base, '/api/session')
-        # Wallet tools read the token from the node's owner-only file.
+        # Wallet tools read the token from the node's owner-only file, and the
+        # session lists server wallets only to a caller presenting it.
+        token = chain_path.with_suffix('.session-token').read_text()
+        _, anonymous = request(base, '/api/session')
+        assert not {'wallets', 'wallet_id', 'public_key', 'address', 'token'} & set(anonymous)
+        _, session = request(base, '/api/session', None, token)
         assert 'token' not in session
-        session['token'] = chain_path.with_suffix('.session-token').read_text()
+        session['token'] = token
         assert session['wallet_mode'] == 'none' and (not session['wallet_enabled'])
         assert session['wallet_id'] is None and session['public_key'] is None and (session['wallets'] == [])
         assert session['address'] is None
@@ -228,7 +232,7 @@ def main():
             storage.commit()
             try:
                 manage('create', expected=400, name='Must not be exposed')
-                _, failed_session = request(base, '/api/session')
+                _, failed_session = request(base, '/api/session', None, session['token'])
                 assert failed_session['wallet_id'] == session['wallet_id']
                 assert failed_session['wallet_revision'] == session['wallet_revision']
                 assert failed_session['wallets'] == session['wallets']
@@ -243,8 +247,9 @@ def main():
         stop(node_process)
         _, restarted_base = start(args.node, node_arguments(base.removeprefix('http://')), 'node-restored', 'RPC: (http://127\\.0\\.0\\.1:\\d+)/rpc')
         assert restarted_base == base
-        _, restarted = request(base, '/api/session')
-        restarted['token'] = chain_path.with_suffix('.session-token').read_text()
+        restarted_token = chain_path.with_suffix('.session-token').read_text()
+        _, restarted = request(base, '/api/session', None, restarted_token)
+        restarted['token'] = restarted_token
         assert restarted['token'] != session['token']
         assert restarted['wallet_id'] == hot_id and restarted['public_key'] == primary['public_key']
         assert sorted((wallet['id'] for wallet in restarted['wallets'])) == persisted_ids

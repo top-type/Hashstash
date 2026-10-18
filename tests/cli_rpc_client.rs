@@ -809,6 +809,44 @@ async fn an_empty_stratum_password_file_is_refused_before_the_node_opens() {
     }
 }
 
+#[tokio::test]
+async fn shared_networks_need_calibration_before_untrusted_peers_reach_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = |name: &str| directory.path().join(name).to_str().unwrap().to_owned();
+    let slow = cli(&args(&["init", "--config", &path("slow.json"), "--preset", "slow"]), &[]).await;
+    assert!(!slow.status.success());
+    assert!(String::from_utf8_lossy(&slow.stderr).contains("--hashrate"));
+    assert!(!directory.path().join("slow.json").exists());
+    // A production-denominated network that keeps the development limit.
+    let mut config = hashstash::config::Config::slow_testnet();
+    config.test_work = false;
+    std::fs::write(path("easy.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    let miner = hex::encode(crypto::public_key(&[29; 32]).unwrap());
+    for exposure in [
+        &["--peer-discovery", "--p2p", "127.0.0.1:0"][..],
+        &["--p2p", "0.0.0.0:0"][..],
+    ] {
+        let mut run = args(&[
+            "run",
+            "--config",
+            &path("easy.json"),
+            "--data",
+            &path("chain.sqlite"),
+            "--miner",
+            &miner,
+            "--rpc",
+            "127.0.0.1:0",
+            "--no-stratum",
+        ]);
+        run.extend(args(exposure));
+        let output = cli(&run, &[]).await;
+        assert!(!output.status.success(), "{exposure:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("--allow-easy-target"), "{stderr}");
+        assert!(!directory.path().join("chain.sqlite").exists());
+    }
+}
+
 #[cfg(feature = "test-fixtures")]
 mod funded {
     use super::*;

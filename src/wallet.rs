@@ -220,6 +220,11 @@ pub fn decode_signed(raw: &str, chain_id: &Hash) -> Result<Transaction> {
 /// signature verifies only for one chain ID; the receiving node checks it.
 pub fn decode_signed_record(raw: &str) -> Result<Transaction> {
     let bytes = raw_bytes(raw)?;
+    // Hostile hex reaches this from public broadcasts and faucet claims. Walk
+    // the framing first, as for peer records, so a forged collection length
+    // is refused before the codec reserves memory for it.
+    crate::peer_wire::preflight_transaction(&bytes, bytes.len())
+        .map_err(|error| anyhow::anyhow!("malformed signed transaction: {error}"))?;
     let transaction: Transaction = codec::decode(&bytes, bytes.len())?;
     validate_body(&transaction.body)?;
     Ok(transaction)
@@ -838,6 +843,128 @@ mod governance_review_tests {
                 &[42; 32]
             ))
             .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod signed_record_tests {
+    use super::*;
+
+    fn signed(operation: Operation, data: Vec<u8>) -> Transaction {
+        let body = TransactionBody {
+            sender: crypto::public_key(&[41; 32]).unwrap(),
+            nonce: 3,
+            fee: 10u32.into(),
+            anchor: [38; 32],
+            expiry_blocks: 100,
+            operation,
+            data,
+        };
+        crypto::sign(&[42; 32], &body, &[41; 32]).unwrap()
+    }
+
+    fn grant(payments: u8) -> Operation {
+        let mut recipients: Vec<_> = (0..payments)
+            .map(|i| crypto::public_key(&[43 + i; 32]).unwrap())
+            .collect();
+        recipients.sort();
+        Operation::Propose {
+            round: 1,
+            description: [77; 32],
+            proposal: Proposal::Grant {
+                payments: recipients
+                    .into_iter()
+                    .map(|recipient| GrantPayment {
+                        recipient,
+                        amount: 5u32.into(),
+                    })
+                    .collect(),
+            },
+            support: 1u32.into(),
+        }
+    }
+
+    #[test]
+    fn signed_records_pass_the_structural_preflight_before_decoding() {
+        let key = crypto::public_key(&[43; 32]).unwrap();
+        for operation in [
+            Operation::TransferExact {
+                recipient: key,
+                amount: 9u32.into(),
+            },
+            Operation::Deposit {
+                amount: 9u32.into(),
+                decision: Some([5; 32]),
+                outcome: Some(Outcome::Fail),
+            },
+            Operation::Redeem {
+                shares: 9u32.into(),
+                decision: None,
+                outcome: None,
+            },
+            grant(2),
+            Operation::Propose {
+                round: 2,
+                description: [6; 32],
+                proposal: Proposal::Parameter {
+                    parameter: Parameter::Interval,
+                    old: 15,
+                    new: 30,
+                },
+                support: 1u32.into(),
+            },
+            Operation::Support {
+                round: 2,
+                proposal: [7; 32],
+                amount: 9u32.into(),
+            },
+            Operation::Refund {
+                round: 2,
+                proposal: [7; 32],
+            },
+        ] {
+            let transaction = signed(operation, b"note".to_vec());
+            let raw = signed_hex(&transaction);
+            assert_eq!(decode_signed_record(&raw).unwrap(), transaction);
+            assert_eq!(decode_signed(&raw, &[42; 32]).unwrap(), transaction);
+        }
+    }
+
+    #[test]
+    fn forged_collection_lengths_are_refused_by_the_preflight() {
+        let bytes = codec::encode(&signed(grant(2), Vec::new()));
+        // The description, the Grant tag and then the payment count.
+        let at = bytes
+            .windows(34)
+            .position(|w| w[..32] == [77; 32] && w[32..] == [0, 2])
+            .unwrap()
+            + 33;
+        for forged in [1u64 << 40, u64::MAX] {
+            let mut payments = bytes[..at].to_vec();
+            payments.push(253);
+            payments.extend_from_slice(&forged.to_le_bytes());
+            payments.extend_from_slice(&bytes[at + 1..]);
+            let error = decode_signed_record(&hex::encode(&payments)).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("grant count exceeds remaining transaction bytes"),
+                "{error}"
+            );
+        }
+        // Empty data is the last collection, just before the 64-byte signature.
+        let plain = codec::encode(&signed(grant(1), Vec::new()));
+        let data = plain.len() - 65;
+        assert_eq!(plain[data], 0);
+        let mut forged = plain[..data].to_vec();
+        forged.push(253);
+        forged.extend_from_slice(&(1u64 << 40).to_le_bytes());
+        forged.extend_from_slice(&plain[data + 1..]);
+        let error = decode_signed_record(&hex::encode(&forged)).unwrap_err();
+        assert!(
+            error.to_string().starts_with("malformed signed transaction"),
+            "{error}"
         );
     }
 }

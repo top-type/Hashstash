@@ -106,8 +106,14 @@ async fn wallet_snapshot_stays_coherent_during_mining_and_matches_quote_context(
     assert_eq!(funded["feasible"], false);
     server.stop().await;
 }
-async fn session(url: &str) -> Value {
-    reqwest::get(format!("{url}/api/session"))
+/// The session context; server wallets are listed only with the token.
+async fn session(url: &str, token: Option<&str>) -> Value {
+    let mut request = reqwest::Client::new().get(format!("{url}/api/session"));
+    if let Some(token) = token {
+        request = request.header("X-Hashstash-Token", token);
+    }
+    request
+        .send()
         .await
         .unwrap()
         .error_for_status()
@@ -161,12 +167,25 @@ async fn embedded_assets_session_and_atomic_pending_wallet_nonces() {
         );
         assert!(!response.bytes().await.unwrap().is_empty());
     }
-    let s = session(&url).await;
+    let token = &session_token(&server);
+    assert_eq!(token.len(), 64);
+    // Any local process may ask; only the token holder sees server wallets,
+    // whose names and addresses would link the operator's accounts.
+    for anonymous in [
+        session(&url, None).await,
+        session(&url, Some("incorrect-session-token")).await,
+    ] {
+        for field in ["public_key", "address", "wallets", "wallet_id", "wallet_revision"] {
+            assert!(anonymous.get(field).is_none(), "{field}: {anonymous}");
+        }
+        assert_eq!(anonymous["miner"], hex::encode(public));
+        assert_eq!(anonymous["browser_wallet"], true);
+        assert!(anonymous["address_hrp"].is_string());
+    }
+    let s = session(&url, Some(token.as_str())).await;
     assert_eq!(s["wallet_enabled"], true);
     assert_eq!(s["public_key"], hex::encode(public));
     assert_eq!(s["miner"], hex::encode(public));
-    let token = &session_token(&server);
-    assert_eq!(token.len(), 64);
     assert!(s.get("token").is_none());
     assert!(!s.to_string().contains(&hex::encode(secret)));
     let send = |amount: &str| {
@@ -229,8 +248,8 @@ async fn wallet_rejects_foreign_origins_hosts_and_missing_or_wrong_tokens() {
     let server = node::serve(n.clone(), options()).await.unwrap();
     let url = format!("http://{}", server.rpc);
     let client = reqwest::Client::new();
-    let s = session(&url).await;
     let token = &session_token(&server);
+    let s = session(&url, Some(token.as_str())).await;
     let body = json!({"operation":{"TransferExact":{"recipient":public,"amount":"1"}},"extra_fee":"0","expected_sender":hex::encode(public),"wallet_revision":s["wallet_revision"]});
     for header in [None, Some("incorrect-session-token")] {
         let mut request = client.post(format!("{url}/api/wallet")).json(&body);
@@ -320,7 +339,7 @@ async fn no_key_starts_without_a_wallet_and_rpc_never_binds_publicly() {
     let n = Node::open(&d.path().join("readonly.db"), Config::devnet(), public).unwrap();
     let server = node::serve(n.clone(), options()).await.unwrap();
     let url = format!("http://{}", server.rpc);
-    let s = session(&url).await;
+    let s = session(&url, Some(session_token(&server).as_str())).await;
     assert_eq!(s["wallet_enabled"], false);
     assert!(s["public_key"].is_null());
     assert!(s["wallet_id"].is_null());
@@ -348,8 +367,8 @@ async fn restarting_server_rotates_token_and_unfunded_wallet_fails_cleanly() {
         .unwrap();
     let first = node::serve(n.clone(), options()).await.unwrap();
     let first_url = format!("http://{}", first.rpc);
-    let old_session = session(&first_url).await;
     let old_token = session_token(&first);
+    let old_session = session(&first_url, Some(old_token.as_str())).await;
     let body = json!({"operation":{"TransferExact":{"recipient":public,"amount":"1"}},"extra_fee":"0","expected_sender":hex::encode(public),"wallet_revision":old_session["wallet_revision"]});
     let client = reqwest::Client::new();
     let response = client
@@ -372,9 +391,9 @@ async fn restarting_server_rotates_token_and_unfunded_wallet_fails_cleanly() {
     }
     let second = node::serve(n.clone(), options()).await.unwrap();
     let url = format!("http://{}", second.rpc);
-    let new_session = session(&url).await;
-    assert_eq!(old_session["wallet_revision"], new_session["wallet_revision"]);
     let new_token = session_token(&second);
+    let new_session = session(&url, Some(new_token.as_str())).await;
+    assert_eq!(old_session["wallet_revision"], new_session["wallet_revision"]);
     assert_ne!(old_token, new_token);
     let response = client
         .post(format!("{url}/api/wallet"))
@@ -426,7 +445,7 @@ async fn loopback_clients_cannot_obtain_the_wallet_token_over_http() {
             .unwrap();
         assert!(!text.contains(&token), "{path}");
     }
-    let s = session(&url).await;
+    let s = session(&url, Some(token.as_str())).await;
     let export = json!({"action":"export","id":s["wallet_id"],"revision":s["wallet_revision"]});
     let refused = client
         .post(format!("{url}/api/wallet/manage"))

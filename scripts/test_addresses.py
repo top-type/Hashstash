@@ -78,10 +78,11 @@ def main():
             cli('decode-address', '--address', bad, '--config', config, good=False)
         check('CLI round trips both cases and rejects checksum errors, mixed case, wrong networks, and raw keys as addresses')
         base = start(args.node, ['run', '--config', config, '--data', directory / 'chain.sqlite', '--miner', addresses[0], '--watch-key', addresses[1], '--rpc', '127.0.0.1:0', '--p2p', '127.0.0.1:0', '--stratum', '127.0.0.1:0'], 'node', 'RPC: (http://127\\.0\\.0\\.1:\\d+)/rpc')
-        session = request(base, '/api/session')[1]
-        # The wallet token is only in the node's owner-only file, never served.
-        assert 'token' not in session
+        # The wallet token is only in the node's owner-only file, never served;
+        # the session lists server wallets only to a caller presenting it.
         token = (directory / 'chain.session-token').read_text()
+        session = request(base, '/api/session', None, token)[1]
+        assert 'token' not in session
         assert session['address'] == addresses[1] and session['public_key'] == vectors[1]['public_key']
         assert session['wallets'][0]['address'] == addresses[1]
         assert rpc(base, 'address', {'public_key': vectors[0]['public_key']})['address'] == addresses[0]
@@ -89,7 +90,7 @@ def main():
         for bad in [typo, wrong_network]:
             code, response = request(base, '/api/wallet/manage', {'action': 'watch', 'name': 'Invalid', 'public_key': bad, 'revision': session['wallet_revision']}, token)
             assert code == 400, response
-            assert request(base, '/api/session')[1] == session
+            assert request(base, '/api/session', None, token)[1] == session
         check('Node startup, session metadata, address RPCs and watch-only management validate network-bound addresses')
         url = base + '/rpc'
         cli('mine', '--url', url, '--recipient', addresses[0], '--count', 10)

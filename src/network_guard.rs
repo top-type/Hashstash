@@ -2100,6 +2100,9 @@ mod tests {
             .unwrap();
         let expanded = 100 * 1024 * 1024;
         guard.set_frame(expanded).unwrap();
+        // A peer's burst holds a session's two largest frames, its reply and
+        // its push; spend both.
+        assert!(peer.bytes(expanded).is_ok());
         assert!(peer.bytes(expanded).is_ok());
         guard.set_frame(expanded).unwrap();
         assert!(

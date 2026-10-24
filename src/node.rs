@@ -2624,6 +2624,15 @@ impl Node {
         // itself to write it (`peer_write_timeout`).
         Ok(peer_write_timeout(self.peer_limits()?.frame_bytes()))
     }
+    /// The allowance for an inbound connection's handshake and first
+    /// message: a locator, address or header request, which carries no
+    /// blocks and waits for no validation, so it is read for as long as its
+    /// sender may take to write the largest such request.
+    fn peer_request_timeout(&self) -> Result<Duration> {
+        Ok(peer_write_timeout(
+            self.peer_limits()?.locator_request_bytes(),
+        ))
+    }
 
     /// Seed a wallet store that holds no wallets. A store holding wallets keeps
     /// its saved selection over startup flags.
@@ -6958,7 +6967,7 @@ async fn peer_session_steps(
 ) -> Result<()> {
     let remote = stream.peer_addr()?;
     // The handshake and first message share one deadline.
-    let first = tokio::time::Instant::now() + node.peer_exchange_timeout()?;
+    let first = tokio::time::Instant::now() + node.peer_request_timeout()?;
     let mut transport = if let Some(policy) = &node.peer_auth {
         // Nothing has been proved before the handshake completes. A failure
         // here closes the connection without a cooldown that would also hit

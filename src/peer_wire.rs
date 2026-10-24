@@ -8,7 +8,46 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
-pub const MAGIC: &[u8; 8] = b"HSP2PBIN";
+/// Marker that opens every peer payload. Its last three characters name the
+/// peer protocol generation: the release that introduced these block,
+/// transaction, state commitment and peer message rules, not this binary's
+/// version. A release that breaks any of them changes the marker, so nodes of
+/// different generations refuse each other at the first frame instead of
+/// exchanging records that the other side cannot validate.
+pub const MAGIC: &[u8; 8] = b"HSP2P043";
+/// The authenticated transport's handshake marker of the same generation.
+pub const AUTH_MAGIC: &[u8; 8] = b"HSP2A043";
+/// Markers of Hashstash 0.42.0 and earlier. Their framing and chain IDs match
+/// this release's, but their blocks commit to another state encoding and
+/// their signatures do not bind the chain ID.
+pub const LEGACY_MAGIC: &[u8; 8] = b"HSP2PBIN";
+pub const LEGACY_AUTH_MAGIC: &[u8; 8] = b"HSP2PAUT";
+/// Shared by every generation's markers, plain and authenticated.
+const MARKER_FAMILY: &[u8; 4] = b"HSP2";
+
+/// The refusal for a peer whose first eight bytes are another Hashstash
+/// peer protocol generation's marker, naming its release where it is known.
+/// None when they are this generation's markers or no Hashstash marker.
+pub fn incompatible_peer(marker: &[u8]) -> Option<String> {
+    if marker == LEGACY_MAGIC || marker == LEGACY_AUTH_MAGIC {
+        return Some(format!(
+            "peer runs Hashstash 0.42.0 or earlier (peer protocol {}), whose blocks, state commitments and signatures this release does not accept; it must upgrade and join a network created by this release",
+            String::from_utf8_lossy(marker)
+        ));
+    }
+    if marker.len() != MAGIC.len()
+        || !marker.starts_with(MARKER_FAMILY)
+        || marker == MAGIC
+        || marker == AUTH_MAGIC
+    {
+        return None;
+    }
+    Some(format!(
+        "peer speaks another Hashstash peer protocol generation ({}); this release speaks {} and cannot synchronize with it",
+        marker.escape_ascii(),
+        String::from_utf8_lossy(MAGIC)
+    ))
+}
 /// Highest peer transport version this node speaks. Version 1 has only the
 /// synchronization, acknowledgment and address messages. Version 2 adds the
 /// header exchange that may open a synchronization session; a version 1 peer
@@ -472,7 +511,12 @@ pub fn preflight_transaction(bytes: &[u8], maximum: usize) -> Result<()> {
 pub fn decode(bytes: &[u8], limits: Limits) -> Result<Message> {
     ensure!(bytes.len() <= limits.frame_bytes(), "peer frame too large");
     let mut r = Cursor::new(bytes);
-    ensure!(r.take(MAGIC.len())? == MAGIC, "invalid peer message format");
+    let marker = r.take(MAGIC.len())?;
+    if marker != MAGIC {
+        anyhow::bail!(
+            incompatible_peer(marker).unwrap_or_else(|| "invalid peer message format".to_owned())
+        );
+    }
     let message = match r.byte()? {
         1 => Message::Ack,
         2 => {
@@ -610,6 +654,58 @@ pub fn frame(payload: &[u8], maximum: usize) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::{crypto, types::*};
+
+    #[test]
+    fn other_protocol_generations_are_refused_by_name() {
+        let limits = Limits::from_config(&Config::devnet());
+        let sync = Message::Sync(Sync {
+            chain: Config::devnet().chain_id(),
+            locator: vec![[7; 32]],
+            blocks: vec![],
+            transactions: vec![],
+        });
+        let current = encode(&sync, limits).unwrap();
+        assert_eq!(&current[..8], b"HSP2P043");
+        assert_eq!(decode(&current, limits).unwrap(), sync);
+        // A 0.42.0 frame differs only in its marker: the chain ID matches
+        // for the same genesis file, so the marker alone tells them apart.
+        let mut legacy = current.clone();
+        legacy[..8].copy_from_slice(LEGACY_MAGIC);
+        let error = decode(&legacy, limits).unwrap_err().to_string();
+        assert!(
+            error.contains("Hashstash 0.42.0 or earlier") && error.contains("HSP2PBIN"),
+            "{error}"
+        );
+        let mut future = current.clone();
+        future[..8].copy_from_slice(b"HSP2P099");
+        let error = decode(&future, limits).unwrap_err().to_string();
+        assert!(
+            error.contains("another Hashstash peer protocol generation (HSP2P099)")
+                && error.contains("HSP2P043"),
+            "{error}"
+        );
+        // Bytes that carry no Hashstash marker stay a format error.
+        let mut garbage = current;
+        garbage[..8].copy_from_slice(b"GET / HT");
+        assert_eq!(
+            decode(&garbage, limits).unwrap_err().to_string(),
+            "invalid peer message format"
+        );
+        assert!(
+            incompatible_peer(LEGACY_AUTH_MAGIC)
+                .unwrap()
+                .contains("0.42.0")
+        );
+        for own in [MAGIC, AUTH_MAGIC] {
+            assert_eq!(incompatible_peer(own), None);
+        }
+        assert_eq!(incompatible_peer(b"HSP2"), None);
+        assert!(
+            incompatible_peer(b"HSP2\xff\x00\x01\x02")
+                .unwrap()
+                .contains(r"\xff")
+        );
+    }
 
     #[test]
     fn governed_capacity_expands_admission_without_framing_overflow() {

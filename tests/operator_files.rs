@@ -6,7 +6,7 @@ fn repository(path: &str) -> String {
 }
 
 /// Dotted three-part numbers that name a Hashstash release, such as
-/// "Hashstash 0.42.0", "version=0.42.0" or "/opt/hashstash/0.42.0-". Other
+/// "Hashstash 0.43.0", "version=0.43.0" or "/opt/hashstash/0.43.0-". Other
 /// products' versions (nginx, systemd) may appear; IPv4 addresses have four parts.
 fn release_numbers(text: &str) -> Vec<&str> {
     const CONTEXTS: [&str; 5] = [
@@ -63,6 +63,30 @@ fn linux_installer_accepts_exactly_this_release() {
             assert_eq!(release, version, "{path} names another release");
         }
     }
+}
+
+/// The release script builds what the installer accepts: a normal locked
+/// build of this version, with the toolchain continuous integration pins.
+#[test]
+fn release_script_builds_normally_with_the_validated_toolchain() {
+    let script = repository("scripts/release.sh");
+    let pinned = repository(".github/workflows/ci.yml")
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("RUST_TOOLCHAIN: '")
+                .and_then(|rest| rest.strip_suffix('\''))
+                .map(str::to_owned)
+        })
+        .expect("CI toolchain pin");
+    assert!(
+        script.contains(&format!("toolchain=${{RUST_TOOLCHAIN:-{pinned}}}")),
+        "release.sh must default to the CI toolchain {pinned}"
+    );
+    assert!(script.contains("cargo build --locked --release --bins"));
+    // test-fixtures changes the chain identity; releases never enable features.
+    assert!(!script.contains("--features"));
+    assert!(script.contains("grep -qx \"version=$version\" \"$root/deploy/linux/install.sh\""));
 }
 
 #[test]

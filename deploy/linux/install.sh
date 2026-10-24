@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 fail() { printf 'Hashstash install: %s\n' "$*" >&2; exit 1; }
 # The only accepted release; it must equal Cargo.toml (tests/operator_files.rs).
-version=0.42.0
+version=0.43.0
 usage() {
     cat <<EOF
 Usage: sudo bash install.sh --binary /path/hashstash --sha256 HEX \\

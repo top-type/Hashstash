@@ -1,6 +1,6 @@
 # Node operation
 
-The node requires a 64-bit target. Genesis identifies the chain. A database must use its exact genesis configuration; changing that configuration creates a different identity, affecting addresses, application caches and chain-scoped faucet ledgers.
+The node requires a 64-bit target. Genesis identifies the chain. A database must use its exact genesis configuration; changing that configuration creates a different identity, affecting addresses, application caches and chain-scoped faucet ledgers. A database also records the storage format of the release that wrote it (`hashstash-storage-043` since 0.43.0). The same genesis file gives 0.42.0 and 0.43.0 the same chain ID, but their blocks are incompatible, so a database holding blocks written by 0.42.0 or earlier is refused at startup with an error naming that release; start this release with a new `--data` path. Launching a new network is described in the [launch runbook](LAUNCH.md).
 
 Source builds place executables in `target/release`; packaged releases place them in `bin`. The PowerShell launchers prefer the source build when present. Examples using `bin` assume the packaged layout.
 
@@ -36,7 +36,7 @@ Private development methods can mine or submit candidate blocks. Use those only 
 
 Peers exchange length-framed binary synchronization batches containing chain identity, block locators, canonical block records and canonical signed transactions. Each batch is limited to 128 locator hashes, 32 blocks and 256 loose transactions, with separate byte limits. RPC and Stratum remain JSON interfaces. See [network controls](NETWORK-HARDENING.md#binary-peer-transport) for framing and allocation limits.
 
-Configured peers must use the same binary transport and chain identity. Transport keys are separate service identities.
+Configured peers must use the same binary transport, peer protocol generation and chain identity. Every peer message starts with the generation marker `HSP2P043` (`HSP2A043` for authenticated handshakes); a peer of another release is refused at its first message, and the `peers` RPC names it, for example as Hashstash 0.42.0 or earlier. Transport keys are separate service identities.
 
 ### Joining a public network
 

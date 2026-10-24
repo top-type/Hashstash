@@ -6965,6 +6965,20 @@ async fn closed_before_reply<R: AsyncBufRead + Unpin>(
         Ok(Err(error)) => Err(error.into()),
     }
 }
+/// Whether a failed peer read ended because the peer closed or reset the
+/// connection, rather than with a malformed frame or a timeout.
+fn peer_closed(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+            )
+        })
+    })
+}
 /// Header requests that open a version 2 session, until a reply leaves
 /// nothing more to fetch. A version 1 peer rejects the first request as an
 /// unknown message type and closes the connection without replying. So can
@@ -6996,7 +7010,7 @@ async fn header_rounds<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 )
             };
             bail!(
-                "peer closed the connection on a header request: it may run peer transport version 1, without header synchronization; {blocks_only}"
+                "peer closed the connection on a header request: it may run peer transport version 1 or Hashstash 0.42.0 or earlier, follow another genesis, or be at its connection limits; {blocks_only}"
             );
         }
         let reply = read_peer_packet(
@@ -7074,7 +7088,8 @@ async fn sync_peer_steps(node: &Node, peer: SocketAddr) -> Result<()> {
     let mut read = BufReader::new(read);
     // Transport version 2: headers come first, so a branch is learned from
     // its headers whatever its blocks' size or its distance from the tip.
-    if node.speaks_headers(peer) {
+    let headers = node.speaks_headers(peer);
+    if headers {
         header_rounds(
             node,
             peer,
@@ -7093,7 +7108,14 @@ async fn sync_peer_steps(node: &Node, peer: SocketAddr) -> Result<()> {
         &mut transport,
     )
     .await?;
-    let reply = read_peer(&mut read, node, &admission, &mut transport).await?;
+    let reply = match read_peer(&mut read, node, &admission, &mut transport).await {
+        // A peer synchronized by blocks only after closing on header
+        // requests usually closes this request for the same reason.
+        Err(error) if !headers && peer_closed(&error) => bail!(
+            "peer closed the connection on a locator request while synchronized by blocks only: it may run Hashstash 0.42.0 or earlier, follow another genesis, or be at its connection limits"
+        ),
+        reply => reply?,
+    };
     let reply = receive_peer_async(node, reply, peer.ip()).await?;
     write_peer(
         node,

@@ -23,7 +23,9 @@ use tokio::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-const MAGIC: &[u8; 8] = b"HSP2PAUT";
+/// The handshake marker names the peer protocol generation and is part of
+/// the signed transcript (see `peer_wire::MAGIC`).
+const MAGIC: &[u8; 8] = crate::peer_wire::AUTH_MAGIC;
 const HANDSHAKE_TAG: &str = "Hashstash/PeerHandshake";
 const SESSION_TAG: &str = "Hashstash/PeerSession";
 const FRAME_TAG: &str = "Hashstash/PeerFrame";
@@ -363,8 +365,24 @@ impl Channel {
         admission.bytes(hello.len())?;
         stream.write_all(&hello).await?;
         let mut reply = [0u8; 136];
-        stream.read_exact(&mut reply).await?;
+        if let Err(error) = stream.read_exact(&mut reply).await {
+            use std::io::ErrorKind::{ConnectionAborted, ConnectionReset, UnexpectedEof};
+            // The server reads the whole greeting and closes without a reply
+            // when its marker, chain ID or this node's key is not accepted.
+            if matches!(
+                error.kind(),
+                UnexpectedEof | ConnectionReset | ConnectionAborted
+            ) {
+                anyhow::bail!(
+                    "peer closed the authentication handshake: it may run Hashstash 0.42.0 or earlier, follow another genesis, or not accept this node's peer key"
+                );
+            }
+            return Err(error.into());
+        }
         admission.bytes(reply.len())?;
+        if let Some(refusal) = crate::peer_wire::incompatible_peer(&reply[..8]) {
+            anyhow::bail!(refusal);
+        }
         let server: PublicKey = reply[8..40].try_into()?;
         ensure!(
             &reply[..8] == MAGIC
@@ -403,9 +421,13 @@ impl Channel {
         let mut hello = [0u8; 104];
         stream.read_exact(&mut hello).await?;
         admission.bytes(hello.len())?;
+        if let Some(refusal) = crate::peer_wire::incompatible_peer(&hello[..8]) {
+            anyhow::bail!(refusal);
+        }
+        ensure!(&hello[..8] == MAGIC, "peer authentication format mismatch");
         ensure!(
-            &hello[..8] == MAGIC && hello[8..40] == chain,
-            "peer authentication format or chain mismatch"
+            hello[8..40] == chain,
+            "peer authentication chain mismatch: the peer follows another genesis configuration"
         );
         let client = hello[40..72].try_into()?;
         ensure!(policy.allows(ip, client), "unpinned incoming peer identity");
@@ -933,6 +955,65 @@ mod tests {
             .await
             .is_err()
         );
+    }
+    #[tokio::test]
+    async fn other_protocol_generations_are_named_in_both_handshake_roles() {
+        // A 0.42.0 greeting has this release's layout and chain ID; only its
+        // marker differs, and the server names that release.
+        let server = fixture(82, 81, 1001);
+        let mut hello = crate::peer_wire::LEGACY_AUTH_MAGIC.to_vec();
+        hello.extend_from_slice(&[9; 32]);
+        hello.extend_from_slice(&crypto::public_key(&[81; 32]).unwrap());
+        hello.extend_from_slice(&[5; 32]);
+        let (mut client, mut accepted) = tokio::io::duplex(4096);
+        client.write_all(&hello).await.unwrap();
+        let error = Channel::accept(
+            &mut accepted,
+            &server,
+            "127.0.0.1".parse().unwrap(),
+            [9; 32],
+            &admission(),
+        )
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("Hashstash 0.42.0 or earlier"), "{error}");
+        // This generation's greeting for another genesis names the chain.
+        let (a, b) = handshake_policies(
+            fixture(81, 82, 1002),
+            fixture(82, 81, 1001),
+            [8; 32],
+            [9; 32],
+        )
+        .await;
+        let error = b.err().unwrap().to_string();
+        assert!(error.contains("another genesis configuration"), "{error}");
+        // The client sees only the close, and says what can cause it.
+        let error = a.err().unwrap().to_string();
+        assert!(
+            error.contains("closed the authentication handshake")
+                && error.contains("Hashstash 0.42.0 or earlier"),
+            "{error}"
+        );
+        // A reply carrying an older marker is named as well.
+        let (mut stream, mut old_server) = tokio::io::duplex(4096);
+        let mut reply = crate::peer_wire::LEGACY_AUTH_MAGIC.to_vec();
+        reply.extend_from_slice(&crypto::public_key(&[82; 32]).unwrap());
+        reply.extend_from_slice(&[0; 96]);
+        old_server.write_all(&reply).await.unwrap();
+        let error = Channel::connect(
+            &mut stream,
+            &fixture(81, 82, 1002),
+            "127.0.0.1:1002".parse().unwrap(),
+            [9; 32],
+            &admission(),
+        )
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("Hashstash 0.42.0 or earlier"), "{error}");
     }
     #[test]
     fn handshake_proof_binds_both_roles_keys_chain_and_fresh_challenges() {

@@ -6238,22 +6238,25 @@ pub async fn serve(mut node: Node, options: ServerOptions) -> Result<Server> {
     let private_http = Arc::new(HttpContext {
         public: false,
         session_token: Some(session_token),
-        sessions: node.rpc_sessions.clone(),
+        sessions: HttpSessions::Fixed(node.rpc_sessions.clone()),
         parsers: node.rpc_parsers.clone(),
         workers: node.rpc_workers.clone(),
         mutations: node.rpc_mutations.clone(),
+        replies: None,
         guard: node.guard.clone(),
     });
     // The proxy may originate every public connection from loopback. Separate
     // admission records and worker slots prevent it exhausting private RPC.
     // Each visitor it names, like each direct client, holds only a share.
+    // A full session pool makes room for networks holding fewer sessions.
     let public_http = Arc::new(HttpContext {
         public: true,
         session_token: None,
-        sessions: Arc::new(Semaphore::new(network_guard::PUBLIC_WEB_SESSIONS)),
+        sessions: HttpSessions::Public(PublicSessions::new(network_guard::PUBLIC_WEB_SESSIONS)),
         parsers: Arc::new(Semaphore::new(2)),
         workers: Arc::new(Semaphore::new(4)),
         mutations: Arc::new(Semaphore::new(2)),
+        replies: Some(Arc::new(Semaphore::new(PUBLIC_REPLY_MEMORY_KIB))),
         guard: Arc::new(NetworkGuard::for_public_web()),
     });
     let (stop, rx) = watch::channel(false);
@@ -6351,19 +6354,21 @@ pub async fn serve(mut node: Node, options: ServerOptions) -> Result<Server> {
                         (admission, SessionCapacity::Mining(id), Some(slot))
                     } else {
                         let admission = web_admission.expect("HTTP connections are admitted first");
-                        let Ok(permit) = http.sessions.clone().try_acquire_owned() else {
+                        let Some(slot) = http.session_slot(&admission) else {
                             drop(admission);
                             let refusal = HttpRefusal::busy("HTTP sessions busy");
                             refuse_connection(&mut clients, &refusals, guard, address, stream, refusal);
                             continue
                         };
-                        (admission, SessionCapacity::Http(permit), None)
+                        (admission, SessionCapacity::Http(slot), None)
                     };
                     let extranonce = match &capacity { SessionCapacity::Mining(id) => id.1, _ => 0 };
                     // A newcomer may take over a general peer slot; this session then closes.
                     let evicted = match &capacity { SessionCapacity::Peer(slot) => Some(slot.eviction()), _ => None };
+                    // A public newcomer may likewise close this HTTP session to take its place.
+                    let takeover = match &capacity { SessionCapacity::Http(slot) => slot.takeover(), _ => None };
                     let node = n.clone(); let password = password.clone(); let http=http.clone();
-                    clients.spawn(async move { let _permit = permit; let _capacity = capacity; let _ = stream.set_nodelay(true);
+                    let task = clients.spawn(async move { let _permit = permit; let _capacity = capacity; let _ = stream.set_nodelay(true);
                         let reporter = node.clone();
                         let result = match kind { 0|3 => http_session(node, stream, http, admission).await, 1 => peer_session(node, stream, admission, evicted).await, _ => stratum_session(node, stream, password, share_difficulty, extranonce.to_le_bytes(), admission, pending).await };
                         // Peer data is untrusted; individual failures close only that connection.
@@ -6371,6 +6376,7 @@ pub async fn serve(mut node: Node, options: ServerOptions) -> Result<Server> {
                         // mining clients cannot push synchronization errors out of it.
                         if kind == 1 && result.is_err() { reporter.peer_event(format!("inbound/{kind}/{address}"), &result); }
                     });
+                    if let Some((pool, id)) = takeover { pool.attach(id, task); }
                 }
             }}
             clients.abort_all(); while clients.join_next().await.is_some() {}
@@ -6458,7 +6464,7 @@ fn random_u64() -> u64 {
 /// is released by its drop.
 #[allow(dead_code)]
 enum SessionCapacity {
-    Http(tokio::sync::OwnedSemaphorePermit),
+    Http(HttpSlot),
     Peer(network_guard::PeerSlot),
     Mining(SessionId),
 }
@@ -7395,11 +7401,128 @@ fn transaction_data(max_bytes: usize, input: Option<&str>) -> Result<Vec<u8>> {
 struct HttpContext {
     public: bool,
     session_token: Option<String>,
-    sessions: Arc<Semaphore>,
+    sessions: HttpSessions,
     parsers: Arc<Semaphore>,
     workers: Arc<Semaphore>,
     mutations: Arc<Semaphore>,
+    /// The public website's built reply bodies held until written, in KiB
+    /// (`PUBLIC_REPLY_MEMORY_KIB`); `None` on the private listener.
+    replies: Option<Arc<Semaphore>>,
     guard: Arc<NetworkGuard>,
+}
+impl HttpContext {
+    /// A session place for an admitted connection, if one is free or, on
+    /// the public website, can be made (`PublicSessions`).
+    fn session_slot(&self, admission: &Session) -> Option<HttpSlot> {
+        match &self.sessions {
+            HttpSessions::Fixed(pool) => pool.clone().try_acquire_owned().ok().map(HttpSlot::Fixed),
+            HttpSessions::Public(pool) => pool.acquire(admission.network()).map(HttpSlot::Public),
+        }
+    }
+}
+/// Session capacity of one HTTP listener.
+enum HttpSessions {
+    /// The private RPC listener's fixed pool.
+    Fixed(Arc<Semaphore>),
+    /// The public website's pool, which can make room for a newcomer.
+    Public(Arc<PublicSessions>),
+}
+/// One HTTP session's place in its listener's pool, released by its drop.
+#[allow(dead_code)]
+enum HttpSlot {
+    Fixed(tokio::sync::OwnedSemaphorePermit),
+    Public(PublicSlot),
+}
+impl HttpSlot {
+    /// The public pool and place to record the task serving this session
+    /// in, so a newcomer can close it to take its place.
+    fn takeover(&self) -> Option<(Arc<PublicSessions>, u64)> {
+        match self {
+            Self::Public(slot) => Some((slot.pool.clone(), slot.id)),
+            Self::Fixed(_) => None,
+        }
+    }
+}
+/// Built public reply bodies, in KiB, that may wait for their clients to
+/// read them at once. A body larger than the whole allowance takes all of
+/// it, so one largest valid reply is always served; past the allowance a
+/// reply is replaced by a short error, so slow readers cannot make the node
+/// hold a reply per session.
+const PUBLIC_REPLY_MEMORY_KIB: usize = 64 * 1024;
+/// Public reply bodies up to this size need no allowance: all sessions
+/// together hold at most 2 MiB of them, and a wallet's short replies, such
+/// as a broadcast's, are never replaced for want of it.
+const PUBLIC_REPLY_UNHELD: usize = 64 * 1024;
+/// The public website's sessions. When all are in use, a newcomer from a
+/// network (an IPv4 /24 or IPv6 /48, or one address on a local network)
+/// holding at least two fewer sessions than the network holding the most
+/// closes that network's oldest session and takes its place. A few networks
+/// therefore cannot keep everyone else out by holding sessions open, as a
+/// reply that is never read would: shutting newcomers out takes about as
+/// many networks as there are sessions. The loopback proxy's sessions carry
+/// many visitors behind the proxy's own limits and are never closed this
+/// way; its newcomers count as a network holding none.
+struct PublicSessions {
+    capacity: usize,
+    live: Mutex<PublicSessionTable>,
+}
+#[derive(Default)]
+struct PublicSessionTable {
+    next: u64,
+    /// Oldest first: each session's network and the task serving it.
+    sessions: BTreeMap<u64, (Option<IpAddr>, Option<tokio::task::AbortHandle>)>,
+}
+struct PublicSlot {
+    pool: Arc<PublicSessions>,
+    id: u64,
+}
+impl PublicSessions {
+    fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            capacity,
+            live: Mutex::default(),
+        })
+    }
+    fn acquire(self: &Arc<Self>, network: Option<IpAddr>) -> Option<PublicSlot> {
+        let mut live = self.live.unpoisoned();
+        if live.sessions.len() >= self.capacity {
+            let mut held: HashMap<IpAddr, usize> = HashMap::new();
+            for net in live.sessions.values().filter_map(|(net, _)| *net) {
+                *held.entry(net).or_default() += 1;
+            }
+            let own = network.and_then(|net| held.get(&net).copied()).unwrap_or(0);
+            let most = held.values().copied().max().unwrap_or(0);
+            if most < own.saturating_add(2) {
+                return None;
+            }
+            let victim = live
+                .sessions
+                .iter()
+                .find(|(_, (net, task))| task.is_some() && net.is_some_and(|n| held[&n] == most))
+                .map(|(id, _)| *id)?;
+            if let Some((_, Some(task))) = live.sessions.remove(&victim) {
+                task.abort();
+            }
+        }
+        let id = live.next;
+        live.next += 1;
+        live.sessions.insert(id, (network, None));
+        Some(PublicSlot {
+            pool: self.clone(),
+            id,
+        })
+    }
+    /// Record the task serving session `id`, unless it already ended.
+    fn attach(&self, id: u64, task: tokio::task::AbortHandle) {
+        if let Some(entry) = self.live.unpoisoned().sessions.get_mut(&id) {
+            entry.1 = Some(task);
+        }
+    }
+}
+impl Drop for PublicSlot {
+    fn drop(&mut self) {
+        self.pool.live.unpoisoned().sessions.remove(&self.id);
+    }
 }
 
 fn public_rpc_allowed(method: &str) -> bool {
@@ -7565,7 +7688,11 @@ async fn read_http<R: AsyncBufRead + Unpin>(
         let client = client
             .parse::<IpAddr>()
             .map_err(|_| anyhow!("invalid X-Real-IP header"))?;
-        admission.forwarded_for(client)?;
+        if let Err(error) = admission.forwarded_for(client) {
+            // A visitor its own quota refuses spends none of the proxy's.
+            admission.refund_refused_visitor();
+            return Err(error);
+        }
     }
     ensure!(
         !headers.contains_key("transfer-encoding"),
@@ -7638,6 +7765,11 @@ async fn read_http<R: AsyncBufRead + Unpin>(
             },
         "HTTP body too large"
     );
+    if public && method == "GET" {
+        // Pages and scripts are not wallet-critical calls: their request,
+        // bytes and reply leave the proxy's essential reserve in place.
+        admission.nonessential();
+    }
     admission.request()?;
     admission.bytes(length.saturating_add(size))?;
     // Grow only with received bytes: a claimed length alone never allocates.
@@ -7715,12 +7847,24 @@ async fn write_http_response<W: AsyncWrite + Unpin>(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{retry_after}Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Resource-Policy: same-origin\r\nContent-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'\r\n\r\n",
         body.len()
     );
-    timeout(IO_TIMEOUT, async {
+    timeout(reply_write_deadline(body.len()), async {
         write.write_all(header.as_bytes()).await?;
         write.write_all(body).await
     })
     .await??;
     Ok(())
+}
+/// A reply must be written within this base time plus its body's time at
+/// `REPLY_WRITE_RATE` bytes per second, and never longer than `IO_TIMEOUT`.
+/// A client that stops reading a short reply, such as a script, then holds
+/// its session for seconds rather than the whole I/O deadline.
+const REPLY_WRITE_BASE: Duration = Duration::from_secs(5);
+const REPLY_WRITE_RATE: u64 = 64 * 1024;
+fn reply_write_deadline(bytes: usize) -> Duration {
+    let transfer = (bytes as u64).saturating_mul(1000) / REPLY_WRITE_RATE;
+    REPLY_WRITE_BASE
+        .saturating_add(Duration::from_millis(transfer))
+        .min(IO_TIMEOUT)
 }
 fn http_error(message: &str) -> Value {
     json!({"error":{"message":message}})
@@ -7875,10 +8019,63 @@ async fn refuse_http(stream: TcpStream, refusal: HttpRefusal) {
 fn charge_public_reply(admission: &Session, bytes: usize, work: usize) -> Result<()> {
     admission.outgoing(bytes, work)
 }
+/// Settle a built public reply before it is written. The part of its
+/// `reserved` work that its `reply_work` did not use returns; its bytes are
+/// held against the public reply allowance until written; and its bytes and
+/// any work beyond the reservation are charged. A reply that does not fit
+/// the allowance or the byte budget is replaced by a short JSON-RPC error
+/// that keeps its status, because the request has already run; its reserved
+/// work stays paid either way. Returns the held allowance.
+fn settle_public_reply(
+    admission: &Session,
+    replies: &Arc<Semaphore>,
+    body: &mut Vec<u8>,
+    reply_work: usize,
+    reserved: usize,
+    rpc_error: impl Fn(&str) -> Value,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+    admission.refund_work(reserved.saturating_sub(reply_work));
+    let unreserved = reply_work.saturating_sub(reserved);
+    // A reply is held in memory until its client has read it. A large one is
+    // held against the allowance and, past it, replaced at once rather than
+    // held, however many sessions read slowly.
+    let mut held = None;
+    if body.len() > PUBLIC_REPLY_UNHELD {
+        let kib = body.len().div_ceil(1024).min(PUBLIC_REPLY_MEMORY_KIB);
+        held = replies.clone().try_acquire_many_owned(kib as u32).ok();
+        if held.is_none() {
+            *body = serde_json::to_vec(&rpc_error("public replies are busy; try again"))?;
+        }
+    }
+    if charge_public_reply(admission, body.len(), unreserved).is_err() {
+        // Never a cooldown: the node chose the reply's size. The request has
+        // already run, so this is no admission refusal and keeps the status
+        // its result had: 429 and 503 promise that nothing ran, and a
+        // broadcast whose reply is replaced here may already be relayed.
+        *body = serde_json::to_vec(&rpc_error(
+            "public response byte budget exhausted; try again",
+        ))?;
+        held = None;
+    }
+    Ok(held)
+}
 /// Explorer replies pay one work unit per this many bytes they return, once
 /// they are built, in addition to their method price. Public work bursts
 /// admit the work of one largest reply.
 const EXPLORER_REPLY_BYTES_PER_WORK: usize = network_guard::REPLY_BYTES_PER_WORK as usize;
+/// One explorer record's bytes per byte of a largest transaction: its raw
+/// and data hexadecimal and its decoded operation, with room to spare.
+const EXPLORER_RECORD_EXPANSION: usize = 8;
+/// The reply work reserved for a public explorer page before it is built:
+/// that of `MAX_PAGE` records, each as large as a largest transaction's
+/// record at `capacity`, within the page budget. A larger page, such as one
+/// whose first record alone exceeds the budget, pays the rest with its bytes.
+fn explorer_reply_reserve(capacity: usize) -> usize {
+    let rows = crate::explorer::MAX_PAGE as usize;
+    rows.saturating_mul(capacity.saturating_mul(EXPLORER_RECORD_EXPANSION))
+        .min(JSON_PAGE_BYTES)
+        / EXPLORER_REPLY_BYTES_PER_WORK
+}
 /// Public calls a wallet needs to show its balance, to price, prepare and
 /// broadcast a transfer, a Stash deposit or redemption, and to check its
 /// support for a refund. Only these may spend the reserve that the public
@@ -7943,16 +8140,21 @@ async fn http_session(
             .config
             .transaction_bytes(&view.chain.tip_state().settings)
     };
-    let response_frame = http_response_frame(
-        transaction_bytes,
-        node.known_block_bytes.load(Ordering::Acquire),
-    )?;
+    let known_block_bytes = node.known_block_bytes.load(Ordering::Acquire);
+    let response_frame = http_response_frame(transaction_bytes, known_block_bytes)?;
+    // Explorer records follow the greatest validated capacity, as the frame.
+    let page_capacity =
+        transaction_bytes.max(usize::try_from(known_block_bytes).unwrap_or(usize::MAX));
     if http.public {
         // The public guard never sees the private capacity updates. Its byte
         // burst admits one response frame, so a large valid reply waits for
         // refill instead of never fitting, and it follows a lower capacity.
         http.guard.set_frame(response_frame)?;
     }
+    // Every RPC work burst admits one largest valid request at this
+    // capacity, such as a broadcast of a largest transaction.
+    http.guard
+        .allow_rpc_work(largest_request_work(transaction_bytes)?)?;
     let request = match timeout(
         IO_TIMEOUT,
         read_http(
@@ -8067,6 +8269,13 @@ async fn http_session(
             _ => None,
         };
         if let Some((mime, body)) = asset {
+            // A public page or script spends the byte budget like any reply.
+            // Nothing ran, so a refusal asks the client to wait (429).
+            if http.public
+                && let Err(e) = charge_public_reply(&admission, body.len(), 0)
+            {
+                return refuse_request(&mut write, e, http_error).await;
+            }
             return http_response(&mut write, 200, mime, body).await;
         }
         if request.path == "/api/session" {
@@ -8326,6 +8535,8 @@ async fn http_session(
     // A valid record may need more than the fixed service frame once
     // governance raises capacity; the frame then follows that capacity.
     let limit = response_frame;
+    // Work reserved for a public explorer reply before it is built.
+    let mut reserved = 0;
     let (mut body, refusal, admission) =
         if value.get("jsonrpc") != Some(&Value::String("2.0".into())) {
             let (body, refusal) = rpc_reply(&id, Err(anyhow!("jsonrpc must be 2.0")), limit)?;
@@ -8343,6 +8554,22 @@ async fn http_session(
                 return busy.send(&mut write, &rpc_error(&busy.message)).await;
             };
             let permit = permit?;
+            // A public explorer reply pays one work unit per KiB it returns.
+            // That work is reserved for a largest page at this capacity
+            // before the page is built, while a worker is held, so a client
+            // cannot skip it by leaving too little budget for the reply's
+            // bytes; what the page did not use returns once its size is
+            // known. Nothing ran yet, so a refusal returns the method price
+            // and asks the client to wait.
+            if public && explorer {
+                let reserve = explorer_reply_reserve(page_capacity);
+                if let Err(e) = admission.outgoing(0, reserve) {
+                    drop(permit);
+                    admission.refund_work(cost);
+                    return refuse_request(&mut write, e, rpc_error).await;
+                }
+                reserved = reserve;
+            }
             let id = id.clone();
             // The reply is serialized, and its JSON tree freed, on this worker:
             // a page may hold millions of values, too many for a runtime thread.
@@ -8363,15 +8590,18 @@ async fn http_session(
     } else {
         0
     };
-    if public && charge_public_reply(&admission, body.len(), explorer_work).is_err() {
-        // Never a cooldown: the node chose the reply's size. The request has
-        // already run, so this is no admission refusal and keeps the status
-        // its result had: 429 and 503 promise that nothing ran, and a
-        // broadcast whose reply is replaced here may already be relayed.
-        body = serde_json::to_vec(&rpc_error(
-            "public response byte budget exhausted; try again",
-        ))?;
-    }
+    // Held until the reply is written.
+    let _held = match (&http.replies, public) {
+        (Some(replies), true) => settle_public_reply(
+            &admission,
+            replies,
+            &mut body,
+            explorer_work,
+            reserved,
+            rpc_error,
+        )?,
+        _ => None,
+    };
     let (status, retry_after) = refusal.map_or((200, None), |r| (r.status, r.retry_after));
     write_http_response(
         &mut write,
@@ -8453,6 +8683,17 @@ fn rpc_cost(method: &str, params: &Value) -> usize {
         _ => 0,
     };
     base.saturating_add(recipients).saturating_add(raw_work)
+}
+/// The work of one largest valid request at a capacity of
+/// `transaction_bytes`: a broadcast whose hexadecimal transaction fills the
+/// HTTP body limit pays its raw parsing work, its method base and a full
+/// pool's reselection. RPC work bursts admit it (`allow_rpc_work`), so a
+/// valid transaction is never refused, with a penalty, as larger than a
+/// whole budget.
+fn largest_request_work(transaction_bytes: usize) -> Result<usize> {
+    Ok((transaction_request_bytes(transaction_bytes)? / (2 * 34))
+        .saturating_add(MAX_MEMPOOL + 1)
+        .saturating_add(pool_change_work(MAX_ADAPTIVE_MEMPOOL + MAX_BACKLOG)))
 }
 
 #[cfg(test)]
@@ -8567,6 +8808,182 @@ mod capacity_work_tests {
             decode(&body)["error"]["message"],
             "transaction admission is busy"
         );
+    }
+
+    #[test]
+    fn a_largest_valid_broadcast_fits_every_rpc_work_burst() {
+        // At the governed maximum and at 8 MiB, a broadcast filling the HTTP
+        // body limit with its hexadecimal transaction, against a full pool,
+        // was charged more than the private burst (1,048,576) and a public
+        // visitor's (197,632): refused for good with a penalty.
+        for capacity in [crate::config::MAX_GOVERNED_BLOCK_BYTES as usize, 8 << 20] {
+            let raw = "00".repeat(transaction_request_bytes(capacity).unwrap() / 2 - 64);
+            let cost = rpc_cost("broadcasttransaction", &json!({ "raw": raw }))
+                + pool_change_work(MAX_ADAPTIVE_MEMPOOL + MAX_BACKLOG);
+            let largest = largest_request_work(capacity).unwrap();
+            assert!(cost <= largest, "{cost} > {largest}");
+            assert!(largest > 197_632);
+            for guard in [NetworkGuard::default(), NetworkGuard::for_public_web()] {
+                let guard = Arc::new(guard);
+                guard.set_frame(MAX_RESPONSE_FRAME).unwrap();
+                guard.allow_rpc_work(largest).unwrap();
+                let session = guard
+                    .admit("127.0.0.1".parse().unwrap(), Surface::Rpc)
+                    .unwrap();
+                if session.proxied() {
+                    session
+                        .forwarded_for("198.51.100.5".parse().unwrap())
+                        .unwrap();
+                }
+                session.work(cost).unwrap();
+            }
+        }
+        // At launch capacity the allowance changes no burst.
+        assert!(largest_request_work(16 * 1024).unwrap() < 131_072);
+    }
+
+    #[test]
+    fn short_replies_must_be_written_within_seconds_and_long_ones_within_the_deadline() {
+        assert_eq!(reply_write_deadline(0), REPLY_WRITE_BASE);
+        // A script of about 200 KiB that a client never reads holds its
+        // session about 8 seconds, not the whole 15-second I/O deadline.
+        let script = include_bytes!("../ui/app.js").len();
+        let deadline = reply_write_deadline(script);
+        assert!(
+            deadline > REPLY_WRITE_BASE + Duration::from_secs(2) && deadline < IO_TIMEOUT,
+            "{deadline:?}"
+        );
+        assert_eq!(reply_write_deadline(MAX_RESPONSE_FRAME), IO_TIMEOUT);
+        assert_eq!(reply_write_deadline(usize::MAX), IO_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_full_public_pool_closes_the_oldest_session_of_the_network_holding_most() {
+        let pool = PublicSessions::new(4);
+        let net = |n: u8| Some(IpAddr::from([198, 51, n, 0]));
+        // Each session's task never ends by itself, like one whose client
+        // never reads its reply.
+        let open = |network| {
+            let slot = pool.acquire(network)?;
+            let task = tokio::spawn(std::future::pending::<()>());
+            pool.attach(slot.id, task.abort_handle());
+            Some((slot, task))
+        };
+        // One network holds three of four sessions, as a few addresses
+        // holding unread replies would; another holds the fourth. Before,
+        // every newcomer was refused until their deadlines ran out.
+        let (first, oldest) = open(net(1)).unwrap();
+        let (second, next) = open(net(1)).unwrap();
+        let rest = [open(net(1)).unwrap(), open(net(2)).unwrap()];
+        // A newcomer from a third network closes the first one's oldest.
+        let third = open(net(3)).unwrap();
+        assert!(oldest.await.unwrap_err().is_cancelled());
+        // The first network, now at two, cannot take another place, and
+        // neither can the second, holding one.
+        assert!(open(net(1)).is_none() && open(net(2)).is_none());
+        // The loopback proxy's newcomers count as a network holding none.
+        let proxied = open(None).unwrap();
+        assert!(next.await.unwrap_err().is_cancelled());
+        // Each network now holds one place: nobody can take another's.
+        assert!(open(net(4)).is_none() && open(None).is_none());
+        // The proxy's own sessions are never closed this way.
+        drop((first, second, rest, third));
+        let proxy: Vec<_> = (0..3).map(|_| open(None).unwrap()).collect();
+        assert!(open(net(5)).is_none());
+        drop((proxy, proxied));
+        assert!(open(net(5)).is_some());
+    }
+
+    #[test]
+    fn explorer_reply_work_is_paid_even_when_its_bytes_are_refused() {
+        const MIB: usize = 1024 * 1024;
+        let guard = Arc::new(NetworkGuard::for_public_web());
+        let visitor = guard
+            .admit("198.51.100.30".parse().unwrap(), Surface::Rpc)
+            .unwrap();
+        let replies = Arc::new(Semaphore::new(PUBLIC_REPLY_MEMORY_KIB));
+        let error = |message: &str| json!({"error": message});
+        // The reservation at the governed maximum: a whole page budget.
+        let reserve = explorer_reply_reserve(crate::config::MAX_GOVERNED_BLOCK_BYTES as usize);
+        assert_eq!(reserve, 32 * 1024);
+        // The visitor spends its byte burst, so its next reply's bytes are
+        // refused. Its explorer page's work was reserved before the page was
+        // built, so the 16,384 units the 16 MiB page pays stay paid.
+        visitor.outgoing(66 * MIB / 8, 0).unwrap();
+        visitor.outgoing(0, reserve).unwrap();
+        let mut body = vec![b'x'; 16 * MIB];
+        let held =
+            settle_public_reply(&visitor, &replies, &mut body, 16 * 1024, reserve, error).unwrap();
+        assert!(held.is_none());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"],
+            "public response byte budget exhausted; try again"
+        );
+        assert_eq!(replies.available_permits(), PUBLIC_REPLY_MEMORY_KIB);
+        // Without that payment the whole 131,072-unit burst would remain.
+        assert!(visitor.outgoing(0, 131_072 - 8 * 1024).is_err());
+        // A page smaller than the reservation pays only its own work, and
+        // its bytes are held against the reply allowance until written.
+        let reader = guard
+            .admit("198.51.101.30".parse().unwrap(), Surface::Rpc)
+            .unwrap();
+        reader.outgoing(0, reserve).unwrap();
+        let mut body = vec![b'x'; MIB];
+        let held = settle_public_reply(&reader, &replies, &mut body, 1024, reserve, error).unwrap();
+        assert_eq!(body.len(), MIB);
+        assert_eq!(replies.available_permits(), PUBLIC_REPLY_MEMORY_KIB - 1024);
+        reader.outgoing(0, 131_072 - 2 * 1024).unwrap();
+        // Past the allowance a reply is replaced at once rather than held.
+        let crowded = Arc::new(Semaphore::new(512));
+        let mut body = vec![b'x'; MIB];
+        let other = guard
+            .admit("198.51.102.30".parse().unwrap(), Surface::Rpc)
+            .unwrap();
+        let _held_elsewhere = crowded.clone().try_acquire_many_owned(256).unwrap();
+        assert!(
+            settle_public_reply(&other, &crowded, &mut body, 0, 0, error)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"],
+            "public replies are busy; try again"
+        );
+        drop(held);
+        assert_eq!(replies.available_permits(), PUBLIC_REPLY_MEMORY_KIB);
+        // A short reply, such as a broadcast's, needs no allowance: it is
+        // never replaced, however many large replies wait.
+        let _rest = crowded.clone().try_acquire_many_owned(256).unwrap();
+        assert_eq!(crowded.available_permits(), 0);
+        let mut body = vec![b'x'; PUBLIC_REPLY_UNHELD];
+        assert!(
+            settle_public_reply(&other, &crowded, &mut body, 0, 0, error)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(body.len(), PUBLIC_REPLY_UNHELD);
+    }
+
+    #[test]
+    fn explorer_reservations_follow_capacity_and_leave_room_for_parallel_pages() {
+        // At launch capacity a page reserves the work of 50 records of a
+        // 16 KiB transaction (128 KiB each), not that of a whole 32 MiB page
+        // budget, so a browser's parallel explorer calls, each with its
+        // method price, fit one visitor's work burst together.
+        let launch = explorer_reply_reserve(16 * 1024);
+        assert_eq!(launch, 6_400);
+        let price = rpc_cost("explorer_mail", &json!({}));
+        let guard = Arc::new(NetworkGuard::for_public_web());
+        let visitor = guard
+            .admit("198.51.100.40".parse().unwrap(), Surface::Rpc)
+            .unwrap();
+        for _ in 0..network_guard::PUBLIC_WEB_VISITOR_SESSIONS {
+            visitor.work(price).unwrap();
+            visitor.outgoing(0, launch).unwrap();
+        }
+        // Larger capacities reserve more, up to the page budget.
+        assert_eq!(explorer_reply_reserve(1 << 20), JSON_PAGE_BYTES / 1024);
+        assert_eq!(explorer_reply_reserve(usize::MAX), JSON_PAGE_BYTES / 1024);
     }
 
     #[test]

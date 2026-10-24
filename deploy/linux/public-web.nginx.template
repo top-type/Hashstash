@@ -8,8 +8,9 @@
 # Every visitor reaches the restricted listener from 127.0.0.1. The node tells
 # them apart only by the X-Real-IP header set below, which must overwrite any
 # client-supplied value. All visitors together share one admission record of
-# 32 sessions and 131,072 work units/s (burst 1,048,576), a quarter of which is
-# kept for wallet polls, quotes, preparation and broadcast; each visitor's own
+# 32 sessions and 131,072 work units/s (burst 1,048,576), a quarter of whose
+# request, byte and work bursts is kept for wallet polls, quotes, preparation
+# and broadcast, which page requests must leave; each visitor's own
 # record allows 6 sessions and a share of the requests, bytes and work (an
 # eighth, 16,384 units/s and burst 131,072, while few visitors are active), and
 # one /24 or /48 gets at most four shares. The client chooses a request's cost:
@@ -19,10 +20,23 @@
 # share, and keeping the shared budget empty takes many addresses. The
 # per-client rates below only pace ordinary use; enough addresses can always
 # exhaust a shared quota.
+#
+# There is deliberately no proxy-wide connection limit on clients: one shared
+# counter would let a few addresses that send slowly, or read slowly, hold
+# every place and shut everyone else out. nginx buffers each request body
+# before it contacts the node and each reply as fast as the node sends it, so
+# a slow client holds only its own connection here, never a node session. The
+# upstream's max_conns caps connections to the node at its 32 public sessions;
+# a request finding all of them in use is answered 503 with Retry-After.
 limit_req_zone $binary_remote_addr zone=hashstash_web:10m rate=15r/s;
 limit_req_zone $binary_remote_addr zone=hashstash_rpc:10m rate=2r/s;
 limit_conn_zone $binary_remote_addr zone=hashstash_connections:10m;
-limit_conn_zone $server_name zone=hashstash_upstream:1m;
+
+upstream hashstash_public {
+    # The shared zone makes max_conns one limit for all worker processes.
+    zone hashstash_public 64k;
+    server 127.0.0.1:18483 max_conns=32;
+}
 
 server {
     listen 80 default_server;
@@ -51,11 +65,10 @@ server {
     client_header_timeout 10s;
     keepalive_timeout 15s;
     send_timeout 15s;
+    reset_timedout_connection on;
     # One client gets a browser's six parallel connections, below the node's
-    # per-visitor cap; all clients together get the node's 32 sessions, so
-    # excess requests receive 429 here instead of a reset upstream connection.
+    # per-visitor cap. Connections to the node are capped by the upstream.
     limit_conn hashstash_connections 6;
-    limit_conn hashstash_upstream 32;
     limit_req zone=hashstash_web burst=60 nodelay;
     limit_req_status 429;
     limit_conn_status 429;
@@ -75,20 +88,36 @@ server {
     proxy_connect_timeout 3s;
     proxy_read_timeout 20s;
     proxy_send_timeout 10s;
+    # Keep both on: a slow client must never hold a node session.
+    proxy_request_buffering on;
+    proxy_buffering on;
+    # Every upstream connection in use (nginx answers 502 for that), or the
+    # node restarting: ask the client to retry instead.
+    error_page 502 =503 @busy;
     location = /rpc {
         # The node admits twice the governed BlockBytes plus 128 KiB of JSON
         # (160 KiB at the default 16 KiB). Raise this only after governance
         # enlarges blocks beyond 448 KiB.
         client_max_body_size 1m;
-        # Location limits replace the server-level ones, so both connection
-        # limits are repeated. Sequential callers are paced rather than
-        # refused; floods beyond the burst receive 429.
+        # Location limits replace the server-level ones, so the per-client
+        # connection limit is repeated. Sequential callers are paced rather
+        # than refused; floods beyond the burst receive 429.
         limit_conn hashstash_connections 4;
-        limit_conn hashstash_upstream 32;
         limit_req zone=hashstash_rpc burst=20 delay=10;
-        proxy_pass http://127.0.0.1:18483;
+        proxy_pass http://hashstash_public;
     }
     location / {
-        proxy_pass http://127.0.0.1:18483;
+        proxy_pass http://hashstash_public;
+    }
+    location @busy {
+        # A location with its own add_header inherits none of the server's,
+        # so they are repeated.
+        add_header Retry-After 1 always;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy no-referrer always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+        default_type application/json;
+        return 503 '{"error":{"message":"public web sessions busy; try again"}}';
     }
 }

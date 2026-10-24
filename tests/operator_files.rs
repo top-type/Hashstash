@@ -253,16 +253,76 @@ fn public_web_proxy_names_each_visitor_and_stays_within_node_sessions() {
             .map(|rest| rest.trim_end_matches(';').parse().unwrap())
             .collect()
     };
-    // One client stays within the node's per-visitor cap, and all clients
-    // together within its public session pool, in every proxied location.
-    // The cap is below the pool, so one client never holds all of it.
+    // One client stays within the node's per-visitor cap in every proxied
+    // location. The cap is below the pool, so one client never holds all of it.
     const { assert!(PUBLIC_WEB_VISITOR_SESSIONS < PUBLIC_WEB_SESSIONS) };
     let per_client = limits("hashstash_connections");
     assert!(per_client.len() >= 2, "{per_client:?}");
     for limit in per_client {
         assert!(limit <= PUBLIC_WEB_VISITOR_SESSIONS, "{limit}");
     }
-    assert_eq!(limits("hashstash_upstream"), [PUBLIC_WEB_SESSIONS; 2]);
+    // No connection limit is shared by all clients: a few addresses sending
+    // or reading slowly would hold every place of one shared counter and
+    // shut everyone else out. Every connection-limit key is the client's.
+    assert!(limits("hashstash_upstream").is_empty());
+    for zone in template
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("limit_conn_zone "))
+    {
+        assert!(zone.starts_with("$binary_remote_addr "), "{zone}");
+    }
+    // Connections to the node are capped at the upstream instead, within the
+    // node's public session pool and across all worker processes, and every
+    // proxied location uses that upstream.
+    let upstream = template
+        .split("upstream hashstash_public {")
+        .nth(1)
+        .and_then(|rest| rest.split('}').next())
+        .expect("capped public upstream");
+    assert!(upstream.contains("zone hashstash_public "), "{upstream}");
+    let max_conns: usize = upstream
+        .split("max_conns=")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .and_then(|value| value.parse().ok())
+        .expect("upstream max_conns");
+    assert!(
+        (1..=PUBLIC_WEB_SESSIONS).contains(&max_conns),
+        "{max_conns}"
+    );
+    let passes: Vec<_> = template
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("proxy_pass "))
+        .collect();
+    assert!(passes.len() >= 2, "{passes:?}");
+    assert!(
+        passes
+            .iter()
+            .all(|pass| *pass == "http://hashstash_public;")
+    );
+    // A request finding the upstream full (nginx's 502) is asked to retry.
+    assert!(
+        template
+            .lines()
+            .any(|line| line.trim() == "error_page 502 =503 @busy;")
+    );
+    let busy = template
+        .split("location @busy {")
+        .nth(1)
+        .and_then(|rest| rest.split('}').next())
+        .expect("busy answer");
+    assert!(busy.contains("add_header Retry-After "), "{busy}");
+    // Buffering keeps slow clients off node sessions; it must stay on.
+    for directive in ["proxy_request_buffering", "proxy_buffering"] {
+        assert!(
+            template.contains(&format!("{directive} on;")),
+            "{directive}"
+        );
+        assert!(
+            !template.contains(&format!("{directive} off;")),
+            "{directive}"
+        );
+    }
 }
 
 /// A PowerShell script's `param(...)` block, if it has one. Parentheses after

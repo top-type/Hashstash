@@ -47,6 +47,11 @@ MemoryMax=1G
 # These are operator resource limits, not proof that every valid chain fits.
 # Monitor pressure/OOM restarts and raise them for measured legitimate demand:
 # the account state is held in memory in full and grows with the chain.
+# Peers can also fill memory that normal running does not show, and it grows
+# with the greatest validated block capacity (capacity_allowance in
+# peerstatus): keep MemoryMax at least 128 MiB plus 20 times that capacity
+# above the measured peak. That fits the launch capacity of 16 KiB; raise
+# both limits before governance raises capacity to several MiB (README).
 TasksMax=128
 RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

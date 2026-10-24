@@ -3720,7 +3720,9 @@ pub struct TemplateJob {
     transactions: Vec<Transaction>,
 }
 /// A built template, and how many of its job's transactions it kept: all of
-/// them unless the block could not be finished with them.
+/// them unless the block could not be finished with them. When it kept
+/// fewer, the job's transaction at index `kept` is the first it left out:
+/// the block could not be finished with it, or it no longer applied.
 #[derive(Debug)]
 pub struct TemplateBuild {
     pub block: Block,
@@ -3730,6 +3732,10 @@ impl TemplateJob {
     /// The parent block the template extends.
     pub fn previous(&self) -> Hash {
         self.header.previous
+    }
+    /// The selection the template is built from, in order.
+    pub fn transactions(&self) -> &[Transaction] {
+        &self.transactions
     }
     pub fn build(&self) -> Result<TemplateBuild> {
         self.build_unless(&|| false)
@@ -3760,12 +3766,11 @@ impl TemplateJob {
         // against this parent reproduces its execution. Should one no longer
         // apply, the block keeps the prefix before it.
         let mut applied = 0;
+        let mut refused = None;
         for transaction in &self.transactions {
             unless_stale(stale)?;
-            if execution
-                .apply_verified_transaction(&self.config, transaction)
-                .is_err()
-            {
+            if let Err(error) = execution.apply_verified_transaction(&self.config, transaction) {
+                refused = Some(error);
                 break;
             }
             applied += 1;
@@ -3777,18 +3782,25 @@ impl TemplateJob {
                 let Some(kept) = finisher.prefix(&self.transactions[..applied], stale)? else {
                     return Err(error);
                 };
+                // The search ends with the block finishing without the
+                // transaction at `kept` and failing with it.
                 eprintln!(
-                    "Template kept {} of {} transactions: {error:#}",
+                    "Template kept {} of {} transactions: the block could not be finished with transaction {} ({}): {error:#}",
                     kept.0,
-                    self.transactions.len()
+                    self.transactions.len(),
+                    kept.0,
+                    hex::encode(codec::transaction_id(&self.transactions[kept.0]))
                 );
                 kept
             }
         };
-        if applied < self.transactions.len() && kept == applied {
+        if let Some(error) = refused
+            && kept == applied
+        {
             eprintln!(
-                "Template kept {kept} of {} transactions: a selected transaction no longer applies",
-                self.transactions.len()
+                "Template kept {kept} of {} transactions: transaction {kept} ({}) no longer applies: {error:#}",
+                self.transactions.len(),
+                hex::encode(codec::transaction_id(&self.transactions[kept]))
             );
         }
         let block = self.header.assemble(

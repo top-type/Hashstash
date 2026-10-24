@@ -713,10 +713,15 @@ const MAX_SIDE_SOURCES: usize = 1024;
 /// which the node lock is released: in all, and per lock hold for a block
 /// that would become the tip and for a side block. Every hold of a side
 /// block is charged to the side-validation budgets, which are checked again
-/// before the next.
+/// before the next. A block that would become the tip is never refused, so
+/// its holds are sized by time instead: its first hold replays one step, and
+/// each later one as many as fit REPLAY_HOLD_TIME at the pace the previous
+/// hold measured, at least one and at most REPLAY_STEPS_PER_HOLD (see
+/// [replay_steps_after]).
 const REPLAY_STEPS: usize = 64;
 const REPLAY_STEPS_PER_HOLD: usize = 8;
 const SIDE_REPLAY_STEPS_PER_HOLD: usize = 1;
+const REPLAY_HOLD_TIME: Duration = Duration::from_millis(50);
 /// Spends from accounts that a pending transfer creates, held until that
 /// funding confirms: in all, per sender and per source, and the new tips
 /// one may wait for. They also stay within one block's bytes.
@@ -1138,6 +1143,9 @@ struct Validating {
     blocks: Mutex<HashSet<Hash>>,
     done: std::sync::Condvar,
 }
+/// A block's validation in progress. A submission drops it as soon as the
+/// block is stored, before the admission that storing starts, so a copy or
+/// a child waiting for it goes on at once, and ahead of that admission.
 struct ValidatingClaim<'a> {
     validating: &'a Validating,
     hash: Hash,
@@ -1170,9 +1178,10 @@ impl Drop for ValidatingClaim<'_> {
     }
 }
 
-/// Template builds at once. A build for the tip waits only for another build
-/// of that same parent, whose result it then reuses, so a build that a new
-/// tip overtook never delays the new tip's.
+/// Template builds at once. Each is claimed for the parent it extends. A
+/// build for the tip waits only for another build of that same parent, whose
+/// result it then reuses; a build that a new tip overtook stops at its next
+/// step, so it delays the new tip's by at most the step it is in.
 const MAX_TEMPLATE_BUILDS: usize = 2;
 /// Template builds in progress, by the parent each extends.
 #[derive(Default)]
@@ -1210,6 +1219,29 @@ impl Drop for BuildClaim<'_> {
         drop(running);
         self.builds.done.notify_all();
     }
+}
+
+/// Replay steps for the next node-lock hold of a block that would become
+/// the tip, after a hold that ran `granted` steps in `spent`: as many as fit
+/// REPLAY_HOLD_TIME at that pace, at least one and at most
+/// REPLAY_STEPS_PER_HOLD. After a slow step the next hold runs one.
+fn replay_steps_after(granted: usize, spent: Duration) -> usize {
+    let fit = REPLAY_HOLD_TIME.as_nanos().saturating_mul(granted as u128) / spent.as_nanos().max(1);
+    usize::try_from(fit)
+        .unwrap_or(usize::MAX)
+        .clamp(1, REPLAY_STEPS_PER_HOLD)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run on this thread once a submitted block that became the tip is
+    /// stored, before the admission that storing starts.
+    static BLOCK_STORED_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Run on this thread after each node-lock hold of a block that would
+    /// become the tip; it returns how long to count that hold as.
+    static REPLAY_HOLD_HOOK: std::cell::RefCell<Option<Box<dyn FnMut() -> Duration>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn compact_size_len(n: usize) -> usize {
@@ -1339,6 +1371,10 @@ struct TemplateEntry {
     /// When its build finished, and how long the build took.
     finished: Instant,
     cost: Duration,
+    /// Transactions that builds for this tip could not finish a block with.
+    /// Later builds for the tip leave them out, with their senders' later
+    /// nonces; they stay pooled and are tried again on the next tip.
+    parked: HashSet<Hash>,
 }
 /// How current a template its caller needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1354,6 +1390,8 @@ enum Freshness {
     Throttled,
 }
 /// Template builds one request runs while new tips keep overtaking them.
+/// After these it is served an empty template for the tip then current,
+/// which clears no trades (see [Node::template_shared]).
 const TEMPLATE_BUILD_ATTEMPTS: u32 = 3;
 /// A stored side-branch block whose descendants a peer may still provide,
 /// and the source that delivered it (see `network_guard::peer_source`).
@@ -3482,12 +3520,13 @@ impl Node {
     /// The configured miner's template for the current tip, committing to the
     /// installed selection. Finishing a block clears its batch trades, so the
     /// build runs outside the node lock; the lock is held only to capture the
-    /// selection and to store the result. A request waits only for a build of
-    /// the same parent, whose result it then reuses (see [TemplateBuilds]),
-    /// and a new tip abandons a build for the old one at its next step, so
-    /// new-tip work never waits for an outdated build. The instant returned
-    /// with a template that lags the selection or the tip is when to ask
-    /// again; only Throttled templates lag the selection.
+    /// selection and to store the result. Each build is claimed for the tip
+    /// it extends: a request waits only for a build of the same parent, whose
+    /// result it then reuses (see [TemplateBuilds]), and a new tip abandons a
+    /// build for the old one at its next step, so new-tip work waits for an
+    /// outdated build only until that step ends. The instant returned with a
+    /// template that lags the selection or the tip is when to ask again; only
+    /// Throttled templates lag the selection.
     fn template_shared(&self, freshness: Freshness) -> Result<(Arc<Block>, Option<Instant>)> {
         let served = |i: &Inner| -> Option<(Arc<Block>, Option<Instant>)> {
             let entry = i.template.as_ref()?;
@@ -3504,7 +3543,6 @@ impl Node {
         };
         let mut attempt = 0;
         loop {
-            attempt += 1;
             let parent = {
                 let i = self.locked()?;
                 if let Some(served) = served(&i) {
@@ -3513,34 +3551,54 @@ impl Node {
                 i.chain.tip_hash()
             };
             let _build = self.template_builds.claim(parent);
-            let (job, selection, generation) = {
+            // A new tip needs proof of work, so a repeat is rare. While the
+            // tip keeps moving, as during catch-up, a request stops after
+            // TEMPLATE_BUILD_ATTEMPTS builds rather than holding a build
+            // slot, and a Stratum worker, until it rests. Each of those stops
+            // at the next step once a new tip arrives and starts again on it.
+            // The request is then served an empty template for the tip then
+            // current: it clears no trades, so it runs to its end, holding its
+            // slot only briefly, and is served unstored and due again at
+            // once, so Stratum connections ask for the full template as soon
+            // as their refresh interval allows.
+            let (job, selection, generation, mut parked, empty) = {
                 let mut i = self.locked()?;
                 // Another build may have finished while this one waited.
                 if let Some(served) = served(&i) {
                     return Ok(served);
                 }
+                // A new tip arrived while this one waited: claim that tip
+                // instead, so a build is always claimed for the parent it
+                // extends and a build of it never runs twice at once.
+                if i.chain.tip_hash() != parent {
+                    continue;
+                }
+                attempt += 1;
+                let empty = attempt > TEMPLATE_BUILD_ATTEMPTS;
                 self.refresh_stale_pool(&mut i)?;
-                let job = i.chain.template_job(
-                    self.miner,
-                    i.mempool.clone(),
-                    Self::timestamp(&i.chain),
-                )?;
+                let parked = i
+                    .template
+                    .as_ref()
+                    .filter(|entry| entry.tip == parent)
+                    .map(|entry| entry.parked.clone())
+                    .unwrap_or_default();
+                let transactions = if empty {
+                    Vec::new()
+                } else {
+                    Self::unparked(&i.mempool, &parked)
+                };
+                let job =
+                    i.chain
+                        .template_job(self.miner, transactions, Self::timestamp(&i.chain))?;
                 (
                     job,
                     i.selection_revision,
                     self.tip_generation.load(Ordering::Acquire),
+                    parked,
+                    empty,
                 )
             };
-            // A new tip needs proof of work, so a repeat is rare. While the
-            // tip keeps moving, as during catch-up, a request stops after
-            // TEMPLATE_BUILD_ATTEMPTS builds rather than holding a build
-            // slot, and a Stratum worker, until it rests. Earlier attempts
-            // stop at the next step once a new tip arrives and start again
-            // on it; the last runs to its end and is served unstored, for its
-            // own parent, as if the tip had moved just after it was served,
-            // and Stratum connections ask again when the new tip is published.
-            let last = attempt >= TEMPLATE_BUILD_ATTEMPTS;
-            let stale = || !last && self.tip_generation.load(Ordering::Acquire) != generation;
+            let stale = || !empty && self.tip_generation.load(Ordering::Acquire) != generation;
             let started = Instant::now();
             let built = match job.build_unless(&stale) {
                 Ok(built) => built,
@@ -3548,13 +3606,19 @@ impl Node {
                 Err(error) => return Err(error),
             };
             let finished = Instant::now();
+            // The block was cut short before this transaction: it could not
+            // be finished with it, or it no longer applied (logged by the
+            // build). Later builds for this tip leave it out.
+            if let Some(cut) = job.transactions().get(built.kept) {
+                parked.insert(codec::transaction_id(cut));
+            }
             let block = Arc::new(built.block);
+            if empty {
+                return Ok((block, Some(Instant::now())));
+            }
             let mut i = self.locked()?;
             if i.chain.tip_hash() != job.previous() {
-                if !last {
-                    continue;
-                }
-                return Ok((block, Some(Instant::now())));
+                continue;
             }
             // Current only if the selection did not change meanwhile.
             i.template = Some(TemplateEntry {
@@ -3563,9 +3627,32 @@ impl Node {
                 selection,
                 finished,
                 cost: finished - started,
+                parked,
             });
             return Ok((block, None));
         }
+    }
+    /// `selection` without the `parked` transactions and their senders'
+    /// later nonces, which could not apply without them.
+    fn unparked(selection: &[Transaction], parked: &HashSet<Hash>) -> Vec<Transaction> {
+        if parked.is_empty() {
+            return selection.to_vec();
+        }
+        let mut stopped = HashSet::new();
+        selection
+            .iter()
+            .filter(|tx| {
+                if stopped.contains(&tx.body.sender) {
+                    return false;
+                }
+                if parked.contains(&codec::transaction_id(tx)) {
+                    stopped.insert(tx.body.sender);
+                    return false;
+                }
+                true
+            })
+            .cloned()
+            .collect()
     }
     pub fn submit_transaction(&self, tx: Transaction) -> Result<Hash> {
         self.submit_transaction_from(tx, false)
@@ -3712,10 +3799,13 @@ impl Node {
     fn submit_block_from(&self, block: Block, source: Option<IpAddr>) -> Result<bool> {
         // A parent another worker is still validating is stored first.
         drop(self.validating.settle(&block.header.previous));
-        let _validating = self.validating.claim(codec::block_hash(&block));
+        let validating = self.validating.claim(codec::block_hash(&block));
         // The execution slot of a block that would not become the tip.
         let mut slot = None;
         let mut replay = REPLAY_STEPS;
+        // Replay steps for the next hold of a block that would become the
+        // tip, sized by time (see [replay_steps_after]).
+        let mut per_hold = 1;
         let validation = loop {
             let mut i = self.locked_for_block()?;
             let height = i.chain.tip_height();
@@ -3726,15 +3816,22 @@ impl Node {
                     self.side_permit(&mut slot, source, height)?;
                     SIDE_REPLAY_STEPS_PER_HOLD
                 } else {
-                    REPLAY_STEPS_PER_HOLD
+                    per_hold
                 };
                 granted = steps.min(replay);
                 Ok(Some(granted))
             });
+            let spent = started.elapsed();
             // A side block's checks and replay under the lock are charged
-            // as its execution is.
+            // as its execution is; a block that would become the tip sizes
+            // its next hold by this one's pace.
             if slot.is_some() {
-                self.charge_side(source, started.elapsed());
+                self.charge_side(source, spent);
+            } else if granted > 0 {
+                #[cfg(test)]
+                let spent = REPLAY_HOLD_HOOK
+                    .with(|hook| hook.borrow_mut().as_mut().map_or(spent, |hook| hook()));
+                per_hold = replay_steps_after(granted, spent);
             }
             match begun {
                 Ok(Some(validation)) => break validation,
@@ -3811,6 +3908,16 @@ impl Node {
         let funded = Self::reconsider_awaiting(&mut i, &funding);
         let block_bytes = i.chain.tip_state().settings.block_bytes;
         drop(i);
+        // The block is stored. A copy or child waiting for its validation
+        // goes on now and asks for the node lock as a block submission, so
+        // the admission below yields to it.
+        drop(validating);
+        #[cfg(test)]
+        BLOCK_STORED_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
         // Spends whose funding just confirmed, and relayed newcomers that
         // waited for the block, go through admission now.
         self.queue_admissions(funded, block_bytes);
@@ -4016,12 +4123,16 @@ impl Node {
         // Mining rewards affect the complete post-state commitment. Build a new
         // candidate without changing the configured miner or its Stratum
         // cache, finished outside the node lock like every template.
-        let candidate = {
-            let _build = self
-                .template_builds
-                .claim(self.read_view()?.chain.tip_hash());
+        let candidate = loop {
+            let parent = self.locked()?.chain.tip_hash();
+            let _build = self.template_builds.claim(parent);
             let job = {
                 let i = self.locked()?;
+                // A new tip arrived while this waited: claim that tip
+                // instead, so the build is claimed for the parent it extends.
+                if i.chain.tip_hash() != parent {
+                    continue;
+                }
                 let candidates: Vec<Transaction> = i.pending().cloned().collect();
                 let selection = i.chain.select_admission(
                     recipient,
@@ -4035,7 +4146,7 @@ impl Node {
                     Self::timestamp(&i.chain),
                 )?
             };
-            job.build()?.block
+            break job.build()?.block;
         };
         let block = Chain::mine(candidate, max_attempts)?;
         self.submit_block(block.clone())?;

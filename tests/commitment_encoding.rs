@@ -59,9 +59,10 @@ fn map_roots_match_independent_trie_vectors() {
         let bytes = codec::encode(&forward);
         let restored: Map<u64> = codec::decode(&bytes, bytes.len()).unwrap();
         assert_eq!(hex::encode(restored.root()), expected);
+        // Inclusion proofs are crate-internal test helpers (audit L065); the
+        // tree module's own tests verify them.
         for (key, value) in &entries {
-            let proof = forward.proof(key).unwrap();
-            assert!(proof.verify(key, value, &restored.root()));
+            assert_eq!(restored.get(key), Some(value));
         }
     }
 }

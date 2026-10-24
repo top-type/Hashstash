@@ -538,10 +538,32 @@ impl<V> Map<V> {
         it
     }
 
+    /// The number of trie branches above `key`'s leaf, if it is present. A
+    /// diagnostic for depth bounds; it proves nothing.
+    #[doc(hidden)]
+    pub fn depth(&self, key: &[u8]) -> Option<usize> {
+        let entry = self.entry(key)?;
+        let (mut depth, mut next) = (0, self.trie.as_ref()?);
+        while let Trie::Branch(b) = next {
+            depth += 1;
+            next = &b.children[side(&entry.path, b.bit)];
+        }
+        Some(depth)
+    }
+
     /// An inclusion proof commits to a value, not to a particular serialization
     /// of an in-memory tree. The caller supplies the independently trusted root.
     /// Its length is the key's depth in the trie.
-    pub fn proof(&self, key: &[u8]) -> Option<Proof> {
+    ///
+    /// Test-only (audit L065): nothing in the node serves proofs. They are
+    /// inclusion-only, so a missing or failed proof says nothing about
+    /// absence, and they do not name their map: every state map uses the same
+    /// trie tags, and `proposals` and `actions` share keys, so a verifier would
+    /// have to take the root from the matching position of the state
+    /// commitment. Proofs exposed to clients need a map identifier and
+    /// non-membership proofs first.
+    #[cfg(test)]
+    pub(crate) fn proof(&self, key: &[u8]) -> Option<Proof> {
         let entry = self.entry(key)?;
         let mut path = Vec::new();
         let mut next = self.trie.as_ref()?;
@@ -642,20 +664,23 @@ impl<'de, V: Clone + Serialize + Deserialize<'de>> Deserialize<'de> for Map<V> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProofStep {
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProofStep {
     /// The branch's bit; the proven key's path selects its side.
     pub bit: u8,
     /// The root of the branch's other child.
     pub sibling: Hash,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Proof {
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Proof {
     /// Root-to-leaf branches above the proven entry's leaf.
     pub path: Vec<ProofStep>,
 }
 
+#[cfg(test)]
 impl Proof {
     pub fn verify<V: Serialize>(&self, key: &[u8], value: &V, expected_root: &Hash) -> bool {
         if !self.path.is_sorted_by(|a, b| a.bit < b.bit) {
@@ -936,6 +961,7 @@ mod tests {
         let map = populated(0..200);
         for n in 0..200 {
             let proof = map.proof(&key(n)).unwrap();
+            assert_eq!(map.depth(&key(n)), Some(proof.path.len()));
             assert!(proof.verify(&key(n), &(n as u64 * 3), &map.root()));
             assert!(!proof.verify(&key(n), &(n as u64 * 3 + 1), &map.root()));
             assert!(!proof.verify(&key(n + 1), &(n as u64 * 3), &map.root()));
@@ -952,10 +978,13 @@ mod tests {
             assert!(!modified.verify(&key(n), &(n as u64 * 3), &map.root()));
         }
         assert!(map.proof(&key(500)).is_none());
+        assert_eq!(map.depth(&key(500)), None);
         // A lone entry's proof is empty.
         let one = populated(5..6);
         let proof = one.proof(&key(5)).unwrap();
         assert!(proof.path.is_empty());
+        assert_eq!(one.depth(&key(5)), Some(0));
+        assert_eq!(Map::<u64>::new().depth(&key(5)), None);
         assert!(proof.verify(&key(5), &15u64, &one.root()));
     }
 

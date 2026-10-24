@@ -74,7 +74,7 @@ fn build(k: &Keys, with_root: bool) -> Map<u64> {
 
 /// A key's depth: the number of trie branches above its leaf.
 fn depth(map: &Map<u64>, key: &[u8]) -> usize {
-    map.proof(key).unwrap().path.len()
+    map.depth(key).unwrap()
 }
 
 fn max_depth<'a>(map: &Map<u64>, keys: impl IntoIterator<Item = &'a Vec<u8>>) -> usize {
@@ -220,10 +220,7 @@ fn bench_map_at_100k_entries() {
     }
     let build = started.elapsed();
     let keys: Vec<_> = (0..ENTRIES).map(key).collect();
-    let depths: Vec<usize> = keys
-        .iter()
-        .map(|k| map.proof(k).unwrap().path.len())
-        .collect();
+    let depths: Vec<usize> = keys.iter().map(|k| map.depth(k).unwrap()).collect();
     let mean = depths.iter().sum::<usize>() as f64 / depths.len() as f64;
     let deepest = *depths.iter().max().unwrap();
 

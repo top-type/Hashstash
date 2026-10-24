@@ -56,7 +56,7 @@ fn shared_bits(a: &[u8; 32], b: &[u8; 32]) -> usize {
 }
 
 fn depth(map: &Map<u64>, key: &[u8]) -> usize {
-    map.proof(key).map_or(0, |proof| proof.path.len())
+    map.depth(key).unwrap_or(0)
 }
 
 fn main() {

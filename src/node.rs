@@ -4498,16 +4498,16 @@ impl Node {
     /// Answer a header request from this node's active chain.
     #[cfg(test)]
     fn headers_reply(&self, locator: &[Hash], version: u8) -> Result<PeerPacket> {
-        self.headers_reply_within(locator, version, Ok)
+        self.headers_reply_within(locator, version, |_| Ok(()))
     }
-    /// Answer a header request from this node's active chain. `charge` is
-    /// given the number of headers planned, before any is read, and returns
-    /// how many of them the requester's budget pays for.
+    /// Answer a header request from this node's active chain. `charge` pays
+    /// for the number of headers the reply will carry before any is read; a
+    /// refusal ends the reply unbuilt.
     fn headers_reply_within(
         &self,
         locator: &[Hash],
         version: u8,
-        charge: impl FnOnce(usize) -> Result<usize>,
+        charge: impl FnOnce(usize) -> Result<()>,
     ) -> Result<PeerPacket> {
         let (chain, (height, hash, planned)) = {
             let i = self.locked()?;
@@ -4516,11 +4516,11 @@ impl Node {
                 Self::header_reply_plan(&i.chain, locator)?,
             )
         };
-        let count = charge(planned)?.min(planned);
+        charge(planned)?;
         Ok(PeerPacket::Headers {
             chain,
             version: version.min(peer_wire::TRANSPORT_VERSION),
-            headers: self.headers_from(height, hash, count)?,
+            headers: self.headers_from(height, hash, planned)?,
         })
     }
     /// Follow a header reply from `peer`, an outbound peer this node asked.
@@ -7181,10 +7181,12 @@ async fn header_request_async(node: &Node, peer: SocketAddr) -> Result<PeerPacke
     .context("peer header worker failed")?
 }
 /// A header reply built on a peer worker. Its headers are paid for from
-/// `admission`'s budget before any is read, one work unit each: as many as
-/// that budget admits, halving from those planned down to one, so a
-/// requester whose budget is spent receives a shorter reply rather than
-/// one built and then refused. An exhausted budget never penalizes it.
+/// `admission`'s budget before any is read, one work unit each, so a reply
+/// is never built and then refused. A budget that cannot pay for the whole
+/// reply ends the session unbuilt, never penalizing the requester. The
+/// reply is not shortened instead: a requester that is holding a counted
+/// branch takes a short reply for a chain that now ends short of what it
+/// counted, and would end its download.
 async fn headers_reply_async(
     node: &Node,
     locator: Vec<Hash>,
@@ -7196,14 +7198,7 @@ async fn headers_reply_async(
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         node.headers_reply_within(&locator, version, |planned| {
-            let mut count = planned;
-            loop {
-                match admission.outgoing(0, count.max(1)) {
-                    Ok(()) => return Ok(count),
-                    Err(error) if count <= 1 => return Err(error),
-                    Err(_) => count /= 2,
-                }
-            }
+            admission.outgoing(0, planned.max(1))
         })
     })
     .await
@@ -14007,15 +14002,69 @@ mod peer_tests {
         (address, task)
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn header_replies_are_paid_for_before_they_are_read() {
+    #[test]
+    fn header_replies_are_paid_for_before_any_header_is_read() {
+        const LENGTH: usize = 300;
         let dir = tempfile::tempdir().unwrap();
         let config = Config::devnet();
         let node = node_on(&dir.path().join("node.db"), &config, |chain| {
-            for _ in 0..peer_wire::MAX_HEADERS {
+            for _ in 0..LENGTH {
                 advance(chain, crypto::public_key(&[61; 32]).unwrap());
             }
         });
+        let genesis = node.locked().unwrap().chain.hash_at_height(0).unwrap();
+        let version = peer_wire::TRANSPORT_VERSION;
+        let reads = || crate::chain::HEADER_READS.with(std::cell::Cell::get);
+        // A reply is planned from its locator alone and paid for before any
+        // header is read, so a refused payment reads none. Replies used to be
+        // read in full under the node lock and refused only when written.
+        let before = reads();
+        let mut planned = None;
+        let refused = node.headers_reply_within(&[genesis], version, |count| {
+            planned = Some(count);
+            Err(anyhow!("outgoing network budget exhausted"))
+        });
+        assert!(refused.is_err());
+        assert_eq!((planned, reads()), (Some(LENGTH), before));
+        let PeerPacket::Headers { headers, .. } = node
+            .headers_reply_within(&[genesis], version, |_| Ok(()))
+            .unwrap()
+        else {
+            panic!("not a header reply")
+        };
+        assert_eq!((headers.len(), reads() - before), (LENGTH, LENGTH));
+        assert_eq!(headers[0].previous, genesis);
+        for pair in headers.windows(2) {
+            assert_eq!(pair[1].previous, header_hash(&pair[0]));
+        }
+        // A requester catching up on this chain, whose locator opens with
+        // its tip and that tip's parent, learns that this chain extends its
+        // tip from one header rather than from a full reply it would discard.
+        let i = node.locked().unwrap();
+        let at = |height| i.chain.hash_at_height(height).unwrap();
+        let plan = |locator: &[Hash]| Node::header_reply_plan(&i.chain, locator).unwrap();
+        assert_eq!(plan(&[at(10), at(9), at(0)]), (10, at(10), 1));
+        // Otherwise the reply holds every header after the match, up to
+        // MAX_HEADERS: after a sparse locator, or after a cursor listed first.
+        let after = LENGTH - 10;
+        assert_eq!(plan(&[at(10), at(0)]), (10, at(10), after));
+        assert_eq!(plan(&[at(10), [9; 32], at(9)]), (10, at(10), after));
+        assert_eq!(plan(&[at(0)]), (0, genesis, LENGTH));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_peer_that_leaves_between_messages_is_not_cooled_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        let node = Node::open(
+            &dir.path().join("node.db"),
+            config.clone(),
+            crypto::public_key(&[73; 32]).unwrap(),
+        )
+        .unwrap();
+        for _ in 0..20 {
+            node.mine(100_000).unwrap();
+        }
         let genesis = node.locked().unwrap().chain.hash_at_height(0).unwrap();
         let limits = node.peer_limits().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -14024,11 +14073,6 @@ mod peer_tests {
             .unwrap();
         let (stream, remote) = listener.accept().await.unwrap();
         let admission = node.guard.admit(remote.ip(), Surface::Peer).unwrap();
-        // The address has spent its work budget, which then refills for a
-        // little over a hundred headers before the request arrives.
-        while admission.outgoing(0, 1024).is_ok() {}
-        while admission.outgoing(0, 1).is_ok() {}
-        tokio::time::sleep(Duration::from_millis(8)).await;
         let session = tokio::spawn(peer_session(node.clone(), stream, admission, None));
         let request = PeerPacket::GetHeaders {
             chain: config.chain_id(),
@@ -14037,39 +14081,19 @@ mod peer_tests {
             locator: vec![genesis],
         };
         send_packet(&mut client, &request, limits).await;
-        // The full reply would have been read under the node lock and then
-        // refused, ending the session without an answer. The reply's work is
-        // paid first instead, and the reply shortened to what the budget pays.
         let Some(PeerPacket::Headers { headers, .. }) = receive_packet(&mut client, limits).await
         else {
             panic!("no header reply")
         };
-        assert!(
-            !headers.is_empty() && headers.len() < peer_wire::MAX_HEADERS,
-            "{}",
-            headers.len()
-        );
-        assert_eq!(headers[0].previous, genesis);
-        for pair in headers.windows(2) {
-            assert_eq!(pair[1].previous, header_hash(&pair[0]));
-        }
-        // Leaving between messages is not a malformed frame: no cooldown.
+        assert_eq!(headers.len(), 20);
+        // The client leaves after a whole reply instead of sending its next
+        // request, as a peer does whose own processing failed. That ends the
+        // session, but it sent nothing malformed: no cooldown, where the end
+        // of stream used to count as a malformed frame.
         drop(client);
-        assert!(session.await.unwrap().is_err());
+        let error = session.await.unwrap().unwrap_err();
+        assert!(error.is::<PeerClosed>(), "{error:#}");
         assert!(node.guard.admit(remote.ip(), Surface::Peer).is_ok());
-        // A requester catching up on this chain, whose locator opens with
-        // its tip and that tip's parent, learns that this chain extends its
-        // tip from one header rather than the full reply it would discard.
-        let i = node.locked().unwrap();
-        let at = |height| i.chain.hash_at_height(height).unwrap();
-        let plan = |locator: &[Hash]| Node::header_reply_plan(&i.chain, locator).unwrap();
-        assert_eq!(plan(&[at(10), at(9), at(0)]), (10, at(10), 1));
-        // Otherwise the reply holds every header after the match, up to
-        // MAX_HEADERS: after a sparse locator, or a cursor listed first.
-        let after = peer_wire::MAX_HEADERS - 10;
-        assert_eq!(plan(&[at(10), at(0)]), (10, at(10), after));
-        assert_eq!(plan(&[at(10), [9; 32], at(9)]), (10, at(10), after));
-        assert_eq!(plan(&[at(0)]).2, peer_wire::MAX_HEADERS);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -242,6 +242,8 @@ thread_local! {
         const { RefCell::new(None) };
     /// Commits of admitted held headers on this thread.
     pub(crate) static HELD_COMMITS: Cell<usize> = const { Cell::new(0) };
+    /// Stored headers read from the header index on this thread.
+    pub(crate) static HEADER_READS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Digest of the running executable. A saved checkpoint is used only by the
@@ -2682,6 +2684,8 @@ impl Chain {
     /// A stored block's header, from the header index without its body. A
     /// header reply reads thousands, so they bypass the metadata cache.
     pub fn block_header(&self, hash: &Hash) -> Result<Option<Header>> {
+        #[cfg(test)]
+        HEADER_READS.with(|count| count.set(count.get() + 1));
         Ok(Self::read_entry(&self.db, hash)?.map(|entry| entry.header.clone()))
     }
     /// The locator entry for a peer download cursor: a stored block, a held

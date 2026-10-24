@@ -149,6 +149,13 @@ fn deep_ancestor_reconstruction_costs_its_depth_not_the_chain_height() {
     }
     let tip = chain.tip_hash();
     drop(chain);
+    // The clean stop saved a state checkpoint, which a start from it would
+    // retain alone below its height; without one this build saved, as at
+    // the first start after an upgrade, startup replays all history.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DELETE FROM state_checkpoint_parts; DELETE FROM state_checkpoints;")
+        .unwrap();
     // A freshly started node answers from the checkpoints its startup replay kept.
     let mut chain = Chain::open(&path, config).unwrap();
     assert_eq!(chain.tip_hash(), tip);

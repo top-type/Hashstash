@@ -356,7 +356,7 @@ fn selection_ranks_whole_exact_miner_earnings_per_weight() {
 }
 
 #[test]
-fn zero_percent_selection_has_deterministic_nonmonetary_ties() {
+fn zero_percent_selection_ranks_signed_fees_then_transaction_ids() {
     let d = tempfile::tempdir().unwrap();
     let c = chain_config(0);
     let mut chain = Chain::open(&d.path().join("zero.sqlite"), c.clone()).unwrap();
@@ -367,19 +367,30 @@ fn zero_percent_selection_has_deterministic_nonmonetary_ties() {
     assert!(balance(s, &OWNER) > fees::quote(&c, s, &big).unwrap().fee);
     assert!(fees::quote(&c, s, &small).unwrap().miner_fee.is_zero());
     assert!(fees::quote(&c, s, &big).unwrap().miner_fee.is_zero());
-    let expected = if codec::transaction_id(&small) < codec::transaction_id(&big) {
+    let select = |candidates: &[Transaction]| {
+        chain
+            .select_transactions(key(&OWNER), candidates, 1)
+            .unwrap()
+            .transactions
+    };
+    // Neither bid earns the miner anything, so the higher signed fee per
+    // weight unit ranks first, whatever the candidate order or the IDs; a
+    // same-nonce replacement that raises it therefore outranks what it
+    // replaces.
+    for candidates in [[small.clone(), big.clone()], [big.clone(), small.clone()]] {
+        assert_eq!(select(&candidates), vec![big.clone()]);
+    }
+    // Equal bids are ordered by transaction ID.
+    let twin = transfer(&c, s, key(&OWNER), 0, 0);
+    assert_eq!(twin.body, small.body);
+    assert_ne!(codec::transaction_id(&twin), codec::transaction_id(&small));
+    let expected = if codec::transaction_id(&small) < codec::transaction_id(&twin) {
         small.clone()
     } else {
-        big.clone()
+        twin.clone()
     };
-    for candidates in [[small.clone(), big.clone()], [big, small]] {
-        assert_eq!(
-            chain
-                .select_transactions(key(&OWNER), &candidates, 1)
-                .unwrap()
-                .transactions,
-            vec![expected.clone()]
-        );
+    for candidates in [[small.clone(), twin.clone()], [twin, small]] {
+        assert_eq!(select(&candidates), vec![expected.clone()]);
     }
 }
 

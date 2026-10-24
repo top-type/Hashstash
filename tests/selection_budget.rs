@@ -283,9 +283,10 @@ fn repeated_state_failures_have_a_linear_per_sender_operation_budget() {
     candidates.extend(valid.iter().rev().cloned());
     let result = chain.select_transactions(key(), &candidates, 256).unwrap();
     assert!(result.budget_exhausted);
+    // Their sender also gets one last attempt once nothing else is ready.
     assert_eq!(
         result.execution_attempts,
-        valid.len() + failing * SELECTION_ATTEMPTS_PER_CANDIDATE
+        valid.len() + failing * SELECTION_ATTEMPTS_PER_CANDIDATE + 1
     );
     assert_eq!(result.signatures_checked, candidates.len());
     assert_eq!(result.transactions, valid);

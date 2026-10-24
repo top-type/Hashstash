@@ -77,7 +77,7 @@ fn nonce(node: &Node, account: &PublicKey) -> u64 {
 /// poisoned node lock ends the whole process.
 fn pool(node: &Node) -> (Vec<Transaction>, Vec<Transaction>, Hash) {
     let i = node.locked().unwrap();
-    (i.mempool.clone(), i.backlog.clone(), i.pool_tip)
+    (i.mempool.to_vec(), i.backlog.to_vec(), i.pool_tip)
 }
 fn published(node: &Node) -> u64 {
     *node.work_updates.borrow()
@@ -312,7 +312,7 @@ fn relay_selects_and_publishes_only_for_new_admissible_entries() {
         );
     }
     assert_eq!(published(&node), revision);
-    assert_eq!(snapshot(&node).mempool, vec![pooled.clone()]);
+    assert_eq!(snapshot(&node).mempool.to_vec(), vec![pooled.clone()]);
     // A pool change ends a pool-scoped refusal, never a stale-state one; the
     // underbid replacement is refused again by its rule alone.
     let other_payment = payment(config, state, &OTHER, nonce(&node, &other()), key(), 1, 0);
@@ -394,7 +394,7 @@ fn a_relayed_nonce_gap_is_not_remembered_and_its_chain_is_admitted_together() {
             .contains_key(&codec::transaction_id(&second))
     );
     assert_eq!(deliver(vec![first.clone(), second.clone()]), 1);
-    assert_eq!(snapshot(&node).mempool, vec![first, second]);
+    assert_eq!(snapshot(&node).mempool.to_vec(), vec![first, second]);
 }
 
 #[test]
@@ -476,7 +476,7 @@ fn reorg_recovery_is_one_selection_without_rechecking_reincluded_transactions() 
     // pooled and detached ones when their blocks executed: none is rechecked.
     assert_eq!(selections(), 1);
     assert_eq!(signatures(), 0);
-    assert_eq!(snapshot(&node).mempool, vec![pending.clone()]);
+    assert_eq!(snapshot(&node).mempool.to_vec(), vec![pending.clone()]);
     assert_eq!(node.template().unwrap().transactions, vec![pending]);
 }
 
@@ -512,7 +512,7 @@ fn a_failed_recovery_still_reports_the_block_and_keeps_pending_entries() {
     );
     let tip = codec::block_hash(&block);
     assert_eq!(snapshot(&node).chain.tip_hash(), tip);
-    assert_eq!(snapshot(&node).mempool, vec![pending.clone()]);
+    assert_eq!(snapshot(&node).mempool.to_vec(), vec![pending.clone()]);
     assert_ne!(pool(&node).2, tip);
     // The next selection revalidates the kept entries for the new tip.
     assert_eq!(node.template().unwrap().transactions, vec![pending]);
@@ -721,7 +721,7 @@ fn a_new_tip_is_published_once_together_with_its_recovered_pool() {
     assert_eq!(published(&node), revision + 1);
     let view = snapshot(&node);
     assert_eq!(view.chain.tip_hash(), codec::block_hash(&block));
-    assert_eq!(view.mempool, vec![pending]);
+    assert_eq!(view.mempool.to_vec(), vec![pending]);
 }
 
 #[test]
@@ -771,7 +771,12 @@ fn an_entry_that_failed_every_attempt_is_dropped_rather_than_kept_undecided() {
         0,
         1_000,
     );
-    node.locked().unwrap().mempool.push(failing.clone());
+    {
+        let mut i = node.locked().unwrap();
+        let (mut selection, backlog) = (i.mempool.to_vec(), i.backlog.to_vec());
+        selection.push(failing.clone());
+        i.set_pool(selection, backlog);
+    }
     // Reselection retries it after every acceptance until its sender's own
     // budget is spent, which used to mark the whole selection saturated and
     // keep it in the backlog ahead of entries that lost only to capacity.
@@ -1221,7 +1226,7 @@ fn admission_spends_no_curve_work_under_the_node_lock() {
     step("hot wallet submission after failed recovery", &|| {
         Some(wallet_trade(Outcome::Pass, 106))
     });
-    let pending = snapshot(&node).mempool.clone();
+    let pending = snapshot(&node).mempool.to_vec();
     let ((), template) = metered(|| {
         assert_eq!(node.template().unwrap().transactions, pending);
     });
@@ -1306,7 +1311,7 @@ fn equal_rate_replacement_churn_is_refused_without_a_selection() {
     // refused before any selection, and is not reconsidered when resent.
     assert_eq!(selected, 1);
     assert_eq!(published(&node), revision + 1);
-    assert_eq!(snapshot(&node).mempool, vec![variants[0].clone()]);
+    assert_eq!(snapshot(&node).mempool.to_vec(), vec![variants[0].clone()]);
     assert_eq!((churn.under_lock, churn.evaluations), (0, 0));
     relay(&node, variants[1..].to_vec());
     assert!(node.submit_transaction(variants[1].clone()).is_err());
@@ -1326,7 +1331,7 @@ fn equal_rate_replacement_churn_is_refused_without_a_selection() {
     assert!(replaces(config, state, &raised, &variants[0]));
     node.submit_transaction(raised.clone()).unwrap();
     assert_eq!(selections(), 1);
-    assert_eq!(snapshot(&node).mempool, vec![raised.clone()]);
+    assert_eq!(snapshot(&node).mempool.to_vec(), vec![raised.clone()]);
     let (block, _) = metered(|| node.template().unwrap());
     assert_eq!(block.transactions, vec![raised]);
 }
@@ -2215,7 +2220,7 @@ fn a_spend_from_an_account_a_pending_transfer_creates_waits_for_its_funding() {
     let spend = payment(config, state, &fresh, 0, key(), 1, 0);
     let id = node.submit_transaction(spend.clone()).unwrap();
     assert_eq!(awaiting(&node), vec![id]);
-    assert_eq!(snapshot(&node).mempool, vec![funding.clone()]);
+    assert_eq!(snapshot(&node).mempool.to_vec(), vec![funding.clone()]);
     // Without a pending transfer creating its account, a spend is refused.
     let stranger = payment(config, state, &[79; 32], 0, key(), 1, 0);
     let refused = node.submit_transaction(stranger).unwrap_err().to_string();
@@ -2651,4 +2656,471 @@ fn only_a_sources_own_new_block_or_transaction_protects_its_inbound_sessions() {
     relay(message(Vec::new(), vec![block]), second);
     assert!(node.peer_sessions.delivered_recently(first));
     assert!(!node.peer_sessions.delivered_recently(second));
+}
+
+// ---------------------------------------------------------------------------
+// Admission, backlog and selection: ranking, holding bounds and budgets.
+
+/// Install the selection and backlog that `candidates` make, each of them
+/// retained as if pooled before.
+fn install_retained(node: &Node, candidates: &[Transaction]) {
+    let retained = candidates.iter().map(codec::transaction_id).collect();
+    let installed = {
+        let mut i = node.locked().unwrap();
+        Node::select_pool(
+            &i.chain,
+            node.miner,
+            candidates,
+            &retained,
+            &HashSet::new(),
+        )
+        .and_then(|selected| node.install_pool(&mut i, selected))
+    };
+    installed.unwrap();
+}
+/// A payment to `key()` carrying `pad` data bytes, at the exact minimum fee
+/// plus `extra`.
+fn padded(
+    config: &Config,
+    state: &State,
+    secret: &[u8; 32],
+    nonce: u64,
+    pad: usize,
+    extra: u64,
+) -> Transaction {
+    let operation = Operation::TransferExact {
+        recipient: key(),
+        amount: 1u32.into(),
+    };
+    let mut body = unsigned(config, secret, nonce, operation);
+    body.data = vec![0; pad];
+    exact(config, state, secret, body, extra)
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn high_bids_behind_a_low_backlog_entry_never_displace_other_backlog_entries() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    fund_other(&node);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let (start, other_start) = (nonce(&node, &key()), nonce(&node, &other()));
+    // Honest bids that overfill one block, and other()'s lowest bid, too
+    // large for the room they leave; what lost only to capacity waits.
+    let honest: Vec<_> = (0..100)
+        .map(|offset| payment(config, state, &SECRET, start + offset, key(), 1, 20))
+        .collect();
+    let foothold = padded(config, state, &OTHER, other_start, 64, 2);
+    let mut candidates = honest.clone();
+    candidates.push(foothold.clone());
+    install_retained(&node, &candidates);
+    let (_, backlog, _) = pool(&node);
+    let id = codec::transaction_id(&foothold);
+    assert!(ids(&backlog).contains(&id));
+    let waiting = &ids(&backlog) - &ids(&[foothold.clone()]);
+    assert!(waiting.len() > 4, "honest entries wait for capacity");
+    // One relayed batch of high bids behind the foothold, about one block's
+    // bytes, each affordable on its own.
+    let mut chained = Vec::new();
+    let mut bytes = 0;
+    while bytes < 15 * 1024 {
+        let nonce = other_start + 1 + chained.len() as u64;
+        let tx = payment(config, state, &OTHER, nonce, other(), 1, 1_000);
+        bytes += codec::encode(&tx).len();
+        chained.push(tx);
+    }
+    relay(&node, chained.clone());
+    // They cannot be selected before the foothold, so they rank no higher
+    // than it and take no honest entry's place.
+    let (_, backlog, _) = pool(&node);
+    assert!(
+        waiting.is_subset(&ids(&backlog)),
+        "honest backlog entries are kept"
+    );
+    assert!(ids(&backlog).contains(&id));
+    let kept = ids(&backlog).intersection(&ids(&chained)).count();
+    assert!(
+        kept > 0 && kept <= MAX_BACKLOG / BACKLOG_SENDER_SHARE,
+        "{kept}"
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn a_chain_displaced_by_capacity_keeps_its_longest_prefix_in_the_backlog() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let start = nonce(&node, &key());
+    // Equal bids that overfill the block and then the backlog. Kept by
+    // their own bids, in txid order, they used to leave most entries
+    // stranded behind a missing predecessor, and their room unused.
+    let chain: Vec<_> = (0..200)
+        .map(|offset| payment(config, state, &SECRET, start + offset, key(), 1, 100))
+        .collect();
+    install_retained(&node, &chain);
+    let (selection, backlog, _) = pool(&node);
+    let (selected, waiting) = (selection.len(), backlog.len());
+    assert_eq!(selection, chain[..selected].to_vec());
+    assert_eq!(backlog, chain[selected..selected + waiting].to_vec());
+    // The next entry would exceed the backlog's bytes or the sender's share.
+    let size = |tx: &Transaction| codec::encode(tx).len();
+    let left_out = size(&chain[selected + waiting]);
+    let bytes: usize = backlog.iter().map(size).sum();
+    let following = bytes - size(&backlog[0]);
+    assert!(
+        following + left_out > 16 * 1024 / BACKLOG_SENDER_SHARE
+            || bytes + left_out > 16 * 1024,
+        "{waiting} entries, {bytes} bytes"
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn a_public_broadcast_runs_only_while_the_public_budget_has_credit() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let tx = payment(config, state, &SECRET, nonce(&node, &key()), key(), 1, 0);
+    // A broadcast found credit before it queued for the admission lock;
+    // broadcasts that found it too spent it meanwhile.
+    node.admission
+        .unpoisoned()
+        .public
+        .spend(PUBLIC_SELECTION_TIME_BURST * 2, Instant::now());
+    selections();
+    let refused = node.submit_transaction_from(tx.clone(), true).unwrap_err();
+    let limited = refused
+        .downcast_ref::<network_guard::Limited>()
+        .expect("a 429 refusal");
+    assert!(limited.retry_after.is_some_and(|wait| !wait.is_zero()));
+    assert_eq!(selections(), 0, "nothing ran");
+    assert!(pool(&node).0.is_empty());
+    // It was not judged, so nothing remembers it: the operator's own
+    // submission is admitted at once.
+    node.submit_transaction(tx.clone()).unwrap();
+    assert_eq!(pool(&node).0, vec![tx]);
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn a_support_ranked_above_its_pending_proposal_survives_acceptances_between_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let (node, round, _) = auction_node(directory.path());
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let (start, other_start) = (nonce(&node, &key()), nonce(&node, &other()));
+    // other() pays three times and then proposes; the miner supports that
+    // pending proposal at the minimum fee, which ranks the Support above
+    // the payments.
+    let payments: Vec<_> = (0..3)
+        .map(|offset| payment(config, state, &OTHER, other_start + offset, other(), 1, 0))
+        .collect();
+    let description = [74; 32];
+    let proposal = Proposal::Parameter {
+        parameter: Parameter::Lead,
+        old: state.settings.lead,
+        new: state.settings.lead * 2,
+    };
+    let id = crate::state::proposal_id(&state.chain_id, round, &other(), &description, &proposal);
+    let propose = Operation::Propose {
+        round,
+        description,
+        proposal,
+        support: 1u32.into(),
+    };
+    let propose = exact(
+        config,
+        state,
+        &OTHER,
+        unsigned(config, &OTHER, other_start + 3, propose),
+        0,
+    );
+    let support = Operation::Support {
+        round,
+        proposal: id,
+        amount: 1u32.into(),
+    };
+    let support = exact(config, state, &SECRET, unsigned(config, &SECRET, start, support), 0);
+    let rank = |tx: &Transaction| {
+        let quote = fees::quote(config, state, tx).unwrap();
+        crate::chain::Priority::new(&quote, codec::transaction_id(tx))
+    };
+    assert!(payments.iter().all(|payment| rank(&support) < rank(payment)));
+    // Each payment's acceptance retries the failed Support, which spends
+    // its whole attempt budget before the proposal it waits for applies.
+    let mut candidates = payments;
+    candidates.push(propose.clone());
+    candidates.push(support.clone());
+    let selected = {
+        let i = node.locked().unwrap();
+        i.chain
+            .select_admission(
+                node.miner,
+                &candidates,
+                MAX_ADAPTIVE_MEMPOOL,
+                &HashSet::new(),
+            )
+            .map(|selection| selection.transactions)
+    };
+    let selected = selected.unwrap();
+    assert!(selected.contains(&propose));
+    assert_eq!(selected.last(), Some(&support), "{selected:?}");
+    // So the pool keeps it, and the next block includes it.
+    install_retained(&node, &candidates);
+    assert!(pool(&node).0.contains(&support));
+    assert!(node.mine(1_000_000).unwrap().transactions.contains(&support));
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn a_queued_transfer_its_sender_cannot_pay_funds_no_spend() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let (ghost, fresh) = ([86; 32], [87; 32]);
+    // A signed transfer from an account that does not exist waits in the
+    // admission queue while the relay budget is spent.
+    node.admission
+        .unpoisoned()
+        .budget
+        .spend(SELECTION_TIME_BURST * 2, Instant::now());
+    let recipient = crypto::public_key(&fresh).unwrap();
+    relay(
+        &node,
+        vec![payment(config, state, &ghost, 0, recipient, 5_000, 0)],
+    );
+    assert_eq!(queued(&node), 1);
+    // It never creates the account it pays, so no spend from that waits.
+    let spend = payment(config, state, &fresh, 0, key(), 1, 0);
+    let refused = node.submit_transaction(spend).unwrap_err().to_string();
+    assert!(
+        refused.contains("sender account does not exist"),
+        "{refused}"
+    );
+    assert!(awaiting(&node).is_empty());
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn one_source_holds_only_its_share_of_spends_awaiting_funding() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let fresh = [88; 32];
+    let funding = payment(
+        config,
+        state,
+        &SECRET,
+        nonce(&node, &key()),
+        crypto::public_key(&fresh).unwrap(),
+        5_000,
+        0,
+    );
+    node.submit_transaction(funding).unwrap();
+    let spend = |nonce: u64| padded(config, state, &fresh, nonce, 1_000, 0);
+    let bytes = codec::encode(&spend(0)).len();
+    let held = 16 * 1024 / AWAITING_SOURCES / bytes;
+    assert!(held > 0);
+    // One relaying source fills only its own share of the holding bytes.
+    relay_from(&node, "127.0.0.1", (0..8).map(spend).collect(), Vec::new());
+    assert_eq!(awaiting(&node).len(), held);
+    // Local submissions and recovery keep a share of their own.
+    for nonce in 8..8 + held as u64 {
+        node.submit_transaction(spend(nonce)).unwrap();
+    }
+    assert_eq!(awaiting(&node).len(), 2 * held);
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn a_replacement_that_raises_the_signed_fee_outranks_what_it_replaces() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let start = nonce(&node, &key());
+    let quote = |tx: &Transaction| fees::quote(config, state, tx).unwrap();
+    // Fees of 2 and 3 atoms both earn the miner one atom at its half share.
+    // The replacement used to lose whenever the replaced transaction had
+    // the smaller txid.
+    let (old, new) = loop {
+        let old = payment(config, state, &SECRET, start, key(), 1, 1);
+        let new = payment(config, state, &SECRET, start, key(), 1, 2);
+        if codec::transaction_id(&old) < codec::transaction_id(&new) {
+            break (old, new);
+        }
+    };
+    assert_eq!(quote(&old).miner_fee, quote(&new).miner_fee);
+    assert!(new.body.fee > old.body.fee);
+    node.submit_transaction(old).unwrap();
+    node.submit_transaction(new.clone()).unwrap();
+    assert_eq!(pool(&node).0, vec![new.clone()]);
+    // A heavier replacement can raise the signed fee per weight unit enough
+    // while earning the miner less per weight unit; it is refused before
+    // any selection rather than losing one.
+    let second = payment(config, state, &SECRET, start + 1, key(), 1, 1);
+    node.submit_transaction(second.clone()).unwrap();
+    let heavier = (1..400)
+        .map(|pad| padded(config, state, &SECRET, start + 1, pad, 2))
+        .find(|tx| {
+            let (offered, held) = (quote(tx), quote(&second));
+            let signed = raises(
+                state,
+                (&tx.body.fee, offered.weight),
+                (&second.body.fee, held.weight),
+            );
+            signed
+                && &offered.miner_fee * Amount::from(held.weight)
+                    < &held.miner_fee * Amount::from(offered.weight)
+        })
+        .expect("a heavier replacement earning the miner less");
+    assert!(!replaces(config, state, &heavier, &second));
+    selections();
+    assert!(node.submit_transaction(heavier).is_err());
+    assert_eq!(selections(), 0);
+    assert_eq!(pool(&node).0, vec![new, second]);
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn a_resent_invalid_transaction_does_not_hold_back_one_signed_since() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    fund_other(&node);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let other_start = nonce(&node, &other());
+    // An affordable zero transfer never applies. Refused for validity, it
+    // makes a later newcomer at its sender nonce raise its fee rate.
+    let invalid = payment(config, state, &OTHER, other_start, other(), 0, 1_000);
+    relay(&node, vec![invalid.clone()]);
+    assert!(pool(&node).0.is_empty());
+    let variant = payment(config, state, &OTHER, other_start, other(), 0, 1_000);
+    selections();
+    relay(&node, vec![variant]);
+    assert_eq!(selections(), 0, "a variant is refused without a selection");
+    // Once the pool changes, anyone holding the refused bytes resends them.
+    let start = nonce(&node, &key());
+    node.submit_transaction(payment(config, state, &SECRET, start, key(), 1, 0))
+        .unwrap();
+    relay(&node, vec![invalid]);
+    // A transaction its sender signed since, bidding less, still gets its
+    // selection.
+    let signed_since = payment(config, state, &OTHER, other_start, key(), 1, 0);
+    relay(&node, vec![signed_since.clone()]);
+    assert!(pool(&node).0.contains(&signed_since));
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn a_low_bid_at_a_byte_full_pool_is_refused_without_a_selection() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    fund_other(&node);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let start = nonce(&node, &key());
+    let full: Vec<_> = (0..100)
+        .map(|offset| payment(config, state, &SECRET, start + offset, key(), 1, 10))
+        .collect();
+    install_retained(&node, &full);
+    let (selection, backlog, _) = pool(&node);
+    assert!(!backlog.is_empty(), "the selection is full by bytes");
+    assert!(selection.len() < mempool_limit(config).min(config.max_signatures));
+    // A newcomer the selection leaves no room for, which does not outbid
+    // its weakest entry, could enter only by displacing an entry it cannot
+    // displace.
+    let other_start = nonce(&node, &other());
+    let low = padded(config, state, &OTHER, other_start, 64, 0);
+    selections();
+    let refused = node
+        .submit_transaction(low.clone())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("does not outbid its weakest entry"),
+        "{refused}"
+    );
+    relay(&node, vec![low]);
+    assert_eq!(selections(), 0);
+    let high = padded(config, state, &OTHER, other_start, 64, 100);
+    node.submit_transaction(high.clone()).unwrap();
+    assert_eq!(selections(), 1);
+    assert!(pool(&node).0.contains(&high));
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn a_repeated_identity_in_one_admission_answers_its_first_occurrence() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let tx = payment(config, state, &SECRET, nonce(&node, &key()), key(), 1, 0);
+    let newcomer = || Newcomer::new(tx.clone(), None, true);
+    let outcomes = {
+        let mut i = node.locked().unwrap();
+        node.admit_locked(&mut i, vec![newcomer(), newcomer()])
+    };
+    let outcomes = outcomes.unwrap();
+    assert_eq!(outcomes[0].as_ref().ok(), Some(&Admitted::Pending));
+    let repeated = outcomes[1].as_ref().unwrap_err().to_string();
+    assert!(repeated.contains("repeated"), "{repeated}");
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn the_published_pool_shares_the_nodes_own_entries() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let tx = payment(config, state, &SECRET, nonce(&node, &key()), key(), 1, 0);
+    node.submit_transaction(tx.clone()).unwrap();
+    let view = snapshot(&node);
+    let shared = {
+        let i = node.locked().unwrap();
+        Arc::ptr_eq(&view.mempool, &i.shared_pending())
+    };
+    assert!(shared, "a publish copies no transaction");
+    assert_eq!(view.mempool.to_vec(), vec![tx]);
 }

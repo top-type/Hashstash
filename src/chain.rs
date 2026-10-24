@@ -340,7 +340,9 @@ impl Read for PartReader<'_> {
 
 /// Local transaction-selection policy; these are not consensus block limits.
 pub const MAX_SELECTION_CANDIDATES: usize = 8192;
-/// Operation attempts granted to each sender per candidate it submits.
+/// Operation attempts granted to each sender per candidate it submits. A
+/// candidate that failed until its sender's budget ran out also gets one last
+/// attempt once nothing else is ready.
 pub const SELECTION_ATTEMPTS_PER_CANDIDATE: usize = 4;
 #[derive(Debug)]
 pub struct SelectionResult {
@@ -3427,14 +3429,12 @@ impl Chain {
             pending.push(Candidate {
                 transaction,
                 bytes: compact_size_len(bytes.len()) + bytes.len(),
-                priority: Priority {
-                    fee: quote.miner_fee,
-                    weight: quote.weight,
-                    id,
-                },
+                priority: Priority::new(&quote, id),
                 recipient,
                 slot: Slot::Waiting,
                 attempted: false,
+                starved: false,
+                reprieved: false,
             });
         }
         let refs: Vec<_> = pending
@@ -3468,8 +3468,9 @@ impl Chain {
                 payments.entry(recipient).or_default().push(index);
             }
         }
-        // Rank actual miner earnings per weight; txid breaks equal bids. Only
-        // candidates at their sender's current nonce are ready to execute.
+        // Rank actual miner earnings per weight, then the signed fee per
+        // weight (see [Priority]); txid breaks equal bids. Only candidates at
+        // their sender's current nonce are ready to execute.
         let mut ready = BTreeSet::new();
         for queue in senders.values_mut() {
             // Lower nonces are already used and never become executable.
@@ -3480,9 +3481,30 @@ impl Chain {
             }
         }
         let mut parked = Vec::new();
-        while result.transactions.len() < limit {
-            let Some((_, index)) = ready.pop_first() else {
-                break;
+        // Candidates whose budget ran out after they had failed. Every
+        // acceptance retries every failure, so acceptances that cannot help
+        // a candidate may spend its budget before the one it waits for, such
+        // as another sender's proposal that a Support needs, ranked below
+        // it. Each gets one more attempt once nothing else is ready, against
+        // everything accepted; only a failure then refuses it.
+        let mut starved = Vec::new();
+        loop {
+            let next = if result.transactions.len() < limit {
+                ready.pop_first()
+            } else {
+                None
+            };
+            let Some((_, index)) = next else {
+                if result.transactions.len() >= limit || starved.is_empty() {
+                    break;
+                }
+                for index in starved.drain(..) {
+                    let candidate: &mut Candidate<'_> = &mut pending[index];
+                    candidate.reprieved = true;
+                    candidate.slot = Slot::Ready;
+                    ready.insert((candidate.priority.clone(), index));
+                }
+                continue;
             };
             let (transaction, bytes, recipient) = {
                 let candidate = &mut pending[index];
@@ -3503,16 +3525,23 @@ impl Chain {
             if body_size > byte_limit || !execution.opening_funds_cover(transaction) {
                 continue;
             }
-            if queue.budget == 0 {
+            if queue.budget == 0 && !pending[index].reprieved {
                 result.budget_exhausted = true;
-                // A candidate that already failed its attempts stays refused;
-                // only one never tried leaves its sender undecided.
-                if !pending[index].attempted {
+                // A candidate that already failed its attempts waits for its
+                // last one, and stays refused if that fails too; only one
+                // never tried leaves its sender undecided.
+                let candidate = &mut pending[index];
+                if !candidate.attempted {
                     result.exhausted_senders.insert(transaction.body.sender);
+                } else if !candidate.starved {
+                    candidate.starved = true;
+                    starved.push(index);
                 }
                 continue;
             }
-            queue.budget -= 1;
+            if !std::mem::take(&mut pending[index].reprieved) {
+                queue.budget -= 1;
+            }
             result.execution_attempts += 1;
             pending[index].attempted = true;
             let created_recipient =
@@ -3556,8 +3585,7 @@ impl Chain {
                         pending[payment].slot = Slot::Done;
                         continue;
                     };
-                    pending[payment].priority.fee = quote.miner_fee;
-                    pending[payment].priority.weight = quote.weight;
+                    pending[payment].priority.requote(&quote);
                     if slot == Slot::Ready {
                         ready.insert((pending[payment].priority.clone(), payment));
                     }
@@ -3900,18 +3928,50 @@ impl BlockValidation {
     }
 }
 
-/// Selection order: higher actual miner earnings per weight, then txid.
-#[derive(Clone)]
-struct Priority {
+/// Selection order, which ranks first as the lesser: higher actual miner
+/// earnings per weight, then a higher signed fee per weight, then txid. The
+/// miner's share is rounded down per transaction, so bids that differ in
+/// their signed fee may earn the miner the same; the signed fee then decides
+/// rather than the txid, which a signer can grind, and a replacement that
+/// raises the signed fee (see `node::replaces`) outranks what it replaces.
+/// Mempool admission ranks its full-pool floor and backlog by this order too.
+#[derive(Clone, Debug)]
+pub(crate) struct Priority {
     fee: Amount,
+    signed: Amount,
     weight: u64,
     id: Hash,
 }
+impl Priority {
+    pub(crate) fn new(quote: &fees::FeeQuote, id: Hash) -> Self {
+        Self {
+            fee: quote.miner_fee.clone(),
+            signed: quote.fee.clone(),
+            weight: quote.weight,
+            id,
+        }
+    }
+    /// The same bid at another quoted weight, as account creation reprices it.
+    fn requote(&mut self, quote: &fees::FeeQuote) {
+        self.fee = quote.miner_fee.clone();
+        self.signed = quote.fee.clone();
+        self.weight = quote.weight;
+    }
+    /// Whether this bid ranks first by fee alone, by miner earnings per
+    /// weight and then signed fee per weight, whatever either txid.
+    pub(crate) fn outbids(&self, other: &Self) -> bool {
+        self.by_fee(other) == Ordering::Less
+    }
+    fn by_fee(&self, other: &Self) -> Ordering {
+        let (mine, theirs) = (Amount::from(self.weight), Amount::from(other.weight));
+        (&other.fee * &mine)
+            .cmp(&(&self.fee * &theirs))
+            .then_with(|| (&other.signed * &mine).cmp(&(&self.signed * &theirs)))
+    }
+}
 impl Ord for Priority {
     fn cmp(&self, other: &Self) -> Ordering {
-        (&other.fee * Amount::from(self.weight))
-            .cmp(&(&self.fee * Amount::from(other.weight)))
-            .then_with(|| self.id.cmp(&other.id))
+        self.by_fee(other).then_with(|| self.id.cmp(&other.id))
     }
 }
 impl PartialOrd for Priority {
@@ -3939,6 +3999,10 @@ struct Candidate<'a> {
     recipient: Option<PublicKey>,
     slot: Slot,
     attempted: bool,
+    /// Its budget ran out after it had failed (see `Chain::select_open`).
+    starved: bool,
+    /// Holds its one further attempt, which its budget does not pay for.
+    reprieved: bool,
 }
 struct SenderQueue {
     nonce: u64,

@@ -695,6 +695,11 @@ const MAX_INVALID_NONCES: usize = MAX_REJECTED_TRANSACTIONS;
 /// the signed fee per weight unit by at least 1/REPLACEMENT_RAISE, and by at
 /// least the minimum fee rate.
 const REPLACEMENT_RAISE: u32 = 8;
+/// One sender's backlog chain, past its first entry, holds at most
+/// 1/BACKLOG_SENDER_SHARE of the backlog's entries and bytes: each entry's
+/// funds are checked on its own, so a chain may hold more than its sender
+/// can pay for, and it must not crowd out every other sender's entries.
+const BACKLOG_SENDER_SHARE: usize = 2;
 /// Executing blocks that would not become the tip: node-wide wall time, and
 /// each relaying source's own share of it, per second and in a burst that
 /// admits one block at the largest benchmarked clearing cost.
@@ -719,10 +724,14 @@ const REPLAY_STEPS_PER_HOLD: usize = 8;
 const SIDE_REPLAY_STEPS_PER_HOLD: usize = 1;
 /// Spends from accounts that a pending transfer creates, held until that
 /// funding confirms: in all, per sender and per source, and the new tips
-/// one may wait for. They also stay within one block's bytes.
+/// one may wait for. They also stay within one block's bytes, of which each
+/// source holds at most 1/AWAITING_SOURCES. Relaying sources together leave
+/// one source's share of entries and bytes to local submissions and reorg
+/// recovery.
 const MAX_AWAITING: usize = MAX_MEMPOOL;
 const AWAITING_PER_SENDER: usize = 16;
-const AWAITING_PER_SOURCE: usize = MAX_AWAITING / 4;
+const AWAITING_SOURCES: usize = 4;
+const AWAITING_PER_SOURCE: usize = MAX_AWAITING / AWAITING_SOURCES;
 const AWAITING_TIPS: u32 = 6;
 
 /// A wall-time token bucket. Work is charged after it ran, so the bucket may
@@ -927,8 +936,10 @@ struct Awaiting {
 /// Whether `new` may replace `old`, a pending transaction at the same sender
 /// nonce: it raises the signed fee per weight unit by at least an eighth and
 /// by at least the minimum fee rate, so a sender cannot churn the pool with
-/// free replacements. Weights are quoted against the tip state; one that
-/// cannot be quoted is left to the opening screen.
+/// free replacements, and it earns the miner at least as much per weight
+/// unit, so the selection ranks it ahead of `old` by fee rather than by
+/// transaction ID (see [crate::chain::Priority]). Weights are quoted against
+/// the tip state; one that cannot be quoted is left to the opening screen.
 fn replaces(config: &Config, state: &State, new: &Transaction, old: &Transaction) -> bool {
     let (Ok(quoted), Ok(pending)) = (
         fees::quote(config, state, new),
@@ -936,11 +947,12 @@ fn replaces(config: &Config, state: &State, new: &Transaction, old: &Transaction
     ) else {
         return true;
     };
+    let rank = |quote: &fees::FeeQuote| crate::chain::Priority::new(quote, ZERO_HASH);
     raises(
         state,
         (&new.body.fee, quoted.weight),
         (&old.body.fee, pending.weight),
-    )
+    ) && rank(&quoted).outbids(&rank(&pending))
 }
 /// Whether a signed fee and weight raise the fee per weight unit of another
 /// by the replacement rule's margins (see [replaces]).
@@ -960,29 +972,54 @@ fn raises(state: &State, new: (&Amount, u64), old: (&Amount, u64)) -> bool {
 /// broadcast newcomer at such a nonce, such as a copy changed in one data
 /// byte, is refused without a selection unless it raises that fee rate by
 /// the replacement rule. The operator's private submissions are exempt.
+/// Anyone holding a refused transaction's bytes can resend it once the pool
+/// changes, so a transaction refused again, after it already set an entry,
+/// sets one that holds back only other resent transactions: a transaction
+/// its sender signed since, at an equal fee rate, still gets its selection.
 #[derive(Default)]
 struct InvalidNonces {
     at: (Hash, u64),
-    entries: BTreeMap<(PublicKey, u64), (Amount, u64)>,
+    /// The refused fee and weight, and whether a resent transaction set it.
+    entries: BTreeMap<(PublicKey, u64), (Amount, u64, bool)>,
+    /// Transactions that set an entry, at most MAX_INVALID_NONCES of the
+    /// latest, whatever tip and pool they were judged against.
+    set: HashSet<Hash>,
+    order: VecDeque<Hash>,
 }
 impl InvalidNonces {
     /// The refused fee and weight at `transaction`'s sender nonce, while
-    /// that refusal holds.
-    fn refused(&self, at: (Hash, u64), transaction: &Transaction) -> Option<&(Amount, u64)> {
+    /// that refusal holds and holds back `id`.
+    fn refused(
+        &self,
+        at: (Hash, u64),
+        id: &Hash,
+        transaction: &Transaction,
+    ) -> Option<(&Amount, u64)> {
         let body = &transaction.body;
-        (self.at == at)
-            .then(|| self.entries.get(&(body.sender, body.nonce)))
-            .flatten()
+        let (fee, weight, resent) = self.entries.get(&(body.sender, body.nonce))?;
+        (self.at == at && (!resent || self.set.contains(id))).then_some((fee, *weight))
     }
-    fn refuse(&mut self, at: (Hash, u64), transaction: &Transaction, weight: u64) {
+    fn refuse(&mut self, at: (Hash, u64), id: Hash, transaction: &Transaction, weight: u64) {
         if self.at != at {
             self.at = at;
             self.entries.clear();
         }
-        if self.entries.len() < MAX_INVALID_NONCES {
-            let body = &transaction.body;
-            self.entries
-                .insert((body.sender, body.nonce), (body.fee.clone(), weight));
+        let resent = self.set.contains(&id);
+        if !resent {
+            self.set.insert(id);
+            self.order.push_back(id);
+            while self.order.len() > MAX_INVALID_NONCES {
+                if let Some(old) = self.order.pop_front() {
+                    self.set.remove(&old);
+                }
+            }
+        }
+        let body = &transaction.body;
+        let key = (body.sender, body.nonce);
+        // A resent transaction never weakens an entry a new one set.
+        let weakens = self.entries.get(&key).is_some_and(|entry| resent && !entry.2);
+        if !weakens && (self.entries.len() < MAX_INVALID_NONCES || self.entries.contains_key(&key)) {
+            self.entries.insert(key, (body.fee.clone(), weight, resent));
         }
     }
 }
@@ -1006,8 +1043,16 @@ struct Room {
 }
 impl Room {
     fn after(chain: &Chain, miner: PublicKey, selection: &SelectionResult) -> Result<Self> {
-        let state = chain.tip_state();
         let limit = mempool_limit(&chain.config).min(chain.config.max_signatures);
+        let mut room = Self::of(chain, miner, &selection.transactions)?;
+        room.saturated = selection.truncated || selection.transactions.len() >= limit;
+        room.exhausted = selection.exhausted_senders.clone();
+        Ok(room)
+    }
+    /// What `transactions`, a selection on the tip, leave of the next block,
+    /// leaving no sender undecided.
+    fn of(chain: &Chain, miner: PublicKey, transactions: &[Transaction]) -> Result<Self> {
+        let state = chain.tip_state();
         let height = state
             .height
             .checked_add(1)
@@ -1015,7 +1060,7 @@ impl Room {
         let (prefix, suffix) = codec::coinbase_parts(height, &miner, &ZERO_HASH);
         let system = prefix.len() + 8 + suffix.len();
         let mut room = Self {
-            used_bytes: compact_size_len(selection.transactions.len() + 2)
+            used_bytes: compact_size_len(transactions.len() + 2)
                 + compact_size_len(system)
                 + system
                 + 32,
@@ -1029,10 +1074,10 @@ impl Room {
             byte_limit: usize::try_from(state.settings.block_bytes).unwrap_or(usize::MAX),
             weight_limit: state.settings.block_bytes,
             next: BTreeMap::new(),
-            saturated: selection.truncated || selection.transactions.len() >= limit,
-            exhausted: selection.exhausted_senders.clone(),
+            saturated: false,
+            exhausted: BTreeSet::new(),
         };
-        for tx in &selection.transactions {
+        for tx in transactions {
             let bytes = codec::encode(tx).len();
             room.used_bytes = room
                 .used_bytes
@@ -1063,29 +1108,43 @@ impl Room {
         self.saturated || self.exhausted.contains(sender)
     }
 }
-/// The weakest entry of a count-full selection, by the selection's own order:
-/// miner fee per weight unit, then transaction ID.
+/// The weakest entry of a full selection, by the selection's own order:
+/// miner fee per weight unit, then signed fee per weight unit, then
+/// transaction ID (see [crate::chain::Priority]).
 #[derive(Clone)]
-struct Weakest {
-    fee: Amount,
-    weight: u64,
-    id: Hash,
-}
+struct Weakest(crate::chain::Priority);
 impl Weakest {
     fn of(config: &Config, state: &State, transaction: &Transaction) -> Option<Self> {
         let quote = fees::quote(config, state, transaction).ok()?;
-        Some(Self {
-            fee: quote.miner_fee,
-            weight: quote.weight,
-            id: codec::transaction_id(transaction),
-        })
+        Some(Self(crate::chain::Priority::new(
+            &quote,
+            codec::transaction_id(transaction),
+        )))
     }
     /// Whether `other` ranks before this entry.
     fn outranked_by(&self, other: &Self) -> bool {
-        (&other.fee * Amount::from(self.weight))
-            .cmp(&(&self.fee * Amount::from(other.weight)))
-            .then_with(|| self.id.cmp(&other.id))
-            == std::cmp::Ordering::Greater
+        other.0 < self.0
+    }
+}
+/// A full installed selection's weakest entry, which a newcomer must outrank
+/// to enter it by displacing an entry, and what makes it full: its count,
+/// for every newcomer, or its bytes, for a newcomer they leave no room for.
+#[derive(Clone)]
+struct Floor {
+    weakest: Weakest,
+    count_full: bool,
+    /// The selection's block bytes, counted as [Room] counts them, and their limit.
+    used_bytes: usize,
+    byte_limit: usize,
+}
+impl Floor {
+    /// Whether a newcomer of `bytes` encoded bytes can enter only by displacing an entry.
+    fn binds(&self, bytes: usize) -> bool {
+        self.count_full
+            || self
+                .used_bytes
+                .saturating_add(compact_size_len(bytes) + bytes)
+                > self.byte_limit
     }
 }
 
@@ -1300,9 +1359,9 @@ struct Inner {
     chain: Chain,
     /// The next-block selection; templates commit to these entries, or to
     /// their longest prefix that finishes as a block.
-    mempool: Vec<Transaction>,
+    mempool: PoolPart,
     /// Pending entries displaced by capacity, retried against later blocks.
-    backlog: Vec<Transaction>,
+    backlog: PoolPart,
     /// Tip the pool was last selected against; differs only after a failed recovery.
     pool_tip: Hash,
     /// Advances with every installed change to the selection or backlog.
@@ -1319,15 +1378,53 @@ struct Inner {
     relay_cursor: usize,
     /// Spends waiting for a pending transfer to create their sender's account.
     awaiting: Vec<Awaiting>,
-    /// The weakest entry of a count-full selection, and the selection
-    /// revision it was found at.
-    weakest: Option<(u64, Option<Weakest>)>,
+    /// The floor of the installed selection (see `Node::pool_floor`), and
+    /// the selection revision it was found at.
+    floor: Option<(u64, Option<Floor>)>,
     /// Sender nonces recent selections refused for validity.
     invalid_nonces: InvalidNonces,
 }
 impl Inner {
     fn pending(&self) -> impl Iterator<Item = &Transaction> {
-        self.mempool.iter().chain(&self.backlog)
+        self.mempool.iter().chain(self.backlog.iter())
+    }
+    /// Install a selection and its backlog in one buffer, which published
+    /// read views share instead of copying.
+    fn set_pool(&mut self, mempool: Vec<Transaction>, backlog: Vec<Transaction>) {
+        let selected = mempool.len();
+        let entries: Arc<[Transaction]> = mempool.into_iter().chain(backlog).collect();
+        self.backlog = PoolPart {
+            entries: entries.clone(),
+            range: selected..entries.len(),
+        };
+        self.mempool = PoolPart {
+            entries,
+            range: 0..selected,
+        };
+    }
+    /// Every pending entry, the selection and then its backlog, shared.
+    fn shared_pending(&self) -> Arc<[Transaction]> {
+        self.mempool.entries.clone()
+    }
+}
+/// The next-block selection or its backlog: a part of one buffer holding
+/// both (see [Inner::set_pool]).
+struct PoolPart {
+    entries: Arc<[Transaction]>,
+    range: std::ops::Range<usize>,
+}
+impl PoolPart {
+    fn empty() -> Self {
+        Self {
+            entries: Arc::from(Vec::new()),
+            range: 0..0,
+        }
+    }
+}
+impl std::ops::Deref for PoolPart {
+    type Target = [Transaction];
+    fn deref(&self) -> &[Transaction] {
+        &self.entries[self.range.clone()]
     }
 }
 struct TemplateEntry {
@@ -1688,7 +1785,8 @@ impl PublishedChain {
 }
 struct ReadView {
     chain: PublishedChain,
-    mempool: Vec<Transaction>,
+    /// The selection and then its backlog, shared with the node's own pool.
+    mempool: Arc<[Transaction]>,
     pool_revision: u64,
     cache: Arc<TipCache>,
 }
@@ -1993,7 +2091,7 @@ impl ReadView {
                 tip: inner.chain.tip_hash(),
                 state: Arc::new(inner.chain.tip_state().clone()),
             },
-            mempool: inner.pending().cloned().collect(),
+            mempool: inner.shared_pending(),
             pool_revision: inner.pool_revision,
             cache: Arc::default(),
         }
@@ -2282,14 +2380,14 @@ impl Node {
             pool_revision: 0,
             selection_revision: 0,
             chain,
-            mempool: Vec::new(),
-            backlog: Vec::new(),
+            mempool: PoolPart::empty(),
+            backlog: PoolPart::empty(),
             template: None,
             downloads: VecDeque::new(),
             header_syncs: BTreeMap::new(),
             relay_cursor: 0,
             awaiting: Vec::new(),
-            weakest: None,
+            floor: None,
             invalid_nonces: InvalidNonces::default(),
         };
         // A derived index failure never makes chain validation unavailable.
@@ -2697,24 +2795,25 @@ impl Node {
     fn pool_ids(i: &Inner) -> HashSet<Hash> {
         i.pending().map(codec::transaction_id).collect()
     }
-    /// The weakest entry of the installed selection while it holds as many
-    /// entries as a selection may: a newcomer can then enter only by
-    /// displacing one, so a newcomer that does not outrank this entry is
-    /// refused without a selection. Kept for one selection revision.
-    fn pool_floor(i: &mut Inner) -> Option<Weakest> {
-        let config = &i.chain.config;
-        let limit = mempool_limit(config).min(config.max_signatures);
-        if i.mempool.len() < limit || i.pool_tip != i.chain.tip_hash() {
+    /// The installed selection's weakest entry and what fills it (see
+    /// [Floor]). While it holds as many entries as a selection may, or its
+    /// bytes leave no room for a newcomer, that newcomer can enter only by
+    /// displacing an entry. Every selected entry outranks it and is tried
+    /// before it, so one that does not outrank the weakest entry is refused
+    /// without a selection. Kept for one selection revision.
+    fn pool_floor(i: &mut Inner, miner: PublicKey) -> Option<Floor> {
+        if i.mempool.is_empty() || i.pool_tip != i.chain.tip_hash() {
             return None;
         }
-        if let Some((revision, weakest)) = &i.weakest
+        if let Some((revision, floor)) = &i.floor
             && *revision == i.selection_revision
         {
-            return weakest.clone();
+            return floor.clone();
         }
+        let config = &i.chain.config;
         let state = i.chain.tip_state();
         let mut weakest: Option<Weakest> = None;
-        for tx in &i.mempool {
+        for tx in i.mempool.iter() {
             let Some(entry) = Weakest::of(config, state, tx) else {
                 // An entry its own quote no longer prices sets no floor.
                 weakest = None;
@@ -2724,8 +2823,18 @@ impl Node {
                 weakest = Some(entry);
             }
         }
-        i.weakest = Some((i.selection_revision, weakest.clone()));
-        weakest
+        let limit = mempool_limit(config).min(config.max_signatures);
+        let floor = weakest.and_then(|weakest| {
+            let room = Room::of(&i.chain, miner, &i.mempool).ok()?;
+            Some(Floor {
+                weakest,
+                count_full: i.mempool.len() >= limit,
+                used_bytes: room.used_bytes,
+                byte_limit: room.byte_limit,
+            })
+        });
+        i.floor = Some((i.selection_revision, floor.clone()));
+        floor
     }
     /// Admissible newcomers sorted by what a selection could do with them,
     /// without running one: a replacement that does not raise its pending
@@ -2734,16 +2843,16 @@ impl Node {
     /// [InvalidNonces]; `operator` submissions are exempt) that does not
     /// raise that one's fee rate enough, an entry the next block's opening
     /// refuses for its fee or funds, one after a missing earlier nonce of its
-    /// sender, and, while the selection is count-full, one that does not
-    /// outrank its weakest entry, are never selected on this tip and pool. A
-    /// candidate that rebids or extends its own sender's backlog chain cannot
-    /// be selected before that chain, so it may wait in the backlog within
-    /// the same bounds.
+    /// sender, and, while the selection is full by its count or by bytes for
+    /// that entry (see [Floor]), one that does not outrank its weakest entry,
+    /// are never selected on this tip and pool. A candidate that rebids or
+    /// extends its own sender's backlog chain cannot be selected before that
+    /// chain, so it may wait in the backlog within the same bounds.
     fn screen_newcomers<'a>(
         &self,
         i: &Inner,
         newcomers: Vec<(Hash, &'a Transaction)>,
-        floor: Option<&Weakest>,
+        floor: Option<&Floor>,
         operator: &HashSet<Hash>,
     ) -> Result<Newcomers<'a>> {
         let state = i.chain.tip_state();
@@ -2770,9 +2879,9 @@ impl Node {
                     ),
                 ));
             } else if !operator.contains(&id)
-                && let Some((fee, weight)) = i.invalid_nonces.refused(judged, tx)
+                && let Some((fee, weight)) = i.invalid_nonces.refused(judged, &id, tx)
                 && fees::quote(&i.chain.config, state, tx)
-                    .is_ok_and(|quote| !raises(state, (&tx.body.fee, quote.weight), (fee, *weight)))
+                    .is_ok_and(|quote| !raises(state, (&tx.body.fee, quote.weight), (fee, weight)))
             {
                 screened.outbid.push((
                     id,
@@ -2823,7 +2932,7 @@ impl Node {
             }
         }
         let mut backlog = BTreeMap::<PublicKey, (u64, u64)>::new();
-        for tx in &i.backlog {
+        for tx in i.backlog.iter() {
             let (low, high) = backlog
                 .entry(tx.body.sender)
                 .or_insert((tx.body.nonce, tx.body.nonce));
@@ -2832,20 +2941,26 @@ impl Node {
         }
         let mut chained: Vec<_> = candidates.iter().collect();
         chained.sort_by_key(|(_, tx)| (tx.body.sender, tx.body.nonce));
+        // Past its first entry, a sender's chain keeps at most its share.
+        let share = (MAX_BACKLOG / BACKLOG_SENDER_SHARE) as u64;
         for (id, tx) in chained {
             if let Some((low, high)) = backlog.get_mut(&tx.body.sender)
                 && (*low..=high.saturating_add(1)).contains(&tx.body.nonce)
+                && tx.body.nonce - *low <= share
             {
                 *high = (*high).max(tx.body.nonce);
                 screened.waiting.insert(*id);
             }
         }
         for (id, tx) in candidates {
-            let outranks = || {
+            let floor = floor.filter(|floor| {
+                !screened.waiting.contains(&id) && floor.binds(codec::encode(tx).len())
+            });
+            let outranks = |floor: &Floor| {
                 Weakest::of(&i.chain.config, state, tx)
-                    .is_some_and(|entry| floor.is_some_and(|floor| floor.outranked_by(&entry)))
+                    .is_some_and(|entry| floor.weakest.outranked_by(&entry))
             };
-            if floor.is_some() && !screened.waiting.contains(&id) && !outranks() {
+            if floor.is_some_and(|floor| !outranks(floor)) {
                 screened.outbid.push((
                     id,
                     anyhow!(
@@ -2890,7 +3005,11 @@ impl Node {
                 outcomes[position] = Some(Err(anyhow!("{reason}")));
                 continue;
             }
-            if index.insert(id, position).is_some() {
+            // Outcomes are written through `index`, so it keeps the first
+            // occurrence's position.
+            if let std::collections::hash_map::Entry::Vacant(vacant) = index.entry(id) {
+                vacant.insert(position);
+            } else {
                 outcomes[position] = Some(Err(anyhow!("transaction repeated in one admission")));
                 continue;
             }
@@ -2918,7 +3037,7 @@ impl Node {
             outcomes[position] = Some(Err(anyhow!(message)));
         }
         if !checked.is_empty() {
-            let floor = Self::pool_floor(i);
+            let floor = Self::pool_floor(i, self.miner);
             let operator: HashSet<Hash> = newcomers
                 .iter()
                 .filter(|newcomer| newcomer.operator)
@@ -2998,7 +3117,7 @@ impl Node {
                             && let Ok(quote) = fees::quote(&i.chain.config, state, tx)
                             && room.fits(newcomer.bytes, quote.weight)
                         {
-                            invalid.push((*tx, quote.weight));
+                            invalid.push((*id, *tx, quote.weight));
                         }
                         "transaction not valid in next block or block capacity exhausted"
                     };
@@ -3007,8 +3126,8 @@ impl Node {
                 }
                 drop(rejected);
                 let judged = (tip, i.pool_revision);
-                for (tx, weight) in invalid {
-                    i.invalid_nonces.refuse(judged, tx, weight);
+                for (id, tx, weight) in invalid {
+                    i.invalid_nonces.refuse(judged, id, tx, weight);
                 }
             }
         }
@@ -3038,21 +3157,40 @@ impl Node {
             .collect())
     }
     /// Accounts that a pending transfer, or one still queued for admission,
-    /// creates by paying them.
+    /// creates by paying them. A queued transfer has passed only its
+    /// signature check, so it counts only if the next block's opening could
+    /// take it: its sender's account and unused nonce, its anchor, and an
+    /// opening balance covering its amount and fee.
     fn funded_accounts(&self, i: &Inner) -> HashSet<PublicKey> {
         let recipient = |tx: &Transaction| match &tx.body.operation {
             Operation::TransferExact { recipient, .. } => Some(*recipient),
             _ => None,
         };
         let mut funded: HashSet<PublicKey> = i.pending().filter_map(recipient).collect();
-        let admission = self.admission.unpoisoned();
-        funded.extend(
-            admission
-                .queue
-                .entries
-                .iter()
-                .filter_map(|queued| recipient(&queued.transaction)),
-        );
+        let queued: Vec<Transaction> = self
+            .admission
+            .unpoisoned()
+            .queue
+            .entries
+            .iter()
+            .filter(|queued| recipient(&queued.transaction).is_some_and(|to| !funded.contains(&to)))
+            .map(|queued| queued.transaction.clone())
+            .collect();
+        let queued: Vec<&Transaction> = queued
+            .iter()
+            .filter(|tx| Self::admissible(&i.chain, tx).is_ok())
+            .collect();
+        if !queued.is_empty()
+            && let Ok(opening) = i.chain.opening_screen(self.miner, &queued)
+        {
+            funded.extend(
+                queued
+                    .into_iter()
+                    .zip(opening)
+                    .filter(|(_, opening)| opening.is_ok())
+                    .filter_map(|(tx, _)| recipient(tx)),
+            );
+        }
         funded
     }
     /// Hold a newcomer whose sender has no account, if a transfer in
@@ -3076,7 +3214,8 @@ impl Node {
                 "sender account does not exist, and its pending funding leaves this nonce too far ahead",
             ));
         }
-        let (mut sender, mut source, mut bytes) = (0usize, 0usize, 0usize);
+        let (mut sender, mut source, mut bytes) = (0usize, (0usize, 0usize), 0usize);
+        let mut relayed = (0usize, 0usize);
         for entry in &i.awaiting {
             let held = &entry.transaction.body;
             if held.sender == body.sender {
@@ -3088,14 +3227,32 @@ impl Node {
                 }
                 sender += 1;
             }
-            source += usize::from(entry.source == newcomer.source);
+            let count = |held: &mut (usize, usize)| {
+                held.0 += 1;
+                held.1 = held.1.saturating_add(entry.bytes);
+            };
+            if entry.source == newcomer.source {
+                count(&mut source);
+            }
+            if entry.source.is_some() {
+                count(&mut relayed);
+            }
             bytes = bytes.saturating_add(entry.bytes);
         }
         let limit = usize::try_from(i.chain.tip_state().settings.block_bytes).unwrap_or(usize::MAX);
+        // Each source holds at most its share of the entries and bytes, and
+        // relaying sources together leave local submissions and recovery
+        // (the source None) one share of their own.
+        let share = limit / AWAITING_SOURCES;
+        let relays_full = newcomer.source.is_some()
+            && (relayed.0 >= MAX_AWAITING - AWAITING_PER_SOURCE
+                || relayed.1.saturating_add(newcomer.bytes) > limit - share);
         if i.awaiting.len() >= MAX_AWAITING
             || sender >= AWAITING_PER_SENDER
-            || source >= AWAITING_PER_SOURCE
+            || source.0 >= AWAITING_PER_SOURCE
+            || source.1.saturating_add(newcomer.bytes) > share
             || bytes.saturating_add(newcomer.bytes) > limit
+            || relays_full
         {
             return Err((
                 false,
@@ -3188,7 +3345,10 @@ impl Node {
     /// Admit one newcomer at once, as a direct submission does: after any
     /// newcomer admission in progress and after waiting block submissions.
     /// Its lock time is charged to the node-wide selection budget, or for a
-    /// public broadcast to the budget reserved for those.
+    /// public broadcast to the budget reserved for those. A public broadcast
+    /// starts only while that budget has credit, checked once it is its turn,
+    /// so broadcasts that waited together cannot all run on one credit; when
+    /// it is spent, nothing runs and the refusal is a [network_guard::Limited].
     fn admit_now(
         &self,
         public: bool,
@@ -3196,6 +3356,13 @@ impl Node {
     ) -> Result<(Hash, Admitted)> {
         let outcome = {
             let _run = self.admission_run.unpoisoned();
+            if public && let Some(wait) = self.public_selection_wait() {
+                return Err(network_guard::Limited {
+                    reason: "transaction admission is busy",
+                    retry_after: Some(wait),
+                }
+                .into());
+            }
             self.yield_to_blocks();
             let mut i = self.locked()?;
             let started = Instant::now();
@@ -3320,6 +3487,12 @@ impl Node {
     /// in-block weights, so a fitting estimate is conservative. The best bids
     /// are kept within MAX_BACKLOG entries and one block's bytes, independent
     /// of the selection's size: a count-saturated selection keeps its backlog.
+    /// An entry cannot be selected before its sender's earlier nonces, so it
+    /// ranks no higher than the lowest bid among them, and it is kept only
+    /// after all of them: a high bid behind a low one never displaces another
+    /// sender's entry, and the room of an entry left out goes to the next
+    /// bid. Past its first entry, one sender's chain keeps at most its share
+    /// (see BACKLOG_SENDER_SHARE).
     fn displaced(
         chain: &Chain,
         selection: &SelectionResult,
@@ -3329,16 +3502,13 @@ impl Node {
     ) -> Result<Vec<Transaction>> {
         struct Waiting<'a> {
             transaction: &'a Transaction,
-            id: Hash,
             bytes: usize,
-            fee: Amount,
             weight: u64,
+            /// Its own bid.
+            bid: crate::chain::Priority,
+            /// The lowest bid along its sender's chain up to it.
+            rank: crate::chain::Priority,
         }
-        let better = |a: &Waiting<'_>, b: &Waiting<'_>| {
-            (&b.fee * Amount::from(a.weight))
-                .cmp(&(&a.fee * Amount::from(b.weight)))
-                .then_with(|| a.id.cmp(&b.id))
-        };
         let state = chain.tip_state();
         let mut seen: HashSet<Hash> = selection
             .transactions
@@ -3357,15 +3527,16 @@ impl Node {
             let Ok(quote) = fees::quote(&chain.config, state, transaction) else {
                 continue;
             };
+            let bid = crate::chain::Priority::new(&quote, id);
             senders
                 .entry(transaction.body.sender)
                 .or_default()
                 .push(Waiting {
                     transaction,
-                    id,
                     bytes: codec::encode(transaction).len(),
-                    fee: quote.miner_fee,
                     weight: quote.weight,
+                    rank: bid.clone(),
+                    bid,
                 });
         }
         let mut first = BTreeMap::new();
@@ -3373,13 +3544,14 @@ impl Node {
         for (sender, mut entries) in senders {
             entries.sort_by(|a, b| {
                 let nonce = a.transaction.body.nonce.cmp(&b.transaction.body.nonce);
-                nonce.then_with(|| better(a, b))
+                nonce.then_with(|| a.bid.cmp(&b.bid))
             });
             let start = room.start(state, &sender);
             first.insert(sender, start);
             let undecided = room.undecided(&sender);
             let mut expected = start;
-            for entry in entries {
+            let mut lowest: Option<crate::chain::Priority> = None;
+            for mut entry in entries {
                 let nonce = entry.transaction.body.nonce;
                 // Used, replaced or outbid at an equal nonce; then a nonce gap.
                 if nonce < expected {
@@ -3391,18 +3563,49 @@ impl Node {
                 if room.fits(entry.bytes, entry.weight) && !undecided && expected == start {
                     break;
                 }
+                // Ranks never improve along a chain, so each entry sorts
+                // after its predecessors (by nonce where they tie).
+                if let Some(lowest) = &lowest
+                    && *lowest > entry.bid
+                {
+                    entry.rank = lowest.clone();
+                }
+                lowest = Some(entry.rank.clone());
                 waiting.push(entry);
                 expected += 1;
             }
         }
-        waiting.sort_by(|a, b| better(a, b));
+        waiting.sort_by(|a, b| {
+            let nonce = a.transaction.body.nonce.cmp(&b.transaction.body.nonce);
+            a.rank.cmp(&b.rank).then(nonce)
+        });
         let byte_limit = room.byte_limit;
+        let (share_entries, share_bytes) = (
+            MAX_BACKLOG / BACKLOG_SENDER_SHARE,
+            byte_limit / BACKLOG_SENDER_SHARE,
+        );
         let mut bytes = 0usize;
-        let mut kept = BTreeMap::<PublicKey, HashSet<u64>>::new();
+        // Each sender's next nonce to keep, and the entries and bytes its
+        // chain holds past its first entry.
+        let mut kept = BTreeMap::<PublicKey, (u64, usize, usize)>::new();
         let mut backlog = Vec::new();
         for entry in waiting {
             if backlog.len() == MAX_BACKLOG {
                 break;
+            }
+            let sender = entry.transaction.body.sender;
+            let (next, chained, chained_bytes) =
+                kept.entry(sender).or_insert((first[&sender], 0, 0));
+            // A predecessor left out strands every later nonce of its sender.
+            if entry.transaction.body.nonce != *next {
+                continue;
+            }
+            let following = *next != first[&sender];
+            if following
+                && (*chained >= share_entries
+                    || chained_bytes.saturating_add(entry.bytes) > share_bytes)
+            {
+                continue;
             }
             let Some(total) = bytes
                 .checked_add(entry.bytes)
@@ -3411,16 +3614,13 @@ impl Node {
                 continue;
             };
             bytes = total;
-            kept.entry(entry.transaction.body.sender)
-                .or_default()
-                .insert(entry.transaction.body.nonce);
+            *next += 1;
+            if following {
+                *chained += 1;
+                *chained_bytes += entry.bytes;
+            }
             backlog.push(entry);
         }
-        // An evicted predecessor strands every later nonce from its sender.
-        backlog.retain(|entry| {
-            let sender = &entry.transaction.body.sender;
-            (first[sender]..entry.transaction.body.nonce).all(|nonce| kept[sender].contains(&nonce))
-        });
         Ok(backlog
             .into_iter()
             .map(|entry| entry.transaction.clone())
@@ -3434,10 +3634,12 @@ impl Node {
         (mempool, backlog): (Vec<Transaction>, Vec<Transaction>),
     ) -> Result<bool> {
         i.pool_tip = i.chain.tip_hash();
-        let selection_changed = mempool != i.mempool;
-        let changed = selection_changed || backlog != i.backlog;
-        i.mempool = mempool;
-        i.backlog = backlog;
+        let selection_changed = mempool[..] != i.mempool[..];
+        let changed = selection_changed || backlog[..] != i.backlog[..];
+        // An unchanged pool keeps the buffer its published view shares.
+        if changed {
+            i.set_pool(mempool, backlog);
+        }
         if selection_changed {
             i.selection_revision = i.selection_revision.wrapping_add(1);
         }
@@ -3522,7 +3724,7 @@ impl Node {
                 self.refresh_stale_pool(&mut i)?;
                 let job = i.chain.template_job(
                     self.miner,
-                    i.mempool.clone(),
+                    i.mempool.to_vec(),
                     Self::timestamp(&i.chain),
                 )?;
                 (
@@ -3797,8 +3999,7 @@ impl Node {
             Err(error) => {
                 // Keep every earlier entry; the next selection revalidates them.
                 eprintln!("Pending transaction recovery deferred: {error:#}");
-                i.mempool = pending;
-                i.backlog.clear();
+                i.set_pool(pending, Vec::new());
                 i.pool_tip = old_tip;
                 i.pool_revision = i.pool_revision.wrapping_add(1);
                 i.selection_revision = i.selection_revision.wrapping_add(1);
@@ -8691,7 +8892,8 @@ mod capacity_work_tests {
         // No block, transaction, faucet claim or external connection is made.
         {
             let mut inner = node.locked().unwrap();
-            inner.mempool = vec![transaction.clone()];
+            let backlog = inner.backlog.to_vec();
+            inner.set_pool(vec![transaction.clone()], backlog);
             node.publish(&inner).unwrap();
         }
         let snapshot = node.rpc("snapshot", json!({})).unwrap();
@@ -8787,7 +8989,7 @@ mod read_admission_tests {
                 tip: [9; 32],
                 state: Arc::new(s),
             },
-            mempool,
+            mempool: mempool.into(),
             pool_revision: 0,
             cache: Arc::default(),
         }
@@ -11020,7 +11222,7 @@ mod tests {
                     tip: [7; 32],
                     state: Arc::new(s),
                 },
-                mempool: vec![],
+                mempool: Arc::from(Vec::new()),
                 pool_revision: 0,
                 cache: Arc::default(),
             },

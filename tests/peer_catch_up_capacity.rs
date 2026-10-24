@@ -371,3 +371,111 @@ async fn a_branch_that_raised_capacity_far_behind_is_followed_once_its_headers_c
     assert_eq!(allowance(&victim), capacity);
     server.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_after_a_download_cursor_stays_within_the_recipients_allowance() {
+    let directory = tempfile::tempdir().unwrap();
+    let secret = [123; 32];
+    let miner = crypto::public_key(&secret).unwrap();
+    let mut config = Config::testnet();
+    config.initial_bits = 0x1f00ffff;
+    config.initial.rest = 30;
+    config.initial.lead = 15;
+    config.initial.decision_blocks = 4;
+    config.validate().unwrap();
+    let initial = config.initial.block_bytes;
+
+    // As above: a private branch enacts a larger capacity, and the victim
+    // stores it while its own chain leads by more than the capacity
+    // allowance follows losing branches.
+    let mut private =
+        Chain::open(&directory.path().join("private.sqlite"), config.clone()).unwrap();
+    append(&mut private, secret, vec![]);
+    curved::chain(&mut private, &secret);
+    let shared: Vec<_> = (1..=private.tip_height())
+        .map(|height| {
+            private
+                .block(&private.hash_at_height(height).unwrap())
+                .unwrap()
+        })
+        .collect();
+    let capacity = 2 * initial - 173;
+    let branch = enact(&mut private, &secret, capacity);
+    let victim_path = directory.path().join("victim.sqlite");
+    let mut victim = Chain::open(&victim_path, config.clone()).unwrap();
+    for block in &shared {
+        assert!(
+            victim
+                .submit(block.clone(), u64::from(block.header.timestamp))
+                .unwrap()
+        );
+    }
+    let lead = branch.len() + CAPACITY_BRANCH_MARGIN_BLOCKS as usize + 2;
+    for _ in 0..lead {
+        append(&mut victim, [124; 32], vec![]);
+    }
+    for block in &branch {
+        assert!(
+            !victim
+                .submit(block.clone(), u64::from(block.header.timestamp))
+                .unwrap()
+        );
+    }
+    let light_tip = hex::encode(victim.tip_hash());
+    drop(victim);
+    let replica = |private: &Chain, name: &str| {
+        let path = directory.path().join(name);
+        let mut copy = Chain::open(&path, config.clone()).unwrap();
+        for height in 1..=private.tip_height() {
+            let block = private
+                .block(&private.hash_at_height(height).unwrap())
+                .unwrap();
+            copy.submit(block.clone(), u64::from(block.header.timestamp))
+                .unwrap();
+        }
+        drop(copy);
+        Node::open(&path, config.clone(), miner).unwrap()
+    };
+    let large = |chain: &Chain, n: usize| {
+        vec![signed(
+            chain,
+            &secret,
+            Operation::TransferExact {
+                recipient: miner,
+                amount: 1u32.into(),
+            },
+            vec![n as u8; initial as usize + 4096],
+        )]
+    };
+    // The victim learns the branch's stored blocks from the private node:
+    // its download cursor for that peer now ends at the branch's stored tip.
+    let transactions = large(&private, 0);
+    append(&mut private, secret, transactions);
+    let victim = Node::open(&victim_path, config.clone(), miner).unwrap();
+    let source = replica(&private, "lighter.sqlite");
+    let server = serve(&source).await;
+    node::sync_peer(&victim, server.p2p).await.unwrap();
+    server.stop().await;
+    assert_eq!(allowance(&victim), initial);
+
+    // The branch then claims more work than the victim's chain, with
+    // blocks above the victim's allowance that the victim has not seen.
+    for n in 1..lead - branch.len() + 1 {
+        let transactions = large(&private, n);
+        append(&mut private, secret, transactions);
+    }
+    let source = replica(&private, "heavier.sqlite");
+    // The heavier node opens the session. Its push follows the victim's
+    // highest locator match, that cursor, whose next block exceeds the
+    // victim's allowance. It was sent anyway, sized to itself: the victim
+    // refused the whole frame and cooled the honest sender down. A cursor is
+    // not a block the victim validated, so the push now stops before it,
+    // and the session completes, again and again.
+    let server = serve(&victim).await;
+    for _ in 0..2 {
+        node::sync_peer(&source, server.p2p).await.unwrap();
+    }
+    assert_eq!(victim.status().unwrap()["tip"], light_tip);
+    assert_eq!(allowance(&victim), initial);
+    server.stop().await;
+}

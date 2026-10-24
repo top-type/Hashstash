@@ -153,7 +153,9 @@ pub enum HeaderParent {
 pub enum HeaderHold {
     /// Its block is already validated and stored.
     Stored,
-    /// Held; its chain does not claim more work than the tip.
+    /// Held without admission: its chain does not claim more work than the
+    /// tip, or leaves an admitted chain below its best header without
+    /// claiming more work than every admitted chain.
     Held,
     /// Held, and its chain claimed more work than the tip: its blocks are
     /// validated without the side-branch admission policy.
@@ -684,6 +686,24 @@ impl HeldHeaders {
             cursor = held.header.previous;
         }
         cost
+    }
+    /// Whether a chain whose header after `hash` claims `claimed` work may be
+    /// admitted. An admitted chain is extended only from its best header: a
+    /// branch that leaves an admitted chain below an admitted header that
+    /// already has an admitted child must claim more work than every
+    /// admitted chain. Siblings fanned out inside admitted chains therefore
+    /// each raise the best claimed work, instead of one admitted chain taking
+    /// a new admitted sibling for every cheap header.
+    fn admits_after(&self, hash: &Hash, claimed: &Amount) -> bool {
+        let mut cursor = *hash;
+        while let Some(held) = self.headers.get(&cursor) {
+            if held.admitted {
+                return self.admitted_tip(&cursor)
+                    || self.tips.last().is_none_or(|(best, _)| claimed > best);
+            }
+            cursor = held.header.previous;
+        }
+        true
     }
     /// Pin a held header to a header download, once per download.
     fn pin(&mut self, hash: Hash, pin: u64) {
@@ -2392,12 +2412,16 @@ impl Chain {
     /// Hold a header without its block, so its branch can still be presynced
     /// from peers. Held headers are never executed. A chain that claims more
     /// work than the tip is admitted, proven by proof of work alone; its
-    /// headers are persisted and its bodies validated when they arrive. A
+    /// headers are persisted and its bodies validated when they arrive. One
+    /// that leaves an admitted chain below that chain's best header is
+    /// admitted only once it claims more work than every admitted chain
+    /// (`HeldHeaders::admits_after`), and is held as presync until then. A
     /// nonzero `pin` keeps the header for that header download. A header
     /// that would make more than MAX_SYNC_HEADERS pinned or admitted is not
     /// held.
     fn hold(&mut self, hash: Hash, held: HeldHeader, pin: u64) -> Result<HeaderHold> {
-        let overtakes = held.claimed > self.tip_entry.work;
+        let overtakes = held.claimed > self.tip_entry.work
+            && self.held.admits_after(&held.header.previous, &held.claimed);
         let cost = usize::from(pin != 0 || overtakes)
             + if overtakes {
                 self.held.admission_cost(&held.header.previous)
@@ -2699,6 +2723,19 @@ impl Chain {
     #[cfg(test)]
     pub(crate) fn forget_held_header(&mut self, hash: &Hash) {
         self.held.remove_branch(hash);
+    }
+    /// Make header index reads of uncached entries fail, as a damaged
+    /// database would, or work again.
+    #[cfg(test)]
+    pub(crate) fn break_header_index(&self, broken: bool) {
+        let (from, to) = if broken {
+            ("entry_index", "entry_index_broken")
+        } else {
+            ("entry_index_broken", "entry_index")
+        };
+        self.db
+            .execute_batch(&format!("ALTER TABLE {from} RENAME TO {to}"))
+            .unwrap();
     }
     /// Drop admitted held chains whose best header now claims less work than
     /// the tip by more than CAPACITY_BRANCH_MARGIN_BLOCKS next-block works:

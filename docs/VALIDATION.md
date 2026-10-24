@@ -19,6 +19,20 @@ node fuzz/js/mail_envelope.cjs
 
 The Rust command runs library, binary and integration tests. Some tests launch temporary local nodes or exercise large grant lists and can take several minutes. Keep the complete output: a total from one test executable is not the total for the all-target run. Unit tests that need accelerated test funding are reported as ignored without `test-fixtures`, and fixture-only integration tests are skipped; the second command runs them.
 
+The shipped release profile keeps overflow checks but compiles out `debug_assert!`, which guards invariants such as a held header entering the held-header store unadmitted and unpinned. The debug-profile commands above check them; so does the release profile with debug assertions turned on, which finishes sooner:
+
+```text
+CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo test --release --all-targets --locked --features test-fixtures --target-dir target/debug-assertions
+```
+
+`ui/vendor/noble.js`, the browser wallets' signing and encryption library, must be the clean build of the locked registry packages. With Node.js 22 or 24, which ship corepack, this installs the pnpm that `package.json` names, checked against its hash, then rebuilds the bundle and compares every byte with the committed files:
+
+```text
+cd scripts/browser-crypto
+corepack pnpm install --frozen-lockfile
+corepack pnpm run check
+```
+
 Release binaries for Linux servers come from `bash scripts/release.sh --verify` on the validated commit: a normal build (never `test-fixtures`) with `--locked`, the pinned toolchain and remapped build paths, rebuilt from scratch and compared byte for byte, with `SHA256SUMS` and `BUILDINFO` written beside the binaries. A second builder with the same Rust and C compiler versions must obtain the same `SHA256SUMS` ([launch runbook](LAUNCH.md#2-build-and-pin-the-release)).
 
 Formatting needs the `rustfmt` component and Clippy the `clippy` component of the same toolchain. A newer Clippy can add lints that `-D warnings` denies, so record the toolchain with the results; continuous integration pins the one the gate was last recorded with.
@@ -43,7 +57,7 @@ HASHSTASH_TEST_BINARY="$PWD/target/release/hashstash" \
   python3 -B -m unittest discover -s scripts -p 'test_*.py'
 ```
 
-Discovery runs the Python unit tests, including activity planning, custody and retry rules, campaign completion checks, and rental-monitor parsing. Several `test_*.py` files are standalone integration programs rather than unittest suites; discovery alone does not run their scenarios.
+Discovery runs the Python unit tests, including activity planning, custody and retry rules, campaign completion checks, rental-monitor parsing, and the rules the continuous-integration workflow must keep. Several `test_*.py` files are standalone integration programs rather than unittest suites; discovery alone does not run their scenarios (see [isolated process and network scenarios](#isolated-process-and-network-scenarios)).
 
 ## What the regression tests cover
 
@@ -91,12 +105,14 @@ HASHSTASH_FUZZ_SECONDS=600 cargo test --release --features test-fixtures --test 
 
 `HASHSTASH_FUZZ_TARGETS` selects targets by name, separated by commas, and `HASHSTASH_FUZZ_SEED` repeats a run. A failing input is saved in hexadecimal under `HASHSTASH_FUZZ_ARTIFACTS`, by default in the system temporary directory. Once its cause is fixed, keep the input as `fuzz/regressions/<target>/<name>.hex`, with a `#` comment saying what it found, and add a named regression test.
 
-Coverage-guided fuzzing uses cargo-fuzz and libFuzzer on a nightly toolchain. Copying the lockfile keeps shared dependencies at the versions the node ships with; the stable runner writes the seed corpora:
+Coverage-guided fuzzing uses cargo-fuzz and libFuzzer on a nightly toolchain; these are the dated nightly and the cargo-fuzz version continuous integration pins. Copying the lockfile keeps shared dependencies at the versions the node ships with; the stable runner writes the seed corpora; `--debug-assertions` also checks the invariants the shipped build compiles out:
 
 ```text
+rustup toolchain install nightly-2026-10-10 --profile minimal
+cargo +nightly-2026-10-10 install cargo-fuzz --version 0.13.2 --locked
 cp Cargo.lock fuzz/Cargo.lock
 HASHSTASH_FUZZ_CORPUS="$PWD/fuzz/corpus" cargo test --release --features test-fixtures --test fuzz_parsers -- --ignored write_seed_corpus
-cargo +nightly fuzz run peer_wire fuzz/corpus/peer_wire -- -max_total_time=600
+cargo +nightly-2026-10-10 fuzz run --release --debug-assertions peer_wire fuzz/corpus/peer_wire -- -max_total_time=600
 ```
 
 Without nightly, the same libFuzzer binaries build on stable with the SanitizerCoverage flags cargo-fuzz passes, less its address sanitizer. Run each binary in `fuzz/target/x86_64-unknown-linux-gnu/release/` with its corpus directory and libFuzzer options, such as `-max_total_time=600`:
@@ -114,13 +130,34 @@ A run that finds nothing shows only that the inputs it tried passed. Mutation fr
 
 On Windows the library tests also read back the access list of each secret file written on NTFS with `icacls`: one protected entry granting the current account full control, nothing inherited. Where the volume keeps access lists, failing to set one is an error rather than a warning; a test gives a file a list that its owner cannot change and requires the restriction to fail, or, for an account whose privileges still allow the change, to leave the file owner-only. Only a volume without access lists, such as FAT or exFAT, produces a warning. The library tests also check that the key reader refuses a key whose list lets the Users group read it, and that a symbolic link to a peer identity is refused; creating the link needs Developer Mode or administrator rights, and the check reports itself skipped without them. [`scripts/test_cold_launcher.ps1`](../scripts/test_cold_launcher.ps1) starts `Start-ColdWallet.ps1` for a fixture chain and checks the token hand-off: the token reaches the signer only through its environment, never its command line or `/api/session`, and every POST needs it. It stops only the signer it started: any process of the selected executable that was not running before the launch, also when the launcher fails after starting it. It also checks the launcher's Windows Error Reporting exclusion of the signer under a test key of the current account, which it removes, never the real `ExcludedApplications` key; `-RegistryOnly` runs just that check, without a signer build.
 
-Windows PowerShell 5.1, the version Windows ships, differs from PowerShell 7 in two ways that have broken these scripts. Started with `-File`, as a shortcut or a scheduled task starts a script, it leaves `$PSScriptRoot` empty while it evaluates parameter defaults; and under `$ErrorActionPreference = 'Stop'` a native command's redirected error output ends the script. The launchers therefore set path defaults in their bodies, which [`operator_files.rs`](../tests/operator_files.rs) checks for every script, and continuous integration also runs [`test_rental_launcher_guard.ps1`](../scripts/test_rental_launcher_guard.ps1) and [`test_launcher.ps1`](../scripts/test_launcher.ps1) with `powershell -File`.
+Windows PowerShell 5.1, the version Windows ships, differs from PowerShell 7 in two ways that have broken these scripts. Started with `-File`, as a shortcut or a scheduled task starts a script, it leaves `$PSScriptRoot` empty while it evaluates parameter defaults; and under `$ErrorActionPreference = 'Stop'` a native command's redirected error output ends the script. The launchers therefore set path defaults in their bodies, which [`operator_files.rs`](../tests/operator_files.rs) checks for every script, and continuous integration runs every launcher test, [`test_rental_launcher_guard.ps1`](../scripts/test_rental_launcher_guard.ps1) and [`test_launcher.ps1`](../scripts/test_launcher.ps1) among them, with `powershell -File`.
 
 ## Continuous integration
 
-[`ci.yml`](../.github/workflows/ci.yml) runs on every push and pull request: formatting and the two Clippy configurations, as separate jobs; on Linux the release build, both Rust suites, the frontend checks, Python unittest discovery and the wallet, address and mail programs on disposable nodes; on Windows the fixture suite, the checks above, the frontend checks and both Clippy configurations; and one minute of libFuzzer per target. Within a job, every check runs once the build it needs succeeded, even after another check failed, so one run reports every failing check.
+[`ci.yml`](../.github/workflows/ci.yml) is configured to run on every push and pull request: formatting and the two Clippy configurations, as separate jobs; on Linux the release build, both Rust suites, the frontend checks, the browser cryptography rebuild, Python unittest discovery, and the standalone programs on disposable nodes (wallet CLI, wallet manager, addresses, adversarial wallet, mail wire, the independent Stratum worker, peer discovery across processes, and production issuance on the normal build); the fixture suite again with debug assertions; on Windows the fixture suite, the checks above, every PowerShell launcher test, the frontend checks and both Clippy configurations; and one minute of libFuzzer per target. Each check is its own step and runs once the build it needs succeeded, even after another check failed, so one run reports every failing check; the frontend runner itself stops at its first failing suite. PowerShell takes a step's result from its last command alone, so each Windows step that PowerShell runs holds one command, and each launcher test runs in its own Windows PowerShell 5.1, whose exit code says whether the test passed.
 
-A nightly schedule gives each fuzz target its own job: 15 minutes of libFuzzer, then 10 minutes of the stable runner from the same corpus. Each job minimizes its target's corpus with `cargo fuzz cmin` and keeps it, and a final job saves the corpora in the Actions cache, where every later run, nightly or per push, starts from them; a target whose job kept none keeps its previous corpus. A failing input is kept as a `fuzz-artifacts-<target>` artifact, also when the job fails or is cancelled. The nightly schedule also runs the live network suites on disposable three-node networks with [`ci_network_suites.sh`](../scripts/ci_network_suites.sh), the Linux counterpart of `Start-Testnet.ps1 -Fresh -SeedWallets`. The workflow runs both Rust suites with `--release`: the shipped profile keeps overflow checks and the code has no debug-only assertions, so the checks are the same as the commands above and finish sooner.
+The full gate also gives each fuzz target its own job: 15 minutes of libFuzzer, then 10 minutes of the stable runner from the same corpus. Each job minimizes its target's corpus with `cargo fuzz cmin` and keeps it, and on the nightly and manual runs a final job saves the corpora in the Actions cache, where every later run, nightly or per push, starts from them; a target whose job kept none keeps its previous corpus. A failing input is kept as a `fuzz-artifacts-<target>` artifact, also when the job fails or is cancelled. The full gate also runs the live network suites on disposable three-node networks with [`ci_network_suites.sh`](../scripts/ci_network_suites.sh), the Linux counterpart of `Start-Testnet.ps1 -Fresh -SeedWallets`. It runs nightly and on manual dispatch, which GitHub starts only from the workflow on the default branch, and on every push of a `v*` tag or a `release/*` branch, which runs it on exactly the pushed commit.
+
+Every action is pinned to a full commit and every toolchain and installed tool to an exact version: Rust 1.97.1; for libFuzzer, nightly-2026-10-10 and cargo-fuzz 0.13.2; for the bundle rebuild, the pnpm in `scripts/browser-crypto/package.json`, which corepack checks against its hash. A moved tag or branch upstream therefore cannot change what a run executes. [`test_ci_workflow.py`](../scripts/test_ci_workflow.py), which unittest discovery runs, checks these rules, the one-command PowerShell steps, and that every standalone test program and launcher test runs in a job.
+
+The workflow runs the Rust suites with `--release`, the shipped profile, which keeps overflow checks and compiles out debug assertions. Two exist: `HeldHeaders::insert` in `src/chain.rs` requires an unadmitted, unpinned header, and `src/wallet_store.rs` checks a wallet backup's fixed length. The debug-assertions job and every fuzz build, libFuzzer and the stable runner alike, turn them on.
+
+### Release gate
+
+The network launches from one commit. That exact commit needs a green run of the full gate before launch, recorded here:
+
+| Item | Record |
+| --- | --- |
+| Release commit | Not yet chosen |
+| Full-gate run | Not yet run |
+
+As of 2026-10-24 the workflow has never run on GitHub: the repository's only branch is `main` at `cfaaeb8`, which has no workflow, and `audit-fixes` has not been pushed. Every result below is a local run. To run the gate on the release commit:
+
+1. Push the release branch. Its push and pull-request runs cover every job except the per-target fuzz jobs and the network suites.
+2. Push a `release/<version>` branch, or the release tag, at the release commit. That run is the full gate on that commit.
+3. Record the commit, the run's address and its result in the table above. After any fix, repeat on the new commit: a run on another commit does not count.
+
+Nightly runs and manual dispatch become available once the workflow is on the default branch.
 
 ## Recorded results
 
@@ -146,7 +183,7 @@ The latest full run of this guide, with every audit workstream and the R15 and R
 | Windows, natively | 333 library unit tests (1 ignored) and 30 command-line unit tests passed, including the access-list, fail-closed and link checks; the in-process fuzz targets, `stratum_session` included, and the listener tests passed; `test_cold_launcher.ps1` passed under Windows PowerShell 5.1 and, with a stand-in signer that never became ready, stopped that signer. These were cross-built for x86_64-pc-windows-gnu with Rust 1.96.0 and MinGW-w64. Integration tests that embed build-host paths cannot run from such a build, and Clippy did not run for Windows; the Windows CI job covers both |
 | Fuzzing | `stratum_session` under libFuzzer (stable toolchain, SanitizerCoverage, no address sanitizer) for 300 seconds, 2.1 million inputs, then the stable runner for 120 seconds from that corpus: no failures. The earlier run of the other targets (the stable runner for 480 seconds per target, libFuzzer for 300) found and fixed a panic when `fee_quote` or `transfer_quote` received non-object parameters, and the browser opening a byte-order-mark-prefixed envelope that the node does not index as mail |
 
-The integration run after the other review branches were merged on top (the R01, R02, R03, R04, R05, R06, R08, R09, R11, R12, R13, R16, R17, R20, R22, R23, R25, R30 and R40 review commits, with `cargo fmt` over the merged tree) repeated part of this guide under WSL 2 and on Windows: `cargo fmt --check` and the fuzz `rustfmt` check passed; the `test-fixtures` suite with `--release` passed 823 tests, 8 ignored; the frontend runner passed its 24 suites; the seven self-contained Python unit scripts passed; and `test_network`, `test_economic_adversarial` and `test_load` (twelve 64-transaction waves, no refusals) passed with the fixture build on one fresh three-node network. Clippy, the plain suite, the Windows native checks and fuzzing were not repeated; continuous integration runs them.
+The integration run after the other review branches were merged on top (the R01, R02, R03, R04, R05, R06, R08, R09, R11, R12, R13, R16, R17, R20, R22, R23, R25, R30 and R40 review commits, with `cargo fmt` over the merged tree) repeated part of this guide under WSL 2 and on Windows: `cargo fmt --check` and the fuzz `rustfmt` check passed; the `test-fixtures` suite with `--release` passed 823 tests, 8 ignored; the frontend runner passed its 24 suites; the seven self-contained Python unit scripts passed; and `test_network`, `test_economic_adversarial` and `test_load` (twelve 64-transaction waves, no refusals) passed with the fixture build on one fresh three-node network. Clippy, the plain suite, the Windows native checks and fuzzing were not repeated, and continuous integration had not run them either (see the [release gate](#release-gate)).
 
 The 0.43.0 release preparation (the version bump, the peer protocol and storage markers, the release script and the launch documents, on `audit-fixes` at `c1ae19c`) repeated these under WSL 2 with rustc, Cargo and Clippy 1.97.1 and on Windows with rustfmt 1.9.0 and Node.js: `cargo fmt --check` and the fuzz `rustfmt` check passed; both Clippy configurations passed; the `test-fixtures` suite with `--release` passed 827 tests, 8 ignored, and the later `operator_files` run passed 10 (one earlier full run failed once in `stratum_shares::shares_difficulty_changes_duplicates_blocks_and_reorgs`, a solved block on the job after a reorganization that was not accepted under full parallel load; it passed ten runs alone and the next full run); the frontend runner passed its 24 suites and the mail property check its 117 vectors and 20,000 mutations; the seven self-contained Python unit scripts passed; and `test_network` (12 checks), `test_economic_adversarial` (10), `test_load` (twelve 64-transaction waves, no refusals) and `test_reserve_network` (12) passed through `ci_network_suites.sh` with the fixture build on fresh three-node networks. `scripts/release.sh --verify` produced byte-identical binaries from two from-scratch builds, and a copy of the source at another path gave the same `SHA256SUMS`. A 0.42.0 node and this build, given the same genesis file, refused each other at the first message in plain and pinned transport, and this build refused the 0.42.0 database, each naming that release; 0.42.0 still opened its database afterwards.
 
@@ -162,7 +199,8 @@ The [local testnet guide](TESTNET.md) describes creating a disposable three-node
 | [test_reserve_network.py](../scripts/test_reserve_network.py) | Reserve, revenue and grant accounting across nodes; takes a fixture manifest and required report path |
 | [test_economic_adversarial.py](../scripts/test_economic_adversarial.py) | Specific adversarial economic scenarios; takes a fixture manifest and required report path |
 | [test_load.py](../scripts/test_load.py) | Transaction waves, occupancy and conservation; takes a fixture manifest, required report path and bounded workload options |
-| [test_stratum_wire.py](../scripts/test_stratum_wire.py) | Stratum protocol scenarios using an explicitly selected node executable and report path |
+| [test_stratum_wire.py](../scripts/test_stratum_wire.py) | Stratum protocol scenarios from an independent Python worker; select a `test-fixtures` executable and report path |
+| [test_production_issuance.py](../scripts/test_production_issuance.py) | Production issuance on an unfunded loopback devnet: the normal build initializes it, refuses accelerated issuance and mines blocks at one petahash per atom; select a normal build and a new report path |
 | [test_wallet_adversarial.py](../scripts/test_wallet_adversarial.py) | Wallet and cold-signer rejection scenarios; select the rebuilt executables, disposable directory, unused ports and report path |
 | [test_wallet_cli.py](../scripts/test_wallet_cli.py), [test_wallet_manager.py](../scripts/test_wallet_manager.py), [test_addresses.py](../scripts/test_addresses.py) | CLI preparation, cold signing, wallet management and address round trips on their own disposable nodes; select the fixture executables, a disposable directory and report path; ports are chosen by the system |
 | [test_mail_wire.py](../scripts/test_mail_wire.py) | End-to-end encrypted mail on one disposable chain; select the fixture executable and report path |
@@ -170,6 +208,8 @@ The [local testnet guide](TESTNET.md) describes creating a disposable three-node
 | [soak.py](../scripts/soak.py) | Long chaos soak on a network it starts itself; takes a `test-fixtures` executable, report path, duration, node count, seed and base port (see [Chaos soak](#chaos-soak)) |
 
 Read each program's `--help` before running it. Pass explicit paths for generated reports and fixture directories. Use a fresh fixture for independent scenarios whose setup expects an empty chain. Stop test nodes through their owning launcher and manifest when finished.
+
+Continuous integration runs every program in this table except the soak: the four network suites in the full gate, the others on every push. [`test_full_audit_wallets.py`](../scripts/test_full_audit_wallets.py) and [`test_full_audit_wallet_launchers.ps1`](../scripts/test_full_audit_wallet_launchers.ps1) rerun suites that it runs directly, in relocated directories and ports.
 
 ## Chaos soak
 
@@ -211,7 +251,7 @@ The JSON report has `passed`, every check's count and violations, each violation
 
 The seed fixes keys and every randomized choice of the workload, miner and chaos schedules; thread timing is not deterministic, so reproduce a failure with the report's `reproduce.command` and, if needed, several runs or a longer duration. Linux's default ephemeral port range (32768–60999) includes the default ports, so a restarting node can find its port briefly held by a client socket; the harness retries that start and counts it under `workload.environment`. Conservation relies on the harness creating every account; it is meaningful only on the network the harness started. A passing soak covers the exercised schedules on one machine; it does not establish behavior under real network latency, adversarial peers at scale or production issuance.
 
-PowerShell launcher tests are separate from Rust, JavaScript and Python unittest discovery. They cover process ownership, configuration and startup/shutdown behavior; inspect their inputs and run them only in a disposable local environment. Linux shell and service-installation checks likewise require the intended platform. Report unrun platform checks as unrun.
+PowerShell launcher tests are separate from Rust, JavaScript and Python unittest discovery. They cover process ownership, configuration and startup/shutdown behavior; inspect their inputs and run them only in a disposable local environment. The Windows job runs each one in its own Windows PowerShell 5.1, and `test_cold_launcher.ps1` also under PowerShell 7. Run them the same way, for example `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test_rental_launcher_guard.ps1 -Executable target\release\hashstash.exe`: the child's exit code says whether the test passed, whereas a direct call leaves the last native command's code behind, which a passing test can set by checking a refusal. Linux shell and service-installation checks likewise require the intended platform. Report unrun platform checks as unrun.
 
 ## Interpreting results
 

@@ -1,15 +1,27 @@
 # The validation gate of docs/VALIDATION.md on Linux and Windows, plus
 # bounded fuzzing of the parsers that read hostile input. Every job uses
-# disposable local processes and OS-chosen or job-local ports only. Within a
-# job, each check runs once the build it needs succeeded, even after another
-# check failed, so one run reports every failing check.
+# disposable local processes and OS-chosen or job-local ports only. Each check
+# is its own step and runs once the build it needs succeeded, even after
+# another check failed, so one run reports every failing check; a runner of
+# several suites, such as the frontend runner, stops at its own first failure.
+#
+# Every action is pinned to a full commit, with its release in a comment, and
+# every toolchain and installed tool to an exact version: bump them
+# deliberately. scripts/test_ci_workflow.py checks these rules.
+#
+# Pushes and pull requests run every job below except the network suites,
+# with one minute of libFuzzer per target. The full gate also gives each fuzz
+# target its own 15-minute job and runs the live network suites. It runs
+# nightly and on demand, which GitHub starts only from the default branch, and
+# on a push of a release tag (v*) or a release/* branch, which runs it on the
+# exact commit being released.
 name: CI
 
 on:
   push:
   pull_request:
   schedule:
-    # Nightly: longer fuzzing and the live three-node network suites.
+    # Nightly: the full gate, on the default branch.
     - cron: '23 3 * * *'
   workflow_dispatch:
     inputs:
@@ -29,6 +41,9 @@ env:
   # The toolchain the gate was last recorded with (docs/VALIDATION.md). Bump
   # it deliberately: a newer Clippy can add lints the gate denies.
   RUST_TOOLCHAIN: '1.97.1'
+  # libFuzzer needs nightly: a dated one, and an exact cargo-fuzz.
+  FUZZ_TOOLCHAIN: 'nightly-2026-10-10'
+  CARGO_FUZZ_VERSION: '0.13.2'
   NODE_VERSION: '22'
   PYTHON_VERSION: '3.12'
 
@@ -37,8 +52,8 @@ jobs:
     name: Formatting
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
@@ -52,12 +67,12 @@ jobs:
     name: Clippy
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Clippy with test fixtures
@@ -67,22 +82,25 @@ jobs:
   linux:
     name: Tests (Linux)
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
+    env:
+      FIXTURES: target/fixtures/release
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Build
         id: build
         run: |
+          mkdir -p work/reports
           cargo build --release --locked --bins
           cargo build --release --locked --bins --features test-fixtures --target-dir target/fixtures
       - name: Rust tests
@@ -93,44 +111,99 @@ jobs:
         run: cargo test --release --all-targets --locked --features test-fixtures --target-dir target/fixtures
       - name: Frontend suites
         if: ${{ !cancelled() }}
+        run: node scripts/test_all_frontend.cjs
+      - name: Mail envelope property check
+        if: ${{ !cancelled() }}
+        run: node fuzz/js/mail_envelope.cjs
+      - name: Browser cryptography rebuilt from its lockfile
+        if: ${{ !cancelled() }}
+        # The pnpm that package.json names, which corepack checks against its
+        # hash, installs the registry tarballs pnpm-lock.yaml locks; a clean
+        # build must then match ui/vendor byte for byte.
+        working-directory: scripts/browser-crypto
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
         run: |
-          node scripts/test_all_frontend.cjs
-          node fuzz/js/mail_envelope.cjs
+          corepack pnpm install --frozen-lockfile
+          corepack pnpm run check
       - name: Python unit tests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         env:
           HASHSTASH_TEST_BINARY: ${{ github.workspace }}/target/release/hashstash
         run: python3 -B -m unittest discover -s scripts -p 'test_*.py'
-      - name: Python wallet, address and mail programs on disposable nodes
+      - name: Wallet CLI program
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: |
-          fixtures=target/fixtures/release
-          mkdir -p work/reports
-          python3 -B scripts/test_wallet_cli.py --node $fixtures/hashstash --cold $fixtures/hashstash-cold --directory work --report work/reports/wallet-cli.json
-          python3 -B scripts/test_wallet_manager.py --node $fixtures/hashstash --cold $fixtures/hashstash-cold --directory work --report work/reports/wallet-manager.json
-          python3 -B scripts/test_addresses.py --node $fixtures/hashstash --cold $fixtures/hashstash-cold --directory work --report work/reports/addresses.json
-          python3 -B scripts/test_wallet_adversarial.py --node $fixtures/hashstash --cold $fixtures/hashstash-cold --directory work/adversarial --base-port 38480 --report work/reports/wallet-adversarial.json
-          python3 -B scripts/test_mail_wire.py --binary $fixtures/hashstash --report work/reports/mail-wire.json
+        run: python3 -B scripts/test_wallet_cli.py --node $FIXTURES/hashstash --cold $FIXTURES/hashstash-cold --directory work --report work/reports/wallet-cli.json
+      - name: Wallet manager program
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 -B scripts/test_wallet_manager.py --node $FIXTURES/hashstash --cold $FIXTURES/hashstash-cold --directory work --report work/reports/wallet-manager.json
+      - name: Address program
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 -B scripts/test_addresses.py --node $FIXTURES/hashstash --cold $FIXTURES/hashstash-cold --directory work --report work/reports/addresses.json
+      - name: Adversarial wallet program
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 -B scripts/test_wallet_adversarial.py --node $FIXTURES/hashstash --cold $FIXTURES/hashstash-cold --directory work/adversarial --base-port 38480 --report work/reports/wallet-adversarial.json
+      - name: Mail wire program
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 -B scripts/test_mail_wire.py --binary $FIXTURES/hashstash --report work/reports/mail-wire.json
+      - name: Independent Stratum worker
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 -B scripts/test_stratum_wire.py --executable $FIXTURES/hashstash --report work/reports/stratum-wire.json
+      - name: Peer discovery across processes, normal build
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 -B scripts/test_peer_discovery_process.py --binary target/release/hashstash --output work/reports/peer-discovery-process.json
+      - name: Production issuance, normal build
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 -B scripts/test_production_issuance.py --binary target/release/hashstash --report work/reports/production-issuance.json
       - name: Keep reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: linux-reports
           path: work/reports
           if-no-files-found: ignore
 
+  debug-assertions:
+    # The release profile with debug assertions on: the shipped build compiles
+    # out every debug_assert!, so this is the only run that checks them.
+    name: Tests with debug assertions (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: 'true'
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Build
+        id: build
+        run: cargo build --release --locked --bins --features test-fixtures --target-dir target/debug-assertions
+      - name: Rust tests with test fixtures and debug assertions
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: cargo test --release --all-targets --locked --features test-fixtures --target-dir target/debug-assertions
+
   windows:
     name: Tests (Windows)
     runs-on: windows-2022
-    timeout-minutes: 120
+    timeout-minutes: 150
+    # PowerShell takes a step's result from its last command alone, so each
+    # PowerShell step runs one command. Each launcher test runs in its own
+    # Windows PowerShell 5.1, the shell Windows ships, whose exit code says
+    # whether the test passed; a passing test can leave a failed native
+    # command's code behind, which a direct call would report.
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
       - name: Build
@@ -143,25 +216,36 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         # Reads each secret file's access list back with icacls.
         run: cargo test --release --locked --lib --target-dir target/fixtures --features test-fixtures windows_ -- --nocapture
-      - name: Cold signer launcher token hand-off
+      - name: Cold signer launcher token hand-off, PowerShell 7
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        shell: pwsh
-        run: .\scripts\test_cold_launcher.ps1 -Executable .\target\release\hashstash-cold.exe -Port 21980 -Report work\cold-launcher-report.json
-      - name: Launchers under Windows PowerShell 5.1
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\test_cold_launcher.ps1 -Executable .\target\release\hashstash-cold.exe -Port 21980 -Report work\cold-launcher-report.json
+      - name: Cold signer launcher token hand-off, Windows PowerShell 5.1
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        # The PowerShell Windows ships, started with -File as a shortcut or a
-        # scheduled task starts a script; PowerShell 7 hides its differences.
-        shell: powershell
-        run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test_rental_launcher_guard.ps1 -Executable .\target\release\hashstash.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test_launcher.ps1 -Executable .\target\release\hashstash.exe -DataRoot work\launcher-ps51 -ReportPath work\launcher-ps51-report.json
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test_cold_launcher.ps1 -Executable .\target\release\hashstash-cold.exe -Port 21980 -Report work\cold-launcher-report-5.1.json
+      - name: Testnet launcher restarts and equal-work forks
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test_launcher.ps1 -Executable .\target\release\hashstash.exe -DataRoot ${{ github.workspace }}\work\launcher -BasePort 20680 -ReportPath ${{ github.workspace }}\work\launcher-report.json
+      - name: Testnet launcher configuration templates
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test_config_launcher.ps1 -Executable .\target\release\hashstash.exe -BasePort 23180 -Report work\config-launcher-report.json
+      - name: Testnet launcher mining settings
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test_mining_launcher.ps1 -Executable .\target\release\hashstash.exe -BasePort 24580 -Report work\mining-launcher-report.json
+      - name: Testnet launcher wallet seeding
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test_fresh_wallet_launcher.ps1 -Executable .\target\release\hashstash.exe -BasePort 21880 -Report work\fresh-wallet-launcher-report.json
+      - name: Watch-only launcher
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test_wallet_launcher.ps1 -Config config\devnet.json -Executable .\target\release\hashstash.exe -BasePort 21780 -Report work\wallet-launcher-report.json
+      - name: Rental launcher configuration guard
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test_rental_launcher_guard.ps1 -Executable .\target\release\hashstash.exe
       - name: Frontend suites
         if: ${{ !cancelled() }}
-        run: |
-          node scripts/test_all_frontend.cjs
-          node fuzz/js/mail_envelope.cjs
+        run: node scripts/test_all_frontend.cjs
+      - name: Mail envelope property check
+        if: ${{ !cancelled() }}
+        run: node fuzz/js/mail_envelope.cjs
       - name: Clippy, including the Windows-only access-list code
         if: ${{ !cancelled() }}
         run: cargo clippy --all-targets --locked -- -D warnings
@@ -170,7 +254,7 @@ jobs:
         run: cargo clippy --all-targets --locked --features test-fixtures --target-dir target/fixtures -- -D warnings
       - name: Keep reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: windows-reports
           path: work
@@ -178,8 +262,8 @@ jobs:
 
   fuzz:
     # Every push and pull request fuzzes all targets in one job, one minute
-    # each. The nightly and manual runs give each target its own job, time
-    # limit and corpus, so one target's time or failure never cuts another's.
+    # each. The full gate gives each target its own job, time limit and
+    # corpus, so one target's time or failure never cuts another's.
     name: Fuzz (${{ matrix.target }})
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -187,25 +271,32 @@ jobs:
       fail-fast: false
       matrix:
         # Every target in fuzz/Cargo.toml; tests/fuzz_parsers.rs checks this list.
-        target: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["peer_wire","peer_channel","codec_transaction","codec_block","json","http_request","rpc_params","address","signed_record","unsigned_envelope","mail_envelope","plain_text","address_book","stratum_session"]' || '["all"]') }}
+        target: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/heads/release/')) && '["peer_wire","peer_channel","codec_transaction","codec_block","json","http_request","rpc_params","address","signed_record","unsigned_envelope","mail_envelope","plain_text","address_book","stratum_session"]' || '["all"]') }}
     env:
-      FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || (github.event_name == 'schedule' && '900' || '60') }}
+      FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || ((github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/heads/release/')) && '900' || '60') }}
       TARGET: ${{ matrix.target }}
+      # Fuzzing, and the stable runner below, check the debug assertions the
+      # shipped build compiles out; cargo fuzz also takes --debug-assertions.
+      CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # The installed cargo-fuzz is cached with the rest of ~/.cargo.
+          key: ${{ env.FUZZ_TOOLCHAIN }}-cargo-fuzz-${{ env.CARGO_FUZZ_VERSION }}
           workspaces: |
             . -> target
             fuzz -> target
       - name: Install cargo-fuzz
-        run: cargo +nightly install cargo-fuzz --locked
+        run: cargo +${{ env.FUZZ_TOOLCHAIN }} install cargo-fuzz --version ${{ env.CARGO_FUZZ_VERSION }} --locked
       - name: Restore the corpus the last nightly run kept
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
@@ -218,21 +309,26 @@ jobs:
         run: |
           # Shared dependencies resolve to the versions the node ships with.
           cp Cargo.lock fuzz/Cargo.lock
+          fuzz="cargo +$FUZZ_TOOLCHAIN fuzz"
           if [ "$TARGET" = all ]; then
-            cargo +nightly fuzz build --release
-            targets=$(cargo +nightly fuzz list)
+            $fuzz build --release --debug-assertions
+            targets=$($fuzz list)
           else
-            cargo +nightly fuzz build --release "$TARGET"
+            $fuzz build --release --debug-assertions "$TARGET"
             targets=$TARGET
           fi
           # The RPC target's fixture node lives for the whole process by design,
           # so leak detection is left to the sanitizer's ordinary error checks.
+          # Every target runs even after another failed.
+          failed=
           for target in $targets; do
             echo "::group::$target"
-            cargo +nightly fuzz run --release "$target" "fuzz/corpus/$target" -- \
-              -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=4096 -timeout=30 -detect_leaks=0 -print_final_stats=1
+            $fuzz run --release --debug-assertions "$target" "fuzz/corpus/$target" -- \
+              -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=4096 -timeout=30 -detect_leaks=0 -print_final_stats=1 \
+              || failed="$failed $target"
             echo "::endgroup::"
           done
+          [ -z "$failed" ] || { echo "::error::libFuzzer failed:$failed"; exit 1; }
       - name: Seeded stable runner from the same corpus, bounded time
         if: matrix.target != 'all'
         env:
@@ -243,11 +339,13 @@ jobs:
         run: cargo +${{ env.RUST_TOOLCHAIN }} test --release --locked --features test-fixtures --test fuzz_parsers -- --ignored --nocapture fuzz_for_a_bounded_time
       - name: Minimize the corpus
         if: matrix.target != 'all'
-        run: cargo +nightly fuzz cmin --release "$TARGET" "fuzz/corpus/$TARGET" -- -rss_limit_mb=4096 -timeout=30 -detect_leaks=0
+        run: |
+          fuzz="cargo +$FUZZ_TOOLCHAIN fuzz"
+          $fuzz cmin --release --debug-assertions "$TARGET" "fuzz/corpus/$TARGET" -- -rss_limit_mb=4096 -timeout=30 -detect_leaks=0
       - name: Keep the corpus for the next runs
         # Also after a failure: the inputs that found it are kept separately.
         if: ${{ !cancelled() && matrix.target != 'all' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: fuzz-corpus-${{ matrix.target }}
           path: fuzz/corpus/${{ matrix.target }}
@@ -256,7 +354,7 @@ jobs:
       - name: Keep failing inputs
         # Last, so it also keeps what the stable runner found.
         if: failure() || cancelled()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts
@@ -265,20 +363,21 @@ jobs:
   fuzz-corpus:
     # The next runs, nightly and per push, start from each target's corpus as
     # the last nightly run left it; a target whose job kept none keeps its
-    # previous corpus.
+    # previous corpus. Caches a tag or release branch saves would serve only
+    # that ref, so those runs keep none.
     name: Keep the nightly fuzz corpora
     needs: fuzz
     if: ${{ always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-24.04
     steps:
       - name: Restore the previous corpora
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
           restore-keys: fuzz-corpus-
       - name: Collect the corpora this run kept
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: fuzz-corpus-*
           path: kept
@@ -293,36 +392,37 @@ jobs:
           done
           du -sh fuzz/corpus/* || true
       - name: Save the corpora
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
 
   network:
     name: Live fixture network suites
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/heads/release/')
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Build the fixture executable
         id: build
         run: cargo build --release --locked --bins --features test-fixtures --target-dir target/fixtures
       - name: Network, adversarial-economics and load suites on one funded network
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: bash scripts/ci_network_suites.sh target/fixtures/release/hashstash work/network/funded 38480
       - name: Reserve suite on a fresh network
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: bash scripts/ci_network_suites.sh target/fixtures/release/hashstash work/network/reserve 38480 test_reserve_network
       - name: Keep reports and node logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: network-reports
           path: work/network

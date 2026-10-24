@@ -6,7 +6,7 @@ fn repository(path: &str) -> String {
 }
 
 /// Dotted three-part numbers that name a Hashstash release, such as
-/// "Hashstash 0.42.0", "version=0.42.0" or "/opt/hashstash/0.42.0-". Other
+/// "Hashstash 0.43.0", "version=0.43.0" or "/opt/hashstash/0.43.0-". Other
 /// products' versions (nginx, systemd) may appear; IPv4 addresses have four parts.
 fn release_numbers(text: &str) -> Vec<&str> {
     const CONTEXTS: [&str; 5] = [

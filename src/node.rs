@@ -1017,8 +1017,12 @@ impl InvalidNonces {
         let body = &transaction.body;
         let key = (body.sender, body.nonce);
         // A resent transaction never weakens an entry a new one set.
-        let weakens = self.entries.get(&key).is_some_and(|entry| resent && !entry.2);
-        if !weakens && (self.entries.len() < MAX_INVALID_NONCES || self.entries.contains_key(&key)) {
+        let weakens = self
+            .entries
+            .get(&key)
+            .is_some_and(|entry| resent && !entry.2);
+        if !weakens && (self.entries.len() < MAX_INVALID_NONCES || self.entries.contains_key(&key))
+        {
             self.entries.insert(key, (body.fee.clone(), weight, resent));
         }
     }
@@ -2875,7 +2879,7 @@ impl Node {
                 screened.outbid.push((
                     id,
                     anyhow!(
-                        "a pending transaction at this nonce is replaced only by one raising its fee rate by at least an eighth and by the minimum fee rate"
+                        "a pending transaction at this nonce is replaced only by one raising its fee rate by at least an eighth and by the minimum fee rate, and earning the miner at least as much per weight unit"
                     ),
                 ));
             } else if !operator.contains(&id)
@@ -4180,10 +4184,21 @@ impl Node {
         let changed = self.install_pool(i, pool)?;
         if !unfunded.is_empty() {
             let funding = self.funded_accounts(i);
+            let (mut dropped, mut reason) = (0usize, "");
             for transaction in unfunded {
                 // Beyond the holding bounds, or without a transfer that
                 // creates its sender, it can be submitted again once funded.
-                let _ = Self::hold_unfunded(i, &Newcomer::new(transaction, None, true), &funding);
+                if let Err((_, why)) =
+                    Self::hold_unfunded(i, &Newcomer::new(transaction, None, true), &funding)
+                {
+                    dropped += 1;
+                    reason = why;
+                }
+            }
+            if dropped > 0 {
+                eprintln!(
+                    "Reorganization recovery dropped {dropped} spends from accounts not yet created ({reason}); they can be submitted again once funded"
+                );
             }
         }
         Ok(changed)

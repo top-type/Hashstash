@@ -206,10 +206,11 @@ fn persistent_failures_use_only_their_senders_budget() {
     // them as refused rather than leaving them undecided in its backlog.
     assert!(attacked.exhausted_senders.is_empty());
     assert!(!attacked.truncated);
-    // The attacker's candidates spend exactly their own allowance.
+    // The attacker's candidates spend exactly their own allowance, plus the
+    // one last attempt its sender gets once nothing else is ready.
     assert_eq!(
         attacked.execution_attempts,
-        honest.len() + attack.len() * SELECTION_ATTEMPTS_PER_CANDIDATE
+        honest.len() + attack.len() * SELECTION_ATTEMPTS_PER_CANDIDATE + 1
     );
     // The resulting template is a valid block.
     let time = chain.tip_block().header.timestamp + 15;

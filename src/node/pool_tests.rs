@@ -2667,14 +2667,8 @@ fn install_retained(node: &Node, candidates: &[Transaction]) {
     let retained = candidates.iter().map(codec::transaction_id).collect();
     let installed = {
         let mut i = node.locked().unwrap();
-        Node::select_pool(
-            &i.chain,
-            node.miner,
-            candidates,
-            &retained,
-            &HashSet::new(),
-        )
-        .and_then(|selected| node.install_pool(&mut i, selected))
+        Node::select_pool(&i.chain, node.miner, candidates, &retained, &HashSet::new())
+            .and_then(|selected| node.install_pool(&mut i, selected))
     };
     installed.unwrap();
 }
@@ -2721,7 +2715,7 @@ fn high_bids_behind_a_low_backlog_entry_never_displace_other_backlog_entries() {
     let (_, backlog, _) = pool(&node);
     let id = codec::transaction_id(&foothold);
     assert!(ids(&backlog).contains(&id));
-    let waiting = &ids(&backlog) - &ids(&[foothold.clone()]);
+    let waiting = &ids(&backlog) - &ids(std::slice::from_ref(&foothold));
     assert!(waiting.len() > 4, "honest entries wait for capacity");
     // One relayed batch of high bids behind the foothold, about one block's
     // bytes, each affordable on its own.
@@ -2777,8 +2771,7 @@ fn a_chain_displaced_by_capacity_keeps_its_longest_prefix_in_the_backlog() {
     let bytes: usize = backlog.iter().map(size).sum();
     let following = bytes - size(&backlog[0]);
     assert!(
-        following + left_out > 16 * 1024 / BACKLOG_SENDER_SHARE
-            || bytes + left_out > 16 * 1024,
+        following + left_out > 16 * 1024 / BACKLOG_SENDER_SHARE || bytes + left_out > 16 * 1024,
         "{waiting} entries, {bytes} bytes"
     );
 }
@@ -2856,12 +2849,22 @@ fn a_support_ranked_above_its_pending_proposal_survives_acceptances_between_them
         proposal: id,
         amount: 1u32.into(),
     };
-    let support = exact(config, state, &SECRET, unsigned(config, &SECRET, start, support), 0);
+    let support = exact(
+        config,
+        state,
+        &SECRET,
+        unsigned(config, &SECRET, start, support),
+        0,
+    );
     let rank = |tx: &Transaction| {
         let quote = fees::quote(config, state, tx).unwrap();
         crate::chain::Priority::new(&quote, codec::transaction_id(tx))
     };
-    assert!(payments.iter().all(|payment| rank(&support) < rank(payment)));
+    assert!(
+        payments
+            .iter()
+            .all(|payment| rank(&support) < rank(payment))
+    );
     // Each payment's acceptance retries the failed Support, which spends
     // its whole attempt budget before the proposal it waits for applies.
     let mut candidates = payments;
@@ -2884,7 +2887,12 @@ fn a_support_ranked_above_its_pending_proposal_survives_acceptances_between_them
     // So the pool keeps it, and the next block includes it.
     install_retained(&node, &candidates);
     assert!(pool(&node).0.contains(&support));
-    assert!(node.mine(1_000_000).unwrap().transactions.contains(&support));
+    assert!(
+        node.mine(1_000_000)
+            .unwrap()
+            .transactions
+            .contains(&support)
+    );
 }
 
 #[test]
@@ -3003,7 +3011,11 @@ fn a_replacement_that_raises_the_signed_fee_outranks_what_it_replaces() {
         .expect("a heavier replacement earning the miner less");
     assert!(!replaces(config, state, &heavier, &second));
     selections();
-    assert!(node.submit_transaction(heavier).is_err());
+    let refused = node.submit_transaction(heavier).unwrap_err().to_string();
+    assert!(
+        refused.contains("earning the miner at least as much per weight unit"),
+        "{refused}"
+    );
     assert_eq!(selections(), 0);
     assert_eq!(pool(&node).0, vec![new, second]);
 }

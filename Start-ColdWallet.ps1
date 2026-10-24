@@ -24,6 +24,37 @@ function Register-CrashReportExclusion([string]$Name, [string]$SubKey) {
         return 'added'
     } finally { $key.Dispose() }
 }
+# The free-port check below does not reserve the port, so another program, in
+# any account, could bind it before the signer does; the signer then exits,
+# and the browser would hand that program the launch token and whatever
+# passphrase or key is typed into its page. The signer is ready only when
+# every listener on the port belongs to the started process and it answers
+# as the signer.
+function Wait-SignerReady($Process, [int]$Port, [TimeSpan]$Timeout) {
+    if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) {
+        throw 'Get-NetTCPConnection (the NetTCPIP module) is needed to confirm that the signer owns its port.'
+    }
+    $deadline = [DateTime]::UtcNow + $Timeout
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ($Process.HasExited) { throw 'Cold signer exited during startup.' }
+        # Listeners that take connections to 127.0.0.1, IPv4 or dual-stack.
+        $owners = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+            Where-Object { @('127.0.0.1', '0.0.0.0', '::') -contains $_.LocalAddress } |
+            ForEach-Object { [int64]$_.OwningProcess } | Sort-Object -Unique)
+        $others = @($owners | Where-Object { $_ -ne [int64]$Process.Id })
+        if ($others.Count -gt 0) {
+            throw "Another program (process ID $($others -join ', ')) is listening on port $Port, so the signer address was not opened. Stop that program, or start the signer with another -Port."
+        }
+        if ($owners.Count -gt 0) {
+            try {
+                $session = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/session" -TimeoutSec 1
+                if ($session.format -eq 'hashstash-cold-v1' -and -not $Process.HasExited) { return }
+            } catch { }
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "Signer did not become ready. Process ID: $($Process.Id)"
+}
 if (-not $Executable) {
     $Executable = Join-Path $PSScriptRoot 'target/release/hashstash-cold.exe'
     if (-not (Test-Path -LiteralPath $Executable)) { $Executable = Join-Path $PSScriptRoot 'bin/hashstash-cold.exe' }
@@ -74,19 +105,8 @@ $env:HASHSTASH_COLD_TOKEN = $signerToken
 try {
     $signerProcess = Start-Process -FilePath $signerPath -ArgumentList $quotedArguments -WindowStyle Hidden -PassThru
 } finally { Remove-Item Env:\HASHSTASH_COLD_TOKEN -ErrorAction SilentlyContinue }
-$signerUrl = "http://127.0.0.1:$Port/"
-$launchUrl = $signerUrl + '#token=' + $signerToken
-$signerReady = $false
-$signerDeadline = [DateTime]::UtcNow.AddSeconds(15)
-while ([DateTime]::UtcNow -lt $signerDeadline) {
-    if ($signerProcess.HasExited) { throw 'Cold signer exited during startup.' }
-    try {
-        $signerSession = Invoke-RestMethod -Uri ($signerUrl + 'api/session') -TimeoutSec 1
-        if ($signerSession.format -eq 'hashstash-cold-v1') { $signerReady = $true; break }
-    } catch { }
-    Start-Sleep -Milliseconds 100
-}
-if (-not $signerReady) { throw "Signer did not become ready. Process ID: $($signerProcess.Id)" }
+$launchUrl = "http://127.0.0.1:$Port/#token=$signerToken"
+Wait-SignerReady $signerProcess $Port ([TimeSpan]::FromSeconds(15))
 Write-Host "Cold signer: $launchUrl"
 Write-Host "Open that full address; the page needs its #token part. Process ID: $($signerProcess.Id). An open wallet locks after 5 minutes without use; lock it when finished and stop this process to close the signer."
 if (-not $NoBrowser) { Start-Process $launchUrl }

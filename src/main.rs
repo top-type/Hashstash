@@ -647,8 +647,9 @@ fn stratum_password(text: &str) -> Result<String> {
 }
 
 /// Create the automatic discovery identity without ever leaving a partial file
-/// under its final name: write a temporary file, then link it into place without
-/// overwriting. An empty file from an interrupted earlier start is replaced.
+/// under its final name: write it in a staging directory, then link it into
+/// place without overwriting. An empty file from an interrupted earlier start
+/// is replaced.
 fn ensure_peer_key_file(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() && metadata.len() == 0 => {
@@ -661,25 +662,10 @@ fn ensure_peer_key_file(path: &Path) -> Result<()> {
             return Err(error).with_context(|| format!("inspect {}", path.display()));
         }
     }
-    let name = path
-        .file_name()
-        .context("peer identity path needs a file name")?;
-    let mut unique = [0u8; 8];
-    getrandom::fill(&mut unique).map_err(|e| anyhow!("randomness unavailable: {e}"))?;
-    let temporary = path.with_file_name(format!(
-        ".{}.{}.tmp",
-        name.to_string_lossy(),
-        hex::encode(unique)
-    ));
-    if let Err(error) = hashstash::peer_auth::generate_key_file(&temporary) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    let published = publish_new(&temporary, path, |from, to| fs::hard_link(from, to));
-    if published.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    published.with_context(|| format!("publish peer identity {}", path.display()))?;
+    let (staged, _) = StagedIdentity::create(path)?;
+    publish_new(&staged.file, path, |from, to| fs::hard_link(from, to))
+        .with_context(|| format!("publish peer identity {}", path.display()))?;
+    drop(staged);
     #[cfg(unix)]
     {
         // Make the new directory entry durable as well as the file contents.
@@ -689,28 +675,71 @@ fn ensure_peer_key_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Move a complete temporary file to `path` unless a file is already there.
-/// `link` adds the name without replacing; where hard links are unsupported
-/// (FAT volumes, some network mounts) the file is renamed while `path` is
-/// still absent, which only two simultaneous first starts could race.
+/// A new peer identity, generated in a staging directory beside its final
+/// path that only this account can open. The identity file is created by
+/// `peer_auth`, so in a folder whose inherited access list lets other
+/// accounts read it, it would otherwise be readable by them until it is
+/// restricted, and a handle opened in that moment keeps its access; inside
+/// the staging directory it is owner-only from the start, and it keeps that
+/// list when it is linked or renamed into place. Dropping this removes the
+/// staging directory and anything left in it.
+struct StagedIdentity {
+    directory: PathBuf,
+    file: PathBuf,
+}
+impl StagedIdentity {
+    fn create(path: &Path) -> Result<(Self, PublicKey)> {
+        let name = path
+            .file_name()
+            .context("peer identity path needs a file name")?;
+        let mut unique = [0u8; 8];
+        getrandom::fill(&mut unique).map_err(|e| anyhow!("randomness unavailable: {e}"))?;
+        let directory = path.with_file_name(format!(
+            ".{}.{}.tmp",
+            name.to_string_lossy(),
+            hex::encode(unique)
+        ));
+        hashstash::local_files::create_private_directory(&directory)?;
+        let staged = Self {
+            file: directory.join("peer-key.json"),
+            directory,
+        };
+        let public = hashstash::peer_auth::generate_key_file(&staged.file)?;
+        Ok((staged, public))
+    }
+}
+impl Drop for StagedIdentity {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.file);
+        let _ = fs::remove_dir(&self.directory);
+    }
+}
+
+/// Move a complete temporary file to `path` unless a file is already there,
+/// and say whether it was moved. `link` adds the name without replacing;
+/// where hard links are unsupported (FAT volumes, some network mounts) the
+/// file is renamed while `path` is still absent, which only two simultaneous
+/// first starts could race.
 fn publish_new(
     temporary: &Path,
     path: &Path,
     link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    match link(temporary, path) {
-        Ok(()) => {}
+) -> std::io::Result<bool> {
+    let published = match link(temporary, path) {
+        Ok(()) => true,
         // A concurrent start published its identity first; keep that one.
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
         Err(_) => match fs::symlink_metadata(path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return fs::rename(temporary, path);
+                fs::rename(temporary, path)?;
+                return Ok(true);
             }
             Err(error) => return Err(error),
-            Ok(_) => {}
+            Ok(_) => false,
         },
-    }
-    fs::remove_file(temporary)
+    };
+    fs::remove_file(temporary)?;
+    Ok(published)
 }
 
 /// Peer transport keys are public network identities; never link one to a
@@ -734,27 +763,26 @@ fn read_json(path: &Path) -> Result<Value> {
     )?)
 }
 fn write_new(path: &Path, value: &impl serde::Serialize, private: bool) -> Result<()> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(if private { 0o600 } else { 0o644 });
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = private;
-    }
-    let mut file = options.open(path).with_context(|| {
-        format!(
-            "create {} (existing files are not overwritten)",
-            path.display()
-        )
-    })?;
-    if private {
-        // Owner-only before any key byte is written, on Windows too.
-        hashstash::local_files::restrict_to_owner(path)?;
-    }
+    let mut file = if private {
+        // Owner-only from the moment it exists, on Windows too: the system
+        // creates it with that access list, so no other account can open it
+        // before the key is written.
+        hashstash::local_files::create_new_private(path)?
+    } else {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o644);
+        }
+        options.open(path).with_context(|| {
+            format!(
+                "create {} (existing files are not overwritten)",
+                path.display()
+            )
+        })?
+    };
     // Key files pass through this buffer; wipe it rather than freeing it intact.
     file.write_all(&Zeroizing::new(serde_json::to_vec_pretty(value)?))?;
     file.write_all(b"\n")?;
@@ -778,8 +806,25 @@ impl Drop for SpendingKeyFile {
         self.secret.zeroize();
     }
 }
+/// Spending key files are a few hundred bytes; the cold signer's page accepts
+/// at most this much too.
+const MAX_KEY_FILE_BYTES: usize = 4096;
+
+/// Reads a spending key file and warns, on standard error, when other
+/// accounts on this computer can read it (`local_files::read_operator_secret`).
 fn key_file(path: &Path) -> Result<(Zeroizing<[u8; 32]>, PublicKey)> {
-    let bytes = Zeroizing::new(fs::read(path).with_context(|| format!("read {}", path.display()))?);
+    read_key_file(path, true)
+}
+
+fn read_key_file(path: &Path, warn: bool) -> Result<(Zeroizing<[u8; 32]>, PublicKey)> {
+    let (bytes, exposed) = hashstash::local_files::read_operator_secret(path, MAX_KEY_FILE_BYTES)
+        .with_context(|| format!("read {}", path.display()))?;
+    if let Some(exposed) = exposed.filter(|_| warn) {
+        eprintln!(
+            "Warning: key file {} {exposed}. Keep spending keys readable only by your own account.",
+            path.display()
+        );
+    }
     let file: SpendingKeyFile = serde_json::from_slice(&bytes)?;
     let (private_field, public_field) = if let Some(format) = &file.format {
         ensure!(
@@ -1522,7 +1567,8 @@ async fn send_operation(
         &prepared.notes(&client),
     );
     let signed = {
-        let (secret, public) = key_file(key)?;
+        // Read again only to sign; the first read already warned.
+        let (secret, public) = read_key_file(key, false)?;
         ensure!(
             public == sender,
             "key file changed while preparing the transaction"
@@ -1557,10 +1603,16 @@ async fn main() -> Result<()> {
             );
         }
         Command::PeerKeygen { out } => {
-            println!(
-                "{}",
-                hex::encode(hashstash::peer_auth::generate_key_file(&out)?)
+            let (staged, public) = StagedIdentity::create(&out)?;
+            let published = publish_new(&staged.file, &out, |from, to| fs::hard_link(from, to))
+                .with_context(|| format!("publish peer identity {}", out.display()))?;
+            ensure!(
+                published,
+                "create {} (existing files are never overwritten)",
+                out.display()
             );
+            drop(staged);
+            println!("{}", hex::encode(public));
         }
         Command::PeerKeycheck {
             key_file,
@@ -2932,16 +2984,69 @@ mod tests {
         let unsupported: Link = |_, _| Err(std::io::ErrorKind::Unsupported.into());
         let existing: Link = |_, _| Err(std::io::ErrorKind::AlreadyExists.into());
         fs::write(&temporary, b"whole").unwrap();
-        publish_new(&temporary, &path, unsupported).unwrap();
+        assert!(publish_new(&temporary, &path, unsupported).unwrap());
         assert_eq!(fs::read(&path).unwrap(), b"whole");
         assert!(!temporary.exists());
-        // A file already published is kept, whichever way publication failed.
+        // A file already published is kept, whichever way publication failed,
+        // and the caller learns that its own was not.
         for link in [unsupported, existing] {
             fs::write(&temporary, b"other").unwrap();
-            publish_new(&temporary, &path, link).unwrap();
+            assert!(!publish_new(&temporary, &path, link).unwrap());
             assert_eq!(fs::read(&path).unwrap(), b"whole");
             assert!(!temporary.exists());
         }
+    }
+
+    /// `peer-keygen` writes a new identity through the same staging directory
+    /// and never replaces an existing file.
+    #[test]
+    fn explicit_peer_identities_are_staged_and_never_replace_a_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("peer.json");
+        let (staged, public) = StagedIdentity::create(&path).unwrap();
+        assert!(staged.directory.is_dir() && staged.file.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&staged.directory), 0o700);
+            assert_eq!(mode(&staged.file), 0o600);
+        }
+        assert!(publish_new(&staged.file, &path, |from, to| fs::hard_link(from, to)).unwrap());
+        drop(staged);
+        assert_eq!(
+            hashstash::peer_auth::Policy::discovery_from_file(&path, Vec::new())
+                .unwrap()
+                .public_key(),
+            public
+        );
+        let (again, _) = StagedIdentity::create(&path).unwrap();
+        assert!(!publish_new(&again.file, &path, |from, to| fs::hard_link(from, to)).unwrap());
+        drop(again);
+        assert_eq!(
+            fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "no staging directory is left behind"
+        );
+    }
+
+    /// Spending key files are small; a large file is refused before it is
+    /// read into memory, as the faucet and passphrase readers refuse theirs.
+    #[test]
+    fn key_files_larger_than_a_key_backup_are_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let secret = hex::encode([19u8; 32]);
+        let path = directory.path().join("padded.json");
+        let mut contents = serde_json::to_vec(&json!({"secret":secret})).unwrap();
+        fs::write(&path, &contents).unwrap();
+        assert!(key_file(&path).is_ok());
+        contents.resize(MAX_KEY_FILE_BYTES + 1, b' ');
+        fs::write(&path, &contents).unwrap();
+        let error = key_file(&path).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("at most 4096 bytes"),
+            "{error:#}"
+        );
     }
 
     #[test]

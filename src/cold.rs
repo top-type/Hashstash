@@ -139,16 +139,6 @@ impl WalletState {
         self.backup_pending = false;
         Ok(())
     }
-    fn backup(&self) -> Result<Value> {
-        let secret = self
-            .secret
-            .as_ref()
-            .ok_or_else(|| anyhow!("Open a wallet first"))?;
-        let private_key = Zeroizing::new(hex::encode(secret.as_slice()));
-        Ok(
-            json!({"format":"hashstash-private-v1","private_key":private_key.as_str(),"public_key":self.public.map(hex::encode)}),
-        )
-    }
     fn status(&self) -> Result<Value> {
         let public = self.public;
         // An unsaved generated key must not be funded: no address or
@@ -402,6 +392,7 @@ pub async fn serve_with_options(address: SocketAddr, options: ColdOptions) -> Re
             get(|| async { ([("content-type", "text/css; charset=utf-8")], STYLE) }),
         )
         .route("/api/session", get(session))
+        .route("/api/status", post(status))
         .route("/api/network", post(network))
         .route("/api/unlock", post(unlock))
         .route("/api/generate", post(generate))
@@ -442,29 +433,65 @@ pub async fn serve_with_options(address: SocketAddr, options: ColdOptions) -> Re
     })
 }
 
-/// Status only. Loopback is shared by every local account and service, so
-/// the session token is never served here; the page reads its launch URL.
-async fn session(State(app): State<App>) -> Response {
+/// The signer's status with its format and local limits. Reading it never
+/// extends an idle wallet's lifetime.
+async fn current_status(app: &App) -> Result<Value> {
     // A long review holds the wallet lock; wait for it off the async workers.
     let wallet = app.wallet.clone();
     let idle = app.idle_lock;
-    let status = tokio::task::spawn_blocking(move || {
+    let mut status = tokio::task::spawn_blocking(move || {
         let mut state = wallet.lock().map_err(|_| anyhow!("Signer unavailable"))?;
-        // Reading status never extends an idle wallet's lifetime.
         state.expire(idle);
         state.status()
     })
-    .await;
-    match status {
-        Ok(Ok(mut status)) => {
-            status["format"] = json!("hashstash-cold-v1");
-            status["max_review_bytes"] = json!(app.limits.bytes);
-            status["max_review_payments"] = json!(app.limits.payments);
-            status["idle_lock_seconds"] = json!(app.idle_lock.as_secs());
-            Json(status).into_response()
+    .await
+    .map_err(|_| anyhow!("Signer unavailable"))??;
+    status["format"] = json!("hashstash-cold-v1");
+    status["max_review_bytes"] = json!(app.limits.bytes);
+    status["max_review_payments"] = json!(app.limits.payments);
+    status["idle_lock_seconds"] = json!(app.idle_lock.as_secs());
+    Ok(status)
+}
+
+/// Fields of the status any local program may read without the session
+/// token: the format, local limits and whether a wallet is open.
+const PUBLIC_STATUS: [&str; 6] = [
+    "format",
+    "max_review_bytes",
+    "max_review_payments",
+    "idle_lock_seconds",
+    "unlocked",
+    "idle_locked",
+];
+
+/// Format, limits and lock state only, for readiness checks and a page
+/// opened without its token. Loopback is shared by every local account and
+/// service, so neither the session token nor anything naming the open
+/// account (its key, address or network) is served without the token:
+/// another local program could otherwise watch which accounts the operator
+/// opens and link them. The page reads those through POST /api/status.
+async fn session(State(app): State<App>) -> Response {
+    match current_status(&app).await {
+        Ok(status) => {
+            let public: serde_json::Map<String, Value> = PUBLIC_STATUS
+                .iter()
+                .map(|field| ((*field).to_owned(), status[*field].clone()))
+                .collect();
+            Json(Value::Object(public)).into_response()
         }
-        Ok(Err(problem)) => error(StatusCode::INTERNAL_SERVER_ERROR, &problem.to_string()),
-        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Signer unavailable"),
+        Err(problem) => error(StatusCode::INTERNAL_SERVER_ERROR, &problem.to_string()),
+    }
+}
+
+/// The full status, including the open account, for the page holding the
+/// session token (every POST requires it). The body, `{}` by convention, is
+/// read and ignored: a client that sent `Expect: 100-continue` (Windows
+/// PowerShell does) is then asked for it and keeps its connection, instead of
+/// getting an answer that closes the connection while it may be sending.
+async fn status(State(app): State<App>, _body: Bytes) -> Response {
+    match current_status(&app).await {
+        Ok(status) => Json(status).into_response(),
+        Err(problem) => error(StatusCode::INTERNAL_SERVER_ERROR, &problem.to_string()),
     }
 }
 
@@ -502,9 +529,42 @@ fn secret_body(bytes: Bytes) -> Zeroizing<Vec<u8>> {
     Zeroizing::new(Vec::from(bytes))
 }
 
-async fn job<F>(app: App, work: F) -> Response
+/// A request's answer: a JSON value, or a body that holds a private key,
+/// serialized into a buffer reserved at its exact size that is handed to the
+/// HTTP library without a copy and wiped once the response is sent.
+enum Answer {
+    Json(Value),
+    Secret(Zeroizing<Vec<u8>>),
+}
+impl From<Value> for Answer {
+    fn from(value: Value) -> Self {
+        Self::Json(value)
+    }
+}
+/// Lets the response body own a wiped buffer.
+struct Wiped(Zeroizing<Vec<u8>>);
+impl AsRef<[u8]> for Wiped {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+impl IntoResponse for Answer {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Json(value) => Json(value).into_response(),
+            Self::Secret(body) => (
+                [("content-type", "application/json")],
+                Bytes::from_owner(Wiped(body)),
+            )
+                .into_response(),
+        }
+    }
+}
+
+async fn job<F, A>(app: App, work: F) -> Response
 where
-    F: FnOnce(&mut WalletState) -> Result<Value> + Send + 'static,
+    F: FnOnce(&mut WalletState) -> Result<A> + Send + 'static,
+    A: Into<Answer> + Send + 'static,
 {
     let Ok(permit) = app.jobs.clone().try_acquire_owned() else {
         return error(StatusCode::CONFLICT, "Signer busy");
@@ -528,7 +588,7 @@ where
     })
     .await
     {
-        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Ok(answer)) => answer.into().into_response(),
         Ok(Err(problem)) => error(StatusCode::BAD_REQUEST, &problem.to_string()),
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Signer unavailable"),
     }
@@ -586,11 +646,46 @@ async fn generate(State(app): State<App>) -> Response {
         };
         state.load(secret, None)?;
         state.backup_pending = true;
-        let mut status = state.status()?;
-        status["backup"] = state.backup()?;
-        Ok(status)
+        let status = state.status()?;
+        let (Some(secret), Some(public)) = (state.secret.as_ref(), state.public.as_ref()) else {
+            return Err(anyhow!("Open a wallet first"));
+        };
+        generate_body(&status, secret, public).map(Answer::Secret)
     })
     .await
+}
+
+const BACKUP_PREFIX: &[u8] = br#","backup":{"format":"hashstash-private-v1","private_key":""#;
+const BACKUP_MIDDLE: &[u8] = br#"","public_key":""#;
+const BACKUP_SUFFIX: &[u8] = br#""}}"#;
+/// The /api/generate response: `status`, which holds no secret, with the new
+/// key's only `hashstash-private-v1` backup added as `backup`. Its JSON is
+/// written straight into a buffer reserved at its exact size, so no
+/// reallocation leaves a copy behind, and wiped on drop once sent. No
+/// `Value` or `String` holds the key's hex.
+fn generate_body(
+    status: &Value,
+    secret: &[u8; 32],
+    public: &PublicKey,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let status = serde_json::to_vec(status)?;
+    let open = status
+        .strip_suffix(b"}")
+        .filter(|open| open.len() > 1)
+        .ok_or_else(|| anyhow!("Signer status is not an object"))?;
+    let mut encoded = Zeroizing::new([0u8; 64]);
+    hex::encode_to_slice(secret, encoded.as_mut()).map_err(|_| anyhow!("Invalid key"))?;
+    let size =
+        open.len() + BACKUP_PREFIX.len() + 64 + BACKUP_MIDDLE.len() + 64 + BACKUP_SUFFIX.len();
+    let mut body = Zeroizing::new(Vec::with_capacity(size));
+    body.extend_from_slice(open);
+    body.extend_from_slice(BACKUP_PREFIX);
+    body.extend_from_slice(encoded.as_ref());
+    body.extend_from_slice(BACKUP_MIDDLE);
+    body.extend_from_slice(hex::encode(public).as_bytes());
+    body.extend_from_slice(BACKUP_SUFFIX);
+    debug_assert_eq!(body.len(), size);
+    Ok(body)
 }
 
 #[derive(Deserialize)]
@@ -744,10 +839,30 @@ async fn sign(State(app): State<App>, bytes: Bytes) -> Response {
     }).await
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
+
+    /// The one response that carries a generated key is the status with the
+    /// backup added, built in a buffer of exactly its size, so no
+    /// reallocation leaves a copy of the key, and wiped when dropped.
+    #[test]
+    fn generated_key_responses_hold_the_key_in_one_exact_buffer() {
+        let secret = [7u8; 32];
+        let public = crate::crypto::public_key(&secret).unwrap();
+        let status = json!({"public_key":hex::encode(public),"address":null,"unlocked":true,"backup_pending":true});
+        let body = super::generate_body(&status, &secret, &public).unwrap();
+        assert_eq!(body.len(), body.capacity());
+        let mut expected = status.clone();
+        expected["backup"] = json!({"format":"hashstash-private-v1","private_key":hex::encode(secret),"public_key":hex::encode(public)});
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), expected);
+        assert!(super::generate_body(&json!({}), &secret, &public).is_err());
+        assert!(super::generate_body(&json!([1]), &secret, &public).is_err());
+    }
+
     /// Runs in a child test process, since the change applies to a whole
     /// process and cannot be undone.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_signer_process_cannot_dump_core() {
         const CHILD: &str = "HASHSTASH_CORE_DUMP_CHILD";

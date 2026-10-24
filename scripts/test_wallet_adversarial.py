@@ -193,7 +193,8 @@ def main():
         check('Duplicate JSON body keys cannot substitute or retain an approved transaction')
         for headers in ({'Origin': 'https://example.invalid'}, {'X-Hashstash-Cold-Token': 'wrong'}, {'Host': 'example.invalid'}):
             assert raw_cold('unlock', json.dumps({'passphrase': other['passphrase']}), headers)[0] == 403
-        assert request(cold_base, '/api/session')[1]['public_key'] == primary['public_key']
+        # The open account is read with the token; without it the signer names none.
+        assert cold('status')['public_key'] == primary['public_key'] and 'public_key' not in request(cold_base, '/api/session')[1]
         assert raw_cold('unlock', ' ' * (128 * 1024 + 1))[0] == 413
         assert raw_cold('review', ' ' * (128 * 1024 + 1))[0] == 400
         assert raw_cold('review', ' ' * (review_limit + 1))[0] == 400

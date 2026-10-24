@@ -41,7 +41,7 @@ the faucet a visitor's key or the key to an account holding valuable funds.
 The daemon accepts the usual key-file JSON, with `secret` and `public` fields.
 It refuses a key file that is a symbolic link, and on Unix one readable or
 writable by its group or other users (keep `keygen`'s 0600 mode). On Windows
-it refuses one whose access list, read with `icacls /save` (account SIDs, the
+it refuses one whose access list, read from the open file (account SIDs, the
 same in every display language), lets in any account other than the faucet's
 own, SYSTEM and Administrators; inherited entries count, so a key copied into
 a folder that lets Users read is refused until it is restricted again
@@ -50,7 +50,7 @@ which holds no access list. The key is read through the one opened handle the
 other checks inspected, so a path replaced in between is refused: on Unix the
 handle must have the inspected device and inode, and on Windows the path is
 opened without following a symbolic link or junction, which is then refused.
-The Windows access list is read by path after that.
+The Windows access list is read through that same handle.
 The node's peer identity files use the same reader. Parsed copies of the
 secret are wiped, and stored subnet digests use a key derived from the signer,
 never the signing key itself.

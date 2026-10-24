@@ -2620,9 +2620,12 @@ impl Node {
     }
     /// Configured or pinned peers have their own reserved inbound capacity.
     /// Discovery peers this node verified in the last hour have separate
-    /// reserved slots, but stay subject to network group caps.
+    /// reserved slots, but stay subject to network group caps. Operator
+    /// privileges go to the exact configured or pinned address
+    /// (`protected_peers`), never to its neighbours in an IPv6 /64, which a
+    /// pin's key check, also by exact address, does not cover.
     fn peer_class(&self, configured: &HashSet<IpAddr>, ip: IpAddr) -> PeerClass {
-        if configured.contains(&network_guard::admission_address(ip)) {
+        if configured.contains(&ip.to_canonical()) {
             PeerClass::Operator
         } else if self
             .discovery
@@ -4437,7 +4440,9 @@ impl Node {
     /// Accept a peer message from `source`, the address that sent it. A block
     /// of it that this call makes the tip, and a transaction of it that a
     /// selection admits as new, credit that address with a delivery, which
-    /// keeps its inbound sessions from eviction (`PeerSlots::delivered`).
+    /// keeps its inbound sessions from eviction (`PeerSlots::delivered`); the
+    /// block also tells discovery that the address advanced this node
+    /// (`PeerSlots::advanced`).
     fn receive_peer(&self, msg: &PeerMessage, source: IpAddr) -> Result<()> {
         ensure!(
             msg.chain == self.read_view()?.chain.chain_id(),
@@ -4481,7 +4486,7 @@ impl Node {
                 );
                 math::check_pow(&b.header, &target)?;
                 match self.submit_block_from(b.clone(), Some(source)) {
-                    Ok(true) => self.peer_sessions.delivered(peer),
+                    Ok(true) => self.peer_sessions.advanced(peer),
                     Ok(false) => {}
                     // A declined side block's header is held for presync, so
                     // the rest of its branch is still downloaded after it. A
@@ -6151,15 +6156,10 @@ pub async fn serve(mut node: Node, options: ServerOptions) -> Result<Server> {
         }
     }
     // Configured and pinned peer addresses keep reserved inbound capacity.
-    let protected: Arc<HashSet<IpAddr>> = Arc::new(
-        options
-            .peers
-            .iter()
-            .map(SocketAddr::ip)
-            .chain(node.peer_auth.iter().flat_map(|p| p.pinned_ips()))
-            .map(network_guard::admission_address)
-            .collect(),
-    );
+    let protected = Arc::new(protected_peers(
+        &options.peers,
+        node.peer_auth.iter().flat_map(|p| p.pinned_ips()),
+    ));
     // Addresses whose miners authorized before a restart, and prefixes the
     // operator trusts, keep reserved Stratum slots from the first connection.
     node.stratum_pending.allow(&options.stratum_trusted);
@@ -6334,12 +6334,15 @@ pub async fn serve(mut node: Node, options: ServerOptions) -> Result<Server> {
                     };
                     let (admission, capacity, pending) = if kind == 1 {
                         // Rate limits and cooldowns apply before slot selection, so a
-                        // connection flood spends its own request budget.
-                        let Ok(admission)=guard.admit(address.ip(),surface) else {drop(stream);continue};
+                        // connection flood spends its own request budget. A configured or
+                        // pinned address, recognized exactly, is charged to its own record
+                        // only, so its prefix neighbours' cooldowns cannot refuse it, and
+                        // keeps a share of frame memory too.
+                        let operator = protected.contains(&address.ip().to_canonical());
+                        let admitted = if operator { guard.admit_operator(address.ip(),surface) } else { guard.admit(address.ip(),surface) };
+                        let Ok(admission)=admitted else {drop(stream);continue};
                         let class = n.peer_class(&protected, address.ip());
                         let Some(slot) = n.peer_sessions.try_acquire(address.ip(), class) else { drop(stream); continue };
-                        // Configured and pinned peers keep a share of frame memory too.
-                        let admission = if class == PeerClass::Operator { admission.operator() } else { admission };
                         (admission, SessionCapacity::Peer(slot), None)
                     } else if kind == 2 {
                         // As for peers, an attempt refused for want of a slot still
@@ -6486,6 +6489,112 @@ fn accept_retry_delay(error: &std::io::Error, consecutive: &mut u32) -> Duration
     *consecutive = consecutive.saturating_add(1);
     delay
 }
+/// The addresses that keep operator privileges on inbound peer sessions:
+/// configured and pinned peers' exact addresses, an IPv4-mapped one as IPv4.
+/// Never a wider prefix: a pin's key is checked for its exact address only,
+/// so in discovery mode a neighbour in a pinned peer's IPv6 /64 joins with
+/// any key and must not inherit its reserved slots, eviction immunity,
+/// group-cap exemption or frame memory share.
+fn protected_peers(
+    peers: &[SocketAddr],
+    pinned: impl IntoIterator<Item = IpAddr>,
+) -> HashSet<IpAddr> {
+    peers
+        .iter()
+        .map(SocketAddr::ip)
+        .chain(pinned)
+        .map(|ip| ip.to_canonical())
+        .collect()
+}
+/// One discovery turn with `peer`, judged as a whole for scheduling
+/// (`discovery_contact`): a synchronization and, when that succeeded, at
+/// most once a minute per peer, an address exchange, which holds the
+/// outbound slot as well. One overall deadline of five read allowances
+/// still bounds the synchronization, but one that has delivered nothing new
+/// after two is cut off, so a slow-walking endpoint holds a slot for at most
+/// that long plus one allowance for the address exchange.
+async fn discovery_turn(node: &Node, peer: SocketAddr) -> peer_discovery::Contact {
+    let Ok(allowance) = node.peer_exchange_timeout() else {
+        return peer_discovery::Contact::Failed;
+    };
+    let started = Instant::now();
+    let session = timeout(allowance.saturating_mul(5), sync_peer(node, peer));
+    tokio::pin!(session);
+    let cutoff = tokio::time::sleep(allowance.saturating_mul(2));
+    tokio::pin!(cutoff);
+    let mut watching = true;
+    let result = loop {
+        tokio::select! {
+            // Only whether the exchange completed counts here; what this
+            // node made of the blocks is judged from the tip below.
+            result = &mut session => break Some(match result {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(anyhow!("peer synchronization exceeded its overall deadline")),
+            }),
+            () = &mut cutoff, if watching => {
+                if !node.peer_sessions.delivered_since(peer.ip(), started) {
+                    break None;
+                }
+                watching = false;
+            }
+        }
+    };
+    if result.is_none() {
+        let stalled = Err(anyhow!(
+            "peer synchronization delivered nothing new within two read allowances"
+        ));
+        node.peer_event(peer.to_string(), &stalled);
+    }
+    let advanced = node.peer_sessions.advanced_since(peer.ip(), started);
+    let contact = discovery_contact(result.as_ref(), advanced, started.elapsed(), allowance);
+    let query = contact.success()
+        && matches!(result, Some(Ok(())))
+        && node
+            .discovery
+            .unpoisoned()
+            .as_mut()
+            .is_some_and(|b| b.needs_discovery(peer, now()));
+    if !query {
+        return contact;
+    }
+    // A separate exchange cannot change Sync/Ack semantics or cause an
+    // authenticated connection to retry unsigned.
+    let exchanged = discover_peer(node, peer).await;
+    if exchanged.is_err() {
+        node.peer_event(format!("discovery/{peer}"), &exchanged);
+    }
+    discovery_contact(result.as_ref(), advanced, started.elapsed(), allowance)
+}
+/// What a discovery turn achieved, for scheduling: `result` is the
+/// synchronization's, `None` for one cut off because it had delivered
+/// nothing new, and `elapsed` the whole turn's time. A block of the peer's
+/// that became the tip makes it `Advanced`, whatever else happened; only
+/// proof of work earns that. A turn whose exchange otherwise completed is
+/// `Current` within one read allowance and `Stalled` after it: a slow turn
+/// that delivered nothing held an outbound slot without advancing this
+/// node. As for configured peers (`sync_completed`), a deferred replay or a
+/// held side-branch header completes an exchange; a deferred replay is this
+/// node's own limit, never the peer's.
+fn discovery_contact(
+    result: Option<&Result<()>>,
+    advanced: bool,
+    elapsed: Duration,
+    allowance: Duration,
+) -> peer_discovery::Contact {
+    use crate::chain::{SideBranchRefused, ValidationDeferred};
+    use peer_discovery::Contact;
+    if advanced {
+        return Contact::Advanced;
+    }
+    match result {
+        None => Contact::Stalled,
+        Some(Err(error)) if error.is::<ValidationDeferred>() => Contact::Current,
+        Some(Err(error)) if !error.is::<SideBranchRefused>() => Contact::Failed,
+        Some(_) if elapsed <= allowance => Contact::Current,
+        Some(_) => Contact::Stalled,
+    }
+}
 /// A deferred replay or a held side-branch header is local validation
 /// progress, not a peer failure.
 fn sync_completed(result: &Result<()>) -> bool {
@@ -6536,40 +6645,14 @@ async fn discovery_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
         };
         for peer in candidates {
             let n = node.clone();
-            workers.spawn(async move {
-                // Keep the former five-stage overall budget, but grow it with
-                // the same validated capacity as individual exchanges.
-                let Ok(exchange_timeout) = n.peer_exchange_timeout() else {
-                    return (peer, false);
-                };
-                let result = timeout(exchange_timeout.saturating_mul(5), sync_peer(&n, peer)).await;
-                // A peer serving a deep reorganization while local replay
-                // defers is healthy, exactly as in configured-peer loops.
-                let success = result.as_ref().is_ok_and(sync_completed);
-                if matches!(result, Ok(Ok(()))) {
-                    let query = n
-                        .discovery
-                        .unpoisoned()
-                        .as_mut()
-                        .is_some_and(|b| b.needs_discovery(peer, now()));
-                    if query {
-                        // A separate exchange cannot change Sync/Ack semantics or
-                        // cause an authenticated connection to retry unsigned.
-                        let result = discover_peer(&n, peer).await;
-                        if result.is_err() {
-                            n.peer_event(format!("discovery/{peer}"), &result);
-                        }
-                    }
-                }
-                (peer, success)
-            });
+            workers.spawn(async move { (peer, discovery_turn(&n, peer).await) });
         }
         tokio::select! {
             _=shutdown.changed()=>break,
             Some(result)=workers.join_next(),if !workers.is_empty()=>{
-                if let Ok((peer,success))=result
+                if let Ok((peer,contact))=result
                     && let Some(book)=node.discovery.unpoisoned().as_mut() {
-                    book.finished(peer,success,now(),random_u64());
+                    book.finished(peer,contact,now(),random_u64());
                 }
             }
             _=tokio::time::sleep(Duration::from_millis(200))=>{},
@@ -13430,5 +13513,55 @@ mod peer_tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn discovery_contacts_are_judged_by_what_they_delivered_and_how_long_they_held_a_slot() {
+        use peer_discovery::Contact;
+        let allowance = Duration::from_secs(15);
+        let (quick, slow) = (Duration::from_secs(2), Duration::from_secs(16));
+        let ok: Result<()> = Ok(());
+        let deferred: Result<()> = Err(crate::chain::ValidationDeferred.into());
+        let refused: Result<()> = Err(crate::chain::SideBranchRefused("test").into());
+        let failed: Result<()> = Err(anyhow!("peer closed"));
+        let judge =
+            |result, advanced, elapsed| discovery_contact(result, advanced, elapsed, allowance);
+        // Completing promptly with nothing new: the peer is not ahead.
+        assert_eq!(judge(Some(&ok), false, quick), Contact::Current);
+        assert_eq!(judge(Some(&refused), false, quick), Contact::Current);
+        // Completing slowly with nothing new, or being cut off for that,
+        // held an outbound slot without advancing this node.
+        assert_eq!(judge(Some(&ok), false, slow), Contact::Stalled);
+        assert_eq!(judge(Some(&refused), false, slow), Contact::Stalled);
+        assert_eq!(judge(None, false, slow * 2), Contact::Stalled);
+        // This node's own replay limit is never the peer's fault.
+        assert_eq!(judge(Some(&deferred), false, slow), Contact::Current);
+        assert_eq!(judge(Some(&failed), false, quick), Contact::Failed);
+        // A block of the peer's that became the tip outweighs the rest.
+        for result in [Some(&ok), Some(&failed), None] {
+            assert_eq!(judge(result, true, slow * 4), Contact::Advanced);
+        }
+    }
+
+    #[test]
+    fn operator_privileges_need_the_exact_configured_or_pinned_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(
+            &dir.path().join("node.db"),
+            Config::devnet(),
+            crypto::public_key(&[65; 32]).unwrap(),
+        )
+        .unwrap();
+        let configured: SocketAddr = "[2600:1f18:1:2::10]:18481".parse().unwrap();
+        let pinned: IpAddr = "8.8.4.4".parse().unwrap();
+        let protected = protected_peers(&[configured], [pinned]);
+        let class = |ip: &str| node.peer_class(&protected, ip.parse().unwrap());
+        assert_eq!(class("2600:1f18:1:2::10"), PeerClass::Operator);
+        assert_eq!(class("8.8.4.4"), PeerClass::Operator);
+        assert_eq!(class("::ffff:8.8.4.4"), PeerClass::Operator);
+        // A neighbour in the same IPv6 /64, which in discovery mode joins
+        // with any key, is an ordinary source.
+        assert_eq!(class("2600:1f18:1:2::11"), PeerClass::General);
+        assert_eq!(class("8.8.4.5"), PeerClass::General);
     }
 }

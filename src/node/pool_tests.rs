@@ -2652,3 +2652,42 @@ fn only_a_sources_own_new_block_or_transaction_protects_its_inbound_sessions() {
     assert!(node.peer_sessions.delivered_recently(first));
     assert!(!node.peer_sessions.delivered_recently(second));
 }
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn only_a_sources_new_tip_block_counts_as_advancing_this_node() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let message = |transactions: Vec<Transaction>, blocks: Vec<Block>| PeerMessage {
+        chain: config.chain_id(),
+        locator: Vec::new(),
+        blocks,
+        transactions,
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let relay = |message: PeerMessage, source: IpAddr| {
+        runtime
+            .block_on(receive_peer_async(&node, message, source))
+            .unwrap();
+    };
+    let address = |text: &str| -> IpAddr { text.parse().unwrap() };
+    let (relayer, miner, late) = (address("8.1.1.1"), address("8.2.1.1"), address("8.3.1.1"));
+    let start = Instant::now();
+    // A new transaction is a delivery, but any funded sender can supply one:
+    // it never tells the discovery scheduler that this node advanced.
+    let fresh = payment(config, state, &SECRET, nonce(&node, &key()), key(), 1, 0);
+    relay(message(vec![fresh], Vec::new()), relayer);
+    assert!(node.peer_sessions.delivered_since(relayer, start));
+    assert!(!node.peer_sessions.advanced_since(relayer, start));
+    // A block that becomes the tip does; the same block sent again does not.
+    let block = child(&node, 11);
+    relay(message(Vec::new(), vec![block.clone()]), miner);
+    assert_eq!(snapshot(&node).chain.tip_hash(), codec::block_hash(&block));
+    relay(message(Vec::new(), vec![block]), late);
+    assert!(node.peer_sessions.advanced_since(miner, start));
+    assert!(!node.peer_sessions.advanced_since(late, start));
+}

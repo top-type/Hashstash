@@ -4,7 +4,8 @@
 // that file alone cannot reveal an edited bundle. PINNED is a reviewed record
 // kept apart from the build output: any bundle change must also change this
 // line. To reproduce the bundle from the lockfile, run
-// `pnpm install --frozen-lockfile && pnpm run check` in scripts/browser-crypto.
+// `corepack pnpm install --frozen-lockfile && corepack pnpm run check` in
+// scripts/browser-crypto; continuous integration runs it on every push.
 const assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), { createHash } = require('node:crypto');
 const PINNED = 'deba70770f9b3a145da6768bcfa6bdc99565dd71118015dcee9f886c2a378695';
@@ -23,6 +24,9 @@ const manifest = JSON.parse(read('scripts/browser-crypto/package.json'));
 eq(manifest.dependencies, { '@noble/curves': '2.4.0', '@noble/hashes': '2.4.0' }, 'library versions are exact');
 eq(manifest.devDependencies, { esbuild: '0.28.2' }, 'the bundler version is exact');
 eq(manifest.scripts.check, 'node build.mjs --check', 'a byte-for-byte rebuild check is available');
+// Continuous integration runs the rebuild check with this pnpm, which
+// corepack downloads only when its tarball matches the hash.
+ok(/^pnpm@\d+\.\d+\.\d+\+sha512\.[0-9a-f]{128}$/.test(manifest.packageManager || ''), 'the package manager version and tarball hash are exact');
 const lock = read('scripts/browser-crypto/pnpm-lock.yaml').toString('utf8');
 for (const name of ['@noble/curves@2.4.0', '@noble/hashes@2.4.0', 'esbuild@0.28.2']) {
   const entry = new RegExp(`\\n  '?${name.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}'?:\\n    resolution: \\{integrity: sha512-[A-Za-z0-9+/=]{88}\\}`);

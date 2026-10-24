@@ -271,7 +271,7 @@ jobs:
       fail-fast: false
       matrix:
         # Every target in fuzz/Cargo.toml; tests/fuzz_parsers.rs checks this list.
-        target: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/heads/release/')) && '["peer_wire","peer_channel","codec_transaction","codec_block","json","http_request","rpc_params","address","signed_record","unsigned_envelope","mail_envelope","plain_text","address_book","stratum_session"]' || '["all"]') }}
+        target: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/heads/release/')) && '["peer_wire","peer_channel","codec_transaction","codec_block","json","http_request","rpc_params","address","signed_record","unsigned_envelope","mail_envelope","plain_text","address_book","stratum_session","peer_sync"]' || '["all"]') }}
     env:
       FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || ((github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/heads/release/')) && '900' || '60') }}
       TARGET: ${{ matrix.target }}

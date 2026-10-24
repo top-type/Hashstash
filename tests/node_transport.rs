@@ -594,6 +594,119 @@ async fn version_2_peers_that_refuse_a_session_keep_header_synchronization() {
     server.stop().await;
 }
 
+/// A Hashstash 0.42.0 node shares this release's framing and, for the same
+/// genesis file, its chain ID, but not its blocks or signatures. The peer
+/// protocol marker tells them apart, and both directions name that release
+/// instead of exchanging records the other side cannot validate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn incompatible_release_peers_are_refused_by_name_in_both_directions() {
+    use hashstash::peer_wire::{self, LEGACY_MAGIC, Limits, MAGIC, Message, Sync};
+    use std::sync::{Arc, Mutex};
+    let dir = tempfile::tempdir().unwrap();
+    let c = Config::devnet();
+    let a = Node::open(
+        &dir.path().join("a.db"),
+        c.clone(),
+        crypto::public_key(&[89; 32]).unwrap(),
+    )
+    .unwrap();
+    let b = Node::open(
+        &dir.path().join("b.db"),
+        c.clone(),
+        crypto::public_key(&[90; 32]).unwrap(),
+    )
+    .unwrap();
+    a.mine(100_000).unwrap();
+    let tip = a.status().unwrap()["tip"].clone();
+    let server = node::serve(a.clone(), options()).await.unwrap();
+    let limits = Limits::from_config(&c);
+    let genesis = codec::block_hash(&codec::genesis_block(&c).unwrap());
+
+    // Inbound: a 0.42.0 locator request differs only in its marker. The node
+    // replies with nothing, closes, and names the release.
+    let mut hello = peer_wire::encode(
+        &Message::Sync(Sync {
+            chain: c.chain_id(),
+            locator: vec![genesis],
+            blocks: vec![],
+            transactions: vec![],
+        }),
+        limits,
+    )
+    .unwrap();
+    assert_eq!(&hello[..8], MAGIC);
+    hello[..8].copy_from_slice(LEGACY_MAGIC);
+    let mut stream = TcpStream::connect(server.p2p).await.unwrap();
+    stream
+        .write_all(&peer_wire::frame(&hello, limits.frame_bytes()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(read_frame(&mut stream).await, None);
+    let refusal = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let events = a.rpc("peers", json!({})).unwrap();
+            let inbound = events.as_array().unwrap().iter().find_map(|event| {
+                event["peer"]
+                    .as_str()
+                    .filter(|peer| peer.starts_with("inbound/"))
+                    .and(event["error"].as_str())
+            });
+            if let Some(error) = inbound {
+                break error.to_owned();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        refusal.contains("Hashstash 0.42.0 or earlier") && refusal.contains("HSP2PBIN"),
+        "{refusal}"
+    );
+    assert_eq!(a.status().unwrap()["tip"], tip);
+
+    // Outbound: a 0.42.0 server reads one frame, cannot decode it and closes.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let legacy = listener.local_addr().unwrap();
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let seen = frames.clone();
+    let old_server = tokio::spawn(async move {
+        loop {
+            let (mut client, _) = listener.accept().await.unwrap();
+            if let Some(first) = read_frame(&mut client).await {
+                seen.lock().unwrap().push((first[..8].to_vec(), first[8]));
+            }
+        }
+    });
+    let error = node::sync_peer(&b, legacy).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Hashstash 0.42.0 or earlier"),
+        "{error:#}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let error = node::sync_peer(&b, legacy).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("by blocks only for 600 seconds"),
+        "{error:#}"
+    );
+    // Synchronization by blocks only meets the same close, also named.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let error = node::sync_peer(&b, legacy).await.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("locator request while synchronized by blocks only")
+            && format!("{error:#}").contains("Hashstash 0.42.0 or earlier"),
+        "{error:#}"
+    );
+    assert_eq!(
+        *frames.lock().unwrap(),
+        [4, 4, 0].map(|tag| (MAGIC.to_vec(), tag))
+    );
+    // Nothing from either side was taken as a block.
+    assert_eq!(b.status().unwrap()["height"], 0);
+    old_server.abort();
+    server.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_legal_loose_transaction_relays_alongside_blocks_without_stalling_cursor() {
     use hashstash::peer_wire::{self, Limits, Message, Sync};

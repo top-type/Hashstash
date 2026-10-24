@@ -558,7 +558,10 @@ pub fn codec_block(data: &[u8]) -> String {
 }
 
 const PEER_TOKENS: &[&[u8]] = &[
-    b"HSP2PBIN",
+    peer_wire::MAGIC,
+    peer_wire::AUTH_MAGIC,
+    peer_wire::LEGACY_MAGIC,
+    peer_wire::LEGACY_AUTH_MAGIC,
     &[0],
     &[1],
     &[0xfa],
@@ -1527,7 +1530,7 @@ pub fn peer_channel(data: &[u8]) -> String {
 
 fn channel_seeds(_: Option<&Node>) -> Vec<Vec<u8>> {
     let mut hello = vec![2];
-    hello.extend_from_slice(b"HSP2PAUT");
+    hello.extend_from_slice(peer_wire::AUTH_MAGIC);
     hello.extend_from_slice(&chain_id());
     hello.extend_from_slice(&key(12));
     hello.extend_from_slice(&[5; 32]);
@@ -1536,8 +1539,12 @@ fn channel_seeds(_: Option<&Node>) -> Vec<Vec<u8>> {
     raw.extend_from_slice(&9u32.to_be_bytes());
     raw.extend_from_slice(&0u64.to_be_bytes());
     raw.extend_from_slice(&[0; 64]);
-    raw.extend_from_slice(b"HSP2PBIN\x01");
-    let mut seeds = vec![hello, raw];
+    raw.extend_from_slice(peer_wire::MAGIC);
+    raw.push(1);
+    // A Hashstash 0.42.0 greeting: the same layout under the older marker.
+    let mut legacy = hello.clone();
+    legacy[1..9].copy_from_slice(peer_wire::LEGACY_AUTH_MAGIC);
+    let mut seeds = vec![hello, raw, legacy];
     seeds.extend(
         peer_wire_seeds(None)
             .into_iter()

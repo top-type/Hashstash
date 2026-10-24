@@ -72,6 +72,10 @@ const MAX_CAPACITY_BRANCHES: usize = 256;
 /// One stored block row: the greatest valid body plus generous room for its
 /// header and record framing.
 pub const MAX_BLOCK_ROW_BYTES: u64 = crate::config::MAX_GOVERNED_BLOCK_BYTES + (1 << 20);
+/// Marker of the stored history's rules, kept in the database metadata. Like
+/// the peer marker, its suffix names the generation that introduced them;
+/// a release whose stored blocks or states another cannot read changes it.
+pub const STORAGE_FORMAT: &[u8] = b"hashstash-storage-043";
 /// Blocks replayed per committed batch of the startup index rebuild. Unit tests
 /// use small batches so reopening their short chains crosses batch boundaries.
 const INDEX_REBUILD_BATCH: u64 = if cfg!(test) { 7 } else { 4096 };
@@ -800,6 +804,34 @@ impl Chain {
             db.execute(
                 "INSERT INTO metadata(key,value) VALUES('config',?1)",
                 [&encoded],
+            )?;
+        }
+        // The same genesis file has the same chain ID under Hashstash 0.42.0,
+        // but its blocks commit to another state encoding. It wrote no
+        // format marker, so its stored history is refused by name here
+        // instead of failing replay at its first block.
+        let format: Option<Vec<u8>> = db
+            .query_row("SELECT value FROM metadata WHERE key='format'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if let Some(format) = format {
+            ensure!(
+                format == STORAGE_FORMAT,
+                "database was written in storage format {}, not this release's {}",
+                format.escape_ascii(),
+                STORAGE_FORMAT.escape_ascii()
+            );
+        } else {
+            let stored: bool =
+                db.query_row("SELECT EXISTS(SELECT 1 FROM blocks)", [], |r| r.get(0))?;
+            ensure!(
+                !stored,
+                "database holds blocks written by Hashstash 0.42.0 or earlier, which this release cannot validate; keep it for that release and give this one a new --data path"
+            );
+            db.execute(
+                "INSERT INTO metadata(key,value) VALUES('format',?1)",
+                [STORAGE_FORMAT],
             )?;
         }
         let mut chain = Self::at_genesis(config, db)?;
@@ -3925,6 +3957,61 @@ mod cache_tests {
         block.extranonce = salt.to_le_bytes();
         block.header.merkle_root = codec::merkle_root(&block).unwrap();
         Chain::mine(block, 100_000).unwrap()
+    }
+    #[test]
+    fn stored_history_of_another_generation_is_refused_by_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("format.db");
+        let config = Config::devnet();
+        let mut chain = Chain::open(&path, config.clone()).unwrap();
+        let block = candidate(&chain, 0);
+        chain
+            .submit(block.clone(), block.header.timestamp as u64)
+            .unwrap();
+        let tip = chain.tip_hash();
+        drop(chain);
+        assert_eq!(Chain::open(&path, config.clone()).unwrap().tip_hash(), tip);
+        let edit = |path: &Path, statement: &str| {
+            Connection::open(path)
+                .unwrap()
+                .execute_batch(statement)
+                .unwrap();
+        };
+        let refusal = |path: &Path| {
+            Chain::open(path, Config::devnet())
+                .err()
+                .unwrap()
+                .to_string()
+        };
+        // A 0.42.0 database has the same configuration row and its blocks,
+        // but no format marker.
+        edit(&path, "DELETE FROM metadata WHERE key='format'");
+        let error = refusal(&path);
+        assert!(
+            error.contains("Hashstash 0.42.0 or earlier") && error.contains("new --data path"),
+            "{error}"
+        );
+        edit(
+            &path,
+            "INSERT INTO metadata(key,value) VALUES('format',CAST('hashstash-storage-099' AS BLOB))",
+        );
+        let error = refusal(&path);
+        assert!(
+            error.contains("hashstash-storage-099") && error.contains("hashstash-storage-043"),
+            "{error}"
+        );
+        // A database without blocks holds nothing to misread; it takes the marker.
+        let empty = directory.path().join("empty.db");
+        drop(Chain::open(&empty, config.clone()).unwrap());
+        edit(&empty, "DELETE FROM metadata WHERE key='format'");
+        let chain = Chain::open(&empty, config).unwrap();
+        let format: Vec<u8> = chain
+            .db
+            .query_row("SELECT value FROM metadata WHERE key='format'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(format, STORAGE_FORMAT);
     }
     #[test]
     fn losing_history_evicts_hot_metadata_without_losing_blocks_or_future_forks() {

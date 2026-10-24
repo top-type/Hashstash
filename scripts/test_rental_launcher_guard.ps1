@@ -32,7 +32,10 @@ try {
     $configuration = Get-Content -LiteralPath (Join-Path $repository 'config/devnet.json') -Raw | ConvertFrom-Json
     $configuration.initial.interval = 0
     [IO.File]::WriteAllText($temporary, ($configuration | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
-    $diagnostic = & $Executable network --config $temporary 2>&1
+    # Windows PowerShell 5.1 makes a redirected native error line terminating
+    # under 'Stop'; this rejection is expected, so capture it in a child scope.
+    $diagnostic = & { $ErrorActionPreference = 'Continue'; & $Executable network --config $temporary 2>&1 }
     if ($LASTEXITCODE -eq 0) { throw 'Invalid arithmetic configuration was accepted.' }
+    if (-not ($diagnostic -match 'interval must be positive')) { throw "Unexpected rejection: $diagnostic" }
 } finally { Remove-Item -LiteralPath $temporary }
 Write-Output 'Rental configuration validation passes all presets and rejects invalid arithmetic. No services started.'

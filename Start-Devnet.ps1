@@ -1,11 +1,15 @@
 param(
-    [string]$DataDirectory = (Join-Path $PSScriptRoot 'data'),
+    # Default: the data folder beside this script.
+    [string]$DataDirectory,
     [int]$RpcPort = 18480,
     [int]$PeerPort = 18481,
     [int]$MiningPort = 18482,
     [switch]$SeedWallets
 )
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 leaves $PSScriptRoot empty in parameter defaults when
+# a script is started with -File, so the default is set here.
+if (-not $DataDirectory) { $DataDirectory = Join-Path $PSScriptRoot 'data' }
 $hashstashExe = Join-Path $PSScriptRoot 'target/release/hashstash.exe'
 if (-not (Test-Path -LiteralPath $hashstashExe)) {
     $hashstashExe = Join-Path $PSScriptRoot 'bin/hashstash.exe'

@@ -147,6 +147,16 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         shell: pwsh
         run: .\scripts\test_cold_launcher.ps1 -Executable .\target\release\hashstash-cold.exe -Port 21980 -Report work\cold-launcher-report.json
+      - name: Launchers under Windows PowerShell 5.1
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        # The PowerShell Windows ships, started with -File as a shortcut or a
+        # scheduled task starts a script; PowerShell 7 hides its differences.
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test_rental_launcher_guard.ps1 -Executable .\target\release\hashstash.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test_launcher.ps1 -Executable .\target\release\hashstash.exe -DataRoot work\launcher-ps51 -ReportPath work\launcher-ps51-report.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Frontend suites
         if: ${{ !cancelled() }}
         run: |

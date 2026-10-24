@@ -63,11 +63,10 @@ fn faucet_node_rpc_ignores_environment_proxies() {
             .unwrap(),
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        // The faucet accepts only an owner-only key file: mode 0600 on Unix,
+        // an owner-only access list on Windows, where a temporary folder may
+        // let other accounts in.
+        hashstash::local_files::restrict_to_owner(&key_file).unwrap();
         let server = faucet::serve(FaucetConfig {
             bind: "127.0.0.1:0".parse().unwrap(),
             rpc_url: format!("http://{rpc}/rpc"),

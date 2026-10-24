@@ -265,6 +265,67 @@ fn public_web_proxy_names_each_visitor_and_stays_within_node_sessions() {
     assert_eq!(limits("hashstash_upstream"), [PUBLIC_WEB_SESSIONS; 2]);
 }
 
+/// A PowerShell script's `param(...)` block, if it has one. Parentheses after
+/// a `#` on the same line are comment text.
+fn parameter_block(script: &str) -> Option<&str> {
+    let start = script.to_ascii_lowercase().find("param(")?;
+    let mut depth = 0usize;
+    let mut comment = false;
+    for (index, c) in script[start..].char_indices() {
+        match c {
+            '\n' => comment = false,
+            '#' => comment = true,
+            '(' if !comment => depth += 1,
+            ')' if !comment => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&script[start..=start + index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Windows PowerShell 5.1, the version Windows ships, leaves `$PSScriptRoot`
+/// empty while it evaluates the parameter defaults of a script started with
+/// `powershell -File` (a shortcut, a scheduled task), so a default built from
+/// it fails before the script runs. Such defaults are set in the body instead.
+#[test]
+fn powershell_parameter_defaults_never_use_the_script_folder() {
+    assert_eq!(
+        parameter_block(
+            "[CmdletBinding()]\nParam(\n  # (note\n  [string]$A = (Join-Path $PSScriptRoot 'x')\n)\n$b = 1"
+        ),
+        Some("Param(\n  # (note\n  [string]$A = (Join-Path $PSScriptRoot 'x')\n)")
+    );
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut checked = 0;
+    for directory in [root.to_path_buf(), root.join("scripts")] {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if !path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("ps1"))
+            {
+                continue;
+            }
+            let script = fs::read_to_string(&path).unwrap();
+            let Some(block) = parameter_block(&script) else {
+                continue;
+            };
+            assert!(
+                !block.to_ascii_lowercase().contains("$psscriptroot"),
+                "{}: set $PSScriptRoot-based defaults in the script body",
+                path.display()
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 16, "only {checked} launcher scripts were found");
+}
+
 #[cfg(target_os = "linux")]
 fn run_script(arguments: &[&str]) {
     let output = std::process::Command::new("bash")

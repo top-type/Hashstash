@@ -600,8 +600,14 @@ async fn public_mining_status_and_storage_errors_hide_operator_details() {
         assert!(!value.to_string().contains(&bind), "{method}");
     }
     // An unopenable derived index reports a generic public error; the local
-    // listener and the operator's log keep the full storage detail.
-    std::fs::remove_file(path.with_extension("explorer.sqlite")).unwrap();
+    // listener and the operator's log keep the full storage detail. Windows
+    // cannot delete a file the node holds open, so there reading it is denied
+    // instead, which fails each request's own read-only open the same way.
+    let index = path.with_extension("explorer.sqlite");
+    #[cfg(not(windows))]
+    std::fs::remove_file(&index).unwrap();
+    #[cfg(windows)]
+    icacls(&index, &["/deny", "*S-1-1-0:(RD)"]);
     let hidden = request(&client, &public, "explorer_blocks", json!({}))
         .await
         .json::<Value>()
@@ -611,11 +617,9 @@ async fn public_mining_status_and_storage_errors_hide_operator_details() {
         hidden["error"]["message"],
         "node storage is temporarily unavailable"
     );
-    assert!(
-        !hidden
-            .to_string()
-            .contains(directory.path().to_str().unwrap())
-    );
+    // The path as it appears inside JSON, where Windows separators are escaped.
+    let escaped = Value::from(directory.path().to_str().unwrap()).to_string();
+    assert!(!hidden.to_string().contains(escaped.trim_matches('"')));
     let detailed = request(&client, &private, "explorer_blocks", json!({}))
         .await
         .json::<Value>()
@@ -628,6 +632,8 @@ async fn public_mining_status_and_storage_errors_hide_operator_details() {
             .contains("explorer.sqlite"),
         "{detailed}"
     );
+    #[cfg(windows)]
+    icacls(&index, &["/remove:d", "*S-1-1-0"]);
     server.stop().await;
     // An explicitly advertised endpoint is meant for miners and stays public.
     let node = Node::open(&directory.path().join("advertised.sqlite"), config(), key).unwrap();
@@ -652,6 +658,22 @@ async fn public_mining_status_and_storage_errors_hide_operator_details() {
     );
     assert!(value["result"]["stratum"].get("bind_address").is_none());
     server.stop().await;
+}
+
+/// Changes `path`'s access list with the system's icacls.
+#[cfg(windows)]
+fn icacls(path: &std::path::Path, change: &[&str]) {
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .args(change)
+        .arg("/q")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 #[tokio::test]

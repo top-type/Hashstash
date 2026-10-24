@@ -13250,13 +13250,19 @@ mod peer_tests {
         // count, which then restarted from its fork point every session.
         for n in 0..2 * MAX_CONNECTIONS {
             let peer = SocketAddr::from(([9, n as u8, 1, 1], 18481));
-            assert!(!receiver.receive_headers(peer, &[stored.clone()]).unwrap());
+            assert!(
+                !receiver
+                    .receive_headers(peer, std::slice::from_ref(&stored))
+                    .unwrap()
+            );
         }
         assert_eq!(cursor(honest), header_hash(&branch[99]));
         // One network group runs at most its share of the downloads.
         for n in 0..2 * HEADER_SYNCS_PER_SOURCE {
             let peer = SocketAddr::from(([9, 200, 1, n as u8], 18481));
-            receiver.receive_headers(peer, &[stored.clone()]).unwrap();
+            receiver
+                .receive_headers(peer, std::slice::from_ref(&stored))
+                .unwrap();
         }
         let i = receiver.locked().unwrap();
         assert_eq!(i.header_syncs.len(), MAX_CONNECTIONS);

@@ -5193,13 +5193,7 @@ impl Node {
             public_rpc_allowed(method),
             "method is unavailable on public web"
         );
-        let mut result = if matches!(method, "fee_quote" | "transfer_quote") {
-            // The private RPC convenience fallback reads the selected server
-            // wallet. Public requests must always identify their own sender.
-            required_str(&params, "sender")?;
-            let view = self.read_view()?;
-            Self::read_rpc_metered(&view, method, params, Some(admission))
-        } else if method == "broadcasttransaction" {
+        let mut result = if method == "broadcasttransaction" {
             self.broadcast(params, true)
         } else {
             self.rpc_with_admission(method, params, Some(admission))
@@ -5283,26 +5277,26 @@ impl Node {
                 Ok(result)
             }
             "fee_quote" | "transfer_quote" => {
-                let i = self.read_view()?;
                 // Omitted parameters are no fields. Any other non-object is
                 // refused: indexing a JSON array or scalar by name panics.
-                let mut params = if params.is_null() { json!({}) } else { params };
-                if params.get("sender").is_none() {
-                    let session = self.wallets_locked()?.status();
-                    let sender = session
-                        .get("public_key")
-                        .filter(|key| key.is_string())
-                        .cloned()
-                        .unwrap_or_else(|| json!(hex::encode(self.miner)));
-                    params
-                        .as_object_mut()
-                        .context("expected quote fields")?
-                        .insert("sender".into(), sender);
-                }
+                let params = if params.is_null() { json!({}) } else { params };
+                ensure!(params.is_object(), "expected quote fields");
+                // Every quote names its sender, on either listener. The
+                // private one needs no session token, so a default read from
+                // the selected server wallet would tell any local process the
+                // operator's account and balance, which `/api/session` keeps
+                // behind the token.
+                required_str(&params, "sender")?;
+                let i = self.read_view()?;
                 Self::read_rpc_metered(&i, method, params, admission)
             }
             "broadcasttransaction" => self.broadcast(params, false),
             "getblock" => {
+                let format = params.get("format").map_or(Some("json"), Value::as_str);
+                ensure!(
+                    matches!(format, Some("json" | "hex")),
+                    "format must be \"json\" or \"hex\""
+                );
                 let block = {
                     let i = self.locked()?;
                     let h = if let Some(h) = params.get("hash").and_then(Value::as_str) {
@@ -5316,8 +5310,28 @@ impl Node {
                     };
                     i.chain.block(&h).context("unknown block")?
                 };
-                // The JSON tree of a large block is built after the node lock is released.
-                Ok(serde_json::to_value(block)?)
+                // Replies are built after the node lock is released.
+                let (hash, height) = (codec::block_hash(&block), block.height);
+                if format == Some("hex") {
+                    // The canonical record: two characters per byte, which
+                    // the response frame admits for every valid block. One
+                    // work unit per KiB of hexadecimal output.
+                    let raw = codec::encode(&block);
+                    drop(block);
+                    charge(admission, raw.len() / 512)?;
+                    return Ok(
+                        json!({"hash":hex::encode(hash),"height":height,"raw":hex::encode(raw)}),
+                    );
+                }
+                // The JSON form holds one generic value per byte, tens of
+                // bytes of memory each, so it is built only within the JSON
+                // page budgets and paid for per value before the tree exists.
+                let (text, values) = JsonPage::new().encode(&block).map_err(|_| {
+                    anyhow!("block is too large for a JSON reply; request format \"hex\"")
+                })?;
+                drop(block);
+                charge(admission, values / RESPONSE_VALUES_PER_WORK)?;
+                Ok(serde_json::from_slice(&text)?)
             }
             "blockreceipt" => {
                 // A bounded receipt lookup: one canonical hash and the presence of
@@ -5394,8 +5408,18 @@ impl Node {
                 Ok(json!({"txid":hex::encode(self.submit_transaction(tx)?)}))
             }
             "submitblock" => {
-                let b: Block =
-                    serde_json::from_value(params.get("block").cloned().unwrap_or(params))?;
+                // Also the canonical record, as `getblock` returns it in hex.
+                let b: Block = match params.get("raw") {
+                    Some(raw) => {
+                        let raw = hex::decode(raw.as_str().context("raw must be a string")?)
+                            .context("raw must be hexadecimal")?;
+                        let block = codec::decode_block(&raw, raw.len())?;
+                        // The JSON form's method price counts its transactions.
+                        charge(admission, block.transactions.len())?;
+                        block
+                    }
+                    None => serde_json::from_value(params.get("block").cloned().unwrap_or(params))?,
+                };
                 let hash = codec::block_hash(&b);
                 Ok(json!({"hash":hex::encode(hash),"selected":self.submit_block(b)?}))
             }
@@ -7246,6 +7270,7 @@ fn wallet_body(
     }
     // The fee integer's encoded length contributes to its own minimum charge.
     let mut stable = false;
+    let mut weight = 0;
     for _ in 0..32 {
         let quote = fees::quote(
             c,
@@ -7255,6 +7280,7 @@ fn wallet_body(
                 signature: [0; 64],
             },
         )?;
+        weight = quote.weight;
         if explicit.is_some() {
             ensure!(
                 body.fee >= quote.minimum_fee,
@@ -7276,6 +7302,16 @@ fn wallet_body(
     ensure!(
         codec::encode(&body).len().saturating_add(64) <= c.transaction_bytes(&s.settings),
         "transaction too large"
+    );
+    // A block admits the weight its capacity names, and the bytes are only
+    // part of it. A transaction whose weight alone exceeds that can never be
+    // included, so it is neither quoted nor prepared for signing.
+    ensure!(
+        weight <= s.settings.block_bytes,
+        "transaction weight {weight} exceeds the block capacity of {} weight units: \
+         each new account, proposal or support record and grant recipient adds {} to its bytes",
+        s.settings.block_bytes,
+        fees::ACCOUNT_WEIGHT
     );
     Ok(body)
 }
@@ -7334,26 +7370,56 @@ fn fee_quote_json(
     Ok(value)
 }
 
-/// A pending MinimumFeeRate or BlockBytes change that takes effect within the
-/// quoted lifetime. The activating block still uses the tip's settings and
-/// the blocks after it use the new value, under which this fee or size may no
-/// longer be valid. The quote stays exact; clients warn or defer instead.
+/// A passed MinimumFeeRate or BlockBytes change that takes effect within the
+/// quoted lifetime: one pending in rest, or one the next block passes when it
+/// resolves the current decision. That block's final observation depends only
+/// on this tip, so the outcome is already certain; with a zero rest it also
+/// activates the change, and no tip is ever in rest. Earlier in a decision the
+/// outcome is unknown and nothing is reported. The activating block still uses
+/// the tip's settings and the blocks after it use the new value, under which
+/// this fee or size may no longer be valid. The quote stays exact; clients
+/// warn or defer instead.
 fn scheduled_change(
     s: &State,
     body: &TransactionBody,
     quote: &crate::fees::FeeQuote,
 ) -> Option<Value> {
-    let crate::state::Phase::Rest(rest) = &s.phase else {
-        return None;
+    let interval = s.settings.interval.max(1);
+    let (parameter, new, activation) = match &s.phase {
+        crate::state::Phase::Rest(rest) => {
+            let (parameter, new) = rest.pending?;
+            // The first block whose scheduled clock reaches the deadline activates it.
+            let remaining = rest.until.saturating_sub(s.clock);
+            let blocks = remaining.div_ceil(interval).max(1);
+            (parameter, new, s.height.saturating_add(blocks))
+        }
+        crate::state::Phase::Governance(decision) => {
+            let resolution = s.height.checked_add(1)?;
+            if decision.started_height.checked_add(decision.blocks)? != resolution {
+                return None;
+            }
+            let Proposal::Parameter { parameter, new, .. } = &*decision.proposal else {
+                return None;
+            };
+            // As consensus resolves it: the tip's own observation counts.
+            let leads = crate::consensus::pass_beats_fail(
+                s.alternative.as_ref()?,
+                &s.world,
+                s.frozen.pass_margin_bps.unwrap_or(0),
+            );
+            if decision.leading_blocks.saturating_add(u64::from(leads)) <= decision.blocks / 2 {
+                return None;
+            }
+            // The resolving block starts the rest; the first block whose
+            // clock reaches its end, possibly that same block, activates it.
+            let blocks = s.frozen.rest.div_ceil(interval);
+            (*parameter, *new, resolution.saturating_add(blocks))
+        }
+        crate::state::Phase::Auction(_) => return None,
     };
-    let (parameter, new) = rest.pending?;
     if !matches!(parameter, Parameter::MinimumFeeRate | Parameter::BlockBytes) {
         return None;
     }
-    // The first block whose scheduled clock reaches the deadline activates it.
-    let remaining = rest.until.saturating_sub(s.clock);
-    let blocks = remaining.div_ceil(s.settings.interval.max(1)).max(1);
-    let activation = s.height.saturating_add(blocks);
     let effective = activation.saturating_add(1);
     if effective > s.height.saturating_add(body.expiry_blocks) {
         return None;
@@ -10446,7 +10512,7 @@ mod tests {
         let quote = node
             .rpc(
                 "transfer_quote",
-                json!({"recipient":hex::encode(recipient),"amount":"5","extra_fee":"3"}),
+                json!({"sender":hex::encode(sender),"recipient":hex::encode(recipient),"amount":"5","extra_fee":"3"}),
             )
             .unwrap();
         assert_eq!(quote["account_creation_fee"], "1");
@@ -10510,7 +10576,7 @@ mod tests {
         let quote = node
             .rpc(
                 "transfer_quote",
-                json!({"recipient":hex::encode(recipient),"amount":"5"}),
+                json!({"sender":hex::encode(sender),"recipient":hex::encode(recipient),"amount":"5"}),
             )
             .unwrap();
         assert_eq!(quote["account_creation_fee"], "0");
@@ -10579,6 +10645,152 @@ mod tests {
         let change = check(&s, body(2, 2)).unwrap();
         assert_eq!(change["value"], capacity.to_string());
         assert_eq!(change["valid_after"], false);
+    }
+    #[test]
+    fn quotes_report_a_change_the_next_block_passes() {
+        // A decision's last tip already decides its outcome. With a zero rest
+        // the resolving block also activates the change, so no tip is ever in
+        // rest; a two-block quote there had only that block left under the old
+        // fee and reported nothing. The reported heights are checked against
+        // consensus executing the following blocks.
+        use crate::state::{Decision, Phase, RoundRecord, RoundStatus};
+        let mut c = Config::devnet();
+        c.test_work = false;
+        let miner = crypto::public_key(&[9; 32]).unwrap();
+        let interval = c.initial.interval;
+        let tip = |rest, leading_blocks| {
+            let mut c = c.clone();
+            c.initial.rest = rest;
+            let mut s = State::genesis(&c);
+            s.height = 10;
+            s.clock = 10 * interval;
+            // An unchanged PASS world never leads, so the tip's own
+            // observation adds no PASS block.
+            s.alternative = Some(s.world.clone());
+            // The auction round that this proposal won.
+            s.rounds.insert(
+                0u64.to_be_bytes().to_vec(),
+                RoundRecord {
+                    status: RoundStatus::Won([6; 32]),
+                    refund_height: 6,
+                },
+            );
+            s.phase = Phase::Governance(Decision {
+                id: [5; 32],
+                epoch: 0,
+                round: 0,
+                proposal_id: [6; 32],
+                proposal: Arc::new(Proposal::Parameter {
+                    parameter: Parameter::MinimumFeeRate,
+                    old: 1,
+                    new: 2,
+                }),
+                started: 6 * interval,
+                started_height: 7,
+                blocks: 4,
+                leading_blocks,
+            });
+            (c, s)
+        };
+        let report = |s: &State, expiry_blocks| {
+            let tx = Transaction {
+                body: TransactionBody {
+                    sender: miner,
+                    nonce: 0,
+                    fee: 2u32.into(),
+                    anchor: [2; 32],
+                    expiry_blocks,
+                    operation: Operation::TransferExact {
+                        recipient: crypto::public_key(&[3; 32]).unwrap(),
+                        amount: 1u32.into(),
+                    },
+                    data: vec![],
+                },
+                signature: [0; 64],
+            };
+            let quote = crate::fees::quote(&c, s, &tx).unwrap();
+            assert_eq!(quote.minimum_fee, 2u32.into());
+            scheduled_change(s, &tx.body, &quote)
+        };
+        // The first height whose block runs under the new minimum fee rate.
+        let consensus_effective = |c: &Config, s: &State| {
+            let mut state = s.clone();
+            while state.settings.minimum_fee_rate == 1 {
+                state =
+                    crate::consensus::execute(c, &state, &[0; 32], &miner, &Amount::zero(), &[])
+                        .unwrap();
+                assert!(state.height < 20, "the change never activated");
+            }
+            state.height + 1
+        };
+        for (rest, effective) in [
+            (0, 12),
+            (1, 13),
+            (interval, 13),
+            (interval + 1, 14),
+        ] {
+            let (c, s) = tip(rest, 3);
+            assert_eq!(consensus_effective(&c, &s), effective, "rest {rest}");
+            let lifetime = effective - s.height;
+            let change = report(&s, lifetime).unwrap();
+            assert_eq!(change["parameter"], "MinimumFeeRate");
+            assert_eq!(change["activation_height"], effective - 1, "rest {rest}");
+            assert_eq!(change["effective_height"], effective, "rest {rest}");
+            assert_eq!(change["valid_after"], false);
+            // A lifetime that ends with the activation block is unaffected.
+            assert!(report(&s, lifetime - 1).is_none(), "rest {rest}");
+            // A losing decision changes nothing.
+            let (c, lost) = tip(rest, 2);
+            let after = crate::consensus::execute(&c, &lost, &[0; 32], &miner, &Amount::zero(), &[])
+                .unwrap();
+            assert!(!matches!(after.phase, Phase::Rest(ref r) if r.pending.is_some()));
+            assert_eq!(after.settings.minimum_fee_rate, 1);
+            assert!(report(&lost, lifetime).is_none(), "rest {rest}");
+        }
+        // Before the last tip the outcome is still open.
+        let (_, mut early) = tip(0, 3);
+        early.height = 9;
+        assert!(report(&early, 10).is_none());
+    }
+    #[test]
+    fn quotes_refuse_a_transaction_heavier_than_block_capacity() {
+        // Consensus limits a block's weight, not only its bytes: a payment
+        // that creates an account adds 1,024 weight. One whose bytes fit but
+        // whose weight cannot was quoted and prepared, and only refused at
+        // admission with a generic error.
+        let c = Config::devnet();
+        let mut s = State::genesis(&c);
+        let sender = crypto::public_key(&[11; 32]).unwrap();
+        let recipient = crypto::public_key(&[12; 32]).unwrap();
+        let capacity = usize::try_from(s.settings.block_bytes).unwrap();
+        let request = || WalletRequest {
+            operation: Operation::TransferExact {
+                recipient,
+                amount: 1u32.into(),
+            },
+            fee: None,
+            extra_fee: None,
+            data_hex: Some(hex::encode(vec![7; capacity - 512])),
+            expiry_blocks: None,
+            anchor: None,
+            nonce: None,
+        };
+        let error = wallet_body(&c, &s, [4; 32], sender, 0, request()).unwrap_err();
+        assert!(error.to_string().contains("weight"), "{error}");
+        // The same bytes to an existing account fit.
+        s.world.put(recipient, Account::default(), &c).unwrap();
+        let body = wallet_body(&c, &s, [4; 32], sender, 0, request()).unwrap();
+        let quote = fees::quote(
+            &c,
+            &s,
+            &Transaction {
+                body,
+                signature: [0; 64],
+            },
+        )
+        .unwrap();
+        assert!(quote.weight <= s.settings.block_bytes);
+        assert!(quote.weight + fees::ACCOUNT_WEIGHT > s.settings.block_bytes);
     }
     fn quote_with_expiry(mut quote: Value, expiry: u64) -> Value {
         for field in [

@@ -54,8 +54,15 @@ const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// The longest pause a busy node's `Retry-After` can impose between refreshes.
 const MAX_POLL_WAIT: Duration = Duration::from_secs(60);
 /// The longest `Retry-After` waited out before a refused request is resent
-/// once. It fits a claim's 15-second answer deadline with both lookups.
+/// once. A claim's answer awaits one such lookup, its preparation, and at
+/// most `CLAIM_BROADCAST_WAIT` of its broadcast: a prompt refusal, this wait
+/// and a prompt resend fit the 15-second request deadline, though each
+/// attempt may take up to the client's five-second timeout and the claim may
+/// first wait for the engine.
 const NODE_RETRY_WAIT: Duration = Duration::from_secs(5);
+/// How long a reserved claim's answer waits for its first broadcast before
+/// that broadcast continues in the background.
+const CLAIM_BROADCAST_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -210,11 +217,21 @@ fn subnet(value: &str) -> Result<String> {
             let o = v.octets();
             format!("{}.{}.{}.0/24", o[0], o[1], o[2])
         }
+        // A 6to4 source is the IPv4 host whose address it embeds, so it shares
+        // that host's /24 rather than holding a /48 of its own, as network
+        // admission accounts it.
+        IpAddr::V6(v) if v.segments()[0] == 0x2002 => {
+            let [a, b] = v.segments()[1].to_be_bytes();
+            let [c, _] = v.segments()[2].to_be_bytes();
+            format!("{a}.{b}.{c}.0/24")
+        }
         IpAddr::V6(v) => {
-            // Customers commonly receive a /56. One holder must not obtain a
-            // separate allowance for every /64 network it can address.
+            // One site holds a /48, as network admission groups it: a free
+            // tunnel broker or a VPS hands one out whole. Grouped by the /56
+            // customer delegation, its 256 networks each had their own share,
+            // so one holder could take most of the global allowance.
             let o = v.segments();
-            format!("{:x}:{:x}:{:x}:{:x}::/56", o[0], o[1], o[2], o[3] & 0xff00)
+            format!("{:x}:{:x}:{:x}::/48", o[0], o[1], o[2])
         }
     })
 }
@@ -1863,8 +1880,9 @@ impl Engine {
                 && quote["expiry_height"] == expiry,
             "prepared faucet snapshot changed"
         );
-        // Preparation checks encoded size only. A payment heavier than the block
-        // capacity could never be included and must not consume an allowance.
+        // A payment heavier than the block capacity could never be included and
+        // must not consume an allowance. The node's preparation refuses one too;
+        // this check does not depend on the node's release.
         let weight: u64 = quote["weight"]
             .as_str()
             .and_then(|v| v.parse().ok())
@@ -2075,19 +2093,20 @@ async fn reconcile(hold: &mut impl Hold, node: &NodeClient, snap: &Snap) -> Resu
     Ok(None)
 }
 
-/// Pays one claim, or answers a repeated one. A refresh retries reserved
-/// bytes anyway, so the broadcast needs no hold.
-async fn claim_with(
+/// Reserves one claim, or answers a repeated one. A new reservation also
+/// returns its signed bytes for the first broadcast, which needs no hold: a
+/// refresh retries reserved bytes anyway.
+async fn claim_reserve(
     hold: &mut impl Hold,
     node: &NodeClient,
     recipient: String,
     client_subnet: String,
-) -> Result<Value> {
+) -> Result<(Value, Option<String>)> {
     let preparation = match hold
         .step(move |engine| engine.claim_start(&recipient, &client_subnet))
         .await?
     {
-        ClaimStart::Answered(answer) => return Ok(answer),
+        ClaimStart::Answered(answer) => return Ok((answer, None)),
         ClaimStart::Prepare(preparation) => *preparation,
     };
     let prepared: Value = node
@@ -2097,9 +2116,29 @@ async fn claim_with(
         .step(move |engine| engine.claim_commit(preparation, prepared))
         .await?;
     hold.release();
+    Ok((answer, Some(raw)))
+}
+
+/// The first broadcast of reserved bytes. Any RPC error is uncertain; the
+/// durable pending record keeps them, and refreshes retry exactly these bytes.
+async fn broadcast_claim(node: &NodeClient, raw: String) {
     let _ = node
         .call::<IgnoredAny>("broadcasttransaction", json!({"raw":raw}))
         .await;
+}
+
+/// Pays one claim, or answers a repeated one, awaiting the first broadcast.
+#[cfg(test)]
+async fn claim_with(
+    hold: &mut impl Hold,
+    node: &NodeClient,
+    recipient: String,
+    client_subnet: String,
+) -> Result<Value> {
+    let (answer, raw) = claim_reserve(hold, node, recipient, client_subnet).await?;
+    if let Some(raw) = raw {
+        broadcast_claim(node, raw).await;
+    }
     Ok(answer)
 }
 
@@ -2332,8 +2371,20 @@ async fn claim_handler(
     // Claims take turns with the engine; a refresh waiting for the node holds
     // it only between its lookups.
     let mut held = Held(Some(app.engine.clone().lock_owned().await));
-    match claim_with(&mut held, &app.node, request.address, client).await {
-        Ok(v) => Json(v).into_response(),
+    match claim_reserve(&mut held, &app.node, request.address, client).await {
+        Ok((answer, raw)) => {
+            // The claim is reserved. A usual broadcast is answered at once,
+            // and the answer still follows it; a busy node's Retry-After and
+            // resend, or a slow reply, continue in the background instead of
+            // holding the answer past the request deadline, which reported a
+            // reserved payment as still being checked.
+            if let Some(raw) = raw {
+                let node = app.node.clone();
+                let broadcast = tokio::spawn(async move { broadcast_claim(&node, raw).await });
+                let _ = tokio::time::timeout(CLAIM_BROADCAST_WAIT, broadcast).await;
+            }
+            Json(answer).into_response()
+        }
         Err(error) => {
             let message = error.to_string();
             if let Some(wait) = error.downcast_ref::<Cooldown>() {
@@ -2729,15 +2780,29 @@ mod tests {
             subnet("2001:db8:5:6::1").unwrap(),
             subnet("2001:db8:5:6::ffff").unwrap()
         );
-        // One delegated /56 shares an allowance across its /64 networks.
+        // One /48 site shares an allowance across its /56 and /64 networks
+        // (it used to have one per /56).
         assert_eq!(
             subnet("2001:db8:5:6::1").unwrap(),
             subnet("2001:db8:5:ff::1").unwrap()
         );
-        assert_eq!(subnet("2001:db8:5:6::1").unwrap(), "2001:db8:5:0::/56");
-        assert_ne!(
+        assert_eq!(
             subnet("2001:db8:5:6::1").unwrap(),
             subnet("2001:db8:5:106::1").unwrap()
+        );
+        assert_eq!(subnet("2001:db8:5:6::1").unwrap(), "2001:db8:5::/48");
+        assert_ne!(
+            subnet("2001:db8:5:6::1").unwrap(),
+            subnet("2001:db8:6:6::1").unwrap()
+        );
+        // A 6to4 source shares the IPv4 /24 its address embeds.
+        assert_eq!(
+            subnet("2002:c000:0211:7::1").unwrap(),
+            subnet("192.0.2.17").unwrap()
+        );
+        assert_eq!(
+            subnet("2002:c000:02ff::1").unwrap(),
+            subnet("192.0.2.200").unwrap()
         );
         for bad in ["", "192.0.2.1, 127.0.0.1", "192.0.2.1:90", "fe80::1%eth0"] {
             assert!(subnet(bad).is_err());
@@ -4518,6 +4583,41 @@ mod tests {
     }
 
     #[test]
+    fn one_ipv6_site_receives_one_network_share() {
+        // A /48, which a free tunnel broker or a VPS hands out whole, holds
+        // 256 /56 networks. Grouped by /56, one holder cycling through them
+        // received 256 daily shares, far beyond the whole daily allowance.
+        let dir = TempDir::new().unwrap();
+        let mut c = config(&dir);
+        c.subnet_daily_claims = 3;
+        let sender = crypto::public_key(&[41; 32]).unwrap();
+        let mut ledger = Ledger::open(&c.database, &[7; 32], &sender, &c.payout).unwrap();
+        let digest = |ip: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-real-ip", HeaderValue::from_str(ip).unwrap());
+            private_client_subnet(&[9; 32], &headers).unwrap()
+        };
+        let start = 1_000_000;
+        for n in 0..3u8 {
+            // Each from another /56, after the network cooldown.
+            let claim = record(n + 1, start + 60 * i64::from(n));
+            let network = digest(&format!("2001:db8:77:{n:x}00::1"));
+            ledger.reserve(&c, &claim, &network).unwrap();
+            finish(&ledger, &claim);
+        }
+        let fresh = digest("2001:db8:77:ff00::1");
+        let wait = cooldown(&ledger.db, &c, &recipient(9), &fresh, start + 180)
+            .unwrap()
+            .unwrap();
+        assert_eq!(wait.scope, "network");
+        assert!(ledger.reserve(&c, &record(9, start + 180), &fresh).is_err());
+        // Another site keeps its own share.
+        ledger
+            .eligible(&c, &recipient(9), &digest("2001:db8:78::1"), start + 180)
+            .unwrap();
+    }
+
+    #[test]
     fn signer_file_must_be_private_and_subnet_digests_use_a_derived_key() {
         let dir = TempDir::new().unwrap();
         let c = config(&dir);
@@ -4721,6 +4821,64 @@ mod tests {
             recipient(4)
         );
         assert_eq!(node.lock().await.transactions.len(), 2);
+        server.abort();
+        mock_task.abort();
+    }
+
+    /// Waits for the mock node to have received `count` transactions.
+    async fn broadcasts(node: &Arc<Mutex<MockNode>>, count: usize) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while node.lock().await.transactions.len() < count {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(node.lock().await.transactions.len(), count);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reserved_claim_is_answered_without_waiting_for_its_broadcast() {
+        // The answer used to await the broadcast, including a busy node's
+        // Retry-After and the resend, so a reserved payment could pass the
+        // 15-second deadline and be reported as still being checked.
+        let dir = TempDir::new().unwrap();
+        let (engine, _, node, mock_task) = ready_engine(&dir, |_| {}).await;
+        let app = App::new(
+            engine,
+            vec!["https://faucet.example".into()],
+            vec!["faucet.example".into()],
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let routes = router(app.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, routes).await.unwrap();
+        });
+        node.lock().await.refusals.push((
+            "broadcasttransaction",
+            StatusCode::TOO_MANY_REQUESTS,
+            Some("5"),
+        ));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let started = Instant::now();
+        let paid = client
+            .post(format!("{base}/faucet/claim"))
+            .header("host", "faucet.example")
+            .header("origin", "https://faucet.example")
+            .header("x-real-ip", "192.0.2.5")
+            .json(&json!({"address":recipient(5)}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paid.status(), StatusCode::OK);
+        assert_eq!(paid.json::<Value>().await.unwrap()["status"], "pending");
+        assert!(started.elapsed() < CLAIM_BROADCAST_WAIT + Duration::from_secs(2));
+        assert!(node.lock().await.transactions.is_empty());
+        // The refused broadcast is resent after its wait, with nobody waiting.
+        broadcasts(&node, 1).await;
+        assert!(node.lock().await.refusals.is_empty());
+        assert!(started.elapsed() >= Duration::from_secs(5));
         server.abort();
         mock_task.abort();
     }

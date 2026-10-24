@@ -61,14 +61,18 @@ The ledger stores the amount of each payment alongside its claim record.
 
 The example dispenses 1 hash per claim (1,000 raw hash atoms) and permits one claim
 per address each day. Configuration and API amounts use integer raw hash atoms.
-A shared IPv4 /24 or IPv6 /56 can make a new claim once per minute, so another
+A shared IPv4 /24 or IPv6 /48 can make a new claim once per minute, so another
 wallet on the same network does not inherit a full day's wait. The separate
 `subnet_cooldown_seconds` setting defaults to 60 when omitted; both cooldowns
 must be positive and at most one year. Each such network also receives at most
 `subnet_daily_claims` claims in any 24 hours (default 10, at most 1,000,000), so
 one host generating fresh addresses cannot take most of the global allowance.
-IPv6 is grouped by /56, the usual customer delegation, so one holder does not
-receive a separate allowance for each of its /64 networks. At this payout, the
+IPv6 is grouped by /48, one site, as the node's network admission groups it: a
+free tunnel broker or a VPS hands out a whole /48, and grouping by /56 would
+give its one holder 256 daily shares, more than the example's whole daily
+allowance. Customers of one provider whose delegations share a /48
+share its allowance too, as visitors behind one IPv4 /24 do. A 6to4 address
+(`2002::/16`) counts as the IPv4 /24 it embeds. At this payout, the
 claim-count caps allow up to 100 hashes per hour, 250 hashes per day, and 1,000
 hashes over the ledger's lifetime. The service additionally limits each exact
 quoted fee to 0.01 hash.
@@ -77,7 +81,9 @@ and expired claims consume the allowance too. When a passed MinimumFeeRate
 increase or BlockBytes decrease takes effect within a claim's lifetime, the
 node's quote reports it and the faucet refuses the claim before signing, so the
 visitor can retry once the change is active instead of spending an allowance on
-a payment with only one usable block. Changing the payout does not
+a payment with only one usable block. That includes a change the next block
+passes when it resolves a decision, which with a zero rest that same block
+activates. Changing the payout does not
 reset these counts; historical payments retain the amounts paid at the time. This
 limits the dispenser's exposure; IP limits are not proof of unique people. To
 extend an exhausted lifetime allowance, raise `lifetime_claims` (up to
@@ -146,9 +152,14 @@ each local accounting step, never while it waits for the node (each node call
 has a five-second timeout). A claim holds the engine from its eligibility checks
 through its reservation, including the node's preparation of the transfer, so
 the nonce, anchor and one pending payment cannot change meanwhile; the
-broadcast that follows holds nothing. All ledger work, including its
+broadcast that follows holds nothing. The claim's answer waits at most two
+seconds for that broadcast, which a node usually accepts at once; a busy node's
+`Retry-After` and resend (below), or a slow reply, continue in the background,
+and refreshes retry the reserved bytes anyway. All ledger work, including its
 synchronous commits, runs on blocking threads rather than the HTTP workers. A
-request still waiting after 15 seconds receives HTTP 503.
+request still waiting after 15 seconds receives HTTP 503: a claim queued behind
+other claims, or whose preparation the node is slow to answer, can reach it,
+and the visitor then reads the claim's outcome from status.
 
 A node refusing a request on admission grounds answers 429 or 503 with
 `Retry-After`; the request did not run. The faucet waits out a `Retry-After` of
@@ -199,7 +210,7 @@ otherwise available faucet, `state` is `cooldown`, `available` is false, and
 `cooldown_scope` is `address` or `network`. No other recipient, claim, client IP,
 or stored subnet digest is disclosed. Status queries do not reserve funds. Like
 any per-network limit that reports its wait, a `network` wait tells a caller
-that someone on the same /24 or /56 claimed recently or used that network's
+that someone on the same /24 or /48 claimed recently or used that network's
 daily share; the claim response reports the same wait.
 
 `POST /faucet/claim` accepts only `{"address":"RECIPIENT_ADDRESS"}`. It returns
@@ -250,8 +261,15 @@ twice:
 - The newest confirmed receipt is checked by its block hash alone, which commits
   to the payment and to all older receipts. If that block leaves the canonical
   chain, the claim is accounted again: found elsewhere it keeps a moved
-  receipt, otherwise it is retried while still valid, and expires after its
-  lifetime.
+  receipt. Otherwise, while no newer claim is pending, it is pending again and
+  retried while still valid, and expires after its lifetime. A newer claim
+  that is pending was signed on the abandoned branch, so its anchor is
+  orphaned and it expires unpaid (next rule); the faucet keeps one pending
+  payment, marks the reorganized claim expired at once and does not resend it
+  itself. The nodes that switched branches return its transaction to their
+  pools while its anchor and nonce allow, and if a later block includes it the
+  claim is marked confirmed again (see below). Otherwise it stays expired, and
+  its recipient waits out the address cooldown as after any expired claim.
 - A pending claim whose anchor was orphaned, even by a one-block reorganization,
   or whose anchor lies above a shorter chain, keeps its exact bytes and expires
   once the canonical height reaches its expiry height with its nonce unused.
@@ -318,8 +336,9 @@ claim times to the present, so their cooldowns restart from now.
 
 Upgrading from a release without these rules keeps every claim, receipt,
 address cooldown and budget count. Stored subnet digests use the new derived
-key and IPv6 /56 grouping, so network cooldowns and daily network shares start
-afresh once.
+key and IPv6 /48 grouping, so network cooldowns and daily network shares start
+afresh once. That includes upgrading from a release that grouped IPv6 by /56;
+IPv4 network digests are unchanged.
 
 Mining availability is an operational observation: the node's height must have
 advanced recently and RPC must still respond. "Recently" means within the larger

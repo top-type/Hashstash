@@ -219,16 +219,25 @@ fn mutate(
 
 /// Outcome labels without the input they quote back, in quotes or in
 /// parentheses such as another peer protocol generation's marker, or
-/// numbers, hashes and keys.
+/// numbers, hashes and keys. Quoted-back bytes can hold parentheses
+/// themselves, so everything from the first `(` to the last `)` goes.
 fn normalized(label: &str) -> String {
+    let label = match label.find('(') {
+        Some(open) => {
+            let rest = label[open..]
+                .rfind(')')
+                .map_or("", |close| &label[open + close + 1..]);
+            format!("{}{rest}", &label[..open])
+        }
+        None => label.to_owned(),
+    };
     let mut unquoted = String::new();
     let mut quote = None;
     for c in label.chars() {
         match quote {
-            Some(close) if c == close => quote = None,
+            Some(open) if c == open => quote = None,
             Some(_) => {}
             None if matches!(c, '"' | '`' | '\'') => quote = Some(c),
-            None if c == '(' => quote = Some(')'),
             None => unquoted.push(c),
         }
     }

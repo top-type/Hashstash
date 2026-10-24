@@ -1754,8 +1754,10 @@ pub fn peer_sync(node: &Node, data: &[u8]) -> String {
     };
     let outcome = match result {
         Err(_) => panic!("a session with a scripted peer outlived {SYNC_LIMIT:?}"),
-        // Whatever the session reports about itself, the checks above hold.
-        Ok(Ok(_)) => "synchronized".to_owned(),
+        // Whatever the session reports about itself, the checks above hold;
+        // what it reports, such as a header reply that failed while the
+        // block exchange went on, tells outcomes apart.
+        Ok(Ok(report)) => format!("synchronized {report:?}"),
         Ok(Err(error)) => rejected(error),
     };
     // What the runners tell apart comes first: labels are cut short.
@@ -1764,7 +1766,7 @@ pub fn peer_sync(node: &Node, data: &[u8]) -> String {
         .get(requests.len())
         .unwrap_or(&"more");
     format!(
-        "{tip}, {count} requests: {outcome} (sent {})",
+        "{tip}, {count} requests: {outcome}; sent {}",
         requests.join(", ")
     )
 }

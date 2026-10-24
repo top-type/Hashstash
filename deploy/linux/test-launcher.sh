@@ -73,6 +73,20 @@ for prefix in 'miner.example' '192.0.2.0/24;id' '192.0.2.0/1234'; do
 done
 base; printf 'STRATUM_ENABLED=false\nSTRATUM_TRUSTED=192.0.2.9\n' >> "$fixture/node.env"; rm -- "$fixture/password"; reject run 'trusted prefix without Stratum'
 printf 'fixture-password\n' > "$fixture/password"
+# A public prefix shorter than IPv4 /16 or IPv6 /32 would exempt much of the
+# internet from the pending limits; only STRATUM_TRUSTED_BROAD accepts one.
+for prefix in 0.0.0.0/0 ::/0 198.50.0.0/15 2001:db8::/31 11.0.0.0/8 172.32.0.0/12 100.128.0.0/10 fe00::/8; do
+  base; printf 'STRATUM_TRUSTED=%s\n' "$prefix" >> "$fixture/node.env"; reject run "broad trusted prefix $prefix"
+done
+base; printf 'STRATUM_TRUSTED=198.51.0.0/16 2001:db8::/32 10.0.0.0/8 127.0.0.0/8 172.16.0.0/12 100.64.0.0/10 fd00::/8 fe80::/10\n' >> "$fixture/node.env"; pass run
+[[ $(grep -Fxc -- --stratum-trusted "$fixture/args") == 8 ]]; checks=$((checks+1)); lacks --stratum-trusted-broad
+base; printf 'STRATUM_TRUSTED=192.0.2.9\nSTRATUM_TRUSTED_BROAD=0.0.0.0/0 ::/0\n' >> "$fixture/node.env"; pass run
+[[ $(grep -Fxc -- --stratum-trusted-broad "$fixture/args") == 2 ]]; checks=$((checks+1)); has 0.0.0.0/0; has ::/0; has --stratum-trusted
+for prefix in 'miner.example' '0.0.0.0/0;id' '0.0.0.0/1234'; do
+  base; printf 'STRATUM_TRUSTED_BROAD=%s\n' "$prefix" >> "$fixture/node.env"; reject run "broad trusted prefix $prefix"
+done
+base; printf 'STRATUM_ENABLED=false\nSTRATUM_TRUSTED_BROAD=0.0.0.0/0\n' >> "$fixture/node.env"; rm -- "$fixture/password"; reject run 'broad trusted prefix without Stratum'
+printf 'fixture-password\n' > "$fixture/password"
 for endpoint in 256.0.0.1:18481 01.0.0.1:18481 1.2.3.4:0 1.2.3.4:65536 1.2.3.4:018481 0.0.0.0:18481 255.255.255.255:18481 bad.example:18481; do
   base; replace PEERS "$endpoint"; reject run "peer $endpoint"
   base; auth; replace PEER_PINS "$endpoint=$peer_key"; reject run "pin $endpoint"

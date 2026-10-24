@@ -398,8 +398,16 @@ async fn shares_difficulty_changes_duplicates_blocks_and_reorgs() {
     }
     let other_server = node::serve(b.clone(), options(1e-8)).await.unwrap();
     node::sync_peer(&a, other_server.p2p).await.unwrap();
-    assert_eq!(a.status().unwrap()["tip"], b.status().unwrap()["tip"]);
-    let reorg_job = worker.job().await;
+    let tip = b.status().unwrap()["tip"].clone();
+    assert_eq!(a.status().unwrap()["tip"], tip);
+    // The tip may pass through b's earlier blocks while they connect, each
+    // replacing the work, so wait for the job on the final tip.
+    let reorg_job = loop {
+        let job = worker.job().await;
+        if json!(hex::encode(header(&job, &worker.extra, [0; 4]).previous)) == tip {
+            break job;
+        }
+    };
     assert_eq!(reorg_job["params"][8], true);
     assert_ne!(reorg_job["params"][1], next["params"][1]);
     let stale = header(&next, &worker.extra, [6; 4]);
@@ -410,10 +418,8 @@ async fn shares_difficulty_changes_duplicates_blocks_and_reorgs() {
     let base = header(&reorg_job, &worker.extra, [7; 4]);
     let target = math::target_from_bits(base.bits).unwrap();
     let winning = solve(base, |hash| hash <= &target);
-    assert_eq!(
-        worker.submit(&reorg_job, &winning, [7; 4], true).await["result"],
-        true
-    );
+    let reply = worker.submit(&reorg_job, &winning, [7; 4], true).await;
+    assert_eq!(reply["result"], true, "{reply}");
     assert_eq!(a.status().unwrap()["height"], 4);
     let mining = a.rpc("mining", json!({})).unwrap();
     assert_eq!(mining["workers_connected"], 1);

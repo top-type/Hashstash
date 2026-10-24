@@ -526,6 +526,10 @@ pub struct Session {
     request_bucket: Mutex<Bucket>,
     overrun_bucket: Mutex<Bucket>,
     worker: AtomicBool,
+    /// An authorized Stratum worker from an operator-trusted prefix: it no
+    /// longer counts toward its address's or network's connections and pays
+    /// only its own session limits.
+    released: AtomicBool,
     reserved_frame: Mutex<u64>,
     /// Inbound frames begun by this session.
     frames: AtomicU64,
@@ -783,6 +787,7 @@ impl NetworkGuard {
             request_bucket: Mutex::new(Bucket::new(SESSION_REQUEST_BURST, now)),
             overrun_bucket: Mutex::new(Bucket::new(WORKER_OVERRUN_BURST, now)),
             worker: AtomicBool::new(false),
+            released: AtomicBool::new(false),
             reserved_frame: Mutex::new(0),
             frames: AtomicU64::new(0),
         })
@@ -1005,17 +1010,35 @@ impl Session {
     }
     /// Mark an authorized Stratum worker. An address cooldown, which another
     /// session from a shared address can cause, then no longer ends this
-    /// session's requests; its budgets still apply.
-    pub fn authorize_worker(&self) {
+    /// session's requests. A worker from a prefix the operator trusts
+    /// (`--stratum-trusted`) also stops counting toward its address's and
+    /// network's connection limits and pays no address or network budget:
+    /// the worker registry and its own session limits bound it instead.
+    pub fn authorize_worker(&self, trusted: bool) {
         self.worker.store(true, Ordering::Relaxed);
+        if trusted && !self.released.swap(true, Ordering::Relaxed) {
+            let mut records = accounting(&self.guard.records);
+            for key in [Some(self.key), self.aggregate].into_iter().flatten() {
+                if let Some(record) = records.get_mut(&key) {
+                    record.active = record.active.saturating_sub(1);
+                }
+            }
+        }
+    }
+    /// The admission address this session is accounted to.
+    pub fn address(&self) -> IpAddr {
+        self.key.0
     }
     /// Charge one line from an authorized Stratum worker. Within the session
     /// rate it is an ordinary request. Past it, the line draws on a separate
     /// overrun allowance and no address request unit, so one fast worker
     /// neither drains the budget of other sessions at its address nor is
-    /// disconnected while its difficulty is raised. `Ok(false)` marks such a
-    /// line. Bytes are always charged to the address.
-    pub fn worker_line(&self, bytes: usize) -> Result<bool> {
+    /// disconnected while its difficulty is raised. Bytes are charged to the
+    /// address too. Other sources can exhaust the address and network budgets
+    /// a worker shares, so their refusal only restricts the line and never
+    /// penalizes or disconnects the worker. `Err` means the overrun allowance
+    /// is spent as well.
+    pub fn worker_line(&self, bytes: usize) -> Result<WorkerLine> {
         let now = Instant::now();
         let within =
             accounting(&self.request_bucket).take(1, SESSION_REQUESTS, SESSION_REQUEST_BURST, now);
@@ -1026,8 +1049,29 @@ impl Session {
                 "mining session request rate limit"
             );
         }
-        self.charge_address(u64::from(within), bytes as u64, 0, true, now)?;
-        Ok(within)
+        let shared = self.worker_charge(u64::from(within), bytes as u64, 0, now);
+        Ok(match shared {
+            _ if !within => WorkerLine::Throttled,
+            Ok(()) => WorkerLine::Admitted,
+            Err(error) => WorkerLine::Refused(error),
+        })
+    }
+    /// Charge an authorized worker's accepted share or solved block to its
+    /// address and network work budgets, as its lines are charged.
+    pub fn worker_work(&self, work: usize) -> Result<()> {
+        self.worker_charge(0, 0, work as u64, Instant::now())
+    }
+    /// Charge an authorized worker's address and network records, unless the
+    /// operator trusts its prefix. A refusal penalizes no one.
+    fn worker_charge(&self, requests: u64, bytes: u64, work: u64, now: Instant) -> Result<()> {
+        if self.released.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.charge_address(requests, bytes, work, false, now)
+            .map_err(|error| match error.downcast::<Limited>() {
+                Ok(refusal) => limited("network rate budget exhausted", refusal.retry_after),
+                Err(error) => error,
+            })
     }
     fn charge(&self, requests: u64, bytes: u64, work: u64, penalize: bool) -> Result<()> {
         let now = Instant::now();
@@ -1179,8 +1223,13 @@ impl Session {
 }
 impl Drop for Session {
     fn drop(&mut self) {
+        let released = *self.released.get_mut();
         let mut records = accounting(&self.guard.records);
         for (key, _) in self.keys().into_iter().flatten() {
+            // A trusted worker released its own records at authorization.
+            if released && (key == self.key || Some(key) == self.aggregate) {
+                continue;
+            }
             if let Some(record) = records.get_mut(&key) {
                 record.active = record.active.saturating_sub(1);
             }
@@ -1486,6 +1535,27 @@ impl Drop for PeerSlot {
     }
 }
 
+/// How an authorized Stratum worker's line was charged.
+pub enum WorkerLine {
+    /// Within its session rate and every budget it pays.
+    Admitted,
+    /// Past its session rate, on the overrun allowance.
+    Throttled,
+    /// Refused by an address or network budget that other sessions share.
+    Refused(anyhow::Error),
+}
+/// The group whose authorized Stratum workers share one cap: the pending
+/// group (IPv4 /24, IPv6 /48), or the address itself on a local network.
+pub fn stratum_group(ip: IpAddr) -> IpAddr {
+    let address = admission_address(ip);
+    pending_group(address).unwrap_or(address)
+}
+/// The shortest trusted prefix, IPv4 then IPv6, that `--stratum-trusted`
+/// accepts outside local networks: the network groups peer diversity uses. A
+/// broader public prefix would exempt much of the internet from the pending
+/// limits, so only `--stratum-trusted-broad` names one.
+pub const TRUSTED_PREFIX_MINIMUM: (u8, u8) = (16, 32);
+
 /// An address prefix the operator names, such as `203.0.113.0/24`,
 /// `2001:db8:7::/48` or one address, whose Stratum sources always count as
 /// recently authorized.
@@ -1499,10 +1569,34 @@ impl TrustedPrefix {
         let ip = unmapped(ip);
         ip.is_ipv4() == self.network.is_ipv4() && masked(ip, self.length.into()) == self.network
     }
-}
-impl FromStr for TrustedPrefix {
-    type Err = anyhow::Error;
-    fn from_str(text: &str) -> Result<Self> {
+    /// A prefix of any length, even one shorter than `TRUSTED_PREFIX_MINIMUM`
+    /// outside local networks, for an operator who means to trust it.
+    pub fn broad(text: &str) -> Result<Self> {
+        Self::parse(text)
+    }
+    /// Whether every address in the prefix belongs to a local network:
+    /// loopback, private, shared (CGNAT), link-local or unique-local.
+    fn local(&self) -> bool {
+        let within = |network: IpAddr, length: u8| {
+            self.length >= length && masked(self.network, length.into()) == network
+        };
+        let v4 = |octets: [u8; 4], length| within(IpAddr::from(octets), length);
+        let v6 = |first: u16, length| within(IpAddr::from([first, 0, 0, 0, 0, 0, 0, 0]), length);
+        match self.network {
+            IpAddr::V4(_) => {
+                v4([10, 0, 0, 0], 8)
+                    || v4([127, 0, 0, 0], 8)
+                    || v4([172, 16, 0, 0], 12)
+                    || v4([192, 168, 0, 0], 16)
+                    || v4([169, 254, 0, 0], 16)
+                    || v4([100, 64, 0, 0], 10)
+            }
+            IpAddr::V6(_) => {
+                within(IpAddr::V6(Ipv6Addr::LOCALHOST), 128) || v6(0xfc00, 7) || v6(0xfe80, 10)
+            }
+        }
+    }
+    fn parse(text: &str) -> Result<Self> {
         let (address, length) = match text.split_once('/') {
             Some((address, length)) => (address, Some(length)),
             None => (text, None),
@@ -1528,6 +1622,22 @@ impl FromStr for TrustedPrefix {
             network: masked(address, length.into()),
             length,
         })
+    }
+}
+impl FromStr for TrustedPrefix {
+    type Err = anyhow::Error;
+    /// A prefix outside local networks must be at least
+    /// `TRUSTED_PREFIX_MINIMUM` long; see [TrustedPrefix::broad].
+    fn from_str(text: &str) -> Result<Self> {
+        let prefix = Self::parse(text)?;
+        let (v4, v6) = TRUSTED_PREFIX_MINIMUM;
+        let minimum = if prefix.network.is_ipv4() { v4 } else { v6 };
+        ensure!(
+            prefix.length >= minimum || prefix.local(),
+            "a trusted prefix outside local networks must be at least /{v4} for IPv4 or /{v6} \
+             for IPv6; use --stratum-trusted-broad to trust a broader prefix deliberately"
+        );
+        Ok(prefix)
     }
 }
 impl std::fmt::Display for TrustedPrefix {
@@ -1595,6 +1705,8 @@ pub struct PendingSlot {
     group: Option<IpAddr>,
     reserved: bool,
     charged: bool,
+    /// A prefix the operator named holds the source.
+    allowed: bool,
     started: Instant,
     released: bool,
 }
@@ -1606,18 +1718,18 @@ impl StratumPending {
         let address = admission_address(ip);
         let mut counts = accounting(&self.counts);
         let counts = &mut *counts;
+        let allowed = counts.allowed.iter().any(|prefix| prefix.contains(ip));
         let slot = |group, reserved, charged| PendingSlot {
             pending: self.clone(),
             address,
             group,
             reserved,
             charged,
+            allowed,
             started: now,
             released: false,
         };
-        if counts.trusted.contains_key(&address)
-            || counts.allowed.iter().any(|prefix| prefix.contains(ip))
-        {
+        if allowed || counts.trusted.contains_key(&address) {
             let reserved = if counts.general < STRATUM_PENDING_SLOTS {
                 false
             } else if counts.reserved < RESERVED_STRATUM_PENDING {
@@ -1769,6 +1881,11 @@ impl StratumPending {
     }
 }
 impl PendingSlot {
+    /// Whether a prefix the operator named (`--stratum-trusted`) holds the
+    /// source, rather than a recent authorization alone.
+    pub fn operator_trusted(&self) -> bool {
+        self.allowed
+    }
     /// The session authorized. Its address may later wait uncharged and use
     /// reserved slots, and dropping this slot releases it.
     pub fn authorized(self) {
@@ -2846,22 +2963,23 @@ mod tests {
         let guard = Arc::new(NetworkGuard::default());
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
         let worker = guard.admit(ip, Surface::Stratum).unwrap();
-        worker.authorize_worker();
+        worker.authorize_worker(false);
         let other = guard.admit(ip, Surface::Stratum).unwrap();
         other.malformed();
         // A cooldown from another session at the address refuses new
         // connections and unauthenticated requests, not the worker.
         assert!(guard.admit(ip, Surface::Stratum).is_err());
         assert!(other.request().is_err());
-        assert!(worker.worker_line(100).unwrap());
-        assert!(worker.work(1).is_ok());
+        assert!(matches!(worker.worker_line(100), Ok(WorkerLine::Admitted)));
+        assert!(worker.worker_work(1).is_ok());
         // Past its session rate a worker is throttled rather than refused
         // until its overrun allowance runs out.
         let (mut within, mut throttled) = (1, 0);
         let error = loop {
             match worker.worker_line(100) {
-                Ok(true) => within += 1,
-                Ok(false) => throttled += 1,
+                Ok(WorkerLine::Admitted) => within += 1,
+                Ok(WorkerLine::Throttled) => throttled += 1,
+                Ok(WorkerLine::Refused(error)) => panic!("{error}"),
                 Err(error) => break error,
             }
         };
@@ -2874,6 +2992,88 @@ mod tests {
         let record = &records[&(ip, Surface::Stratum, Direction::Inbound, Scope::Address)];
         assert!(record.requests.tokens >= 64 - 2 - within as u64);
         assert_eq!(record.strikes, 1);
+    }
+    #[test]
+    fn shared_budgets_other_sources_drain_restrict_a_worker_without_penalty() {
+        let guard = Arc::new(NetworkGuard::default());
+        let ip: IpAddr = "198.51.100.7".parse().unwrap();
+        let worker = guard.admit(ip, Surface::Stratum).unwrap();
+        worker.authorize_worker(false);
+        // Other devices at the address, and their neighbours in the /24, use
+        // up the request budget the worker shares with them.
+        let other = guard.admit(ip, Surface::Stratum).unwrap();
+        while other.charge_address(1, 0, 0, true, Instant::now()).is_ok() {}
+        // The worker's line is restricted, not a reason to close it, and the
+        // refusal penalizes neither the address nor its network.
+        let key = (ip, Surface::Stratum, Direction::Inbound, Scope::Address);
+        let aggregate = (
+            masked(ip, 24),
+            Surface::Stratum,
+            Direction::Inbound,
+            Scope::Aggregate,
+        );
+        let penalties = |records: &HashMap<Key, Record>| {
+            let network = &records[&aggregate];
+            (
+                records[&key].strikes,
+                network.strikes,
+                network.members.len(),
+            )
+        };
+        let before = penalties(&guard.records.lock().unwrap());
+        match worker.worker_line(100) {
+            Ok(WorkerLine::Refused(error)) => {
+                let refusal = error.downcast::<Limited>().unwrap();
+                assert_eq!(refusal.reason, "network rate budget exhausted");
+                assert!(refusal.retry_after.is_some());
+            }
+            _ => panic!("a drained address budget did not restrict the line"),
+        }
+        assert_eq!(penalties(&guard.records.lock().unwrap()), before);
+        // A share's work charge is not refused for another session's requests.
+        assert!(worker.worker_work(1).is_ok());
+    }
+    #[test]
+    fn trusted_workers_leave_the_address_connection_limits_and_shared_budgets() {
+        let guard = Arc::new(NetworkGuard::default());
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let limit = Surface::Stratum.policy().connections;
+        // A marketplace proxy behind one address: once authorized, a trusted
+        // worker no longer holds one of its address's connections.
+        let workers: Vec<Session> = (0..limit * 2)
+            .map(|_| {
+                let session = guard.admit(ip, Surface::Stratum).unwrap();
+                session.authorize_worker(true);
+                session
+            })
+            .collect();
+        let mut pending: Vec<Session> = (0..limit)
+            .map(|_| guard.admit(ip, Surface::Stratum).unwrap())
+            .collect();
+        let refused = guard.admit(ip, Surface::Stratum).err().unwrap();
+        let reason = refused.downcast::<Limited>().unwrap().reason;
+        assert_eq!(reason, "per-address connection limit");
+        // Its lines pay only its own session limits, whatever other sessions
+        // at the address spend.
+        pending.pop();
+        let other = guard.admit(ip, Surface::Stratum).unwrap();
+        while other.request().is_ok() {}
+        for worker in &workers {
+            assert!(matches!(worker.worker_line(100), Ok(WorkerLine::Admitted)));
+            assert!(worker.worker_work(8192).is_ok());
+        }
+        // Closing the workers leaves the counts of the remaining sessions.
+        drop(workers);
+        let key = (ip, Surface::Stratum, Direction::Inbound, Scope::Address);
+        let aggregate = (
+            masked(ip, 24),
+            Surface::Stratum,
+            Direction::Inbound,
+            Scope::Aggregate,
+        );
+        let records = guard.records.lock().unwrap();
+        assert_eq!(records[&key].active, limit);
+        assert_eq!(records[&aggregate].active, limit);
     }
     #[test]
     fn json_preflight_rejects_excess_shape_before_decoding() {
@@ -3417,5 +3617,86 @@ mod tests {
         let mapped = prefix("::ffff:203.0.113.5").unwrap();
         assert_eq!(mapped.to_string(), "203.0.113.5/32");
         assert!(mapped.contains("203.0.113.5".parse().unwrap()));
+    }
+    #[test]
+    fn broad_public_trusted_prefixes_need_an_explicit_override() {
+        let prefix = |text: &str| text.parse::<TrustedPrefix>();
+        // A /0, or any public prefix shorter than IPv4 /16 or IPv6 /32, would
+        // treat much of the internet as the operator's own miners.
+        for broad in [
+            "0.0.0.0/0",
+            "::/0",
+            "198.50.0.0/15",
+            "2001:db8::/31",
+            "11.0.0.0/8",
+            "0.0.0.0/1",
+            "172.32.0.0/12",
+            "100.128.0.0/10",
+            "fe00::/8",
+            "::ffff:0.0.0.0/96",
+        ] {
+            let error = prefix(broad).unwrap_err().to_string();
+            assert!(
+                error.contains("--stratum-trusted-broad") || error.contains("exceeds"),
+                "{broad}: {error}"
+            );
+        }
+        for narrow in [
+            "198.51.0.0/16",
+            "2001:db8::/32",
+            "203.0.113.9",
+            "2001:db8::7",
+        ] {
+            assert!(prefix(narrow).is_ok(), "{narrow}");
+        }
+        // The operator's own local networks may be named whole.
+        for local in [
+            "10.0.0.0/8",
+            "127.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "100.64.0.0/10",
+            "fd00::/8",
+            "fc00::/7",
+            "fe80::/10",
+            "::1",
+        ] {
+            assert!(prefix(local).is_ok(), "{local}");
+        }
+        // The explicit override accepts any length, and keeps parsing exact.
+        let everything = TrustedPrefix::broad("0.0.0.0/0").unwrap();
+        assert!(everything.contains("8.8.8.8".parse().unwrap()));
+        assert!(!everything.contains("2001:db8::1".parse().unwrap()));
+        assert!(TrustedPrefix::broad("::/0").is_ok());
+        assert!(TrustedPrefix::broad("0.0.0.0/33").is_err());
+        assert!(TrustedPrefix::broad("miner.example/8").is_err());
+    }
+    #[test]
+    fn pending_slots_tell_operator_prefixes_from_recent_authorizations() {
+        let pending = Arc::new(StratumPending::default());
+        let now = Instant::now();
+        let farm: IpAddr = "203.0.113.77".parse().unwrap();
+        let miner: IpAddr = "198.51.100.8".parse().unwrap();
+        pending.allow(&["203.0.113.0/24".parse().unwrap()]);
+        let slot = pending.try_acquire_at(farm, now).unwrap();
+        assert!(slot.operator_trusted());
+        let first = pending.try_acquire_at(miner, now).unwrap();
+        assert!(!first.operator_trusted());
+        first.authorized();
+        // A recent authorization keeps reserved slots, but only an operator
+        // prefix lifts the limits of authorized workers.
+        let again = pending.try_acquire_at(miner, now).unwrap();
+        assert!(!again.operator_trusted() && !again.charged);
+        drop((slot, again));
+    }
+    #[test]
+    fn authorized_workers_are_grouped_by_their_network() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        assert_eq!(stratum_group(ip("198.51.100.7")), ip("198.51.100.0"));
+        assert_eq!(stratum_group(ip("::ffff:198.51.100.7")), ip("198.51.100.0"));
+        assert_eq!(stratum_group(ip("2001:db8:7:9::1")), ip("2001:db8:7::"));
+        // A local network keeps one group per address.
+        assert_eq!(stratum_group(ip("192.168.1.20")), ip("192.168.1.20"));
+        assert_eq!(stratum_group(ip("127.0.88.4")), ip("127.0.88.4"));
     }
 }

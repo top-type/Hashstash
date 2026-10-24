@@ -12,6 +12,7 @@ guessing. They check that:
 - each check is its own step and still runs after another check failed;
 - the browser cryptography bundle is rebuilt from its lockfile;
 - one Rust pass and the fuzzers run with debug assertions;
+- a pushed release tag or release branch runs the full gate on its commit;
 - every standalone test program and launcher test is run by a job, or only
   wraps programs that are.
 """
@@ -245,6 +246,24 @@ class WorkflowTest(unittest.TestCase):
         for command, arguments in commands:
             with self.subTest(command=command):
                 self.assertIn('--release --debug-assertions', arguments)
+
+    def test_release_refs_run_the_full_gate(self):
+        # Nightly and manual runs start only from the default branch, so a
+        # pushed release tag or branch is how the release commit itself gets
+        # per-target fuzzing and the network suites.
+        self.assertRegex(self.text, r'(?m)^on:\n  push:\n  pull_request:\n',
+                         'every pushed branch and tag runs the workflow')
+        release = ("startsWith(github.ref, 'refs/tags/v')", "startsWith(github.ref, 'refs/heads/release/')")
+        network = re.search(r'(?m)^    if: (.*)$', self.jobs['network'].text)
+        self.assertTrue(network, 'the network suites run only in the full gate')
+        fuzz = self.jobs['fuzz'].text
+        matrix = re.search(r'(?m)^\s*target: \$\{\{ fromJSON\((.*)$', fuzz)
+        seconds = re.search(r'(?m)^\s*FUZZ_SECONDS: (.*)$', fuzz)
+        for where, text in (('network suites', network.group(1)), ('fuzz matrix', matrix.group(1)),
+                            ('fuzz time', seconds.group(1))):
+            for ref in release:
+                with self.subTest(where=where, ref=ref):
+                    self.assertIn(ref, text)
 
     def test_every_program_and_launcher_test_runs(self):
         network = NETWORK_SUITES.read_text(encoding='utf-8')

@@ -1,14 +1,19 @@
 [CmdletBinding()]
 param(
-    [string]$Executable = (Join-Path (Split-Path $PSScriptRoot -Parent) 'target/release/hashstash.exe'),
-    [string]$DataRoot = (Join-Path (Split-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) -Parent) 'work/audit-fixes-launcher'),
+    [string]$Executable,
+    [string]$DataRoot,
     [ValidateRange(1024, 65513)][int]$BasePort = 20680,
-    [string]$ReportPath = (Join-Path (Split-Path $PSScriptRoot -Parent) 'work/launcher-fix-test-report.json')
+    [string]$ReportPath
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $repository = Split-Path $PSScriptRoot -Parent
+# Windows PowerShell 5.1 leaves $PSScriptRoot empty in parameter defaults when
+# a script is started with -File, so path defaults are set here.
+if (-not $Executable) { $Executable = Join-Path $repository 'target/release/hashstash.exe' }
+if (-not $DataRoot) { $DataRoot = Join-Path (Split-Path (Split-Path $repository -Parent) -Parent) 'work/audit-fixes-launcher' }
+if (-not $ReportPath) { $ReportPath = Join-Path $repository 'work/launcher-fix-test-report.json' }
 $testDirectory = [IO.Path]::GetFullPath($DataRoot)
 New-Item -ItemType Directory -Path $testDirectory -Force | Out-Null
 $testExecutable = Join-Path $testDirectory ('hashstash-launcher-' + [Guid]::NewGuid().ToString('N') + '.exe')

@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [switch]$Fresh,
-    [string]$DataRoot = (Join-Path $PSScriptRoot 'data'),
+    # Default: the data folder beside this script.
+    [string]$DataRoot,
     [string]$ManifestPath,
     [ValidateRange(1024, 65513)][int]$BasePort = 19480,
     [ValidateRange(0, 100)][int]$InitialBlocks = 0,
@@ -13,11 +14,16 @@ param(
     [double]$ShareDifficulty = 65536,
     [string]$StratumAdvertise = '',
     [string]$StratumPasswordFile = '',
-    [ValidateNotNullOrEmpty()][string]$Config = (Join-Path $PSScriptRoot 'config/testnet.json')
+    # Default: config/testnet.json beside this script.
+    [ValidateNotNullOrEmpty()][string]$Config
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+# Windows PowerShell 5.1 leaves $PSScriptRoot empty in parameter defaults when
+# a script is started with -File, so path defaults are set here.
+if (-not $DataRoot) { $DataRoot = Join-Path $PSScriptRoot 'data' }
+if (-not $Config) { $Config = Join-Path $PSScriptRoot 'config/testnet.json' }
 
 function Save-JsonAtomic([string]$Path, $Value) {
     $temporary = $Path + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'

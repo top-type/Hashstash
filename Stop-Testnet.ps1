@@ -1,11 +1,15 @@
 [CmdletBinding()]
 param(
-    [string]$DataRoot = (Join-Path $PSScriptRoot 'data'),
+    # Default: the data folder beside this script.
+    [string]$DataRoot,
     [string]$ManifestPath
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+# Windows PowerShell 5.1 leaves $PSScriptRoot empty in parameter defaults when
+# a script is started with -File, so the default is set here.
+if (-not $DataRoot) { $DataRoot = Join-Path $PSScriptRoot 'data' }
 if (-not $ManifestPath) {
     $latestPath = Join-Path ([IO.Path]::GetFullPath($DataRoot)) 'testnet-latest.json'
     if (-not (Test-Path -LiteralPath $latestPath)) { throw 'There is no saved testnet. Supply -ManifestPath to select one.' }

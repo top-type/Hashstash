@@ -65,6 +65,30 @@ fn linux_installer_accepts_exactly_this_release() {
     }
 }
 
+/// The release script builds what the installer accepts: a normal locked
+/// build of this version, with the toolchain continuous integration pins.
+#[test]
+fn release_script_builds_normally_with_the_validated_toolchain() {
+    let script = repository("scripts/release.sh");
+    let pinned = repository(".github/workflows/ci.yml")
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("RUST_TOOLCHAIN: '")
+                .and_then(|rest| rest.strip_suffix('\''))
+                .map(str::to_owned)
+        })
+        .expect("CI toolchain pin");
+    assert!(
+        script.contains(&format!("toolchain=${{RUST_TOOLCHAIN:-{pinned}}}")),
+        "release.sh must default to the CI toolchain {pinned}"
+    );
+    assert!(script.contains("cargo build --locked --release --bins"));
+    // test-fixtures changes the chain identity; releases never enable features.
+    assert!(!script.contains("--features"));
+    assert!(script.contains("grep -qx \"version=$version\" \"$root/deploy/linux/install.sh\""));
+}
+
 #[test]
 fn systemd_unit_confines_the_node() {
     let unit = repository("deploy/linux/hashstash.service");

@@ -21,13 +21,85 @@ pub const MAX_PERSISTED_BYTES: usize = 128 * 1024;
 pub const MAX_PER_IP: usize = 2;
 /// Consecutive failures after which a never-verified learned entry is dropped.
 pub const MAX_UNVERIFIED_FAILURES: u32 = 3;
-/// The last verified outbound peers, in distinct network groups, saved with
-/// the book and tried first after a restart.
+/// The last outbound peers that advanced this node, in distinct network
+/// groups, saved with the book and tried first after a restart.
 pub const MAX_ANCHORS: usize = 2;
 const MAX_AGE: u64 = 7 * 24 * 3600;
+/// A learned entry that never answered expires this long after it was added.
+const UNVERIFIED_AGE: u64 = 24 * 3600;
+/// Operator-chosen entries (configured peers and seeds) and peers that
+/// recently advanced this node are synchronized about this often, ahead of
+/// the rotation through other verified peers.
+pub const PREFERRED_INTERVAL: u64 = 15;
+/// How long a peer whose block became the tip stays preferred.
+pub const PRODUCTIVE_WINDOW: u64 = 3600;
+/// An unknown entry in a network group that already holds a healthy
+/// verified peer is probed at most this often.
+const HEALTHY_GROUP_PROBE_INTERVAL: u64 = 600;
+/// Consecutive failed or stalled contacts past six double an entry's retry
+/// delay beyond a minute, up to this many seconds.
+const MAX_RETRY_SECONDS: u64 = 3600;
 const CONFIGURED: &str = "configured";
+/// The source of seed results, followed by a digest of the seed.
+const SEED_SOURCE: &str = "seed:";
 /// How long every requester receives the same address sample.
 const ADVERTISED_SAMPLE_SECONDS: u64 = 6 * 3600;
+
+/// What one outbound synchronization with a book entry achieved. Only
+/// `Current` and `Advanced` count as success: a completed exchange that held
+/// an outbound slot without advancing this node does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Contact {
+    /// Connecting or the exchange failed.
+    Failed,
+    /// The exchange delivered nothing new, and took longer than one read
+    /// allowance or was cut off for that.
+    Stalled,
+    /// The exchange completed promptly with nothing new: as far as the peer
+    /// shows, it is not ahead of this node.
+    Current,
+    /// A block the peer delivered became the tip. It may hold more, so it is
+    /// synchronized again at once.
+    Advanced,
+}
+impl Contact {
+    pub fn success(self) -> bool {
+        matches!(self, Self::Current | Self::Advanced)
+    }
+}
+/// How an address reached the book.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    /// A configured peer or numeric seed, which may be private when the
+    /// operator configures it.
+    Explicit,
+    /// A DNS seed result: operator input, but only a public address.
+    Seed,
+    /// Learned from another peer.
+    Gossip,
+    /// Announced by an inbound peer for its own source address.
+    Own,
+}
+/// An entry the operator chose: a configured peer or a seed result. Learned
+/// quotas, displacement and the drop of never-verified entries after
+/// repeated failures do not apply to it.
+fn operator_input(entry: &Entry) -> bool {
+    entry.explicit || entry.source.starts_with(SEED_SOURCE)
+}
+/// Seconds until an entry with `failures` consecutive failed or stalled
+/// contacts is tried again: as for configured peers up to a minute, then,
+/// unless the operator named the endpoint itself (`explicit`), doubling up
+/// to an hour, so an address that went silent or keeps stalling costs an
+/// attempt an hour rather than one a minute until it expires.
+fn retry_seconds(failures: u32, jitter: u64, explicit: bool) -> u64 {
+    if failures <= 6 || explicit {
+        return crate::network_guard::retry_delay(failures, jitter)
+            .as_secs()
+            .max(1);
+    }
+    let base = (60u64 << (failures - 6).min(6)).min(MAX_RETRY_SECONDS);
+    base + jitter % (base / 4)
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -170,6 +242,13 @@ pub struct Entry {
     pub busy: bool,
     #[serde(skip)]
     pub last_discovery: u64,
+    /// When a synchronization with this entry last made one of its blocks
+    /// the tip.
+    #[serde(skip)]
+    pub advanced: u64,
+    /// Its last synchronization did, so it is tried again at once.
+    #[serde(skip)]
+    pub ahead: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -203,8 +282,13 @@ pub struct AddressBook {
     /// peer, which shows that the clock and network work.
     stale: Vec<Entry>,
     verified_this_run: bool,
-    /// The last verified outbound peers, most recent first, in distinct groups.
+    /// The last outbound peers that advanced this node, most recent first,
+    /// in distinct groups.
     anchors: Vec<SocketAddr>,
+    /// The entry in the exploring outbound slot (see `next`).
+    exploring: Option<SocketAddr>,
+    /// When an unknown entry in a healthy group was last probed.
+    healthy_probe: u64,
     /// Anchors saved by the previous run that this run has not tried yet.
     reconnect: Vec<SocketAddr>,
     /// The sidecar bytes last read or durably written.
@@ -239,6 +323,8 @@ impl AddressBook {
             stale: Vec::new(),
             verified_this_run: false,
             anchors: Vec::new(),
+            exploring: None,
+            healthy_probe: 0,
             reconnect: Vec::new(),
             persisted: None,
             salt,
@@ -270,7 +356,7 @@ impl AddressBook {
             book.load_error = Some(message);
         }
         for address in configured {
-            book.insert(*address, CONFIGURED.into(), true, at);
+            book.insert(*address, CONFIGURED.into(), Origin::Explicit, at);
             // The flag also covers an entry first learned from gossip.
             match book.entries.get_mut(&normalized(*address)) {
                 Some(entry) => entry.configured = true,
@@ -341,7 +427,12 @@ impl AddressBook {
         if at.saturating_sub(entry.last_success) > MAX_AGE {
             return;
         }
-        if self.insert(entry.address, entry.source.clone(), false, at) {
+        let origin = if entry.source.starts_with(SEED_SOURCE) {
+            Origin::Seed
+        } else {
+            Origin::Gossip
+        };
+        if self.insert(entry.address, entry.source.clone(), origin, at) {
             let current = self.entries.get_mut(&normalized(entry.address)).unwrap();
             current.last_success = entry.last_success;
             current.last_attempt = entry.last_attempt.min(at);
@@ -393,46 +484,102 @@ impl AddressBook {
                 && address.port() == self.local.port()
                 && address.ip().is_loopback())
     }
-    fn insert(&mut self, address: SocketAddr, source: String, explicit: bool, at: u64) -> bool {
+    /// Drop learned entries without a successful contact for `MAX_AGE`, and
+    /// learned ones that never answered `UNVERIFIED_AGE` after they were
+    /// added, so addresses gossiped into a group that is never probed do not
+    /// hold quotas for a week. Explicit and busy entries stay.
+    fn expire(&mut self, at: u64) {
+        self.entries.retain(|_, entry| {
+            let limit = if entry.last_success == 0 && !operator_input(entry) {
+                UNVERIFIED_AGE
+            } else {
+                MAX_AGE
+            };
+            entry.explicit
+                || entry.busy
+                || at.saturating_sub(entry.last_success.max(entry.added)) <= limit
+        });
+    }
+    /// Whether a learned `address` from `source` fits the learned-entry
+    /// quotas per source, network group and IP address. A full group or IP
+    /// makes room by displacing an unverified entry: any, for an inbound peer
+    /// announcing its own address (`own`), and otherwise only one another
+    /// source supplied that would still hold more of them than the
+    /// newcomer's, so entries one source gossiped in cannot squat an honest
+    /// node's address or group. Nothing is displaced unless the newcomer
+    /// then fits both.
+    fn make_room(&mut self, address: SocketAddr, source: &str, own: bool) -> bool {
+        if self.entries.values().filter(|e| e.source == source).count() >= MAX_PER_SOURCE {
+            return false;
+        }
+        let network = group(address);
+        let mut victims = Vec::new();
+        for (by_group, limit) in [(true, MAX_PER_GROUP), (false, MAX_PER_IP)] {
+            let members: Vec<&Entry> = self
+                .entries
+                .values()
+                .filter(|e| {
+                    !operator_input(e)
+                        && !victims.contains(&e.address)
+                        && if by_group {
+                            group(e.address) == network
+                        } else {
+                            e.address.ip() == address.ip()
+                        }
+                })
+                .collect();
+            if members.len() < limit {
+                continue;
+            }
+            let held = |s: &str| members.iter().filter(|e| e.source == s).count();
+            let mine = held(source);
+            let victim = members
+                .iter()
+                .filter(|e| {
+                    e.last_success == 0
+                        && !e.busy
+                        && (own || (e.source != source && held(&e.source) > mine + 1))
+                })
+                .max_by_key(|e| (held(&e.source), e.failures, self.rank(e.address)))
+                .map(|e| e.address);
+            let Some(victim) = victim else {
+                return false;
+            };
+            victims.push(victim);
+        }
+        for victim in victims {
+            self.entries.remove(&victim);
+        }
+        true
+    }
+    fn insert(&mut self, address: SocketAddr, source: String, origin: Origin, at: u64) -> bool {
         let address = normalized(address);
+        let explicit = origin == Origin::Explicit;
         if self.is_self(address) || !allowed(address, self.options.allow_private || explicit) {
             return false;
         }
         if let Some(entry) = self.entries.get_mut(&address) {
             entry.explicit |= explicit;
+            // A learned entry a seed also returns becomes operator input.
+            if origin == Origin::Seed && !operator_input(entry) {
+                entry.source = source;
+            }
             return false;
         }
-        self.entries.retain(|_, entry| {
-            entry.explicit
-                || entry.busy
-                || at.saturating_sub(entry.last_success.max(entry.added)) <= MAX_AGE
-        });
-        let network = group(address);
-        if !explicit
-            && (self.entries.values().filter(|e| e.source == source).count() >= MAX_PER_SOURCE
-                || self
-                    .entries
-                    .values()
-                    .filter(|e| group(e.address) == network && !e.explicit)
-                    .count()
-                    >= MAX_PER_GROUP
-                || self
-                    .entries
-                    .values()
-                    .filter(|e| e.address.ip() == address.ip() && !e.explicit)
-                    .count()
-                    >= MAX_PER_IP)
-        {
+        self.expire(at);
+        let operator = explicit || origin == Origin::Seed;
+        if !operator && !self.make_room(address, &source, origin == Origin::Own) {
             return false;
         }
         if self.entries.len() >= MAX_BOOK {
-            // Replace instead of refusing. An operator's explicit endpoint
-            // displaces any learned entry; a learned address displaces only an
-            // unverified one, failed entries first, otherwise in salted order.
+            // Replace instead of refusing. An operator's endpoint or seed
+            // result displaces any learned entry; a learned address displaces
+            // only an unverified one, failed entries first, otherwise in
+            // salted order.
             let victim = self
                 .entries
                 .values()
-                .filter(|e| !e.explicit && !e.busy && (explicit || e.last_success == 0))
+                .filter(|e| !operator_input(e) && !e.busy && (operator || e.last_success == 0))
                 .max_by_key(|e| (e.last_success == 0, e.failures, self.rank(e.address)))
                 .map(|e| e.address);
             let Some(victim) = victim else {
@@ -457,32 +604,38 @@ impl AddressBook {
                 configured: false,
                 busy: false,
                 last_discovery: 0,
+                advanced: 0,
+                ahead: false,
             },
         );
         true
     }
     pub fn add_seed(&mut self, address: SocketAddr, seed: &str, at: u64) -> bool {
         // Seeds are operator input, but DNS responses still cannot nominate LAN endpoints.
-        let explicit = seed.parse::<SocketAddr>().is_ok();
+        let origin = if seed.parse::<SocketAddr>().is_ok() {
+            Origin::Explicit
+        } else {
+            Origin::Seed
+        };
         self.insert(
             address,
             format!(
-                "seed:{}",
+                "{SEED_SOURCE}{}",
                 &hex::encode(crate::crypto::sha256d(seed.as_bytes()))[..16]
             ),
-            explicit,
+            origin,
             at,
         )
     }
     pub fn learn(&mut self, source: SocketAddr, addresses: &[SocketAddr], at: u64) {
         for address in addresses.iter().take(MAX_ADDRESSES) {
-            self.insert(*address, group(source), false, at);
+            self.insert(*address, group(source), Origin::Gossip, at);
         }
     }
     pub fn advertisement(&mut self, source: SocketAddr, address: SocketAddr, at: u64) {
         // An inbound node can nominate only its observed source IP, never a victim IP.
         if normalized(source).ip() == normalized(address).ip() {
-            self.learn(source, &[address], at);
+            self.insert(address, group(source), Origin::Own, at);
         }
     }
     pub fn advertised(&mut self, at: u64, random: u64) -> Vec<SocketAddr> {
@@ -557,11 +710,7 @@ impl AddressBook {
                 self.restore(entry, at);
             }
         }
-        self.entries.retain(|_, entry| {
-            entry.explicit
-                || entry.busy
-                || at.saturating_sub(entry.last_success.max(entry.added)) <= MAX_AGE
-        });
+        self.expire(at);
         let healthy_groups = self
             .entries
             .values()
@@ -570,7 +719,6 @@ impl AddressBook {
             })
             .map(|e| group(e.address))
             .collect::<BTreeSet<_>>();
-        let protect_healthy = !healthy_groups.is_empty();
         let mut unknown_busy = self
             .entries
             .values()
@@ -582,16 +730,10 @@ impl AddressBook {
             .entries
             .values()
             .filter(|e| !e.busy && e.next_attempt <= at)
-            .map(|e| {
-                (
-                    e.last_attempt,
-                    self.rank(e.address),
-                    e.address,
-                    e.last_success > 0,
-                )
-            })
+            .map(|e| (e.last_attempt, self.rank(e.address), e.address))
             .collect::<Vec<_>>();
         candidates.sort();
+        let candidates: Vec<SocketAddr> = candidates.into_iter().map(|(_, _, a)| a).collect();
         let mut selected = Vec::new();
         let mut groups = self
             .entries
@@ -623,74 +765,163 @@ impl AddressBook {
             false
         });
         self.reconnect = reconnect;
-        // Reserve one slot for established paths. An untrusted book flood must
-        // never queue both slots for minutes ahead of an already healthy peer.
-        // Within each class oldest-attempt rotation preserves fairness.
-        for phase in 0..3 {
-            for &(_, _, address, verified) in &candidates {
-                if selected.len() >= maximum.min(2) {
-                    break;
-                }
-                if self.entries[&address].busy
-                    || (phase == 0 && !verified)
-                    || (phase == 1 && verified)
-                    || (phase == 2 && protect_healthy && !verified)
-                {
-                    continue;
-                }
-                if protect_healthy && !verified && unknown_busy >= 1 {
-                    continue;
-                }
-                let network = group(address);
-                if !self.options.allow_private
-                    && (groups.contains(&network)
-                        || (protect_healthy && !verified && healthy_groups.contains(&network)))
-                {
-                    continue;
-                }
-                groups.insert(network);
-                let entry = self.entries.get_mut(&address).unwrap();
-                entry.busy = true;
-                entry.last_attempt = at;
-                selected.push(address);
-                if !verified {
-                    unknown_busy += 1;
-                }
-                if phase < 2 {
-                    break;
-                }
+        // The two outbound slots have roles, so neither a flood of unknown
+        // addresses nor many verified ones that answer slowly can keep
+        // productive and operator-chosen peers waiting their turn in a full
+        // rotation. An anchor takes the synchronizing slot.
+        while selected.len() < maximum.min(2) {
+            let exploring = self.exploring.is_none();
+            let Some(address) = self.pick(
+                at,
+                exploring,
+                &candidates,
+                &groups,
+                &healthy_groups,
+                unknown_busy,
+            ) else {
+                break;
+            };
+            groups.insert(group(address));
+            let entry = self.entries.get_mut(&address).unwrap();
+            entry.busy = true;
+            entry.last_attempt = at;
+            if entry.last_success == 0 {
+                unknown_busy += 1;
             }
+            if exploring {
+                self.exploring = Some(address);
+            }
+            selected.push(address);
         }
         selected
     }
-    pub fn finished(&mut self, address: SocketAddr, success: bool, at: u64, jitter: u64) {
-        if let Some(entry) = self.entries.get_mut(&address) {
-            entry.busy = false;
-            if success {
-                entry.last_success = at;
-                entry.failures = 0;
-                self.verified_this_run = true;
-                // This outbound peer becomes the newest anchor, replacing an
-                // older one in its group.
-                self.anchors
-                    .retain(|a| *a != address && group(*a) != group(address));
-                self.anchors.insert(0, address);
-                self.anchors.truncate(MAX_ANCHORS);
+    /// Operator-chosen entries: configured peers and seed results.
+    fn chosen(entry: &Entry) -> bool {
+        operator_input(entry) || entry.configured
+    }
+    /// Operator-chosen entries, and peers that advanced this node within
+    /// `PRODUCTIVE_WINDOW` and have not failed or stalled since.
+    fn preferred(entry: &Entry, at: u64) -> bool {
+        Self::chosen(entry)
+            || (entry.advanced > 0 && at.saturating_sub(entry.advanced) < PRODUCTIVE_WINDOW)
+    }
+    /// A ready entry, of `candidates` least recently tried first, for a free
+    /// outbound slot in a network group no busy entry uses.
+    ///
+    /// The synchronizing slot takes, in order: a peer whose last session
+    /// advanced this node, which may hold more; a preferred peer not tried
+    /// for `PREFERRED_INTERVAL`, operator-chosen ones first; the verified
+    /// peer tried least recently; an unknown probe. The exploring slot takes
+    /// a peer that advanced this node, then an unknown probe, then verified
+    /// and last preferred peers.
+    ///
+    /// While a recent healthy peer exists, at most one unknown entry is
+    /// probed at a time and, except at most once per
+    /// `HEALTHY_GROUP_PROBE_INTERVAL`, none in a group such a peer is in.
+    /// Unverified configured peers and seeds are preferred peers instead.
+    fn pick(
+        &mut self,
+        at: u64,
+        exploring: bool,
+        candidates: &[SocketAddr],
+        groups: &BTreeSet<String>,
+        healthy: &BTreeSet<String>,
+        unknown_busy: usize,
+    ) -> Option<SocketAddr> {
+        let protect_healthy = !healthy.is_empty();
+        let ready: Vec<&Entry> = candidates
+            .iter()
+            .filter_map(|address| self.entries.get(address))
+            .filter(|e| {
+                !e.busy && (self.options.allow_private || !groups.contains(&group(e.address)))
+            })
+            .collect();
+        let find =
+            |wanted: &dyn Fn(&Entry) -> bool| ready.iter().find(|e| wanted(e)).map(|e| e.address);
+        let ahead = || find(&|e| e.ahead);
+        let due = |preferred: fn(&Entry, u64) -> bool| {
+            find(&|e| preferred(e, at) && at >= e.last_attempt.saturating_add(PREFERRED_INTERVAL))
+        };
+        // Peers that relayed a block first can earn preference, so they never
+        // delay the operator's own choices.
+        let due = || due(|e, _| Self::chosen(e)).or_else(|| due(Self::preferred));
+        let verified = || find(&|e| e.last_success > 0);
+        let preferred = || find(&|e| Self::preferred(e, at));
+        let probe = || {
+            if protect_healthy && unknown_busy >= 1 {
+                return None;
+            }
+            find(&|e| {
+                e.last_success == 0 && !(protect_healthy && healthy.contains(&group(e.address)))
+            })
+        };
+        let background = || {
+            let allowed = protect_healthy
+                && unknown_busy == 0
+                && at
+                    >= self
+                        .healthy_probe
+                        .saturating_add(HEALTHY_GROUP_PROBE_INTERVAL);
+            if allowed {
+                find(&|e| e.last_success == 0)
             } else {
-                entry.failures = entry.failures.saturating_add(1).min(16);
+                None
             }
-            entry.next_attempt = at
-                + crate::network_guard::retry_delay(entry.failures, jitter)
-                    .as_secs()
-                    .max(1);
-            // A learned address that never answered is dropped after a few
-            // consecutive failures instead of cycling until it expires.
-            if !entry.explicit
-                && entry.last_success == 0
-                && entry.failures >= MAX_UNVERIFIED_FAILURES
-            {
-                self.entries.remove(&address);
+        };
+        if exploring {
+            if let Some(address) = ahead().or_else(probe) {
+                return Some(address);
             }
+            if let Some(address) = background() {
+                self.healthy_probe = at;
+                return Some(address);
+            }
+            verified().or_else(preferred)
+        } else {
+            ahead().or_else(due).or_else(verified).or_else(probe)
+        }
+    }
+    pub fn finished(&mut self, address: SocketAddr, contact: Contact, at: u64, jitter: u64) {
+        if self.exploring == Some(address) {
+            self.exploring = None;
+        }
+        let Some(entry) = self.entries.get_mut(&address) else {
+            return;
+        };
+        entry.busy = false;
+        entry.ahead = contact == Contact::Advanced;
+        if contact.success() {
+            entry.last_success = at;
+            entry.failures = 0;
+        } else {
+            entry.failures = entry.failures.saturating_add(1).min(16);
+            // A peer that advanced this node keeps its preference only while
+            // its sessions keep completing promptly.
+            entry.advanced = 0;
+        }
+        entry.next_attempt = if entry.ahead {
+            at
+        } else {
+            at + retry_seconds(entry.failures, jitter, entry.explicit)
+        };
+        // A learned address that never answered is dropped after a few
+        // consecutive failures instead of cycling until it expires.
+        let unanswered = !operator_input(entry)
+            && entry.last_success == 0
+            && entry.failures >= MAX_UNVERIFIED_FAILURES;
+        if contact == Contact::Advanced {
+            entry.advanced = at;
+            // This outbound peer becomes the newest anchor, replacing an
+            // older one in its group: only a peer that advanced this node,
+            // not one that merely answered.
+            self.anchors
+                .retain(|a| *a != address && group(*a) != group(address));
+            self.anchors.insert(0, address);
+            self.anchors.truncate(MAX_ANCHORS);
+        }
+        self.verified_this_run |= contact.success();
+        if unanswered {
+            self.entries.remove(&address);
         }
     }
     pub fn needs_discovery(&mut self, address: SocketAddr, at: u64) -> bool {
@@ -823,7 +1054,7 @@ mod tests {
         let mut book = book(dir.path().join("book"));
         let good = "8.8.8.8:9".parse().unwrap();
         book.add_seed(good, "8.8.8.8:9", 100);
-        book.finished(good, true, 100, 0);
+        book.finished(good, Contact::Current, 100, 0);
         for source in 1..20 {
             for destination in 1..33 {
                 book.learn(
@@ -839,9 +1070,9 @@ mod tests {
         assert_eq!(first.len(), 2);
         // Leave the unknown probe hanging. The known path must resume again,
         // rather than waiting behind every never-tested entry.
-        book.finished(good, true, 110, 0);
+        book.finished(good, Contact::Current, 110, 0);
         assert_eq!(book.next(120, 1), vec![good]);
-        book.finished(good, true, 120, 0);
+        book.finished(good, Contact::Current, 120, 0);
         assert!(book.next(120, 1).is_empty());
         assert_eq!(
             book.entries()
@@ -864,11 +1095,11 @@ mod tests {
         assert_eq!(book.entries().count(), MAX_PER_GROUP);
         assert_eq!(book.next(100, 2).len(), 1); // one /16 cannot occupy both slots
         let address = book.entries().find(|e| e.busy).unwrap().address;
-        book.finished(address, false, 100, 0);
+        book.finished(address, Contact::Failed, 100, 0);
         let next = book.entries[&address].next_attempt;
         assert!(next > 100);
         assert_eq!(book.entries[&address].failures, 1);
-        book.finished(address, false, next, 0);
+        book.finished(address, Contact::Failed, next, 0);
         assert!(book.entries[&address].next_attempt > next);
         for seed in [
             "localhost:18481",
@@ -1034,7 +1265,7 @@ mod tests {
             vec!["9.9.9.9:9".parse::<SocketAddr>().unwrap()]
         );
         let addr = book.next(100, 2)[0];
-        book.finished(addr, true, 101, 0);
+        book.finished(addr, Contact::Current, 101, 0);
         book.save().unwrap();
         let loaded = AddressBook::open(
             path.clone(),
@@ -1070,7 +1301,7 @@ mod tests {
         let peer: SocketAddr = "8.8.8.8:9".parse().unwrap();
         original.add_seed(peer, "dns.example:9", 1_000);
         original.next(1_000, 2);
-        original.finished(peer, true, 1_000, 0);
+        original.finished(peer, Contact::Current, 1_000, 0);
         original.save().unwrap();
         let saved = fs::read(&path).unwrap();
         // A host booting with its clock far behind (no RTC, before NTP).
@@ -1083,7 +1314,7 @@ mod tests {
         let learned: SocketAddr = "9.9.9.9:9".parse().unwrap();
         early.learn("7.7.7.7:9".parse().unwrap(), &[learned], 100);
         early.next(100, 2);
-        early.finished(learned, true, 101, 0);
+        early.finished(learned, Contact::Current, 101, 0);
         early.save().unwrap();
         let mut corrected = AddressBook::open(
             path,
@@ -1119,7 +1350,7 @@ mod tests {
         let peer: SocketAddr = "8.8.8.8:9".parse().unwrap();
         original.add_seed(peer, "dns.example:9", 100);
         original.next(100, 2);
-        original.finished(peer, true, 100, 0);
+        original.finished(peer, Contact::Current, 100, 0);
         original.save().unwrap();
         let saved = fs::read(&path).unwrap();
         let open = |at| {
@@ -1147,7 +1378,7 @@ mod tests {
         assert_eq!(open(200).entries().count(), 1);
         // Once this run verifies a peer, rows that really expired are dropped.
         fast.next(ahead, 2);
-        fast.finished(learned, true, ahead, 0);
+        fast.finished(learned, Contact::Current, ahead, 0);
         fast.save().unwrap();
         assert_eq!(
             open(ahead).entries().map(|e| e.address).collect::<Vec<_>>(),
@@ -1223,7 +1454,7 @@ mod tests {
         reopened.entries.get_mut(&failing).unwrap().last_success = 0;
         for attempt in 0..MAX_UNVERIFIED_FAILURES {
             assert!(reopened.entries.contains_key(&failing));
-            reopened.finished(failing, false, 200 + u64::from(attempt), 0);
+            reopened.finished(failing, Contact::Failed, 200 + u64::from(attempt), 0);
         }
         assert!(!reopened.entries.contains_key(&failing));
     }
@@ -1244,7 +1475,7 @@ mod tests {
         )
         .unwrap();
         b.next(100, 1);
-        b.finished(configured, true, 100, 0);
+        b.finished(configured, Contact::Current, 100, 0);
         assert!(b.verified_ip("8.8.8.8".parse().unwrap(), 101));
         assert!(!b.verified_ip("8.8.4.4".parse().unwrap(), 101));
         assert!(b.advertised(101, 0).is_empty());
@@ -1279,7 +1510,7 @@ mod tests {
         let mut saved = book(path.clone());
         let learned: SocketAddr = "9.9.9.9:9".parse().unwrap();
         saved.learn("7.7.7.7:9".parse().unwrap(), &[learned], 100);
-        saved.finished(learned, true, 100, 0);
+        saved.finished(learned, Contact::Current, 100, 0);
         assert_eq!(saved.advertised(100, 0), [learned]);
         saved.save().unwrap();
         let mut reopened = AddressBook::open(
@@ -1330,13 +1561,16 @@ mod tests {
             let entry = b.entries.get_mut(peer).unwrap();
             (entry.last_success, entry.last_attempt) = (100, 100);
         }
-        // This node last synchronized with three of them. Anchors keep
-        // distinct groups, so the newest replaces its group's older one.
+        // Synchronizing with three of them last advanced this node. Anchors
+        // keep distinct groups, so the newest replaces its group's older
+        // one. A peer that merely answered, as all twenty did, is no anchor.
         let (first, second) = (peers[17], peers[18]);
+        b.finished(peers[0], Contact::Current, 250, 0);
         for (anchor, at) in [(sibling, 150), (first, 200), (second, 200)] {
             b.entries.get_mut(&anchor).unwrap().last_attempt = at;
-            b.finished(anchor, true, at, 0);
+            b.finished(anchor, Contact::Advanced, at, 0);
         }
+        b.finished(peers[1], Contact::Current, 250, 0);
         assert_eq!(b.anchors, [second, first]);
         b.save().unwrap();
         // After a restart they are tried first, although rotation by oldest
@@ -1357,8 +1591,8 @@ mod tests {
         next.sort();
         assert_eq!(next, [first, second]);
         // Only once: afterwards the usual rotation resumes.
-        reopened.finished(first, true, 300, 0);
-        reopened.finished(second, true, 300, 0);
+        reopened.finished(first, Contact::Current, 300, 0);
+        reopened.finished(second, Contact::Current, 300, 0);
         let rotation = reopened.next(400, 2);
         assert_eq!(rotation.len(), 2);
         assert!(!rotation.contains(&first) && !rotation.contains(&second));
@@ -1405,5 +1639,342 @@ mod tests {
             1000,
         );
         assert_eq!(book.entries().next().unwrap().added, 100);
+    }
+    /// Run the scheduler second by second from `start` for `seconds` with two
+    /// outbound slots, each session with `address` taking and ending as
+    /// `session(address)` says. Returns how often each address was tried.
+    fn simulate(
+        book: &mut AddressBook,
+        start: u64,
+        seconds: u64,
+        session: impl Fn(SocketAddr) -> (u64, Contact),
+    ) -> BTreeMap<SocketAddr, usize> {
+        let mut busy: Vec<(u64, SocketAddr, Contact)> = Vec::new();
+        let mut tried = BTreeMap::new();
+        for at in start..start + seconds {
+            busy.retain(|&(end, address, contact)| {
+                if end > at {
+                    return true;
+                }
+                book.finished(address, contact, at, 0);
+                false
+            });
+            for address in book.next(at, 2 - busy.len()) {
+                let (took, contact) = session(address);
+                *tried.entry(address).or_default() += 1;
+                busy.push((at + took, address, contact));
+            }
+        }
+        tried
+    }
+    fn verified(book: &mut AddressBook, peers: &[SocketAddr], last_attempt: u64) {
+        for (n, address) in peers.iter().enumerate() {
+            let source = SocketAddr::from(([20, n as u8, 1, 1], 9));
+            book.learn(source, &[*address], 100);
+            let entry = book.entries.get_mut(address).unwrap();
+            (entry.last_success, entry.last_attempt) = (100, last_attempt);
+        }
+    }
+    #[test]
+    fn slow_empty_sessions_lose_their_turn_while_operator_peers_keep_theirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured: SocketAddr = "8.8.8.8:9".parse().unwrap();
+        let mut b = AddressBook::open(
+            dir.path().join("book"),
+            [1; 32],
+            Options {
+                enabled: true,
+                ..Default::default()
+            },
+            "0.0.0.0:9".parse().unwrap(),
+            &[configured],
+            100,
+        )
+        .unwrap();
+        // Forty verified addresses in distinct groups, all due before the
+        // configured peer, answer each session just before it is cut off
+        // and deliver nothing.
+        let slow: Vec<SocketAddr> = (1..=40u8)
+            .map(|n| SocketAddr::from(([30, n, 1, 1], 9)))
+            .collect();
+        verified(&mut b, &slow, 50);
+        b.entries.get_mut(&configured).unwrap().last_attempt = 100;
+        let tried = simulate(&mut b, 1000, 600, |address| {
+            if address == configured {
+                (2, Contact::Current)
+            } else {
+                (30, Contact::Stalled)
+            }
+        });
+        // The configured peer is synchronized about every PREFERRED_INTERVAL
+        // plus one stalled session, not once per pass through all of them.
+        assert!(tried[&configured] >= 10, "{tried:?}");
+        // A stalled session is no success: it neither refreshes the entry's
+        // verification nor makes it an anchor, and it backs off.
+        for address in &slow {
+            let entry = &b.entries[address];
+            assert_eq!(entry.last_success, 100);
+            assert_eq!(
+                entry.failures as usize + usize::from(entry.busy),
+                tried.get(address).copied().unwrap_or(0)
+            );
+        }
+        assert!(b.anchors.is_empty());
+    }
+    #[test]
+    fn a_peer_that_advanced_this_node_is_synchronized_again_at_once_and_stays_preferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = book(dir.path().join("book"));
+        let peers: Vec<SocketAddr> = (1..=10u8)
+            .map(|n| SocketAddr::from(([30, n, 1, 1], 9)))
+            .collect();
+        verified(&mut b, &peers, 100);
+        for (n, address) in peers.iter().enumerate() {
+            b.entries.get_mut(address).unwrap().last_attempt = 100 + n as u64;
+        }
+        // The peer tried most recently delivered a block that became the tip.
+        // It may hold more, so it is tried again at once, ahead of peers
+        // tried earlier, for as long as it keeps advancing this node.
+        let productive = peers[9];
+        b.finished(productive, Contact::Advanced, 200, 0);
+        assert_eq!(b.next(200, 1), [productive]);
+        b.finished(productive, Contact::Advanced, 201, 0);
+        assert_eq!(b.next(201, 1), [productive]);
+        assert_eq!(b.anchors, [productive]);
+        // Once it has nothing more, it returns to the rotation.
+        b.finished(productive, Contact::Current, 202, 0);
+        let both = b.next(210, 2);
+        assert!(!both.contains(&productive), "{both:?}");
+        let synchronizing = both
+            .into_iter()
+            .find(|address| Some(*address) != b.exploring)
+            .unwrap();
+        b.finished(synchronizing, Contact::Current, 216, 0);
+        // It stays preferred: PREFERRED_INTERVAL after its last attempt the
+        // synchronizing slot takes it before peers tried long before.
+        assert_eq!(b.next(201 + PREFERRED_INTERVAL, 1), [productive]);
+        b.finished(productive, Contact::Current, 217, 0);
+        // Only for a while after it last advanced this node.
+        let later = 201 + PRODUCTIVE_WINDOW;
+        assert!(AddressBook::preferred(&b.entries[&productive], later - 1));
+        assert!(!AddressBook::preferred(&b.entries[&productive], later));
+        // Peers that merely answered are no anchors.
+        assert_eq!(b.anchors, [productive]);
+    }
+    #[test]
+    fn operator_chosen_peers_are_due_before_peers_that_relayed_a_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured: SocketAddr = "8.8.8.8:9".parse().unwrap();
+        let mut b = AddressBook::open(
+            dir.path().join("book"),
+            [1; 32],
+            Options {
+                enabled: true,
+                ..Default::default()
+            },
+            "0.0.0.0:9".parse().unwrap(),
+            &[configured],
+            100,
+        )
+        .unwrap();
+        let relays: Vec<SocketAddr> = (1..=3u8)
+            .map(|n| SocketAddr::from(([30, n, 1, 1], 9)))
+            .collect();
+        verified(&mut b, &relays, 100);
+        // Each relay delivered a block that became the tip, then had nothing
+        // more. Any well connected source can earn that.
+        for (n, relay) in relays.iter().enumerate() {
+            b.finished(*relay, Contact::Advanced, 200, 0);
+            b.finished(*relay, Contact::Current, 201, 0);
+            b.entries.get_mut(relay).unwrap().last_attempt = 100 + n as u64;
+            assert!(AddressBook::preferred(&b.entries[relay], 201));
+        }
+        // The configured peer was synchronized after all of them.
+        let entry = b.entries.get_mut(&configured).unwrap();
+        (entry.last_success, entry.last_attempt) = (250, 250);
+        // Once every one is due, the exploring slot takes the peer tried
+        // least recently, but the synchronizing slot the configured peer.
+        assert_eq!(b.next(300, 2), [relays[0], configured]);
+        // A relay whose session stalls loses its preference at once; one
+        // that keeps answering promptly keeps it.
+        b.finished(relays[0], Contact::Stalled, 330, 0);
+        assert!(!AddressBook::preferred(&b.entries[&relays[0]], 330));
+        assert!(AddressBook::preferred(&b.entries[&relays[1]], 330));
+        b.finished(configured, Contact::Stalled, 330, 0);
+        assert!(AddressBook::preferred(&b.entries[&configured], 330));
+    }
+    #[test]
+    fn verified_entries_that_keep_failing_are_retried_at_most_hourly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = book(dir.path().join("book"));
+        let peer: SocketAddr = "30.1.1.1:9".parse().unwrap();
+        b.learn("20.1.1.1:9".parse().unwrap(), &[peer], 100);
+        b.finished(peer, Contact::Current, 100, 0);
+        // A session that completed slowly with nothing new is a failure.
+        b.finished(peer, Contact::Stalled, 200, 0);
+        let entry = &b.entries[&peer];
+        assert_eq!((entry.last_success, entry.failures), (100, 1));
+        let mut at = 200;
+        let mut delays = Vec::new();
+        for _ in 0..15 {
+            b.finished(peer, Contact::Failed, at, 0);
+            let next = b.entries[&peer].next_attempt;
+            delays.push(next - at);
+            at = next;
+        }
+        // Up to a minute as before, then doubling to an hour. A verified
+        // entry is kept until it expires.
+        assert_eq!(
+            delays,
+            [
+                4, 8, 16, 32, 60, 120, 240, 480, 960, 1920, 3600, 3600, 3600, 3600, 3600
+            ]
+        );
+        assert!(retry_seconds(16, u64::MAX, false) < MAX_RETRY_SECONDS * 5 / 4);
+        // Endpoints the operator named are retried at least once a minute, as
+        // configured peers are in closed mode.
+        let configured: SocketAddr = "8.8.8.8:9".parse().unwrap();
+        let mut b = AddressBook::open(
+            dir.path().join("configured"),
+            [1; 32],
+            Options {
+                enabled: true,
+                ..Default::default()
+            },
+            "0.0.0.0:9".parse().unwrap(),
+            &[configured],
+            100,
+        )
+        .unwrap();
+        for at in 100..116 {
+            b.finished(configured, Contact::Failed, at, 0);
+        }
+        assert_eq!(b.entries[&configured].next_attempt, 115 + 60);
+        assert!(b.entries.contains_key(&configured));
+    }
+    #[test]
+    fn gossip_cannot_squat_an_honest_address_or_network_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = book(dir.path().join("book"));
+        let gossip = |n: u8| SocketAddr::from(([20, n, 1, 1], 9));
+        let honest = |port: u16| SocketAddr::from(([9, 9, 9, 9], port));
+        // One peer gossips two bogus ports for an honest node's address.
+        b.learn(gossip(1), &[honest(1), honest(2)], 100);
+        assert_eq!(b.entries().count(), MAX_PER_IP);
+        // The real endpoint, gossiped by another peer, still gets in: one of
+        // the bogus entries makes room.
+        b.learn(gossip(2), &[honest(18481)], 100);
+        assert!(b.entries.contains_key(&honest(18481)));
+        let squatted = |b: &AddressBook| {
+            b.entries()
+                .filter(|e| e.address.ip() == honest(1).ip())
+                .count()
+        };
+        assert_eq!(squatted(&b), MAX_PER_IP);
+        // Gossiping the displaced port again cannot push it out in turn.
+        let displaced = [honest(1), honest(2)]
+            .into_iter()
+            .find(|address| !b.entries.contains_key(address))
+            .unwrap();
+        b.learn(gossip(1), &[displaced], 100);
+        assert!(!b.entries.contains_key(&displaced));
+        assert!(b.entries.contains_key(&honest(18481)));
+        // The node announcing its own address makes room for it.
+        b.advertisement(honest(5000), honest(18482), 100);
+        assert!(b.entries.contains_key(&honest(18482)));
+        assert_eq!(squatted(&b), MAX_PER_IP);
+        // A network group one source gossiped full leaves room for another
+        // source's entry, but not the other way round.
+        for host in 1..=20 {
+            b.learn(gossip(1), &[SocketAddr::from(([7, 7, host, 1], 9))], 100);
+        }
+        let grouped =
+            |b: &AddressBook| b.entries().filter(|e| group(e.address) == "v4:7:7").count();
+        assert_eq!(grouped(&b), MAX_PER_GROUP);
+        let other = SocketAddr::from(([7, 7, 200, 1], 9));
+        b.learn(gossip(2), &[other], 100);
+        assert!(b.entries.contains_key(&other));
+        let again = SocketAddr::from(([7, 7, 201, 1], 9));
+        b.learn(gossip(1), &[again], 100);
+        assert!(!b.entries.contains_key(&again));
+        assert_eq!(grouped(&b), MAX_PER_GROUP);
+    }
+    #[test]
+    fn a_learned_address_that_still_would_not_fit_displaces_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = book(dir.path().join("book"));
+        let gossip = |n: u8| SocketAddr::from(([20, n, 1, 1], 9));
+        let member = |host: u8, port: u16| SocketAddr::from(([7, 7, host, 1], port));
+        // Two verified endpoints share one address, in a network group that
+        // one source otherwise gossiped full.
+        for port in [1, 2] {
+            b.learn(gossip(3), &[member(1, port)], 100);
+            b.finished(member(1, port), Contact::Current, 100, 0);
+        }
+        for host in 2..=20 {
+            b.learn(gossip(1), &[member(host, 9)], 100);
+        }
+        let before: Vec<SocketAddr> = b.entries().map(|e| e.address).collect();
+        assert_eq!(before.len(), MAX_PER_GROUP);
+        // Another source's endpoint at that address would find room in the
+        // group but none at its address, so nothing is displaced for it.
+        b.learn(gossip(2), &[member(1, 3)], 100);
+        assert_eq!(b.entries().map(|e| e.address).collect::<Vec<_>>(), before);
+    }
+    #[test]
+    fn seed_results_bypass_learned_quotas_and_are_never_dropped_for_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = book(dir.path().join("book"));
+        let gossip = |n: u8| SocketAddr::from(([20, n, 1, 1], 9));
+        let honest = |port: u16| SocketAddr::from(([9, 9, 9, 9], port));
+        // Two peers each gossip a bogus port for the seed's address, so
+        // gossip of the real endpoint finds no room.
+        b.learn(gossip(1), &[honest(1)], 100);
+        b.learn(gossip(2), &[honest(2)], 100);
+        b.learn(gossip(3), &[honest(18481)], 100);
+        assert!(!b.entries.contains_key(&honest(18481)));
+        // The seed's own DNS result is operator input and still gets in, but
+        // never a private address.
+        assert!(b.add_seed(honest(18481), "seed.example:18481", 100));
+        assert!(!b.add_seed("10.1.1.1:18481".parse().unwrap(), "seed.example:18481", 100));
+        // It is kept however often it fails; a learned entry that never
+        // answered is dropped.
+        for n in 0..2 * MAX_UNVERIFIED_FAILURES {
+            b.finished(honest(18481), Contact::Failed, 200 + u64::from(n), 0);
+            b.finished(honest(1), Contact::Failed, 200 + u64::from(n), 0);
+        }
+        assert!(b.entries.contains_key(&honest(18481)));
+        assert!(!b.entries.contains_key(&honest(1)));
+        // A learned entry that never answered expires a day after it was
+        // added rather than a week.
+        b.next(100 + UNVERIFIED_AGE, 0);
+        assert!(b.entries.contains_key(&honest(2)));
+        b.next(101 + UNVERIFIED_AGE, 0);
+        assert!(!b.entries.contains_key(&honest(2)));
+        assert!(b.entries.contains_key(&honest(18481)));
+        // A learned entry a seed also returns becomes operator input.
+        b.learn(gossip(4), &[honest(3)], 200);
+        b.add_seed(honest(3), "seed.example:18481", 200);
+        assert!(operator_input(&b.entries[&honest(3)]));
+    }
+    #[test]
+    fn unknown_entries_in_a_healthy_group_are_still_probed_at_a_low_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = book(dir.path().join("book"));
+        let healthy: SocketAddr = "30.1.1.1:9".parse().unwrap();
+        let unknown: SocketAddr = "30.1.2.1:9".parse().unwrap();
+        b.learn("20.1.1.1:9".parse().unwrap(), &[healthy], 1000);
+        b.learn("20.2.1.1:9".parse().unwrap(), &[unknown], 1000);
+        b.finished(healthy, Contact::Current, 1000, 0);
+        // Ordinary probes skip a group that holds a healthy peer, but one is
+        // probed there now and then.
+        assert_eq!(b.next(1001, 1), [unknown]);
+        b.finished(unknown, Contact::Failed, 1001, 0);
+        assert_eq!(b.next(1010, 1), [healthy]);
+        b.finished(healthy, Contact::Current, 1010, 0);
+        let early = 1000 + HEALTHY_GROUP_PROBE_INTERVAL;
+        assert_eq!(b.next(early, 1), [healthy]);
+        b.finished(healthy, Contact::Current, early, 0);
+        assert_eq!(b.next(early + 1, 1), [unknown]);
     }
 }

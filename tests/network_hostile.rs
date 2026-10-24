@@ -650,23 +650,27 @@ async fn p2p_admission_saturation_does_not_starve_rpc_or_a_different_peer() {
         }
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
-    // A fifth address takes over the newest session of the most represented
-    // source instead of waiting for one to end; that session closes at once.
-    // The oldest sessions of up to four sources and the four longest-connected
-    // others stay.
+    // A fifth address cannot take over a session admitted less than one read
+    // allowance ago (`EVICTION_GRACE`), so sources that keep reconnecting
+    // cannot displace an honest session before it finishes its exchange.
+    // While every unprotected session is that young the newcomer is closed
+    // before parsing, and the sessions keep their slots. Which session a
+    // newcomer takes over once they are older is covered by the slot tests
+    // in `network_guard`.
     let mut newcomer = connect(server.p2p, 6, 5).await;
-    let mut evicted = held.pop().unwrap();
     assert!(
-        read_closed(&mut evicted, Instant::now() + FAST_DEADLINE)
+        read_closed(&mut newcomer, Instant::now() + FAST_DEADLINE)
             .await
-            .is_empty()
+            .is_empty(),
+        "a newcomer is refused while every unprotected session is in its grace period"
     );
     let mut probe = [0u8; 1];
+    let newest = held.last_mut().unwrap();
     assert!(
-        timeout(Duration::from_millis(500), newcomer.read(&mut probe))
+        timeout(Duration::from_millis(500), newest.read(&mut probe))
             .await
             .is_err(),
-        "the newcomer holds the slot it took over"
+        "the newest session keeps its slot"
     );
     for _ in 0..8 {
         healthy(&server, &before).await;
@@ -675,9 +679,8 @@ async fn p2p_admission_saturation_does_not_starve_rpc_or_a_different_peer() {
     valid_peer(server.p2p, &hello(&node), 6, 9).await;
     drop((held, newcomer));
     // Admission alone should not permanently ban an address. Allow tasks to
-    // observe the closed sockets, and the newcomer's first cooldown for the
-    // frame it abandoned (250 ms) to pass, then retry a well-formed local
-    // handshake.
+    // observe the closed sockets, and any first cooldown (250 ms) to pass,
+    // then retry a well-formed local handshake from the refused address.
     tokio::time::sleep(Duration::from_millis(400)).await;
     healthy(&server, &before).await;
     valid_peer(server.p2p, &hello(&node), 6, 5).await;

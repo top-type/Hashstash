@@ -1591,8 +1591,8 @@ const BOOK_ADVERTISED: &str = "203.0.114.5:18481";
 /// book keeps its documented bounds; finally its saved form reopens cleanly.
 pub fn address_book(data: &[u8]) -> String {
     use hashstash::peer_discovery::{
-        self as discovery, AddressBook, MAX_ADDRESSES, MAX_BOOK, MAX_PER_GROUP, MAX_PER_IP,
-        MAX_PER_SOURCE, MAX_PERSISTED_BYTES, Options,
+        self as discovery, AddressBook, Contact, MAX_ADDRESSES, MAX_BOOK, MAX_PER_GROUP,
+        MAX_PER_IP, MAX_PER_SOURCE, MAX_PERSISTED_BYTES, Options,
     };
     use std::collections::BTreeMap;
     thread_local! {
@@ -1683,11 +1683,17 @@ pub fn address_book(data: &[u8]) -> String {
             _ => {
                 let Some(flags) = script.byte() else { break };
                 if let Some(address) = tried.pop() {
-                    book.finished(address, flags & 1 != 0, at, u64::from(flags));
+                    let contact = match (flags & 1 != 0, flags & 4 != 0) {
+                        (true, false) => Contact::Current,
+                        (true, true) => Contact::Advanced,
+                        (false, false) => Contact::Failed,
+                        (false, true) => Contact::Stalled,
+                    };
+                    book.finished(address, contact, at, u64::from(flags));
                 }
                 if flags & 2 != 0 {
                     for address in tried.drain(..) {
-                        book.finished(address, false, at, 0);
+                        book.finished(address, Contact::Failed, at, 0);
                     }
                 }
             }

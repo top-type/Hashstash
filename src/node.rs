@@ -1424,8 +1424,8 @@ const HEADER_READ_CHUNK: usize = 250;
 /// share: the download that counted fewest checked headers, the least
 /// recently answered among equals, from that group or else from all. A
 /// download that only resent stored headers has counted none, so downloads
-/// created for free, however many addresses create them, displace only one
-/// another, never one that counted work.
+/// created for free, however many addresses create them, displace only each
+/// other, never one that counted work.
 fn make_room_for_header_sync(
     chain: &mut Chain,
     syncs: &mut BTreeMap<SocketAddr, HeaderSync>,
@@ -4342,8 +4342,7 @@ impl Node {
     fn peer_snapshot(&self, locator: Option<&[Hash]>) -> Result<PeerMessage> {
         self.peer_snapshot_within(locator, None)
     }
-    /// A synchronization message whose blocks fit `declared`, the capacity
-    /// allowance a version 2 recipient declared, when there is one.
+    /// `peer_snapshot_charged` with nothing to pay.
     #[cfg(test)]
     fn peer_snapshot_within(
         &self,
@@ -4352,11 +4351,12 @@ impl Node {
     ) -> Result<PeerMessage> {
         self.peer_snapshot_charged(locator, declared, &|_| true)
     }
-    /// As `peer_snapshot_within`, paying for each block and loose transaction
-    /// with `charge` as it is added, before the message is encoded: a
-    /// message ends at the first entry the budget refuses, so a session
-    /// whose budget is spent receives a shorter message, and none is built
-    /// beyond what that budget pays for.
+    /// A synchronization message whose blocks fit `declared`, the capacity
+    /// allowance a version 2 recipient declared, when there is one. Each
+    /// block and loose transaction is paid for with `charge` as it is added,
+    /// before the message is encoded: the message ends at the first entry the
+    /// budget refuses, so a session whose budget is spent receives a shorter
+    /// message, and none is built beyond what that budget pays for.
     fn peer_snapshot_charged(
         &self,
         locator: Option<&[Hash]>,

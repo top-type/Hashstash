@@ -48,7 +48,7 @@
       ? { automated: true, text: `${native[1]} — ${text.slice(native[0].length)}` }
       : { automated: false, text };
   }
-  function create({ rpc, document = root.document, location = root.location, storage = root.localStorage, amountText }) {
+  function create({ rpc, backoff = () => 0, document = root.document, location = root.location, storage = root.localStorage, amountText }) {
     const $ = id => document.getElementById(id);
     let context = {}, chain = '', sequence = 0, loading = false, lastTip = null, lastAt = 0, observedTip = null, observedAt = Date.now();
     let items = [], pending = [], next = null, pages = 1, muted = new Set(), rendered = '', loadError = '', indexReady = true, skipped = 0;
@@ -146,6 +146,9 @@
     async function load(more = false, force = false) {
       if (!context.ready || !context.available || !active() || loading || more && (!next || pages >= MAX_PAGES)) return;
       if (!force && !more && context.tip === lastTip && Date.now() - lastAt < 6000) return;
+      // While a refusal's Retry-After lasts, the feed waits for a later poll;
+      // only opening Chat or asking for older messages is sent.
+      if (!more && !force && backoff() > 0) return;
       const request = ++sequence, capturedChain = chain, capturedTip = context.tip, cursor = more ? next : null;
       const current = () => sequence === request && chain === capturedChain && context.tip === capturedTip && context.ready && context.available && active();
       loading = true; statusView();

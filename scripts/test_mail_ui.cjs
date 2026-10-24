@@ -361,6 +361,61 @@ async function run(){
   eq(restored.get('mail-list').children.length,1,'so no mail is missed');ok(!saved.has(startKey),'and the start is dropped');
  }
  {
+  // A refused page (429/503: it did not run) is sent again from the same
+  // cursor once its Retry-After has passed, without waiting for a block.
+  const h=await setup(),m=await h.message(),s=h.currentSnapshot,good=h.handlers.explorer_mail;let refusals=0;
+  h.handlers.explorer_mail=p=>refusals++<1?{ok:false,status:429,headers:{get:name=>name==='Retry-After'?'2':null},text:async()=>JSON.stringify({jsonrpc:'2.0',id:1,error:{code:-32000,message:'network work budget exhausted'}})}:good(p);
+  h.history.push(m);s.status.height=m.height;s.status.tip=key(4242);const before=h.calls.length;await h.refresh();
+  await wait(()=>h.get('mail-scan-status').textContent.includes('waiting for the node'),h);
+  eq(h.get('mail-error').textContent,'','a refusal is not reported as a failed scan');ok([...h.timers.values()].some(timer=>timer.delay===2000),'the scan waits as long as Retry-After asks');
+  h.wallClock+=2000;await h.timersDue(2000);await h.drain();
+  const requests=h.calls.slice(before).filter(x=>x.body.method==='explorer_mail').map(x=>x.body.params);
+  eq(requests.length,2,'the refused page is sent once more');eq(requests[1],requests[0],'from the same cursor');
+  eq(h.get('mail-list').children.length,1,'and finds the mail without another block');eq(h.get('mail-error').textContent,'');
+ }
+ {
+  // On a public site a long scan sends a burst of pages, then one page every
+  // 1.5 seconds, rather than drain the visitor's shared work budget into a
+  // cooldown. A private node's scan is not paced.
+  const history=(h,count)=>{const s=h.currentSnapshot;s.status.height++;s.status.tip=key(4343);for(let i=0;i<count;i++)h.history.push({txid:key(6000+i),height:s.status.height,position:i,sender_public_key:h.other,sender:addr(h.other),nonce:'0',data_hex:'00',raw:'00'});const good=h.handlers.explorer_mail;h.handlers.explorer_mail=p=>good({...p,limit:1});};
+  let scanTimers;const paced=()=>[...scanTimers.values()].some(timer=>timer.delay===1500);
+  const h=await setup({publicWeb:true});scanTimers=h.timers;history(h,12);
+  // The page's first, empty scan was the burst's first page.
+  const pages=()=>h.calls.filter(x=>x.body.method==='explorer_mail').length;eq(pages(),1);await h.refresh();
+  await wait(()=>pages()===8&&paced(),h);await settle();eq(pages(),8,'a burst of eight pages');ok(h.get('mail-scan-status').textContent.startsWith('Scanning'));
+  h.wallClock+=1500;await h.timersDue(1500);await wait(()=>pages()===9&&paced(),h);await settle();eq(pages(),9,'then one page per interval');
+  for(let i=0;i<4;i++){h.wallClock+=1500;await h.timersDue(1500);await wait(()=>pages()===10+i,h);}
+  await h.drain();eq(pages(),13);ok(h.get('mail-scan-status').textContent.startsWith('12 checked'),h.get('mail-scan-status').textContent);
+  const local=await setup();scanTimers=local.timers;history(local,12);const start=local.calls.filter(x=>x.body.method==='explorer_mail').length;await local.refresh();await local.drain();
+  eq(local.calls.filter(x=>x.body.method==='explorer_mail').length-start,12,'a private node scans without pacing');ok(!paced());
+ }
+ {
+  // A reply also costs one work unit per KiB: a page whose envelopes fill
+  // another 4,160 KiB (a page's own price) counts as two pages.
+  const h=await setup({publicWeb:true}),s=h.currentSnapshot,big='00'.repeat(4160*512);s.status.height++;s.status.tip=key(4444);
+  for(let i=0;i<8;i++)h.history.push({txid:key(7000+i),height:s.status.height,position:i,sender_public_key:h.other,sender:addr(h.other),nonce:'0',data_hex:'00',raw:big});
+  const good=h.handlers.explorer_mail;h.handlers.explorer_mail=p=>good({...p,limit:1});
+  const pages=()=>h.calls.filter(x=>x.body.method==='explorer_mail').length,start=pages(),doubled=()=>[...h.timers.values()].some(timer=>timer.delay===3000);
+  await h.refresh();await wait(()=>pages()===start+4&&doubled(),h);await settle();
+  eq(pages()-start,4,'the rest of the burst holds four double-cost pages');ok(doubled(),'and the next page waits for two pages of refill');
+ }
+ {
+  // A mail whose broadcast answer was an error, but which the snapshots then
+  // show pending, was sent after all: its unchanged draft is cleared as after
+  // an answered send, while a draft edited meanwhile is kept.
+  for(const edited of [false,true]){
+   const h=await setup(),f=await h.compose(),s=h.currentSnapshot,nonce=s.account.account.nonce;
+   h.handlers.broadcasttransaction=()=>response({jsonrpc:'2.0',id:1,error:{code:-32000,message:'public response byte budget exhausted; try again'}});
+   await f.requestSubmit();eq(h.wallet.length,1);
+   ok(f.feedback.textContent.startsWith('Result unknown · '),f.feedback.textContent);ok(!f.feedback.textContent.includes('try again'),'the node text does not invite a second send');
+   eq(f.elements.subject.value,'Fixture subject','the draft is kept while the result is unknown');
+   if(edited){f.elements.message.value='Edited meanwhile';await f.fire('input');}
+   s.mempool.push({body:{sender:h.sender,nonce,operation:{TransferExact:{recipient:h.sender,amount:'1'}}}});await h.refresh();
+   ok(f.feedback.textContent.startsWith('Pending · '),f.feedback.textContent);
+   eq(f.elements.subject.value,edited?'Fixture subject':'');eq(f.elements.message.value,edited?'Edited meanwhile':'');
+  }
+ }
+ {
   const h=await harness({mail:true,empty:true});await h.refresh();await h.navigate('#mail');eq(h.calls.filter(c=>c.body.method==='explorer_mail').length,0);ok(h.get('mail-empty').textContent.includes('Select a wallet'));
  }
  console.log(`${checks} recipient-hidden mail UI checks passed`);

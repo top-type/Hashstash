@@ -40,8 +40,9 @@ function harness() {
     explorer_account: { ...ctx, address, public_key: publicKey, account: { ordinary: '1000', shares: '2', nonce: 1 }, stash_value_hash: { numerator: '3000', denominator: '1' }, stash_withdrawal_hash: '2000', history: [{ height: 12, block_hash: blockHash, kind: 'mining_reward', amount: '1000000000000', asset: 'hash' }], pending: [], next_cursor: null },
     explorer_governance: { ...ctx, phase: 'rest', proposals: [{ id: proposal, round: 0, description: 'f'.repeat(64), action: { Grant: { payments: [{recipient:Array(32).fill(18),amount:'1000'}] } }, support: '100', created_height: 5 }], decisions: [{ id: 'f'.repeat(64), proposal, started: 105, started_height: 7, ended_height: 10, outcome: 'pass', blocks:3, observed_blocks:3, leading_blocks:2, blocks_remaining:0, pass_margin_bps: 0 }], contributions: [{ txid, height: 5, sender: address, amount: '100' }], next_cursor: null, next_before_height: null },
   };
-  const api = create({ document, location, amountText: (n, value) => { n.textContent = value; }, rpc: async (method, params) => { calls.push({ method, params }); const value = replies[method]; if (typeof value === 'function') return value(params); if (value instanceof Error) throw value; return value; } });
-  return { get, location, calls, replies, api, tabs, content: get('explorer-content'), navigate: async hash => { location.hash = hash; api.route(); await settle(); } };
+  const pause = { ms: 0 };
+  const api = create({ document, location, backoff: () => pause.ms, amountText: (n, value) => { n.textContent = value; }, rpc: async (method, params) => { calls.push({ method, params }); const value = replies[method]; if (typeof value === 'function') return value(params); if (value instanceof Error) throw value; return value; } });
+  return { get, location, calls, replies, api, tabs, pause, content: get('explorer-content'), navigate: async hash => { location.hash = hash; api.route(); await settle(); } };
 }
 async function run() {
   let checks = 0;
@@ -253,6 +254,29 @@ async function run() {
     h.replies.explorer_transaction={...ctx,transaction:{...tx,data_hex:Buffer.from('\ufeffa\u200bb\u2066c').toString('hex')}};
     await h.navigate('#explorer?tx='+txid);
     assert.ok(walk(h.content).some(n=>n.tagName==='pre'&&n.textContent==='\\ufeffa\\u200bb\\u2066c'),'invisible characters are escaped in the raw text view');checks++;
+  }
+  {
+    // While a refusal's Retry-After lasts, automatic reloads wait; the user's
+    // own navigation is still sent. A refused search is reported, not
+    // retried at once as another lookup.
+    const realNow = Date.now; let now = realNow(); Date.now = () => now;
+    try {
+      const r = harness(); r.api.route(); r.api.update({ ready: true, ...ctx }); await settle();
+      const sent = method => r.calls.filter(c => c.method === method).length, refused = () => Object.assign(new Error('network work budget exhausted (try again in 5 s)'), { refused: true, retryAfter: 5 });
+      assert.equal(sent('explorer_blocks'), 1); checks++;
+      const good = r.replies.explorer_blocks; r.replies.explorer_blocks = refused();
+      now += 3000; r.api.update({ ready: true, ...ctx, tip: 'e'.repeat(64) }); await settle();
+      assert.equal(sent('explorer_blocks'), 2); checks++; assert.match(r.get('explorer-message').textContent, /try again in 5 s/); checks++;
+      r.pause.ms = 5000; r.replies.explorer_blocks = good;
+      now += 3000; r.api.update({ ready: true, ...ctx, tip: 'e'.repeat(64) }); await settle();
+      assert.equal(sent('explorer_blocks'), 2, 'a failed page is not reloaded while Retry-After lasts'); checks++;
+      await r.navigate('#explorer?block=12'); assert.equal(sent('explorer_block'), 1, 'navigation is still sent'); checks++;
+      await r.navigate('#explorer'); r.pause.ms = 0;
+      r.replies.explorer_block = refused(); r.replies.explorer_transaction = { ...ctx, transaction: tx };
+      await r.navigate('#explorer?q=' + txid);
+      assert.equal(sent('explorer_transaction'), 0, 'a refused block lookup is not followed by a transaction lookup'); checks++;
+      assert.match(r.get('explorer-message').textContent, /try again in 5 s/); checks++;
+    } finally { Date.now = realNow; }
   }
   console.log(`Explorer UI: ${checks} behavior assertions passed.`);
 }

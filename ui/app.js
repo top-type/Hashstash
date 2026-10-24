@@ -118,14 +118,17 @@
     }
     const chat = typeof HashstashChat === "object" ? HashstashChat.create({
         rpc: rpc,
+        backoff: rpcBackoff,
         amountText: amountText
     }) : null;
     const explorer = typeof HashstashExplorer === "object" ? HashstashExplorer.create({
         rpc: rpc,
+        backoff: rpcBackoff,
         amountText: amountText
     }) : null;
     const mail = typeof HashstashMail === "object" ? HashstashMail.create({
         rpc: rpc,
+        backoff: rpcBackoff,
         amountText: amountText,
         encodeAddress: address,
         recipientKey: () => recipientKey($("mail-form")),
@@ -351,26 +354,97 @@
         const node = form.querySelector(".form-feedback");
         if (!node) return;
         node.textContent = message;
+        delete node.dataset.submission;
         node.classList.toggle("error", failed);
     }
     // A submitted transaction can expire, or lose its anchor or decision in a
     // reorganization; the node then drops it without notice. Follow each
     // form's last submission by sender nonce until it leaves the pool.
+    //
+    // A broadcast answered by anything but a 429 or 503 refusal may have run,
+    // even when its answer was an error or never arrived: the transaction can
+    // be pending and relayed. Such an uncertain submission is followed the
+    // same way and blocks its form, whose next submission would sign a second
+    // transaction at the next nonce, until the snapshots show its nonce
+    // pending or used, or twice show it free. Its exact signed bytes can be
+    // sent again meanwhile: the node answers a transaction it already holds
+    // with the same ID, and one nonce can be used only once. The node's own
+    // answer (which may say "try again") is shown only once the transaction
+    // is known not to be pending.
     const submissions = new Map;
-    function trackSubmission(form, id, sender, nonce) {
-        submissions.set(form.id, {id: id, sender: sender, nonce: BigInt(nonce), misses: 0});
+    let refreshSerial = 0;
+    function trackSubmission(form, id, sender, nonce, uncertain = null) {
+        const tracked = {id: id, sender: sender, chain: state.status?.chain_id, nonce: BigInt(nonce), misses: 0, since: refreshSerial, uncertain: uncertain};
+        submissions.set(form.id, tracked);
+        showSubmission(form, tracked);
     }
-    function followSubmissions(cleared) {
+    function uncertainSubmission(form) {
+        const tracked = submissions.get(form.id);
+        return tracked?.uncertain && tracked.sender === key() ? tracked : null;
+    }
+    function mailDraft(form) {
+        return form.id === "mail-form" ? JSON.stringify([ form.elements.recipient.value, form.elements.subject.value, form.elements.message.value ]) : null;
+    }
+    // An uncertain submission found pending was sent after all: a mail draft
+    // it carried, still unchanged, is cleared as after an answered send.
+    function submissionSent(form, uncertain) {
+        uncertain.draft !== null && uncertain.draft === mailDraft(form) && mail?.sent();
+    }
+    function showSubmission(form, tracked) {
+        const uncertain = tracked.uncertain;
+        feedback(form, uncertain ? `Result unknown · ${short(tracked.id)}: the node may have received this transaction although its answer was lost or was an error. Checking whether it is pending. Do not submit it again.${uncertain.note ? ` ${uncertain.note}` : ""} ` : `Pending · ${short(tracked.id)}`, !!uncertain);
+        const node = form.querySelector(".form-feedback");
+        if (!node) return;
+        node.dataset.submission = tracked.id;
+        if (!uncertain) return;
+        const resend = append(node, "button", "small-link submission-resend", "Send the same transaction again");
+        resend.type = "button";
+        resend.disabled = !!uncertain.resending;
+        resend.addEventListener("click", () => resendSubmission(form, tracked));
+    }
+    async function resendSubmission(form, tracked) {
+        const uncertain = tracked.uncertain;
+        if (!uncertain || uncertain.resending || submissions.get(form.id) !== tracked) return;
+        uncertain.resending = true;
+        uncertain.note = "";
+        showSubmission(form, tracked);
+        try {
+            const data = await rpc("broadcasttransaction", {
+                raw: uncertain.raw
+            });
+            if (data?.transaction_id !== tracked.id) throw new Error("The node returned an unexpected transaction ID.");
+            if (submissions.get(form.id) !== tracked) return;
+            // The node holds the transaction now.
+            tracked.uncertain = null;
+            tracked.misses = 0;
+            submissionSent(form, uncertain);
+            toast("Transaction submitted.");
+        } catch (error) {
+            uncertain.note = `Sending it again failed: ${error.message}`;
+        } finally {
+            uncertain.resending = false;
+            submissions.get(form.id) === tracked && showSubmission(form, tracked);
+            modeButtons();
+        }
+        await refresh();
+    }
+    function followSubmissions(cleared, serial) {
         for (const [formId, tracked] of submissions) {
             const form = $(formId);
-            if (!form || tracked.sender !== key()) {
+            if (!form || tracked.chain !== state.status?.chain_id) {
                 submissions.delete(formId);
                 continue;
             }
-            const message = `Pending · ${short(tracked.id)}`;
-            const shown = form.querySelector(".form-feedback")?.textContent;
-            if (shown !== message && !(cleared && shown === "")) {
-                // A newer action on this form replaced the indicator.
+            if (tracked.sender !== key()) {
+                // An uncertain submission waits for its account to return.
+                tracked.uncertain || submissions.delete(formId);
+                continue;
+            }
+            const node = form.querySelector(".form-feedback");
+            let shown = node?.dataset.submission === tracked.id;
+            if (!shown && !tracked.uncertain && !(cleared && node?.textContent === "")) {
+                // A newer action on this form replaced the indicator. An
+                // uncertain submission is followed regardless, and shown again.
                 submissions.delete(formId);
                 continue;
             }
@@ -381,19 +455,27 @@
             }
             if (ownPending().some(tx => hex(tx.body?.sender) === tracked.sender && BigInt(tx.body.nonce) === tracked.nonce)) {
                 tracked.misses = 0;
-                shown === message || feedback(form, message);
+                if (tracked.uncertain && !tracked.uncertain.resending) {
+                    // Its broadcast ran: an ordinary pending submission now.
+                    submissionSent(form, tracked.uncertain);
+                    tracked.uncertain = null;
+                    shown = false;
+                }
+                shown || showSubmission(form, tracked);
                 continue;
             }
             // The snapshot lists bounded prefixes of the pool and of this
             // sender's rows, and a tip change briefly publishes an empty pool
-            // before recovery: confirm twice.
+            // before recovery: confirm twice, with snapshots requested after
+            // the submission.
             const truncated = Array.isArray(state.senderMempool) ? state.senderMempool.length >= 128 : Number(state.status?.mempool || 0) > state.mempool.length;
-            if (truncated || ++tracked.misses < 2) {
-                shown === message || feedback(form, message);
+            if (truncated || serial <= tracked.since || tracked.uncertain?.resending || ++tracked.misses < 2) {
+                shown || showSubmission(form, tracked);
                 continue;
             }
             submissions.delete(formId);
-            feedback(form, `No longer pending · ${short(tracked.id)} expired or was invalidated by a reorganization. Prepare it again.`, true);
+            const answer = tracked.uncertain?.answer;
+            feedback(form, tracked.uncertain ? `Not pending · ${short(tracked.id)} is not in the pool and its transaction number is unused: it was not accepted, or it expired.${answer ? ` Its reply was: ${answer.replace(/[.\s]+$/, "")}.` : ""} Submit it again.` : `No longer pending · ${short(tracked.id)} expired or was invalidated by a reorganization. Prepare it again.`, true);
         }
     }
     // Node JSON carries u64 values (settings, proposal parameters, lifetimes)
@@ -423,6 +505,25 @@
             return value;
         });
     }
+    // An admission refusal (429, 503) promises that the node did not run the
+    // request, and Retry-After says when to send it again. Every other
+    // failure, a lost reply or a 200 carrying a JSON-RPC error included, may
+    // follow a request that ran. A refusal also pauses this page's background
+    // traffic (the refresh poll, and the Mail, Chat and Explorer loops) for
+    // that long: a refused address is usually cooling down, and anything sent
+    // meanwhile is refused too.
+    const RPC_BACKOFF_LIMIT_MS = 60e3;
+    let rpcBackoffUntil = 0;
+    function rpcBackoff() {
+        return Math.max(0, rpcBackoffUntil - Date.now());
+    }
+    function refusalWait(response) {
+        if (response.status !== 429 && response.status !== 503) return null;
+        const wait = response.headers?.get?.("Retry-After") || "";
+        const seconds = /^[0-9]{1,5}$/.test(wait) ? Number(wait) : null;
+        rpcBackoffUntil = Math.max(rpcBackoffUntil, Date.now() + Math.min(Math.max(seconds ?? 1, 1) * 1e3, RPC_BACKOFF_LIMIT_MS));
+        return seconds;
+    }
     async function rpc(method, params = {}) {
         const response = await fetch("/rpc", {
             method: "POST",
@@ -441,19 +542,24 @@
             cache: "no-store"
         });
         if (!response.ok) {
-            // A refusal (429, 503) still carries the node's JSON-RPC error,
-            // and Retry-After says when the request may be sent again.
+            // A refusal still carries the node's JSON-RPC error.
             let message = null;
             try {
                 message = (await exactJSON(response))?.error?.message;
             } catch {}
-            const wait = response.headers?.get?.("Retry-After") || "";
-            const retry = /^[0-9]{1,5}$/.test(wait) ? wait : null;
-            if (typeof message !== "string" || !message) throw new Error(`Node request failed (${response.status}).`);
-            throw new Error(retry ? `${message} (try again in ${retry} s)` : message);
+            const refused = response.status === 429 || response.status === 503, retry = refusalWait(response);
+            const error = new Error(typeof message !== "string" || !message ? `Node request failed (${response.status}).` : retry !== null ? `${message} (try again in ${retry} s)` : message);
+            error.status = response.status;
+            error.refused = refused;
+            refused && (error.retryAfter = retry ?? 1);
+            throw error;
         }
         const data = await exactJSON(response);
-        if (data.error) throw new Error(data.error.message || "The node rejected this request.");
+        if (data.error) {
+            const error = new Error(data.error.message || "The node rejected this request.");
+            error.status = response.status;
+            throw error;
+        }
         return data.result;
     }
     function activeDecision() {
@@ -738,6 +844,7 @@
         document.querySelectorAll(".wallet-action").forEach(button => {
             const form = button.closest("form");
             form && feeBuilders.has(form.id) && feeQuotes.get(form.id)?.identity !== feeIdentity(form) && (button.disabled = true);
+            form && uncertainSubmission(form) && (button.disabled = true);
         });
         tradeBalanceView();
         faucetView();
@@ -913,6 +1020,8 @@
         if (!state.account) throw new Error("Your account needs its first hashes payment before it can send transactions.");
         if (state.submitting) throw new Error("Wait for the current submission to finish.");
         if (state.managing) throw new Error("Wait for the wallet change to finish.");
+        const uncertain = uncertainSubmission(form);
+        if (uncertain) throw new Error(`The last transaction from this form may already be pending · ${short(uncertain.id)}. Wait until it is checked, or send the same transaction again.`);
         if (form.id === "send-form" && operation.TransferExact && (!state.sendQuote || state.sendQuote.identity !== sendIdentity())) throw new Error("Wait for a current payment quote.");
         const feeQuote = feeQuotes.get(form.id);
         if (!feeQuote || feeQuote.identity !== feeIdentity(form)) throw new Error("Wait for the current fee quote.");
@@ -922,7 +1031,7 @@
         checkOutcomeFunds(operation, feeFields.fee);
         const expiry = transactionExpiry(form);
         if (!expiry) throw new Error("Transaction expiry must be greater than zero.");
-        const identity = submissionIdentity(form), hot = state.session.wallet_enabled, dataFields = transactionData(form);
+        const identity = submissionIdentity(form), draft = mailDraft(form), hot = state.session.wallet_enabled, dataFields = transactionData(form);
         if (hot && walletLockedNow()) {
             const error = new Error("Unlock this browser wallet to sign.");
             error.walletLocked = true;
@@ -976,16 +1085,38 @@
             }
             const signed = await browserWallet.signUnsigned(envelope, expected);
             if (identity !== submissionIdentity(form)) throw new Error("Wallet or details changed. Submit again.");
-            const data = await rpc("broadcasttransaction", {
-                raw: signed.raw
-            });
+            let data = null, answer = null;
+            try {
+                data = await rpc("broadcasttransaction", {
+                    raw: signed.raw
+                });
+            } catch (error) {
+                // Refused: nothing ran, so the same details can be submitted again.
+                if (error.refused) throw new Error(`Not sent: ${error.message}`);
+                // A reply's text; a lost connection has none.
+                error.status === void 0 || (answer = error.message);
+            }
+            if (!data?.transaction_id || data.transaction_id !== signed.transaction_id) {
+                // Any other outcome may follow a broadcast that ran. Never
+                // show the node's text as if it were final, and keep the
+                // signed bytes rather than invite a second signature at the
+                // next nonce (see trackSubmission).
+                form.id === "propose-form" && rememberDescription(operation);
+                trackSubmission(form, signed.transaction_id, request.sender, nonce, {
+                    raw: signed.raw,
+                    note: "",
+                    answer: answer ?? (data ? "The node returned an unexpected transaction ID." : null),
+                    draft: draft !== null && draft === mailDraft(form) ? draft : null
+                });
+                toast("Result unknown. Checking whether the transaction is pending.");
+                await refresh();
+                return null;
+            }
             const id = data.transaction_id;
-            if (!id || id !== signed.transaction_id) throw new Error("The node returned an unexpected transaction ID.");
             form.id === "propose-form" && rememberDescription(operation);
             toast("Transaction submitted.");
             if (form.id !== "mail-form" || identity === submissionIdentity(form)) {
                 form.id === "mail-form" && mail?.sent();
-                feedback(form, `Pending · ${short(id)}`);
                 trackSubmission(form, id, request.sender, nonce);
             }
             await refresh();
@@ -1030,6 +1161,8 @@
         form.addEventListener("submit", async event => {
             event.preventDefault();
             if (form.dataset.preparing === "true" || state.submitting) return;
+            const uncertain = uncertainSubmission(form);
+            if (uncertain) return showSubmission(form, uncertain);
             form.dataset.preparing = "true";
             try {
                 const identity = submissionIdentity(form);
@@ -2224,7 +2357,9 @@
         });
         feeQuotes.clear();
         pendingFeeRefresh.clear();
-        submissions.clear();
+        // A broadcast of unknown outcome is still followed: the form that sent
+        // it stays blocked for its account (see trackSubmission).
+        for (const [formId, tracked] of submissions) tracked.uncertain || submissions.delete(formId);
         feeForms.forEach(name => clearFeeAllocation($(`${name}-form`)));
         feeTimers.forEach(clearTimeout);
         feeTimers.clear();
@@ -2262,7 +2397,10 @@
         const response = await fetch("/api/session", {
             cache: "no-store"
         });
-        if (!response.ok) throw new Error(`Session unavailable (${response.status}).`);
+        if (!response.ok) {
+            const retry = refusalWait(response);
+            throw new Error(`Session unavailable (${response.status}).${retry !== null ? ` Try again in ${retry} s.` : ""}`);
+        }
         const remote = await exactJSON(response);
         if (version !== sessionVersion) return false;
         if (!/^[0-9a-f]{64}$/.test(remote.chain_id || "") || remote.address_hrp !== "hsh" + remote.chain_id.slice(0, 16)) throw new Error("Address network is unavailable.");
@@ -2325,7 +2463,7 @@
             if (!await loadSession()) return;
             const identity = walletIdentity();
             // Do not disclose the association between every locally saved wallet.
-            const keys = key() ? [key()] : [];
+            const keys = key() ? [key()] : [], serial = ++refreshSerial;
             const snapshot = await rpc("snapshot", {
                 ...key() ? {
                     key: key()
@@ -2379,7 +2517,7 @@
                 $("quote-remaining").hidden = true;
                 feedback($("trade-form"), "");
             }
-            followSubmissions(previousDecision !== hex(activeDecision()?.id));
+            followSubmissions(previousDecision !== hex(activeDecision()?.id), serial);
             networkPhaseView();
             text("reserve-ratio", `${reserveRatio(curveWorld())} reserve ratio`);
             text("header-height", commas(status.height));
@@ -2424,7 +2562,8 @@
                 wallet_id: state.session?.wallet_id,
                 wallet_revision: state.session?.wallet_revision,
                 can_decrypt: !!state.session?.wallet_enabled && !state.session?.wallet_locked,
-                locked: !!state.session?.wallet_locked
+                locked: !!state.session?.wallet_locked,
+                public_web: !!state.session?.public_web
             });
             !$("trade-amount").value || state.submitting || state.managing || !changedState && !state.quoteFailed || quoteSoon(true);
             $("send-form").elements.recipient.value && $("send-form").elements.amount.value && !state.submitting && !state.managing && (changedState || state.sendFailed) && sendSoon(true);
@@ -2701,24 +2840,57 @@
             location.hash = "send";
         }
     }
-    // A private key copied to the clipboard is cleared after 30 seconds,
-    // unless this page can see that the clipboard now holds something else.
+    // A private key copied to the clipboard is cleared after 30 seconds. The
+    // page clears it unasked only while it knows the clipboard still holds
+    // the key: nothing was copied or cut in this page since, and the page
+    // kept focus, so no other application can have copied anything either
+    // (or, with clipboard-read permission already granted, it reads the key
+    // back). Otherwise it asks, rather than erase what was copied since.
     // Browsers let a page write the clipboard only while it has focus, and
-    // Firefox and Safari only during a click or key press. A refused clear
-    // says the key is still there and retries at the next one, or on focus.
-    const CLIPBOARD_CLEAR_MS = 30e3, CLIPBOARD_RETRY = [ "pointerdown", "pointerup", "keydown", "focus" ];
-    let copiedSecret = null, clipboardTimer;
+    // Firefox and Safari only during a click or key press: a refused clear
+    // says the key is still there and retries at the next one. Leaving the
+    // page before the clear asks first; an unloading page cannot be relied on
+    // to clear the clipboard, and the backup dialog says so.
+    const CLIPBOARD_CLEAR_MS = 30e3, CLIPBOARD_RETRY = [ "pointerdown", "pointerup", "keydown" ];
+    let copiedSecret = null, clipboardTimer, clipboardTrusted = false;
     function clipboardRetry(waiting) {
         $("clipboard-notice").hidden = !waiting;
-        for (const name of CLIPBOARD_RETRY) waiting ? window.addEventListener(name, clearCopiedSecret) : window.removeEventListener(name, clearCopiedSecret);
+        text("clipboard-notice-text", clipboardTrusted ? "The copied private key is still on the clipboard: this browser did not let the page clear it. Click anywhere in this page to clear it now." : "A private key copied from this page may still be on the clipboard. The page lost focus since, so it cannot tell whether something else was copied after it.");
+        const retry = waiting && clipboardTrusted;
+        for (const name of CLIPBOARD_RETRY) retry ? window.addEventListener(name, clearCopiedSecret) : window.removeEventListener(name, clearCopiedSecret);
+    }
+    function armClipboardClear(secret) {
+        copiedSecret = secret;
+        clipboardTrusted = true;
+        clipboardRetry(false);
+        clearTimeout(clipboardTimer);
+        clipboardTimer = setTimeout(clearCopiedSecret, CLIPBOARD_CLEAR_MS);
+        window.addEventListener("beforeunload", leavingWithSecret);
+        window.addEventListener("pagehide", leftWithSecret);
     }
     function forgetCopiedSecret() {
         copiedSecret = null;
+        clipboardTrusted = false;
         clearTimeout(clipboardTimer);
         clipboardRetry(false);
+        window.removeEventListener("beforeunload", leavingWithSecret);
+        window.removeEventListener("pagehide", leftWithSecret);
     }
-    async function clearCopiedSecret() {
+    // Leaving the page before the clear asks first: staying shows how to
+    // clear the key. A page that is left tries to, which may be refused.
+    function leavingWithSecret(event) {
+        if (!copiedSecret) return;
+        clipboardRetry(true);
+        event.preventDefault();
+        event.returnValue = "";
+    }
+    function leftWithSecret() {
         const copied = copiedSecret;
+        copied && clipboardTrusted && navigator.clipboard.writeText("").then(() => copiedSecret === copied && forgetCopiedSecret(), () => {});
+    }
+    // An explicit request clears whatever the clipboard holds.
+    async function clearCopiedSecret(request) {
+        const copied = copiedSecret, explicit = request === true;
         if (!copied) return;
         clearTimeout(clipboardTimer);
         let current = null;
@@ -2734,14 +2906,30 @@
         }
         if (copiedSecret !== copied) return;
         if (current !== null && current !== copied) return forgetCopiedSecret();
+        if (current === null && !clipboardTrusted && !explicit) return clipboardRetry(true);
+        const known = current === copied || clipboardTrusted;
         try {
             await navigator.clipboard.writeText("");
             if (copiedSecret === copied) forgetCopiedSecret();
-            toast("The private key was cleared from the clipboard.");
+            toast(known ? "The private key was cleared from the clipboard." : "The clipboard was cleared.");
         } catch {
             copiedSecret === copied && clipboardRetry(true);
         }
     }
+    // Another application can copy only while this page has no focus.
+    window.addEventListener("blur", () => {
+        if (!copiedSecret || !clipboardTrusted) return;
+        clipboardTrusted = false;
+        $("clipboard-notice").hidden || clipboardRetry(true);
+    });
+    // A copy or cut in this page replaces the key, unless it copies the key
+    // again from the backup dialog.
+    for (const name of [ "copy", "cut" ]) document.addEventListener(name, event => {
+        if (privateBackup && event.target === $("backup-private")) armClipboardClear(privateBackup.private_key);
+        else copiedSecret && forgetCopiedSecret();
+    });
+    $("clipboard-clear").addEventListener("click", () => clearCopiedSecret(true));
+    $("clipboard-keep").addEventListener("click", forgetCopiedSecret);
     // The backup file is encoded into bytes that are wiped once the browser
     // holds its own copy, with no other string of the whole document. The key
     // string itself cannot be wiped.
@@ -2913,13 +3101,14 @@
         $("wallet-lock").hidden = !encrypted || locked;
         $("wallet-passphrase-open").hidden = encrypted && locked;
         text("wallet-passphrase-open", encrypted ? "Change passphrase" : "Set passphrase");
-        const remove = $("wallet-passphrase-remove");
-        remove.hidden = !encrypted || locked;
-        if (remove.hidden && remove.dataset.confirm) {
-            delete remove.dataset.confirm;
-            text("wallet-passphrase-remove", "Remove passphrase");
-        }
+        // Changing or removing a passphrase asks for the current one, not only
+        // an unlocked page.
+        $("wallet-current-field").hidden = !encrypted;
+        $("wallet-current-passphrase").disabled = !encrypted;
+        $("wallet-current-passphrase").required = encrypted;
+        $("wallet-passphrase-remove").hidden = !encrypted || locked;
         if (encrypted && locked) $("wallet-passphrase-form").hidden = true;
+        if (!encrypted || locked) closeRemoveForm(true);
     }
     function openUnlock(message = "") {
         if (!state.session?.wallet_locked) return;
@@ -2989,8 +3178,8 @@
             } else if (action === "watch") result = await browserWallet.watch(values.public_key, guard); else if (action === "select") result = await browserWallet.select(values.id, guard);
             else if (action === "unlock") result = await browserWallet.unlock(values.passphrase);
             else if (action === "lock") result = browserWallet.lock();
-            else if (action === "passphrase") result = await browserWallet.setPassphrase(values.passphrase, guard);
-            else if (action === "remove-passphrase") result = await browserWallet.removePassphrase(guard); else {
+            else if (action === "passphrase") result = await browserWallet.setPassphrase(values.passphrase, guard, values.current);
+            else if (action === "remove-passphrase") result = await browserWallet.removePassphrase(guard, values.current); else {
                 if (action !== "export") throw new Error("Unknown wallet action.");
                 result = {
                     format: "hashstash-private-v1",
@@ -3150,11 +3339,8 @@
         try {
             if (!privateBackup) return;
             await navigator.clipboard.writeText(privateBackup.private_key);
-            copiedSecret = privateBackup.private_key;
-            clipboardRetry(false);
-            clearTimeout(clipboardTimer);
-            clipboardTimer = setTimeout(clearCopiedSecret, CLIPBOARD_CLEAR_MS);
-            toast(`Private key copied. The clipboard is cleared in ${CLIPBOARD_CLEAR_MS / 1e3} seconds.`);
+            armClipboardClear(privateBackup.private_key);
+            toast(`Private key copied. The clipboard is cleared in ${CLIPBOARD_CLEAR_MS / 1e3} seconds while this page stays open.`);
         } catch {
             toast("Select and copy the private key.");
         }
@@ -3187,14 +3373,20 @@
     $("wallet-lock").addEventListener("click", async () => {
         try {
             await manageWallet("lock");
-            walletMessage("Wallet locked.");
+            walletMessage("Wallet locked in every page of this site open in this browser.");
         } catch (error) {
             walletMessage(error.message, true);
         }
     });
     function closePassphraseForm(hidden) {
         const form = $("wallet-passphrase-form");
-        form.elements.passphrase.value = form.elements.confirm.value = "";
+        form.elements.passphrase.value = form.elements.confirm.value = form.elements.current.value = "";
+        feedback(form, "");
+        form.hidden = hidden;
+    }
+    function closeRemoveForm(hidden) {
+        const form = $("wallet-remove-form");
+        form.elements.current.value = "";
         feedback(form, "");
         form.hidden = hidden;
     }
@@ -3202,13 +3394,15 @@
     $("wallet-passphrase-cancel").addEventListener("click", () => closePassphraseForm(true));
     $("wallet-passphrase-form").addEventListener("submit", async event => {
         event.preventDefault();
-        const form = $("wallet-passphrase-form"), passphrase = form.elements.passphrase.value, repeated = form.elements.confirm.value, changing = !!state.session?.wallet_encrypted;
-        form.elements.passphrase.value = form.elements.confirm.value = "";
+        const form = $("wallet-passphrase-form"), passphrase = form.elements.passphrase.value, repeated = form.elements.confirm.value, changing = !!state.session?.wallet_encrypted, current = changing ? form.elements.current.value : null;
+        form.elements.passphrase.value = form.elements.confirm.value = form.elements.current.value = "";
         try {
             if (passphrase !== repeated) throw new Error("The two passphrases differ.");
-            feedback(form, "Encrypting keys…");
+            if (changing && !current) throw new Error("Enter the current passphrase.");
+            feedback(form, changing ? "Checking the current passphrase…" : "Encrypting keys…");
             await manageWallet("passphrase", {
-                passphrase: passphrase
+                passphrase: passphrase,
+                current: current
             });
             closePassphraseForm(true);
             countWalletsElsewhere();
@@ -3221,20 +3415,22 @@
             lockedPrompt(error);
         }
     });
-    $("wallet-passphrase-remove").addEventListener("click", async () => {
-        const button = $("wallet-passphrase-remove");
-        if (!button.dataset.confirm) {
-            button.dataset.confirm = "true";
-            text("wallet-passphrase-remove", "Confirm: save keys unencrypted");
-            return;
-        }
-        delete button.dataset.confirm;
-        text("wallet-passphrase-remove", "Remove passphrase");
+    $("wallet-passphrase-remove").addEventListener("click", () => closeRemoveForm(!$("wallet-remove-form").hidden));
+    $("wallet-remove-cancel").addEventListener("click", () => closeRemoveForm(true));
+    $("wallet-remove-form").addEventListener("submit", async event => {
+        event.preventDefault();
+        const form = $("wallet-remove-form"), current = form.elements.current.value;
+        form.elements.current.value = "";
         try {
-            await manageWallet("remove-passphrase");
+            if (!current) throw new Error("Enter the current passphrase.");
+            feedback(form, "Checking the current passphrase…");
+            await manageWallet("remove-passphrase", {
+                current: current
+            });
+            closeRemoveForm(true);
             walletMessage("Passphrase removed. Private keys in this browser are saved unencrypted again.");
         } catch (error) {
-            walletMessage(error.message, true);
+            feedback(form, error.message, true);
             lockedPrompt(error);
         }
     });
@@ -3249,21 +3445,38 @@
             state.broadcasting = true;
             modeButtons();
             feedback(form, "Broadcasting…");
-            const result = await rpc("broadcasttransaction", {
-                raw: raw
-            });
-            if (!result?.transaction_id) throw new Error("The node did not return a transaction ID.");
             // Follow the selected account's own broadcasts by sender nonce, as
             // the transaction forms do. Another account's is not refreshed here.
-            let signed = null;
+            let signed = null, result = null;
             try {
                 signed = HashstashBrowserWallet.verifySigned(raw, {chain_id: state.status?.chain_id});
             } catch {
-                // The node accepted bytes this page cannot decode or verify
+                // The node may accept bytes this page cannot decode or verify
                 // for its network; it reports only the ID.
             }
+            try {
+                result = await rpc("broadcasttransaction", {
+                    raw: raw
+                });
+            } catch (error) {
+                if (error.refused) throw new Error(`Not sent: ${error.message}`);
+                // As in submit(): this broadcast may have run. The same bytes
+                // can be sent again safely, a newly signed transaction not.
+                if (signed?.sender === key()) {
+                    trackSubmission(form, signed.txid, signed.sender, signed.nonce, {
+                        raw: raw.toLowerCase(),
+                        note: "",
+                        answer: error.status === void 0 ? null : error.message,
+                        draft: null
+                    });
+                    toast("Result unknown. Checking whether the transaction is pending.");
+                    await refresh();
+                    return;
+                }
+                throw new Error(`Result unknown${signed ? ` · ${short(signed.txid)}` : ""}: the node may have received this transaction although its answer was lost or was an error (${error.message}). Broadcasting these same bytes again is safe; do not sign a new transaction until you know whether this one is pending.`);
+            }
+            if (!result?.transaction_id) throw new Error("The node did not return a transaction ID.");
             if (signed?.txid === result.transaction_id && signed.sender === key()) {
-                feedback(form, `Pending · ${short(result.transaction_id)}`);
                 trackSubmission(form, result.transaction_id, signed.sender, signed.nonce);
             } else {
                 feedback(form, `Broadcast · ${short(result.transaction_id)}. This form follows only the selected account's transactions.`);
@@ -3522,5 +3735,6 @@
         input.name === "fee" && (input.title += " Minimum permitted fee: 0 hash.");
     });
     refresh();
-    setInterval(refresh, 2e3);
+    // The poll skips its turns while a refusal's Retry-After lasts.
+    setInterval(() => rpcBackoff() > 0 || refresh(), 2e3);
 })();

@@ -13,9 +13,9 @@ const equal=(a,b)=>{assert.equal(a,b);checks++;};
 const throws=(f,pattern)=>{assert.throws(f,pattern);checks++;};
 const rejects=async(f,pattern)=>{await assert.rejects(f,pattern);checks++;};
 function profile() {
-  const values=new Map(),listeners=new Set(),queues=new Map();
+  const values=new Map(),listeners=new Set(),queues=new Map(),channels=new Map();
   return {
-    values,listeners,
+    values,listeners,channels,
     storage:{getItem:k=>values.has(k)?values.get(k):null,setItem:(k,v)=>values.set(k,v)},
     locks:{request(name,fn){const previous=queues.get(name)||Promise.resolve();const result=previous.catch(()=>{}).then(fn);queues.set(name,result);return result;}},
     event(key){for(const f of listeners)f({key});}
@@ -23,7 +23,14 @@ function profile() {
 }
 function browser(p=profile(),hostname='wallet.example',protocol='https:') {
   const logs=[],quiet={},metrics={publicKeyDerivations:0};for(const method of ['log','warn','error','info','debug'])quiet[method]=(...args)=>logs.push(args);
-  const context=vm.createContext({Uint8Array,DataView,TextEncoder,TextDecoder,console:quiet,JSON,BigInt,crypto:webcrypto,
+  // Pages of one profile reach each other's open channels of the same name,
+  // later and never their own, as in a browser.
+  class BroadcastChannel {
+    constructor(name){this.name=String(name);this.onmessage=null;if(!p.channels.has(this.name))p.channels.set(this.name,new Set());p.channels.get(this.name).add(this);}
+    postMessage(data){for(const other of p.channels.get(this.name))if(other!==this)setTimeout(()=>p.channels.get(this.name).has(other)&&other.onmessage?.({data}),0);}
+    close(){p.channels.get(this.name)?.delete(this);}
+  }
+  const context=vm.createContext({Uint8Array,DataView,TextEncoder,TextDecoder,console:quiet,JSON,BigInt,crypto:webcrypto,BroadcastChannel,
     location:{hostname,protocol},isSecureContext:protocol==='https:'||hostname==='localhost',
     localStorage:p.storage,navigator:{locks:p.locks},
     addEventListener:(event,f)=>{if(event==='storage')p.listeners.add(f);},removeEventListener:(event,f)=>p.listeners.delete(f),
@@ -473,8 +480,12 @@ async function passphraseLock(f) {
   const created=await reloaded.create({wallet_revision:view.wallet_revision}),createdSecret=await reloaded.exportPrivate(created.wallet_id,{wallet_revision:created.wallet_revision});
   ok(!text().includes(createdSecret),'a key created while unlocked is saved sealed');equal(created.wallet_plaintext_keys,0);
   const upgraded=await reloaded.importPrivate('24'.repeat(32));ok(!text().includes('24'.repeat(32)),'a watch entry upgraded with its key is sealed too');equal(upgraded.wallets.find(w=>w.id===watchedLocked.public_key).encrypted,true);
+  // An unlocked page alone cannot change the passphrase: it needs the current one.
+  await rejects(()=>reloaded.setPassphrase(changedPhrase,{wallet_revision:upgraded.wallet_revision}),/current wallet passphrase/);
+  await rejects(()=>reloaded.setPassphrase(changedPhrase,{wallet_revision:upgraded.wallet_revision},'wrong horse battery staple'),/Wrong current passphrase/);
+  equal(stored().lock.salt,sealed.lock.salt,'a change without the current passphrase changes nothing');equal(reloaded.snapshot().wallet_locked,false,'and keeps the page unlocked');
   // A passphrase changed in another tab locks this one: its key opens the old lock only.
-  view=await reloaded.setPassphrase(changedPhrase,{wallet_revision:upgraded.wallet_revision});equal(view.wallet_locked,false);ok(stored().lock.salt!==sealed.lock.salt,'a new passphrase gets a new salt');
+  view=await reloaded.setPassphrase(changedPhrase,{wallet_revision:upgraded.wallet_revision},phrase);equal(view.wallet_locked,false);ok(stored().lock.salt!==sealed.lock.salt,'a new passphrase gets a new salt');
   equal(store.snapshot().wallet_locked,true,'the first page no longer opens the changed lock');
   await lockedError(()=>store.exportPrivate(first.public_key),/Unlock/);await rejects(()=>store.unlock(phrase),/Wrong passphrase/);
   equal(reloaded.lock().wallet_locked,true);await lockedError(()=>reloaded.exportPrivate(first.public_key),/Unlock/);
@@ -523,9 +534,24 @@ async function passphraseLock(f) {
     await new Promise(resolve=>setTimeout(resolve,60));equal(s.snapshot().wallet_locked,true,'a late timer cannot keep an idle key open');
     await s.unlock(changedPhrase);await new Promise(resolve=>setTimeout(resolve,60));timers.at(-1).fn();equal(changes.at(-1),true,'the timer locks the page and says so');
   }
-  // Removing the passphrase restores the original unencrypted layout.
+  // Lock now reaches every page of this site that holds the passphrase open.
   {
-    await legacy.unlock(changedPhrase);const removed=await legacy.removePassphrase({wallet_revision:legacy.snapshot().wallet_revision});
+    const one=browser(a.profile).api.createStore(chain),two=browser(a.profile).api.createStore(chain),changes=[];
+    two.onLockChange(snapshot=>changes.push(snapshot.wallet_locked));
+    await one.unlock(changedPhrase);await two.unlock(changedPhrase);equal(two.snapshot().wallet_locked,false);
+    equal(one.lock().wallet_locked,true);await new Promise(resolve=>setTimeout(resolve,5));
+    equal(two.snapshot().wallet_locked,true,'another page holding the passphrase locks too');equal(changes.at(-1),true,'and says so');
+    await lockedError(()=>two.exportPrivate(first.public_key),/Unlock/);
+    one.destroy();two.destroy();
+  }
+  // Removing the passphrase restores the original unencrypted layout. It
+  // needs the current passphrase, not only an unlocked page.
+  {
+    await legacy.unlock(changedPhrase);
+    await rejects(()=>legacy.removePassphrase({wallet_revision:legacy.snapshot().wallet_revision}),/current wallet passphrase/);
+    await rejects(()=>legacy.removePassphrase({wallet_revision:legacy.snapshot().wallet_revision},phrase),/Wrong current passphrase/);
+    ok(stored().lock&&!text().includes(f.secret),'a refused removal keeps every key sealed');
+    const removed=await legacy.removePassphrase({wallet_revision:legacy.snapshot().wallet_revision},changedPhrase);
     equal(removed.wallet_encrypted,false);equal(removed.wallet_locked,false);equal(Object.keys(stored()).join(),plainLayout);
     ok(stored().wallets.every(w=>!Object.hasOwn(w,'sealed_key')));ok(text().includes(f.secret));equal(await legacy.exportPrivate(first.public_key),f.secret);
     await rejects(()=>legacy.unlock(changedPhrase),/no passphrase/);

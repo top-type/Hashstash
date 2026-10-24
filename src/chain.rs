@@ -153,7 +153,9 @@ pub enum HeaderParent {
 pub enum HeaderHold {
     /// Its block is already validated and stored.
     Stored,
-    /// Held; its chain does not claim more work than the tip.
+    /// Held without admission: its chain does not claim more work than the
+    /// tip, or leaves an admitted chain below its best header without
+    /// claiming more work than every admitted chain.
     Held,
     /// Held, and its chain claimed more work than the tip: its blocks are
     /// validated without the side-branch admission policy.
@@ -240,6 +242,8 @@ thread_local! {
         const { RefCell::new(None) };
     /// Commits of admitted held headers on this thread.
     pub(crate) static HELD_COMMITS: Cell<usize> = const { Cell::new(0) };
+    /// Stored headers read from the header index on this thread.
+    pub(crate) static HEADER_READS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Digest of the running executable. A saved checkpoint is used only by the
@@ -478,6 +482,10 @@ struct HeldHeader {
     /// Headers held after an admitted parent since its chain was admitted
     /// or restored, this one included; zero for others.
     lead: u32,
+    /// For a header that is not admitted, the admitted header its chain was
+    /// last found to leave (`HeldHeaders::admits_after`), so a later search
+    /// starts there instead of walking the chain again.
+    below: Option<Hash>,
 }
 impl HeldHeader {
     fn evictable(&self) -> bool {
@@ -684,6 +692,48 @@ impl HeldHeaders {
             cursor = held.header.previous;
         }
         cost
+    }
+    /// Whether a chain whose header after `hash` claims `claimed` work may be
+    /// admitted. An admitted chain is extended only from its best header: a
+    /// branch that leaves an admitted chain below an admitted header that
+    /// already has an admitted child must claim more work than every
+    /// admitted chain. Siblings fanned out inside admitted chains therefore
+    /// each raise the best claimed work, instead of one admitted chain taking
+    /// a new admitted sibling for every cheap header.
+    ///
+    /// The search for the admitted header a chain leaves remembers what it
+    /// found on the headers it walked, so a chain that keeps growing below an
+    /// admitted chain without being admitted is not walked again for each
+    /// header. A remembered header that is no longer admitted is walked
+    /// past; one that has gained an admitted header below it since only
+    /// answers more strictly, as it is no admitted chain's best header.
+    fn admits_after(&mut self, hash: &Hash, claimed: &Amount) -> bool {
+        let mut cursor = *hash;
+        let mut walked = Vec::new();
+        let left = loop {
+            let Some(held) = self.headers.get(&cursor) else {
+                break None;
+            };
+            if held.admitted {
+                break Some(cursor);
+            }
+            if let Some(below) = held.below
+                && self.admitted(&below)
+            {
+                break Some(below);
+            }
+            walked.push(cursor);
+            cursor = held.header.previous;
+        };
+        let Some(left) = left else {
+            return true;
+        };
+        for hash in walked {
+            if let Some(held) = self.headers.get_mut(&hash) {
+                held.below = Some(left);
+            }
+        }
+        self.admitted_tip(&left) || self.tips.last().is_none_or(|(best, _)| claimed > best)
     }
     /// Pin a held header to a header download, once per download.
     fn pin(&mut self, hash: Hash, pin: u64) {
@@ -2392,12 +2442,16 @@ impl Chain {
     /// Hold a header without its block, so its branch can still be presynced
     /// from peers. Held headers are never executed. A chain that claims more
     /// work than the tip is admitted, proven by proof of work alone; its
-    /// headers are persisted and its bodies validated when they arrive. A
+    /// headers are persisted and its bodies validated when they arrive. One
+    /// that leaves an admitted chain below that chain's best header is
+    /// admitted only once it claims more work than every admitted chain
+    /// (`HeldHeaders::admits_after`), and is held as presync until then. A
     /// nonzero `pin` keeps the header for that header download. A header
     /// that would make more than MAX_SYNC_HEADERS pinned or admitted is not
     /// held.
     fn hold(&mut self, hash: Hash, held: HeldHeader, pin: u64) -> Result<HeaderHold> {
-        let overtakes = held.claimed > self.tip_entry.work;
+        let overtakes = held.claimed > self.tip_entry.work
+            && self.held.admits_after(&held.header.previous, &held.claimed);
         let cost = usize::from(pin != 0 || overtakes)
             + if overtakes {
                 self.held.admission_cost(&held.header.previous)
@@ -2623,6 +2677,7 @@ impl Chain {
                 admitted: false,
                 pins: 0,
                 lead,
+                below: None,
             },
             pin,
         )
@@ -2658,6 +2713,8 @@ impl Chain {
     /// A stored block's header, from the header index without its body. A
     /// header reply reads thousands, so they bypass the metadata cache.
     pub fn block_header(&self, hash: &Hash) -> Result<Option<Header>> {
+        #[cfg(test)]
+        HEADER_READS.with(|count| count.set(count.get() + 1));
         Ok(Self::read_entry(&self.db, hash)?.map(|entry| entry.header.clone()))
     }
     /// The locator entry for a peer download cursor: a stored block, a held
@@ -2699,6 +2756,19 @@ impl Chain {
     #[cfg(test)]
     pub(crate) fn forget_held_header(&mut self, hash: &Hash) {
         self.held.remove_branch(hash);
+    }
+    /// Make header index reads of uncached entries fail, as a damaged
+    /// database would, or work again.
+    #[cfg(test)]
+    pub(crate) fn break_header_index(&self, broken: bool) {
+        let (from, to) = if broken {
+            ("entry_index", "entry_index_broken")
+        } else {
+            ("entry_index_broken", "entry_index")
+        };
+        self.db
+            .execute_batch(&format!("ALTER TABLE {from} RENAME TO {to}"))
+            .unwrap();
     }
     /// Drop admitted held chains whose best header now claims less work than
     /// the tip by more than CAPACITY_BRANCH_MARGIN_BLOCKS next-block works:
@@ -2780,6 +2850,7 @@ impl Chain {
                         admitted: false,
                         pins: 0,
                         lead: 0,
+                        below: None,
                     },
                 )))
             })();
@@ -3124,6 +3195,7 @@ impl Chain {
                 admitted: false,
                 pins: 0,
                 lead: 0,
+                below: None,
             },
             0,
         )?;
@@ -4400,6 +4472,7 @@ mod cache_tests {
             admitted: false,
             pins: 0,
             lead: 0,
+            below: None,
         }
     }
     fn held_id(prefix: u8, n: u32) -> Hash {
@@ -4470,6 +4543,40 @@ mod cache_tests {
                 .iter()
                 .all(|(_, hash)| held.headers[hash].evictable())
         );
+    }
+    #[test]
+    fn a_chain_below_an_admitted_header_waits_for_more_work_and_is_searched_once() {
+        let mut held = HeldHeaders::default();
+        let work = |amount: u32| Amount::from(amount);
+        // An admitted chain of ten headers whose best claims 100.
+        let mut previous = ZERO_HASH;
+        for n in 0..10 {
+            held.insert(
+                held_id(1, n),
+                held_header(previous, n as u64 + 1, 10 * (n + 1)),
+            );
+            previous = held_id(1, n);
+        }
+        held.admit(&held_id(1, 9));
+        // Its best header is extended; a header inside it only by a chain
+        // claiming more work than every admitted chain.
+        assert!(held.admits_after(&held_id(1, 9), &work(101)));
+        assert!(!held.admits_after(&held_id(1, 4), &work(100)));
+        assert!(held.admits_after(&held_id(1, 4), &work(101)));
+        // A long chain held below the fifth header: one search from its end
+        // finds that header and remembers it on every header it passed.
+        let mut previous = held_id(1, 4);
+        for n in 0..1000 {
+            held.insert(held_id(2, n), held_header(previous, 6 + n as u64, 1));
+            previous = held_id(2, n);
+        }
+        assert!(!held.admits_after(&held_id(2, 999), &work(100)));
+        assert!((0..1000).all(|n| held.headers[&held_id(2, n)].below == Some(held_id(1, 4))));
+        assert!(held.admits_after(&held_id(2, 500), &work(101)));
+        // Once the fifth header's block is stored it leaves the held set; the
+        // chain then leaves validated history and may be admitted.
+        held.remove(&held_id(1, 4));
+        assert!(held.admits_after(&held_id(2, 999), &work(100)));
     }
     #[test]
     fn held_headers_stay_pinned_until_every_download_holding_them_ends() {

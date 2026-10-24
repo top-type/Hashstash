@@ -496,6 +496,9 @@ impl Record {
         limited(reason, wait.map(|wait| wait.max(cooling)))
     }
 }
+/// Peer frames decoded at once, inbound or outbound: each builds its decoded
+/// message beside the frame's bytes. The node runs this many peer parsers.
+pub const PEER_DECODERS: usize = 2;
 /// Incoming frame bytes buffered by inbound sessions.
 #[derive(Default)]
 struct FrameMemory {
@@ -504,6 +507,19 @@ struct FrameMemory {
     shared: u64,
     /// Shared bytes held by each network group.
     groups: HashMap<IpAddr, u64>,
+    /// Frames being decoded, whose messages are built beside their bytes.
+    decoding: u64,
+}
+/// A frame being decoded (`Session::decoding`); dropping it ends that.
+pub struct FrameDecoding {
+    guard: Arc<NetworkGuard>,
+    bytes: u64,
+}
+impl Drop for FrameDecoding {
+    fn drop(&mut self) {
+        let mut memory = accounting(&self.guard.frame_memory);
+        memory.decoding = memory.decoding.saturating_sub(self.bytes);
+    }
 }
 #[derive(Default)]
 pub struct NetworkGuard {
@@ -565,6 +581,15 @@ impl NetworkGuard {
             policy.work_burst = policy
                 .work_burst
                 .max(self.max_peer_work.load(Ordering::Relaxed));
+            // One synchronization session charges one address record for a
+            // largest frame each way, its reply and its push, and a peer
+            // synchronizes about once a second. Once two such frames exceed
+            // the baseline, the record's burst holds both and its refill
+            // rate renews them every second, so honest peers keep up with
+            // the governed capacity.
+            let session = frame.saturating_mul(2);
+            policy.bytes = policy.bytes.max(session);
+            policy.byte_burst = policy.byte_burst.max(session);
         }
         policy
     }
@@ -681,23 +706,41 @@ impl NetworkGuard {
         }
         Ok(())
     }
-    /// The node-wide frame budget; the part that sessions other than
-    /// configured or pinned peers may share, which leaves one largest frame
-    /// to those peers; and one network group's limit within that share. Half
-    /// the general slots' groups can each buffer one largest frame at once,
-    /// so one group can hold at most a quarter of the shared part.
+    /// The node-wide budget for buffered frames; the part that sessions
+    /// other than configured or pinned peers may share, which leaves one
+    /// largest frame to those peers; and one network group's limit within
+    /// that share. Half the general slots' groups can each buffer one largest
+    /// frame at once, so one group can hold at most a quarter of the shared
+    /// part. The whole frame memory budget also keeps one largest frame for
+    /// each of the PEER_DECODERS frames being decoded, whose messages are
+    /// built beside their buffered bytes: that reserve is not part of the
+    /// buffered budget returned here.
     fn frame_memory_limits(&self) -> (u64, u64, u64) {
+        let (total, decoding) = self.frame_memory_budget();
         let frame = self.max_frame_bytes.load(Ordering::Relaxed);
         let groups = (INBOUND_PEER_SLOTS / PEER_SLOTS_PER_GROUP) as u64;
-        let total = PEER_FRAME_MEMORY.max(frame.saturating_mul(groups / 2 + 1));
-        let shared = total.saturating_sub(frame);
-        (total, shared, frame.max(shared / groups))
+        let buffered = total.saturating_sub(decoding);
+        let shared = buffered.saturating_sub(frame);
+        (buffered, shared, frame.max(shared / groups))
+    }
+    /// The whole frame memory budget and its reserve for decoding frames.
+    fn frame_memory_budget(&self) -> (u64, u64) {
+        let frame = self.max_frame_bytes.load(Ordering::Relaxed);
+        let groups = (INBOUND_PEER_SLOTS / PEER_SLOTS_PER_GROUP) as u64;
+        let decoding = frame.saturating_mul(PEER_DECODERS as u64);
+        let total = PEER_FRAME_MEMORY.max(
+            frame
+                .saturating_mul(groups / 2 + 1)
+                .saturating_add(decoding),
+        );
+        (total, decoding)
     }
     /// The current largest validated frame, which sets the one-frame byte
-    /// burst and the frame memory budget. An increase extends existing
-    /// records' bursts at once; a decrease lowers them again, clamping
-    /// records' byte tokens to the new bursts. Throughput, connection,
-    /// request and work quotas remain local policy.
+    /// burst, the peer byte burst and refill of two frames, and the frame
+    /// memory budget. An increase extends existing records' bursts at once;
+    /// a decrease lowers them again, clamping records' byte tokens to the
+    /// new bursts. Other throughput, connection, request and work quotas
+    /// remain local policy.
     pub fn set_frame(&self, maximum: usize) -> Result<()> {
         let maximum = u64::try_from(maximum)?;
         let previous = self.max_frame_bytes.swap(maximum, Ordering::Relaxed);
@@ -926,9 +969,11 @@ impl NetworkGuard {
     pub fn tracked_addresses(&self) -> usize {
         accounting(&self.records).len()
     }
+    /// Frame memory buffered or held by frames being decoded.
     #[cfg(test)]
     pub fn frame_memory_in_use(&self) -> u64 {
-        accounting(&self.frame_memory).total
+        let memory = accounting(&self.frame_memory);
+        memory.total + memory.decoding
     }
 }
 impl Session {
@@ -989,9 +1034,11 @@ impl Session {
     /// actually sent. A configured or pinned peer can always buffer one
     /// largest frame; other sessions share the rest, at most one largest frame
     /// or an equal share of the general slots per network group. The
-    /// reservation also covers decoding and processing of that message and is
-    /// released once that is done (`frame_processed`), or by the session's
-    /// next frame or its close. Connections this node opened are bounded
+    /// reservation also covers the decoded message, once the frame's bytes
+    /// are gone, while it is processed, and is released once that is done
+    /// (`frame_processed`), or by the session's next frame or its close;
+    /// while the frame is decoded, `decoding` accounts the message built
+    /// beside its bytes. Connections this node opened are bounded
     /// separately and never wait on inbound traffic.
     pub fn reserve_frame(&self, bytes: usize) -> Result<()> {
         if self.key.2 == Direction::Outbound {
@@ -1024,6 +1071,20 @@ impl Session {
         }
         *held += bytes;
         Ok(())
+    }
+    /// Account a frame of `bytes` being decoded, inbound or outbound: its
+    /// message is built beside the frame's bytes, which a reservation keeps
+    /// until the message has been processed. At most PEER_DECODERS frames
+    /// decode at once, within the reserve the frame memory budget keeps for
+    /// them, so this never refuses. Dropping the result ends it.
+    pub fn decoding(&self, bytes: usize) -> FrameDecoding {
+        let bytes = bytes as u64;
+        let mut memory = accounting(&self.guard.frame_memory);
+        memory.decoding = memory.decoding.saturating_add(bytes);
+        FrameDecoding {
+            guard: self.guard.clone(),
+            bytes,
+        }
     }
     fn release_frame(&self, memory: &mut FrameMemory, held: u64) {
         memory.total = memory.total.saturating_sub(held);
@@ -2221,6 +2282,9 @@ mod tests {
             .unwrap();
         let expanded = 100 * 1024 * 1024;
         guard.set_frame(expanded).unwrap();
+        // A peer's burst holds a session's two largest frames, its reply and
+        // its push; spend both.
+        assert!(peer.bytes(expanded).is_ok());
         assert!(peer.bytes(expanded).is_ok());
         guard.set_frame(expanded).unwrap();
         assert!(
@@ -2233,17 +2297,32 @@ mod tests {
         const FRAME: usize = 97 * 1024 * 1024;
         let guard = Arc::new(NetworkGuard::with_frame_limit(FRAME));
         let ip = "127.0.0.1".parse().unwrap();
+        // One synchronization session's two largest frames, a reply and a
+        // push, fit a peer's burst, and its refill renews them each second.
         let peer = guard.admit(ip, Surface::Peer).unwrap();
         assert!(peer.bytes(FRAME).is_ok());
+        assert!(peer.bytes(FRAME).is_ok());
         assert!(peer.bytes(FRAME).is_err());
+        assert_eq!(guard.policy(Surface::Peer).bytes, 2 * FRAME as u64);
         assert_eq!(
-            guard.policy(Surface::Peer).bytes,
-            Surface::Peer.policy().bytes
+            guard.policy(Surface::Rpc).bytes,
+            Surface::Rpc.policy().bytes
         );
+        assert_eq!(guard.policy(Surface::Rpc).byte_burst, FRAME as u64);
         assert_eq!(guard.policy(Surface::Peer).connections, 4);
         assert_eq!(guard.policy(Surface::Stratum).byte_burst, 2 * 1024 * 1024);
         let old = Arc::new(NetworkGuard::default());
         assert!(old.admit(ip, Surface::Peer).unwrap().bytes(FRAME).is_err());
+        // Below the baseline nothing changes.
+        let small = Arc::new(NetworkGuard::with_frame_limit(3 * 1024 * 1024));
+        assert_eq!(
+            small.policy(Surface::Peer).bytes,
+            Surface::Peer.policy().bytes
+        );
+        assert_eq!(
+            small.policy(Surface::Peer).byte_burst,
+            Surface::Peer.policy().byte_burst
+        );
     }
     #[test]
     fn rpc_raw_transaction_exception_does_not_relax_other_fields() {
@@ -3342,7 +3421,8 @@ mod tests {
             .unwrap();
         guard.set_frame(100 * MIB).unwrap();
         assert!(guard.frame_memory_limits().0 > baseline.0);
-        assert_eq!(guard.policy(Surface::Peer).byte_burst, 100 * MIB as u64);
+        // A peer's burst holds a session's two largest frames.
+        assert_eq!(guard.policy(Surface::Peer).byte_burst, 200 * MIB as u64);
         // When the validated capacity falls again, so do the frame budget,
         // the one-frame byte burst and tokens already held above it.
         guard.set_frame(0).unwrap();
@@ -3368,7 +3448,38 @@ mod tests {
         // A raise extends the burst again, refilling held tokens at once.
         guard.set_frame(100 * MIB).unwrap();
         let records = guard.records.lock().unwrap();
-        assert_eq!(records[&address].bytes.tokens, 100 * MIB as u64);
+        assert_eq!(records[&address].bytes.tokens, 200 * MIB as u64);
+    }
+    #[test]
+    fn frames_being_decoded_are_accounted_within_the_frame_memory_budget() {
+        const MIB: usize = 1024 * 1024;
+        const FRAME: u64 = 100 * MIB as u64;
+        let guard = Arc::new(NetworkGuard::with_frame_limit(FRAME as usize));
+        // The budget keeps one largest frame for each decoding worker beside
+        // the five that buffered frames may hold: a decoded message exists
+        // beside its frame's bytes until decoding ends.
+        let (total, reserve) = guard.frame_memory_budget();
+        assert_eq!(reserve, PEER_DECODERS as u64 * FRAME);
+        assert_eq!(total, 5 * FRAME + reserve);
+        assert_eq!(guard.frame_memory_limits().0, 5 * FRAME);
+        let session = guard
+            .admit("8.1.1.1".parse().unwrap(), Surface::Peer)
+            .unwrap();
+        session.begin_frame().unwrap();
+        session.reserve_frame(MIB).unwrap();
+        let decoding = session.decoding(MIB);
+        assert_eq!(guard.frame_memory_in_use(), 2 * MIB as u64);
+        // Decoding ends with its worker; the frame's reservation remains for
+        // the decoded message until it has been processed.
+        drop(decoding);
+        assert_eq!(guard.frame_memory_in_use(), MIB as u64);
+        session.frame_processed();
+        assert_eq!(guard.frame_memory_in_use(), 0);
+        // At the baseline the 64 MiB budget includes the reserve.
+        let small = Arc::new(NetworkGuard::with_frame_limit(3 * MIB));
+        let (total, reserve) = small.frame_memory_budget();
+        assert_eq!((total, reserve), (PEER_FRAME_MEMORY, 6 * MIB as u64));
+        assert_eq!(small.frame_memory_limits().0, total - reserve);
     }
     #[test]
     fn a_slow_maximal_frame_from_one_group_does_not_block_another_groups_frame() {

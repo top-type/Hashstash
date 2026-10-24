@@ -72,8 +72,49 @@ The [local testnet guide](TESTNET.md) describes creating a disposable three-node
 | [test_load.py](../scripts/test_load.py) | Transaction waves, occupancy and conservation; takes a fixture manifest, required report path and bounded workload options |
 | [test_stratum_wire.py](../scripts/test_stratum_wire.py) | Stratum protocol scenarios using an explicitly selected node executable and report path |
 | [test_wallet_adversarial.py](../scripts/test_wallet_adversarial.py) | Wallet and cold-signer rejection scenarios; select the rebuilt executables, disposable directory, unused ports and report path |
+| [soak.py](../scripts/soak.py) | Long chaos soak on a network it starts itself; takes a `test-fixtures` executable, report path, duration, node count, seed and base port (see [Chaos soak](#chaos-soak)) |
 
 Read each program's `--help` before running it. Pass explicit paths for generated reports and fixture directories. Use a fresh fixture for independent scenarios whose setup expects an empty chain. Stop test nodes through their owning launcher and manifest when finished.
+
+## Chaos soak
+
+[soak.py](../scripts/soak.py) runs a long randomized workload against a network it creates and owns, while it kills, restarts and partitions the nodes. Unlike the manifest-driven programs above, it starts its own nodes and never connects to an existing network. It needs only Python's standard library and a `test-fixtures` executable. Run it on Linux or WSL; it uses `SIGKILL`, `SIGINT`, `/proc` and loopback aliases.
+
+```bash
+cargo build --release --locked --features test-fixtures --target-dir target/fixtures --bin hashstash
+python3 scripts/soak.py --binary target/fixtures/release/hashstash \
+  --duration 30m --nodes 5 --seed 1 --base-port 47480 --report soak-report.json
+```
+
+The run directory (a new temporary directory, or `--workdir`) holds a `network.json` derived from `config/testnet.json` with `test_work: true`, a unique network name and a low difficulty floor (`--initial-bits`, about 4096 expected hashes per block). Mining every `--block-interval` seconds is faster than the 15-second target, so the timestamp adjustment (anchored at block 1) raises difficulty by about one half-life every 70 blocks; once a block needs more than `--max-block-hashes`, the harness mines only at the target interval, which stops the climb. At the defaults that point comes near the end of a 30-minute run; longer runs then slow to the target interval unless `--block-interval` is raised. Node *i* listens on `base+10i` (RPC), `+1` (peer) and `+2` (Stratum). Every directed peer link goes through a harness proxy on the next port block, and node *i* dials from its own address `127.0.0.(11+i)`, so partitions cut exact links and each peer has its own admission accounting. The directory, including databases and node logs, is removed after a passing run unless `--keep` or `--workdir` is given, and kept after a failure.
+
+The workload signs transactions locally with BIP340 (checked first against `tests/data/bip340.csv`) after the node prepares their bodies, and broadcasts some to a different node than the one that prepared them. Python unit discovery runs [test_soak.py](../scripts/test_soak.py), which checks that signer and the harness's body patching against the independent encoder in `chain_activity.py`. The workload covers:
+
+- transfers between seeded wallets and up to `--max-accounts` newly created accounts, with chat text and structurally valid encrypted-mail envelopes as transaction data;
+- deposits and redeems at rest and in both PASS and FAIL during decisions, with a seeded favorite side per decision;
+- grant proposals (most asking for all waiting revenue plus part of reserve, so a winning grant bends the PASS curve and trading can decide it; some unfundable), safe parameter proposals, support and refunds during auctions;
+- same-nonce fee bumps and underbids of still-pooled transactions;
+- submissions that are invalid by construction: random and truncated bytes, trailing bytes, corrupted or wrong-key signatures, far-future nonces, unknown anchors, zero lifetimes; plus overspends, stale replays, blocks re-mined with valid proof of work but invalid bodies, and malformed RPC requests.
+
+Mining moves randomly between nodes about every `--block-interval` seconds. Chaos events come from a shuffled deck so every type recurs: `kill -9` and restart (checkpoint and history replay), `kill -9` inside a multi-block mining burst, isolation of one node, a split into two groups (sometimes killing a node inside one), a graceful stop followed by a restart with a random subset of peers, `kill -9` of every node at once, and malformed peer input from a separate address. After each heal or restart, and every `--converge-interval` seconds, mining pauses until all nodes agree.
+
+| Check | What must hold |
+| --- | --- |
+| `conservation` | In each world, tracked account hashes + reserve + revenue + grant escrow + auction escrow = issued, for every new tip on every node (one atomic `snapshot` per 256 keys) |
+| `share_conservation`, `share_supply` | Tracked shares equal the world's account shares, which equal its curve shares |
+| `curve_bounds`, `grant_capacity`, `fail_world_grant_escrow`, `snapshot_consistency` | Reserve within curve mass and zero together; capacity = revenue + reserve − 1; no FAIL grant escrow; status and governance agree within one snapshot |
+| `convergence`, `explorer_ready` | All running nodes reach one tip and state root within `--converge-timeout`, and each explorer index reaches its tip within `--explorer-timeout`. Mining pauses meanwhile; because nodes keep the first-seen of equal-work tips, competing tips at the top height get one tie-breaking block every `--tie-break-after` seconds |
+| `restart_ready`, `restart_durability`, `graceful_shutdown`, `node_alive` | Nodes answer RPC within `--start-timeout`, keep every block they reported before `kill -9`, exit 0 on Ctrl+C, and never exit on their own |
+| `mempool_*` | Pooled transactions hash to their IDs, have unique sender nonces continuing the account nonce, have live anchors on the active branch, fit one block and include no invalid submission |
+| `garbage_rejected`, `garbage_block_rejected`, `fee_replacement`, `rpc_garbage_survived`, `peer_garbage_survived` | Invalid-by-construction input is rejected, a replaced fee never pools beside its replacement, and malformed input never stops a node |
+| `transaction_id`, `prepared_body` | Returned IDs match the signed bytes; prepared bodies keep the requested sender and lifetime |
+| `node_log_clean` | No panic, `ERROR`, `Error:`, fatal or "unavailable" lines in node output |
+| `rpc_latency`, `rpc_available` | Every `--probe-interval` seconds, from a separate loopback address, `status` (published snapshot) and genesis `getblock` (main state lock) answer within `--max-rpc-latency`, detecting read-path and lock stalls |
+| `rss_bound`, `rss_growth`, `disk_bound`, `disk_per_block` | Memory and data-directory size stay within the `--max-*` bounds |
+
+The JSON report has `passed`, every check's count and violations, each violation with its node, tip and the preceding chaos and transaction events, the chaos timeline with convergence times, reorganization depths, governance coverage (phases, decisions, settings changes), workload counts by kind with rejections grouped by node error, RPC latency percentiles, and per-node restarts, memory and disk. The process exits non-zero on any violation or harness error. Rejections of valid-looking transactions are expected under forks, expiries and cross-node submission (reported with a `cross-node` suffix); they are counted, not failed.
+
+The seed fixes keys and every randomized choice of the workload, miner and chaos schedules; thread timing is not deterministic, so reproduce a failure with the report's `reproduce.command` and, if needed, several runs or a longer duration. Linux's default ephemeral port range (32768–60999) includes the default ports, so a restarting node can find its port briefly held by a client socket; the harness retries that start and counts it under `workload.environment`. Conservation relies on the harness creating every account; it is meaningful only on the network the harness started. A passing soak covers the exercised schedules on one machine; it does not establish behavior under real network latency, adversarial peers at scale or production issuance.
 
 PowerShell launcher tests are separate from Rust, JavaScript and Python unittest discovery. They cover process ownership, configuration and startup/shutdown behavior; inspect their inputs and run them only in a disposable local environment. Linux shell and service-installation checks likewise require the intended platform. Report unrun platform checks as unrun.
 

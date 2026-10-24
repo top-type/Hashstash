@@ -19,7 +19,7 @@ node fuzz/js/mail_envelope.cjs
 
 The Rust command runs library, binary and integration tests. Some tests launch temporary local nodes or exercise large grant lists and can take several minutes. Keep the complete output: a total from one test executable is not the total for the all-target run. Unit tests that need accelerated test funding are reported as ignored without `test-fixtures`, and fixture-only integration tests are skipped; the second command runs them.
 
-The shipped release profile keeps overflow checks but compiles out `debug_assert!`, which guards invariants such as a held header entering the held-header store unadmitted and unpinned. The debug-profile commands above check them; so does the release profile with debug assertions turned on, which finishes sooner:
+The shipped release profile keeps overflow checks but compiles out `debug_assert!`, which guards internal invariants such as a wallet backup's fixed length. The debug-profile commands above check them; so does the release profile with debug assertions turned on, which finishes sooner:
 
 ```text
 CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo test --release --all-targets --locked --features test-fixtures --target-dir target/debug-assertions
@@ -33,7 +33,7 @@ corepack pnpm install --frozen-lockfile
 corepack pnpm run check
 ```
 
-Release binaries for Linux servers come from `bash scripts/release.sh --verify` on the validated commit: a normal build (never `test-fixtures`) with `--locked`, the pinned toolchain and remapped build paths, rebuilt from scratch and compared byte for byte, with `SHA256SUMS` and `BUILDINFO` written beside the binaries. A second builder with the same Rust and C compiler versions must obtain the same `SHA256SUMS` ([launch runbook](LAUNCH.md#2-build-and-pin-the-release)).
+Release binaries for Linux servers come from `bash scripts/release.sh --verify` on the validated commit: a normal build (never `test-fixtures`) with `--locked`, the pinned toolchain and remapped build paths, rebuilt from scratch and compared byte for byte, with `SHA256SUMS` and `BUILDINFO` written beside the binaries. A second builder with the same Rust and C compiler versions must obtain the same `SHA256SUMS` ([launch runbook](LAUNCH.md#2-build-and-pin-the-release)). Before launch, that commit also needs a green run of the full continuous-integration gate, recorded under [release gate](#release-gate).
 
 Formatting needs the `rustfmt` component and Clippy the `clippy` component of the same toolchain. A newer Clippy can add lints that `-D warnings` denies, so record the toolchain with the results; continuous integration pins the one the gate was last recorded with.
 
@@ -81,7 +81,7 @@ The executable tests and their assertions define the coverage. Public fixture ke
 
 ## Fuzzing
 
-Each parser of hostile input has a fuzz target in [`fuzz/src/lib.rs`](../fuzz/src/lib.rs). Besides the absence of panics, each target checks invariants: one encoding per decoded value, agreement between the peer preflight and the consensus codec, agreement between the bounded JSON parsers, the discovery address book's bounds, and that read-only RPC methods leave the node unchanged.
+Each parser of hostile input has a fuzz target in [`fuzz/src/lib.rs`](../fuzz/src/lib.rs), and so does synchronization from a hostile peer. Besides the absence of panics, each target checks invariants: one encoding per decoded value, agreement between the peer preflight and the consensus codec, agreement between the bounded JSON parsers, the discovery address book's bounds, that read-only RPC methods leave the node unchanged, and that after synchronizing from a hostile peer a node's tip is its active block and a replay of its active chain reaches the same state root.
 
 | Target | Input |
 | --- | --- |
@@ -96,6 +96,7 @@ Each parser of hostile input has a fuzz target in [`fuzz/src/lib.rs`](../fuzz/sr
 | `mail_envelope`, `plain_text` | Encrypted-mail envelopes, chat text and proposal rationale in transaction data |
 | `address_book` | Discovery gossip into the peer address book, and the book's saved form |
 | `stratum_session` | Everything a miner sends on one mining connection: line framing, subscribe and authorize, `mining.configure` with version rolling and minimum difficulty, difficulty suggestions and share submissions, on a fixture node. Replies must be JSON lines, and a closed session must leave no worker registered |
+| `peer_sync` | The replies of a peer that a fixture node synchronizes from over loopback, each session from another loopback address: header replies into the held-header store with its download pins, then a block batch and its validation, from seeds that extend the chain, reorganize it to a heavier branch from genesis, or withhold blocks, deliver part of a branch, and repeat or reverse headers. Each request the node sends must decode canonically; afterwards its tip must be its active block, and a changed tip must match a replay of the active chain in a fresh node |
 
 The ordinary Rust suite runs each target from its fixed seeds and kept regressions for a fixed number of mutated inputs ([stable runner](../tests/fuzz_parsers.rs)), keeping inputs whose outcome is new, replays every input kept under `fuzz/regressions/`, and sends mutated Stratum lines and HTTP requests through live listeners. It never reads a libFuzzer corpus, which is local and untracked, so its runs are the same on every machine. A longer run on the stable toolchain, which also starts from any corpus under `HASHSTASH_FUZZ_CORPUS` (default `fuzz/corpus`):
 
@@ -105,7 +106,7 @@ HASHSTASH_FUZZ_SECONDS=600 cargo test --release --features test-fixtures --test 
 
 `HASHSTASH_FUZZ_TARGETS` selects targets by name, separated by commas, and `HASHSTASH_FUZZ_SEED` repeats a run. A failing input is saved in hexadecimal under `HASHSTASH_FUZZ_ARTIFACTS`, by default in the system temporary directory. Once its cause is fixed, keep the input as `fuzz/regressions/<target>/<name>.hex`, with a `#` comment saying what it found, and add a named regression test.
 
-Coverage-guided fuzzing uses cargo-fuzz and libFuzzer on a nightly toolchain; these are the dated nightly and the cargo-fuzz version continuous integration pins. Copying the lockfile keeps shared dependencies at the versions the node ships with; the stable runner writes the seed corpora; `--debug-assertions` also checks the invariants the shipped build compiles out:
+Coverage-guided fuzzing uses cargo-fuzz and libFuzzer on a nightly toolchain; these are the dated nightly and the cargo-fuzz version continuous integration pins. Copying the lockfile keeps shared dependencies at the versions the node ships with, and `fuzz/Cargo.toml` pins `libfuzzer-sys` exactly; the stable runner writes the seed corpora; `--debug-assertions` also checks the invariants the shipped build compiles out:
 
 ```text
 rustup toolchain install nightly-2026-10-10 --profile minimal
@@ -140,7 +141,7 @@ The full gate also gives each fuzz target its own job: 15 minutes of libFuzzer, 
 
 Every action is pinned to a full commit and every toolchain and installed tool to an exact version: Rust 1.97.1; for libFuzzer, nightly-2026-10-10 and cargo-fuzz 0.13.2; for the bundle rebuild, the pnpm in `scripts/browser-crypto/package.json`, which corepack checks against its hash. A moved tag or branch upstream therefore cannot change what a run executes. [`test_ci_workflow.py`](../scripts/test_ci_workflow.py), which unittest discovery runs, checks these rules, the one-command PowerShell steps, and that every standalone test program and launcher test runs in a job.
 
-The workflow runs the Rust suites with `--release`, the shipped profile, which keeps overflow checks and compiles out debug assertions. Two exist: `HeldHeaders::insert` in `src/chain.rs` requires an unadmitted, unpinned header, and `src/wallet_store.rs` checks a wallet backup's fixed length. The debug-assertions job and every fuzz build, libFuzzer and the stable runner alike, turn them on.
+The workflow runs the Rust suites with `--release`, the shipped profile, which keeps overflow checks and compiles out `debug_assert!`; `grep -rn debug_assert src` lists the invariants that only those check. The debug-assertions job and every fuzz build, libFuzzer and the stable runner alike, turn them on.
 
 ### Release gate
 
@@ -151,7 +152,7 @@ The network launches from one commit. That exact commit needs a green run of the
 | Release commit | Not yet chosen |
 | Full-gate run | Not yet run |
 
-As of 2026-10-24 the workflow has never run on GitHub: the repository's only branch is `main` at `cfaaeb8`, which has no workflow, and `audit-fixes` has not been pushed. Every result below is a local run. To run the gate on the release commit:
+As of 2026-10-25 the workflow has never run on GitHub: the repository's only branch is `main` at `cfaaeb8`, which has no workflow, and `audit-fixes` has not been pushed. Every result below is a local run. To run the gate on the release commit:
 
 1. Push the release branch. Its push and pull-request runs cover every job except the per-target fuzz jobs and the network suites.
 2. Push a `release/<version>` branch, or the release tag, at the release commit. That run is the full gate on that commit.

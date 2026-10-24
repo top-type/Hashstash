@@ -104,8 +104,9 @@ The coinbase height push, the canonical codec and the pinned `bincode`, `serde` 
 
 ### Validation
 
-- Continuous integration (`.github/workflows/ci.yml`): formatting, Clippy in both configurations, Linux and Windows suites, frontend and Python checks, nightly network suites, and fuzzing.
-- Fourteen coverage-guided fuzz targets over every parser of hostile input, a stable seeded runner in the test suite, and kept regression inputs.
+- Continuous integration (`.github/workflows/ci.yml`): formatting, Clippy in both configurations, Linux and Windows suites, frontend and Python checks, a test pass with debug assertions, the byte-for-byte rebuild of the browser cryptography bundle with the pnpm that `package.json` pins, the Stratum worker, cross-process discovery and production-issuance programs, every PowerShell launcher test under Windows PowerShell 5.1, network suites, and fuzzing. Every action is pinned to a commit and every toolchain and tool to an exact version, and each check is its own step, so a later passing command cannot hide a failing one. A push of a `v*` tag or a `release/*` branch runs the full gate, per-target fuzzing and network suites included, on exactly that commit.
+- **Release requirement:** the launch commit needs a green full-gate run, recorded in [the release gate](docs/VALIDATION.md#release-gate). The workflow had not yet run on GitHub when 0.43.0 was prepared.
+- Fifteen coverage-guided fuzz targets: every parser of hostile input, and `peer_sync`, which synchronizes a fixture node from a scripted hostile peer through header replies, the held-header store and block validation, then checks its tip and a replay of its active chain. A stable seeded runner in the test suite runs them all, with kept regression inputs.
 
 ### Accepted limitations
 

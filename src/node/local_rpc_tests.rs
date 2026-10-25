@@ -324,3 +324,77 @@ async fn quotes_never_default_to_the_selected_server_wallet() {
     }
     server.stop().await;
 }
+
+/// While a node's miner account does not exist, its admission keeps 1,024
+/// weight of each block for the reward that creates it. A transaction that
+/// fits the block only without that room was quoted and prepared on such a
+/// node, a wallet-only or newly launched one, and then refused at broadcast
+/// with the generic admission error, and never relayed to other miners.
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn quotes_leave_room_for_a_missing_miner_account() {
+    let directory = tempfile::tempdir().unwrap();
+    let secret = [90; 32];
+    let sender = crypto::public_key(&secret).unwrap();
+    let config = Config::devnet();
+    let path = directory.path().join("reserve.sqlite");
+    let node = Node::open(&path, config.clone(), sender).unwrap();
+    // Enough two-atom rewards for a fee of about 16 atoms.
+    for _ in 0..20 {
+        node.mine(100_000).unwrap();
+    }
+    drop(node);
+    let request = |data: usize| json!({"sender":hex::encode(sender),"operation":Operation::TransferExact{recipient:sender,amount:1u32.into()},"data_hex":hex::encode(vec![7; data])});
+    // The same chain, mining to a key that has no account.
+    let newcomer = crypto::public_key(&[91; 32]).unwrap();
+    let node = Node::open(&path, config.clone(), newcomer).unwrap();
+    let capacity = config.initial.block_bytes;
+    let base: u64 = node.rpc("fee_quote", request(0)).unwrap()["weight"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // 512 weight below capacity, inside the room that node keeps.
+    let data = usize::try_from(capacity - 512 - base).unwrap();
+    let transfer = json!({"sender":hex::encode(sender),"recipient":hex::encode(sender),"amount":"1","data_hex":hex::encode(vec![7; data])});
+    for (method, params) in [
+        ("fee_quote", request(data)),
+        ("transfer_quote", transfer),
+        ("preparetransaction", request(data)),
+    ] {
+        let error = node.rpc(method, params).unwrap_err().to_string();
+        assert!(error.contains("miner account"), "{method}: {error}");
+    }
+    // A payment that creates that account pays its weight and needs no room.
+    let create = |data: usize| json!({"sender":hex::encode(sender),"operation":Operation::TransferExact{recipient:newcomer,amount:1u32.into()},"data_hex":hex::encode(vec![7; data])});
+    let creating: u64 = node.rpc("fee_quote", create(0)).unwrap()["weight"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let data_creating = usize::try_from(capacity - 512 - creating).unwrap();
+    node.rpc("preparetransaction", create(data_creating))
+        .unwrap();
+    drop(node);
+    // A node whose miner account exists prepares, admits and mines it.
+    let node = Node::open(&path, config.clone(), sender).unwrap();
+    let mut prepared = node.rpc("preparetransaction", request(data)).unwrap();
+    let weight: u64 = prepared["fee_quote"]["weight"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(weight <= capacity && weight + fees::ACCOUNT_WEIGHT > capacity);
+    prepared.as_object_mut().unwrap().remove("fee_quote");
+    let body = wallet::decode_unsigned(&serde_json::from_value(prepared).unwrap()).unwrap();
+    let transaction = crypto::sign(&config.chain_id(), &body, &secret).unwrap();
+    node.rpc(
+        "broadcasttransaction",
+        json!({"raw":wallet::signed_hex(&transaction)}),
+    )
+    .unwrap();
+    assert_eq!(node.mine(100_000).unwrap().transactions, vec![transaction]);
+}

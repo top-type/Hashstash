@@ -3946,8 +3946,27 @@ impl Chain {
         limit: usize,
         authenticated: &HashSet<Hash>,
     ) -> Result<SelectionResult> {
-        self.select_open(miner, candidates, limit, authenticated)
-            .map(|(selected, _, _)| selected)
+        self.select_admission_opening(miner, candidates, limit, authenticated)
+            .map(|(selected, _)| selected)
+    }
+    /// [Chain::select_admission], with the next block's opening after the
+    /// selected transactions: the weight they used and the opening funds
+    /// they committed (see [Opening]).
+    pub(crate) fn select_admission_opening(
+        &self,
+        miner: PublicKey,
+        candidates: &[Transaction],
+        limit: usize,
+        authenticated: &HashSet<Hash>,
+    ) -> Result<(SelectionResult, Opening<'_>)> {
+        let (selected, execution, _) = self.select_open(miner, candidates, limit, authenticated)?;
+        Ok((
+            selected,
+            Opening {
+                config: &self.config,
+                execution,
+            },
+        ))
     }
     /// Selection and construction share the same parent, miner and
     /// configuration. The completed state never escapes as a reusable unchecked
@@ -3987,36 +4006,29 @@ impl Chain {
     /// are fixed within a block, accounts are never removed and commitments
     /// only grow, so a transaction failing any of these is never selected on
     /// the current tip, whatever else is pending. This costs one block
-    /// opening, without signatures or execution.
+    /// opening, without signatures or execution. Each passing transaction's
+    /// fee quote at the opening is returned.
     pub fn opening_screen(
         &self,
         miner: PublicKey,
         transactions: &[&Transaction],
-    ) -> Result<Vec<Result<()>>> {
+    ) -> Result<Vec<Result<fees::FeeQuote>>> {
+        let opening = self.opening(miner)?;
+        Ok(transactions
+            .iter()
+            .map(|transaction| opening.screen(transaction))
+            .collect())
+    }
+    /// The next block's opening on the tip, before any transaction (see
+    /// [Opening]).
+    pub(crate) fn opening(&self, miner: PublicKey) -> Result<Opening<'_>> {
         let target = self.target(&self.tip_entry)?;
         let execution =
             consensus::prepare_block(&self.config, &self.tip_state, &miner, &math::work(&target))?;
-        Ok(transactions
-            .iter()
-            .map(|transaction| {
-                let quote = fees::quote(&self.config, &execution.state, transaction)?;
-                // Account and record creation each add exactly their rate to
-                // the rounded minimum. A proposal's own record is always new.
-                let creation = match &transaction.body.operation {
-                    Operation::Support { .. } => &quote.account_creation_fee + &quote.record_fee,
-                    _ => quote.account_creation_fee.clone(),
-                };
-                ensure!(
-                    transaction.body.fee >= &quote.minimum_fee - &creation,
-                    "signed fee is below the mandatory minimum"
-                );
-                ensure!(
-                    execution.opening_funds_cover(transaction),
-                    "opening balance does not cover its inputs and fee"
-                );
-                Ok(())
-            })
-            .collect())
+        Ok(Opening {
+            config: &self.config,
+            execution,
+        })
     }
     fn select_executed(
         &self,
@@ -4712,6 +4724,49 @@ struct SenderQueue {
     /// Whether a candidate of this sender already holds or spent the last
     /// attempt granted once its budget ran out.
     reprieve_granted: bool,
+}
+
+/// The next block's opening on the tip, for checks that it alone decides,
+/// without executing anything more: from [Chain::opening] before any
+/// transaction, or from [Chain::select_admission_opening] after an admission
+/// selection's transactions, with the weight they used and the opening funds
+/// they committed.
+pub(crate) struct Opening<'a> {
+    config: &'a Config,
+    execution: consensus::BlockExecution,
+}
+impl Opening<'_> {
+    /// The checks of [Chain::opening_screen] for `transaction` on its own,
+    /// with its fee quote at the opening.
+    pub(crate) fn screen(&self, transaction: &Transaction) -> Result<fees::FeeQuote> {
+        let quote = fees::quote(self.config, &self.execution.state, transaction)?;
+        // Account and record creation each add exactly their rate to the
+        // rounded minimum. A proposal's own record is always new.
+        let creation = match &transaction.body.operation {
+            Operation::Support { .. } => &quote.account_creation_fee + &quote.record_fee,
+            _ => quote.account_creation_fee.clone(),
+        };
+        ensure!(
+            transaction.body.fee >= &quote.minimum_fee - &creation,
+            "signed fee is below the mandatory minimum"
+        );
+        ensure!(
+            self.execution.opening_funds_cover(transaction),
+            "opening balance does not cover its inputs and fee"
+        );
+        Ok(quote)
+    }
+    /// Commit `transaction`'s inputs and fee from the opening funds left
+    /// after everything committed before it, as including it would; when
+    /// they no longer cover it, an error that commits nothing.
+    pub(crate) fn commit(&mut self, transaction: &Transaction) -> Result<()> {
+        self.execution.reserve_opening_funds(transaction)
+    }
+    /// The block weight used: the opening's own account creation and, after
+    /// a selection, its transactions, as block execution counts it.
+    pub(crate) fn used_weight(&self) -> u64 {
+        self.execution.used_weight()
+    }
 }
 
 #[cfg(test)]

@@ -1081,6 +1081,19 @@ impl BlockExecution {
     pub(crate) fn opening_funds_cover(&self, t: &Transaction) -> bool {
         reserve_inputs(&self.opening, &self.spent, t).is_ok()
     }
+    /// Commit `t`'s inputs and fee from opening funds, as accepting it would,
+    /// without applying it; when they no longer cover it, an error that
+    /// commits nothing. Only for screening: the block is not built from it.
+    pub(crate) fn reserve_opening_funds(&mut self, t: &Transaction) -> Result<()> {
+        let spent = reserve_inputs(&self.opening, &self.spent, t)?;
+        self.spent.extend(spent);
+        Ok(())
+    }
+    /// Weight used so far: protocol account creation at the opening and the
+    /// accepted transactions, as the capacity check counts it.
+    pub(crate) fn used_weight(&self) -> u64 {
+        self.used_weight
+    }
 
     /// Charge accounting is updated only after an atomic transaction succeeds.
     pub(crate) fn apply_verified_transaction(&mut self, c: &Config, t: &Transaction) -> Result<()> {

@@ -3428,3 +3428,375 @@ fn the_published_pool_shares_the_nodes_own_entries() {
     assert!(shared, "a publish copies no transaction");
     assert_eq!(view.mempool.to_vec(), vec![tx]);
 }
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn a_low_bid_at_a_weight_full_pool_is_refused_without_a_selection() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    fund_other(&node);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let start = nonce(&node, &key());
+    // Payments that each create an account weigh over 1,024 units in few
+    // bytes, as launch faucet payouts do: they fill the block's weight long
+    // before its bytes or its count.
+    let fresh = |n: u8| crypto::public_key(&[100 + n; 32]).unwrap();
+    let creating: Vec<_> = (0..20u8)
+        .map(|n| {
+            payment(
+                config,
+                state,
+                &SECRET,
+                start + u64::from(n),
+                fresh(n),
+                1,
+                10,
+            )
+        })
+        .collect();
+    install_retained(&node, &creating);
+    let (selection, backlog, _) = pool(&node);
+    assert!(!backlog.is_empty(), "the selection is full by weight");
+    let bytes: usize = selection.iter().map(|tx| codec::encode(tx).len()).sum();
+    assert!(bytes < 4 * 1024, "{bytes} bytes leave room for many more");
+    // A low bid that creates another account cannot fit the weight left,
+    // and could enter only by displacing an entry it cannot displace.
+    let other_start = nonce(&node, &other());
+    let low = payment(config, state, &OTHER, other_start, fresh(99), 1, 0);
+    selections();
+    let refused = node
+        .submit_transaction(low.clone())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("does not outbid its weakest entry"),
+        "{refused}"
+    );
+    relay(&node, vec![low]);
+    assert_eq!(selections(), 0);
+    // A low bid to an account that a selected payment creates weighs less
+    // in the block than on the tip; it fits, and gets its selection.
+    let shared = payment(config, state, &OTHER, other_start, fresh(0), 1, 0);
+    node.submit_transaction(shared.clone()).unwrap();
+    assert_eq!(selections(), 1);
+    assert!(pool(&node).0.contains(&shared));
+}
+
+/// Fund `secret`'s account from the miner and confirm it.
+fn fund(node: &Node, secret: &[u8; 32]) {
+    let view = snapshot(node);
+    let funding = payment(
+        view.chain.config.as_ref(),
+        view.chain.tip_state(),
+        &SECRET,
+        nonce(node, &key()),
+        crypto::public_key(secret).unwrap(),
+        5_000,
+        0,
+    );
+    node.submit_transaction(funding).unwrap();
+    node.mine(1_000_000).unwrap();
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn a_queued_transfer_funds_an_account_only_in_nonce_order_within_its_senders_funds() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    fund_other(&node);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let other_start = nonce(&node, &other());
+    let (paid, unpaid, gapped) = ([93; 32], [94; 32], [95; 32]);
+    let to = |secret: &[u8; 32]| crypto::public_key(secret).unwrap();
+    // other() holds 5,000: it can pay either of the first two transfers,
+    // but not both, and the third follows a nonce nobody sent.
+    let transfers = vec![
+        payment(config, state, &OTHER, other_start, to(&paid), 3_000, 0),
+        payment(
+            config,
+            state,
+            &OTHER,
+            other_start + 1,
+            to(&unpaid),
+            3_000,
+            0,
+        ),
+        payment(config, state, &OTHER, other_start + 3, to(&gapped), 1, 0),
+    ];
+    node.admission
+        .unpoisoned()
+        .budget
+        .spend(SELECTION_TIME_BURST * 2, Instant::now());
+    relay(&node, transfers);
+    assert_eq!(queued(&node), 3);
+    // Only the first creates an account whose spends may wait for it.
+    let spend = |secret: &[u8; 32]| payment(config, state, secret, 0, key(), 1, 0);
+    let held = node.submit_transaction(spend(&paid)).unwrap();
+    assert_eq!(awaiting(&node), vec![held]);
+    for secret in [&unpaid, &gapped] {
+        let refused = node
+            .submit_transaction(spend(secret))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("sender account does not exist"),
+            "{refused}"
+        );
+    }
+    assert_eq!(awaiting(&node), vec![held]);
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn a_held_spend_is_dropped_once_its_funding_is_gone() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    fund_other(&node);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let other_start = nonce(&node, &other());
+    let fresh = [96; 32];
+    let funding = payment(
+        config,
+        state,
+        &OTHER,
+        other_start,
+        crypto::public_key(&fresh).unwrap(),
+        1_000,
+        0,
+    );
+    node.admission
+        .unpoisoned()
+        .budget
+        .spend(SELECTION_TIME_BURST * 2, Instant::now());
+    relay(&node, vec![funding]);
+    assert_eq!(queued(&node), 1);
+    node.submit_transaction(payment(config, state, &fresh, 0, key(), 1, 0))
+        .unwrap();
+    assert_eq!(awaiting(&node).len(), 1);
+    // Another transaction takes the queued transfer's nonce: that transfer
+    // can no longer create the account, and the next admission drops the
+    // spend that waited for it, rather than holding it until the next tip.
+    let taken = payment(config, state, &OTHER, other_start, key(), 1, 0);
+    node.submit_transaction(taken.clone()).unwrap();
+    assert!(pool(&node).0.contains(&taken));
+    assert!(awaiting(&node).is_empty());
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn recovery_holds_its_spends_beside_full_public_broadcast_holds() {
+    fn appended(chain: &mut Chain, transactions: Vec<Transaction>) -> Block {
+        let time = chain.tip_block().header.timestamp + chain.tip_state().settings.interval as u32;
+        let block = Chain::mine(
+            chain.template(key(), transactions, time).unwrap(),
+            1_000_000,
+        )
+        .unwrap();
+        assert!(chain.submit(block.clone(), time as u64).unwrap());
+        block
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let config = configuration(16 * 1024);
+    let mut old = Chain::open(&directory.path().join("old.sqlite"), config.clone()).unwrap();
+    let base: Vec<_> = (0..8).map(|_| appended(&mut old, Vec::new())).collect();
+    let mut new = Chain::open(&directory.path().join("new.sqlite"), config.clone()).unwrap();
+    for block in &base {
+        new.submit(block.clone(), block.header.timestamp as u64)
+            .unwrap();
+    }
+    // The abandoned branch funds an account and confirms a spend from it.
+    let start = old.tip_state().account(&key(), None).unwrap().nonce;
+    let (detached, public) = ([97; 32], [98; 32]);
+    let funding = payment(
+        &config,
+        old.tip_state(),
+        &SECRET,
+        start,
+        crypto::public_key(&detached).unwrap(),
+        5_000,
+        0,
+    );
+    let mut old_blocks = vec![appended(&mut old, vec![funding])];
+    let recovered = payment(&config, old.tip_state(), &detached, 0, key(), 1, 0);
+    old_blocks.push(appended(&mut old, vec![recovered.clone()]));
+    let new_blocks: Vec<_> = (0..3).map(|_| appended(&mut new, Vec::new())).collect();
+    let node = Node::open(&directory.path().join("node.sqlite"), config.clone(), key()).unwrap();
+    for block in base.iter().chain(&old_blocks) {
+        assert!(node.submit_block(block.clone()).unwrap());
+    }
+    // Public broadcasts fill their share of the holding area with spends
+    // from an account that a pending transfer creates.
+    let view = snapshot(&node);
+    let state = view.chain.tip_state();
+    let pending = payment(
+        &config,
+        state,
+        &SECRET,
+        start + 1,
+        crypto::public_key(&public).unwrap(),
+        5_000,
+        0,
+    );
+    node.submit_transaction(pending).unwrap();
+    let mut held = 0;
+    for pad in [1_000, 0] {
+        let refused = loop {
+            let spend = padded(&config, state, &public, held, pad, 0);
+            match node.submit_transaction_from(spend, true) {
+                Ok(_) => held += 1,
+                Err(error) => break error.to_string(),
+            }
+        };
+        assert!(refused.contains("no more spends can wait"), "{refused}");
+    }
+    assert_eq!(awaiting(&node).len() as u64, held);
+    // The heavier branch detaches the spend; its funding is recovered into
+    // the pool, and the spend waits for it in a share of its own.
+    for block in &new_blocks {
+        node.submit_block(block.clone()).unwrap();
+    }
+    assert_eq!(snapshot(&node).chain.tip_hash(), new.tip_hash());
+    assert!(
+        awaiting(&node).contains(&codec::transaction_id(&recovered)),
+        "the recovered spend is held"
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn a_payment_needing_an_account_a_left_out_payment_creates_is_not_refused_as_invalid() {
+    let directory = tempfile::tempdir().unwrap();
+    // A small block, so that two account-creating payments leave weight for
+    // a small one but not for a large one.
+    let node = funded_node(directory.path(), 4096);
+    fund_other(&node);
+    let third = [92; 32];
+    fund(&node, &third);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let (start, other_start) = (nonce(&node, &key()), nonce(&node, &other()));
+    let third_key = crypto::public_key(&third).unwrap();
+    let third_start = nonce(&node, &third_key);
+    let fresh = |n: u8| crypto::public_key(&[110 + n; 32]).unwrap();
+    let first = payment(config, state, &SECRET, start, fresh(0), 1, 50);
+    let second = payment(config, state, &SECRET, start + 1, fresh(1), 1, 50);
+    // other() creates a new account with a large, low bid that the weight
+    // left does not fit; third() pays that account a fee that needs an
+    // earlier transaction to create it.
+    let created = fresh(2);
+    let transfer = |secret: &[u8; 32], nonce: u64| {
+        let operation = Operation::TransferExact {
+            recipient: created,
+            amount: 1u32.into(),
+        };
+        unsigned(config, secret, nonce, operation)
+    };
+    let mut body = transfer(&OTHER, other_start);
+    body.data = vec![0; 800];
+    let creating = exact(config, state, &OTHER, body, 0);
+    let mut body = transfer(&third, third_start);
+    let needy = loop {
+        let tx = crypto::sign(&state.chain_id, &body, &third).unwrap();
+        let quote = fees::quote(config, state, &tx).unwrap();
+        let fee = &quote.minimum_fee - &quote.account_creation_fee;
+        if tx.body.fee == fee {
+            break tx;
+        }
+        body.fee = fee;
+    };
+    // Relayed together, both lose; the selection decided nothing about the
+    // needy payment, so its sender nonce is not held back as invalid.
+    install_retained(&node, std::slice::from_ref(&first));
+    relay(&node, vec![second.clone(), creating.clone(), needy.clone()]);
+    assert_eq!(pool(&node).0, vec![first.clone(), second.clone()]);
+    let held_back = {
+        let i = node.locked().unwrap();
+        i.invalid_nonces
+            .entries
+            .contains_key(&(third_key, third_start))
+    };
+    assert!(!held_back, "its sender nonce is not refused as invalid");
+    // Pooled together, it waits in the backlog with the payment it needs.
+    install_retained(&node, &[first, second, creating.clone(), needy.clone()]);
+    let (_, backlog, _) = pool(&node);
+    assert!(ids(&backlog).contains(&codec::transaction_id(&creating)));
+    assert!(
+        ids(&backlog).contains(&codec::transaction_id(&needy)),
+        "the needy payment stays pending"
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn a_backlog_chain_keeps_only_what_its_sender_can_pay_for() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    fund_other(&node);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let (start, other_start) = (nonce(&node, &key()), nonce(&node, &other()));
+    // Honest bids overfill one block; other()'s low bid waits behind them.
+    let honest: Vec<_> = (0..100)
+        .map(|offset| payment(config, state, &SECRET, start + offset, key(), 1, 20))
+        .collect();
+    let foothold = padded(config, state, &OTHER, other_start, 64, 2);
+    let mut candidates = honest;
+    candidates.push(foothold.clone());
+    install_retained(&node, &candidates);
+    assert!(ids(&pool(&node).1).contains(&codec::transaction_id(&foothold)));
+    // Transfers chained behind it, each affordable on its own, together
+    // far beyond other()'s 5,000.
+    let chained: Vec<_> = (1..=10)
+        .map(|offset| {
+            payment(
+                config,
+                state,
+                &OTHER,
+                other_start + offset,
+                key(),
+                1_000,
+                100,
+            )
+        })
+        .collect();
+    relay(&node, chained);
+    let (_, backlog, _) = pool(&node);
+    let kept: Vec<_> = backlog
+        .iter()
+        .filter(|tx| tx.body.sender == other())
+        .collect();
+    assert!(kept.len() > 1, "the chain past its foothold is kept");
+    let committed = kept.iter().fold(Amount::zero(), |sum, tx| {
+        let Operation::TransferExact { amount, .. } = &tx.body.operation else {
+            unreachable!("only transfers are chained")
+        };
+        sum + &tx.body.fee + amount
+    });
+    let balance = state.account(&other(), None).unwrap().ordinary;
+    assert!(
+        committed <= balance,
+        "{} kept, committing {committed} of {balance}",
+        kept.len()
+    );
+}

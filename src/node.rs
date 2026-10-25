@@ -792,9 +792,8 @@ const MAX_INVALID_NONCES: usize = MAX_REJECTED_TRANSACTIONS;
 /// least the minimum fee rate.
 const REPLACEMENT_RAISE: u32 = 8;
 /// One sender's backlog chain, past its first entry, holds at most
-/// 1/BACKLOG_SENDER_SHARE of the backlog's entries and bytes: each entry's
-/// funds are checked on its own, so a chain may hold more than its sender
-/// can pay for, and it must not crowd out every other sender's entries.
+/// 1/BACKLOG_SENDER_SHARE of the backlog's entries and bytes, besides only
+/// as many entries as its opening balance pays for after its selected ones.
 const BACKLOG_SENDER_SHARE: usize = 2;
 /// Executing blocks that would not become the tip: node-wide wall time, and
 /// each relaying source's own share of it, per second and in a burst that
@@ -824,11 +823,12 @@ const REPLAY_STEPS_PER_HOLD: usize = 8;
 const SIDE_REPLAY_STEPS_PER_HOLD: usize = 1;
 const REPLAY_HOLD_TIME: Duration = Duration::from_millis(50);
 /// Spends from accounts that a pending transfer creates, held until that
-/// funding confirms: in all, per sender and per source, and the new tips
-/// one may wait for. They also stay within one block's bytes, of which each
-/// source holds at most 1/AWAITING_SOURCES. Relaying sources together leave
-/// one source's share of entries and bytes to local submissions and reorg
-/// recovery.
+/// funding confirms: in all, per sender and per untrusted holder (see
+/// [Holder]), and the new tips one may wait for. They also stay within one
+/// block's bytes, of which each untrusted holder holds at most
+/// 1/AWAITING_SOURCES. Relaying sources together leave one holder's share of
+/// entries and bytes to public broadcasts, and one to the operator's
+/// submissions and reorg recovery.
 const MAX_AWAITING: usize = MAX_MEMPOOL;
 const AWAITING_PER_SENDER: usize = 16;
 const AWAITING_SOURCES: usize = 4;
@@ -1029,9 +1029,42 @@ struct Awaiting {
     transaction: Transaction,
     /// Its encoded length.
     bytes: usize,
-    source: Option<IpAddr>,
+    holder: Holder,
     /// New tips seen while its sender still had no account.
     tips: u32,
+}
+/// Who a held spend came from, for the holding shares (see
+/// [Node::hold_unfunded]). Each relaying peer, by source, and public
+/// broadcasts, together, are untrusted holders: each holds at most its
+/// share, and relays together leave public broadcasts and the trusted
+/// holder a share each. The operator's private submissions and
+/// reorganization recovery are that trusted holder, bounded only by the
+/// holding limits in all, so no public visitor or peer can take its room.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Holder {
+    Relay(IpAddr),
+    Public,
+    Local,
+}
+impl Holder {
+    /// The holder of a relayed, broadcast or operator-submitted newcomer.
+    fn of(newcomer: &Newcomer) -> Self {
+        match newcomer.source {
+            Some(source) => Self::Relay(source),
+            None if newcomer.operator => Self::Local,
+            None => Self::Public,
+        }
+    }
+    fn untrusted(self) -> bool {
+        self != Self::Local
+    }
+    /// The relaying source, credited with fair queue shares on admission.
+    fn source(self) -> Option<IpAddr> {
+        match self {
+            Self::Relay(source) => Some(source),
+            Self::Public | Self::Local => None,
+        }
+    }
 }
 
 /// Whether `new` may replace `old`, a pending transaction at the same sender
@@ -1077,6 +1110,10 @@ fn raises(state: &State, new: (&Amount, u64), old: (&Amount, u64)) -> bool {
 /// changes, so a transaction refused again, after it already set an entry,
 /// sets one that holds back only other resent transactions: a transaction
 /// its sender signed since, at an equal fee rate, still gets its selection.
+/// Per pool revision, variants refused for validity at one sender nonce thus
+/// cost at most two selections at an equal fee rate: a resent one, whose
+/// entry holds back only resent ones, and the first one its sender signed
+/// since, whose entry holds back every other.
 #[derive(Default)]
 struct InvalidNonces {
     at: (Hash, u64),
@@ -1128,8 +1165,13 @@ impl InvalidNonces {
         }
     }
 }
-/// A next-block selection and its capacity-displaced backlog.
-type Pool = (Vec<Transaction>, Vec<Transaction>);
+/// A next-block selection, its capacity-displaced backlog, and the block
+/// weight the selection used as its execution counted it (see [Floor]).
+struct Pool {
+    selection: Vec<Transaction>,
+    backlog: Vec<Transaction>,
+    weight: u64,
+}
 /// What a selection left of the next block, by the selection's own body
 /// accounting with one further record, and which senders it left undecided.
 struct Room {
@@ -1143,16 +1185,97 @@ struct Room {
     /// every entry it left out is undecided.
     saturated: bool,
     /// Senders whose attempt budget ran out before one of their candidates
-    /// was tried. Another sender's spent budget says nothing about an entry.
+    /// was tried, and those of left-out candidates that may have failed only
+    /// for want of another sender's left-out candidate (see [Room::needy]).
+    /// Another sender's spent budget says nothing about an entry.
     exhausted: BTreeSet<PublicKey>,
 }
 impl Room {
-    fn after(chain: &Chain, miner: PublicKey, selection: &SelectionResult) -> Result<Self> {
+    fn after(
+        chain: &Chain,
+        miner: PublicKey,
+        selection: &SelectionResult,
+        candidates: &[Transaction],
+    ) -> Result<Self> {
         let limit = mempool_limit(&chain.config).min(chain.config.max_signatures);
         let mut room = Self::of(chain, miner, &selection.transactions)?;
         room.saturated = selection.truncated || selection.transactions.len() >= limit;
         room.exhausted = selection.exhausted_senders.clone();
+        room.exhausted
+            .extend(Self::needy(chain, &selection.transactions, candidates));
         Ok(room)
+    }
+    /// Senders of candidates left out of `selected` that may have failed only
+    /// because a left-out candidate of another sender, for capacity or
+    /// otherwise, would have created what they need: a Support needs the
+    /// proposal that a Propose registers, and a payment signed below its
+    /// minimum on the tip needs an earlier payment to create its new
+    /// recipient's account. The selection decided nothing about them.
+    fn needy(
+        chain: &Chain,
+        selected: &[Transaction],
+        candidates: &[Transaction],
+    ) -> BTreeSet<PublicKey> {
+        let state = chain.tip_state();
+        // A candidate at a selected sender nonce never executes in this block.
+        let selected: HashSet<(PublicKey, u64)> = selected
+            .iter()
+            .map(|tx| (tx.body.sender, tx.body.nonce))
+            .collect();
+        let left_out: Vec<&Transaction> = candidates
+            .iter()
+            .filter(|tx| !selected.contains(&(tx.body.sender, tx.body.nonce)))
+            .collect();
+        // What left-out candidates would have created, and by whom.
+        let mut proposals = HashMap::<Hash, BTreeSet<PublicKey>>::new();
+        let mut accounts = HashMap::<PublicKey, BTreeSet<PublicKey>>::new();
+        for tx in &left_out {
+            let sender = tx.body.sender;
+            match &tx.body.operation {
+                Operation::Propose {
+                    round,
+                    description,
+                    proposal,
+                    ..
+                } => {
+                    let id = crate::state::proposal_id(
+                        &state.chain_id,
+                        *round,
+                        &sender,
+                        description,
+                        proposal,
+                    );
+                    proposals.entry(id).or_default().insert(sender);
+                }
+                Operation::TransferExact { recipient, .. }
+                    if state.account(recipient, None).is_none() =>
+                {
+                    accounts.entry(*recipient).or_default().insert(sender);
+                }
+                _ => {}
+            }
+        }
+        if proposals.is_empty() && accounts.is_empty() {
+            return BTreeSet::new();
+        }
+        let by_another = |creators: Option<&BTreeSet<PublicKey>>, sender: &PublicKey| {
+            creators.is_some_and(|creators| creators.iter().any(|creator| creator != sender))
+        };
+        left_out
+            .into_iter()
+            .filter(|tx| match &tx.body.operation {
+                Operation::Support { proposal, .. } => {
+                    by_another(proposals.get(proposal), &tx.body.sender)
+                }
+                Operation::TransferExact { recipient, .. } => {
+                    by_another(accounts.get(recipient), &tx.body.sender)
+                        && fees::quote(&chain.config, state, tx)
+                            .is_ok_and(|quote| tx.body.fee < quote.minimum_fee)
+                }
+                _ => false,
+            })
+            .map(|tx| tx.body.sender)
+            .collect()
     }
     /// What `transactions`, a selection on the tip, leave of the next block,
     /// leaving no sender undecided.
@@ -1233,7 +1356,8 @@ impl Weakest {
 }
 /// A full installed selection's weakest entry, which a newcomer must outrank
 /// to enter it by displacing an entry, and what makes it full: its count,
-/// for every newcomer, or its bytes, for a newcomer they leave no room for.
+/// for every newcomer, or its bytes or weight, for a newcomer they leave no
+/// room for.
 #[derive(Clone)]
 struct Floor {
     weakest: Weakest,
@@ -1241,15 +1365,24 @@ struct Floor {
     /// The selection's block bytes, counted as [Room] counts them, and their limit.
     used_bytes: usize,
     byte_limit: usize,
+    /// The block weight the selection used, as its execution counted it,
+    /// when known for the installed selection, and the weight limit.
+    used_weight: Option<u64>,
+    weight_limit: u64,
 }
 impl Floor {
-    /// Whether a newcomer of `bytes` encoded bytes can enter only by displacing an entry.
-    fn binds(&self, bytes: usize) -> bool {
+    /// Whether a newcomer of `bytes` encoded bytes, which weighs at least
+    /// `weight` in the block after every selected entry, can enter only by
+    /// displacing an entry.
+    fn binds(&self, bytes: usize, weight: u64) -> bool {
         self.count_full
             || self
                 .used_bytes
                 .saturating_add(compact_size_len(bytes) + bytes)
                 > self.byte_limit
+            || self
+                .used_weight
+                .is_some_and(|used| used.saturating_add(weight) > self.weight_limit)
     }
 }
 
@@ -1513,6 +1646,9 @@ struct Inner {
     /// The floor of the installed selection (see `Node::pool_floor`), and
     /// the selection revision it was found at.
     floor: Option<(u64, Option<Floor>)>,
+    /// The block weight the installed selection used, as its execution
+    /// counted it, and the selection revision it was installed at.
+    selection_weight: Option<(u64, u64)>,
     /// Sender nonces recent selections refused for validity.
     invalid_nonces: InvalidNonces,
 }
@@ -2642,6 +2778,7 @@ impl Node {
             relay_cursor: 0,
             awaiting: Vec::new(),
             floor: None,
+            selection_weight: None,
             invalid_nonces: InvalidNonces::default(),
         };
         // A derived index failure never makes chain validation unavailable.
@@ -3095,17 +3232,28 @@ impl Node {
     }
     /// The installed selection's weakest entry and what fills it (see
     /// [Floor]). While it holds as many entries as a selection may, or its
-    /// bytes leave no room for a newcomer, that newcomer can enter only by
-    /// displacing an entry. Every selected entry outranks it and is tried
-    /// before it, so one that does not outrank the weakest entry is refused
-    /// without a selection. Kept for one selection revision.
+    /// bytes or weight leave no room for a newcomer, that newcomer can enter
+    /// only by displacing an entry. Every selected entry outranks it and is
+    /// tried before it, so one that does not outrank the weakest entry is
+    /// refused without a selection. Its weight is the selection's own, as
+    /// execution counted it, since quotes on the tip overstate it; it is
+    /// known for a selection installed by [Node::install_pool]. Kept for one
+    /// selection revision.
     fn pool_floor(i: &mut Inner, miner: PublicKey) -> Option<Floor> {
         if i.mempool.is_empty() || i.pool_tip != i.chain.tip_hash() {
             return None;
         }
-        if let Some((revision, floor)) = &i.floor
+        let used_weight = i
+            .selection_weight
+            .filter(|(revision, _)| *revision == i.selection_revision)
+            .map(|(_, weight)| weight);
+        if let Some((revision, floor)) = &mut i.floor
             && *revision == i.selection_revision
         {
+            // An unchanged selection reinstalled may have made its weight known.
+            if let Some(floor) = floor {
+                floor.used_weight = used_weight;
+            }
             return floor.clone();
         }
         let config = &i.chain.config;
@@ -3129,6 +3277,8 @@ impl Node {
                 count_full: i.mempool.len() >= limit,
                 used_bytes: room.used_bytes,
                 byte_limit: room.byte_limit,
+                used_weight,
+                weight_limit: room.weight_limit,
             })
         });
         i.floor = Some((i.selection_revision, floor.clone()));
@@ -3141,11 +3291,14 @@ impl Node {
     /// [InvalidNonces]; `operator` submissions are exempt) that does not
     /// raise that one's fee rate enough, an entry the next block's opening
     /// refuses for its fee or funds, one after a missing earlier nonce of its
-    /// sender, and, while the selection is full by its count or by bytes for
-    /// that entry (see [Floor]), one that does not outrank its weakest entry,
-    /// are never selected on this tip and pool. A candidate that rebids or
-    /// extends its own sender's backlog chain cannot be selected before that
-    /// chain, so it may wait in the backlog within the same bounds.
+    /// sender, and, while the selection is full by its count or by bytes or
+    /// weight for that entry (see [Floor]), one that does not outrank its
+    /// weakest entry, are never selected on this tip and pool. That entry is
+    /// judged by its least weight in the block, and its best rank there,
+    /// once selected entries have created the account it pays or the support
+    /// record it needs. A candidate that rebids or extends its own sender's
+    /// backlog chain cannot be selected before that chain, so it may wait in
+    /// the backlog within the same bounds.
     fn screen_newcomers<'a>(
         &self,
         i: &Inner,
@@ -3199,12 +3352,12 @@ impl Node {
         let mut payable = Vec::new();
         for ((id, tx), opening) in replacing.into_iter().zip(opening) {
             match opening {
-                Ok(()) => {
+                Ok(quote) => {
                     nonces
                         .entry(tx.body.sender)
                         .or_default()
                         .insert(tx.body.nonce);
-                    payable.push((id, tx));
+                    payable.push((id, tx, quote.weight));
                 }
                 Err(error) => screened.unpayable.push((id, error)),
             }
@@ -3212,7 +3365,7 @@ impl Node {
         // The first nonce from the account nonce up that nothing pending holds.
         let mut reachable = BTreeMap::new();
         let mut candidates = Vec::new();
-        for (id, tx) in payable {
+        for (id, tx, weight) in payable {
             let sender = tx.body.sender;
             let next = *reachable.entry(sender).or_insert_with(|| {
                 let mut next = state
@@ -3226,7 +3379,7 @@ impl Node {
             if tx.body.nonce > next {
                 screened.gapped.push(id);
             } else {
-                candidates.push((id, tx));
+                candidates.push((id, tx, weight));
             }
         }
         let mut backlog = BTreeMap::<PublicKey, (u64, u64)>::new();
@@ -3238,10 +3391,10 @@ impl Node {
             *high = (*high).max(tx.body.nonce);
         }
         let mut chained: Vec<_> = candidates.iter().collect();
-        chained.sort_by_key(|(_, tx)| (tx.body.sender, tx.body.nonce));
+        chained.sort_by_key(|(_, tx, _)| (tx.body.sender, tx.body.nonce));
         // Past its first entry, a sender's chain keeps at most its share.
         let share = (MAX_BACKLOG / BACKLOG_SENDER_SHARE) as u64;
-        for (id, tx) in chained {
+        for (id, tx, _) in chained {
             if let Some((low, high)) = backlog.get_mut(&tx.body.sender)
                 && (*low..=high.saturating_add(1)).contains(&tx.body.nonce)
                 && tx.body.nonce - *low <= share
@@ -3250,13 +3403,85 @@ impl Node {
                 screened.waiting.insert(*id);
             }
         }
-        for (id, tx) in candidates {
+        // Accounts that selected payments pay, and the support records that
+        // selected Supports and Proposes may create, by sender and proposal.
+        // A newcomer needing one that the tip lacks weighs less in the
+        // block, after them, than its quote on the tip says.
+        let created = std::cell::OnceCell::new();
+        let created = || {
+            created.get_or_init(|| {
+                let (mut accounts, mut records) = (HashSet::new(), HashSet::new());
+                for tx in i.mempool.iter() {
+                    let sender = tx.body.sender;
+                    match &tx.body.operation {
+                        Operation::TransferExact { recipient, .. } => {
+                            accounts.insert(*recipient);
+                        }
+                        Operation::Support { proposal, .. } => {
+                            records.insert((sender, *proposal));
+                        }
+                        Operation::Propose {
+                            round,
+                            description,
+                            proposal,
+                            ..
+                        } => {
+                            let id = crate::state::proposal_id(
+                                &state.chain_id,
+                                *round,
+                                &sender,
+                                description,
+                                proposal,
+                            );
+                            records.insert((sender, id));
+                        }
+                        _ => {}
+                    }
+                }
+                (accounts, records)
+            })
+        };
+        let credit = |tx: &Transaction| {
+            if floor.is_none() {
+                return 0;
+            }
+            match &tx.body.operation {
+                Operation::TransferExact { recipient, .. }
+                    if state.account(recipient, None).is_none()
+                        && created().0.contains(recipient) =>
+                {
+                    fees::ACCOUNT_WEIGHT
+                }
+                Operation::Support {
+                    round, proposal, ..
+                } if state
+                    .supports
+                    .get(&crate::state::support_key(
+                        *round,
+                        proposal,
+                        &tx.body.sender,
+                    ))
+                    .is_none()
+                    && created().1.contains(&(tx.body.sender, *proposal)) =>
+                {
+                    fees::RECORD_WEIGHT
+                }
+                _ => 0,
+            }
+        };
+        for (id, tx, weight) in candidates {
+            let credit = credit(tx);
             let floor = floor.filter(|floor| {
-                !screened.waiting.contains(&id) && floor.binds(codec::encode(tx).len())
+                !screened.waiting.contains(&id)
+                    && floor.binds(codec::encode(tx).len(), weight.saturating_sub(credit))
             });
+            // Ranked as the selection ranks it once its weight is credited.
             let outranks = |floor: &Floor| {
-                Weakest::of(&i.chain.config, state, tx)
-                    .is_some_and(|entry| floor.weakest.outranked_by(&entry))
+                fees::quote(&i.chain.config, state, tx).is_ok_and(|mut quote| {
+                    quote.weight = quote.weight.saturating_sub(credit).max(1);
+                    let entry = Weakest(crate::chain::Priority::new(&quote, id));
+                    floor.weakest.outranked_by(&entry)
+                })
             };
             if floor.is_some_and(|floor| !outranks(floor)) {
                 screened.outbid.push((
@@ -3381,9 +3606,9 @@ impl Node {
                     &authenticated,
                 )?;
                 let accepted: HashSet<_> = pool
-                    .0
+                    .selection
                     .iter()
-                    .chain(&pool.1)
+                    .chain(&pool.backlog)
                     .map(codec::transaction_id)
                     .collect();
                 self.install_pool(i, pool)?;
@@ -3429,24 +3654,36 @@ impl Node {
                 }
             }
         }
-        if !unfunded.is_empty() {
+        if !unfunded.is_empty() || !i.awaiting.is_empty() {
+            // Held spends whose funding is gone, such as a queued transfer
+            // that this admission refused, or a pending one it displaced,
+            // are dropped now rather than at the next tip; those whose
+            // account exists wait for the next tip to be admitted.
             let funding = self.funded_accounts(i);
+            let state = i.chain.tip_state();
+            i.awaiting.retain(|entry| {
+                let sender = &entry.transaction.body.sender;
+                funding.contains(sender) || state.account(sender, None).is_some()
+            });
             for position in unfunded {
                 let newcomer = &newcomers[position];
-                outcomes[position] = Some(match Self::hold_unfunded(i, newcomer, &funding) {
-                    Ok(()) => Ok(Admitted::Awaiting),
-                    Err((pooled, reason)) => {
-                        let message = format!("transaction not valid in next block: {reason}");
-                        // Funding may still enter the pool on this tip.
-                        let scope = if pooled {
-                            Refusal::Pool(tip, i.pool_revision)
-                        } else {
-                            Refusal::Tip(tip)
-                        };
-                        self.rejected_locked().refuse(newcomer.id, scope, &message);
-                        Err(anyhow!(message))
-                    }
-                });
+                let holder = Holder::of(newcomer);
+                outcomes[position] =
+                    Some(match Self::hold_unfunded(i, newcomer, holder, &funding) {
+                        Ok(()) => Ok(Admitted::Awaiting),
+                        Err((pooled, reason)) => {
+                            let message = format!("transaction not valid in next block: {reason}");
+                            // Funding, or room to hold it, may still appear on
+                            // this tip.
+                            let scope = if pooled {
+                                Refusal::Pool(tip, i.pool_revision)
+                            } else {
+                                Refusal::Tip(tip)
+                            };
+                            self.rejected_locked().refuse(newcomer.id, scope, &message);
+                            Err(anyhow!(message))
+                        }
+                    });
             }
         }
         Ok(outcomes
@@ -3455,51 +3692,102 @@ impl Node {
             .collect())
     }
     /// Accounts that a pending transfer, or one still queued for admission,
-    /// creates by paying them. A queued transfer has passed only its
-    /// signature check, so it counts only if the next block's opening could
-    /// take it: its sender's account and unused nonce, its anchor, and an
-    /// opening balance covering its amount and fee.
+    /// creates by paying them. A queued transaction has passed only its
+    /// signature check, so a queued transfer counts only if the next block
+    /// could take it after its sender's pending transactions and the queued
+    /// ones before it that pass: its sender's account, its anchor, its nonce
+    /// right after theirs (not after a gap), its fee, and an opening balance
+    /// that covers it together with them.
     fn funded_accounts(&self, i: &Inner) -> HashSet<PublicKey> {
         let recipient = |tx: &Transaction| match &tx.body.operation {
             Operation::TransferExact { recipient, .. } => Some(*recipient),
             _ => None,
         };
         let mut funded: HashSet<PublicKey> = i.pending().filter_map(recipient).collect();
-        let queued: Vec<Transaction> = self
-            .admission
-            .unpoisoned()
-            .queue
-            .entries
-            .iter()
-            .filter(|queued| recipient(&queued.transaction).is_some_and(|to| !funded.contains(&to)))
-            .map(|queued| queued.transaction.clone())
-            .collect();
-        let queued: Vec<&Transaction> = queued
+        // Every queued transaction of a sender with a queued transfer that
+        // would fund a new account, since each takes a nonce and funds.
+        let queued: Vec<Transaction> = {
+            let admission = self.admission.unpoisoned();
+            let entries = &admission.queue.entries;
+            let funders: HashSet<PublicKey> = entries
+                .iter()
+                .filter(|queued| {
+                    recipient(&queued.transaction).is_some_and(|to| !funded.contains(&to))
+                })
+                .map(|queued| queued.transaction.body.sender)
+                .collect();
+            entries
+                .iter()
+                .filter(|queued| funders.contains(&queued.transaction.body.sender))
+                .map(|queued| queued.transaction.clone())
+                .collect()
+        };
+        let mut senders = BTreeMap::<PublicKey, Vec<&Transaction>>::new();
+        for tx in queued
             .iter()
             .filter(|tx| Self::admissible(&i.chain, tx).is_ok())
-            .collect();
-        if !queued.is_empty()
-            && let Ok(opening) = i.chain.opening_screen(self.miner, &queued)
         {
-            funded.extend(
-                queued
-                    .into_iter()
-                    .zip(opening)
-                    .filter(|(_, opening)| opening.is_ok())
-                    .filter_map(|(tx, _)| recipient(tx)),
+            senders.entry(tx.body.sender).or_default().push(tx);
+        }
+        if senders.is_empty() {
+            return funded;
+        }
+        let Ok(mut opening) = i.chain.opening(self.miner) else {
+            return funded;
+        };
+        let mut pending = BTreeMap::<PublicKey, Vec<&Transaction>>::new();
+        for tx in i
+            .pending()
+            .filter(|tx| senders.contains_key(&tx.body.sender))
+        {
+            pending.entry(tx.body.sender).or_default().push(tx);
+        }
+        let state = i.chain.tip_state();
+        for (sender, mut waiting) in senders {
+            let pending = pending.remove(&sender).unwrap_or_default();
+            // Its pending transactions come first and commit their funds.
+            for tx in &pending {
+                let _ = opening.commit(tx);
+            }
+            let nonces: BTreeSet<u64> = pending.iter().map(|tx| tx.body.nonce).collect();
+            let free = |mut nonce: u64| {
+                while nonces.contains(&nonce) {
+                    nonce = nonce.saturating_add(1);
+                }
+                nonce
+            };
+            let mut next = free(
+                state
+                    .account(&sender, None)
+                    .map_or(0, |account| account.nonce),
             );
+            waiting.sort_by_key(|tx| tx.body.nonce);
+            for tx in waiting {
+                // After a gap, or at a nonce already taken, it never follows.
+                if tx.body.nonce != next
+                    || opening.screen(tx).is_err()
+                    || opening.commit(tx).is_err()
+                {
+                    continue;
+                }
+                funded.extend(recipient(tx));
+                next = free(next.saturating_add(1));
+            }
         }
         funded
     }
     /// Hold a newcomer whose sender has no account, if a transfer in
     /// `funding` (see [Node::funded_accounts]) creates that account, within
-    /// the holding bounds. Its signature was checked before it got here, or
-    /// its detached block checked it. A refusal says whether it depends on
-    /// the pool, because no transfer creates the account yet; the others
-    /// hold for the tip, during which held spends are only added.
+    /// the holding bounds for its `holder`. Its signature was checked before
+    /// it got here, or its detached block checked it. A refusal says whether
+    /// it depends on the pool: no transfer creates the account yet, or the
+    /// holding area has no room or holds another spend at that nonce, which
+    /// may change once holds whose funding is gone are dropped. A nonce too
+    /// far ahead holds for the tip.
     fn hold_unfunded(
         i: &mut Inner,
         newcomer: &Newcomer,
+        holder: Holder,
         funding: &HashSet<PublicKey>,
     ) -> std::result::Result<(), (bool, &'static str)> {
         let body = &newcomer.transaction.body;
@@ -3512,14 +3800,14 @@ impl Node {
                 "sender account does not exist, and its pending funding leaves this nonce too far ahead",
             ));
         }
-        let (mut sender, mut source, mut bytes) = (0usize, (0usize, 0usize), 0usize);
+        let (mut sender, mut own, mut bytes) = (0usize, (0usize, 0usize), 0usize);
         let mut relayed = (0usize, 0usize);
         for entry in &i.awaiting {
             let held = &entry.transaction.body;
             if held.sender == body.sender {
                 if held.nonce == body.nonce {
                     return Err((
-                        false,
+                        true,
                         "sender account does not exist, and another transaction at this nonce waits for its funding",
                     ));
                 }
@@ -3529,31 +3817,32 @@ impl Node {
                 held.0 += 1;
                 held.1 = held.1.saturating_add(entry.bytes);
             };
-            if entry.source == newcomer.source {
-                count(&mut source);
+            if entry.holder == holder {
+                count(&mut own);
             }
-            if entry.source.is_some() {
+            if matches!(entry.holder, Holder::Relay(_)) {
                 count(&mut relayed);
             }
             bytes = bytes.saturating_add(entry.bytes);
         }
         let limit = usize::try_from(i.chain.tip_state().settings.block_bytes).unwrap_or(usize::MAX);
-        // Each source holds at most its share of the entries and bytes, and
-        // relaying sources together leave local submissions and recovery
-        // (the source None) one share of their own.
+        // Each untrusted holder holds at most its share of the entries and
+        // bytes, and relaying sources together leave public broadcasts, and
+        // the operator's submissions and recovery, one share each.
         let share = limit / AWAITING_SOURCES;
-        let relays_full = newcomer.source.is_some()
-            && (relayed.0 >= MAX_AWAITING - AWAITING_PER_SOURCE
-                || relayed.1.saturating_add(newcomer.bytes) > limit - share);
+        let untrusted_full = holder.untrusted()
+            && (own.0 >= AWAITING_PER_SOURCE || own.1.saturating_add(newcomer.bytes) > share);
+        let relays_full = matches!(holder, Holder::Relay(_))
+            && (relayed.0 >= MAX_AWAITING - 2 * AWAITING_PER_SOURCE
+                || relayed.1.saturating_add(newcomer.bytes) > limit - 2 * share);
         if i.awaiting.len() >= MAX_AWAITING
             || sender >= AWAITING_PER_SENDER
-            || source.0 >= AWAITING_PER_SOURCE
-            || source.1.saturating_add(newcomer.bytes) > share
             || bytes.saturating_add(newcomer.bytes) > limit
+            || untrusted_full
             || relays_full
         {
             return Err((
-                false,
+                true,
                 "sender account does not exist, and no more spends can wait for their funding",
             ));
         }
@@ -3561,7 +3850,7 @@ impl Node {
             id: newcomer.id,
             transaction: newcomer.transaction.clone(),
             bytes: newcomer.bytes,
-            source: newcomer.source,
+            holder,
             tips: 0,
         });
         Ok(())
@@ -3579,7 +3868,7 @@ impl Node {
                     id: entry.id,
                     transaction: entry.transaction,
                     bytes: entry.bytes,
-                    source: entry.source,
+                    source: entry.holder.source(),
                     peer: None,
                     authenticated: true,
                     operator: false,
@@ -3761,7 +4050,7 @@ impl Node {
         retained: &HashSet<Hash>,
         authenticated: &HashSet<Hash>,
     ) -> Result<(Pool, Room)> {
-        let selection = chain.select_admission(
+        let (selection, mut opening) = chain.select_admission_opening(
             miner,
             candidates,
             mempool_limit(&chain.config),
@@ -3772,13 +4061,19 @@ impl Node {
             POOL_SELECTIONS.with(|count| count.set(count.get() + 1));
             POOL_SIGNATURES.with(|count| count.set(count.get() + selection.signatures_checked));
         }
-        let room = Room::after(chain, miner, &selection)?;
-        let backlog = Self::displaced(chain, &selection, &room, candidates, retained)?;
-        Ok(((selection.transactions, backlog), room))
+        let room = Room::after(chain, miner, &selection, candidates)?;
+        let backlog =
+            Self::displaced(chain, &selection, &mut opening, &room, candidates, retained)?;
+        let pool = Pool {
+            selection: selection.transactions,
+            backlog,
+            weight: opening.used_weight(),
+        };
+        Ok((pool, room))
     }
     /// Retained entries the selection left out only for block capacity. Unless
     /// the selection was saturated (or truncated, which an admission selection
-    /// never is) or left the sender's own candidates unattempted, an entry
+    /// never is) or left the sender undecided (see [Room]), an entry
     /// that still fits the selected block's
     /// bytes and weight was refused for validity: it is dropped with its sender's
     /// later nonces. Weights quoted against the parent state can only overstate
@@ -3789,11 +4084,15 @@ impl Node {
     /// ranks no higher than the lowest bid among them, and it is kept only
     /// after all of them: a high bid behind a low one never displaces another
     /// sender's entry, and the room of an entry left out goes to the next
-    /// bid. Past its first entry, one sender's chain keeps at most its share
-    /// (see BACKLOG_SENDER_SHARE).
+    /// bid. An entry is kept only while the next block's opening balances,
+    /// after the selection's (`opening`) and the sender's kept entries before
+    /// it, still cover its inputs and fee, so a sender's chain holds no more
+    /// than it can pay for. Past its first entry, one sender's chain keeps at
+    /// most its share (see BACKLOG_SENDER_SHARE).
     fn displaced(
         chain: &Chain,
         selection: &SelectionResult,
+        opening: &mut crate::chain::Opening<'_>,
         room: &Room,
         candidates: &[Transaction],
         retained: &HashSet<Hash>,
@@ -3911,6 +4210,10 @@ impl Node {
             else {
                 continue;
             };
+            // What its sender cannot pay for strands it and its later nonces.
+            if opening.commit(entry.transaction).is_err() {
+                continue;
+            }
             bytes = total;
             *next += 1;
             if following {
@@ -3929,7 +4232,11 @@ impl Node {
     fn install_pool(
         &self,
         i: &mut Inner,
-        (mempool, backlog): (Vec<Transaction>, Vec<Transaction>),
+        Pool {
+            selection: mempool,
+            backlog,
+            weight,
+        }: Pool,
     ) -> Result<bool> {
         i.pool_tip = i.chain.tip_hash();
         let selection_changed = mempool[..] != i.mempool[..];
@@ -3941,6 +4248,7 @@ impl Node {
         if selection_changed {
             i.selection_revision = i.selection_revision.wrapping_add(1);
         }
+        i.selection_weight = Some((i.selection_revision, weight));
         if changed {
             i.pool_revision = i.pool_revision.wrapping_add(1);
             self.publish(i)?;
@@ -4554,9 +4862,8 @@ impl Node {
             for transaction in unfunded {
                 // Beyond the holding bounds, or without a transfer that
                 // creates its sender, it can be submitted again once funded.
-                if let Err((_, why)) =
-                    Self::hold_unfunded(i, &Newcomer::new(transaction, None, true), &funding)
-                {
+                let newcomer = Newcomer::new(transaction, None, true);
+                if let Err((_, why)) = Self::hold_unfunded(i, &newcomer, Holder::Local, &funding) {
                     dropped += 1;
                     reason = why;
                 }

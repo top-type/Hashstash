@@ -654,9 +654,7 @@ async fn p2p_admission_saturation_does_not_starve_rpc_or_a_different_peer() {
     // allowance ago (`EVICTION_GRACE`), so sources that keep reconnecting
     // cannot displace an honest session before it finishes its exchange.
     // While every unprotected session is that young the newcomer is closed
-    // before parsing, and the sessions keep their slots. Which session a
-    // newcomer takes over once they are older is covered by the slot tests
-    // in `network_guard`.
+    // before parsing, and the sessions keep their slots.
     let mut newcomer = connect(server.p2p, 6, 5).await;
     assert!(
         read_closed(&mut newcomer, Instant::now() + FAST_DEADLINE)
@@ -672,12 +670,42 @@ async fn p2p_admission_saturation_does_not_starve_rpc_or_a_different_peer() {
             .is_err(),
         "the newest session keeps its slot"
     );
+    // Once the sessions are older than their grace period (shortened here,
+    // as the held sessions' own first-message allowance is no longer), a
+    // sixth address takes over the newest session of the most represented
+    // source instead of waiting for one to end, and that session closes at
+    // once. The oldest sessions of up to four sources and the four
+    // longest-connected others stay.
+    node.set_peer_eviction_grace(Duration::from_millis(200));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut taker = connect(server.p2p, 6, 6).await;
+    let mut evicted = held.pop().unwrap();
+    assert!(
+        read_closed(&mut evicted, Instant::now() + FAST_DEADLINE)
+            .await
+            .is_empty(),
+        "the session taken over closes at once"
+    );
+    assert!(
+        timeout(Duration::from_millis(500), taker.read(&mut probe))
+            .await
+            .is_err(),
+        "the newcomer holds the slot it took over"
+    );
+    for stream in held.iter_mut() {
+        assert!(
+            timeout(Duration::from_millis(20), stream.read(&mut probe))
+                .await
+                .is_err(),
+            "only one session is taken over"
+        );
+    }
     for _ in 0..8 {
         healthy(&server, &before).await;
     }
     // A configured peer still synchronizes through reserved capacity.
     valid_peer(server.p2p, &hello(&node), 6, 9).await;
-    drop((held, newcomer));
+    drop((held, newcomer, taker));
     // Admission alone should not permanently ban an address. Allow tasks to
     // observe the closed sockets, and any first cooldown (250 ms) to pass,
     // then retry a well-formed local handshake from the refused address.

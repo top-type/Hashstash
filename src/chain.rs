@@ -50,11 +50,19 @@ pub const SIDE_BRANCH_CATCH_UP_BLOCKS: u32 = 4096;
 /// chain growth.
 pub const SIDE_BRANCH_BURST: u64 = 4096;
 pub const SIDE_BRANCH_BLOCKS_PER_TIP: u64 = 4;
-/// The same budget in stored bytes: at most this many, refilled by
-/// SIDE_BRANCH_BLOCKS_PER_TIP block capacities per new active-chain height,
-/// so side storage tracks the chain's own growth rather than the block count
-/// times a governed capacity. Both budgets persist across restarts.
+/// The same budget in stored bytes: at most this many, or
+/// SIDE_BRANCH_BLOCKS_PER_TIP block capacities if that is more, refilled by
+/// SIDE_BRANCH_CAPACITIES_PER_TIP block capacities per new active-chain
+/// height, so side blocks are admitted no faster than the active chain
+/// itself grows, whatever the governed capacity. Both budgets persist
+/// across restarts.
 pub const SIDE_BRANCH_BURST_BYTES: u64 = 64 << 20;
+pub const SIDE_BRANCH_CAPACITIES_PER_TIP: u64 = 1;
+/// Stored side blocks are judged again every this many new active-chain
+/// heights while the node runs, and those that fell out of competition are
+/// deleted as at startup (see [Chain::prune_side_blocks]), so side storage
+/// stays bounded instead of growing until the next restart.
+const SIDE_PRUNE_HEIGHTS: u64 = 64;
 /// Free disk space below which side blocks are declined (their headers are
 /// held as for any declined block) and state checkpoints are not saved, so
 /// what remains serves the active chain.
@@ -103,10 +111,13 @@ const CHECKPOINT_INTERVAL: u64 = 1024;
 /// branches forking within that depth stay cheap to reconstruct.
 const CHECKPOINT_DEPTH: u64 = DENSE_STATE_CHECKPOINTS - 1;
 /// Saved checkpoints kept: the newest two, the older serving when the newer
-/// fails its checks, and up to two older ones about one per doubling of depth
-/// (see [saved_checkpoints_kept]), from which a reorganization below a
-/// restored state rebuilds its fork point instead of from genesis.
-const MAX_SAVED_CHECKPOINTS: usize = 4;
+/// fails its checks, and older ones about one per doubling of depth (see
+/// [saved_checkpoints_kept]), from which a reorganization below a restored
+/// state rebuilds its fork point instead of from genesis. The oldest lies at
+/// least a third of the way down to genesis, and their number grows with the
+/// logarithm of the height: this bound is met only after 2^15 checkpoint
+/// intervals (about 33 million heights).
+const MAX_SAVED_CHECKPOINTS: usize = 16;
 /// After a failed save, periodic saves wait one checkpoint interval of
 /// active-chain heights before trying again, doubling with each further
 /// failure up to this many intervals, instead of retrying on every block.
@@ -917,6 +928,16 @@ pub struct Chain {
     side_budget: u64,
     side_budget_bytes: u64,
     side_budget_height: u64,
+    // Every stored block off the active chain, by height, which runtime
+    // pruning judges (see [Chain::prune_side_blocks]); entries that have
+    // since joined the active chain drop out when judged. None until
+    // startup pruning lists them, or after a block that left the active
+    // chain could not be listed: pruning then waits for the next start.
+    side_blocks: Option<BTreeSet<(u64, Hash)>>,
+    // The active-chain height of the last runtime pruning, and the new
+    // heights between runs (SIDE_PRUNE_HEIGHTS).
+    side_pruned_at: u64,
+    side_prune_every: u64,
     // The saved checkpoint this process started from, while it stays on the
     // active chain. Below it only genesis is retained, so it stays retained too.
     restored: Option<(u64, Hash)>,
@@ -1057,6 +1078,7 @@ impl Chain {
             eprintln!("Pruned {pruned} stored losing-branch block(s) that fell out of competition");
         }
         chain.resume_side_budget()?;
+        chain.side_pruned_at = chain.tip_height();
         chain.db.execute_batch("COMMIT")?;
         // Housekeeping only: a failed WAL checkpoint leaves committed history intact.
         let _ = chain.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
@@ -1107,6 +1129,9 @@ impl Chain {
             side_budget: SIDE_BRANCH_BURST,
             side_budget_bytes: SIDE_BRANCH_BURST_BYTES,
             side_budget_height: 0,
+            side_blocks: None,
+            side_pruned_at: 0,
+            side_prune_every: SIDE_PRUNE_HEIGHTS,
             restored: None,
             loaded: Cell::new(None),
             checkpoint_every: CHECKPOINT_INTERVAL,
@@ -2630,23 +2655,52 @@ impl Chain {
     ) {
         self.cache_entry(hash, entry.clone());
         let previous = (self.tip, self.tip_entry.clone());
+        let reorganized = best && block.header.previous != previous.0;
         if best {
             self.select_tip(hash, block, state, entry.clone());
             self.refill_side_budget(entry.height);
         } else {
             self.cache_state(hash, state);
         }
+        // Startup lists the stored side blocks once it has replayed them.
+        if self.opened {
+            if !best {
+                if let Some(side) = &mut self.side_blocks {
+                    side.insert((entry.height, hash));
+                }
+            } else if reorganized && let Err(error) = self.note_left_active(previous.0) {
+                eprintln!("Side-branch pruning paused until the next start: {error:#}");
+                self.side_blocks = None;
+            }
+        }
         self.note_branch(hash, &entry, best, previous);
         self.refresh_capacity();
     }
+    /// List the blocks a reorganization took off the active chain, from the
+    /// previous tip `hash` down to the fork point, as stored side blocks.
+    fn note_left_active(&mut self, mut hash: Hash) -> Result<()> {
+        loop {
+            let entry = self
+                .load_entry(&hash)?
+                .context("a block that left the active chain has no index entry")?;
+            if entry.height == 0 || self.canonical_hash(entry.height)? == Some(hash) {
+                return Ok(());
+            }
+            if let Some(side) = &mut self.side_blocks {
+                side.insert((entry.height, hash));
+            }
+            hash = entry.header.previous;
+        }
+    }
     /// The most side-branch bytes the budget holds: SIDE_BRANCH_BURST_BYTES,
-    /// or a refill's worth of block capacities if that is more.
+    /// or SIDE_BRANCH_BLOCKS_PER_TIP block capacities if that is more.
     fn side_bytes_cap(&self) -> u64 {
-        let refill = SIDE_BRANCH_BLOCKS_PER_TIP.saturating_mul(self.tip_state.settings.block_bytes);
-        SIDE_BRANCH_BURST_BYTES.max(refill)
+        let blocks = SIDE_BRANCH_BLOCKS_PER_TIP.saturating_mul(self.tip_state.settings.block_bytes);
+        SIDE_BRANCH_BURST_BYTES.max(blocks)
     }
     /// Only new active-chain heights refill side-branch admissions, by
-    /// SIDE_BRANCH_BLOCKS_PER_TIP blocks and as many block capacities each.
+    /// SIDE_BRANCH_BLOCKS_PER_TIP blocks and SIDE_BRANCH_CAPACITIES_PER_TIP
+    /// block capacities each.
     fn refill_side_budget(&mut self, height: u64) {
         if height <= self.side_budget_height {
             return;
@@ -2656,7 +2710,8 @@ impl Chain {
             .saturating_mul(SIDE_BRANCH_BLOCKS_PER_TIP)
             .saturating_add(self.side_budget)
             .min(SIDE_BRANCH_BURST);
-        let refill = SIDE_BRANCH_BLOCKS_PER_TIP.saturating_mul(self.tip_state.settings.block_bytes);
+        let refill =
+            SIDE_BRANCH_CAPACITIES_PER_TIP.saturating_mul(self.tip_state.settings.block_bytes);
         self.side_budget_bytes = gained
             .saturating_mul(refill)
             .saturating_add(self.side_budget_bytes)
@@ -3444,12 +3499,15 @@ impl Chain {
         Ok(())
     }
     /// Delete stored losing-branch blocks that a child at their required target
-    /// could no longer extend competitively, unless a kept descendant needs them.
-    /// Children follow their parents in storage order, so one reverse pass
-    /// suffices. Peers can deliver a pruned branch again through header presync.
+    /// could no longer extend competitively, unless a kept descendant needs them
+    /// (see [Chain::side_block_kept]), and list the stored side blocks that
+    /// stay for runtime pruning. Children follow their parents in storage
+    /// order, so one reverse pass suffices. Peers can deliver a pruned branch
+    /// again through header presync.
     fn prune_stale_branches(&mut self) -> Result<u64> {
         let next = math::work(&self.target(&self.tip_entry)?);
         let mut needed = BTreeSet::new();
+        let mut side = BTreeSet::new();
         let mut sequence = i64::MAX;
         let mut pruned = 0u64;
         loop {
@@ -3471,15 +3529,9 @@ impl Chain {
                 needed.remove(&hash);
                 continue;
             }
-            let child = math::work(&self.target(&entry)?);
-            let branch = &entry.work + &child;
-            // A stored root of an admitted held chain is where its body
-            // downloads resume.
-            if needed.remove(&hash)
-                || self.held.roots.contains_key(&hash)
-                || Self::competitive(&self.tip_entry.work, &branch, &child, &next).is_ok()
-            {
+            if needed.remove(&hash) || self.side_block_kept(&hash, &entry, &next)? {
                 needed.insert(entry.header.previous);
+                side.insert((entry.height, hash));
                 continue;
             }
             self.db
@@ -3488,11 +3540,13 @@ impl Chain {
             self.db
                 .prepare_cached("DELETE FROM entry_index WHERE hash=?1")?
                 .execute([hash.as_slice()])?;
+            self.drop_held_after(&hash);
             pruned += 1;
             if pruned.is_multiple_of(INDEX_REBUILD_BATCH) {
                 self.db.execute_batch("COMMIT; BEGIN IMMEDIATE;")?;
             }
         }
+        self.side_blocks = Some(side);
         if pruned > 0 {
             // Pruned hashes may sit in the hot caches; they are only caches.
             *self.entries.get_mut() = EntryCache::default();
@@ -3506,6 +3560,171 @@ impl Chain {
             self.refresh_capacity();
         }
         Ok(pruned)
+    }
+    /// Whether a stored losing-branch block stays whatever its descendants:
+    /// a child at its required target could still extend it competitively
+    /// (see [Chain::competitive]), or a held header after it that is admitted
+    /// or pinned by a header download needs it, as where that branch's body
+    /// downloads resume.
+    fn side_block_kept(&self, hash: &Hash, entry: &Entry, next: &Amount) -> Result<bool> {
+        let child = math::work(&self.target(entry)?);
+        let branch = &entry.work + &child;
+        if Self::competitive(&self.tip_entry.work, &branch, &child, next).is_ok()
+            || self.held.roots.contains_key(hash)
+        {
+            return Ok(true);
+        }
+        let mut pending: Vec<Hash> = self
+            .held
+            .children
+            .get(hash)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        while let Some(header) = pending.pop() {
+            if self
+                .held
+                .headers
+                .get(&header)
+                .is_some_and(|held| !held.evictable())
+            {
+                return Ok(true);
+            }
+            pending.extend(
+                self.held
+                    .children
+                    .get(&header)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            );
+        }
+        Ok(false)
+    }
+    /// Drop the held headers after a pruned block: presync of a branch that
+    /// fell out of competition with it, all evictable (see
+    /// [Chain::side_block_kept]), which could no longer reach a stored parent.
+    fn drop_held_after(&mut self, hash: &Hash) {
+        let children: Vec<Hash> = self
+            .held
+            .children
+            .get(hash)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        for child in children {
+            self.held.remove_branch(&child);
+        }
+    }
+    /// Every `side_prune_every` new active-chain heights, delete the stored
+    /// side blocks that fell out of competition since (see
+    /// [Chain::prune_side_blocks]). Housekeeping only: a failure is logged
+    /// and the next run tries again.
+    fn prune_side_blocks_due(&mut self) {
+        let height = self.tip_height();
+        if height < self.side_pruned_at.saturating_add(self.side_prune_every) {
+            return;
+        }
+        self.side_pruned_at = height;
+        match self.prune_side_blocks() {
+            Ok(0) => {}
+            Ok(pruned) => eprintln!(
+                "Pruned {pruned} stored losing-branch block(s) that fell out of competition"
+            ),
+            Err(error) => eprintln!("Side-branch pruning deferred: {error:#}"),
+        }
+    }
+    /// Delete, while the node runs, the stored side blocks that startup
+    /// pruning would (see [Chain::prune_stale_branches]). Only the listed
+    /// side blocks are judged, children before parents, so a run costs about
+    /// their number, never the chain height; they are deleted in one commit.
+    /// Their deferred replays, cached metadata and states, and the presync
+    /// headers after them go too. A block executing outside the chain whose
+    /// parent goes meanwhile is refused when it finishes.
+    fn prune_side_blocks(&mut self) -> Result<u64> {
+        let Some(listed) = &self.side_blocks else {
+            return Ok(0);
+        };
+        let listed: Vec<(u64, Hash)> = listed.iter().rev().copied().collect();
+        let next = math::work(&self.target(&self.tip_entry)?);
+        let mut needed = BTreeSet::new();
+        let mut gone = Vec::new();
+        let mut stale = Vec::new();
+        for (height, hash) in listed {
+            let Some(entry) = self.load_entry(&hash)? else {
+                gone.push((height, hash));
+                continue;
+            };
+            // Adopted by a reorganization since it was listed.
+            if self.canonical_hash(height)? == Some(hash) {
+                gone.push((height, hash));
+                continue;
+            }
+            if needed.remove(&hash) || self.side_block_kept(&hash, &entry, &next)? {
+                needed.insert(entry.header.previous);
+                continue;
+            }
+            stale.push((height, hash));
+        }
+        if let Some(listed) = &mut self.side_blocks {
+            for key in &gone {
+                listed.remove(key);
+            }
+        }
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        self.delete_side_blocks(&stale)?;
+        Ok(stale.len() as u64)
+    }
+    /// Delete stored side blocks, descendants before their ancestors, in one
+    /// commit, and forget them.
+    fn delete_side_blocks(&mut self, stale: &[(u64, Hash)]) -> Result<()> {
+        let transaction = self.db.transaction()?;
+        for (_, hash) in stale {
+            transaction
+                .prepare_cached("DELETE FROM blocks WHERE hash=?1")?
+                .execute([hash.as_slice()])?;
+            transaction
+                .prepare_cached("DELETE FROM entry_index WHERE hash=?1")?
+                .execute([hash.as_slice()])?;
+        }
+        transaction.commit()?;
+        for (height, hash) in stale {
+            if let Some(listed) = &mut self.side_blocks {
+                listed.remove(&(*height, *hash));
+            }
+            {
+                let mut cache = self.entries.borrow_mut();
+                if cache.entries.remove(hash).is_some() {
+                    cache.order.retain(|cached| cached != hash);
+                }
+            }
+            self.uncache_state(hash);
+            self.branches.remove(hash);
+            self.drop_held_after(hash);
+            let replayed = self
+                .replay
+                .get_mut()
+                .take_if(|replay| replay.target == *hash)
+                .is_some();
+            let priority = self.priority_replays.get_mut();
+            let position = priority.iter().position(|replay| replay.target == *hash);
+            if let Some(position) = position {
+                priority.remove(position);
+            }
+            // Temporary rows only: a later replay of the same target clears
+            // them before it starts.
+            if (replayed || position.is_some())
+                && let Err(error) = self.clear_replay_path(hash)
+            {
+                eprintln!("Replay path of a pruned block kept: {error:#}");
+            }
+        }
+        self.refresh_capacity();
+        Ok(())
     }
     fn validate_block(
         &self,
@@ -3700,6 +3919,12 @@ impl Chain {
         if self.load_entry(&hash)?.is_some() {
             return Ok(false);
         }
+        // Runtime pruning (see [Chain::prune_side_blocks]) may have deleted
+        // the parent of a side block while it executed; a stored block
+        // always has its parent.
+        if self.load_entry(&block.header.previous)?.is_none() {
+            return Err(SideBranchRefused("its parent was pruned while it executed").into());
+        }
         let bytes = validation.bytes.unwrap_or_else(|| codec::encode(&block));
         let ExecutedBlock { entry, state } = match executed {
             Ok(executed) => executed,
@@ -3789,6 +4014,7 @@ impl Chain {
                 eprintln!("Held header pruning deferred: {error:#}");
             }
             self.save_checkpoint(self.checkpoint_every);
+            self.prune_side_blocks_due();
         }
         Ok(best)
     }
@@ -5422,6 +5648,8 @@ mod cache_tests {
         let config = Config::devnet();
         let miner = crypto::public_key(&[91; 32]).unwrap();
         let mut chain = Chain::open(&path, config.clone()).unwrap();
+        // The stale branch is left for startup to prune.
+        chain.side_prune_every = u64::MAX;
         let mut early = Chain::open(&directory.path().join("early.db"), config.clone()).unwrap();
         let first = candidate(&chain, 0);
         for target in [&mut chain, &mut early] {
@@ -6144,23 +6372,29 @@ mod cache_tests {
     #[test]
     fn saved_checkpoints_thin_out_to_about_one_per_doubling_of_depth() {
         let mut saved: Vec<u64> = Vec::new();
-        let mut deepest = Vec::new();
-        for newest in 1..=64u64 {
-            let mut heights = vec![newest * 8 + 3];
-            heights.extend(&saved);
-            let kept = saved_checkpoints_kept(&heights, 8);
-            assert!(kept.len() <= MAX_SAVED_CHECKPOINTS);
-            // The newest two always stay, and only saved ones do.
-            assert!(heights.iter().take(2).all(|height| kept.contains(height)));
-            assert!(kept.iter().all(|height| heights.contains(height)));
-            saved = kept.into_iter().rev().collect();
-            deepest.push(newest - saved.last().unwrap() / 8);
+        for newest in 1..=4096u64 {
+            // Every third interval a clean stop saves within it too.
+            let stop = newest.is_multiple_of(3).then_some(newest * 8 + 5);
+            for height in std::iter::once(newest * 8 + 3).chain(stop) {
+                let mut heights = vec![height];
+                heights.extend(&saved);
+                let kept = saved_checkpoints_kept(&heights, 8);
+                assert!(kept.len() <= MAX_SAVED_CHECKPOINTS);
+                // The newest two always stay, and only saved ones do.
+                assert!(heights.iter().take(2).all(|height| kept.contains(height)));
+                assert!(kept.iter().all(|height| heights.contains(height)));
+                saved = kept.into_iter().rev().collect();
+            }
+            // Their number grows with the logarithm of the height, and the
+            // oldest lies at least a third of the way down to genesis, so a
+            // fork point is rebuilt from a saved state at about its depth.
+            assert!(
+                saved.len() as u32 <= 3 + newest.ilog2(),
+                "{newest}: {saved:?}"
+            );
+            let deepest = newest - saved.last().unwrap() / 8;
+            assert!(newest < 16 || deepest * 3 >= newest, "{newest}: {saved:?}");
         }
-        // Once there are enough, an older one lies two to seven intervals below.
-        assert!(
-            deepest[8..].iter().all(|depth| (2..8).contains(depth)),
-            "{deepest:?}"
-        );
         // Several in one interval keep only its newest beyond the newest two.
         assert_eq!(
             saved_checkpoints_kept(&[100, 98, 97, 96, 88, 64], 8),
@@ -6397,6 +6631,8 @@ mod cache_tests {
         let config = Config::devnet();
         let miner = crypto::public_key(&[91; 32]).unwrap();
         let mut chain = Chain::open(&path, config.clone()).unwrap();
+        // The stale branch is left for startup to prune.
+        chain.side_prune_every = u64::MAX;
         let mut early = Chain::open(&directory.path().join("early.db"), config.clone()).unwrap();
         let first = candidate(&chain, 0);
         for target in [&mut chain, &mut early] {
@@ -6736,15 +6972,216 @@ mod cache_tests {
             (SIDE_BRANCH_BURST - 1, 1)
         );
         assert!(submit(&mut chain, &siblings[1]).is_err());
-        // New active-chain heights refill both, by block capacities.
+        // New active-chain heights refill both, the bytes by one block
+        // capacity each: no faster than the active chain itself grows.
         FREE_BYTES.with(|free| free.set(Some(STORAGE_RESERVE_BYTES - 1)));
         extend(&mut chain, 1, 50);
         FREE_BYTES.with(|free| free.set(None));
         let capacity = chain.tip_state().settings.block_bytes;
-        assert_eq!(
-            chain.side_budget_bytes,
-            1 + SIDE_BRANCH_BLOCKS_PER_TIP * capacity
-        );
+        assert_eq!(SIDE_BRANCH_CAPACITIES_PER_TIP, 1);
+        assert_eq!(chain.side_budget_bytes, 1 + capacity);
         assert!(!submit(&mut chain, &siblings[2]).unwrap());
+    }
+    /// Stored blocks off the active chain, as the database holds them.
+    fn stored_side_blocks(chain: &Chain) -> u64 {
+        chain
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM blocks b WHERE NOT EXISTS(SELECT 1 FROM canonical_index c WHERE c.hash=b.hash)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+    /// Extend the active chain by one block a second after the tip, which
+    /// raises the next block's work (see [prune_at_startup]).
+    fn rush(chain: &mut Chain) {
+        let miner = crypto::public_key(&[91; 32]).unwrap();
+        let time = chain.tip_block().header.timestamp + 1;
+        let block = Chain::mine(chain.template(miner, vec![], time).unwrap(), 1_000_000).unwrap();
+        assert!(chain.submit(block, time as u64).unwrap());
+    }
+    #[test]
+    fn side_blocks_that_fall_out_of_competition_are_pruned_while_running() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        let mut chain = Chain::open(&directory.path().join("running.db"), config.clone()).unwrap();
+        chain.side_prune_every = 8;
+        let mut fork = Chain::open(&directory.path().join("fork.db"), config.clone()).unwrap();
+        let first = candidate(&chain, 0);
+        for target in [&mut chain, &mut fork] {
+            target
+                .submit(first.clone(), first.header.timestamp as u64)
+                .unwrap();
+        }
+        // A reorganization takes a block off the active chain: it is listed
+        // with the stored side blocks.
+        let left = candidate(&chain, 1);
+        assert!(
+            chain
+                .submit(left.clone(), left.header.timestamp as u64)
+                .unwrap()
+        );
+        let left = codec::block_hash(&left);
+        let heavier: Vec<Block> = (0..2)
+            .map(|n| {
+                let block = candidate(&fork, 10 + n);
+                fork.submit(block.clone(), block.header.timestamp as u64)
+                    .unwrap();
+                block
+            })
+            .collect();
+        assert!(
+            !chain
+                .submit(heavier[0].clone(), heavier[0].header.timestamp as u64)
+                .unwrap()
+        );
+        assert!(
+            chain
+                .submit(heavier[1].clone(), heavier[1].header.timestamp as u64)
+                .unwrap()
+        );
+        assert!(chain.side_blocks.as_ref().unwrap().contains(&(2, left)));
+        // A sibling of the tip at every height while one-second blocks raise
+        // the next block's work, until early siblings carry less than 1/64
+        // of it: each is pruned at most eight heights after that, without
+        // a restart.
+        let mut siblings = Vec::new();
+        let mut stored = Vec::new();
+        for n in 0..640u64 {
+            let mut sibling = chain.tip_block().clone();
+            sibling.extranonce = (1_000 + n).to_le_bytes();
+            sibling.header.merkle_root = codec::merkle_root(&sibling).unwrap();
+            let sibling = Chain::mine(sibling, 1_000_000).unwrap();
+            assert!(
+                !chain
+                    .submit(sibling.clone(), sibling.header.timestamp as u64)
+                    .unwrap()
+            );
+            siblings.push(codec::block_hash(&sibling));
+            rush(&mut chain);
+            stored.push(stored_side_blocks(&chain));
+            if chain.tip_height() == chain.side_pruned_at {
+                // Right after a run nothing stored is stale any more, and
+                // the list holds exactly the stored side blocks.
+                assert_eq!(chain.prune_side_blocks().unwrap(), 0);
+                assert_eq!(
+                    stored.last().copied(),
+                    chain.side_blocks.as_ref().map(|side| side.len() as u64)
+                );
+            }
+        }
+        assert!(chain.block(&left).is_none());
+        assert!(chain.block(&siblings[0]).is_none());
+        assert!(chain.block(siblings.last().unwrap()).is_some());
+        // Side storage stops growing with the chain: as many fall out as
+        // are stored.
+        let (late, last) = (stored[511], stored[639]);
+        assert!(last < 512, "{stored:?}");
+        assert!(
+            last <= late + 2 * chain.side_prune_every,
+            "{late} then {last}: {stored:?}"
+        );
+    }
+    #[test]
+    fn presync_headers_after_a_pruned_side_block_go_with_it_unless_a_download_pins_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        let mut chain = Chain::open(&directory.path().join("held.db"), config.clone()).unwrap();
+        chain.side_prune_every = 8;
+        let mut near = Chain::open(&directory.path().join("near.db"), config.clone()).unwrap();
+        let first = candidate(&chain, 0);
+        for target in [&mut chain, &mut near] {
+            target
+                .submit(first.clone(), first.header.timestamp as u64)
+                .unwrap();
+        }
+        extend(&mut chain, 3, 1);
+        // A stored side block at height 2 and two presync headers after it,
+        // one of them pinned by a header download.
+        let side = candidate(&near, 50);
+        near.submit(side.clone(), side.header.timestamp as u64)
+            .unwrap();
+        assert!(
+            !chain
+                .submit(side.clone(), side.header.timestamp as u64)
+                .unwrap()
+        );
+        let children: Vec<Block> = (0..2).map(|n| candidate(&near, 60 + n)).collect();
+        let pin = chain.new_header_pin();
+        for (child, pin) in children.iter().zip([0, pin]) {
+            let time = child.header.timestamp as u64;
+            assert_eq!(
+                chain.hold_header(child.header.clone(), time, pin).unwrap(),
+                HeaderHold::Held
+            );
+        }
+        let side = codec::block_hash(&side);
+        // Once it falls out of competition, the pinned header keeps it.
+        while math::work(&chain.next_target().unwrap()) <= Amount::from(128u32) {
+            rush(&mut chain);
+        }
+        let every = chain.side_prune_every;
+        extend(&mut chain, every, 100);
+        assert!(chain.block(&side).is_some());
+        assert_eq!(chain.held_header_count(), 2);
+        // The download ends: the block and both headers go at the next run.
+        chain.release_header_pin(pin);
+        extend(&mut chain, every, 200);
+        assert!(chain.block(&side).is_none());
+        assert_eq!(chain.held_header_count(), 0);
+        assert!(chain.side_blocks.as_ref().unwrap().is_empty());
+    }
+    #[test]
+    fn a_side_block_whose_parent_was_pruned_while_it_executed_is_not_stored() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        let mut chain = Chain::open(&directory.path().join("pruned.db"), config.clone()).unwrap();
+        let mut branch = Chain::open(&directory.path().join("branch.db"), config.clone()).unwrap();
+        let first = candidate(&chain, 0);
+        for target in [&mut chain, &mut branch] {
+            target
+                .submit(first.clone(), first.header.timestamp as u64)
+                .unwrap();
+        }
+        extend(&mut chain, 3, 1);
+        let losing: Vec<Block> = (0..2)
+            .map(|n| {
+                let block = candidate(&branch, 50 + n);
+                branch
+                    .submit(block.clone(), block.header.timestamp as u64)
+                    .unwrap();
+                block
+            })
+            .collect();
+        assert!(
+            !chain
+                .submit(losing[0].clone(), losing[0].header.timestamp as u64)
+                .unwrap()
+        );
+        // The child is checked, then executes outside the chain while
+        // runtime pruning deletes its parent.
+        let time = losing[1].header.timestamp as u64;
+        let validation = chain
+            .begin_submission(&losing[1], time, &mut |_| Ok(None))
+            .unwrap()
+            .unwrap();
+        let executed = validation.execute(&losing[1]);
+        let parent = codec::block_hash(&losing[0]);
+        chain.delete_side_blocks(&[(2, parent)]).unwrap();
+        let refused = chain
+            .finish_submission(validation, losing[1].clone(), executed, time)
+            .unwrap_err();
+        assert!(refused.is::<SideBranchRefused>(), "{refused:#}");
+        assert!(chain.block(&codec::block_hash(&losing[1])).is_none());
+        let orphans: i64 = chain
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM blocks WHERE hash=?1",
+                [codec::block_hash(&losing[1]).as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0);
     }
 }

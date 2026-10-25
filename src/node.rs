@@ -672,9 +672,13 @@ const STORAGE_EXIT_FAILURES: u32 = 8;
 const STORAGE_EXIT_SECONDS: u64 = 60;
 /// EX_IOERR from sysexits.h, distinct from the 70 of a poisoned lock.
 const STORAGE_EXIT_STATUS: i32 = 74;
-/// Whether storage has failed long enough for the node to stop.
-fn storage_exit_due(health: &StorageHealth, now: u64) -> bool {
-    health.failed_commits >= STORAGE_EXIT_FAILURES
+/// Whether storage has failed long enough for the node to stop, after a
+/// submission that found `before` failed commits in a row. Only one whose
+/// own commit failed, adding to them, stops it: a block refused for any
+/// other reason says nothing about storage, which may have recovered.
+fn storage_exit_due(before: u32, health: &StorageHealth, now: u64) -> bool {
+    health.failed_commits > before
+        && health.failed_commits >= STORAGE_EXIT_FAILURES
         && health
             .failing_since
             .is_some_and(|since| now.saturating_sub(since) >= STORAGE_EXIT_SECONDS)
@@ -2815,10 +2819,11 @@ impl Node {
         Ok(self.read_view()?.storage.unpoisoned().degraded())
     }
     /// Exit, for a supervised restart, once block commits have failed for
-    /// long enough (see [storage_exit_due]); `chain` just failed to store one.
-    fn exit_if_storage_failing(chain: &Chain) {
+    /// long enough (see [storage_exit_due]); `chain` just failed to store a
+    /// block, with `before` failed commits in a row when it began.
+    fn exit_if_storage_failing(chain: &Chain, before: u32) {
         let health = chain.storage_health().unpoisoned().clone();
-        if storage_exit_due(&health, now()) {
+        if storage_exit_due(before, &health, now()) {
             eprintln!(
                 "fatal: {} block commits failed in a row since {}, the last with: {}; exiting for a supervised restart",
                 health.failed_commits,
@@ -4288,6 +4293,7 @@ impl Node {
         drop(slot);
         let mut i = self.locked_for_block()?;
         let old_tip = i.chain.tip_hash();
+        let failed_commits = i.chain.storage_health().unpoisoned().failed_commits;
         let submitted = i
             .chain
             .finish_submission(validation, block, executed, now());
@@ -4296,7 +4302,7 @@ impl Node {
             eprintln!("Peer capacity allowance unchanged: {error:#}");
         }
         if submitted.is_err() {
-            Self::exit_if_storage_failing(&i.chain);
+            Self::exit_if_storage_failing(&i.chain, failed_commits);
         }
         let changed = submitted?;
         if !changed {
@@ -5847,6 +5853,17 @@ impl Node {
             self.rpc_with_admission(method, params, Some(admission))
         }
         .map_err(public_error)?;
+        // Public callers learn only whether blocks can be stored; the
+        // failures' text, such as the free disk space a save lacked, and
+        // their timing stay with the operator.
+        let status = match method {
+            "status" => Some(&mut result),
+            "snapshot" => result.get_mut("status"),
+            _ => None,
+        };
+        if let Some(storage) = status.and_then(|status| status.get_mut("storage")) {
+            *storage = json!({"degraded":storage["degraded"].as_bool().unwrap_or(false)});
+        }
         // The public mining panel shows workers and the advertised endpoint;
         // the Stratum bind interface stays private to the operator, including
         // inside a connect URL derived from it without --stratum-advertise.
@@ -12957,6 +12974,15 @@ mod tests {
             assert_eq!(report["failed_commits"], 1);
             assert!(report["last_error"].as_str().unwrap().contains("full"));
         }
+        // Public web callers learn only that blocks cannot be stored.
+        let visitor = Arc::new(NetworkGuard::for_public_web())
+            .admit("127.0.0.1".parse().unwrap(), Surface::Rpc)
+            .unwrap();
+        let status = node.public_rpc("status", json!({}), &visitor).unwrap();
+        let snapshot = node.public_rpc("snapshot", json!({}), &visitor).unwrap();
+        for public in [&status["storage"], &snapshot["status"]["storage"]] {
+            assert_eq!(*public, json!({"degraded":true}));
+        }
         // A stored block ends the streak.
         node.locked().unwrap().chain.limit_database_pages(None);
         node.mine(100_000).unwrap();
@@ -12973,16 +12999,50 @@ mod tests {
         };
         let now = 10_000;
         assert!(storage_exit_due(
+            STORAGE_EXIT_FAILURES - 1,
             &failing(STORAGE_EXIT_FAILURES, now - 60),
             now
         ));
         // Fewer failures, or a burst of deliveries within the minute, do not.
         assert!(!storage_exit_due(
+            STORAGE_EXIT_FAILURES - 2,
             &failing(STORAGE_EXIT_FAILURES - 1, now - 600),
             now
         ));
-        assert!(!storage_exit_due(&failing(100, now - 59), now));
-        assert!(!storage_exit_due(&StorageHealth::default(), now));
+        assert!(!storage_exit_due(99, &failing(100, now - 59), now));
+        assert!(!storage_exit_due(0, &StorageHealth::default(), now));
+        // Nor does a submission refused for another reason, whose own
+        // commit did not fail, however long the streak before it.
+        assert!(!storage_exit_due(100, &failing(100, now - 600), now));
+    }
+    #[test]
+    fn a_block_refused_for_another_reason_never_stops_the_node_over_old_storage_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = crypto::public_key(&[1; 32]).unwrap();
+        let node = Node::open(&dir.path().join("chain.sqlite"), Config::devnet(), key).unwrap();
+        node.mine(100_000).unwrap();
+        // Commits failed long enough for an exit, then the disk was freed
+        // before another block was stored.
+        let health = node.locked().unwrap().chain.storage_health();
+        *health.lock().unwrap() = StorageHealth {
+            failed_commits: STORAGE_EXIT_FAILURES,
+            failing_since: Some(now() - 600),
+            last_error: Some("database or disk is full".into()),
+            checkpoint_error: None,
+        };
+        // A block that fails execution once it is checked: its commit is
+        // never tried, so it cannot stop the node, which would exit this
+        // test process with status 74.
+        let mut invalid = node.template().unwrap();
+        invalid.state_root = [9; 32];
+        invalid.header.merkle_root = codec::merkle_root(&invalid).unwrap();
+        let invalid = Chain::mine(invalid, 100_000).unwrap();
+        let error = node.submit_block(invalid).unwrap_err();
+        assert!(format!("{error:#}").contains("state"), "{error:#}");
+        assert_eq!(health.lock().unwrap().failed_commits, STORAGE_EXIT_FAILURES);
+        // A stored block ends the streak.
+        node.mine(100_000).unwrap();
+        assert!(!node.storage_degraded().unwrap());
     }
     #[test]
     fn stash_quotes_match_execution_and_account_withdrawal_value() {

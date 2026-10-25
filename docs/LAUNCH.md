@@ -4,6 +4,8 @@ This runbook takes a new public Hashstash network from a reviewed source commit 
 
 Work through it in order. Each section ends with a check; do not continue past a failed check. Run a complete rehearsal on a throwaway genesis before launch day (section 10): every command below works the same way on it.
 
+For a concrete network, `scripts/launch-kit.sh` turns the servers' addresses, the calibration hashrate and the release into every server's `node.env`, firewall rules, nginx site, faucet configuration and service, and a numbered `INSTALL.md`, and creates the genesis once. The [launch-day sequence](LAUNCH-DAY.md) is the order of commands across servers, and `scripts/launch_rehearsal.py` rehearses the whole kit on one machine.
+
 ## 1 Roles, hosts and schedule
 
 Name one person for each role before starting. One person may hold several roles, but each signs off its own checks.
@@ -175,7 +177,7 @@ Check: `--check` prints "Configuration and payout public key are valid", and `sy
 
 ## 10 Rehearsal
 
-Two or three days before launch, run the whole procedure on a throwaway genesis created the same way (`./hashstash init --config rehearsal.json --preset slow --hashrate 2P`), on the real hosts, with real miners for at least an hour:
+First rehearse the generated files on one Linux machine: `python3 scripts/launch_rehearsal.py --release-dir target/release` builds kits for three loopback servers and checks installation, discovery, convergence, Stratum mining and the faucet ([launch day](LAUNCH-DAY.md#before-launch-day-t-4-to-t-1)). Then, two or three days before launch, run the whole procedure on a throwaway genesis created the same way (`./hashstash init --config rehearsal.json --preset slow --hashrate 2P`), on the real hosts, with real miners for at least an hour:
 
 1. Install every node, start them, and confirm convergence (section 11).
 2. Send transactions through the website, sign one offline with the cold signer and broadcast it, and run a small governance round if time allows.
@@ -187,6 +189,8 @@ Two or three days before launch, run the whole procedure on a throwaway genesis 
 Then stop every rehearsal node, move its `/var/lib/hashstash` aside and empty it, and replace the rehearsal genesis with the launch genesis using a new installation. Never reuse rehearsal data on the launch chain.
 
 ## 11 Launch day
+
+The [launch-day sequence](LAUNCH-DAY.md) gives these steps as commands for a kit-generated network, including stopping and archiving earlier nodes and enabling the faucet.
 
 1. Start the seeds: `sudo systemctl enable --now hashstash`. On each, `run-node.sh snapshot` must show height 0 and the same `tip` (the genesis block hash) and `chain_id` as on every other node, and `peerstatus` must show each configured peer `reachable` with a recent `last_success`.
 2. Start the mining nodes, then point the miners at them. Watch for the first blocks: heights rise, `blocks_found` increases on the mining node that found each one, and every node reports the same `tip` and `state_root` at the same height.

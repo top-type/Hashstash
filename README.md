@@ -69,7 +69,7 @@ The launcher creates a network configuration and records the processes it owns. 
 
 To join an existing network, obtain its exact genesis configuration and a reachable seed from its operators. Follow [node operation](docs/RUNNING.md#joining-a-public-network) or the [Linux deployment guide](deploy/linux/README.md). Keep private keys, live databases and service credentials outside this repository.
 
-Release binaries for Linux servers come from `bash scripts/release.sh --verify`, which builds them reproducibly with the committed lockfile and writes `SHA256SUMS`. Version 0.43.0 cannot join or continue a 0.42.0 network; the [release notes](CHANGELOG.md) list the required actions, and the [launch runbook](docs/LAUNCH.md) covers starting a new network.
+Release binaries for Linux servers come from `bash scripts/release.sh --verify`, which builds them reproducibly with the committed lockfile and writes `SHA256SUMS`. Version 0.43.0 cannot join or continue a 0.42.0 network; the [release notes](CHANGELOG.md) list the required actions, and the [launch runbook](docs/LAUNCH.md) covers starting a new network. `scripts/launch-kit.sh` generates each server's configuration and install steps from the servers' addresses, and the [launch-day sequence](docs/LAUNCH-DAY.md) gives the order of commands.
 
 ## Develop and test
 
@@ -103,7 +103,7 @@ Consensus encoding depends on exact dependency behaviour: `bincode`, `serde` and
 ## Reference
 
 - [Protocol specification](docs/SPECIFICATION.md), [consensus encoding](docs/CONSENSUS.md), [reserve mathematics](docs/RESERVE.md)
-- [Node operation](docs/RUNNING.md), [mining](docs/MINING.md), [network controls](docs/NETWORK-HARDENING.md), [launch runbook](docs/LAUNCH.md), [release notes](CHANGELOG.md)
+- [Node operation](docs/RUNNING.md), [mining](docs/MINING.md), [network controls](docs/NETWORK-HARDENING.md), [launch runbook](docs/LAUNCH.md), [launch day](docs/LAUNCH-DAY.md), [release notes](CHANGELOG.md)
 - [Wallets](docs/WALLETS.md), [addresses](docs/ADDRESSES.md), [explorer](docs/EXPLORER.md)
 - [Chat](docs/CHAT.md), [Mail](docs/MAIL.md), [faucet](docs/FAUCET.md)
 - [Validation](docs/VALIDATION.md), [security review](docs/AUDIT.md)

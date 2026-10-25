@@ -1,0 +1,63 @@
+[Unit]
+Description=Hashstash faucet (optional funded dispenser behind the website's nginx)
+# scripts/launch-kit.sh writes VERSION-SHA256 of the verified
+# hashstash-faucet binary into ExecStart's path. The faucet calls only the node's private
+# RPC on loopback and serves only loopback; nginx forwards /faucet/ to it and
+# overwrites X-Real-IP, the only client address the faucet trusts.
+Wants=network-online.target
+After=network-online.target hashstash.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=hashstash-faucet
+Group=hashstash-faucet
+WorkingDirectory=/var/lib/hashstash-faucet
+ExecStart=/opt/hashstash-faucet/FAUCET_PIN/hashstash-faucet --config /etc/hashstash-faucet/config.json
+Restart=on-failure
+RestartSec=10
+RestartSteps=8
+RestartMaxDelaySec=2min
+# The faucet stops its listener and payment poller on SIGINT.
+KillSignal=SIGINT
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+# The claim ledger (SQLite and its WAL). The key and configuration are read-only.
+ReadWritePaths=/var/lib/hashstash-faucet
+CapabilityBoundingSet=
+# Loopback only: the node RPC it calls and the listener nginx reaches.
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryHigh=192M
+MemoryMax=384M
+TasksMax=64
+RestrictSUIDSGID=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+PrivateIPC=true
+RemoveIPC=true
+# Crash dumps could copy the faucet's signing key.
+LimitCORE=0
+SyslogIdentifier=hashstash-faucet
+
+[Install]
+WantedBy=multi-user.target

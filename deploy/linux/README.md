@@ -139,6 +139,12 @@ Serve only `/.well-known/acme-challenge/` from that webroot on port 80 during se
 
 Keys stay in each visitor's browser profile. Public hosting still requires trusting the delivered wallet code: HTTPS protects transport, not a compromised host. The watch-only and disconnected signer workflow remains available.
 
+## Faucet service and launch kit
+
+`hashstash-faucet.service` runs the optional [faucet](../../docs/FAUCET.md) as its own unprivileged `hashstash-faucet` account, from a binary pinned by its SHA256 under `/opt/hashstash-faucet/`, with its configuration and key in `/etc/hashstash-faucet` (the key owned by that account, mode 0600) and its claim ledger in `/var/lib/hashstash-faucet`. The faucet binds and calls only loopback addresses, and the unit allows it no other (`IPAddressAllow=localhost`); nginx reaches it through the `/faucet/` route, overwriting `X-Real-IP`. The unit's `ExecStart` names the pinned path, which `scripts/launch-kit.sh` fills in.
+
+`scripts/launch-kit.sh` generates, from the servers' public IPv4 addresses, the web host and the calibration hashrate, every server's `node.env` (public discovery seeds that advertise themselves), firewall rules, the nginx site with the faucet routes, the faucet's configuration and unit, and a numbered `INSTALL.md` that uses this directory's installer. The [launch-day sequence](../../docs/LAUNCH-DAY.md) gives the order across servers.
+
 ## Stop, preserve, upgrade
 
 ```sh

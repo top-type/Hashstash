@@ -111,6 +111,39 @@ fn systemd_unit_confines_the_node() {
     }
 }
 
+/// The faucet holds a spending key: it runs confined, reaches only loopback,
+/// and launch-kit.sh pins its binary path by hash.
+#[test]
+fn faucet_unit_confines_the_faucet() {
+    let unit = repository("deploy/linux/hashstash-faucet.service");
+    for directive in [
+        "User=hashstash-faucet",
+        "NoNewPrivileges=true",
+        "CapabilityBoundingSet=",
+        "ProtectSystem=strict",
+        "ReadWritePaths=/var/lib/hashstash-faucet",
+        "IPAddressDeny=any",
+        "IPAddressAllow=localhost",
+        "SystemCallFilter=@system-service",
+        "SystemCallArchitectures=native",
+        "RestrictNamespaces=true",
+        "MemoryDenyWriteExecute=true",
+        "ProtectProc=invisible",
+        "LimitCORE=0",
+        "KillSignal=SIGINT",
+        "Restart=on-failure",
+    ] {
+        assert!(
+            unit.lines().any(|line| line == directive),
+            "missing {directive}"
+        );
+    }
+    assert!(unit.lines().any(|line| line
+        == "ExecStart=/opt/hashstash-faucet/FAUCET_PIN/hashstash-faucet --config /etc/hashstash-faucet/config.json"));
+    let kit = repository("scripts/launch-kit.sh");
+    assert!(kit.contains("s|/opt/hashstash-faucet/FAUCET_PIN/|/opt/hashstash-faucet/$pin/|"));
+}
+
 #[test]
 fn systemd_unit_backs_off_restarts_and_names_out_of_memory_kills() {
     let unit = repository("deploy/linux/hashstash.service");
@@ -452,6 +485,18 @@ fn run_script(arguments: &[&str]) {
 #[test]
 fn linux_launcher_script_regressions() {
     run_script(&["deploy/linux/test-launcher.sh"]);
+}
+
+/// launch-kit.sh input validation and generated files (stub binary), then a
+/// kit from this build whose every server passes the installer's --check.
+#[cfg(target_os = "linux")]
+#[test]
+fn launch_kit_regressions() {
+    run_script(&[
+        "scripts/test-launch-kit.sh",
+        env!("CARGO_BIN_EXE_hashstash"),
+        env!("CARGO_BIN_EXE_hashstash-faucet"),
+    ]);
 }
 
 /// Read-only installer preflights against this build, from private input copies.

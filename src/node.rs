@@ -1650,8 +1650,8 @@ impl HeaderSync {
 /// expires; at most MAX_CONNECTIONS downloads run, and at most
 /// HEADER_SYNCS_PER_SOURCE from one network group. A new download beyond
 /// either bound takes the place of the one that counted the least work, the
-/// least recently answered among equals, only if it counted more itself
-/// (see `make_room_for_header_sync`).
+/// least recently answered among equals, only if it counted at least as
+/// much itself, and is dropped otherwise (see `make_room_for_header_sync`).
 const HEADER_SYNC_IDLE: Duration = Duration::from_secs(600);
 /// Header downloads from peers in one network group (`network_guard::peer_source`).
 const HEADER_SYNCS_PER_SOURCE: usize = 4;

@@ -2668,7 +2668,10 @@ impl Chain {
                 if let Some(side) = &mut self.side_blocks {
                     side.insert((entry.height, hash));
                 }
-            } else if reorganized && let Err(error) = self.note_left_active(previous.0) {
+            } else if reorganized
+                && self.side_blocks.is_some()
+                && let Err(error) = self.note_left_active(previous.0)
+            {
                 eprintln!("Side-branch pruning paused until the next start: {error:#}");
                 self.side_blocks = None;
             }

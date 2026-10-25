@@ -1,8 +1,10 @@
 //! The node's private readers of hostile network input, each run over one
 //! byte slice exactly as its listener runs it, for the fuzz targets in `fuzz/`
-//! and their stable-toolchain runner in `tests/fuzz_parsers.rs`. Every call
+//! and their stable-toolchain runner in `tests/fuzz_parsers.rs`. Every reader
 //! uses a fresh admission record, so one input's charges and cooldowns never
-//! decide how a later input is read. This is not a stable interface.
+//! decide how a later input is read; an inbound peer session, which needs a
+//! connection, and the held-header counts are here too. This is not a stable
+//! interface.
 use super::*;
 
 const LISTENER: &str = "127.0.0.1:18480";
@@ -68,6 +70,29 @@ pub fn peer_frame(raw: &[u8], maximum: usize, limits: peer_wire::Limits) -> Resu
     let mut read = BufReader::new(raw);
     let payload = block_on(read_peer_frame(&mut read, maximum, &admission))?;
     peer_wire::decode(&payload, limits)
+}
+
+/// One inbound peer connection on `stream`, served as the peer listener
+/// serves a connection it accepted, less its slot selection: header
+/// requests, the locator request, the push after it, or an address request.
+/// Unlike the readers above, the session is admitted by the node's own
+/// guard, as its frame allowance follows the node's capacity, so a caller
+/// connects from a fresh source address to start without that address's
+/// charges and cooldowns. Returns how the session ended.
+pub async fn peer_session(node: &Node, stream: TcpStream) -> Result<()> {
+    let admission = node.guard.admit(stream.peer_addr()?.ip(), Surface::Peer)?;
+    super::peer_session(node.clone(), stream, admission, None).await
+}
+
+/// The headers the node holds for presync: all of them, those of chains
+/// that claimed more work than the tip, and those a header download pins.
+pub fn held_headers(node: &Node) -> Result<(usize, usize, usize)> {
+    let inner = node.locked()?;
+    Ok((
+        inner.chain.held_header_count(),
+        inner.chain.admitted_header_count(),
+        inner.chain.pinned_header_count(),
+    ))
 }
 
 /// A public-web JSON-RPC call: the public method allowlist, the visitor's

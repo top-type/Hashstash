@@ -531,6 +531,77 @@ fn stratum_session() {
 fn peer_sync() {
     bounded("peer_sync");
 }
+#[test]
+fn peer_serve() {
+    bounded("peer_serve");
+}
+
+/// A node target's seeds in order on one fixture node, as a run starts:
+/// each normalized outcome, and the node's held-header counts after it.
+fn seed_outcomes(name: &str) -> Vec<(String, (usize, usize, usize))> {
+    let target = targets::target(name);
+    let directory = tempfile::tempdir().unwrap();
+    let node = targets::fixture_node(directory.path());
+    (target.seeds)(Some(&node))
+        .iter()
+        .map(|seed| {
+            let (label, _) = execute(target, Some(&node), seed)
+                .unwrap_or_else(|message| panic!("a {name} seed failed: {message}"));
+            (normalized(&label), node::fuzz::held_headers(&node).unwrap())
+        })
+        .collect()
+}
+
+/// `peer_sync` outcomes name why a header reply ended the header requests
+/// first and outside parentheses, so the stable runner keeps inputs that
+/// reach different failures of the held-header store; and its seeds hold
+/// headers there, so the store's bounds are checked with headers in it (L079).
+#[test]
+fn peer_sync_seeds_hold_headers_and_name_header_errors() {
+    let outcomes = seed_outcomes("peer_sync");
+    let errors: HashSet<&str> = outcomes
+        .iter()
+        .filter_map(|(label, _)| label.split("header error: ").nth(1))
+        .filter_map(|rest| rest.split(',').next())
+        .filter(|error| *error != "none")
+        .collect();
+    assert!(
+        errors.len() > 1,
+        "header errors not told apart: {outcomes:#?}"
+    );
+    assert!(
+        outcomes.iter().any(|(_, (held, _, _))| *held > 0),
+        "no seed held a header: {outcomes:#?}"
+    );
+}
+
+/// `peer_serve` seeds reach each branch of the node's inbound peer handler:
+/// header rounds and their limit, a locator request and the push after it,
+/// refused locators and chains, address requests, messages out of order,
+/// and pushes that move the tip (L079).
+#[test]
+fn peer_serve_seeds_reach_each_branch_of_the_inbound_handler() {
+    let outcomes = seed_outcomes("peer_serve");
+    for expected in [
+        "served; got several headers, sync: several locators, several blocks",
+        "served; got one headers, several headers, sync",
+        "served; got no headers, sync",
+        "too many header requests",
+        "no common ancestor",
+        "invalid locator length",
+        "different genesis configuration",
+        "peer discovery disabled",
+        "unexpected first peer message",
+        "first peer message must be a locator request",
+        "unexpected peer message type",
+        "new tip",
+    ] {
+        assert!(
+            outcomes.iter().any(|(label, _)| label.contains(expected)),
+            "no seed reached {expected:?}: {outcomes:#?}"
+        );
+    }
+}
 
 /// The ordinary runs start from tracked inputs only, whatever libFuzzer
 /// corpus a machine holds; the long runs add the selected corpus.

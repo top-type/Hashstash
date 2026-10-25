@@ -44,8 +44,10 @@ env:
   # libFuzzer needs nightly: a dated one, and an exact cargo-fuzz.
   FUZZ_TOOLCHAIN: 'nightly-2026-10-10'
   CARGO_FUZZ_VERSION: '0.13.2'
-  NODE_VERSION: '22'
-  PYTHON_VERSION: '3.12'
+  # Node.js, whose bundled corepack checks the pinned pnpm's hash, and a
+  # release of the Python line README.md names.
+  NODE_VERSION: '22.22.1'
+  PYTHON_VERSION: '3.12.15'
 
 jobs:
   format:
@@ -271,7 +273,7 @@ jobs:
       fail-fast: false
       matrix:
         # Every target in fuzz/Cargo.toml; tests/fuzz_parsers.rs checks this list.
-        target: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/heads/release/')) && '["peer_wire","peer_channel","codec_transaction","codec_block","json","http_request","rpc_params","address","signed_record","unsigned_envelope","mail_envelope","plain_text","address_book","stratum_session","peer_sync"]' || '["all"]') }}
+        target: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/heads/release/')) && '["peer_wire","peer_channel","codec_transaction","codec_block","json","http_request","rpc_params","address","signed_record","unsigned_envelope","mail_envelope","plain_text","address_book","stratum_session","peer_sync","peer_serve"]' || '["all"]') }}
     env:
       FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || ((github.event_name == 'schedule' || startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/heads/release/')) && '900' || '60') }}
       TARGET: ${{ matrix.target }}

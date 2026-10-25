@@ -446,7 +446,7 @@ async function harness(options = {}) {
   h.transferQuote = (params={},overrides={}) => {
     const f=h.fee(params);return {...f,recipient:addr(params.recipient),public_key:params.recipient,amount:params.amount,recipient_receives:params.amount,total_debit:String(BigInt(params.amount)+BigInt(f.fee)),pending:false,...overrides};
   };
-  const windowEvents = new Map();
+  const windowEvents = new Map(), documentEvents = new Map();
 
   h.wallClock = 1791500000000;
 
@@ -509,6 +509,7 @@ async function harness(options = {}) {
     document: {
 
       getElementById: get,
+      addEventListener(name, fn) { documentEvents.set(name, fn); },
 
       querySelectorAll(selector) {
 
@@ -540,7 +541,8 @@ async function harness(options = {}) {
 
     setTimeout(fn, delay) { timers.set(++nextTimer, { fn, delay }); return nextTimer; },
 
-    clearTimeout(id) { timers.delete(id); }, setInterval() { return 0; },
+    // The page's periodic refresh runs only when a test calls h.poll().
+    clearTimeout(id) { timers.delete(id); }, setInterval(fn) { h.poll = async () => { await fn(); await settle(); }; return 0; },
 
     async fetch(url, options = {}) {
 
@@ -651,6 +653,7 @@ async function harness(options = {}) {
   h.location = context.location;
   h.navigator = context.navigator;
   h.windowEvents = windowEvents;
+  h.documentEvents = documentEvents;
 
   h.navigate = async hash => { context.location.hash = hash; windowEvents.get('hashchange')?.(); await settle(); };
 
@@ -706,6 +709,13 @@ async function run() {
   const field=/<input\b[^>]*id="import-private-key"[^>]*>/.exec(html)?.[0]||'';
   ok(field&&!/type="password"/.test(field)&&/class="secret-input"/.test(field)&&/data-1p-ignore/.test(field)&&/data-lpignore="true"/.test(field),'the spending key field is not a password field that browsers offer to save and sync');
   ok(!html.includes('The chain ID is not a signed field')&&html.includes('commits to the network\'s chain ID'),'the guide states that signatures bind the chain ID');
+  // The guide describes the optional key encryption and what it leaves out.
+  const storage=html.slice(html.indexOf('<summary>Wallet storage and offline signing</summary>'),html.indexOf('Hashstash Cold</strong> signs'));
+  ok(!storage.includes('locally without encryption')&&/unencrypted unless you set a passphrase/.test(storage),'the guide mentions the optional passphrase');
+  ok(/five minutes without use/.test(storage)&&/other networks/.test(storage)&&/cannot be recovered/.test(storage)&&/remain in the browser's files/.test(storage),'and its idle lock, other networks, recovery and earlier copies');
+  // The backup dialog says that the clipboard clear needs the page open.
+  const backup=html.slice(html.indexOf('id="backup-dialog"'));
+  ok(/closing or reloading the page sooner leaves the key on the clipboard/.test(backup.slice(0,backup.indexOf('</dialog>'))),'the backup dialog warns that closing early leaves the key on the clipboard');
  }
  eq(h.get('network-phase-label').textContent,'Auction');
  eq(h.get('sidebar-height-value').textContent,'20');
@@ -805,6 +815,22 @@ async function run() {
  eq(h.get('global-alert').textContent,'Could not refresh the node: HTTP sessions busy');
  h.handlers.snapshot=()=>refused(502,null,'<html>bad gateway</html>');await h.refresh();
  eq(h.get('global-alert').textContent,'Could not refresh the node: Node request failed (502).');
+ {
+  // A refusal's Retry-After pauses the periodic refresh rather than sending
+  // more requests that the cooling-down address would only have refused.
+  const paced=await harness(),snapshots=()=>paced.calls.filter(c=>c.body.method==='snapshot').length;
+  await paced.poll();const polled=snapshots();ok(polled>0,'the periodic refresh polls');
+  paced.handlers.snapshot=()=>refused(429,'5',JSON.stringify({jsonrpc:'2.0',id:1,error:{code:-32000,message:'network rate budget exhausted'}}));
+  await paced.poll();eq(snapshots(),polled+1);delete paced.handlers.snapshot;
+  paced.wallClock+=4000;await paced.poll();eq(snapshots(),polled+1,'no poll is sent while Retry-After lasts');
+  await paced.refresh();eq(snapshots(),polled+2,'an explicit refresh is still sent');
+  paced.wallClock+=1000;await paced.poll();eq(snapshots(),polled+3,'polling resumes once it has passed');
+  eq(paced.get('connection-label').textContent,'Connected');
+  // A 503 without Retry-After waits one second; other failures do not wait.
+  paced.handlers.snapshot=()=>refused(503,null,JSON.stringify({error:{message:'HTTP sessions busy'}}));await paced.poll();delete paced.handlers.snapshot;
+  await paced.poll();eq(snapshots(),polled+4);paced.wallClock+=1000;await paced.poll();eq(snapshots(),polled+5);
+  paced.handlers.snapshot=()=>refused(502,null,'<html>bad gateway</html>');await paced.poll();delete paced.handlers.snapshot;await paced.poll();eq(snapshots(),polled+7,'a failure that may have run is not a refusal');
+ }
  delete h.handlers.snapshot;s.status.height=1234;await h.refresh();eq(h.get('sidebar-height-value').textContent,'1,234');eq(h.get('sidebar-height').href,'#explorer?block=1234');
  s.status.height=1229;s.status.tip='e'.repeat(64);await h.refresh();eq(h.get('sidebar-height-value').textContent,'1,229');
  h.handlers.snapshot=p=>response({result:{...h.snapshotResult(p),status:{...s.status,chain_id:'f'.repeat(64)}}});

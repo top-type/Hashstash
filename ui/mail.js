@@ -15,6 +15,14 @@
   // A scan keeps this many earlier checkpoints, and rewinds at most this
   // many times in one pass before it restarts from the beginning.
   const CHECKPOINTS=4,MAX_REWINDS=4;
+  // A public site's visitor refills 4,096 to 16,384 work units a second, and
+  // each explorer_mail page costs about 4,160 of the same budget that the
+  // wallet's balance, quote and broadcast calls draw on. There the scan sends
+  // at most PUBLIC_PAGE_BURST pages at once, then one every PUBLIC_PAGE_MS,
+  // instead of draining that budget into a cooldown. A reply also costs one
+  // work unit per whole KiB, so every PUBLIC_PAGE_WORK KiB of envelopes
+  // received count as one more page.
+  const PUBLIC_PAGE_BURST=8,PUBLIC_PAGE_MS=1500,PUBLIC_PAGE_WORK=4160;
   const entryCursor=entry=>`${entry.height}:${entry.position??entry.tx_position??0}`;
   function cacheEntry(entry){
     const position=entry.position??entry.tx_position??0;
@@ -66,11 +74,15 @@
       clearStart(chain,key){try{if(!storage||typeof storage.removeItem!=='function')throw Error();storage.removeItem(cacheKey(chain,key,START_PREFIX));return {cleared:true};}catch(_){return {cleared:false,error:'This browser could not clear its mail scan start.'};}}
     });
   }
-  function create({rpc,getIdentity,recipientKey,decrypt,verifySigned,encodeAddress,onDraftChange=()=>{},document=root.document,location=root.location,cache=createCache()}){
-    const $=id=>document.getElementById(id),form=$('mail-form');let context={},sequence=0,prepared=null,preparing=null,checkedTip='',verifiedTip='',cursor=null,anchor=null,checkpoints=[],opened=new Map(),lastWallet='',lastReadable=false,draftAccount='',loading=false,paused=false,scanned=0,visibleCount=50,rendered='',cacheLoaded=false,restoreEntries=[],storageNote='',omitted=0,start=null;
+  function create({rpc,backoff=()=>0,getIdentity,recipientKey,decrypt,verifySigned,encodeAddress,onDraftChange=()=>{},document=root.document,location=root.location,cache=createCache()}){
+    const $=id=>document.getElementById(id),form=$('mail-form');let context={},sequence=0,prepared=null,preparing=null,checkedTip='',verifiedTip='',cursor=null,anchor=null,checkpoints=[],opened=new Map(),lastWallet='',lastReadable=false,draftAccount='',loading=false,paused=false,waiting=false,scanned=0,visibleCount=50,rendered='',cacheLoaded=false,restoreEntries=[],storageNote='',omitted=0,start=null;
     const active=()=>location.hash.split('?')[0]==='#mail',eligible=()=>active()&&context.ready&&context.available&&context.key&&context.can_decrypt;
     const add=(p,t,c,text)=>{const n=document.createElement(t);n.className=c;if(text!==undefined)n.textContent=text;p.appendChild(n);return n;};
-    const identity=()=>getIdentity(),yieldTask=()=>new Promise(resolve=>root.setTimeout(resolve,0));
+    const identity=()=>getIdentity(),yieldTask=()=>new Promise(resolve=>root.setTimeout(resolve,0)),sleep=ms=>new Promise(resolve=>root.setTimeout(resolve,ms));
+    // Pages the scan may still send at once on a public site (see PUBLIC_PAGE_MS).
+    const pace={tokens:PUBLIC_PAGE_BURST,at:0};
+    function refill(){const now=Date.now();pace.tokens=Math.min(PUBLIC_PAGE_BURST,pace.tokens+Math.max(0,now-pace.at)/PUBLIC_PAGE_MS);pace.at=now;}
+    function paceWait(){if(!context.public_web)return 0;refill();return pace.tokens>=1?0:Math.ceil((1-pace.tokens)*PUBLIC_PAGE_MS);}
     const draftId=()=>JSON.stringify([identity(),form.elements.recipient.value,recipientKey(form.elements.recipient.value),form.elements.subject.value,form.elements.message.value]);
     function invalidate(){prepared=null;preparing=null;}
     function error(message){$('mail-error').textContent=message;$('mail-error').hidden=!message;}
@@ -93,7 +105,7 @@
       const verified=verifiedTip===context.tip;
       $('mail-empty').hidden=verified&&opened.size>0;
       $('mail-empty').textContent=!context.key?'Select a wallet.':!context.can_decrypt?(context.locked?'Locked · unlock this browser wallet to read mail.':'Watch-only · import the private key to read mail.'):!context.available?'Mail unavailable.':loading?'Checking messages…':paused?'Scan paused.':!verified&&checkedTip?'Verifying latest blocks…':'No messages found.';
-      $('mail-scan-status').textContent=context.key&&context.can_decrypt?(loading?`Scanning · ${scanned} checked · ${opened.size} found`:paused?`Paused · ${scanned} checked`:!verified&&checkedTip?'Verification pending':verified?`${scanned} checked · ${opened.size} found`:''):'';
+      $('mail-scan-status').textContent=context.key&&context.can_decrypt?(loading?`Scanning · ${waiting?'waiting for the node · ':''}${scanned} checked · ${opened.size} found`:paused?`Paused · ${scanned} checked`:!verified&&checkedTip?'Verification pending':verified?`${scanned} checked · ${opened.size} found`:''):'';
       if(context.key&&context.can_decrypt&&storageNote)$('mail-scan-status').textContent+=' · '+storageNote;
       if(context.key&&context.can_decrypt&&omitted)$('mail-scan-status').textContent+=` · ${omitted} earlier message${omitted===1?' is':'s are'} not kept in this browser; clear the saved scan to show ${omitted===1?'it':'them'} again`;
       if(context.key&&context.can_decrypt&&start)$('mail-scan-status').textContent+=` · from block ${start.height+1}`;
@@ -124,10 +136,21 @@
       const current=()=>version===sequence&&stamp===lastWallet&&eligible()&&!paused;render();
       try{
         do{
+          // Wait out a refusal's Retry-After, and keep a public site's pace.
+          const hold=backoff(),wait=Math.max(hold,paceWait());
+          if(wait>0){waiting=hold>0;render();await sleep(wait);waiting=false;if(!current())return;}
+          if(context.public_web){refill();pace.tokens=Math.max(0,pace.tokens-1);}
           let result;
           try{result=await rpc('explorer_mail',{limit:50,...(cursor?{after:cursor,anchor}:{})});}
           catch(e){
             if(!current())return;
+            if(e?.refused){
+              // Refused before it ran: wait as asked, then continue from the
+              // same cursor at the paced rate, not at the next block.
+              pace.tokens=0;pace.at=Date.now();waiting=true;render();
+              await sleep(Math.max(backoff(),(e.retryAfter||1)*1e3));waiting=false;
+              if(!current())return;render();continue;
+            }
             // A reorganization above part of the scan keeps what was found at
             // or below the reported fork height and continues from there with
             // the same anchor. Each rewind moves the cursor strictly down, and a
@@ -147,6 +170,7 @@
             throw e;
           }
           if(!current())return;
+          if(context.public_web&&Array.isArray(result?.messages)){let bytes=0;for(const entry of result.messages)bytes+=String(entry?.raw??'').length+String(entry?.data_hex??'').length;pace.tokens-=Math.floor(bytes/1024)/PUBLIC_PAGE_WORK;}
           if(result.chain_id!==context.chain_id)throw Error('Mail belongs to a different network.');
           if(result.ready!==true||!validId(result.tip)||!validId(result.anchor)||result.anchor!==result.tip||!Number.isSafeInteger(result.indexed_height)||result.indexed_height<0||!Array.isArray(result.messages)||result.messages.length>50||!validCursor(result.scan_cursor))throw Error('Invalid shared mail response.');
           if(result.tip!==context.tip||(Number.isSafeInteger(context.height)&&result.indexed_height!==context.height))throw Error('Mail index changed. Refreshing again shortly.');

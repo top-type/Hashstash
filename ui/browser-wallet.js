@@ -419,6 +419,16 @@
       if (!unlocked) return;
       unlocked.used = Date.now(); root.clearTimeout?.(idleTimer); idleTimer = root.setTimeout?.(expire, idleLock);
     }
+    // Changing or removing the passphrase needs the current one again, not
+    // only an unlocked page: someone at an unlocked browser could otherwise
+    // set a passphrase the owner does not know, or quietly save every key
+    // unencrypted. The lock id it opened is returned.
+    async function confirmPassphrase(lock, current) {
+      if (typeof current !== 'string' || !current) fail('Enter the current wallet passphrase.');
+      const salt = fromHex(lock.salt, 16);
+      if (await unseal(await lockKey(current, salt), lock.check, checkData(salt)) === null) fail('Wrong current passphrase.');
+      return lockId(lock);
+    }
     // A saved key's secret bytes, checked against its address. Callers wipe them.
     async function secretOf(data, w) {
       if (w.private_key) return secretBytes(w.private_key);
@@ -539,13 +549,17 @@
       return {networks,keys};
     }
     const onStorage=e=>{if(e.key===storageKey || e.key===null) { invalidateMetadata(); notify(); }}; root.addEventListener?.('storage',onStorage);
+    // Lock now locks every page of this site that opened this network's
+    // passphrase in this browser, not only the page it was pressed in.
+    const lockChannel=typeof root.BroadcastChannel==='function' ? new root.BroadcastChannel(`hashstash.browser-wallet-lock.v1.${chainId}`) : null;
+    if(lockChannel) lockChannel.onmessage=event=>{ if(event?.data==='lock' && unlocked) { relock(); lockChanged(); } };
     return Object.freeze({
       snapshot,
       otherNetworks,
       subscribe(callback) { if(typeof callback!=='function') fail('Invalid wallet subscriber.'); callbacks.add(callback); return ()=>callbacks.delete(callback); },
       // Locking and unlocking change no saved data, so they notify separately.
       onLockChange(callback) { if(typeof callback!=='function') fail('Invalid wallet subscriber.'); lockCallbacks.add(callback); return ()=>lockCallbacks.delete(callback); },
-      destroy() { root.removeEventListener?.('storage',onStorage); callbacks.clear(); lockCallbacks.clear(); relock(); invalidateMetadata(); },
+      destroy() { root.removeEventListener?.('storage',onStorage); lockChannel?.close(); callbacks.clear(); lockCallbacks.clear(); relock(); invalidateMetadata(); },
       async create(expected) { let secret; do { secret=random(32); } while(!noble.validSecret(secret)); try { return await add(hex(noble.schnorr.getPublicKey(secret)),hex(secret),expected); } finally { secret.fill(0); } },
       importPrivate(privateHex,expected) { const key=publicKey(privateHex); return add(key,privateHex.toLowerCase(),expected); },
       // The scheme is explicit: v2 for passphrase accounts, v1 only to restore legacy ones.
@@ -563,14 +577,19 @@
       acknowledgeBackup(id,expected) { return change(data=>{const w=data.wallets.find(w=>w.id===id);if(!w)fail('Wallet not found.');w.backed_up=true;},expected); },
       // Seal every saved key under a new passphrase: the migration from
       // unencrypted storage, or a passphrase change, which needs the current
-      // lock open. Derivation runs before the storage lock is taken.
-      async setPassphrase(passphrase,expected) {
+      // lock open and the current passphrase. Derivation runs before the
+      // storage lock is taken.
+      async setPassphrase(passphrase,expected,current) {
         requireSecure();
         if(typeof passphrase!=='string' || [...passphrase.normalize('NFC')].length < MIN_LOCK_PASSPHRASE) fail(`Choose a wallet passphrase of at least ${MIN_LOCK_PASSPHRASE} characters.`);
+        const existing=read();
+        if(existing.lock && !session(existing.lock)) lockedFail('Unlock this browser wallet before changing its passphrase.');
+        const confirmed=existing.lock ? await confirmPassphrase(existing.lock,current) : null;
         const salt=random(16), key=await lockKey(passphrase,salt);
         let lock;
         const result=await change(async data=>{
           if(data.lock && !session(data.lock)) lockedFail('Unlock this browser wallet before changing its passphrase.');
+          if(lockId(data.lock)!==confirmed) fail('The wallet passphrase changed in another tab. Try again.');
           const opened=await openAll(data);
           try {
             lock={format:LOCK_FORMAT,kdf:LOCK_KDF,iterations:LOCK_ITERATIONS,salt:hex(salt),check:await seal(key,new Uint8Array(0),checkData(salt))};
@@ -582,11 +601,18 @@
         unlocked={lock:lockId(lock),key,used:Date.now()};touch();lockChanged();
         return {...result,wallet_locked:false};
       },
-      // Return every key to unencrypted storage; the lock must be open.
-      async removePassphrase(expected) {
+      // Return every key to unencrypted storage; the lock must be open, and
+      // the current passphrase given again.
+      async removePassphrase(expected,current) {
+        requireSecure();
+        const existing=read();
+        if(!existing.lock) fail('This browser wallet has no passphrase.');
+        if(!session(existing.lock)) lockedFail('Unlock this browser wallet before removing its passphrase.');
+        const confirmed=await confirmPassphrase(existing.lock,current);
         const result=await change(async data=>{
           if(!data.lock) fail('This browser wallet has no passphrase.');
           if(!session(data.lock)) lockedFail('Unlock this browser wallet before removing its passphrase.');
+          if(lockId(data.lock)!==confirmed) fail('The wallet passphrase changed in another tab. Try again.');
           const opened=await openAll(data);
           try { for(const [w,secret] of opened) { w.private_key=hex(secret); delete w.sealed_key; } delete data.lock; }
           finally { for(const [,secret] of opened) secret.fill(0); }
@@ -612,7 +638,7 @@
         lockChanged();
         return snapshot();
       },
-      lock() { relock(); lockChanged(); return snapshot(); },
+      lock() { relock(); lockChanged(); try { lockChannel?.postMessage('lock'); } catch { /* this page is locked either way */ } return snapshot(); },
       async decryptMail(dataHex,identity,expected) {
         requireSecure(); const data=read(); guard(data,expected);
         if(!expected || expected.wallet_revision===undefined || expected.wallet_id!==data.selected || expected.chain_id!==chainId || identity.chain_id!==chainId) fail('Wallet context changed. Try again.');

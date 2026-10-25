@@ -21,7 +21,7 @@
     return [outcome ? String(outcome).toUpperCase() : '', effect || '', {full:'Filled',partial:'Partial fill',unfilled:'Unfilled'}[value.fill_status] || ''].filter(Boolean).join(' · ');
   }
   function href(kind, value) { return `#explorer?${kind}=${encodeURIComponent(String(value))}`; }
-  function create({ rpc, amountText, document = root.document, location = root.location }) {
+  function create({ rpc, backoff = () => 0, amountText, document = root.document, location = root.location }) {
     const $ = id => document.getElementById(id), content = $('explorer-content');
     let context = { ready: false }, version = 0, lastRoute = '', lastTip = '', lastAt = 0, loading = false, failed = false, lastRendered = '';
     const node = (tag, className = '', text) => {
@@ -348,14 +348,19 @@
       if (/^hsh[a-z0-9]+$/i.test(value)) { if (!current()) return; location.hash = href('account', value); return; }
       if (!validHash(value)) throw new Error('Enter an address, transaction ID, block hash or block height.');
       try { await rpc('explorer_block', { hash: value.toLowerCase(), limit: 1 }); if (current()) location.hash = href('block', value.toLowerCase()); }
-      catch { await rpc('explorer_transaction', { txid: value.toLowerCase() }); if (current()) location.hash = href('tx', value.toLowerCase()); }
+      catch (error) {
+        // A refused lookup did not run: report it rather than ask again at once.
+        if (error?.refused) throw error;
+        await rpc('explorer_transaction', { txid: value.toLowerCase() }); if (current()) location.hash = href('tx', value.toLowerCase());
+      }
     }
     function active() { return location.hash.split('?')[0] === '#explorer'; }
     async function load(force = false) {
       if (!active()) return;
       const route = location.hash, changed = route !== lastRoute;
       const age = Date.now() - lastAt;
-      if (!force && !changed && (loading || age < 3000 || !failed && context.tip === lastTip && age < 10000)) return;
+      // Automatic reloads also wait while a refusal's Retry-After lasts.
+      if (!force && !changed && (loading || age < 3000 || !failed && context.tip === lastTip && age < 10000 || backoff() > 0)) return;
       const request = ++version, chain = context.chain_id; lastRoute = route; lastTip = context.tip; lastAt = Date.now(); loading = true;
       const current = () => request === version && location.hash === route && context.ready && context.chain_id === chain;
       if (changed) { content.replaceChildren(); lastRendered = ''; }

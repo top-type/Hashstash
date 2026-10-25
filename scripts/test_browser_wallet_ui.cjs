@@ -217,6 +217,106 @@ async function run() {
     c.currentSnapshot.sender_mempool=[];c.currentSnapshot.account={...c.currentSnapshot.account,pending_nonce:0};await c.refresh();await c.refresh();
     assert.match(f.querySelector().textContent,/^No longer pending · /,'a complete sender page detects a dropped submission');checks++;
   }
+  // A broadcast answered by anything but a 429/503 refusal may have run. The
+  // form keeps the signed transaction and follows it instead of showing the
+  // node's text as a plain error, and it does not sign a second transaction
+  // (at the next nonce) until the first is known to be pending, used or gone.
+  {
+    const c=await setup();c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();
+    const own={body:{sender:bob,nonce:0,operation:{TransferExact:{recipient:alice,amount:'100'}}}},prepared=()=>c.calls.filter(x=>x.body.method==='preparetransaction');
+    const pool=(rows,nonce)=>{c.currentSnapshot.sender_mempool=rows;c.currentSnapshot.account={...c.currentSnapshot.account,pending_nonce:nonce};};
+    const txid=raw=>sha(sha(Buffer.from(raw,'hex'))).toString('hex');
+    // The exact case: the broadcast ran and was pooled, but the public reply
+    // budget replaced its answer with a 200 JSON-RPC error saying "try again".
+    c.handlers.broadcasttransaction=()=>{pool([own],1);return response({jsonrpc:'2.0',id:1,error:{code:-32000,message:'public response byte budget exhausted; try again'}});};
+    const f=await fill(c,alice);await f.requestSubmit();
+    const first=broadcasts(c)[0].body.params.raw;
+    assert.equal(broadcasts(c).length,1);checks++;
+    assert.match(f.querySelector().textContent,new RegExp(`^Pending · ${txid(first).slice(0,7)}`),'the pooled transaction is reported pending, not failed');checks++;
+    assert.doesNotMatch(f.querySelector().textContent,/try again/,'the node text never tells the user to send it again');checks++;
+    // A lost answer whose transaction the snapshots do not show yet.
+    c.handlers.broadcasttransaction=()=>{throw new TypeError('Failed to fetch');};pool([],0);c.currentSnapshot.account.account.nonce=1;
+    await c.refresh();let g=await fill(c,alice);await g.requestSubmit();
+    const lost=broadcasts(c).at(-1).body.params.raw,shown=()=>g.querySelector().textContent;
+    assert.equal(c.browserApi.verifySigned(lost,{chain_id:c.currentSnapshot.status.chain_id}).nonce,'1');checks++;
+    assert.match(shown(),new RegExp(`^Result unknown · ${txid(lost).slice(0,7)}.*Do not submit it again\\.`),shown());checks++;
+    assert.match(shown(),/Send the same transaction again$/,'the identical bytes can be sent again');checks++;
+    assert.doesNotMatch(shown(),/Failed to fetch|reply was/,'a lost connection has no reply to show');checks++;
+    assert.equal(c.get('send-submit').disabled,true,'the form cannot sign another transaction meanwhile');checks++;
+    const signedBefore=prepared().length,sentBefore=broadcasts(c).length;
+    await c.timersDue();await g.requestSubmit();
+    assert.equal(prepared().length,signedBefore,'nothing new is prepared while the result is unknown');checks++;assert.equal(broadcasts(c).length,sentBefore);checks++;
+    assert.match(shown(),/^Result unknown · /,'and the form keeps saying so');checks++;
+    // Sending the same bytes again is idempotent: the node answers with the same ID.
+    c.handlers.broadcasttransaction=p=>{pool([{body:{...own.body,nonce:1}}],2);return response({result:{transaction_id:txid(p.raw)}});};
+    const resend=g.querySelector().children.at(-1);await resend.click();await settle();
+    assert.equal(broadcasts(c).at(-1).body.params.raw,lost,'the resend carries the identical signed bytes');checks++;
+    assert.match(shown(),new RegExp(`^Pending · ${txid(lost).slice(0,7)}`),shown());checks++;
+    assert.equal(prepared().length,signedBefore,'and is not prepared or signed again');checks++;
+    // Once the snapshots show it pending, the form is free again: another
+    // submission is a deliberate second transaction at the next nonce.
+    await c.timersDue();assert.equal(c.get('send-submit').disabled,false);checks++;
+    // An unknown result whose transaction never appears is released after two
+    // complete snapshots requested after the failure, with its transaction
+    // number still unused. One requested before cannot show it: it does not
+    // count.
+    c.handlers.broadcasttransaction=()=>response({jsonrpc:'2.0',id:1,error:{code:-32000,message:'RPC response exceeds the local response limit'}});
+    pool([],1);c.currentSnapshot.account.account.nonce=1;await c.refresh();await c.refresh();g=await fill(c,alice);
+    let early;const held=deferred();c.handlers.snapshot=p=>{early=p;return held.promise;};const polling=c.poll();await settle();
+    await g.requestSubmit();assert.match(shown(),/^Result unknown · /);checks++;
+    assert.doesNotMatch(shown(),/local response limit/,'the node text is not shown while the result is unknown');checks++;
+    delete c.handlers.snapshot;held.resolve(response({result:c.snapshotResult(early)}));await polling;
+    assert.match(shown(),/^Result unknown · /,'a snapshot requested before the failure does not count');checks++;
+    await c.refresh();assert.match(shown(),/^Result unknown · /,'one empty pool view is not conclusive');checks++;
+    await c.refresh();assert.match(shown(),/^Not pending · .*unused.*Submit it again\.$/,shown());checks++;
+    assert.match(shown(),/ Its reply was: RPC response exceeds the local response limit\. Submit it again\.$/,'once it is known not to be pending, the node reply is shown');checks++;
+    g=await fill(c,alice);c.handlers.broadcasttransaction=p=>response({result:{transaction_id:txid(p.raw)}});await g.requestSubmit();
+    assert.equal(prepared().at(-1).body.params.nonce,1,'a released form signs at the same unused nonce');checks++;
+    assert.match(shown(),/^Pending · /);checks++;
+    // A refusal promises that nothing ran: it says so and keeps nothing.
+    pool([],1);await c.refresh();await c.refresh();
+    c.handlers.broadcasttransaction=()=>({ok:false,status:429,headers:{get:name=>name==='Retry-After'?'2':null},text:async()=>JSON.stringify({jsonrpc:'2.0',id:1,error:{code:-32000,message:'transaction admission is busy'}})});
+    g=await fill(c,alice);await g.requestSubmit();
+    assert.equal(shown(),'Not sent: transaction admission is busy (try again in 2 s)');checks++;
+    c.handlers.broadcasttransaction=p=>response({result:{transaction_id:txid(p.raw)}});
+    g=await fill(c,alice);await g.requestSubmit();assert.match(shown(),/^Pending · /,'after a refusal the same details can be sent');checks++;
+    assert.equal(prepared().at(-1).body.params.nonce,1);checks++;
+  }
+  // Switching accounts does not forget a broadcast of unknown outcome.
+  {
+    const c=await setup();c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();
+    c.handlers.broadcasttransaction=()=>{throw new TypeError('Failed to fetch');};
+    const f=await fill(c,alice);await f.requestSubmit();assert.match(f.querySelector().textContent,/^Result unknown · /);checks++;
+    c.get('import-private-key').value='0'.repeat(63)+'5';await c.get('wallet-import-form').requestSubmit();
+    assert.notEqual(c.browserStore.snapshot().public_key,bob);checks++;
+    c.currentSnapshot.sender_mempool=[{body:{sender:bob,nonce:0,operation:{TransferExact:{recipient:alice,amount:'100'}}}}];c.currentSnapshot.account={...c.currentSnapshot.account,pending_nonce:1};
+    await c.chooseWallet(bob);await c.refresh();
+    assert.match(f.querySelector().textContent,/^Pending · /,'back on its account, the broadcast is found pending');checks++;
+  }
+  // Advanced → Broadcast sends signed bytes from the cold signer: its
+  // outcomes are read the same way.
+  {
+    const c=await setup();c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();
+    const txid=raw=>sha(sha(Buffer.from(raw,'hex'))).toString('hex'),refusal=status=>({ok:false,status,headers:{get:name=>name==='Retry-After'?'1':null},text:async()=>JSON.stringify({jsonrpc:'2.0',id:1,error:{code:-32000,message:'HTTP sessions busy'}})});
+    // A refused page broadcast leaves signed bytes that were never sent.
+    let signed;c.handlers.broadcasttransaction=p=>{signed=p.raw;return refusal(503);};
+    const f=await fill(c,alice);await f.requestSubmit();assert.match(f.querySelector().textContent,/^Not sent: HTTP sessions busy/);checks++;
+    const form=c.get('broadcast-form'),shown=()=>form.querySelector().textContent;
+    c.get('broadcast-raw').value=signed;c.handlers.broadcasttransaction=()=>refusal(429);await form.requestSubmit();
+    assert.equal(shown(),'Not sent: HTTP sessions busy (try again in 1 s)','a refusal promises nothing ran');checks++;
+    c.handlers.broadcasttransaction=()=>response({jsonrpc:'2.0',id:1,error:{code:-32000,message:'public response byte budget exhausted; try again'}});await form.requestSubmit();
+    assert.match(shown(),new RegExp(`^Result unknown · ${txid(signed).slice(0,7)}.*Do not submit it again\\..*Send the same transaction again$`),shown());checks++;
+    assert.doesNotMatch(shown(),/try again/);checks++;
+    c.handlers.broadcasttransaction=p=>{c.currentSnapshot.sender_mempool=[{body:{sender:bob,nonce:0,operation:{TransferExact:{recipient:alice,amount:'100'}}}}];c.currentSnapshot.account={...c.currentSnapshot.account,pending_nonce:1};return response({result:{transaction_id:txid(p.raw)}});};
+    const sent=broadcasts(c).length;await form.querySelector().children.at(-1).click();await settle();
+    assert.equal(broadcasts(c).length,sent+1);checks++;assert.equal(broadcasts(c).at(-1).body.params.raw,signed,'the same bytes are sent again');checks++;
+    assert.match(shown(),new RegExp(`^Pending · ${txid(signed).slice(0,7)}`),shown());checks++;
+    // Bytes of an account this page does not follow get the same warning
+    // in place of the node's text.
+    c.get('import-private-key').value='0'.repeat(63)+'5';await c.get('wallet-import-form').requestSubmit();
+    c.handlers.broadcasttransaction=()=>{throw new TypeError('Failed to fetch');};c.get('broadcast-raw').value=signed;await form.requestSubmit();
+    assert.match(shown(),new RegExp(`^Result unknown · ${txid(signed).slice(0,7)}…${txid(signed).slice(-5)}: .*Broadcasting these same bytes again is safe; do not sign a new transaction`),shown());checks++;
+  }
   // Optional passphrase encryption of browser keys, through the page itself.
   {
     const c=await setup(),phrase='correct horse battery staple',saved=()=>[...c.savedStorage.values()].join('\n');
@@ -272,21 +372,38 @@ async function run() {
     r.navigator.clipboard.readText=async()=>bobSecret;await r.get('backup-copy').click();await r.timersDue(30000);assert.equal(r.clipboard.at(-1),'');checks++;
     delete r.navigator.permissions;delete r.navigator.clipboard.readText;
     await r.get('backup-copy').click();await r.get('copy-key').click();await r.timersDue(30000);assert.equal(r.clipboard.at(-1),addr(bob),'a later copy from this page replaces the key and is kept');checks++;
-    const write=r.navigator.clipboard.writeText;await r.get('backup-copy').click();
-    r.navigator.clipboard.writeText=async value=>{if(value==='')throw new Error('Document is not focused.');return write(value);};
-    assert.equal(r.get('clipboard-notice').hidden,true);checks++;
-    await r.timersDue(30000);assert.equal(r.clipboard.at(-1),bobSecret);checks++;
-    assert.equal(r.get('clipboard-notice').hidden,false,'a refused clear says the key is still on the clipboard');checks++;
-    r.navigator.clipboard.writeText=write;await r.windowEvents.get('focus')();await settle();assert.equal(r.clipboard.at(-1),'','an unfocused page clears the key on return');checks++;
-    assert.equal(r.get('clipboard-notice').hidden,true);checks++;assert.equal(r.windowEvents.has('pointerdown'),false,'and stops retrying');checks++;
-    // Firefox and Safari write the clipboard only during a user action: the
-    // next click or key press in the page clears it.
+    // Firefox and Safari write the clipboard only during a user action: while
+    // the page kept focus, the next click or key press in it clears the key.
+    const write=r.navigator.clipboard.writeText;
     for(const action of ['pointerdown','keydown']) {
       await r.get('backup-copy').click();r.navigator.clipboard.writeText=async value=>{if(value==='')throw new Error('Clipboard write was blocked due to lack of user activation.');return write(value);};
-      await r.timersDue(30000);assert.equal(r.clipboard.at(-1),bobSecret);checks++;assert.equal(r.get('clipboard-notice').hidden,false);checks++;
+      assert.equal(r.get('clipboard-notice').hidden,true);checks++;
+      await r.timersDue(30000);assert.equal(r.clipboard.at(-1),bobSecret);checks++;
+      assert.equal(r.get('clipboard-notice').hidden,false,'a refused clear says the key is still on the clipboard');checks++;assert.match(r.get('clipboard-notice-text').textContent,/is still on the clipboard/);checks++;
       r.navigator.clipboard.writeText=write;await r.windowEvents.get(action)();await settle();
       assert.equal(r.clipboard.at(-1),'',`the next ${action} clears the key`);checks++;assert.equal(r.get('clipboard-notice').hidden,true);checks++;
+      assert.equal(r.windowEvents.has('pointerdown'),false,'and stops retrying');checks++;
     }
+    // Once the page has lost focus, another application may have copied
+    // something since: neither the timer, a return nor a click erases it
+    // unasked. The page asks instead.
+    await r.get('backup-copy').click();await r.windowEvents.get('blur')();r.clipboard.push('hsh1copiedelsewhere');
+    await r.timersDue(30000);assert.equal(r.clipboard.at(-1),'hsh1copiedelsewhere','content copied elsewhere is left alone');checks++;
+    assert.equal(r.get('clipboard-notice').hidden,false);checks++;assert.match(r.get('clipboard-notice-text').textContent,/may still be on the clipboard/);checks++;
+    assert.equal(['focus','pointerdown','pointerup','keydown'].some(name=>r.windowEvents.has(name)),false,'no return, click or key press clears it');checks++;
+    await r.get('clipboard-keep').click();assert.equal(r.get('clipboard-notice').hidden,true);checks++;assert.equal(r.clipboard.at(-1),'hsh1copiedelsewhere');checks++;
+    await r.get('backup-copy').click();await r.windowEvents.get('blur')();await r.timersDue(30000);
+    await r.get('clipboard-clear').click();await settle();assert.equal(r.clipboard.at(-1),'','an explicit request clears it');checks++;assert.equal(r.get('clipboard-notice').hidden,true);checks++;
+    // A copy or cut in this page replaces the key and is kept; copying the
+    // key itself from the backup is cleared like Copy.
+    await r.get('backup-copy').click();r.clipboard.push('selected page text');r.documentEvents.get('copy')({target:r.get('wallet-public')});
+    await r.timersDue(30000);assert.equal(r.clipboard.at(-1),'selected page text','a later copy in this page is kept');checks++;
+    r.clipboard.push(bobSecret);r.documentEvents.get('copy')({target:r.get('backup-private')});await r.timersDue(30000);assert.equal(r.clipboard.at(-1),'','the key copied by hand from the backup is cleared too');checks++;
+    // Leaving before the clear asks first; staying shows how to clear it.
+    await r.get('backup-copy').click();const leaving={prevented:false,preventDefault(){this.prevented=true;}};r.windowEvents.get('beforeunload')(leaving);
+    assert.equal(leaving.prevented,true,'closing or reloading before the clear asks first');checks++;assert.equal(r.get('clipboard-notice').hidden,false);checks++;
+    r.windowEvents.get('pagehide')();await settle();assert.equal(r.clipboard.at(-1),'','a page that is left tries to clear it');checks++;
+    assert.equal(r.windowEvents.has('beforeunload')||r.windowEvents.has('pagehide'),false,'with nothing to clear the page leaves without asking');checks++;
     await r.get('backup-download').click();assert.deepEqual(JSON.parse(r.downloads.at(-1)),{format:'hashstash-private-v1',private_key:bobSecret,public_key:bob});checks++;
     assert.ok(r.blobParts.at(-1).every(part=>part instanceof Uint8Array&&part.every(byte=>byte===0)),'the backup bytes are wiped once the file holds its copy');checks++;
     await r.get('backup-close').click();
@@ -297,11 +414,32 @@ async function run() {
     unlock.elements.passphrase.value=phrase;await unlock.requestSubmit();assert.equal(r.get('wallet-lock-state').textContent,'Unlocked');checks++;
     await r.get('wallet-lock').click();assert.equal(r.get('wallet-lock-state').textContent,'Locked','Lock now');checks++;
     unlock.elements.passphrase.value=phrase;await unlock.requestSubmit();
-    await r.get('wallet-passphrase-remove').click();assert.match(r.get('wallet-passphrase-remove').textContent,/Confirm/);checks++;
-    assert.equal(r.get('wallet-lock-state').textContent,'Unlocked','one click does not remove the passphrase');checks++;
-    await r.get('wallet-passphrase-remove').click();assert.equal(r.get('wallet-lock-state').textContent,'Not encrypted',r.get('wallet-feedback').textContent);checks++;
+    // Removing the passphrase asks for it again, not only an unlocked page.
+    await r.get('wallet-passphrase-remove').click();const removal=r.get('wallet-remove-form');assert.equal(removal.hidden,false);checks++;
+    await removal.requestSubmit();assert.equal(removal.nativeBlocked,true,'the current passphrase is required');checks++;
+    removal.elements.current.value='wrong horse battery staple';await removal.requestSubmit();
+    assert.match(removal.querySelector().textContent,/Wrong current passphrase/);checks++;assert.equal(removal.elements.current.value,'');checks++;
+    assert.equal(r.get('wallet-lock-state').textContent,'Unlocked','a wrong passphrase removes nothing');checks++;assert.equal(saved().includes(bobSecret),false);checks++;
+    removal.elements.current.value=phrase;await removal.requestSubmit();assert.equal(r.get('wallet-lock-state').textContent,'Not encrypted',r.get('wallet-feedback').textContent);checks++;
+    assert.equal(removal.hidden,true);checks++;
     assert.ok(saved().includes(bobSecret),'removing the passphrase saves the key unencrypted again');checks++;
     for(const h of [c,r]){assert.equal(JSON.stringify(h.calls).includes(phrase),false,'the passphrase never leaves the page');checks++;}
+  }
+  // Changing the passphrase asks for the current one; a first one does not.
+  {
+    const c=await setup(),phrase='correct horse battery staple',next='another battery staple',form=c.get('wallet-passphrase-form');
+    c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();
+    await c.get('wallet-passphrase-open').click();assert.equal(c.get('wallet-current-field').hidden,true,'a first passphrase needs no current one');checks++;
+    form.elements.passphrase.value=form.elements.confirm.value=phrase;await form.requestSubmit();assert.equal(c.get('wallet-lock-state').textContent,'Unlocked',form.querySelector().textContent);checks++;
+    const salt=()=>JSON.parse([...c.savedStorage.entries()].find(([name])=>name.startsWith('hashstash.browser-wallet.v1.'))[1]).lock.salt,before=salt();
+    await c.get('wallet-passphrase-open').click();assert.equal(c.get('wallet-current-field').hidden,false,'changing it asks for the current one');checks++;
+    form.elements.passphrase.value=form.elements.confirm.value=next;await form.requestSubmit();assert.equal(form.nativeBlocked,true);checks++;
+    form.elements.passphrase.value=form.elements.confirm.value=next;form.elements.current.value='wrong horse battery staple';await form.requestSubmit();
+    assert.match(form.querySelector().textContent,/Wrong current passphrase/);checks++;assert.equal(salt(),before,'a wrong current passphrase changes nothing');checks++;
+    assert.equal(form.elements.current.value,'','the current passphrase field is cleared after every attempt');checks++;
+    form.elements.passphrase.value=form.elements.confirm.value=next;form.elements.current.value=phrase;await form.requestSubmit();
+    assert.equal(c.get('wallet-feedback').textContent,'Passphrase changed.',form.querySelector().textContent);checks++;assert.notEqual(salt(),before);checks++;
+    assert.equal(JSON.stringify(c.calls).includes(phrase)||JSON.stringify(c.calls).includes(next),false,'no passphrase leaves the page');checks++;
   }
   // A passphrase covers this network's keys only. Keys the site keeps
   // unencrypted for another network, as after a network reset, are counted.

@@ -231,6 +231,21 @@ async function run() {
     const muted=walk(h.get('chat-muted-list')).find(node=>node.href?.startsWith('#explorer?account='));
     equal(muted.textContent,label,'muted senders use the same distinguishing label');equal(muted.title,full);
   }
+  {
+    // A refused feed request (429/503: it did not run) is not sent again
+    // while its Retry-After lasts, even for a new block.
+    const h=await setup(),feed=h.handlers.explorer_chat;let sent=0;
+    h.handlers.explorer_chat=()=>{sent++;return {ok:false,status:429,headers:{get:name=>name==='Retry-After'?'3':null},text:async()=>JSON.stringify({jsonrpc:'2.0',id:1,error:{code:-32000,message:'network work budget exhausted'}})};};
+    await h.feedRefresh();equal(sent,1);ok(h.get('chat-status').textContent.includes('(try again in 3 s)'),h.get('chat-status').textContent);
+    h.handlers.explorer_chat=(...args)=>{sent++;return feed(...args);};
+    h.currentSnapshot.status.tip=h.feed.tip=hash(77);h.wallClock+=1000;await h.refresh();equal(sent,1,'a new block during Retry-After does not resend it');
+    h.wallClock+=2000;await h.refresh();equal(sent,2,'the feed loads once it has passed');equal(h.get('chat-status').hidden,true);
+    // Opening Chat is the user's own request: it is sent even while a
+    // refusal's Retry-After lasts.
+    h.handlers.explorer_chat=()=>{sent++;return {ok:false,status:429,headers:{get:name=>name==='Retry-After'?'3':null},text:async()=>JSON.stringify({jsonrpc:'2.0',id:1,error:{code:-32000,message:'network work budget exhausted'}})};};
+    await h.feedRefresh();equal(sent,3);h.handlers.explorer_chat=(...args)=>{sent++;return feed(...args);};
+    await h.navigate('#overview');await h.navigate('#chat');equal(sent,4,'opening Chat is sent');equal(h.get('chat-status').hidden,true);
+  }
   console.log(`Chat UI: ${checks} behavior assertions passed.`);
 }
 run().catch(error=>{console.error(error);process.exitCode=1;});

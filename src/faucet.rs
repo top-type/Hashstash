@@ -311,9 +311,9 @@ impl std::error::Error for Unready {}
 
 /// A refresh that another refresh overtook. A claim whose preparation found
 /// the chain moved refreshes the engine itself, from a later snapshot, while
-/// the poll's refresh may be waiting for the node; that refresh then applies
-/// nothing more, so an older snapshot or older lookups never replace newer
-/// ones.
+/// the poll's refresh may be waiting for the node; from the moment the
+/// claim's refresh begins, the poll's applies nothing more, so an older
+/// snapshot or older lookups never replace newer ones.
 #[derive(Clone, Copy, Debug)]
 struct Superseded;
 impl std::fmt::Display for Superseded {
@@ -1407,10 +1407,11 @@ struct Engine {
     fault: Option<&'static str>,
     scan: Option<Scan>,
     reported_state: Option<&'static str>,
-    /// Refreshes ended so far. A refresh notes the count before it asks for
-    /// its snapshot and takes each later step only while the count is
-    /// unchanged: once another refresh ended, which only a claim's own
-    /// refresh can do meanwhile, this one is `Superseded`.
+    /// Refreshes begun so far. A refresh counts itself in its first step,
+    /// before it asks for its snapshot, and takes each later step only while
+    /// the count is unchanged: once another refresh began, which only a
+    /// claim's own refresh can do meanwhile, this one is `Superseded`,
+    /// whether or not that later refresh ever ends.
     refreshes: u64,
 }
 
@@ -1479,8 +1480,8 @@ impl Engine {
         engine.publish();
         Ok(engine)
     }
-    /// Fails with `Superseded` once a refresh ended after the one that noted
-    /// `seen` began.
+    /// Fails with `Superseded` once another refresh began after the one that
+    /// counted itself as `seen`.
     fn current(&self, seen: u64) -> Result<()> {
         if self.refreshes != seen {
             return Err(Superseded.into());
@@ -1652,9 +1653,9 @@ impl Engine {
     /// resulting state. A failed refresh clears the last success here, in the
     /// step that adopts its unaccounted snapshot, so the claim the engine goes
     /// to next can never prepare against that snapshot as if it were fresh.
-    /// A refresh that another one overtook since it noted `seen` ends here
-    /// without changing anything: the newer refresh's snapshot and outcome
-    /// stand.
+    /// A refresh that another one overtook since it counted itself as `seen`
+    /// ends here without changing anything: the newer refresh's snapshot and
+    /// outcome stand, or, if that one was cut short, the next refresh's.
     fn finish_refresh(
         &mut self,
         seen: u64,
@@ -1663,7 +1664,6 @@ impl Engine {
         if self.current(seen).is_err() {
             return Ok(());
         }
-        self.refreshes = self.refreshes.wrapping_add(1);
         let refreshed = accounted.and_then(|(snap, outcome)| {
             self.height = Some(snap.height);
             self.tip = Some(snap.tip);
@@ -1868,6 +1868,31 @@ impl Engine {
         let node = self.node.clone();
         claim_with(self, &node, recipient.to_owned(), client_subnet.to_owned()).await
     }
+    /// About how many seconds remain until the outstanding payment is
+    /// `confirmations` deep, when another claim can be paid. Signed on the
+    /// block at its height, it can be included in the next one and is
+    /// confirmed `confirmations - 1` blocks later. The blocks it still needs
+    /// for that, at least one while it is outstanding, take a governed
+    /// interval each, and the refresh that sees the last takes up to a poll
+    /// interval; the wait is kept within 3 to 60 seconds.
+    fn pending_wait(&self) -> Result<Option<u64>> {
+        let Some(claim) = self.ledger.pending()? else {
+            return Ok(None);
+        };
+        let height = self.height.unwrap_or(claim.height);
+        let blocks = claim
+            .height
+            .saturating_add(self.config.confirmations)
+            .saturating_sub(height)
+            .max(1);
+        let interval = self.settings.map_or(0, |s| s.interval);
+        Ok(Some(
+            blocks
+                .saturating_mul(interval)
+                .saturating_add(POLL_INTERVAL.as_secs())
+                .clamp(POLL_INTERVAL.as_secs(), MAX_POLL_WAIT.as_secs()),
+        ))
+    }
     /// Answers a repeated claim from the ledger, or checks eligibility and
     /// fixes everything the node is asked to prepare.
     fn claim_start(&self, recipient: &str, client_subnet: &str) -> Result<ClaimStart> {
@@ -1905,14 +1930,13 @@ impl Engine {
         }
         let state = self.availability()?;
         if state != "ready" {
-            // Another visitor's payment is outstanding. It settles within a
-            // block or two, so the visitor may try again after about one
-            // governed interval; other states last longer.
-            let retry_after = (state == "pending").then(|| {
-                self.settings
-                    .map_or(0, |s| s.interval)
-                    .clamp(POLL_INTERVAL.as_secs(), MAX_POLL_WAIT.as_secs())
-            });
+            // Only another visitor's outstanding payment ends soon; other
+            // states last longer.
+            let retry_after = if state == "pending" {
+                self.pending_wait()?
+            } else {
+                None
+            };
             return Err(Unready { state, retry_after }.into());
         }
         self.ledger
@@ -2051,9 +2075,9 @@ impl Engine {
 
 /// Exclusive use of the engine for one local step of a refresh or a claim.
 /// The service runs each step on a blocking thread, so SQLite work, including
-/// its synchronous commits, never occupies the async workers. Between steps a
-/// refresh holds nothing while it waits for the node; a claim keeps the
-/// engine (see `Held`).
+/// its synchronous commits, never occupies the async workers. Between steps
+/// the poll's refresh holds nothing while it waits for the node; a claim, and
+/// a refresh it makes, keep the engine (see `Held`).
 trait Hold: Send {
     fn step<R, F>(&mut self, work: F) -> impl Future<Output = Result<R>> + Send
     where
@@ -2061,6 +2085,18 @@ trait Hold: Send {
         F: FnOnce(&mut Engine) -> Result<R> + Send + 'static;
     /// Gives up a hold kept between steps.
     fn release(&mut self) {}
+    /// The refresh a claim makes after its tip moved (see `claim_reserve`):
+    /// the poll's own refresh, run through this hold.
+    fn claim_refresh(
+        &mut self,
+        node: &NodeClient,
+        key: &str,
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        Self: Sized,
+    {
+        poll_once(self, node, key)
+    }
 }
 
 /// Tests own their engine and run each step in place.
@@ -2096,7 +2132,8 @@ impl Hold for Shared {
 /// The service engine as a claim uses it: kept from the eligibility checks
 /// through the reservation, so the nonce, the anchor and the one pending
 /// payment cannot change while the node prepares the transfer. A refresh the
-/// claim makes after its tip moved runs within this hold too.
+/// claim makes after its tip moved runs within this hold too, node lookups
+/// included.
 struct Held(Option<OwnedMutexGuard<Engine>>);
 impl Hold for Held {
     async fn step<R, F>(&mut self, work: F) -> Result<R>
@@ -2117,20 +2154,43 @@ impl Hold for Held {
     fn release(&mut self) {
         self.0 = None;
     }
+    /// The claim's refresh runs to its end in a task of its own, which keeps
+    /// the engine throughout and hands it back. The request deadline or a
+    /// closed connection stops only the claim, never this refresh between
+    /// its steps with part of its accounting applied and its snapshot not
+    /// adopted.
+    async fn claim_refresh(&mut self, node: &NodeClient, key: &str) -> Result<()> {
+        let mut held = Held(Some(self.0.take().context("faucet engine released")?));
+        let (node, key) = (node.clone(), key.to_owned());
+        let (engine, refreshed) = tokio::spawn(async move {
+            let refreshed = poll_once(&mut held, &node, &key).await;
+            (held.0, refreshed)
+        })
+        .await
+        .context("faucet engine step failed")?;
+        self.0 = engine;
+        refreshed
+    }
 }
 
 /// One refresh: the node snapshot and its accounting, then one step that
 /// adopts it and records the outcome, whether the refresh succeeded or not.
 ///
-/// The count of ended refreshes is noted before the snapshot is requested.
-/// Another refresh can end meanwhile only when a claim refreshes the engine
-/// it holds (see `claim_reserve`); this refresh is then `Superseded` and
-/// changes nothing more. Every adopted snapshot was therefore requested after
-/// the previously adopted one was answered, so the engine never returns to
-/// an older snapshot, and what an overtaken refresh's lookups found is never
-/// applied over the newer accounting.
+/// The refresh counts itself as it begins, before the snapshot is requested.
+/// Another refresh can begin meanwhile only when a claim refreshes the
+/// engine it holds (see `claim_reserve`); this refresh is then `Superseded`
+/// and changes nothing more, even if that claim's refresh never ends. Every
+/// adopted snapshot was therefore requested after the previously adopted one
+/// was answered, so the engine never returns to an older snapshot, and what
+/// an overtaken refresh's lookups found is never applied over the newer
+/// accounting.
 async fn poll_once(hold: &mut impl Hold, node: &NodeClient, key: &str) -> Result<()> {
-    let seen = hold.step(|engine| Ok(engine.refreshes)).await?;
+    let seen = hold
+        .step(|engine| {
+            engine.refreshes = engine.refreshes.wrapping_add(1);
+            Ok(engine.refreshes)
+        })
+        .await?;
     let accounted = account(hold, node, key, seen).await;
     hold.step(move |engine| engine.finish_refresh(seen, accounted))
         .await
@@ -2162,7 +2222,7 @@ async fn account(
 /// run between local steps, holding nothing, so a claim can be reserved
 /// meanwhile; what those lookups found is then applied on a later refresh,
 /// against the ledger as it is by then. Every step first checks that no
-/// other refresh ended since this one began (see `poll_once`).
+/// other refresh began since this one did (see `poll_once`).
 async fn reconcile(
     hold: &mut impl Hold,
     node: &NodeClient,
@@ -2244,7 +2304,10 @@ async fn reconcile(
 /// with all their accounting, and starts again from its eligibility checks
 /// against the new snapshot. It does so only while that refresh shows the
 /// tip moved, at most `CLAIM_PREPARATIONS` times in all; a refusal on an
-/// unmoved tip is the node's answer and ends the claim.
+/// unmoved tip is the node's answer and ends the claim. The refresh holds
+/// the engine through its node lookups too, so other claims wait for it,
+/// and it runs to its end even when the claim is stopped meanwhile (see
+/// `Held::claim_refresh`).
 async fn claim_reserve(
     hold: &mut impl Hold,
     node: &NodeClient,
@@ -2287,7 +2350,7 @@ async fn claim_reserve(
             return Err(refused);
         }
         let key = hold.step(|engine| Ok(hex::encode(engine.sender))).await?;
-        poll_once(hold, node, &key).await?;
+        hold.claim_refresh(node, &key).await?;
         if hold
             .step(move |engine| Ok(engine.tip == Some(anchor)))
             .await?
@@ -2559,8 +2622,9 @@ async fn claim_handler(
     if address::decode(&request.address, &app.chain).is_err() {
         return failure(StatusCode::BAD_REQUEST, "Invalid test-network address");
     }
-    // Claims take turns with the engine; a refresh waiting for the node holds
-    // it only between its lookups.
+    // Claims take turns with the engine; the poll's refresh waiting for the
+    // node holds it only between its lookups, a claim's own refresh
+    // throughout.
     let mut held = Held(Some(app.engine.clone().lock_owned().await));
     match claim_reserve(&mut held, &app.node, request.address, client).await {
         Ok((answer, raw)) => {
@@ -5561,6 +5625,207 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refresh_cut_short_still_supersedes_the_refresh_it_overtook() {
+        // A refresh superseded the poll's waiting refresh only once it ended.
+        // One cut short after repairing a reorganized receipt let the poll's
+        // older lookups expire that repaired payment and adopt the older
+        // snapshot: the faucet read ready, and a later claim could sign the
+        // payment's nonce again while its bytes could still be included.
+        let dir = TempDir::new().unwrap();
+        let (mut engine, _, node, task) = ready_engine(&dir, |c| c.expiry_blocks = 20).await;
+        let first = engine.claim(&recipient(3), "a").await.unwrap();
+        {
+            let mut node = node.lock().await;
+            let transactions = node.transactions.clone();
+            node.blocks.insert(3, block(3, transactions));
+            node.nonce = 1;
+            node.height = 4;
+        }
+        engine.refresh().await.unwrap();
+        assert_eq!(
+            engine.status(Some(&recipient(3)), "a").unwrap()["claim"]["status"],
+            "confirmed"
+        );
+        let key = hex::encode(engine.sender);
+        let client = engine.node.clone();
+        let engine = Arc::new(Mutex::new(engine));
+        // The poll's refresh finds the payment's block still canonical ...
+        let (entered, release) = gate_receipts(&mut *node.lock().await);
+        let refresh = {
+            let (engine, client, key) = (engine.clone(), client.clone(), key.clone());
+            tokio::spawn(async move { poll_once(&mut Shared(engine), &client, &key).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        // ... and then waits for the engine, which another refresh holds.
+        let held = engine.clone().lock_owned().await;
+        let looked_up = node.lock().await.receipts;
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while node.lock().await.receipts == looked_up {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // A reorganization drops that block: the payment's nonce is unused
+        // again, and its bytes may still be included.
+        {
+            let mut node = node.lock().await;
+            let mut branch = block(3, vec![]);
+            branch.header.nonce = 55;
+            node.blocks.insert(3, branch);
+            node.nonce = 0;
+            node.height = 5;
+            // The holder's refresh repairs the receipt and is then stopped
+            // while it waits to broadcast the payment again.
+            node.refusals.push((
+                "broadcasttransaction",
+                StatusCode::TOO_MANY_REQUESTS,
+                Some("5"),
+            ));
+        }
+        let cut_short = tokio::spawn(async move {
+            let mut held = Held(Some(held));
+            poll_once(&mut held, &client, &key).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !node.lock().await.refusals.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cut_short.abort();
+        assert!(cut_short.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), refresh)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // The overtaken refresh applied nothing: the repaired payment is still
+        // outstanding and the engine kept its last adopted snapshot.
+        let mut engine = engine.lock().await;
+        assert_eq!(
+            engine.ledger.pending().unwrap().map(|claim| claim.txid),
+            first["txid"].as_str().map(str::to_owned)
+        );
+        assert_eq!(engine.state().unwrap(), "pending");
+        assert_eq!(engine.height, Some(4));
+        // The next refresh accounts the new branch and keeps the same bytes
+        // outstanding, so no other claim signs their nonce.
+        engine.refresh().await.unwrap();
+        assert_eq!(engine.height, Some(5));
+        assert_eq!(
+            engine.ledger.pending().unwrap().map(|claim| claim.txid),
+            first["txid"].as_str().map(str::to_owned)
+        );
+        assert!(
+            engine
+                .claim(&recipient(4), "b")
+                .await
+                .unwrap_err()
+                .is::<Unready>()
+        );
+        assert!(engine.ledger.last(&recipient(4)).unwrap().is_none());
+        assert_eq!(node.lock().await.transactions.len(), 1);
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claims_refresh_runs_to_its_end_after_the_request_is_dropped() {
+        // A claim's refresh ran inside its request, so the request deadline,
+        // or a client closing its connection, stopped it between steps with
+        // part of its accounting applied and its snapshot never adopted.
+        let dir = TempDir::new().unwrap();
+        let (mut engine, _, node, mock_task) = ready_engine(&dir, |_| {}).await;
+        // A confirmed receipt makes every refresh look up its block.
+        engine.claim(&recipient(3), "a").await.unwrap();
+        {
+            let mut node = node.lock().await;
+            let transactions = node.transactions.clone();
+            node.blocks.insert(3, block(3, transactions));
+            node.nonce = 1;
+            node.height = 4;
+        }
+        engine.refresh().await.unwrap();
+        let mut app = App::new(
+            engine,
+            vec!["https://faucet.example".into()],
+            vec!["faucet.example".into()],
+        );
+        app.deadline = Duration::from_secs(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let routes = router(app.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, routes).await.unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let claim = || {
+            let (client, url) = (client.clone(), format!("{base}/faucet/claim"));
+            tokio::spawn(async move {
+                client
+                    .post(url)
+                    .header("host", "faucet.example")
+                    .header("origin", "https://faucet.example")
+                    .header("x-real-ip", "192.0.2.4")
+                    .json(&json!({"address":recipient(4)}))
+                    .send()
+                    .await
+                    .unwrap()
+            })
+        };
+        // A block arrived since the last refresh, so the node refuses the
+        // claim's preparation, and the receipt lookup of the claim's own
+        // refresh outlasts the request.
+        let (entered, release) = {
+            let mut node = node.lock().await;
+            node.height = 5;
+            gate_receipts(&mut node)
+        };
+        let dropped = claim();
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        let dropped = tokio::time::timeout(Duration::from_secs(5), dropped)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dropped.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            dropped.json::<Value>().await.unwrap()["error"],
+            "Faucet request is still being checked"
+        );
+        // The refresh still holds the engine and ends once the node answers.
+        assert!(app.engine.try_lock().is_err());
+        release.notify_one();
+        let engine = tokio::time::timeout(Duration::from_secs(5), app.engine.lock())
+            .await
+            .unwrap();
+        assert_eq!(engine.height, Some(5));
+        assert_eq!(engine.tip, Some(codec::block_hash(&block(5, vec![]))));
+        assert!(engine.fault.is_none());
+        assert!(engine.refresh_diagnostics.error.is_none());
+        // The dropped claim reserved nothing; sent again, it is paid on the
+        // snapshot that refresh adopted.
+        assert!(engine.ledger.last(&recipient(4)).unwrap().is_none());
+        assert_eq!(engine.state().unwrap(), "ready");
+        drop(engine);
+        let paid = tokio::time::timeout(Duration::from_secs(5), claim())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paid.status(), StatusCode::OK);
+        assert_eq!(paid.json::<Value>().await.unwrap()["status"], "pending");
+        let pending = app.engine.lock().await.ledger.pending().unwrap().unwrap();
+        assert_eq!((pending.nonce, pending.height), (1, 5));
+        server.abort();
+        mock_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn claims_the_faucet_cannot_pay_now_say_why_and_when_to_try_again() {
         let dir = TempDir::new().unwrap();
         let (engine, _, node, mock_task) = ready_engine(&dir, |_| {}).await;
@@ -5590,21 +5855,36 @@ mod tests {
         node.lock().await.advance_before_prepare = 1;
         let paid = claim(3, "192.0.2.3").await.unwrap();
         assert_eq!(paid.status(), StatusCode::OK);
-        // Another visitor's payment is outstanding: try again in about one
-        // block interval.
+        // Another visitor's payment is outstanding until it is two blocks
+        // deep: try again after the two blocks it still needs, 15 seconds
+        // each, and the refresh that sees the second.
         let waiting = claim(4, "198.51.100.4").await.unwrap();
         assert_eq!(waiting.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(waiting.headers()["retry-after"], "15");
+        assert_eq!(waiting.headers()["retry-after"], "33");
         let body: Value = waiting.json().await.unwrap();
         assert_eq!(body["state"], "pending");
-        assert_eq!(body["retry_after_seconds"], 15);
-        // Once that payment confirms, a busy node's refusal of the
-        // preparation is answered with the node's wait.
+        assert_eq!(body["retry_after_seconds"], 33);
+        // Included in the next block, it needs one block more.
         {
             let mut node = node.lock().await;
             let transactions = node.transactions.clone();
             node.blocks.insert(4, block(4, transactions));
             node.nonce = 1;
+            node.height = 4;
+        }
+        poll_once(&mut Shared(app.engine.clone()), &app.node, &key)
+            .await
+            .unwrap();
+        let waiting = claim(4, "198.51.100.4").await.unwrap();
+        assert_eq!(waiting.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(waiting.headers()["retry-after"], "18");
+        let body: Value = waiting.json().await.unwrap();
+        assert_eq!(body["state"], "pending");
+        assert_eq!(body["retry_after_seconds"], 18);
+        // Once that payment confirms, a busy node's refusal of the
+        // preparation is answered with the node's wait.
+        {
+            let mut node = node.lock().await;
             node.height = 5;
             node.refusals
                 .push(("preparetransaction", StatusCode::TOO_MANY_REQUESTS, None));
@@ -5634,6 +5914,57 @@ mod tests {
         drop(engine);
         server.abort();
         mock_task.abort();
+    }
+
+    #[tokio::test]
+    async fn another_visitors_payment_is_waited_for_until_it_can_be_confirmed() {
+        // The wait was one block interval, although the payment stays
+        // outstanding until it is `confirmations` deep: two blocks and a
+        // refresh with the launch settings, so the wallet's one resend
+        // usually found it still outstanding.
+        let dir = TempDir::new().unwrap();
+        let (mut engine, _, node, task) = ready_engine(&dir, |c| c.expiry_blocks = 20).await;
+        engine.claim(&recipient(3), "a").await.unwrap();
+        let wait = |engine: &Engine| {
+            let Err(error) = engine.claim_start(&recipient(4), "b") else {
+                panic!("a claim was prepared while another payment is outstanding");
+            };
+            let unready = error.downcast_ref::<Unready>().copied().unwrap();
+            assert_eq!(unready.state, "pending");
+            unready.retry_after
+        };
+        // Signed at height 2, it can be included at height 3 and confirmed
+        // at height 4: two blocks of 15 seconds and the refresh after them.
+        assert_eq!(wait(&engine), Some(33));
+        // Included at height 3, it needs one block more.
+        {
+            let mut node = node.lock().await;
+            let transactions = node.transactions.clone();
+            node.blocks.insert(3, block(3, transactions));
+            node.nonce = 1;
+            node.height = 3;
+        }
+        engine.refresh().await.unwrap();
+        assert!(engine.ledger.pending().unwrap().is_some());
+        assert_eq!(wait(&engine), Some(18));
+        // Reorganized out and still outstanding later, it needs at least one
+        // block more.
+        {
+            let mut node = node.lock().await;
+            let mut branch = block(3, vec![]);
+            branch.header.nonce = 55;
+            node.blocks.insert(3, branch);
+            node.nonce = 0;
+            node.height = 6;
+        }
+        engine.refresh().await.unwrap();
+        assert!(engine.ledger.pending().unwrap().is_some());
+        assert_eq!(wait(&engine), Some(18));
+        // Slow blocks are waited for at most a minute.
+        node.lock().await.interval = 90;
+        engine.refresh().await.unwrap();
+        assert_eq!(wait(&engine), Some(60));
+        task.abort();
     }
 
     #[tokio::test]

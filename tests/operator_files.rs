@@ -306,12 +306,31 @@ fn public_web_proxy_names_each_visitor_and_stays_within_node_sessions() {
             .lines()
             .any(|line| line.trim() == "error_page 502 =503 @busy;")
     );
-    let busy = template
-        .split("location @busy {")
-        .nth(1)
-        .and_then(|rest| rest.split('}').next())
-        .expect("busy answer");
-    assert!(busy.contains("add_header Retry-After "), "{busy}");
+    // But nginx also answers 502 when the node closed the connection without
+    // a reply, after it received and perhaps ran the request. 503 promises
+    // that nothing ran, and the wallet would then sign a second transaction
+    // while the first one may be pending: only a request that never reached
+    // the node ($upstream_connect_time "-") may become a 503, and any other
+    // 502 stays one.
+    let busy = block(&template, "location @busy {").expect("busy answer");
+    let guard = "if ($upstream_connect_time = \"-\") {";
+    let unsent = block(busy, guard).expect("busy answer only for unsent requests");
+    assert!(unsent.contains("add_header Retry-After "), "{unsent}");
+    assert!(unsent.contains("return 503 "), "{unsent}");
+    let (before, after) = busy.split_once(guard).unwrap();
+    let rest = &after[unsent.len()..];
+    assert!(
+        !before.contains("return ") && !rest.contains("return 503"),
+        "{busy}"
+    );
+    assert_eq!(
+        rest.lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("return "))
+            .collect::<Vec<_>>(),
+        ["return 502;"],
+        "{busy}"
+    );
     // Buffering keeps slow clients off node sessions; it must stay on.
     for directive in ["proxy_request_buffering", "proxy_buffering"] {
         assert!(
@@ -323,6 +342,33 @@ fn public_web_proxy_names_each_visitor_and_stays_within_node_sessions() {
             "{directive}"
         );
     }
+}
+
+/// The body of the first nginx block that `opening` (ending in `{`) starts,
+/// up to its matching `}`. Braces in quoted strings and `#` comments do not
+/// count.
+fn block<'a>(config: &'a str, opening: &str) -> Option<&'a str> {
+    let start = config.find(opening)? + opening.len();
+    let (mut depth, mut quote, mut comment) = (1usize, None, false);
+    for (index, c) in config[start..].char_indices() {
+        match (comment, quote, c) {
+            (true, _, '\n') => comment = false,
+            (true, ..) => {}
+            (false, Some(q), _) if c == q => quote = None,
+            (false, Some(_), _) => {}
+            (false, None, '#') => comment = true,
+            (false, None, '\'' | '"') => quote = Some(c),
+            (false, None, '{') => depth += 1,
+            (false, None, '}') => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&config[start..start + index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// A PowerShell script's `param(...)` block, if it has one. Parentheses after

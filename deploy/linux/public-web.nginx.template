@@ -27,7 +27,8 @@
 # before it contacts the node and each reply as fast as the node sends it, so
 # a slow client holds only its own connection here, never a node session. The
 # upstream's max_conns caps connections to the node at its 32 public sessions;
-# a request finding all of them in use is answered 503 with Retry-After.
+# a request finding all of them in use is answered 503 with Retry-After. Any
+# 502 after a request reached the node stays a 502 (see location @busy).
 limit_req_zone $binary_remote_addr zone=hashstash_web:10m rate=15r/s;
 limit_req_zone $binary_remote_addr zone=hashstash_rpc:10m rate=2r/s;
 limit_conn_zone $binary_remote_addr zone=hashstash_connections:10m;
@@ -91,8 +92,9 @@ server {
     # Keep both on: a slow client must never hold a node session.
     proxy_request_buffering on;
     proxy_buffering on;
-    # Every upstream connection in use (nginx answers 502 for that), or the
-    # node restarting: ask the client to retry instead.
+    # nginx answers 502 when every upstream connection is in use, but also
+    # when the node closed the connection without a reply: location @busy
+    # turns only a request that never reached the node into a retryable 503.
     error_page 502 =503 @busy;
     location = /rpc {
         # The node admits twice the governed BlockBytes plus 128 KiB of JSON
@@ -110,14 +112,27 @@ server {
         proxy_pass http://hashstash_public;
     }
     location @busy {
-        # A location with its own add_header inherits none of the server's,
-        # so they are repeated.
-        add_header Retry-After 1 always;
-        add_header Strict-Transport-Security "max-age=31536000" always;
-        add_header X-Content-Type-Options nosniff always;
-        add_header Referrer-Policy no-referrer always;
-        add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
         default_type application/json;
-        return 503 '{"error":{"message":"public web sessions busy; try again"}}';
+        # nginx sets $upstream_connect_time once it starts sending a request
+        # to the node, so "-" means the node never received this one: every
+        # upstream connection was in use, or the node refused the connection
+        # because it is not running. Only that is answered 503 with
+        # Retry-After, which clients take as a promise that nothing ran.
+        if ($upstream_connect_time = "-") {
+            # A block with its own add_header inherits none of the server's,
+            # so they are repeated.
+            add_header Retry-After 1 always;
+            add_header Strict-Transport-Security "max-age=31536000" always;
+            add_header X-Content-Type-Options nosniff always;
+            add_header Referrer-Policy no-referrer always;
+            add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+            return 503 '{"error":{"message":"public web sessions busy; try again"}}';
+        }
+        # Otherwise nginx had begun sending the request, and the node may
+        # have run it before closing the connection without a reply: while
+        # stopping, after a failed worker or when killed. A broadcast may
+        # then already be pending and relayed, so this stays the plain 502
+        # that clients treat as an unknown outcome.
+        return 502;
     }
 }

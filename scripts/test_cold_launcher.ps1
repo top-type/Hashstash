@@ -73,6 +73,28 @@ try {
     Check ((Register-CrashReportExclusion 'hashstash-cold.exe' $testKey) -eq 'added' -and (Test-Exclusion 'hashstash-cold.exe')) 'A missing key is created with the exclusion'
     if ($RegistryOnly) { $result.passed = $true; return }
 
+    # The launcher's readiness check, taken from its source. Another program
+    # can bind the port after the launcher's free-port check; its listener is
+    # refused even before it answers, so the token address is never opened.
+    $readiness = $syntax.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Wait-SignerReady' }, $true)
+    if (-not $readiness) { throw 'The launcher has no readiness check that confirms the listener belongs to the signer.' }
+    . ([ScriptBlock]::Create($readiness.Extent.Text))
+    $impostor = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $impostor.Start()
+    try {
+        $impostorPort = ([Net.IPEndPoint]$impostor.LocalEndpoint).Port
+        $refusal = { param($Process, [int]$Seconds) try { Wait-SignerReady $Process $impostorPort ([TimeSpan]::FromSeconds($Seconds)); 'ready' } catch { $_.Exception.Message } }
+        # A started signer that has not bound the port yet, while this
+        # process holds it.
+        $starting = [pscustomobject]@{ Id = [int]::MaxValue; HasExited = $false }
+        Check ((& $refusal $starting 10) -like "Another program (process ID $PID) is listening on port $impostorPort*") 'A listener another process owns is refused, never taken for the signer'
+        # The listener's owner is the signer only if it also answers as one.
+        $owner = [pscustomobject]@{ Id = $PID; HasExited = $false }
+        Check ((& $refusal $owner 3) -like 'Signer did not become ready*') 'A listener that does not answer as the signer is never ready'
+        $exited = [pscustomobject]@{ Id = [int]::MaxValue; HasExited = $true }
+        Check ((& $refusal $exited 10) -eq 'Cold signer exited during startup.') 'A signer that exited is reported, whoever holds the port'
+    } finally { $impostor.Stop() }
+
     $Executable = (Resolve-Path -LiteralPath $Executable).Path
     $result.signer_sha256 = (Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash.ToLowerInvariant()
     $client = [Net.Http.HttpClient]::new()
@@ -96,6 +118,10 @@ try {
     Check ($null -eq $env:HASHSTASH_COLD_TOKEN) 'The launcher leaves no token in its own environment'
     $session = Invoke-RestMethod -Uri ($origin + '/api/session') -TimeoutSec 5
     Check ($session.format -eq 'hashstash-cold-v1' -and -not ($session | ConvertTo-Json -Depth 10 -Compress).Contains($token)) 'The session endpoint answers without serving the token'
+    $named = @($session.PSObject.Properties.Name | Where-Object { @('chain_id', 'public_key', 'address', 'watch') -contains $_ })
+    Check ($named.Count -eq 0) 'Without the token the session endpoint names no network or account'
+    $status = Invoke-RestMethod -Uri ($origin + '/api/status') -Method Post -ContentType 'application/json' -Body '{}' -Headers @{ Origin = $origin; 'X-Hashstash-Cold-Token' = $token } -TimeoutSec 5
+    Check ($status.chain_id -eq ('27' * 32)) 'The launch token reads the selected network'
     Check ((Post-Status $origin '/api/lock' $null) -eq 403) 'A POST without the token is refused'
     Check ((Post-Status $origin '/api/lock' ('0' * 64)) -eq 403) 'A POST with another token is refused'
     Check ((Post-Status $origin '/api/lock' $token) -eq 200) 'The launch token authorizes the signer'

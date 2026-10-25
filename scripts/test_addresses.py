@@ -119,7 +119,9 @@ def main():
         cold, token = start(args.cold, ['--port', '0', '--config', config], 'cold', 'cold signer: (http://127\\.0\\.0\\.1:\\d+/#token=[0-9a-f]{64})').split('/#token=')
         cold_session = request(cold, '/api/session')[1]
         assert 'token' not in cold_session
-        assert cold_session['chain_id'] == network['chain_id']
+        # Without the token the signer names no account or network.
+        assert 'chain_id' not in cold_session and 'public_key' not in cold_session
+        assert request(cold, '/api/status', {}, token)[1]['chain_id'] == network['chain_id']
         code, unlocked = request(cold, '/api/import', {'private_key': vectors[1]['secret']}, token)
         assert code == 200 and unlocked['address'] == addresses[1], unlocked
         assert unlocked['watch'] == {'format': 'hashstash-watch-v2', 'address': addresses[1], 'public_key': vectors[1]['public_key'], 'chain_id': network['chain_id']}

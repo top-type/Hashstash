@@ -79,7 +79,11 @@ async function harness(initialChain = null, maxReview = undefined, server = {}) 
         if (body?.format!=='hashstash-unsigned-anchor'||!/^[0-9a-f]{64}$/.test(body.chain_id||'')||serverChain!==body.chain_id)return refuse('Unsigned network context does not match the selected network');
       }
       if(url==='/api/sign' && review.confirmLifetime && body.confirm_lifetime!==true) return refuse('Confirm the long transaction lifetime before signing');
-      const data = url === '/api/session' ? {format:'hashstash-cold-v1',max_review_bytes:review.maxReview,idle_lock_seconds:300,...status()} :
+      // Without the token only limits and lock state, never the account or
+      // network; the page reads those with its token from /api/status.
+      const limits = {format:'hashstash-cold-v1',max_review_bytes:review.maxReview,idle_lock_seconds:300};
+      const data = url === '/api/session' ? {...limits,unlocked:!!serverPublic,idle_locked:idleLocked} :
+        url === '/api/status' ? {...limits,...status()} :
         ['/api/unlock','/api/import','/api/network','/api/lock','/api/backup'].includes(url) ? status() :
         url === '/api/generate' ? {...status(),backup} :
         url === '/api/review' ? {...status(),review_token:'review-token',body:review.body,confirm_lifetime:review.confirmLifetime,fields:review.fields || [{label:'Sender',value:addressFor(serverChain)}]} :
@@ -247,6 +251,21 @@ async function run() {
     assert.equal(saved.calls.some(call=>call.url==='/api/backup'),false);checks++;
     assert.equal(saved.get('backup-panel').hidden,true);checks++;
     assert.equal(saved.get('export-public').disabled,false);checks++;
+    // The open account comes only from the token-authorized status.
+    const loaded=saved.calls.find(call=>call.url==='/api/status');
+    assert.equal(loaded?.options.method,'POST');checks++;
+    assert.equal(loaded.options.headers['X-Hashstash-Cold-Token'],sessionToken);checks++;
+    assert.equal(saved.get('public-key').textContent,publicKey);checks++;
+    assert.equal(saved.get('address').textContent,addressFor(chainA));checks++;
+    // A page without its token never asks for the account at all.
+    const orphan=await harness(chainA,undefined,{public:publicKey,launch:''});
+    assert.equal(orphan.calls.some(call=>call.url==='/api/status'),false);checks++;
+    assert.equal(orphan.get('wallet').hidden,true);checks++;
+    assert.equal(orphan.get('public-key').textContent,'');checks++;
+    // A stale token from an earlier signer is refused and opens nothing.
+    const stale=await harness(chainA,undefined,{public:publicKey,launch:'#token='+'00'.repeat(32)});
+    assert.match(stale.get('message').textContent,/no signer session/);checks++;
+    assert.equal(stale.get('wallet').hidden,true);checks++;
   }
   {
     // Imported keys are network-independent and survive a network change.

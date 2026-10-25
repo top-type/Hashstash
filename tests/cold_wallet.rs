@@ -153,6 +153,20 @@ impl Signer {
             .unwrap()
     }
 
+    /// GET /api/session as any local program sees it, without the token.
+    async fn public_session(&self) -> Value {
+        self.client
+            .get(format!("{}/api/session", self.base))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
     /// Restores a legacy v1 passphrase account; cheap for review fixtures.
     async fn unlock(&self, phrase: &str) -> PublicKey {
         let value = self
@@ -280,16 +294,7 @@ async fn network_changes_invalidate_review_and_persist_across_key_changes() {
             .contains("Select this signer's network"),
         "review without a selected network must explain the requirement"
     );
-    let session: Value = signer
-        .client
-        .get(format!("{}/api/session", signer.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(session["chain_id"].is_null());
+    assert!(signer.ok("status", json!({})).await["chain_id"].is_null());
     signer
         .ok("network", json!({"chain_id":hex::encode([9;32])}))
         .await;
@@ -602,6 +607,140 @@ async fn local_api_requires_host_origin_and_session_and_limits_input() {
         .await
         .unwrap();
     assert_eq!(session["unlocked"], false);
+    signer.server.stop().await;
+}
+
+/// Loopback is shared by every local account and service, and any of them
+/// can send the expected Host header. Without the session token the signer
+/// therefore reports only its format, limits and lock state, never the open
+/// account's key or address or the selected network, so another local
+/// program cannot watch which accounts the operator opens. The page reads
+/// those with its token.
+#[tokio::test]
+async fn tokenless_status_never_names_the_open_account() {
+    let chain = [9; 32];
+    let signer = Signer::with_chain(Some(chain)).await;
+    let sender = signer.unlock(PHRASE).await;
+    let session = signer.public_session().await;
+    let mut fields: Vec<_> = session.as_object().unwrap().keys().cloned().collect();
+    fields.sort();
+    assert_eq!(
+        fields,
+        [
+            "format",
+            "idle_lock_seconds",
+            "idle_locked",
+            "max_review_bytes",
+            "max_review_payments",
+            "unlocked"
+        ]
+    );
+    assert_eq!(session["format"], "hashstash-cold-v1");
+    assert_eq!(session["unlocked"], true);
+    let text = session.to_string();
+    for private in [
+        hex::encode(sender),
+        address::encode(&sender, &chain).unwrap(),
+        hex::encode(chain),
+    ] {
+        assert!(!text.contains(&private), "{text}");
+    }
+    // The full status needs the token, like every other POST.
+    let refused = signer
+        .client
+        .post(format!("{}/api/status", signer.base))
+        .header("Origin", &signer.base)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        signer
+            .client
+            .get(format!("{}/api/status", signer.base))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    let status = signer.ok("status", json!({})).await;
+    assert_eq!(status["public_key"], hex::encode(sender));
+    assert_eq!(status["address"], address::encode(&sender, &chain).unwrap());
+    assert_eq!(status["chain_id"], hex::encode(chain));
+    assert_eq!(status["format"], "hashstash-cold-v1");
+    assert_eq!(status["max_review_bytes"], session["max_review_bytes"]);
+    signer.ok("lock", json!({})).await;
+    assert_eq!(signer.public_session().await["unlocked"], false);
+    signer.server.stop().await;
+}
+
+/// Windows PowerShell sends `Expect: 100-continue` with a POST on a reused
+/// connection and fails the request when the answer closes that connection.
+/// The status request reads its body, so such a client is asked for it and
+/// keeps its connection for the next request.
+#[tokio::test]
+async fn token_status_keeps_the_connection_of_a_client_expecting_continue() {
+    use std::time::Duration;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+    /// One response head, and its body when `Content-Length` gives one.
+    async fn answer(stream: &mut TcpStream) -> String {
+        let mut received = Vec::new();
+        let mut byte = [0; 1];
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !received.ends_with(b"\r\n\r\n") {
+                assert_eq!(stream.read(&mut byte).await.unwrap(), 1, "closed early");
+                received.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&received).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .map_or(0, |value| value.trim().parse().unwrap());
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).await.unwrap();
+            received.extend_from_slice(&body);
+        })
+        .await
+        .expect("no complete answer");
+        String::from_utf8(received).unwrap()
+    }
+    let signer = Signer::start().await;
+    let host = signer.base.trim_start_matches("http://");
+    let mut stream = TcpStream::connect(host).await.unwrap();
+    stream
+        .write_all(format!("GET /api/session HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    assert!(answer(&mut stream).await.starts_with("HTTP/1.1 200"));
+    stream
+        .write_all(
+            format!(
+                "POST /api/status HTTP/1.1\r\nHost: {host}\r\nOrigin: {}\r\nX-Hashstash-Cold-Token: {}\r\nContent-Type: application/json\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n",
+                signer.base, signer.token
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(answer(&mut stream).await.starts_with("HTTP/1.1 100"));
+    stream.write_all(b"{}").await.unwrap();
+    let status = answer(&mut stream).await;
+    assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+    assert!(
+        !status.to_ascii_lowercase().contains("connection: close"),
+        "{status}"
+    );
+    assert!(status.contains("\"chain_id\":\"0909"), "{status}");
+    stream
+        .write_all(format!("GET /api/session HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    assert!(answer(&mut stream).await.starts_with("HTTP/1.1 200"));
     signer.server.stop().await;
 }
 
@@ -1179,22 +1318,18 @@ async fn generated_keys_are_random_return_one_backup_and_sign() {
     // export or review until its backup is confirmed.
     assert!(second["address"].is_null());
     assert!(second["watch"].is_null());
-    let session: Value = signer
-        .client
-        .get(format!("{}/api/session", signer.base))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    // Without the token the signer says only that a wallet is open.
+    let session = signer.public_session().await;
+    assert_eq!(session["unlocked"], true);
+    assert!(!session.to_string().contains(&hex::encode(sender)));
+    let status = signer.ok("status", json!({})).await;
     assert!(
-        session.get("backup").is_none(),
+        status.get("backup").is_none(),
         "status never carries the private key"
     );
-    assert_eq!(session["public_key"], hex::encode(sender));
-    assert_eq!(session["backup_pending"], true);
-    assert!(session["address"].is_null() && session["watch"].is_null());
+    assert_eq!(status["public_key"], hex::encode(sender));
+    assert_eq!(status["backup_pending"], true);
+    assert!(status["address"].is_null() && status["watch"].is_null());
     let expected = body(sender, payment());
     let envelope = serde_json::to_value(wallet::unsigned(&expected, &[9; 32])).unwrap();
     let refused = signer.post("review", envelope.clone()).await;

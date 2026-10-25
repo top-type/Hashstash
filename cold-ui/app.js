@@ -117,12 +117,13 @@
     return value;
   }
   // The signer locks a wallet left unused; stop showing it once that happened.
+  // The session endpoint reports only whether a wallet is open, never which.
   async function followLock() {
     if (!publicKey) return;
     try {
       const response = await fetch('/api/session', {cache:'no-store',credentials:'same-origin'});
       const session = await response.json();
-      if (response.ok && !session.public_key) showWallet(null, session);
+      if (response.ok && session.unlocked === false) showWallet(null, session);
     } catch { /* The reported error already explains the failure. */ }
   }
   async function action(work) {
@@ -210,6 +211,8 @@
   $('unlock-form').addEventListener('submit', event => {
     event.preventDefault();
     action(async () => {
+      // Without its token the page cannot know the signer's network either.
+      if (!sessionToken) throw new Error(NO_SESSION);
       const method = $('import-method').value;
       if (method === 'generate') {
         showWallet(null);
@@ -393,6 +396,7 @@
   $('export-raw').addEventListener('click', () => download('hashstash-signed.txt', $('raw').value+'\n','text/plain'));
   action(async () => {
     sessionToken = launchToken();
+    // Limits and lock state need no token; the open account and network do.
     const response = await fetch('/api/session', {cache:'no-store',credentials:'same-origin'});
     if (!response.ok) throw new Error('Signer unavailable');
     const session = await response.json();
@@ -400,14 +404,16 @@
     const idle = session.idle_lock_seconds;
     $('idle-lock-hint').textContent = Number.isSafeInteger(idle) && idle > 0 ? ` An open wallet locks after ${idle % 60 ? `${idle} seconds` : idle === 60 ? '1 minute' : `${idle / 60} minutes`} without use.` : '';
     if (!sessionToken) { showWallet(null, session); throw new Error(NO_SESSION); }
+    let status;
+    try { status = await api('status'); } catch (error) { showWallet(null, session); throw error; }
     // A generated key's backup is shown once. After a reload it is gone, so
     // the unconfirmed (and so unfunded) key is discarded, never re-served.
-    if (session.public_key && session.backup_pending === true) {
+    if (status.public_key && status.backup_pending === true) {
       showWallet(null, await api('lock'));
       say('The new key was discarded because its backup was not confirmed. Generate a new key and save its backup.', true);
       return;
     }
-    showWallet(session.public_key, session);
-    if (session.idle_locked) say(IDLE_LOCKED);
+    showWallet(status.public_key, status);
+    if (status.idle_locked) say(IDLE_LOCKED);
   });
 })();

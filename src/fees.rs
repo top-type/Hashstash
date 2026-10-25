@@ -99,8 +99,12 @@ impl<'a> PreparedTransaction<'a> {
             }
             _ => false,
         };
-        // Proposal and support records are never pruned. A repeated Support
-        // only adds to the sender's existing record.
+        // Proposal records are never pruned. A support record persists until
+        // its Refund removes it, and a refunded record cannot be created
+        // again: a refund needs an ended round or a cancelled proposal, while
+        // Support needs the open auction round and a proposal without
+        // refund_height. So each record pays this weight once. A repeated
+        // Support only adds to the sender's existing record.
         let creates_record = match self.operation() {
             Operation::Propose { .. } => true,
             Operation::Support {

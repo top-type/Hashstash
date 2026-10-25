@@ -8,7 +8,7 @@ This document describes the current rules. The [consensus format](CONSENSUS.md) 
 
 An account is identified by a 32-byte BIP340 public key and holds spendable hashes and stash shares. Its nonce counts outgoing transactions and prevents a signed transaction from being spent twice. A transaction requires the sender's signature, exact next nonce, an ancestor block reference and a positive lifetime measured from that block. If the reference is block 100 and the lifetime is 2, inclusion is valid in blocks 101–102. A reference removed by a reorganization is invalid on that branch. The reference and lifetime are signed and cannot slide forward during retries. Payments credit the exact signed recipient amount; the signed fee is charged separately. Stash cannot be transferred between accounts.
 
-Each canonical non-genesis block contributes `W = floor(2^256 / (target + 1))` expected hashing attempts. It creates `floor(W / 10^15)` atoms: one atom per whole petahash of expected work, discarding any smaller fraction for that block. A block below one petahash issues zero atoms. Total issuance adds the independently rounded rewards of canonical blocks. Actual attempts are not measurable from a proof. Losing blocks receive no reward. Nodes select the valid branch with greatest accumulated physical expected work and retain their current tip on equality; monetary rounding never changes fork choice. Local admission policy may first presync a far-behind branch's proof-of-work headers before validating its blocks, within the bounds described in [network controls](NETWORK-HARDENING.md); it changes when a heavier branch is adopted, not which branch wins.
+Each canonical non-genesis block contributes `W = floor(2^256 / (target + 1))` expected hashing attempts. It creates `floor(W / 10^15)` atoms: one atom per whole petahash of expected work, discarding any smaller fraction for that block. A block below one petahash issues zero atoms. Total issuance adds the independently rounded rewards of canonical blocks. Actual attempts are not measurable from a proof. Losing blocks receive no reward. Nodes select the valid branch with greatest accumulated physical expected work and retain their current tip on equality; monetary rounding never changes fork choice. Local admission policy may first presync a far-behind branch's proof-of-work headers before validating its blocks, within the bounds described in [network controls](NETWORK-HARDENING.md); within those bounds it changes when a heavier branch is adopted, not which branch wins. Beyond them a running node does not reach the heavier branch by itself: a branch that needs more than 65,536 of its headers past the node's stored fork point before it claims more work than the node's tip is not followed. After a partition that long, about 11 days of evenly split 15-second blocks and longer when the split is uneven, nodes on the lighter side keep their branch until their operators resynchronize them (section 12).
 
 One displayed hash equals 1,000 raw hash atoms; one displayed stash equals 1,000 raw share atoms. RPC and CLI use integer atoms. Mining work and hashrate use EH and EH/s. Display units do not change consensus arithmetic.
 
@@ -72,15 +72,239 @@ The bound applies separately to each block and compounds across blocks. Zero all
 
 The implementation uses integer ratios and directed logarithm bounds, never floating point. Small rational curves use exact power comparisons. A common price bracket determines conservative outputs: buys round Stash down and sells round hash payouts down. No transaction ID, array position or miner-selected rounding winner receives the leftover atoms. A flat curve's price M/S is exact and independent of volume: each order receives its rounded-down output and pays only the least input that buys that output, and the unusable principal is refunded. At a price whose reduced numerator or denominator is one, including the genesis exchange rate, every such trade is exact and leaves the price unchanged. At any other flat price each filled order, buy or sale, can raise it and none lowers it: a buy leaves under one hash atom of extra input in the reserve, and a sale burns under one extra Stash atom. No order needs a minimum lot, so a flat curve reached through revenue replenishment, whose supply is unrelated to its reserve, stays tradeable. Zero-output orders have their principal refunded together before the remaining batch is recalculated.
 
-Directed logarithms use 4b+128 fractional bits, rounded up to a multiple of 64 and at most 2,048, where b is the widest input bit length; one-sided batches evaluate their probe-independent logarithm once. The price search brackets the root between the opening marginal price M/S and M(R+D)/(RS+MB), a bound on the closing marginal price (for a net sale also at least R/S). Within one clearing each price search starts where the previous one ended: every search, including one settled without curve work, records the floor of the mean of its final bounds with its scale, and the next search first probes that value times its own scale divided by the recorded scale, if it lies strictly inside the bracket. That probe and the following Newton proposals number at most 64; otherwise the search bisects, geometrically while the bracket spans more than a factor of two. A probe whose comparison stays undecided ends the search: its two neighbours become the bracket if each is a bracket end or is proven on its side, and otherwise the proven lower and upper bounds are each refined by arithmetic bisection towards that probe. Unless the work below is exhausted, a search on an exact small-ratio curve, or for an exact full redemption, finally tests the simplest fraction inside its bracket for equality.
+Prices, in hash per Stash, are searched as integer numerators over the denominator 2^(2b+32), where b is the widest bit length among R, S, M and the buy and sell totals being priced; outputs are computed from the bracket on that grid, so the grid is part of the result. Directed logarithms use 4b+128 fractional bits, rounded up to a multiple of 64 and at most 2,048; one-sided batches evaluate their probe-independent logarithm once. The price search brackets the root between the opening marginal price M/S and M(R+D)/(RS+MB), a bound on the closing marginal price (for a net sale also at least R/S); a two-sided net buy also caps the bracket at D/B, where buy cash and sale proceeds balance. Within one clearing each price search starts where the previous one ended: every search, including one settled without curve work, records the floor of the mean of its final bounds with its scale, and the next search first probes that value times its own scale divided by the recorded scale, if it lies strictly inside the bracket. That probe and the following Newton proposals number at most 64; otherwise the search bisects, geometrically while the bracket spans more than a factor of two. A probe whose comparison stays undecided ends the search: its two neighbours become the bracket if each is a bracket end or is proven on its side, and otherwise the proven lower and upper bounds are each refined by arithmetic bisection towards that probe. Unless the work below is exhausted, a search on an exact small-ratio curve, or for an exact full redemption, finally tests the simplest fraction inside its bracket for equality.
 
-Clearing one world performs at most 1,024 curve evaluations. A comparison decided by the integer checks that precede the curve costs nothing: a zero probe, a probe at or past D/B, where buy cash and sale proceeds would balance, sale proceeds reaching the funded reserve R + D, or an empty resulting supply. Any other comparison spends one evaluation, which covers its logarithms; a one-sided batch's probe-independent logarithm is computed during its first evaluation and never charged again. On an exact small-ratio curve an undecided logarithm comparison spends one more evaluation for its exact power comparison. Once the evaluations are exhausted every further comparison is undecided, so price brackets keep their proven bounds and the budget search below keeps its best proven candidate, and the result remains valid and conservative. When the limit binds, the result depends on this exact sequence of probes, so matching implementations must reproduce the reference search step for step. Block validation, template construction and mempool selection apply the same limit.
+Clearing one world performs at most 1,024 curve evaluations. A comparison decided by the integer checks that precede the curve costs nothing: a zero probe, a probe at or past D/B, where buy cash and sale proceeds would balance, sale proceeds reaching the funded reserve R + D, or an empty resulting supply. Any other comparison spends one evaluation, which covers its logarithms; a one-sided batch's probe-independent logarithm is computed during its first evaluation and never charged again. On an exact small-ratio curve (one whose reserve ratio R/M has a reduced denominator of at most 8) an undecided logarithm comparison spends one more evaluation for its exact power comparison. Once the evaluations are exhausted, every comparison that needs the curve is undecided, while those decided by the integer checks above still decide. Searches then start no further probes, but a step already under way completes: the neighbour probes of an undecided midpoint still run, and one decided by an integer check can still narrow its bracket. Price brackets keep their proven bounds, the budget search below keeps its best proven candidate, and the result remains valid and conservative. The limit counts curve evaluations only. Integer-decided comparisons, the simplest-fraction step, allocation, and the dust and full-redemption loops are not charged, and a flat world spends no evaluations at all; that work is polynomial in the number of orders, and the stop rules below bound it. Block validation, template construction and mempool selection apply the same limit.
+
+The result depends on the exact sequence of probes whenever the evaluation limit binds and whenever a price bound or the numeric range makes the budget search run, because that search keeps the best candidate along its own path. The [reference clearing algorithm](#reference-clearing-algorithm) below is therefore normative step for step, with every constant.
 
 When a bound is reached, deterministic integer search reduces the affected side’s aggregate budget and apportions it by input amount. When both sides of a flat batch are reduced, it searches the buy budget and the sell budget is that budget times B/D, rounded down. It interpolates on the relative gap to the active bound with Illinois weighting. After an interpolation that fails to halve that gap it bisects, geometrically from one atom, for a run that doubles with each consecutive failure. It stops when the budget is resolved to one atom or to 2^-64 of the retained budget. Rounding can make the result conservative: this rule does not promise the greatest possible filled volume at dust boundaries. The same search reduces fills if their combined reserve, mass or supply would exceed the configured numeric range. Final exact cross-products enforce both price bounds against the actual rounded mass and supply. Reserve, Stash and mass must become empty together. Mass rounds down when reserve grows and up when it shrinks. All actual fills and refunds conserve cash and Stash.
 
 Inputs and fees must be covered by the account’s opening balances, including all its other commitments in that block. A transfer, refund, mining reward or trade output received within the block cannot fund another operation in that same block. This removes funding-order dependencies from clearing. Account credits are aggregated; execution updates affected account-tree paths rather than rewriting all accounts whenever an order changes.
 
 Miners still choose which transactions to include and can censor or delay orders. Batching removes within-block price priority for the included set; the price bound and leading-block rule do not eliminate manipulation across blocks. Without a limit price, any order sharing a block, which a miner can guarantee for its own, raises other buyers' common price on a curved world, and an order reaching the bound reduces the other fills on its side proportionally while their fees are still paid. The price bound limits this per block; flat curves are unaffected. Wallets use a short default trade expiry to limit how long an amount-only order remains eligible.
+
+### Reference clearing algorithm
+
+This subsection is normative. Fills and the closing curve enter the state root, so an implementation must perform exactly these steps, with these constants, in this order, including the probes it makes and the curve evaluations it counts. The [cross-implementation vectors](../tests/data/clearing-vectors.json) were computed from this text by an independent model (`scripts/clearing_model.py`) and are checked against the node (`tests/clearing_vectors.rs`); they cover flat and curved worlds, dust, the D/B cap, bound- and range-limited batches, full redemption and an exhausted limit.
+
+Values are unsigned integers unless marked signed. `a / b` is floor division, `ceil(a, b)` the ceiling of a/b (zero for a = 0), `tdiv(a, b)` signed division truncated toward zero, `bits(x)` the bit length (zero for zero), `isqrt` the integer square root, `cmp` a three-way comparison giving Less, Equal or Greater, and `>>`/`<<` shifts. A failed `require` makes the block invalid. The inputs are the opening world's reserve R, Stash supply S and curve mass M; that world's included buy orders (hash amounts) and sell orders (Stash amounts), each in block order and identified by transaction ID; the bound `bps`, MaxPriceChangeBps in the parent's settings; the genesis `money_bits`, `share_bits` and share scale `q`; and the evaluation limit W = 1,024. Fills are reported per order, in order; no identifier or position selects a value.
+
+```text
+clear():
+  require order IDs distinct, every amount > 0, bits(buy) <= money_bits, bits(sell) <= share_bits
+  D = sum(buys); B = sum(sells)
+  require B <= S, (R = 0) = (S = 0) = (M = 0), M >= R,
+          bits(R) <= money_bits, bits(M) <= money_bits, bits(S) <= share_bits
+  if S = 0:                                     # bootstrap at the genesis exchange rate
+    budget = min(D, 2^money_bits - 1, (2^share_bits - 1) / q)
+    buy i: input = buys[i] * budget / D, output = input * q; sells fill nothing
+    R' = M' = sum of buy inputs; S' = R' * q; require bits(S') <= share_bits; done
+  used = 0; last_price = none                   # shared by every search of this clearing
+  full = candidate(D, B)
+  result = full if fits(full) and upper_ok(full) and lower_ok(full) else budget_search(full)
+  require bits(R'), bits(M') <= money_bits, bits(S') <= share_bits, upper_ok(result), lower_ok(result)
+
+spend():     if used >= W: return false; used += 1; return true
+exhausted(): return used >= W
+upper_ok(x): S'(x) = 0 or M'(x) * S * 10000 <= M * S'(x) * (bps + 10000)
+lower_ok(x): bps >= 10000 or (S'(x) > 0 and M'(x) * S * 10000 >= M * S'(x) * (10000 - bps))
+fits(x):     bits(R'(x)) <= money_bits and bits(M'(x)) <= money_bits and bits(S'(x)) <= share_bits
+```
+
+A candidate allocates the given side budgets in proportion to order amounts, prices them, removes dust and computes the closing curve:
+
+```text
+candidate(buy_budget, sell_budget):
+  in_b[i] = buys[i] * buy_budget / D  (0 if D = 0);  in_s[j] = sells[j] * sell_budget / B  (0 if B = 0)
+  loop:
+    d = sum(in_b); b = sum(in_s)
+    if d = 0 and b = 0: return the empty result (no fills; R, S, M unchanged)
+    (low, high, scale) = price(d, b)
+    out_b[i] = in_b[i] * scale / high;  out_s[j] = in_s[j] * low / scale
+    if R = M:                                   # flat: charge only what buys the rounded output
+      in_b[i] = ceil(out_b[i] * high, scale);  in_s[j] = ceil(out_s[j] * scale, low)
+    d = sum(in_b); b = sum(in_s)
+    if any buy or sale has in > 0 and out = 0:
+      set every such in to 0; continue          # all dust leaves together
+    paid = sum(out_s); require paid <= R + d
+    R' = R + d - paid; S' = S + sum(out_b) - b
+    if S' = 0 and R' > 0:                       # full redemption retains one input atom
+      in_s[j] = in_s[j] * (b - 1) / b for every j; continue
+    require (R' = 0) = (S' = 0)
+    M' = M * R' / R if R' >= R else ceil(M * R', R)
+    return fills (in_b[i], out_b[i]) and (in_s[j], out_s[j]), R', S', M'
+```
+
+The price search returns a bracket `(low, high)` over a denominator `scale` that encloses the batch's uniform execution price:
+
+```text
+price(d, b):
+  (low, high, scale) = search(d, b); last_price = ((low + high) >> 1, scale); return it
+
+search(d, b):
+  if d * S = b * M or R = M: return (M, M, S)   # no net movement, or the flat price M/S
+  n = max(bits(R), bits(S), bits(M), bits(d), bits(b))
+  scale = 2^(2n + 32); P = min(ceil(4n + 128, 64) * 64, 2048)
+  buying = d * S > b * M
+  cn = M * (R + d) * scale; cd = R * S + M * b
+  if buying: lower = M * scale / S; upper = ceil(cn, cd)
+             if b > 0: upper = min(upper, ceil(d * scale, b))
+  else:      lower = max(R * scale / S, cn / cd); upper = ceil(M * scale, S)
+  ratio = (u, v) with u/v = R/M in lowest terms if v <= 8, else none
+  last_eval = none
+  proposal = (last_price.p * scale / last_price.scale) if last_price is set, else none
+  newton_probes = 0
+  while upper - lower > 1 and not exhausted():
+    if proposal is set and lower < proposal < upper and newton_probes < 64:
+      mid = proposal; newton_probes += 1
+    else: mid = bisect(lower, upper)
+    proposal = none
+    c = compare(mid, scale)
+    if c = Less:    lower = mid; proposal = newton(mid, c)
+    if c = Greater: upper = mid; proposal = newton(mid, c)
+    if c = Equal:   return (mid, mid, scale)
+    if c undecided:
+      if (mid - 1 = lower or compare(mid - 1, scale) = Less) and
+         (mid + 1 = upper or compare(mid + 1, scale) = Greater):     # short-circuit, left to right:
+                                                                     # a compare runs only if needed
+        lower = mid - 1; upper = mid + 1; break
+      hi = mid
+      while hi - lower > 1 and not exhausted():
+        x = (lower + hi) >> 1; c = compare(x, scale)
+        Less: lower = x;  Equal: return (x, x, scale);  otherwise: hi = x
+      lo = mid
+      while upper - lo > 1 and not exhausted():
+        x = (lo + upper) >> 1; c = compare(x, scale)
+        Greater: upper = x;  Equal: return (x, x, scale);  otherwise: lo = x
+      break
+  if not exhausted() and (ratio is set or (b = S and d = 0)):
+    (f, g) = simplest_fraction(lower, scale, upper, scale)
+    if compare(f, g) = Equal: return (f, f, g)
+  require upper > 0
+  return (lower, upper, scale)
+
+bisect(lo, hi): if lo > 0 and hi > 2 * lo: return min(max(isqrt(lo * hi), lo + 1), hi - 1)
+                else: return (lo + hi) >> 1
+
+simplest_fraction(a, b, c, d):                 # the simplest fraction in [a/b, c/d]
+  terms = []
+  loop:
+    f = a / b
+    if a mod b = 0: (x, y) = (f, 1); stop
+    if f < c / d:   (x, y) = (f + 1, 1); stop
+    append f to terms; (a, b, c, d) = (d, c - f * d, b, a - f * b)
+  for f in terms, last first: (x, y) = (f * x + y, x)
+  return (x, y)
+```
+
+`compare(p, den)` orders the probe price p/den against the root. The integer checks come first and cost nothing; every other comparison spends one evaluation:
+
+```text
+compare(p, den):
+  if p = 0: return Less
+  cs = d * den; ss = b * p
+  if buying and cs <= ss: return Greater
+  if not buying and cs >= ss: return Less
+  rb = R * den; rt = (R + d) * den
+  if rt <= ss: return Equal if (rt = ss and b = S and d = 0) else Greater
+  nr = rt - ss; sb = S * p; ns = (S - b) * p + cs
+  if ns = 0: return Less
+  (A, Bb, C, Dd) = (nr, rb, ns, sb) if buying else (rb, nr, sb, ns)
+  if not spend(): return undecided
+  (l_lo, l_hi) = L(A / Bb, P); (r_lo, r_hi) = L(C / Dd, P)
+  lo = l_lo * R - r_hi * M; hi = l_hi * R - r_lo * M                 # signed
+  c = Less if hi < 0, Greater if lo > 0, Equal if l_hi = 0 and r_hi = 0, otherwise undecided
+  last_eval = (p, den, tdiv(lo + hi, 2), 2^P)
+  if c is undecided and ratio = (u, v) is set and spend():
+    c = cmp(A^u * Dd^v, Bb^u * C^v)
+  return c
+```
+
+For a buy-only batch A/Bb is (R + d)/R and for a sale-only batch C/Dd is S/(S - b) at every probe; the bounds of L depend only on the rational value, so these are computed once, inside the first evaluation, at no extra charge. A Newton step proposes the next probe after a decided comparison:
+
+```text
+newton(p, c):                                   # always over the denominator scale
+  if p = 0: return none
+  cs = d * scale; ss = b * p
+  if (buying and cs <= ss) or (not buying and cs >= ss): return none
+  rt = (R + d) * scale; if rt <= ss: return none
+  rn = rt - ss; sn = (S - b) * p + cs; if sn = 0: return none
+  if last_eval is not (p, scale, diff, unit) for some diff, unit: return none
+  deriv = M * d * scale * rn - R * b * p * sn  (signed); if not buying: deriv = -deriv
+  if deriv <= 0: return none
+  x = p - tdiv(diff * rn * p * sn, unit * deriv)
+  if x < 0: return none
+  if x = p: return p + 1 if c = Less, p - 1 if c = Greater
+  return x
+```
+
+Directed logarithms enclose ln(x) for a rational x >= 1 in units of 2^-P, rounding every step outwards. The atanh series below uses ceil(P/3) terms; once the lower power reaches 0 and the upper power 1, each remaining term adds exactly 0 below and 1 above, so implementations may add those directly.
+
+```text
+L(n / m, P):                                    # n >= m > 0
+  k = bits(n) - bits(m); t = m << k; if t > n: k -= 1; t = t >> 1
+  (lo, hi) = atanh2(n - t, n + t, P)
+  return (lo + k * ln2_lo(P), hi + k * ln2_hi(P)) where (ln2_lo(P), ln2_hi(P)) = atanh2(1, 3, P)
+
+atanh2(zn, zd, P):                              # encloses 2 * atanh(zn / zd) * 2^P
+  if zn = 0: return (0, 0)
+  z_lo = (zn << P) / zd; z_hi = ceil(zn << P, zd)
+  q_lo = z_lo^2 >> P; q_hi = ceil(z_hi^2, 2^P)
+  (p_lo, p_hi, s_lo, s_hi) = (z_lo, z_hi, 0, 0)
+  for i in 0 .. ceil(P, 3) - 1:
+    s_lo += p_lo / (2i + 1); s_hi += ceil(p_hi, 2i + 1)
+    p_lo = (p_lo * q_lo) >> P; p_hi = ceil(p_hi * q_hi, 2^P)
+  return (2 * s_lo, 2 * s_hi + 1)
+```
+
+When the full batch breaks a bound or the numeric range, the budget search reduces one side, or on a flat world possibly both:
+
+```text
+budget_search(full):
+  upward = not upper_ok(full) or not fits(full)
+  usual = Buys if upward else Sells; other = Sells if upward else Buys
+  evaluate(Buys, x)  = candidate(x, B)
+  evaluate(Sells, x) = candidate(D, x)
+  evaluate(Both, x)  = candidate(x, B * x / D)   (sale budget 0 if D = 0)
+  side = usual; first = evaluate(side, 0); (lg, ldiv) = gap(first)
+  if R = M:                                     # flat worlds only
+    for next in (other, Both): if lg <= 0: stop; side = next; first = evaluate(side, 0); (lg, ldiv) = gap(first)
+  low = 0; high = B if side = Sells else D
+  best = the empty result; (hg, hdiv) = gap(full)
+  if lg <= 0 and upper_ok(first) and lower_ok(first): best = first
+  (low_kept, high_kept, failures, bisections) = (0, 0, 0, 0)
+  while lg <= 0 and high - low > max(low >> 64, 1) and not exhausted():
+    interpolated = (bisections = 0 and lg < 0)
+    if interpolated:
+      a = max(((-lg) * hdiv) >> max(low_kept - 1, 0), 1); b = max((hg * ldiv) >> max(high_kept - 1, 0), 1)
+      mid = min(max(low + (high - low) * a / (a + b), low + 1), high - 1)
+    else: mid = max(bisect(max(low, 1), high), low + 1)
+    x = evaluate(side, mid); (g, div) = gap(x)
+    (old, odiv) = (lg, ldiv) if g <= 0 else (hg, hdiv)
+    halved = |g| * odiv * 2 <= |old| * div
+    if g <= 0:
+      if upper_ok(x) and lower_ok(x): best = x
+      (low, lg, ldiv) = (mid, g, div); low_kept = 0; high_kept += 1
+    else:
+      (high, hg, hdiv) = (mid, g, div); low_kept += 1; high_kept = 0
+    if not interpolated: bisections = max(bisections - 1, 0)
+    else if halved: failures = 0
+    else: bisections = 2^min(failures, 16); failures += 1
+  return best
+
+gap(x):                                         # signed relative distance (gap / div)
+  if upward:       (num, den) = (0, 1) if S'(x) = 0 else (M'(x) * S * 10000, M * S'(x) * (bps + 10000))
+  else if bps >= 10000: (num, den) = (0, 1)
+  else if S'(x) = 0:    (num, den) = (2, 1)
+  else:            (num, den) = (M * S'(x) * (10000 - bps), M'(x) * S * 10000)
+  (gap, div) = (num - den, den)                 # signed gap
+  for (v, limit) in ((R'(x), 2^money_bits - 1), (M'(x), 2^money_bits - 1), (S'(x), 2^share_bits - 1)):
+    if (v - limit) * div > gap * limit: (gap, div) = (v - limit, limit)
+  return (gap, div)
+```
+
+The world then takes R', S' and M', and each order's sender receives its output and its unfilled input (signed amount minus filled input): a buy credits Stash and returns cash, a sale credits cash and returns Stash.
 
 ## 4 Revenue and grants
 
@@ -140,8 +364,8 @@ Anyone with a funded account can propose a grant or one permitted setting change
 Leadership is evaluated once per block, after the block's transactions:
 
 - The incumbent keeps a tie with the highest bid. Otherwise the highest bid leads, and equal bids go to the smallest proposal ID. Proposers can grind their IDs, so this rule gives no fairness guarantee: anyone can break a tie with a one-atom Support. A strictly higher bid restarts the lead period at the block's clock.
-- A proposal that could not open its decision in that block never leads. Examples are an unfundable grant, an invalid projected schedule and an unrepresentable end height. It is cancelled, refundable from the next block, and the evaluation continues with the next bid. A grant can become unfundable after it took the lead, because sales lower the grant capacity. The auction therefore records, in order, each leader that a strictly higher bid displaced, with the lead start it held. When the leader is cancelled, the most recently displaced proposal that is still active is the incumbent again; if it leads, it resumes its recorded lead start, which may already be mature. A cancelled proposal therefore never costs the proposal it displaced any lead time, unless a live higher bid takes over instead. Cancelled proposals are dropped from the record.
-- The lead test is inclusive (`clock - lead_since >= lead`). If a mature leader is nevertheless cancelled, the next leader is chosen in the following block.
+- A proposal that could not open its decision in that block never leads. Examples are an unfundable grant, an invalid projected schedule and an unrepresentable end height. It is cancelled, refundable from the next block, and the evaluation continues with the next bid. A grant can become unfundable after it took the lead, because sales lower the grant capacity. The auction therefore records, in order, each leader that a strictly higher bid displaced, with the lead start it held. When the leader is cancelled, the most recently displaced proposal that is still active is the incumbent again; if it leads, it resumes its recorded lead start, which may already be mature. A cancelled proposal therefore never costs the proposal it displaced any lead time, unless a live higher bid takes over instead. Cancelled proposals are ignored when the record is read. They leave it only when an evaluation without a leader filters it, so the committed record can still hold them, which matters for the state root ([auction evaluation](CONSENSUS.md#auction-evaluation)).
+- The lead test is inclusive (`clock - lead_since >= lead`). Because a proposal that could not open never leads, a leader chosen in a block can always open in that block, and no leader is cancelled at maturity; when the leader is cancelled, the next proposal that can open is chosen in the same block, if there is one.
 - At the auction timeout (`clock - opened >=` the effective timeout), a leader that can open its decision opens it, even before its lead matures. Outbidding the leader late therefore wins the round, and the winning bid becomes revenue, instead of ending the round with every bid refunded. Without such a leader the round enters rest without a decision. Rest completion is processed after auctions, so a zero rest can open the next auction in the block that timed out or resolved the previous one.
 
 The winning proposal's full bid becomes revenue even if the later decision rejects it. Losing contributions become refundable through signed Refund transactions; they are not automatically pushed to every contributor. Refund eligibility is recorded by round and proposal. Proposals with invalid activation conditions are cancelled under the auction rules.
@@ -211,9 +435,9 @@ miner_fee = floor(signed_fee * miner_fee_percent / 100)
 revenue_fee = signed_fee - miner_fee
 ```
 
-The entire signed fee is charged. If an earlier transaction has already created a transfer recipient, its creation weight and required minimum can fall but the signed payment stays unchanged. Grant proposal execution weight is fixed per recipient, whether or not that account exists. Proposal and support records stay in consensus state permanently, so every proposal also pays 1,024 weight for its proposal record and first support record, and a Support pays it when the sender has no support record for that proposal yet; adding to an existing record does not. Like account creation, the Support charge depends on the state before the transaction. The proposal fee is not refunded when a grant loses or never activates, or when recipients receive accounts before settlement. This fee is separate from refundable auction support. Its miner share goes to the proposal's inclusion miner; no further fee is deducted from payouts. An optional extra is a quote-builder input, not a separately signed amount. The minimum rate can be zero. Empty or full blocks do not change it. Allocation conserves each fee exactly, including rounding.
+The entire signed fee is charged. If an earlier transaction has already created a transfer recipient, its creation weight and required minimum can fall but the signed payment stays unchanged. Grant proposal execution weight is fixed per recipient, whether or not that account exists. Proposal records stay in consensus state permanently and support records until refunded, so every proposal also pays 1,024 weight for its proposal record and first support record, and a Support pays it when the sender has no support record for that proposal yet; adding to an existing record does not. A refunded support record cannot be created again, since a refund needs an ended round or a cancelled proposal and Support needs the open round and an active proposal, so no record pays twice. Like account creation, the Support charge depends on the state before the transaction. The proposal fee is not refunded when a grant loses or never activates, or when recipients receive accounts before settlement. This fee is separate from refundable auction support. Its miner share goes to the proposal's inclusion miner; no further fee is deducted from payouts. An optional extra is a quote-builder input, not a separately signed amount. The minimum rate can be zero. Empty or full blocks do not change it. Allocation conserves each fee exactly, including rounding.
 
-Node policy selects executable transactions by miner fee per weight, then signed fee per weight, respecting nonce dependencies. Remaining fee-ranking ties use transaction IDs. Other valid transaction selections remain consensus-valid. The governed body limit also bounds transaction weight, including prepaid grant execution, and new mining-account weight. Only mandatory grant settlement writes are exempt from this weight limit; their number was bounded by the proposal’s admitted bytes and prepaid execution weight. There is no separate recipient-count limit. A complete signed proposal may use the including block’s available byte and weight capacity. There is no separate transaction-size setting. Maintained presets start with 16 KiB of capacity; governance can set a different representable capacity. Transport and API admission apply separate resource limits. Block framing and any mining-account creation also consume capacity. During governance, one logical payment-account creation counts once.
+Node policy selects executable transactions by miner fee per weight, then signed fee per weight, respecting nonce dependencies. Remaining fee-ranking ties use transaction IDs. Other valid transaction selections remain consensus-valid. The governed body limit also bounds transaction weight, including prepaid grant execution, and new mining-account weight. Only mandatory grant settlement writes are exempt from this weight limit; their number was bounded by the proposal’s admitted bytes and prepaid execution weight. The exemption does not cover the miner's own account: if settlement creates it, that block is charged 1,024 weight even when it pays the miner nothing. A transfer that creates it carries that weight itself; otherwise a positive reward creates and charges it, and a zero reward creates no account ([fees and capacity](CONSENSUS.md#fees-capacity-and-issuance)). There is no separate recipient-count limit. A complete signed proposal may use the including block’s available byte and weight capacity. There is no separate transaction-size setting. Maintained presets start with 16 KiB of capacity; governance can set a different representable capacity. Transport and API admission apply separate resource limits. Block framing and any mining-account creation also consume capacity. During governance, one logical payment-account creation counts once.
 
 ## 9 Scheduled time, timestamps and difficulty
 
@@ -232,7 +456,7 @@ ideal_target = initial_target * 2^(error / half_life)
 
 `block_1_interval` is the target interval in block 1's post-state, the one block 2 is scheduled by; before block 2 exists, the anchor timestamp is block 1's own timestamp.
 
-Each branch anchors ASERT at its first mined blocks, excluding the wait between creating the genesis configuration and starting mining. The anchor timestamp is the later of the first block's timestamp and the second block's timestamp less one target interval, so backdating the first block alone cannot turn that wait into timestamp error; a miner producing both of the first two blocks still can. A network calibrated with `init --hashrate` sets its target limit 256 times easier than the initial target, so neither such a backdated start nor a stall can make its blocks more than 256 times cheaper than calibrated. The first two blocks use the initial target, and the third never starts easier than it. Later targets use the fixed integer ASERT approximation, canonical compact rounding and the fixed genesis target limit. An interval change affects future schedule increments without resetting that branch's anchor. The half-life stays fixed, so a governed interval is at most the half-life. A block mined at the old spacing then lowers the next target by at most one halving, rather than demanding work that no miner can supply. Timestamp controls constrain but do not eliminate manipulation.
+Each branch anchors ASERT at its first mined blocks, excluding the wait between creating the genesis configuration and starting mining. The anchor timestamp is the later of the first block's timestamp and the second block's timestamp less one target interval, so backdating the first block alone cannot turn that wait into timestamp error; a miner producing both of the first two blocks still can. A network calibrated with `init --hashrate` sets its target limit 256 times easier than the initial target, so neither such a backdated start nor a stall can make its blocks more than 256 times cheaper than calibrated. The first two blocks use the initial target, and the third never starts easier than it. Later targets use the fixed integer ASERT approximation (the aserti3-2d polynomial, given step by step in [the consensus format](CONSENSUS.md#timestamps-difficulty-and-forks)), canonical compact rounding and the fixed genesis target limit. An interval change affects future schedule increments without resetting that branch's anchor. The half-life stays fixed, so a governed interval is at most the half-life. A block mined at the old spacing then lowers the next target by at most one halving, rather than demanding work that no miner can supply. Timestamp controls constrain but do not eliminate manipulation.
 
 Header timestamps are u32 seconds. Once median past time reaches u32::MAX (2106-02-07 06:28:15 UTC) no timestamp can exceed it and the chain cannot be extended; this is a protocol lifetime limit that only a new header format could lift.
 
@@ -265,9 +489,9 @@ Transactions contain sender, nonce, exact fee, anchor block hash, lifetime in bl
 
 A block contains the header, height, miner key, state root, eight-byte mining extranonce and ordered transactions. Its Bitcoin-shaped system coinbase commits to the miner, transaction list and state root. It is the sole Merkle leaf, allowing SHA256 ASIC Stratum jobs with an empty Merkle branch. Validation of the transaction commitment needs the whole ordered list rather than a short per-transaction proof.
 
-SQLite stores accepted blocks and active-chain metadata transactionally. The node publishes tip and state together. Restart validates history and rebuilds state and derived indexes, above the newest locally saved state checkpoint that passes its checks or else from genesis; history is not pruned. Reorganizations restore every accounting and governance field together and revalidate pending transactions. Neither checkpoint retention nor governance settlement creates finality.
+SQLite stores accepted blocks and active-chain metadata transactionally. The node publishes tip and state together. Restart validates history and rebuilds state and derived indexes above the newest locally saved state checkpoint that loads and passes its own checks (one that does not is discarded and the next older one is tried), or else from genesis; if resuming above the chosen checkpoint fails, the node replays from genesis rather than trying an older one. The active chain is never pruned. Stored losing-branch blocks are kept while they compete; startup deletes those that have fallen out of competition, and a full replay deletes those the persisted index already shows to be stale without executing them, when the rebuilt index reproduces the persisted tip's entry. Peers can deliver a deleted branch again through presync. Reorganizations restore every accounting and governance field together and revalidate pending transactions. Neither checkpoint retention nor governance settlement creates finality.
 
-Peers exchange bounded compact binary frames carrying canonical records. Each frame and authenticated handshake begins with a marker naming the peer protocol generation, the release whose block, state and message rules it carries (`HSP2P043` for 0.43.0); nodes of different generations refuse each other at the first message, and the database records its storage format the same way. Block locators find a common ancestor. Peer transport version 2 opens each synchronization with header requests: a node learns other branches from their 80-byte headers whatever their blocks' size or length, holds a branch's headers, at most 65,536 for all branches together, only after counting that they claim more work than its tip, and then fetches that branch's blocks from where it leaves validated history, within a capacity allowance raised to that history's validated capacity. Fork choice is unchanged: the valid branch with the most work becomes the tip. Version 1 peers, which have no header messages, keep block synchronization. Nodes can use explicit peers, a closed set of pinned transport identities, or authenticated peer discovery. Authenticated sessions bind messages to their direction and sequence; authenticated modes cannot silently fall back to unauthenticated transport. A discovered public key proves control of that key, not a trusted operator or independent participant. Authentication does not encrypt traffic or prevent an eclipse by compromised peers or routing. Connection limits, per-IP work budgets, timeouts and bounded decoders constrain local resource use. State, disk history and replay time still grow. RPC and Stratum remain JSON services. See [node operation](RUNNING.md) and [network limits](NETWORK-HARDENING.md).
+Peers exchange bounded compact binary frames carrying canonical records. Each frame and authenticated handshake begins with a marker naming the peer protocol generation, the release whose block, state and message rules it carries (`HSP2P043` for 0.43.0); nodes of different generations refuse each other at the first message, and the database records its storage format the same way. Block locators find a common ancestor. Peer transport version 2 opens each synchronization with header requests: a node learns other branches from their 80-byte headers whatever their blocks' size or length, holds a branch's headers only after counting that they claim more work than its tip, and then fetches that branch's blocks from where it leaves validated history, within a capacity allowance raised to that history's validated capacity. Headers held after counting, together with those of admitted branches, number at most 65,536 for all branches; separately, at most 32,768 evictable presync headers of declined blocks are held, so up to 98,304 headers in all. Fork choice is unchanged within these bounds: the valid branch with the most work it can reach becomes the tip. A hold beyond 65,536 ends that header download and nothing carries over to the next, so a branch that needs more headers than that past the node's stored fork point before it claims more work than the tip is never followed automatically (section 1). Recovering such a node is a manual step: stop it, move its database aside, and start it with the same genesis configuration and an empty database, synchronizing first from peers known to be on the heavier branch (explicit `--peer` endpoints, without `--peer-discovery`) until it has passed the work of the branch it left. Version 1 peers, which have no header messages, keep block synchronization. Nodes can use explicit peers, a closed set of pinned transport identities, or authenticated peer discovery. Authenticated sessions bind messages to their direction and sequence; authenticated modes cannot silently fall back to unauthenticated transport. A discovered public key proves control of that key, not a trusted operator or independent participant. Authentication does not encrypt traffic or prevent an eclipse by compromised peers or routing. Connection limits, per-IP work budgets, timeouts and bounded decoders constrain local resource use. State, disk history and replay time still grow. RPC and Stratum remain JSON services. See [node operation](RUNNING.md) and [network limits](NETWORK-HARDENING.md).
 
 ## 13 Applications and security scope
 
@@ -275,4 +499,4 @@ Signed transaction data is raw bytes. Chat interprets readable UTF-8 and Mail de
 
 Browser wallets sign locally and trust their serving origin. Keys stored in browser storage are unencrypted unless the user sets a passphrase, which protects keys stored after it is set, but neither earlier copies left in browser files or backups nor the running page. Peer authentication and consensus validation do not establish application privacy, independent participation, economic stability or a guarantee against manipulation. HASH represents expected-work issuance rather than stable external purchasing power. Governance compares an internal stash/hash price, not an independently measured public benefit.
 
-A database must use its exact genesis configuration. Chain, state, transaction, world and block commitments use the domains and field layouts in [CONSENSUS.md](CONSENSUS.md). Signed transactions bind the chain ID and an anchor block, and nodes require that anchor to belong to the branch accepting them. A shared anchor permits inclusion on either descendant fork until expiry, subject to the other transaction checks.
+A database must use its exact genesis configuration. Chain, state, transaction, world and block commitments use the domains and field layouts in [CONSENSUS.md](CONSENSUS.md). Signed transactions bind the chain ID and an anchor block, and nodes require that anchor to belong to the branch accepting them. A shared anchor permits inclusion on either descendant fork until expiry, subject to the other transaction checks. 

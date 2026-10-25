@@ -507,7 +507,9 @@ pub fn check_pow(header: &Header, target: &Amount) -> Result<()> {
 
 /// ASERT's exact integer polynomial, with Hashstash's cumulative schedule error.
 /// Preconditions are fixed at genesis: 0 < initial <= limit <= 2^256-1,
-/// compact-canonical initial and limit, and half_life > 0.
+/// compact-canonical initial and limit, and half_life > 0. Every constant and
+/// rounding step below is consensus; docs/CONSENSUS.md ("Timestamps,
+/// difficulty and forks") gives the same algorithm as pseudocode.
 pub fn asert(initial: &Amount, error: i128, half_life: u64, limit: &Amount) -> Amount {
     assert!(half_life > 0 && !initial.is_zero() && !limit.is_zero());
     assert!(initial <= limit && limit.bits() <= 256);
@@ -772,6 +774,30 @@ mod tests {
             (Amount::one() << 512usize, 1u32.into(), 1u32.into(), 1, 5),
         ] {
             assert!(withdrawal_shares(&r, &b, &target, u, v).is_err());
+        }
+    }
+    /// Hashstash's own edges of the integer approximation: truncation of the
+    /// exponent toward zero, the floored shift, the 512-half-life cutoffs, the
+    /// floor at one, and clamping to the limit before compact rounding
+    /// (audit L083). The expected bits come from scripts/consensus_model.py,
+    /// written from the pseudocode in docs/CONSENSUS.md.
+    #[test]
+    fn asert_matches_the_documented_pseudocode() {
+        let data: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/data/consensus-vectors.json")).unwrap();
+        let vectors = data["asert"].as_array().unwrap();
+        assert!(vectors.len() >= 15);
+        let bits = |v: &serde_json::Value| u32::from_str_radix(v.as_str().unwrap(), 16).unwrap();
+        for v in vectors {
+            let initial = target_from_bits(bits(&v["initial_bits"])).unwrap();
+            let limit = target_from_bits(bits(&v["limit_bits"])).unwrap();
+            let error = i128::from(v["error"].as_i64().unwrap());
+            let half_life = v["half_life"].as_u64().unwrap();
+            assert_eq!(
+                bits_from_target(&asert(&initial, error, half_life, &limit)),
+                bits(&v["bits"]),
+                "{v}"
+            );
         }
     }
     #[test]

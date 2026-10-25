@@ -519,9 +519,9 @@ fn the_leader_at_the_auction_timeout_wins_instead_of_a_refunded_timeout() {
     ));
 }
 
-/// Audit F046. Proposal and support records are never pruned, yet a
-/// Parameter proposal and a new support record paid only their byte weight,
-/// less per permanent record than creating an account.
+/// Audit F046. Proposal records are never pruned and support records persist
+/// until refunded, yet a Parameter proposal and a new support record paid only
+/// their byte weight, less per lasting record than creating an account.
 #[test]
 fn new_governance_records_pay_record_weight() {
     let c = config(4, 4 * Config::testnet().initial.interval);

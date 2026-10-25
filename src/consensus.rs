@@ -703,6 +703,9 @@ fn can_open(c: &Config, s: &State, p: &Proposal) -> Result<()> {
     eligible(c, s, p)
 }
 /// Make a proposal refundable from the next block and remove it from ranking.
+/// It deliberately leaves `displaced` alone: a cancelled entry stays in the
+/// committed list until `displaced_incumbent` next runs (docs/CONSENSUS.md,
+/// "Auction evaluation").
 fn cancel(s: &mut State, a: &mut Auction, id: &Hash) -> Result<()> {
     let mut cancelled = s
         .proposals
@@ -720,6 +723,14 @@ fn cancel(s: &mut State, a: &mut Auction, id: &Hash) -> Result<()> {
 /// The most recently displaced proposal that is still active. Cancelled
 /// proposals are forgotten, so a cancelled leader never counts as having
 /// taken the lead from the proposal it displaced.
+///
+/// This is the only place cancelled entries leave `displaced`, which is
+/// committed inline in the phase. It runs before each selection step taken
+/// while there is no leader and the ranking is not empty, so the committed
+/// list can still hold cancelled entries: one cancelled while another
+/// proposal led, or the last leader's own when the ranking then emptied.
+/// Every use filters them first, so they never change an outcome, but they
+/// are part of the state root; the rule is consensus.
 fn displaced_incumbent(s: &State, a: &mut Auction) -> Option<Hash> {
     a.displaced.retain(|(id, _)| {
         s.proposals
@@ -732,6 +743,10 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
     let Phase::Auction(mut a) = s.phase.clone() else {
         return Ok(());
     };
+    // replacement_height is written once, at opening, as the opening height
+    // plus one (zero for a genesis auction), and the opening block never
+    // evaluates its new round, so this gate always passes: selection runs in
+    // every evaluated block. The committed field and the gate stay unchanged.
     if s.height >= a.replacement_height {
         // A proposal that could not open now never leads. Each one is
         // cancelled when it reaches the top, so it cannot displace an
@@ -807,63 +822,68 @@ fn auction(c: &Config, s: &mut State, parent_hash: &Hash) -> Result<()> {
             .get_shared(&id)
             .context("missing auction leader action")?
             .clone();
-        if can_open(c, s, &action).is_ok() {
-            s.auction_escrow = s
-                .auction_escrow
-                .checked_sub(&p.support)
-                .context("auction escrow underflow")?;
-            s.rounds.insert(
-                a.round.to_be_bytes().to_vec(),
-                RoundRecord {
-                    status: RoundStatus::Won(id),
-                    refund_height: s.height + 1,
-                },
-            );
-            s.ranking = crate::tree::Map::new();
-            // Branch-stable inputs only: a same-parent sibling of this block
-            // opens the same decision, and anyone who knows the parent and the
-            // maturing leader can compute the ID before this block is found.
-            let decision_id = crypto::tagged_hash(
-                "Hashstash/decision",
-                &codec::encode(&(s.chain_id, a.round, id, s.height, parent_hash)),
-            );
-            s.last_epoch = s
-                .last_epoch
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("decision counter overflow"))?;
-            let d = Decision {
-                id: decision_id,
-                epoch: s.last_epoch,
-                round: a.round,
-                proposal_id: id,
-                proposal: action,
-                started: s.clock,
-                started_height: s.height,
-                blocks: s.frozen.decision_blocks,
-                leading_blocks: 0,
-            };
-            let mut pass = s.world.clone();
-            if let Proposal::Grant { payments } = &*d.proposal {
-                grant_reserve(c, &mut pass, &c.validate_grant(payments)?)?;
-                // FAIL sets the same reserve shortfall aside as waiting
-                // revenue. Both outcomes therefore open on identical curves,
-                // so equal trades move their prices alike in either world.
-                let shortfall = &s.world.reserve - &pass.reserve;
-                s.world.reserve -= &shortfall;
-                s.world.revenue += shortfall;
-            }
-            // The winning bid becomes revenue only after the grant is
-            // reserved, so it can never fund the proposal that paid it.
-            s.world.revenue += &p.support;
-            pass.revenue += &p.support;
-            s.alternative = Some(pass);
-            s.phase = Phase::Governance(d);
-            return Ok(());
-        } else {
-            cancel(s, &mut a, &id)?;
-            a.replacement_height = s.height + 1;
-            s.phase = Phase::Auction(a.clone());
+        // Selection above ran in this block and kept only a leader that
+        // could open now. can_open reads the clock, height, frozen settings,
+        // world and action, none of which selection or this phase update
+        // changes, so a mature leader always opens: no leader is cancelled at
+        // maturity. (Before eligibility moved into selection, a mature leader
+        // that could not open was cancelled here and replacement_height
+        // deferred the next choice by one block; that path was unreachable.)
+        debug_assert!(
+            can_open(c, s, &action).is_ok(),
+            "a selected auction leader cannot open"
+        );
+        s.auction_escrow = s
+            .auction_escrow
+            .checked_sub(&p.support)
+            .context("auction escrow underflow")?;
+        s.rounds.insert(
+            a.round.to_be_bytes().to_vec(),
+            RoundRecord {
+                status: RoundStatus::Won(id),
+                refund_height: s.height + 1,
+            },
+        );
+        s.ranking = crate::tree::Map::new();
+        // Branch-stable inputs only: a same-parent sibling of this block
+        // opens the same decision, and anyone who knows the parent and the
+        // maturing leader can compute the ID before this block is found.
+        let decision_id = crypto::tagged_hash(
+            "Hashstash/decision",
+            &codec::encode(&(s.chain_id, a.round, id, s.height, parent_hash)),
+        );
+        s.last_epoch = s
+            .last_epoch
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("decision counter overflow"))?;
+        let d = Decision {
+            id: decision_id,
+            epoch: s.last_epoch,
+            round: a.round,
+            proposal_id: id,
+            proposal: action,
+            started: s.clock,
+            started_height: s.height,
+            blocks: s.frozen.decision_blocks,
+            leading_blocks: 0,
+        };
+        let mut pass = s.world.clone();
+        if let Proposal::Grant { payments } = &*d.proposal {
+            grant_reserve(c, &mut pass, &c.validate_grant(payments)?)?;
+            // FAIL sets the same reserve shortfall aside as waiting
+            // revenue. Both outcomes therefore open on identical curves,
+            // so equal trades move their prices alike in either world.
+            let shortfall = &s.world.reserve - &pass.reserve;
+            s.world.reserve -= &shortfall;
+            s.world.revenue += shortfall;
         }
+        // The winning bid becomes revenue only after the grant is
+        // reserved, so it can never fund the proposal that paid it.
+        s.world.revenue += &p.support;
+        pass.revenue += &p.support;
+        s.alternative = Some(pass);
+        s.phase = Phase::Governance(d);
+        return Ok(());
     }
     if timed_out {
         timeout(s, a.round);
@@ -966,6 +986,9 @@ fn resolve(c: &Config, s: &mut State) -> Result<bool> {
         s.height.checked_sub(d.started_height) == Some(d.blocks),
         "decision has not ended"
     );
+    // Always true for a valid state: opening escrows the whole grant in PASS
+    // and State::validate pins PASS grant_escrow to the grant total for the
+    // whole decision. Kept as defence in depth; a mismatch would select FAIL.
     let funded = match &*d.proposal {
         Proposal::Grant { payments } => pass.grant_escrow == c.validate_grant(payments)?,
         Proposal::Parameter { .. } => true,
@@ -1138,7 +1161,11 @@ pub(crate) fn prepare_block(
         }
     }
     // Grant settlement writes were paid for when proposed. The miner's account
-    // still consumes ordinary capacity if settlement happened to create it.
+    // still consumes ordinary capacity if settlement happened to create it,
+    // even when this block then pays the miner nothing. Otherwise the reward
+    // creates it at the end of the block, charged there, and a zero reward
+    // creates no account; a transfer that creates it pays the weight itself
+    // (docs/CONSENSUS.md, "Fees, capacity and issuance").
     let miner_fees = Amount::zero();
     let used_weight = if parent.account(miner, None).is_none() && s.account(miner, None).is_some() {
         fees::ACCOUNT_WEIGHT
@@ -1977,5 +2004,272 @@ mod reserve_model_tests {
             )
             .is_ok()
         );
+    }
+}
+
+/// Transition-level known-answer vectors (audit L015, L063, L064, L066). The
+/// expected roots and committed auction fields come from
+/// scripts/consensus_model.py, an independent model of docs/CONSENSUS.md
+/// ("Auction evaluation"), not from this crate. Each scripted block runs the
+/// real block pipeline (prepare_block, then finish_block) with no reward; its
+/// "transactions" are direct state changes with the documented effects of a
+/// Propose, a Support or a flat genesis-rate sale.
+#[cfg(test)]
+mod auction_transition_vectors {
+    use super::*;
+    use crate::config::Settings;
+    use serde_json::{Value, json};
+
+    fn data() -> Value {
+        serde_json::from_str(include_str!("../tests/data/consensus-vectors.json")).unwrap()
+    }
+
+    fn config(v: &Value) -> Config {
+        let mut c = Config::testnet();
+        c.network = v["network"].as_str().unwrap().into();
+        // Fixed in every build, so the chain ID and the roots do not depend
+        // on the test-fixtures feature.
+        c.test_work = false;
+        c.auction_timeout = v["auction_timeout"].as_u64().unwrap();
+        c.initial = serde_json::from_value::<Settings>(v["settings"].clone()).unwrap();
+        c.validate().unwrap();
+        c
+    }
+
+    fn n(v: &Value) -> u64 {
+        v.as_u64().unwrap()
+    }
+
+    fn key(v: &Value) -> PublicKey {
+        crypto::public_key(&[n(v) as u8; 32]).unwrap()
+    }
+
+    fn funded_genesis(c: &Config, v: &Value) -> State {
+        let mut s = State::genesis(c);
+        s.issued = n(&v["funds"]).into();
+        let w = &v["world"];
+        s.world.reserve = n(&w["reserve"]).into();
+        s.world.shares = n(&w["shares"]).into();
+        s.world.curve_mass = n(&w["mass"]).into();
+        s.world.revenue = n(&w["revenue"]).into();
+        s.world.grant_escrow = n(&w["grant_escrow"]).into();
+        s.world.account_cash = n(&w["account_cash"]).into();
+        s.world.account_shares = n(&w["account_shares"]).into();
+        s.validate(c).unwrap();
+        s
+    }
+
+    /// The documented effects of a Propose's or Support's bid.
+    fn bid(s: &mut State, id: Hash, sender: PublicKey, amount: u64) {
+        let round = s.auction_round().unwrap();
+        let mut p = s.proposals.get(&id).unwrap().clone();
+        assert!(p.round == round && p.refund_height.is_none());
+        if !p.support.is_zero() {
+            s.ranking.remove(&rank_key(&p.support, &id));
+        }
+        p.support += amount;
+        s.ranking.insert(rank_key(&p.support, &id), id);
+        s.proposals.insert(id.to_vec(), p);
+        let k = support_key(round, &id, &sender);
+        let mut record = s.supports.get(&k).cloned().unwrap_or(SupportRecord {
+            round,
+            proposal: id,
+            sender,
+            amount: Amount::zero(),
+        });
+        record.amount += amount;
+        s.supports.insert(k, record);
+        s.auction_escrow += amount;
+        s.world.account_cash -= amount;
+    }
+
+    fn apply(s: &mut State, op: &Value, ids: &mut Vec<Hash>) {
+        if let Some(o) = op.get("propose") {
+            let proposal = if let Some(payments) = o.get("grant") {
+                let mut payments: Vec<GrantPayment> = payments
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| GrantPayment {
+                        recipient: key(&p[0]),
+                        amount: n(&p[1]).into(),
+                    })
+                    .collect();
+                payments.sort_by_key(|p| p.recipient);
+                Proposal::Grant { payments }
+            } else {
+                let p = &o["parameter"];
+                Proposal::Parameter {
+                    parameter: serde_json::from_value(p[0].clone()).unwrap(),
+                    old: n(&p[1]),
+                    new: n(&p[2]),
+                }
+            };
+            let (proposer, description) = (key(&o["proposer"]), [n(&o["description"]) as u8; 32]);
+            let round = s.auction_round().unwrap();
+            let id = proposal_id(&s.chain_id, round, &proposer, &description, &proposal);
+            assert!(s.proposals.get(&id).is_none());
+            s.actions.insert(id.to_vec(), proposal);
+            s.proposals.insert(
+                id.to_vec(),
+                ProposalRecord {
+                    round,
+                    proposer,
+                    description,
+                    support: Amount::zero(),
+                    refund_height: None,
+                },
+            );
+            ids.push(id);
+            bid(s, id, proposer, n(&o["support"]));
+        } else if let Some(o) = op.get("support") {
+            let id = ids[n(&o["proposal"]) as usize];
+            bid(s, id, key(&o["sender"]), n(&o["amount"]));
+        } else {
+            // A sale of x Stash on the flat genesis-rate curve pays x atoms.
+            let x = Amount::from(n(&op["sell"]));
+            let w = &mut s.world;
+            assert!(w.reserve == w.curve_mass && w.reserve == w.shares);
+            w.reserve -= &x;
+            w.curve_mass -= &x;
+            w.shares -= &x;
+            w.account_shares -= &x;
+            w.account_cash += &x;
+        }
+    }
+
+    fn block(
+        c: &Config,
+        parent: &State,
+        ops: &[Value],
+        ids: &mut Vec<Hash>,
+        miner: &PublicKey,
+    ) -> State {
+        let parent_hash = [parent.height as u8; 32];
+        let mut execution = prepare_block(c, parent, miner, &Amount::zero()).unwrap();
+        for op in ops {
+            apply(&mut execution.state, op, ids);
+        }
+        finish_block(c, parent, &parent_hash, miner, &Amount::zero(), execution).unwrap()
+    }
+
+    fn index(ids: &[Hash], id: &Hash) -> usize {
+        ids.iter().position(|i| i == id).unwrap()
+    }
+
+    /// The fields scripts/consensus_model.py records for each block.
+    fn summary(s: &State, ids: &[Hash]) -> Value {
+        let mut out = json!({
+            "height": s.height,
+            "clock": s.clock,
+            "root": hex::encode(s.root()),
+        });
+        let o = out.as_object_mut().unwrap();
+        match &s.phase {
+            Phase::Auction(a) => {
+                o.insert("phase".into(), json!("Auction"));
+                o.insert("round".into(), json!(a.round));
+                o.insert("opened".into(), json!(a.opened));
+                o.insert("leader".into(), json!(a.leader.map(|l| index(ids, &l))));
+                o.insert("lead_since".into(), json!(a.lead_since));
+                o.insert("replacement_height".into(), json!(a.replacement_height));
+                let displaced: Vec<Value> = a
+                    .displaced
+                    .iter()
+                    .map(|(id, t)| json!([index(ids, id), t]))
+                    .collect();
+                o.insert("displaced".into(), json!(displaced));
+            }
+            Phase::Governance(d) => {
+                o.insert("phase".into(), json!("Governance"));
+                o.insert("proposal".into(), json!(index(ids, &d.proposal_id)));
+                o.insert("started".into(), json!(d.started));
+                o.insert("started_height".into(), json!(d.started_height));
+                o.insert("leading_blocks".into(), json!(d.leading_blocks));
+                o.insert("decision_id".into(), json!(hex::encode(d.id)));
+            }
+            Phase::Rest(r) => {
+                o.insert("phase".into(), json!("Rest"));
+                o.insert("until".into(), json!(r.until));
+            }
+        }
+        let cancelled: Vec<Value> = ids
+            .iter()
+            .enumerate()
+            .filter_map(|(i, id)| {
+                let refund = s.proposals.get(id).unwrap().refund_height?;
+                Some(json!([i, refund]))
+            })
+            .collect();
+        o.insert("cancelled".into(), json!(cancelled));
+        let rounds: Vec<Value> = s
+            .rounds
+            .iter()
+            .map(|(k, r)| {
+                let round = u64::from_be_bytes(k.try_into().unwrap());
+                let status = match &r.status {
+                    RoundStatus::Open => json!("Open"),
+                    RoundStatus::Timeout => json!("Timeout"),
+                    RoundStatus::Won(id) => json!(["Won", index(ids, id)]),
+                };
+                json!([round, status, r.refund_height])
+            })
+            .collect();
+        o.insert("rounds".into(), json!(rounds));
+        out
+    }
+
+    /// Runs the scripted chain for `stop` blocks, checking every block.
+    fn replay(stop: usize, miner: &PublicKey) -> (Config, State, Vec<Hash>) {
+        let all = data();
+        let v = &all["auction"];
+        let c = config(&v["config"]);
+        assert_eq!(hex::encode(c.chain_id()), v["chain_id"].as_str().unwrap());
+        let mut s = funded_genesis(&c, v);
+        let mut ids = Vec::new();
+        let blocks = v["blocks"].as_array().unwrap();
+        assert_eq!(summary(&s, &ids), blocks[0]["expected"]);
+        for b in &blocks[1..=stop] {
+            s = block(&c, &s, b["ops"].as_array().unwrap(), &mut ids, miner);
+            assert_eq!(summary(&s, &ids), b["expected"], "{}", b["note"]);
+        }
+        (c, s, ids)
+    }
+
+    #[test]
+    fn auction_transitions_match_the_independent_model() {
+        let miner = crypto::public_key(&[1; 32]).unwrap();
+        let blocks = data()["auction"]["blocks"].as_array().unwrap().len();
+        let (_, s, _) = replay(blocks - 1, &miner);
+        // A zero reward never creates the miner's account.
+        assert!(s.account(&miner, None).is_none());
+    }
+
+    /// Settlement that creates the miner's account charges its 1,024 weight
+    /// to the block even when the block pays the miner nothing; a miner whose
+    /// account nothing creates is charged nothing (audit L064).
+    #[test]
+    fn a_settlement_created_miner_account_counts_even_without_a_reward() {
+        let miner = crypto::public_key(&[1; 32]).unwrap();
+        // The grant decision opened in block 20 pays key 0x66 100,000 atoms.
+        let (c, mut s, _) = replay(22, &miner);
+        let Phase::Governance(d) = &mut s.phase else {
+            panic!("decision expected")
+        };
+        // Two of the three observations led, so PASS wins at resolution.
+        d.leading_blocks = 2;
+        let recipient = crypto::public_key(&[0x66; 32]).unwrap();
+        assert!(s.account(&recipient, None).is_none());
+        let paid = prepare_block(&c, &s, &recipient, &Amount::zero()).unwrap();
+        assert_eq!(paid.used_weight, fees::ACCOUNT_WEIGHT);
+        assert_eq!(
+            paid.state.account(&recipient, None).unwrap().ordinary,
+            100_000u32.into()
+        );
+        let unpaid = prepare_block(&c, &s, &miner, &Amount::zero()).unwrap();
+        assert_eq!(unpaid.used_weight, 0);
+        let next = finish_block(&c, &s, &[22; 32], &miner, &Amount::zero(), unpaid).unwrap();
+        assert!(next.account(&miner, None).is_none());
+        assert!(next.account(&recipient, None).is_some());
     }
 }

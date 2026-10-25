@@ -19,7 +19,16 @@ use std::{
 /// Curve evaluations (each a pair of directed logarithms, or one exact power
 /// comparison) that clearing one world may perform. An exhausted budget stops
 /// refining: price brackets keep their proven bounds and the budget search
-/// keeps its best proven candidate. This bounds validation work per block.
+/// keeps its best proven candidate.
+///
+/// It bounds curve evaluations only, not all clearing work (audit L067).
+/// Comparisons decided by integer checks, the simplest-fraction step, each
+/// candidate's O(n) allocation and its dust and full-redemption loops are
+/// not charged (the price searches those loops repeat are, until the limit
+/// is reached). A flat world spends no evaluations at all, so its budget
+/// search ends only through its own convergence rule. These costs are
+/// polynomial in the order count; charging them would change consensus
+/// (docs/SPECIFICATION.md, "Reference clearing algorithm").
 pub const CLEARING_WORK: u64 = 1024;
 /// Root-search probes taken from Newton steps before plain bisection resumes.
 const NEWTON_PROBES: usize = 64;
@@ -209,7 +218,8 @@ fn search_price(
         .max()
         .unwrap_or(1);
     // More than twice the input width resolves an output atom even for tiny
-    // prices. It is arithmetic precision, independent of order identifiers.
+    // prices. It is arithmetic precision, independent of order identifiers,
+    // and a consensus constant: outputs are computed on this grid.
     let scale = Amount::one() << (2 * bits as usize + 32);
     let precision = math::clearing_precision(bits);
     let buying = balance == Ordering::Greater;

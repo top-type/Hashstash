@@ -1917,12 +1917,17 @@ fn index_block(
         };
         if let Some((round, proposal, amount)) = supported {
             let key = crate::state::support_key(round, &proposal, &t.body.sender);
-            let mut record = opening.supports.get(&key).cloned().unwrap_or(crate::state::SupportRecord {
-                round,
-                proposal,
-                sender: t.body.sender,
-                amount: Amount::zero(),
-            });
+            let mut record =
+                opening
+                    .supports
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or(crate::state::SupportRecord {
+                        round,
+                        proposal,
+                        sender: t.body.sender,
+                        amount: Amount::zero(),
+                    });
             record.amount += amount;
             opening.supports.insert(key, record);
         }
@@ -3059,7 +3064,12 @@ mod worker_tests {
         // the updates that then finish the work)
         for (name, indexed, failing, expected) in [
             ("catch-up", 3, 2, vec!["advance"; 10]),
-            ("rebuild", 3, 1, [vec!["rebuild"], vec!["advance"; 10]].concat()),
+            (
+                "rebuild",
+                3,
+                1,
+                [vec!["rebuild"], vec!["advance"; 10]].concat(),
+            ),
             (
                 "genesis",
                 0,

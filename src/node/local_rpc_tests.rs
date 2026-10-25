@@ -255,7 +255,10 @@ fn large_blocks_are_served_in_hex_instead_of_a_json_tree() {
         assert_eq!(submitted["selected"], true, "{height}");
         assert_eq!(submitted["hash"], reply["hash"]);
     }
-    assert_eq!(other.status().unwrap()["tip"], node.status().unwrap()["tip"]);
+    assert_eq!(
+        other.status().unwrap()["tip"],
+        node.status().unwrap()["tip"]
+    );
 }
 
 /// The private listener needs no session token, so a quote that omits its

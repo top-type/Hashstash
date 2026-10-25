@@ -7288,7 +7288,9 @@ fn discovery_result(
         Ok(Ok(outcome)) if outcome.deferred => Err(crate::chain::ValidationDeferred.into()),
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => Err(error),
-        Err(_) => Err(anyhow!("peer synchronization exceeded its overall deadline")),
+        Err(_) => Err(anyhow!(
+            "peer synchronization exceeded its overall deadline"
+        )),
     }
 }
 /// What a discovery turn achieved, for scheduling: `result` is the
@@ -12155,12 +12157,7 @@ mod tests {
             }
             state.height + 1
         };
-        for (rest, effective) in [
-            (0, 12),
-            (1, 13),
-            (interval, 13),
-            (interval + 1, 14),
-        ] {
+        for (rest, effective) in [(0, 12), (1, 13), (interval, 13), (interval + 1, 14)] {
             let (c, s) = tip(rest, 3);
             assert_eq!(consensus_effective(&c, &s), effective, "rest {rest}");
             let lifetime = effective - s.height;
@@ -12173,8 +12170,9 @@ mod tests {
             assert!(report(&s, lifetime - 1).is_none(), "rest {rest}");
             // A losing decision changes nothing.
             let (c, lost) = tip(rest, 2);
-            let after = crate::consensus::execute(&c, &lost, &[0; 32], &miner, &Amount::zero(), &[])
-                .unwrap();
+            let after =
+                crate::consensus::execute(&c, &lost, &[0; 32], &miner, &Amount::zero(), &[])
+                    .unwrap();
             assert!(!matches!(after.phase, Phase::Rest(ref r) if r.pending.is_some()));
             assert_eq!(after.settings.minimum_fee_rate, 1);
             assert!(report(&lost, lifetime).is_none(), "rest {rest}");

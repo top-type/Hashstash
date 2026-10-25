@@ -68,6 +68,19 @@ async function run(){
  {
   const h=await setup();h.handlers.grant_quote=()=>response({result:{feasible:false}});await h.fill([[h.keys[0],'20'],[h.keys[1],'40']]);await h.form.requestSubmit();eq(broadcasts(h).length,0,'an infeasible aggregate cannot be proposed');ok(h.form.feedback.textContent.includes('available revenue'));
  }
+ // A snapshot's summary row lists a large grant's first 256 payments and
+ // their count. A proposal broadcast with an unknown result is matched on
+ // that prefix and count, so it is found pending, and a different count is
+ // another transaction at its nonce.
+ for(const count of [300,299]){
+  const h=await setup(),keys=Array.from({length:300},(_,i)=>h.browserApi.publicKey(BigInt(i+100).toString(16).padStart(64,'0'))).sort();
+  await h.fill(keys.map(key=>[key,'1']));h.handlers.broadcasttransaction=()=>{throw new TypeError('Failed to fetch');};
+  await h.form.requestSubmit();ok(h.form.feedback.textContent.startsWith('Result unknown · '),h.form.feedback.textContent);
+  const d=h.browserApi.verifySigned(broadcasts(h).at(-1).body.params.raw,{chain_id:h.currentSnapshot.status.chain_id}),node=v=>Array.from(bytes(v)),g=d.operation.Propose;eq(g.proposal.Grant.payments.length,300);
+  h.currentSnapshot.sender_mempool=[{body:{sender:node(d.sender),nonce:0,fee:d.fee,anchor:node(d.anchor),expiry_blocks:Number(d.expiry_blocks),operation:{Propose:{round:Number(g.round),description:node(g.description),proposal:{Grant:{payments:g.proposal.Grant.payments.slice(0,256).map(p=>({recipient:node(p.recipient),amount:p.amount}))}},support:g.support}}},truncated:true,payment_count:count}];
+  h.currentSnapshot.account={...h.currentSnapshot.account,pending_nonce:1};await h.refresh();
+  ok(h.form.feedback.textContent.startsWith(count===300?'Pending · ':'Not pending · '),h.form.feedback.textContent);
+ }
  console.log(`Multi-recipient grant UI: ${checks} wire, signing and interaction checks passed.`);
 }
 run().catch(error=>{console.error(error);process.exitCode=1;});

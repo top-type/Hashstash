@@ -23,6 +23,12 @@
   // work unit per whole KiB, so every PUBLIC_PAGE_WORK KiB of envelopes
   // received count as one more page.
   const PUBLIC_PAGE_BURST=8,PUBLIC_PAGE_MS=1500,PUBLIC_PAGE_WORK=4160;
+  // A page that ran but whose reply the node replaced with a 200 JSON-RPC
+  // error asking to try again (the public reply allowance or this visitor's
+  // byte budget was spent, or the explorer index was still updating) is sent
+  // again from the same cursor up to this many times, the nth after n times
+  // PUBLIC_PAGE_MS, before the scan stops until the next block.
+  const BUSY_RETRIES=4;
   const entryCursor=entry=>`${entry.height}:${entry.position??entry.tx_position??0}`;
   function cacheEntry(entry){
     const position=entry.position??entry.tx_position??0;
@@ -131,7 +137,7 @@
     }
     async function load(){
       if(!eligible()||loading||paused)return;
-      loading=true;const version=++sequence,stamp=lastWallet;let restarted=false,rewinds=0,checkedThisPass=0;
+      loading=true;const version=++sequence,stamp=lastWallet;let restarted=false,rewinds=0,checkedThisPass=0,busy=0;
       if(!cacheLoaded){cacheLoaded=true;const saved=cache.read(context.chain_id,context.key);storageNote=saved.error||'';start=cache.readStart(context.chain_id,context.key);if(saved.value){cursor=saved.value.cursor;anchor=saved.value.anchor;checkpoints=saved.value.checkpoints;scanned=saved.value.scanned;omitted=saved.value.omitted;restoreEntries=saved.value.entries;}else fromStart();}
       const current=()=>version===sequence&&stamp===lastWallet&&eligible()&&!paused;render();
       try{
@@ -149,6 +155,12 @@
               // same cursor at the paced rate, not at the next block.
               pace.tokens=0;pace.at=Date.now();waiting=true;render();
               await sleep(Math.max(backoff(),(e.retryAfter||1)*1e3));waiting=false;
+              if(!current())return;render();continue;
+            }
+            // Ran, but its reply was replaced: read again, a few times.
+            if(e?.status===200&&/; try again$/.test(String(e.message))&&busy<BUSY_RETRIES){
+              busy++;pace.tokens=0;pace.at=Date.now();waiting=true;render();
+              await sleep(Math.max(backoff(),busy*PUBLIC_PAGE_MS));waiting=false;
               if(!current())return;render();continue;
             }
             // A reorganization above part of the scan keeps what was found at
@@ -230,7 +242,7 @@
           // an earlier checkpoint when the anchor moves on, for an anchor error
           // that later arrives without a fork height.
           if(cursor&&anchor&&anchor!==result.anchor&&compareCursor(cursor,result.scan_cursor)<0)checkpoints=[{cursor,anchor},...checkpoints.filter(point=>compareCursor(point.cursor,cursor)<0)].slice(0,CHECKPOINTS);
-          restoreEntries=[];verifiedTip=result.tip;scanned+=result.messages.length;checkedThisPass+=result.messages.length;cursor=result.scan_cursor;anchor=result.anchor;error('');
+          restoreEntries=[];busy=0;verifiedTip=result.tip;scanned+=result.messages.length;checkedThisPass+=result.messages.length;cursor=result.scan_cursor;anchor=result.anchor;error('');
           const saved=cache.write(context.chain_id,context.key,{cursor,anchor,checkpoints,scanned,omitted,entries:[...opened.values()].map(v=>v.entry)});storageNote=saved.error||'';
           if(result.next_cursor==null){checkedTip=context.tip;break;}
           // Rest after each budget instead of waiting for a click, so a long

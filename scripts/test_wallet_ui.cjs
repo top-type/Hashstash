@@ -616,7 +616,7 @@ async function harness(options = {}) {
       const walletDouble=context.HashstashBrowserWallet;
       vm.runInContext(fs.readFileSync(path.join(__dirname,'../ui/browser-wallet.js'),'utf8'),context,{filename:'browser-wallet.js'});
       h.mailWalletApi=context.HashstashBrowserWallet;
-      if(!options.realWallet)context.HashstashBrowserWallet={...walletDouble,verifySigned:h.mailWalletApi.verifySigned};
+      if(!options.realWallet)context.HashstashBrowserWallet={...walletDouble,verifySigned:h.mailWalletApi.verifySigned,sameOperation:h.mailWalletApi.sameOperation};
       vm.runInContext(fs.readFileSync(path.join(__dirname,'../ui/mail.js'),'utf8'),context,{filename:'mail.js'});
     }
   }

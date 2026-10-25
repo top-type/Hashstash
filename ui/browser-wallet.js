@@ -162,6 +162,11 @@
     }
     return w.finish();
   }
+  // Whether two operations, in any form encodeOperation accepts (keys as
+  // hexadecimal or bytes, integers as strings or numbers), sign the same bytes.
+  function sameOperation(a, b) {
+    try { return hex(encodeOperation(a)) === hex(encodeOperation(b)); } catch { return false; }
+  }
   function readOperation(r) {
     const tag = Number(r.uint(0xffffffffn)), name = operations[tag]; if (!name) fail('Unsupported operation.');
     let v;
@@ -674,5 +679,5 @@
       }
     });
   }
-  return Object.freeze({createStore,publicKey,derivePrivate,derivePrivateV2,decodeUnsigned,verifyUnsigned,verifySigned});
+  return Object.freeze({createStore,publicKey,derivePrivate,derivePrivateV2,decodeUnsigned,verifyUnsigned,verifySigned,sameOperation});
 });

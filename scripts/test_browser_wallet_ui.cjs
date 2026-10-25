@@ -50,6 +50,16 @@ async function fill(h,recipient,data='00ff80') {
   return f;
 }
 const broadcasts=h=>h.calls.filter(c=>c.body.method==='broadcasttransaction');
+// A snapshot's summary row for signed transfer bytes, as the node serializes
+// it: keys and hashes as byte arrays, u64 values as numbers, no data.
+function pendingRow(h,raw,changes={}) {
+  const d=h.browserApi.verifySigned(raw,{chain_id:h.currentSnapshot.status.chain_id}),key=value=>Array.from(Buffer.from(value,'hex')),transfer=d.operation.TransferExact;
+  return {body:{sender:key(d.sender),nonce:Number(d.nonce),fee:d.fee,anchor:key(d.anchor),expiry_blocks:Number(d.expiry_blocks),operation:{TransferExact:{recipient:key(transfer.recipient),amount:transfer.amount}},...changes}};
+}
+// The node's own refusal carries the request's JSON-RPC ID; the public
+// proxy's 503 for an upstream 502 does not.
+const refusal=(status,message,wait='1')=>(_params,request)=>({ok:false,status,headers:{get:name=>name==='Retry-After'?wait:null},text:async()=>JSON.stringify({jsonrpc:'2.0',id:request.id,error:{code:-32000,message}})});
+const proxyBusy=()=>({ok:false,status:503,headers:{get:name=>name==='Retry-After'?'1':null},text:async()=>JSON.stringify({error:{message:'public web sessions busy; try again'}})});
 async function run() {
   let checks=0;
   const a=await setup(),b=await setup();
@@ -223,12 +233,12 @@ async function run() {
   // (at the next nonce) until the first is known to be pending, used or gone.
   {
     const c=await setup();c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();
-    const own={body:{sender:bob,nonce:0,operation:{TransferExact:{recipient:alice,amount:'100'}}}},prepared=()=>c.calls.filter(x=>x.body.method==='preparetransaction');
+    const prepared=()=>c.calls.filter(x=>x.body.method==='preparetransaction');
     const pool=(rows,nonce)=>{c.currentSnapshot.sender_mempool=rows;c.currentSnapshot.account={...c.currentSnapshot.account,pending_nonce:nonce};};
     const txid=raw=>sha(sha(Buffer.from(raw,'hex'))).toString('hex');
     // The exact case: the broadcast ran and was pooled, but the public reply
     // budget replaced its answer with a 200 JSON-RPC error saying "try again".
-    c.handlers.broadcasttransaction=()=>{pool([own],1);return response({jsonrpc:'2.0',id:1,error:{code:-32000,message:'public response byte budget exhausted; try again'}});};
+    c.handlers.broadcasttransaction=p=>{pool([pendingRow(c,p.raw)],1);return response({jsonrpc:'2.0',id:1,error:{code:-32000,message:'public response byte budget exhausted; try again'}});};
     const f=await fill(c,alice);await f.requestSubmit();
     const first=broadcasts(c)[0].body.params.raw;
     assert.equal(broadcasts(c).length,1);checks++;
@@ -248,7 +258,7 @@ async function run() {
     assert.equal(prepared().length,signedBefore,'nothing new is prepared while the result is unknown');checks++;assert.equal(broadcasts(c).length,sentBefore);checks++;
     assert.match(shown(),/^Result unknown · /,'and the form keeps saying so');checks++;
     // Sending the same bytes again is idempotent: the node answers with the same ID.
-    c.handlers.broadcasttransaction=p=>{pool([{body:{...own.body,nonce:1}}],2);return response({result:{transaction_id:txid(p.raw)}});};
+    c.handlers.broadcasttransaction=p=>{pool([pendingRow(c,p.raw)],2);return response({result:{transaction_id:txid(p.raw)}});};
     const resend=g.querySelector().children.at(-1);await resend.click();await settle();
     assert.equal(broadcasts(c).at(-1).body.params.raw,lost,'the resend carries the identical signed bytes');checks++;
     assert.match(shown(),new RegExp(`^Pending · ${txid(lost).slice(0,7)}`),shown());checks++;
@@ -273,14 +283,108 @@ async function run() {
     g=await fill(c,alice);c.handlers.broadcasttransaction=p=>response({result:{transaction_id:txid(p.raw)}});await g.requestSubmit();
     assert.equal(prepared().at(-1).body.params.nonce,1,'a released form signs at the same unused nonce');checks++;
     assert.match(shown(),/^Pending · /);checks++;
-    // A refusal promises that nothing ran: it says so and keeps nothing.
+    // The node's refusal, with this request's ID, promises that nothing ran:
+    // it says so and keeps nothing.
     pool([],1);await c.refresh();await c.refresh();
-    c.handlers.broadcasttransaction=()=>({ok:false,status:429,headers:{get:name=>name==='Retry-After'?'2':null},text:async()=>JSON.stringify({jsonrpc:'2.0',id:1,error:{code:-32000,message:'transaction admission is busy'}})});
+    c.handlers.broadcasttransaction=refusal(429,'transaction admission is busy','2');
     g=await fill(c,alice);await g.requestSubmit();
     assert.equal(shown(),'Not sent: transaction admission is busy (try again in 2 s)');checks++;
     c.handlers.broadcasttransaction=p=>response({result:{transaction_id:txid(p.raw)}});
     g=await fill(c,alice);await g.requestSubmit();assert.match(shown(),/^Pending · /,'after a refusal the same details can be sent');checks++;
     assert.equal(prepared().at(-1).body.params.nonce,1);checks++;
+  }
+  // nginx answers 502 when the node drops a connection after the broadcast
+  // was forwarded, and the public website's template turns that into a 503
+  // without a JSON-RPC ID. Only the node's own refusal says "Not sent".
+  {
+    const c=await setup();c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();
+    const pool=(rows,nonce)=>{c.currentSnapshot.sender_mempool=rows;c.currentSnapshot.account={...c.currentSnapshot.account,pending_nonce:nonce};};
+    const txid=raw=>sha(sha(Buffer.from(raw,'hex'))).toString('hex'),f=await fill(c,alice),shown=()=>f.querySelector().textContent;
+    c.handlers.broadcasttransaction=p=>{pool([pendingRow(c,p.raw)],1);return proxyBusy();};await f.requestSubmit();
+    const ran=broadcasts(c).at(-1).body.params.raw;
+    assert.match(shown(),new RegExp(`^Pending · ${txid(ran).slice(0,7)}`),'a proxy 503 after the broadcast ran is no refusal: the transaction is found pending');checks++;
+    // One that did not run is released by the snapshots, and only then shows the proxy's text.
+    pool([],0);c.currentSnapshot.account.account.nonce=1;await c.refresh();
+    assert.match(shown(),/^Mined or replaced · /);checks++;
+    c.handlers.broadcasttransaction=proxyBusy;await (await fill(c,alice)).requestSubmit();
+    assert.match(shown(),/^Result unknown · /,shown());checks++;
+    assert.equal(c.get('send-submit').disabled,true,'the form signs nothing new meanwhile');checks++;
+    await c.refresh();await c.refresh();
+    assert.match(shown(),/^Not pending · .* Its reply was: public web sessions busy; try again \(try again in 1 s\)\. Submit it again\.$/,shown());checks++;
+    // A refusal body whose ID is not this request's is not the node's answer to it.
+    c.handlers.broadcasttransaction=(params,request)=>refusal(503,'HTTP sessions busy')(params,{id:request.id+1});
+    await (await fill(c,alice)).requestSubmit();assert.match(shown(),/^Result unknown · /,shown());checks++;
+  }
+  // The snapshots identify an uncertain submission's pending row by its
+  // signed fee, anchor, lifetime, operation and (in full rows) data, not by
+  // its nonce alone: another tab or form can sign a different transaction at
+  // that nonce before the lost one could appear.
+  {
+    const c=await setup();c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();
+    const rows=[],pool=nonce=>{c.currentSnapshot.sender_mempool=rows;c.currentSnapshot.account={...c.currentSnapshot.account,pending_nonce:nonce};};
+    const txid=raw=>sha(sha(Buffer.from(raw,'hex'))).toString('hex'),f=c.get('send-form'),shown=()=>f.querySelector().textContent,key=value=>Array.from(Buffer.from(value,'hex'));
+    c.handlers.broadcasttransaction=()=>{throw new TypeError('Failed to fetch');};
+    const changes=[{operation:{TransferExact:{recipient:key(alice),amount:'250'}}},{fee:'5'},{anchor:key('35'.repeat(32))},{expiry_blocks:3},{data:[0,255,129]}];
+    for(let nonce=0;nonce<changes.length;nonce++){
+      await (await fill(c,alice)).requestSubmit();
+      const lost=broadcasts(c).at(-1).body.params.raw;
+      assert.equal(c.browserApi.verifySigned(lost,{chain_id:c.currentSnapshot.status.chain_id}).nonce,String(nonce));checks++;
+      assert.match(shown(),/^Result unknown · /);checks++;
+      rows.push(pendingRow(c,lost,changes[nonce]));pool(nonce+1);await c.refresh();
+      assert.match(shown(),new RegExp(`^Not pending · ${txid(lost).slice(0,7)}.*: another transaction from this account is pending with its transaction number ${nonce}, so this one was not accepted or was replaced\\. Submit it again if it is still needed\\.$`),`${Object.keys(changes[nonce])[0]}: ${shown()}`);checks++;
+      await c.timersDue();assert.equal(c.get('send-submit').disabled,false,'the form is free again');checks++;
+    }
+    // A full row with the same data, and its signature, is this transaction.
+    await (await fill(c,alice)).requestSubmit();const lost=broadcasts(c).at(-1).body.params.raw;
+    rows.push(pendingRow(c,lost,{data:[0,255,128],signature:Array(64).fill(0)}));pool(changes.length+1);await c.refresh();
+    assert.match(shown(),new RegExp(`^Pending · ${txid(lost).slice(0,7)}`),shown());checks++;
+  }
+  // A used nonce does not say which transaction used it: the uncertain one is
+  // looked up by its ID. Found mined, it was sent; not found after a few
+  // snapshots, the form says it cannot tell.
+  {
+    const c=await setup();c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();
+    const txid=raw=>sha(sha(Buffer.from(raw,'hex'))).toString('hex'),f=c.get('send-form'),shown=()=>f.querySelector().textContent;
+    const lookups=()=>c.calls.filter(x=>x.body.method==='explorer_transaction').map(x=>x.body.params.txid);
+    c.handlers.broadcasttransaction=()=>{throw new TypeError('Failed to fetch');};
+    await (await fill(c,alice)).requestSubmit();let lost=broadcasts(c).at(-1).body.params.raw;assert.match(shown(),/^Result unknown · /);checks++;
+    c.handlers.explorer_transaction=p=>response({result:{transaction:{txid:p.txid,status:'confirmed'}}});
+    c.currentSnapshot.account.account.nonce=1;await c.refresh();await settle();
+    assert.deepEqual(lookups(),[txid(lost)]);checks++;
+    assert.match(shown(),new RegExp(`^Mined · ${txid(lost).slice(0,7)}`),shown());checks++;
+    await (await fill(c,alice)).requestSubmit();lost=broadcasts(c).at(-1).body.params.raw;
+    c.handlers.explorer_transaction=()=>response({error:{message:'unknown transaction'}});
+    c.currentSnapshot.account.account.nonce=2;await c.refresh();await settle();
+    assert.match(shown(),/^Checking · .*: transaction number 1 is now used, by this transaction or another one from this account\. Looking it up\. Do not submit it again\.$/,shown());checks++;
+    await c.timersDue();assert.equal(c.get('send-submit').disabled,true,'the form stays blocked while it is looked up');checks++;
+    await c.refresh();await settle();await c.refresh();await settle();
+    assert.equal(lookups().length,4,'three lookups, one per snapshot');checks++;
+    assert.match(shown(),/^Transaction number used · .*: this transaction or another one from this account used transaction number 1, and this page could not find which\. Look it up in Explorer before you submit it again\.$/,shown());checks++;
+    await c.timersDue();assert.equal(c.get('send-submit').disabled,false);checks++;
+  }
+  // The tracker keeps the network the transaction was signed for. Another
+  // tab's wallet storage write resets this page's context while the
+  // broadcast is in flight; the uncertain submission must survive it.
+  {
+    const c=await setup();c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();
+    const txid=raw=>sha(sha(Buffer.from(raw,'hex'))).toString('hex'),prepared=()=>c.calls.filter(x=>x.body.method==='preparetransaction').length,held=deferred();
+    c.handlers.broadcasttransaction=async()=>{await held.promise;throw new TypeError('Failed to fetch');};
+    const f=await fill(c,alice),shown=()=>f.querySelector().textContent,sending=f.requestSubmit();await settle();
+    assert.equal(broadcasts(c).length,1);checks++;
+    c.storageChanged();held.resolve();await sending;await settle();
+    const lost=broadcasts(c).at(-1).body.params.raw;
+    assert.match(shown(),new RegExp(`^Result unknown · ${txid(lost).slice(0,7)}`),shown());checks++;
+    // The snapshot after the failure restored the page's network; one
+    // snapshot is not enough to release the form.
+    f.elements.data_format.value='hex';await f.fire('change');f.elements.recipient.value=addr(alice);f.elements.amount.value='0.1';f.elements.extra_fee.value='0.003';f.elements.data_hex.value='00ff80';
+    await f.fire('input');await c.timersDue();
+    assert.equal(c.get('send-submit').disabled,true,'the form still signs nothing new');checks++;
+    const before=prepared();await f.requestSubmit();assert.equal(prepared(),before);checks++;
+    assert.match(shown(),/^Result unknown · /);checks++;
+    c.handlers.broadcasttransaction=p=>{c.currentSnapshot.sender_mempool=[pendingRow(c,p.raw)];c.currentSnapshot.account={...c.currentSnapshot.account,pending_nonce:1};return response({result:{transaction_id:txid(p.raw)}});};
+    await f.querySelector().children.at(-1).click();await settle();
+    assert.equal(broadcasts(c).at(-1).body.params.raw,lost,'its resend still sends the same bytes');checks++;
+    assert.match(shown(),new RegExp(`^Pending · ${txid(lost).slice(0,7)}`),shown());checks++;
   }
   // Switching accounts does not forget a broadcast of unknown outcome.
   {
@@ -289,7 +393,7 @@ async function run() {
     const f=await fill(c,alice);await f.requestSubmit();assert.match(f.querySelector().textContent,/^Result unknown · /);checks++;
     c.get('import-private-key').value='0'.repeat(63)+'5';await c.get('wallet-import-form').requestSubmit();
     assert.notEqual(c.browserStore.snapshot().public_key,bob);checks++;
-    c.currentSnapshot.sender_mempool=[{body:{sender:bob,nonce:0,operation:{TransferExact:{recipient:alice,amount:'100'}}}}];c.currentSnapshot.account={...c.currentSnapshot.account,pending_nonce:1};
+    c.currentSnapshot.sender_mempool=[pendingRow(c,broadcasts(c).at(-1).body.params.raw)];c.currentSnapshot.account={...c.currentSnapshot.account,pending_nonce:1};
     await c.chooseWallet(bob);await c.refresh();
     assert.match(f.querySelector().textContent,/^Pending · /,'back on its account, the broadcast is found pending');checks++;
   }
@@ -297,17 +401,22 @@ async function run() {
   // outcomes are read the same way.
   {
     const c=await setup();c.get('import-private-key').value=bobSecret;await c.get('wallet-import-form').requestSubmit();
-    const txid=raw=>sha(sha(Buffer.from(raw,'hex'))).toString('hex'),refusal=status=>({ok:false,status,headers:{get:name=>name==='Retry-After'?'1':null},text:async()=>JSON.stringify({jsonrpc:'2.0',id:1,error:{code:-32000,message:'HTTP sessions busy'}})});
+    const txid=raw=>sha(sha(Buffer.from(raw,'hex'))).toString('hex');
     // A refused page broadcast leaves signed bytes that were never sent.
-    let signed;c.handlers.broadcasttransaction=p=>{signed=p.raw;return refusal(503);};
+    let signed;c.handlers.broadcasttransaction=(p,request)=>{signed=p.raw;return refusal(503,'HTTP sessions busy')(p,request);};
     const f=await fill(c,alice);await f.requestSubmit();assert.match(f.querySelector().textContent,/^Not sent: HTTP sessions busy/);checks++;
     const form=c.get('broadcast-form'),shown=()=>form.querySelector().textContent;
-    c.get('broadcast-raw').value=signed;c.handlers.broadcasttransaction=()=>refusal(429);await form.requestSubmit();
+    c.get('broadcast-raw').value=signed;c.handlers.broadcasttransaction=refusal(429,'HTTP sessions busy');await form.requestSubmit();
     assert.equal(shown(),'Not sent: HTTP sessions busy (try again in 1 s)','a refusal promises nothing ran');checks++;
+    // The public proxy's 503 has no JSON-RPC ID: these bytes may have run.
+    c.handlers.broadcasttransaction=proxyBusy;await form.requestSubmit();
+    assert.match(shown(),new RegExp(`^Result unknown · ${txid(signed).slice(0,7)}.*Do not submit it again\\..*Send the same transaction again$`),shown());checks++;
+    c.currentSnapshot.mempool=[];c.currentSnapshot.status.mempool=0;await c.refresh();await c.refresh();
+    assert.match(shown(),/^Not pending · .*Its reply was: public web sessions busy; try again \(try again in 1 s\)\. Submit it again\.$/,shown());checks++;
     c.handlers.broadcasttransaction=()=>response({jsonrpc:'2.0',id:1,error:{code:-32000,message:'public response byte budget exhausted; try again'}});await form.requestSubmit();
     assert.match(shown(),new RegExp(`^Result unknown · ${txid(signed).slice(0,7)}.*Do not submit it again\\..*Send the same transaction again$`),shown());checks++;
     assert.doesNotMatch(shown(),/try again/);checks++;
-    c.handlers.broadcasttransaction=p=>{c.currentSnapshot.sender_mempool=[{body:{sender:bob,nonce:0,operation:{TransferExact:{recipient:alice,amount:'100'}}}}];c.currentSnapshot.account={...c.currentSnapshot.account,pending_nonce:1};return response({result:{transaction_id:txid(p.raw)}});};
+    c.handlers.broadcasttransaction=p=>{c.currentSnapshot.sender_mempool=[pendingRow(c,p.raw)];c.currentSnapshot.account={...c.currentSnapshot.account,pending_nonce:1};return response({result:{transaction_id:txid(p.raw)}});};
     const sent=broadcasts(c).length;await form.querySelector().children.at(-1).click();await settle();
     assert.equal(broadcasts(c).length,sent+1);checks++;assert.equal(broadcasts(c).at(-1).body.params.raw,signed,'the same bytes are sent again');checks++;
     assert.match(shown(),new RegExp(`^Pending · ${txid(signed).slice(0,7)}`),shown());checks++;

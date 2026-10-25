@@ -41,6 +41,17 @@ async fn isolated() -> (TempDir, Config, Node, Server) {
     isolated_with_bits(0x1f7fffff).await
 }
 async fn isolated_with_bits(bits: u32) -> (TempDir, Config, Node, Server) {
+    isolated_with(bits, options()).await
+}
+/// An isolated node whose `--stratum-trusted` prefix holds 127.0.89.0/24.
+async fn isolated_trusting_farm() -> (TempDir, Config, Node, Server) {
+    let options = ServerOptions {
+        stratum_trusted: vec!["127.0.89.0/24".parse().unwrap()],
+        ..options()
+    };
+    isolated_with(0x1f7fffff, options).await
+}
+async fn isolated_with(bits: u32, options: ServerOptions) -> (TempDir, Config, Node, Server) {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::devnet();
     config.genesis_time = SystemTime::now()
@@ -55,17 +66,15 @@ async fn isolated_with_bits(bits: u32) -> (TempDir, Config, Node, Server) {
         crypto::public_key(&[121; 32]).unwrap(),
     )
     .unwrap();
-    let server = node::serve(node.clone(), options()).await.unwrap();
+    let server = node::serve(node.clone(), options).await.unwrap();
     (dir, config, node, server)
 }
 async fn connect(address: SocketAddr, host: u8) -> TcpStream {
+    connect_from(address, Ipv4Addr::new(127, 0, 88, host)).await
+}
+async fn connect_from(address: SocketAddr, source: Ipv4Addr) -> TcpStream {
     let socket = TcpSocket::new_v4().unwrap();
-    socket
-        .bind(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(127, 0, 88, host)),
-            0,
-        ))
-        .unwrap();
+    socket.bind(SocketAddr::new(IpAddr::V4(source), 0)).unwrap();
     let stream = timeout(DEADLINE, socket.connect(address))
         .await
         .unwrap()
@@ -106,14 +115,17 @@ struct Worker {
 }
 impl Worker {
     async fn connect(address: SocketAddr, host: u8) -> Self {
-        let (read, write) = connect(address, host).await.into_split();
+        Self::connect_from(address, Ipv4Addr::new(127, 0, 88, host)).await
+    }
+    async fn connect_from(address: SocketAddr, source: Ipv4Addr) -> Self {
+        let (read, write) = connect_from(address, source).await.into_split();
         Self {
             read: BufReader::new(read),
             write,
             notices: VecDeque::new(),
             id: 0,
             extra: vec![],
-            name: format!("honest.worker.{host}"),
+            name: format!("honest.worker.{}", source.octets()[3]),
         }
     }
     async fn read(&mut self) -> Value {
@@ -391,7 +403,13 @@ async fn rejected_negotiations_and_seeded_fields_do_not_mutate_worker_or_chain()
         let mut candidate = header(&job, &worker.extra, extra2);
         let mut params = worker.submission(&job, &candidate, extra2);
         match index % 10 {
-            0 => params[0] = json!(format!("other.{rng}")),
+            0 => {
+                // Names are checked after the proof of work, so a share,
+                // never a block, under an unauthorized name is refused.
+                candidate = reporting_share(&job, &worker, extra2);
+                params = worker.submission(&job, &candidate, extra2);
+                params[0] = json!(format!("other.{rng}"));
+            }
             1 => params[1] = json!(format!("unknown-{rng:x}")),
             2 => params[2] = json!(format!("{:06x}", rng & 0xffffff)),
             3 => params[2] = json!(format!("{:010x}", rng & 0xffffffffff)),
@@ -925,8 +943,10 @@ async fn unauthorized_mining_sockets_expire_quickly_and_charge_their_address() {
 async fn worker_capacity_is_enforced_at_registration_without_penalty() {
     let (_dir, _config, node, server) = isolated().await;
     let address = server.stratum;
+    // Without trusted prefixes no worker slot is held back for them.
+    let capacity = node::MAX_CONNECTIONS;
     let mut tasks = tokio::task::JoinSet::new();
-    for index in 0..node::MAX_CONNECTIONS {
+    for index in 0..capacity {
         tasks.spawn(async move {
             let mut worker = Worker::connect(address, 80 + (index / 4) as u8).await;
             worker.authorize().await;
@@ -939,7 +959,7 @@ async fn worker_capacity_is_enforced_at_registration_without_penalty() {
     }
     assert_eq!(
         node.rpc("mining", json!({})).unwrap()["workers_connected"],
-        node::MAX_CONNECTIONS
+        capacity
     );
     // Pending connections have their own pool, so a full registry is reported
     // at authorization. The session never becomes an unregistered worker.
@@ -960,8 +980,7 @@ async fn worker_capacity_is_enforced_at_registration_without_penalty() {
         .expect("capacity failure left the session open");
     drop(workers.pop());
     for _ in 0..100 {
-        if node.rpc("mining", json!({})).unwrap()["workers_connected"] == node::MAX_CONNECTIONS - 1
-        {
+        if node.rpc("mining", json!({})).unwrap()["workers_connected"] == capacity - 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -973,8 +992,127 @@ async fn worker_capacity_is_enforced_at_registration_without_penalty() {
     assert_eq!(retry.submit(&job, &share, [96; 4]).await["result"], true);
     assert_eq!(
         node.rpc("mining", json!({})).unwrap()["workers_connected"],
+        capacity
+    );
+    server.stop().await;
+}
+
+/// Workers authorized at once, one from each of `sources`, which may repeat
+/// an address, with the job each received.
+async fn authorize_from(address: SocketAddr, sources: Vec<Ipv4Addr>) -> Vec<(Worker, Value)> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for source in sources {
+        tasks.spawn(async move {
+            let mut worker = Worker::connect_from(address, source).await;
+            let job = worker.authorize().await;
+            (worker, job)
+        });
+    }
+    let mut workers = Vec::new();
+    while let Some(worker) = tasks.join_next().await {
+        workers.push(worker.unwrap());
+    }
+    workers
+}
+async fn refused_for_capacity(address: SocketAddr, source: Ipv4Addr) {
+    let mut worker = Worker::connect_from(address, source).await;
+    let reply = worker.call("mining.subscribe", json!(["capacity/1"])).await;
+    assert!(reply["error"].is_null(), "{reply}");
+    let name = worker.name.clone();
+    let reply = worker
+        .call("mining.authorize", json!([name, PASSWORD]))
+        .await;
+    assert!(
+        reply["error"][1].as_str().unwrap().contains("capacity"),
+        "{reply}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trusted_prefixes_keep_reserved_worker_slots_when_others_fill_theirs() {
+    let (_dir, _config, node, server) = isolated_trusting_farm().await;
+    let address = server.stratum;
+    let general = node::MAX_CONNECTIONS - node::STRATUM_TRUSTED_WORKERS;
+    // Holders of the password outside the trusted prefix fill their slots.
+    let others = (0..general).map(|index| Ipv4Addr::new(127, 0, 88, 100 + (index / 4) as u8));
+    let mut workers = authorize_from(address, others.collect()).await;
+    refused_for_capacity(address, Ipv4Addr::new(127, 0, 88, 150)).await;
+    // The operator's farm still connects every reserved worker, from one address.
+    let farm = vec![Ipv4Addr::new(127, 0, 89, 1); node::STRATUM_TRUSTED_WORKERS];
+    workers.extend(authorize_from(address, farm).await);
+    assert_eq!(
+        node.rpc("mining", json!({})).unwrap()["workers_connected"],
         node::MAX_CONNECTIONS
     );
+    refused_for_capacity(address, Ipv4Addr::new(127, 0, 89, 2)).await;
+    let (farmer, job) = workers.last_mut().unwrap();
+    let share = reporting_share(job, farmer, [89; 4]);
+    assert_eq!(farmer.submit(job, &share, [89; 4]).await["result"], true);
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_trusted_proxy_address_connects_more_workers_than_the_per_address_limit() {
+    let (_dir, _config, node, server) = isolated_trusting_farm().await;
+    let address = server.stratum;
+    let proxy = Ipv4Addr::new(127, 0, 89, 7);
+    // A marketplace proxy opens one upstream connection per rented rig from
+    // one address. Authorized, they stop counting toward its 16 connections;
+    // only connections awaiting authorization still do.
+    let mut workers = authorize_from(address, vec![proxy; 12]).await;
+    // Admission still spends the address's connection rate.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    workers.extend(authorize_from(address, vec![proxy; 12]).await);
+    assert_eq!(
+        node.rpc("mining", json!({})).unwrap()["workers_connected"],
+        24
+    );
+    for (index, (worker, job)) in workers.iter_mut().enumerate().step_by(5) {
+        let extra = (index as u32 + 500).to_le_bytes();
+        let share = reporting_share(job, worker, extra);
+        assert_eq!(worker.submit(job, &share, extra).await["result"], true);
+    }
+    // Other addresses keep their limit.
+    let crowd = vec![Ipv4Addr::new(127, 0, 88, 160); 4];
+    authorize_from(address, crowd).await;
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_connection_authorizes_several_names_and_never_drops_a_block_for_its_name() {
+    let (_dir, _config, node, server) = isolated().await;
+    let mut proxy = Worker::connect(server.stratum, 33).await;
+    let job = proxy.authorize().await;
+    // A proxy authorizes each miner behind it on its one upstream connection;
+    // each name needs the password, and a wrong one keeps the connection.
+    let reply = proxy
+        .call("mining.authorize", json!(["rig.2", PASSWORD]))
+        .await;
+    assert_eq!(reply["result"], true, "{reply}");
+    let reply = proxy
+        .call("mining.authorize", json!(["rig.3", "wrong"]))
+        .await;
+    assert_eq!(reply["result"], false, "{reply}");
+    let share = reporting_share(&job, &proxy, [33; 4]);
+    let mut params = proxy.submission(&job, &share, [33; 4]);
+    params[0] = json!("rig.2");
+    assert_eq!(proxy.call("mining.submit", params).await["result"], true);
+    // A share under a name never authorized is refused.
+    let share = reporting_share(&job, &proxy, [34; 4]);
+    let mut params = proxy.submission(&job, &share, [34; 4]);
+    params[0] = json!("rig.3");
+    let reply = proxy.call("mining.submit", params).await;
+    assert_eq!(reply["error"][1], "worker mismatch", "{reply}");
+    // A solved block is checked before the name and always submitted.
+    let block = block_solution(&job, &proxy, [35; 4]);
+    let mut params = proxy.submission(&job, &block, [35; 4]);
+    params[0] = json!("rig.3");
+    assert_eq!(proxy.call("mining.submit", params).await["result"], true);
+    assert_eq!(node.status().unwrap()["height"], 1);
+    let mining = node.rpc("mining", json!({})).unwrap();
+    assert_eq!(mining["workers_connected"], 1);
+    assert_eq!(mining["workers"][0]["worker"], proxy.name);
+    assert_eq!(mining["blocks_found"], "1");
     server.stop().await;
 }
 

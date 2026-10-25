@@ -27,7 +27,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     key=${line%%=*}
     value=${line#*=}
     case "$key" in
-        MINER_PUBLIC_KEY|RPC_PORT|P2P_PORT|STRATUM_PORT|STRATUM_ADVERTISE|SHARE_DIFFICULTY|PEERS|PUBLIC_WEB_PORT|STRATUM_ENABLED|STRATUM_TRUSTED|PEER_KEY_FILE|PEER_PINS|PEER_DISCOVERY|PEER_SEEDS|PEER_ADVERTISE|ALLOW_EASY_TARGET) ;;
+        MINER_PUBLIC_KEY|RPC_PORT|P2P_PORT|STRATUM_PORT|STRATUM_ADVERTISE|SHARE_DIFFICULTY|PEERS|PUBLIC_WEB_PORT|STRATUM_ENABLED|STRATUM_TRUSTED|STRATUM_TRUSTED_BROAD|PEER_KEY_FILE|PEER_PINS|PEER_DISCOVERY|PEER_SEEDS|PEER_ADVERTISE|ALLOW_EASY_TARGET) ;;
         *) fail "unknown node.env field: $key" ;;
     esac
     [[ ! ${settings[$key]+present} ]] || fail "duplicate node.env field: $key"
@@ -127,15 +127,47 @@ for seed in "${seeds[@]}"; do
     [[ ! ${seed_set[$normalized_seed]+present} ]] || fail 'duplicate peer seed'
     seed_set[$normalized_seed]=1
 done
+# Whether a trusted prefix is narrow enough: at least /16 for IPv4 or /32 for
+# IPv6, as the node requires, unless it lies within a local network (private,
+# loopback, CGNAT or unique-/link-local). The node parses each value exactly.
+trusted_narrow() {
+    local prefix=$1 address=${1%%/*} length first a b
+    [[ "$prefix" == */* ]] || return 0
+    length=$((10#${prefix#*/}))
+    if [[ "$address" == *:* ]]; then
+        (( length >= 32 )) && return 0
+        first=${address%%:*}
+        [[ "$first" =~ ^[0-9A-Fa-f]{0,4}$ ]] || return 1
+        first=$((16#${first:-0}))
+        (( length >= 7 && (first & 0xfe00) == 0xfc00 )) && return 0
+        (( length >= 10 && (first & 0xffc0) == 0xfe80 )) && return 0
+        return 1
+    fi
+    (( length >= 16 )) && return 0
+    IFS=. read -r a b _ <<< "$address"
+    [[ "$a" =~ ^[0-9]{1,3}$ && "$b" =~ ^[0-9]{1,3}$ ]] || return 1
+    a=$((10#$a)); b=$((10#$b))
+    (( length >= 8 && (a == 10 || a == 127) )) && return 0
+    (( length >= 12 && a == 172 && (b & 0xf0) == 16 )) && return 0
+    (( length >= 10 && a == 100 && (b & 0xc0) == 64 )) && return 0
+    return 1
+}
 trusted=()
 read -r -a trusted <<< "${settings[STRATUM_TRUSTED]:-}"
-(( ${#trusted[@]} <= 64 )) || fail 'too many trusted Stratum prefixes'
-for prefix in "${trusted[@]}"; do
+# Broader prefixes are accepted only when listed here deliberately.
+broad=()
+read -r -a broad <<< "${settings[STRATUM_TRUSTED_BROAD]:-}"
+(( ${#trusted[@]} + ${#broad[@]} <= 64 )) || fail 'too many trusted Stratum prefixes'
+for prefix in "${trusted[@]}" "${broad[@]}"; do
     # Shape only; the node parses each address and prefix length exactly.
     [[ "$prefix" =~ ^([0-9.]+|[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*)(/[0-9]{1,3})?$ && ${#prefix} -le 64 ]] \
-        || fail 'STRATUM_TRUSTED must contain IP addresses, optionally with /LENGTH'
+        || fail 'STRATUM_TRUSTED and STRATUM_TRUSTED_BROAD must contain IP addresses, optionally with /LENGTH'
 done
-[[ "$stratum_enabled" == true || ${#trusted[@]} -eq 0 ]] || fail 'STRATUM_TRUSTED requires STRATUM_ENABLED=true'
+for prefix in "${trusted[@]}"; do
+    trusted_narrow "$prefix" \
+        || fail 'STRATUM_TRUSTED prefixes outside local networks must be at least /16 (IPv4) or /32 (IPv6); list a deliberately broader one in STRATUM_TRUSTED_BROAD'
+done
+[[ "$stratum_enabled" == true || ${#trusted[@]} -eq 0 && ${#broad[@]} -eq 0 ]] || fail 'STRATUM_TRUSTED and STRATUM_TRUSTED_BROAD require STRATUM_ENABLED=true'
 peer_advertise=${settings[PEER_ADVERTISE]:-}
 [[ -z "$peer_advertise" ]] || valid_endpoint "$peer_advertise" || fail 'PEER_ADVERTISE must be a numeric IPv4:PORT or [IPv6]:PORT endpoint'
 if [[ "$peer_discovery" == false ]]; then
@@ -191,6 +223,7 @@ if [[ "$stratum_enabled" == true ]]; then
     args+=(--stratum "0.0.0.0:${settings[STRATUM_PORT]}" --stratum-advertise "$advertise"
         --stratum-share-difficulty "$difficulty" --stratum-password-file "$password_file")
     for prefix in "${trusted[@]}"; do args+=(--stratum-trusted "$prefix"); done
+    for prefix in "${broad[@]}"; do args+=(--stratum-trusted-broad "$prefix"); done
 else
     args+=(--no-stratum)
 fi

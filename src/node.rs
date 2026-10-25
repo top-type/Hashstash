@@ -392,6 +392,19 @@ const VERSION_MASK: u32 = 0x1fffe000;
 const HASHRATE_WINDOW_SECONDS: u64 = 300;
 const MAX_SUBMITTED_HEADERS: usize = 4096;
 pub const DEFAULT_STRATUM_SHARE_DIFFICULTY: f64 = 65_536.0;
+/// Of the MAX_CONNECTIONS authorized worker slots, sources outside the
+/// operator's `--stratum-trusted` prefixes may hold all but this many when
+/// the operator named any, and at most STRATUM_GROUP_WORKERS from one group
+/// (IPv4 /24, IPv6 /48, or one address on a local network). Trusted prefixes
+/// may use every slot.
+pub const STRATUM_TRUSTED_WORKERS: usize = 16;
+pub const STRATUM_GROUP_WORKERS: usize = 16;
+/// When the slots a newly authorized worker may use are full, it replaces
+/// the worker it competes with that has gone longest without a valid share,
+/// counted from its authorization, once that is at least this long. Miners
+/// that keep reporting shares are never replaced, and idle sockets cannot
+/// keep every slot from new miners.
+pub const STRATUM_IDLE_WORKER: Duration = Duration::from_secs(300);
 
 struct MiningWorker {
     worker: String,
@@ -400,6 +413,15 @@ struct MiningWorker {
     blocks: u64,
     difficulty: f64,
     last_share: Option<Instant>,
+    /// When it authorized or last sent a valid share or block. A share
+    /// refused for a rate or a budget that others share still proves work.
+    active: Instant,
+    /// The source's group (see `network_guard::stratum_group`), and whether
+    /// a prefix the operator trusts holds it.
+    group: IpAddr,
+    trusted: bool,
+    /// Told when a newcomer replaces this worker, which then disconnects.
+    evict: Arc<tokio::sync::Notify>,
 }
 struct WorkBucket {
     second: u64,
@@ -415,6 +437,9 @@ struct MiningRuntime {
     advertised: bool,
     password_required: bool,
     difficulty: f64,
+    /// Worker slots that only trusted prefixes may use: STRATUM_TRUSTED_WORKERS,
+    /// or none while the operator trusts no prefix.
+    trusted_reserve: usize,
     started: Instant,
     accepted: u64,
     rejected: u64,
@@ -431,6 +456,7 @@ impl Default for MiningRuntime {
             advertised: false,
             password_required: false,
             difficulty: DEFAULT_STRATUM_SHARE_DIFFICULTY,
+            trusted_reserve: STRATUM_TRUSTED_WORKERS,
             started: Instant::now(),
             accepted: 0,
             rejected: 0,
@@ -441,6 +467,60 @@ impl Default for MiningRuntime {
     }
 }
 impl MiningRuntime {
+    /// Register a newly authorized worker as `id`, replacing an idle worker
+    /// when the slots it may use are full: one of its own group when that
+    /// group is at its cap, otherwise one outside trusted prefixes, or for a
+    /// trusted newcomer, failing that, a trusted one. The replaced session is
+    /// told to close. Without such a worker the newcomer is refused.
+    fn register(
+        &mut self,
+        id: u32,
+        worker: MiningWorker,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        let (group, trusted) = (worker.group, worker.trusted);
+        let general = self.workers.values().filter(|w| !w.trusted).count();
+        let grouped = self
+            .workers
+            .values()
+            .filter(|w| !w.trusted && w.group == group)
+            .count();
+        let victim = if !trusted && grouped >= STRATUM_GROUP_WORKERS {
+            let victim = self.idlest(now, |w| !w.trusted && w.group == group);
+            Some(victim.ok_or("per-network mining worker limit reached")?)
+        } else if self.workers.len() >= MAX_CONNECTIONS
+            || (!trusted && general >= MAX_CONNECTIONS - self.trusted_reserve)
+        {
+            let victim = self
+                .idlest(now, |w| !w.trusted)
+                .or_else(|| trusted.then(|| self.idlest(now, |w| w.trusted)).flatten());
+            Some(victim.ok_or("mining worker capacity reached")?)
+        } else {
+            None
+        };
+        if let Some(old) = victim.and_then(|victim| self.workers.remove(&victim)) {
+            old.evict.notify_one();
+        }
+        self.workers.insert(id, worker);
+        Ok(())
+    }
+    /// The worker matching `candidate` that has gone longest without a valid
+    /// share since it authorized, if that is STRATUM_IDLE_WORKER or more.
+    fn idlest(&self, now: Instant, candidate: impl Fn(&MiningWorker) -> bool) -> Option<u32> {
+        self.workers
+            .iter()
+            .filter(|(_, w)| candidate(w))
+            .map(|(id, w)| (w.active, *id))
+            .filter(|(active, _)| now.saturating_duration_since(*active) >= STRATUM_IDLE_WORKER)
+            .min()
+            .map(|(_, id)| id)
+    }
+    /// Worker `id` sent a valid share or block, whether or not it was accepted.
+    fn proved(&mut self, id: u32, now: Instant) {
+        if let Some(worker) = self.workers.get_mut(&id) {
+            worker.active = worker.active.max(now);
+        }
+    }
     fn prune(&mut self, second: u64) {
         while self
             .buckets
@@ -2458,13 +2538,23 @@ struct ListenerHealth {
 }
 /// Live Stratum extranonces. A wrapped counter skips every value still held
 /// by a connected session, so admission never depends on a lifetime count.
-#[derive(Default)]
 struct SessionIds {
     next: u32,
     live: HashSet<u32>,
 }
 struct SessionId(Arc<Mutex<SessionIds>>, u32);
 impl SessionIds {
+    /// The counter starts at a random value, so nodes that pay one key and
+    /// serve the same template, or one node before and after a restart, do
+    /// not hand the same extranonces to their first miners.
+    fn random() -> Self {
+        let mut seed = [0u8; 4];
+        let _ = getrandom::fill(&mut seed);
+        Self {
+            next: u32::from_le_bytes(seed),
+            live: HashSet::new(),
+        }
+    }
     fn allocate(ids: &Arc<Mutex<Self>>) -> Option<SessionId> {
         let mut state = ids.unpoisoned();
         // Live IDs are bounded by the pre-authorization slots plus the
@@ -2607,7 +2697,7 @@ impl Node {
             outbound_sessions: Arc::new(Semaphore::new(2)),
             mining: Arc::new(Mutex::new(MiningRuntime::default())),
             work_updates: watch::channel(0).0,
-            mining_session_ids: Arc::new(Mutex::new(SessionIds::default())),
+            mining_session_ids: Arc::new(Mutex::new(SessionIds::random())),
             stratum_pending: Arc::new(StratumPending::default()),
             listener_health: Arc::new(Mutex::new(HashMap::new())),
             peer_auth: None,
@@ -6845,6 +6935,12 @@ pub async fn serve(mut node: Node, options: ServerOptions) -> Result<Server> {
             },
             password_required: options.stratum_password.is_some(),
             difficulty: options.stratum_share_difficulty,
+            // Slots kept for trusted prefixes would stay empty without any.
+            trusted_reserve: if options.stratum_trusted.is_empty() {
+                0
+            } else {
+                STRATUM_TRUSTED_WORKERS
+            },
             ..MiningRuntime::default()
         };
     }
@@ -11234,17 +11330,30 @@ const STRATUM_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// Connections awaiting authorization hold network_guard pre-authorization
 /// slots. Authorized workers leave them for the MAX_CONNECTIONS worker registry.
 const STRATUM_AUTHORIZATION_WINDOW: Duration = network_guard::STRATUM_AUTHORIZATION_WINDOW;
-/// A connection whose reporting shares at its current difficulty exceed
-/// STRATUM_MAX_SHARE_RATE per second over at least STRATUM_RATE_SAMPLE
-/// intervals has its difficulty multiplied by the power of two that brings
-/// the observed rate to STRATUM_TARGET_SHARE_RATE.
+/// Reporting difficulty follows each connection's share rate at its current
+/// difficulty. A sample of at least STRATUM_RATE_SAMPLE share intervals is
+/// judged once it spans STRATUM_SHARE_WINDOW: above STRATUM_MAX_SHARE_RATE per
+/// second, difficulty is multiplied by the largest power of two that keeps
+/// the rate at or above STRATUM_TARGET_SHARE_RATE. A stream above
+/// STRATUM_BURST_SHARE_RATE, the session request rate past which its shares
+/// are refused, is raised as soon as its sample is complete.
 const STRATUM_MAX_SHARE_RATE: u64 = 2;
 const STRATUM_TARGET_SHARE_RATE: u64 = 1;
-const STRATUM_RATE_SAMPLE: u64 = 4;
+const STRATUM_BURST_SHARE_RATE: u64 = 8;
+const STRATUM_RATE_SAMPLE: u64 = 16;
 /// The shortest span a rate is measured over, so shares buffered together
-/// cannot imply an unbounded rate, and the age at which a sample restarts.
+/// cannot imply an unbounded rate, and the span after which a sample is
+/// judged and restarts.
 const STRATUM_RATE_FLOOR: Duration = Duration::from_millis(250);
-const STRATUM_SHARE_WINDOW: Duration = Duration::from_secs(8);
+const STRATUM_SHARE_WINDOW: Duration = Duration::from_secs(30);
+/// Difficulty above the floor or what the miner negotiated halves once its
+/// valid shares since the last change average fewer than one per
+/// STRATUM_SLOW_SHARE over at least STRATUM_DECAY_SPAN.
+const STRATUM_SLOW_SHARE: Duration = Duration::from_secs(4);
+const STRATUM_DECAY_SPAN: Duration = Duration::from_secs(120);
+/// Worker names one connection may authorize, as a proxy does for each of
+/// the miners behind it.
+const MAX_STRATUM_WORKER_NAMES: usize = 64;
 const STRATUM_RATE_LIMITED: &str = "mining session request rate limit";
 /// When a deferred same-parent refresh runs: one interval after the last job,
 /// and not before the node's throttled template may be rebuilt.
@@ -11335,18 +11444,66 @@ fn stratum_session_expired(authorized: bool, connected: Duration) -> bool {
     !authorized && connected >= STRATUM_AUTHORIZATION_WINDOW
 }
 /// Power-of-two difficulty multiplier for `intervals` share intervals observed
-/// over `elapsed`, or None while the rate is acceptable.
+/// over `elapsed`, or None while the rate is acceptable or not yet judged.
 fn stratum_rate_factor(intervals: u64, elapsed: Duration) -> Option<f64> {
     let millis = elapsed
         .max(STRATUM_RATE_FLOOR)
         .as_millis()
         .min(u64::MAX as u128) as u64;
     let shares = intervals.saturating_mul(1000);
-    if intervals < STRATUM_RATE_SAMPLE || shares <= STRATUM_MAX_SHARE_RATE.saturating_mul(millis) {
+    let ceiling = if elapsed < STRATUM_SHARE_WINDOW {
+        STRATUM_BURST_SHARE_RATE
+    } else {
+        STRATUM_MAX_SHARE_RATE
+    };
+    if intervals < STRATUM_RATE_SAMPLE || shares <= ceiling.saturating_mul(millis) {
         return None;
     }
-    let needed = shares.div_ceil(STRATUM_TARGET_SHARE_RATE.saturating_mul(millis));
-    Some(needed.checked_next_power_of_two().unwrap_or(1 << 63) as f64)
+    // Rounded down, so noise in a sample never pushes the rate below target.
+    let factor = shares / STRATUM_TARGET_SHARE_RATE.saturating_mul(millis);
+    Some((1u64 << factor.ilog2()) as f64)
+}
+/// Whether `shares` valid shares over `elapsed` since the difficulty last
+/// changed are few enough to halve it.
+fn stratum_decays(shares: u64, elapsed: Duration) -> bool {
+    elapsed >= STRATUM_DECAY_SPAN
+        && u128::from(shares).saturating_mul(STRATUM_SLOW_SHARE.as_millis()) < elapsed.as_millis()
+}
+/// One connection's share rate at its current difficulty.
+struct ShareRate {
+    /// The first share of the current sample, and the share intervals since.
+    sample: Option<(tokio::time::Instant, u64)>,
+    /// When the current difficulty took effect, and the valid shares since.
+    since: tokio::time::Instant,
+    shares: u64,
+}
+impl ShareRate {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            sample: None,
+            since: now,
+            shares: 0,
+        }
+    }
+    /// A valid share at the current, uncapped difficulty: the factor to
+    /// raise it by, if any. A judged sample restarts with this share.
+    fn sample(&mut self, now: tokio::time::Instant) -> Option<f64> {
+        let (start, intervals) = match self.sample {
+            Some((start, intervals)) => (start, intervals + 1),
+            None => (now, 0),
+        };
+        let elapsed = now.duration_since(start);
+        self.sample = Some(if elapsed >= STRATUM_SHARE_WINDOW {
+            (now, 0)
+        } else {
+            (start, intervals)
+        });
+        stratum_rate_factor(intervals, elapsed)
+    }
+    /// Whether the difficulty should halve now.
+    fn slow(&self, now: tokio::time::Instant) -> bool {
+        stratum_decays(self.shares, now.duration_since(self.since))
+    }
 }
 /// An authorized worker's line may carry a solved block, so it waits for a
 /// parser without a deadline. The parser semaphore is never closed.
@@ -11359,9 +11516,9 @@ async fn parse_worker_line(node: &Node, bytes: Vec<u8>) -> Result<Value> {
     .await
     .context("JSON worker failed")?
 }
-/// The reply to a line an authorized worker sent past its rate or budget.
-fn stratum_restricted(limit: &Option<anyhow::Error>) -> anyhow::Error {
-    limit.as_ref().map_or_else(
+/// The reply to a line an authorized worker sent past its rate or a budget.
+fn stratum_restricted(reason: Option<&anyhow::Error>) -> anyhow::Error {
+    reason.map_or_else(
         || mining_error(20, STRATUM_RATE_LIMITED),
         |error| anyhow!("{error}"),
     )
@@ -11411,13 +11568,19 @@ async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let mut read = BufReader::new(read);
     let mut subscribed = false;
     let mut authorized = false;
-    let mut worker = String::new();
+    // Every worker name this connection authorized, first the one its
+    // statistics are reported under.
+    let mut names: Vec<String> = Vec::new();
     let mut registration: Option<MiningConnection> = None;
+    let evicted = Arc::new(tokio::sync::Notify::new());
     let mut version_rolling = false;
     let mut rolling_requested = false;
     let mut mask = 0u32;
     let mut difficulty = floor;
     let mut minimum_difficulty = floor;
+    // The difficulty a lowered rate may return to: the floor, or what the
+    // miner negotiated or suggested last.
+    let mut negotiated = floor;
     let mut jobs: HashMap<String, Arc<StratumJob>> = HashMap::new();
     let mut seen = HashMap::<Hash, Hash>::new();
     let mut counter = 0;
@@ -11425,7 +11588,7 @@ async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let mut deferred = false;
     // When the node's throttled template may next be rebuilt, if it lagged.
     let mut retry: Option<tokio::time::Instant> = None;
-    let mut share_window: Option<(tokio::time::Instant, u64)> = None;
+    let mut rate = ShareRate::new(tokio::time::Instant::now());
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut updates = node.work_updates.subscribe();
     let connected = tokio::time::Instant::now();
@@ -11443,16 +11606,25 @@ async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 // An unauthenticated line is charged before it is parsed. An authorized
                 // worker's line is handled first and its charge enforced after the reply,
                 // so an address budget or rate overrun never discards a solved block.
-                // Past its rate or budget, a worker's line can only submit a block.
+                // Past its rate or a budget, a worker's line can only submit a block.
+                // Only a spent overrun allowance (`limit`) closes the session: other
+                // sources can exhaust the budgets a worker shares with them.
                 let mut limit = None;
                 let mut throttled = false;
+                let mut refusal = None;
                 if authorized {
-                    match admission.worker_line(line.len()) { Ok(within) => throttled = !within, Err(e) => limit = Some(e) }
+                    match admission.worker_line(line.len()) {
+                        Ok(network_guard::WorkerLine::Admitted) => {}
+                        Ok(network_guard::WorkerLine::Throttled) => throttled = true,
+                        Ok(network_guard::WorkerLine::Refused(e)) => refusal = Some(e),
+                        Err(e) => limit = Some(e),
+                    }
                 } else {
                     admission.request()?;
                     admission.bytes(line.len())?;
                 }
-                let restricted = throttled || limit.is_some();
+                let restricted = throttled || refusal.is_some() || limit.is_some();
+                let reason = limit.as_ref().or(refusal.as_ref());
                 let parsed = if authorized { parse_worker_line(&node,line).await } else { parse_value_async(&node,line,Surface::Stratum,JsonBody::Ordinary).await };
                 let request = match parsed { Ok(v) => v, Err(e) => { admission.malformed(); return Err(e); } };
                 // The time a never-authorized connection waited is charged to its
@@ -11465,10 +11637,9 @@ async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 let mut submission = None;
                 let mut refresh = false;
                 let mut at_capacity = false;
-                let mut budget = None;
                 let mut retarget = false;
                 let mut result: Result<Value> = (|| {
-                    if restricted && method != "mining.submit" { return Err(stratum_restricted(&limit)); }
+                    if restricted && method != "mining.submit" { return Err(stratum_restricted(reason)); }
                     match method {
                         "mining.configure" => {
                             let extensions = params.first().and_then(Value::as_array).context("extensions required")?;
@@ -11480,6 +11651,7 @@ async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             let mut next_rolling = version_rolling;
                             let mut next_difficulty = difficulty;
                             let mut next_minimum = minimum_difficulty;
+                            let mut next_negotiated = negotiated;
                             for ext in extensions {
                                 let ext = ext.as_str().context("extension must be a string")?;
                                 if ext == "version-rolling" {
@@ -11499,14 +11671,17 @@ async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                                     if compatible {
                                         next_minimum = floor.max(minimum);
                                         next_difficulty = next_minimum;
+                                        next_negotiated = next_minimum;
                                     }
                                     reply.insert(ext.into(),json!(compatible));
                                 } else { reply.insert(ext.into(),json!(ext == "subscribe-extranonce")); }
                             }
                             mask = next_mask; version_rolling = next_rolling;
                             refresh = next_difficulty != difficulty;
+                            if refresh { rate = ShareRate::new(tokio::time::Instant::now()); }
                             difficulty = next_difficulty;
                             minimum_difficulty = next_minimum;
+                            negotiated = next_negotiated;
                             Ok(Value::Object(reply))
                         }
                         "mining.subscribe" => {
@@ -11515,24 +11690,41 @@ async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         }
                         "mining.authorize" => {
                             ensure!(subscribed, "subscribe first");
-                            ensure!(!authorized,"worker already authorized");
                             let name = params.first().and_then(Value::as_str).context("worker name required")?;
                             ensure!(!name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_control), "invalid worker name");
                             // Same comparison as the HTTP session token: no early exit on content.
                             if !password.as_deref().is_none_or(|p|token_matches(params.get(1).and_then(Value::as_str),p)) {
                                 return Ok(json!(false));
                             }
+                            if authorized {
+                                // A proxy authorizes each miner behind it on one connection,
+                                // which keeps its one registry slot.
+                                if !names.iter().any(|known| known == name) {
+                                    ensure!(names.len() < MAX_STRATUM_WORKER_NAMES, "too many worker names on one connection");
+                                    names.push(name.to_owned());
+                                }
+                                return Ok(json!(true));
+                            }
                             let identity = u32::from_le_bytes(extra);
-                            let mut runtime = node.mining.unpoisoned();
-                            if runtime.workers.len() >= MAX_CONNECTIONS { at_capacity = true; bail!("mining worker capacity reached"); }
-                            runtime.workers.insert(identity,MiningWorker {worker:name.to_owned(),accepted:0,rejected:0,blocks:0,difficulty,last_share:None});
+                            // Only a prefix the operator named lifts the limits that
+                            // bind other sources' workers.
+                            let trusted = pending.as_ref().is_some_and(network_guard::PendingSlot::operator_trusted);
+                            let entry = MiningWorker {
+                                worker:name.to_owned(),accepted:0,rejected:0,blocks:0,difficulty,last_share:None,
+                                active:Instant::now(),group:network_guard::stratum_group(admission.address()),
+                                trusted,evict:evicted.clone(),
+                            };
+                            if let Err(reason) = node.mining.unpoisoned().register(identity, entry, Instant::now()) {
+                                at_capacity = true;
+                                bail!(reason);
+                            }
                             registration = Some(MiningConnection {runtime:node.mining.clone(),id:identity});
                             // Authorize only once registered. The worker registry now
                             // bounds this session; free its pre-authorization slot and
                             // let its address reconnect uncharged into reserved slots.
-                            worker = name.to_owned();
+                            names.push(name.to_owned());
                             authorized = true;
-                            admission.authorize_worker();
+                            admission.authorize_worker(trusted);
                             if let Some(slot) = pending.take() { slot.authorized(); }
                             refresh = true;
                             Ok(json!(true))
@@ -11542,13 +11734,17 @@ async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             let suggested = params.first().and_then(Value::as_f64).context("difficulty required")?;
                             let next = suggested_stratum_difficulty(floor,minimum_difficulty,suggested)?;
                             refresh = next != difficulty;
+                            if refresh { rate = ShareRate::new(tokio::time::Instant::now()); }
                             difficulty = next;
+                            negotiated = next;
                             Ok(json!(true))
                         }
                         "mining.submit" => {
                             ensure!(authorized && subscribed,"unauthorized");
                             ensure!(matches!(params.len(),5|6),"invalid submit arguments");
-                            ensure!(params[0].as_str()==Some(worker.as_str()),"worker mismatch");
+                            // The worker name is checked after the proof of work, so a
+                            // solved block is submitted whatever name it carries.
+                            let named = params[0].as_str().is_some_and(|name| names.iter().any(|known| known == name));
                             let id = params[1].as_str().context("job id required")?;
                             let job = jobs.get(id).ok_or_else(||mining_error(21,"unknown or stale job"))?.clone();
                             if !node.mining_job_eligible(&job.block)? { return Err(mining_error(21,"stale job")); }
@@ -11556,13 +11752,13 @@ async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             let extra2: [u8;4] = hex::decode(params[2].as_str().context("extranonce2 required")?)?.try_into().map_err(|_|anyhow!("extranonce2 must be four bytes"))?;
                             let timestamp = hex_u32(&params[3])?;
                             let nonce = hex_u32(&params[4])?;
-                            submission = Some((job,extra2,timestamp,nonce,version));
+                            submission = Some((job,extra2,timestamp,nonce,version,named));
                             Ok(json!(true))
                         }
                         _ => bail!("unsupported mining method"),
                     }
                 })();
-                if let Some((job,extra2,timestamp,nonce,version)) = submission {
+                if let Some((job,extra2,timestamp,nonce,version,named)) = submission {
                     // One fixed-size coinbase and header hash: computing it here
                     // avoids a worker queue that could time out on a found block.
                     let header = job.candidate(extra,extra2,timestamp,nonce,version);
@@ -11576,6 +11772,7 @@ async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         let proof = Amount::from_bytes_le(&hash);
                         let is_block = proof <= job.block_target;
                         let is_share = proof <= job.share_target;
+                        if !is_block && !named { bail!("worker mismatch"); }
                         if !is_block && !is_share { return Err(mining_error(23,"low difficulty share")); }
                         // Only one sampling threshold contributes to hashrate.
                         // Valid network-only blocks are counted but add no rate sample.
@@ -11585,25 +11782,26 @@ async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         Err(error) => Err(error),
                         Ok((work,is_block)) => {
                             let submitted_parent = job.block.header.previous;
-                            // Valid shares at the connection's current, uncapped difficulty
-                            // measure its rate, including shares refused for that rate. A
-                            // job capped at network difficulty cannot be raised further.
-                            if work.is_some() && job.difficulty == difficulty {
+                            // Proven work keeps the worker's slot, even when the share is
+                            // refused for its rate or a budget that others share.
+                            if let Some(registration) = &registration { node.mining.unpoisoned().proved(registration.id, Instant::now()); }
+                            // Valid shares measure the connection's rate, including shares
+                            // refused for that rate. Only those at its current, uncapped
+                            // difficulty can raise it: a job capped at network difficulty
+                            // cannot be raised further.
+                            if work.is_some() {
                                 let now = tokio::time::Instant::now();
-                                let (start, intervals) = match share_window {
-                                    Some((start, intervals)) if now.duration_since(start) < STRATUM_SHARE_WINDOW => (start, intervals + 1),
-                                    _ => (now, 0),
-                                };
-                                share_window = Some((start, intervals));
-                                if let Some(factor) = stratum_rate_factor(intervals, now.duration_since(start)) {
+                                rate.shares = rate.shares.saturating_add(1);
+                                if job.difficulty == difficulty && let Some(factor) = rate.sample(now) {
                                     let next = (difficulty * factor).min(1e18);
-                                    if next > difficulty { difficulty = next; retarget = true; share_window = None; }
+                                    if next > difficulty { difficulty = next; retarget = true; rate = ShareRate::new(now); }
                                 }
                             }
                             let accepted = if is_block {
                                 // Budgets and worker queues may delay a solved block but
-                                // never discard it: validate first, enforce the budget after.
-                                budget = admission.work(1 + job.block.transactions.len()).err();
+                                // never discard it, and a budget that other sources share
+                                // never ends the worker's session: the work is charged after.
+                                let _ = admission.worker_work(1 + job.block.transactions.len());
                                 // Solved blocks have their own permits, never taken by
                                 // template builds or jobs. The semaphore is never closed;
                                 // wait without a deadline.
@@ -11621,8 +11819,8 @@ async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                                     if validator.submit_block(block)? { Ok(()) } else { Err(mining_error(21,"stale job")) }
                                 }).await.unwrap_or_else(|_| Err(anyhow!("mining block worker failed")))
                             } else if restricted {
-                                Err(stratum_restricted(&limit))
-                            } else { admission.work(1) };
+                                Err(stratum_restricted(reason))
+                            } else { admission.worker_work(1) };
                             accepted.map(|()| {
                                 seen.insert(hash, submitted_parent);
                                 node.mining.unpoisoned().submission(registration.as_ref().map(|r|r.id),Some((work.as_ref(),is_block)));
@@ -11643,7 +11841,6 @@ async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 // A full worker registry is capacity, not misbehaviour.
                 if denied && at_capacity { bail!("mining worker capacity reached"); }
                 if denied { admission.malformed(); bail!("mining authorization denied"); }
-                if let Some(error) = budget { return Err(error); }
                 if let Some(error) = limit { return Err(error); }
                 // Never evict duplicate evidence while the parent remains valid.
                 // A fresh connection gets a different extranonce and new work.
@@ -11689,10 +11886,19 @@ async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 deferred = lagging.is_some();
                 retry = lagging;
             }
+            _ = evicted.notified() => bail!("an idle mining worker was replaced by a newcomer"),
             _ = tick.tick() => {
                 if stratum_session_expired(authorized,connected.elapsed()) { bail!("mining authorization timed out"); }
                 if !partial_line.is_empty() { let began=partial_since.get_or_insert_with(tokio::time::Instant::now); ensure!(began.elapsed()<IO_TIMEOUT,"mining partial frame timed out"); }
-                if authorized && last_job.elapsed()>=Duration::from_secs(30) {
+                // Difficulty raised beyond what the miner negotiated falls back while
+                // its shares stay slow, one halving at a time.
+                let now = tokio::time::Instant::now();
+                let decayed = authorized && difficulty > negotiated && rate.slow(now);
+                if decayed {
+                    difficulty = (difficulty / 2.0).max(negotiated);
+                    rate = ShareRate::new(now);
+                }
+                if authorized && (decayed || last_job.elapsed()>=Duration::from_secs(30)) {
                     let (block, lagging) = template_async(&node).await?;
                     fingerprint=Some(new_job(&node,&mut write,&mut jobs,&mut counter,difficulty,&mut seen,u32::from_le_bytes(extra),block).await?);
                     last_job=tokio::time::Instant::now();
@@ -12399,17 +12605,9 @@ mod tests {
         assert_eq!(value["hashrate_hps"], "30");
         stats.prune(331);
         assert!(stats.buckets.is_empty());
-        stats.workers.insert(
-            7,
-            MiningWorker {
-                worker: "fixture".into(),
-                accepted: 0,
-                rejected: 0,
-                blocks: 0,
-                difficulty: 65536.0,
-                last_share: None,
-            },
-        );
+        stats
+            .workers
+            .insert(7, idle_worker(Instant::now(), "127.0.0.1", false));
         let runtime = Arc::new(Mutex::new(stats));
         let registration = MiningConnection {
             runtime: runtime.clone(),
@@ -13726,21 +13924,449 @@ mod tests {
     }
     #[test]
     fn reporting_rate_raises_difficulty_by_a_power_of_two_toward_the_target() {
-        // Too few intervals, or at most two shares per second, keep difficulty.
-        assert_eq!(stratum_rate_factor(3, Duration::ZERO), None);
-        assert_eq!(stratum_rate_factor(16, Duration::from_secs(8)), None);
-        assert_eq!(stratum_rate_factor(17, Duration::from_secs(8)), Some(4.0));
-        assert_eq!(stratum_rate_factor(4, Duration::from_secs(1)), Some(4.0));
+        let seconds = Duration::from_secs;
+        // Too few intervals keep difficulty, however fast they came.
+        assert_eq!(stratum_rate_factor(15, Duration::ZERO), None);
+        // Before a whole window, only a stream past the session request
+        // rate, whose shares are being refused, is raised.
+        assert_eq!(stratum_rate_factor(16, seconds(2)), None);
+        assert_eq!(stratum_rate_factor(17, seconds(2)), Some(8.0));
+        assert_eq!(stratum_rate_factor(16, seconds(1)), Some(16.0));
+        // A whole window is judged against two shares per second, and the
+        // factor rounds down, so the raised rate stays at or above the target.
+        assert_eq!(stratum_rate_factor(60, seconds(30)), None);
+        assert_eq!(stratum_rate_factor(61, seconds(30)), Some(2.0));
+        assert_eq!(stratum_rate_factor(119, seconds(30)), Some(2.0));
+        assert_eq!(stratum_rate_factor(120, seconds(30)), Some(4.0));
         // Shares buffered together are measured over at least 250 ms.
-        assert_eq!(stratum_rate_factor(4, Duration::ZERO), Some(16.0));
+        assert_eq!(stratum_rate_factor(16, Duration::ZERO), Some(64.0));
         assert_eq!(
             stratum_rate_factor(40, Duration::from_millis(100)),
-            Some(256.0)
+            Some(128.0)
         );
+        assert_eq!(stratum_rate_factor(355 * 30, seconds(30)), Some(256.0));
+        // Extreme counts and spans saturate instead of overflowing.
         assert_eq!(
-            stratum_rate_factor(355 * 8, Duration::from_secs(8)),
-            Some(512.0)
+            stratum_rate_factor(u64::MAX, Duration::ZERO),
+            Some((1u64 << 56) as f64)
         );
+        assert_eq!(stratum_rate_factor(u64::MAX, Duration::MAX), None);
+    }
+    #[test]
+    fn share_rate_noise_near_the_target_never_raises_difficulty() {
+        // A miner at the target rate, with exponentially distributed gaps
+        // between shares, for ten hours. Four-interval samples raised such a
+        // miner within about a minute.
+        let start = tokio::time::Instant::now();
+        let mut rate = ShareRate::new(start);
+        let mut random = 0x9e37_79b9_7f4a_7c15u64;
+        let mut at = start;
+        for _ in 0..36_000 {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            let uniform = ((random >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+            at += Duration::from_secs_f64(-uniform.ln());
+            assert_eq!(rate.sample(at), None, "raised after {:?}", at - start);
+        }
+        // Four shares per second are halved to target after one window.
+        let mut rate = ShareRate::new(start);
+        let quarter = Duration::from_millis(250);
+        let raised = (0..=120u32).find_map(|n| rate.sample(start + quarter * n).map(|f| (n, f)));
+        assert_eq!(raised, Some((120, 4.0)));
+        // Ten per second exceed the session rate and are raised as soon as
+        // the sample is complete.
+        let mut rate = ShareRate::new(start);
+        let tenth = Duration::from_millis(100);
+        let raised = (0..=16u32).find_map(|n| rate.sample(start + tenth * n).map(|f| (n, f)));
+        assert_eq!(raised, Some((16, 8.0)));
+    }
+    #[test]
+    fn slow_shares_halve_raised_difficulty() {
+        let seconds = Duration::from_secs;
+        // Fewer than one share per four seconds over two minutes.
+        assert!(stratum_decays(0, seconds(120)));
+        assert!(stratum_decays(29, seconds(120)));
+        assert!(!stratum_decays(30, seconds(120)));
+        assert!(!stratum_decays(0, seconds(119)));
+        assert!(stratum_decays(249, seconds(1000)));
+        assert!(!stratum_decays(250, seconds(1000)));
+        let start = tokio::time::Instant::now();
+        let mut rate = ShareRate::new(start);
+        assert!(!rate.slow(start + seconds(119)));
+        assert!(rate.slow(start + seconds(120)));
+        rate.shares = 30;
+        assert!(!rate.slow(start + seconds(120)));
+    }
+    fn idle_worker(authorized: Instant, source: &str, trusted: bool) -> MiningWorker {
+        MiningWorker {
+            worker: "fixture".into(),
+            accepted: 0,
+            rejected: 0,
+            blocks: 0,
+            difficulty: DEFAULT_STRATUM_SHARE_DIFFICULTY,
+            last_share: None,
+            active: authorized,
+            group: network_guard::stratum_group(source.parse().unwrap()),
+            trusted,
+            evict: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+    #[tokio::test]
+    async fn worker_registry_caps_sources_reserves_trusted_slots_and_replaces_only_idle_workers() {
+        let start = Instant::now();
+        let idle = start + STRATUM_IDLE_WORKER;
+        let later = idle + STRATUM_IDLE_WORKER;
+        let mut registry = MiningRuntime::default();
+        let source = |group: usize, host: usize| format!("198.51.{group}.{host}");
+        let mut id = 0u32;
+        let mut next = || {
+            id += 1;
+            id
+        };
+        // One /24 holds at most its share of the slots, however many
+        // addresses it uses, until one of its own workers is idle.
+        for host in 0..STRATUM_GROUP_WORKERS {
+            let worker = idle_worker(start, &source(1, host), false);
+            registry.register(next(), worker, start).unwrap();
+        }
+        let newcomer = idle_worker(start, &source(1, 200), false);
+        let refused = registry.register(next(), newcomer, start);
+        assert_eq!(refused, Err("per-network mining worker limit reached"));
+        let victim = registry.workers[&1].evict.clone();
+        let newcomer = idle_worker(idle, &source(1, 200), false);
+        registry.register(next(), newcomer, idle).unwrap();
+        assert!(!registry.workers.contains_key(&1));
+        timeout(Duration::from_secs(1), victim.notified())
+            .await
+            .expect("the replaced worker was not told to close");
+        // Miners reporting shares are never replaced. Sources outside trusted
+        // prefixes hold at most all but the reserved slots.
+        let reporting: Vec<u32> = registry.workers.keys().copied().collect();
+        for id in reporting {
+            registry.proved(id, idle);
+        }
+        for group in 2..4 {
+            for host in 0..STRATUM_GROUP_WORKERS {
+                let worker = idle_worker(idle, &source(group, host), false);
+                registry.register(next(), worker, idle).unwrap();
+            }
+        }
+        assert_eq!(
+            registry.workers.len(),
+            MAX_CONNECTIONS - STRATUM_TRUSTED_WORKERS
+        );
+        let newcomer = idle_worker(idle, &source(4, 1), false);
+        let refused = registry.register(next(), newcomer, idle);
+        assert_eq!(refused, Err("mining worker capacity reached"));
+        // The operator's trusted prefixes keep the rest, from one network.
+        for host in 0..STRATUM_TRUSTED_WORKERS {
+            let worker = idle_worker(idle, &format!("203.0.113.{host}"), true);
+            registry.register(next(), worker, idle).unwrap();
+        }
+        assert_eq!(registry.workers.len(), MAX_CONNECTIONS);
+        let newcomer = idle_worker(idle, "203.0.113.200", true);
+        assert!(registry.register(next(), newcomer, idle).is_err());
+        // Once idle, others' workers make way first, for either kind of newcomer.
+        let newcomer = idle_worker(later, &source(4, 1), false);
+        registry.register(next(), newcomer, later).unwrap();
+        let newcomer = idle_worker(later, "203.0.113.201", true);
+        registry.register(next(), newcomer, later).unwrap();
+        let trusted = registry.workers.values().filter(|w| w.trusted).count();
+        assert_eq!(trusted, STRATUM_TRUSTED_WORKERS + 1);
+        // A trusted newcomer replaces an idle trusted worker only when every
+        // other worker is active; another source's newcomer never does.
+        let reporting: Vec<u32> = registry
+            .workers
+            .iter()
+            .filter(|(_, w)| !w.trusted)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in reporting {
+            registry.proved(id, later);
+        }
+        let newcomer = idle_worker(later, &source(5, 1), false);
+        let refused = registry.register(next(), newcomer, later);
+        assert_eq!(refused, Err("mining worker capacity reached"));
+        let newcomer = idle_worker(later, "203.0.113.202", true);
+        registry.register(next(), newcomer, later).unwrap();
+        assert_eq!(
+            registry.workers.values().filter(|w| w.trusted).count(),
+            trusted
+        );
+        assert_eq!(registry.workers.len(), MAX_CONNECTIONS);
+        // Trusted prefixes have no group cap.
+        let mut farm = MiningRuntime::default();
+        for host in 0..MAX_CONNECTIONS {
+            let worker = idle_worker(start, &format!("203.0.113.{host}"), true);
+            farm.register(next(), worker, start).unwrap();
+        }
+        // Without trusted prefixes no slot is held back for them.
+        let mut open = MiningRuntime {
+            trusted_reserve: 0,
+            ..MiningRuntime::default()
+        };
+        for group in 0..MAX_CONNECTIONS / STRATUM_GROUP_WORKERS {
+            for host in 0..STRATUM_GROUP_WORKERS {
+                let worker = idle_worker(start, &source(10 + group, host), false);
+                open.register(next(), worker, start).unwrap();
+            }
+        }
+        assert_eq!(open.workers.len(), MAX_CONNECTIONS);
+        let newcomer = idle_worker(start, &source(20, 1), false);
+        let refused = open.register(next(), newcomer, start);
+        assert_eq!(refused, Err("mining worker capacity reached"));
+    }
+    /// A Stratum session served over loopback TCP as the listener serves one
+    /// without a pre-authorization slot, with the miner's ends of it.
+    async fn loopback_session(
+        node: &Node,
+        floor: f64,
+        extra: u32,
+    ) -> (
+        JoinHandle<Result<()>>,
+        BufReader<tokio::net::tcp::OwnedReadHalf>,
+        tokio::net::tcp::OwnedWriteHalf,
+        IpAddr,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+        let admission = node.guard.admit(peer.ip(), Surface::Stratum).unwrap();
+        let session = tokio::spawn(stratum_session(
+            node.clone(),
+            server,
+            None,
+            floor,
+            extra.to_le_bytes(),
+            admission,
+            None,
+        ));
+        let (read, write) = client.into_split();
+        (session, BufReader::new(read), write, peer.ip())
+    }
+    async fn miner_message<R: AsyncBufRead + Unpin>(read: &mut R) -> Value {
+        let line = timeout(Duration::from_secs(10), bounded_line(read, 16384))
+            .await
+            .expect("mining session stopped responding")
+            .expect("mining session closed");
+        serde_json::from_slice(&line).unwrap()
+    }
+    async fn miner_call<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
+        read: &mut R,
+        write: &mut W,
+        id: u64,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        write_json(write, &json!({"id":id,"method":method,"params":params}))
+            .await
+            .unwrap();
+        loop {
+            let value = miner_message(read).await;
+            if value["id"] == id {
+                return value;
+            }
+        }
+    }
+    /// A submission for `job` under `name` whose header hash satisfies `accept`.
+    fn miner_submission(
+        job: &Value,
+        name: &str,
+        extra1: u32,
+        extra2: [u8; 4],
+        accept: impl Fn(&Amount) -> bool,
+    ) -> Value {
+        let p = &job["params"];
+        let word = |value: &Value| u32::from_str_radix(value.as_str().unwrap(), 16).unwrap();
+        let mut coinbase = hex::decode(p[2].as_str().unwrap()).unwrap();
+        coinbase.extend(extra1.to_le_bytes());
+        coinbase.extend(extra2);
+        coinbase.extend(hex::decode(p[3].as_str().unwrap()).unwrap());
+        let mut previous: Hash = hex::decode(p[1].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        for chunk in previous.chunks_exact_mut(4) {
+            chunk.reverse();
+        }
+        let mut header = Header {
+            version: word(&p[5]),
+            previous,
+            merkle_root: crypto::sha256d(&coinbase),
+            timestamp: word(&p[7]),
+            bits: word(&p[6]),
+            nonce: 0,
+        };
+        while !accept(&Amount::from_bytes_le(&crypto::sha256d(
+            &codec::header_bytes(&header),
+        ))) {
+            header.nonce += 1;
+        }
+        json!([
+            name,
+            p[0],
+            hex::encode(extra2),
+            format!("{:08x}", header.timestamp),
+            format!("{:08x}", header.nonce)
+        ])
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_budget_refusals_restrict_a_worker_without_closing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(
+            &dir.path().join("node.db"),
+            Config::devnet(),
+            crypto::public_key(&[47; 32]).unwrap(),
+        )
+        .unwrap();
+        let (session, mut read, mut write, ip) = loopback_session(&node, 1e-12, 12).await;
+        miner_call(&mut read, &mut write, 1, "mining.subscribe", json!([])).await;
+        let reply = miner_call(
+            &mut read,
+            &mut write,
+            2,
+            "mining.authorize",
+            json!(["budget.worker", "x"]),
+        )
+        .await;
+        assert_eq!(reply["result"], true, "{reply}");
+        let job = loop {
+            let value = miner_message(&mut read).await;
+            if value["method"] == "mining.notify" {
+                break value;
+            }
+        };
+        let block = math::target_from_bits(
+            u32::from_str_radix(job["params"][6].as_str().unwrap(), 16).unwrap(),
+        )
+        .unwrap();
+        let share =
+            |extra2| miner_submission(&job, "budget.worker", 12, extra2, |hash| hash > &block);
+        let mut refused = None;
+        for attempt in 0..8u8 {
+            let params = share([attempt, 1, 0, 0]);
+            // Once any cooldown an earlier attempt caused is over, other
+            // sessions at the worker's address spend its whole request budget.
+            let mut other = loop {
+                if let Ok(other) = node.guard.admit(ip, Surface::Stratum) {
+                    break other;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            loop {
+                while other.request().is_ok() {}
+                match node.guard.admit(ip, Surface::Stratum) {
+                    Ok(next) => other = next,
+                    Err(_) => break,
+                }
+            }
+            drop(other);
+            let active = node.mining.unpoisoned().workers[&12].active;
+            let reply = miner_call(
+                &mut read,
+                &mut write,
+                10 + u64::from(attempt),
+                "mining.submit",
+                params,
+            )
+            .await;
+            if reply["result"] == true {
+                continue;
+            }
+            assert_eq!(
+                reply["error"][1], "network rate budget exhausted",
+                "{reply}"
+            );
+            // The refused share still proved work, so the worker is not idle.
+            assert!(node.mining.unpoisoned().workers[&12].active > active);
+            refused = Some(attempt);
+            break;
+        }
+        assert!(
+            refused.is_some(),
+            "a drained address budget never restricted a share"
+        );
+        // The worker stays connected and mines once the budget refills.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let reply = miner_call(
+            &mut read,
+            &mut write,
+            99,
+            "mining.submit",
+            share([99, 0, 0, 0]),
+        )
+        .await;
+        assert_eq!(reply["result"], true, "{reply}");
+        assert!(!session.is_finished());
+        write.shutdown().await.unwrap();
+        timeout(Duration::from_secs(5), session)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_worker_replaced_by_a_newcomer_disconnects() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::open(
+            &dir.path().join("node.db"),
+            Config::devnet(),
+            crypto::public_key(&[49; 32]).unwrap(),
+        )
+        .unwrap();
+        let (session, mut read, mut write, _) = loopback_session(&node, 1e-12, 13).await;
+        miner_call(&mut read, &mut write, 1, "mining.subscribe", json!([])).await;
+        let reply = miner_call(
+            &mut read,
+            &mut write,
+            2,
+            "mining.authorize",
+            json!(["idle.worker", "x"]),
+        )
+        .await;
+        assert_eq!(reply["result"], true, "{reply}");
+        {
+            // Other sources' workers fill the slots outside trusted prefixes.
+            let mut runtime = node.mining.unpoisoned();
+            for index in 1..(MAX_CONNECTIONS - STRATUM_TRUSTED_WORKERS) {
+                let worker = idle_worker(Instant::now(), &format!("198.51.{index}.1"), false);
+                runtime
+                    .register(1000 + index as u32, worker, Instant::now())
+                    .unwrap();
+            }
+            let newcomer = || idle_worker(Instant::now(), "203.0.113.1", false);
+            assert!(runtime.register(5000, newcomer(), Instant::now()).is_err());
+            // Once every worker has gone without a share for the idle period,
+            // the one idle longest, which authorized first, makes way.
+            let later = Instant::now() + STRATUM_IDLE_WORKER;
+            runtime.register(5000, newcomer(), later).unwrap();
+            assert!(!runtime.workers.contains_key(&13));
+        }
+        let ended = timeout(Duration::from_secs(5), session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ended.unwrap_err().to_string().contains("replaced"));
+    }
+    #[test]
+    fn extranonces_start_at_a_random_value_on_each_node() {
+        let first = || {
+            let dir = tempfile::tempdir().unwrap();
+            let node = Node::open(
+                &dir.path().join("node.db"),
+                Config::devnet(),
+                crypto::public_key(&[48; 32]).unwrap(),
+            )
+            .unwrap();
+            SessionIds::allocate(&node.mining_session_ids).unwrap().1
+        };
+        // Nodes paying one key with the same template, or one node across a
+        // restart, would otherwise give their first miners the same work.
+        let first: HashSet<u32> = (0..4).map(|_| first()).collect();
+        assert_eq!(first.len(), 4, "{first:?}");
     }
     #[test]
     fn authorized_solo_workers_need_not_find_a_block_to_stay_connected() {

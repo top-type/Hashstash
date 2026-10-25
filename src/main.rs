@@ -259,8 +259,12 @@ enum Command {
         #[arg(long)]
         stratum_password_file: Option<PathBuf>,
         /// Address or CIDR prefix of the operator's miners, which always keep reserved Stratum slots.
+        /// Outside local networks it must be at least /16 (IPv4) or /32 (IPv6).
         #[arg(long, conflicts_with = "no_stratum")]
         stratum_trusted: Vec<hashstash::network_guard::TrustedPrefix>,
+        /// As --stratum-trusted, for a deliberately broader prefix of any length.
+        #[arg(long, conflicts_with = "no_stratum", value_parser = hashstash::network_guard::TrustedPrefix::broad)]
+        stratum_trusted_broad: Vec<hashstash::network_guard::TrustedPrefix>,
         /// Accept untrusted peers (a non-loopback --p2p or --peer-discovery) on a
         /// network whose easiest target makes blocks practically free.
         #[arg(long)]
@@ -1789,7 +1793,8 @@ async fn main() -> Result<()> {
             peer_key_file,
             peer_pin,
             stratum_password_file,
-            stratum_trusted,
+            mut stratum_trusted,
+            stratum_trusted_broad,
             allow_easy_target,
             dev_rpc,
             preflight,
@@ -1908,7 +1913,10 @@ async fn main() -> Result<()> {
                     stratum_advertise,
                     peers: peer,
                     stratum_password: password,
-                    stratum_trusted,
+                    stratum_trusted: {
+                        stratum_trusted.extend(stratum_trusted_broad);
+                        stratum_trusted
+                    },
                 },
             )
             .await?;
@@ -2097,6 +2105,36 @@ mod tests {
                 assert!(Cli::try_parse_from(selected).is_err());
             }
         }
+    }
+
+    #[test]
+    fn broad_public_trusted_stratum_prefixes_need_their_own_flag() {
+        let run = |flag: &str, prefix: &str| {
+            Cli::try_parse_from(["hashstash", "run", "--miner", "key", flag, prefix])
+        };
+        for broad in ["0.0.0.0/0", "::/0", "11.0.0.0/8", "2001:db8::/31"] {
+            assert!(run("--stratum-trusted", broad).is_err(), "{broad}");
+            assert!(run("--stratum-trusted-broad", broad).is_ok(), "{broad}");
+        }
+        for narrow in [
+            "198.51.0.0/16",
+            "2001:db8::/32",
+            "10.0.0.0/8",
+            "203.0.113.9",
+        ] {
+            assert!(run("--stratum-trusted", narrow).is_ok(), "{narrow}");
+        }
+        assert!(run("--stratum-trusted-broad", "0.0.0.0/33").is_err());
+        let both = Cli::try_parse_from([
+            "hashstash",
+            "run",
+            "--miner",
+            "key",
+            "--no-stratum",
+            "--stratum-trusted-broad",
+            "0.0.0.0/0",
+        ]);
+        assert!(both.is_err());
     }
 
     #[test]

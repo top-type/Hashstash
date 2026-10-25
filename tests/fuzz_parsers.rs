@@ -635,8 +635,8 @@ fn quote_methods_refuse_parameters_that_are_not_objects() {
                 "{method} {params}"
             );
         }
-        // Omitted parameters are no fields: the sender defaults and the
-        // quote then asks for what is missing.
+        // Omitted parameters are no fields: the quote then asks for what is
+        // missing, starting with the sender it never defaults.
         let error = node.rpc(method, Value::Null).unwrap_err().to_string();
         assert!(error.contains("missing"), "{method}: {error}");
     }

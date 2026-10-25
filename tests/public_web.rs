@@ -198,16 +198,15 @@ async fn public_wallet_prepares_exact_unsigned_intent_and_broadcasts_only_signed
         .unwrap();
     assert!(quote.get("error").is_some());
     assert!(!quote.to_string().contains(&hex::encode(server_key)));
+    // Nor a private one: that listener needs no session token, so a default
+    // sender would show any local process the selected wallet and balance.
     let private_quote = request(&client, &private, "fee_quote", params.clone())
         .await
         .json::<Value>()
         .await
         .unwrap();
-    assert_eq!(
-        private_quote["result"]["sender_public_key"],
-        hex::encode(server_key),
-        "{private_quote}"
-    );
+    assert!(private_quote.get("error").is_some(), "{private_quote}");
+    assert!(!private_quote.to_string().contains(&hex::encode(server_key)));
     let missing_transfer_sender = request(
         &client,
         &public,

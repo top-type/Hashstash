@@ -182,3 +182,142 @@ async fn development_mining_and_server_wallets_have_their_own_workers() {
     assert_eq!(node.status().unwrap()["mempool"], 1);
     server.stop().await;
 }
+
+/// `getblock` used to build a generic JSON tree of the whole block, one value
+/// of tens of bytes per byte, before the response limit was even checked: a
+/// block with tens of MiB of data took gigabytes per call, and blocks beyond
+/// about 50 MiB could never be served. The JSON form now stays within the JSON
+/// page budgets, and every valid block is served as its canonical hexadecimal
+/// record, which `submitblock` accepts back.
+#[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn large_blocks_are_served_in_hex_instead_of_a_json_tree() {
+    let directory = tempfile::tempdir().unwrap();
+    let secret = [88; 32];
+    let sender = crypto::public_key(&secret).unwrap();
+    let recipient = crypto::public_key(&[89; 32]).unwrap();
+    let mut config = Config::testnet();
+    config.initial.block_bytes = 4 << 20;
+    config.initial_bits = 0x1f7fffff;
+    config.limit_bits = config.initial_bits;
+    config.genesis_time = now().saturating_sub(3600) as u32;
+    let node = Node::open(
+        &directory.path().join("large.sqlite"),
+        config.clone(),
+        sender,
+    )
+    .unwrap();
+    for _ in 0..10 {
+        node.mine(1_000_000).unwrap();
+    }
+    // An ordinary block keeps its JSON form.
+    let small: Block = serde_json::from_value(node.rpc("getblock", json!({})).unwrap()).unwrap();
+    assert_eq!(small.height, 10);
+    // More data bytes than the JSON value budget.
+    let data = vec![0xa5; 2_200_000];
+    let mut prepared = node
+        .rpc(
+            "preparetransaction",
+            json!({"sender":hex::encode(sender),"operation":Operation::TransferExact{recipient,amount:1u32.into()},"data_hex":hex::encode(&data)}),
+        )
+        .unwrap();
+    prepared.as_object_mut().unwrap().remove("fee_quote");
+    let body = wallet::decode_unsigned(&serde_json::from_value(prepared).unwrap()).unwrap();
+    let transaction = crypto::sign(&config.chain_id(), &body, &secret).unwrap();
+    node.rpc(
+        "broadcasttransaction",
+        json!({"raw":wallet::signed_hex(&transaction)}),
+    )
+    .unwrap();
+    let block = node.mine(1_000_000).unwrap();
+    assert_eq!(block.transactions, vec![transaction]);
+    let refused = node.rpc("getblock", json!({})).unwrap_err().to_string();
+    assert!(refused.contains("format \"hex\""), "{refused}");
+    assert!(node.rpc("getblock", json!({"format":"xml"})).is_err());
+    // Any block is available as its canonical record, which another node
+    // accepts back through `submitblock`.
+    let other = Node::open(&directory.path().join("other.sqlite"), config, sender).unwrap();
+    for height in 1..=block.height {
+        let reply = node
+            .rpc("getblock", json!({"height":height,"format":"hex"}))
+            .unwrap();
+        assert_eq!(reply["height"], height);
+        let raw = hex::decode(reply["raw"].as_str().unwrap()).unwrap();
+        let decoded = codec::decode_block(&raw, raw.len()).unwrap();
+        assert_eq!(reply["hash"], hex::encode(codec::block_hash(&decoded)));
+        if height == block.height {
+            assert_eq!(decoded, block);
+        }
+        let submitted = other.rpc("submitblock", reply.clone()).unwrap();
+        assert_eq!(submitted["selected"], true, "{height}");
+        assert_eq!(submitted["hash"], reply["hash"]);
+    }
+    assert_eq!(other.status().unwrap()["tip"], node.status().unwrap()["tip"]);
+}
+
+/// The private listener needs no session token, so a quote that omits its
+/// sender is refused there too rather than read from the selected server
+/// wallet, which would show any local process that account and its balance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quotes_never_default_to_the_selected_server_wallet() {
+    let directory = tempfile::tempdir().unwrap();
+    let miner = crypto::public_key(&[85; 32]).unwrap();
+    let selected = crypto::public_key(&[86; 32]).unwrap();
+    let recipient = crypto::public_key(&[87; 32]).unwrap();
+    let node = Node::open(
+        &directory.path().join("quotes.sqlite"),
+        Config::devnet(),
+        miner,
+    )
+    .unwrap()
+    .with_wallet([86; 32])
+    .unwrap();
+    let chain_id = node.read_view().unwrap().chain.chain_id();
+    let hidden = [
+        hex::encode(selected),
+        address::encode(&selected, &chain_id).unwrap(),
+    ];
+    let server = serve(node.clone(), options()).await.unwrap();
+    let client = reqwest::Client::new();
+    let rpc = |method: &str, params: &Value| {
+        client
+            .post(format!("http://{}/rpc", server.rpc))
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+            .send()
+    };
+    let operation = Operation::TransferExact {
+        recipient,
+        amount: 1u32.into(),
+    };
+    for (method, params) in [
+        ("fee_quote", json!({"operation":operation})),
+        (
+            "transfer_quote",
+            json!({"recipient":hex::encode(recipient),"amount":"1"}),
+        ),
+    ] {
+        let reply: Value = rpc(method, &params).await.unwrap().json().await.unwrap();
+        let message = reply["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("sender"), "{method}: {reply}");
+        for value in &hidden {
+            assert!(
+                !reply.to_string().contains(value.as_str()),
+                "{method}: {reply}"
+            );
+        }
+        assert!(node.rpc(method, params.clone()).is_err(), "{method}");
+        // A caller that names its sender is quoted as before.
+        let mut named = params.clone();
+        named["sender"] = json!(hex::encode(miner));
+        let reply: Value = rpc(method, &named).await.unwrap().json().await.unwrap();
+        assert_eq!(
+            reply["result"]["sender_public_key"],
+            hex::encode(miner),
+            "{method}: {reply}"
+        );
+    }
+    server.stop().await;
+}

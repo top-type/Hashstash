@@ -75,6 +75,47 @@ fn failed_and_panicking_updates_retry_without_another_notification() {
 }
 
 #[test]
+fn a_failed_startup_catch_up_is_finished_by_the_worker() {
+    // A failed catch-up at startup used to make opening the index fail, and
+    // the node then ran with an unavailable index until a manual restart.
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config::devnet();
+    let miner = crypto::public_key(&[72; 32]).unwrap();
+    let node = Node::open(
+        &directory.path().join("chain.sqlite"),
+        config.clone(),
+        miner,
+    )
+    .unwrap();
+    let database = directory.path().join("index.sqlite");
+    drop(Explorer::open(&database, &lock_inner(&node.inner).chain).unwrap());
+    for _ in 0..3 {
+        node.mine(1_000_000).unwrap();
+    }
+    let genesis = indexed_tip(&database);
+    let tip = hex::encode(node.read_view().unwrap().chain.tip_hash());
+    let mut explorer = Explorer::connect(&database, &lock_inner(&node.inner).chain).unwrap();
+    explorer.retry_delay = Duration::from_millis(50);
+    let mut calls = 0;
+    explorer.hooks.before_apply = Some(Box::new(move || {
+        calls += 1;
+        // The checkpoint rebuild succeeds; the first catch-up block fails.
+        ensure!(calls != 2, "injected explorer failure");
+        Ok(())
+    }));
+    explorer.sync(&lock_inner(&node.inner).chain);
+    assert_eq!(indexed_tip(&database), genesis);
+    // No notification: the worker retries at the failure's retry time.
+    let worker = ExplorerWorker::start(explorer, Arc::downgrade(&node.inner), config);
+    assert!(
+        eventually(|| indexed_tip(&database).as_deref() == Some(tip.as_str())),
+        "index stayed at {:?}",
+        indexed_tip(&database)
+    );
+    drop(worker);
+}
+
+#[test]
 fn a_stopped_worker_is_reported_once() {
     let (sender, receiver) = mpsc::sync_channel(1);
     drop(receiver);

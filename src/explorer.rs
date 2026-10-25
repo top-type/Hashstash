@@ -100,6 +100,8 @@ pub(crate) struct TestHooks {
 /// Capturing this performs no state replay and no derived-index writes under
 /// the node lock.
 pub(crate) enum Update {
+    /// Detach every row and index genesis: no indexed block is canonical.
+    Genesis(Box<Block>),
     Advance(Box<Block>),
     /// An already indexed canonical block, executed only to rebuild checkpoints.
     Replay(Box<Block>),
@@ -112,7 +114,9 @@ pub(crate) enum Update {
 impl Update {
     fn target(&self) -> Hash {
         match self {
-            Self::Advance(block) | Self::Replay(block) => codec::block_hash(block),
+            Self::Genesis(block) | Self::Advance(block) | Self::Replay(block) => {
+                codec::block_hash(block)
+            }
             Self::Rollback(hash, _) | Self::Rebuild(_, hash, _) => *hash,
         }
     }
@@ -183,11 +187,24 @@ impl Explorer {
         };
         reader.rpc_rooted(method, p, c, s, tip, root, mempool)
     }
+    /// Opens the index and sets it up for `chain`. Only a database that
+    /// cannot be opened or initialised is an error: a failed setup or
+    /// catch-up keeps the index, and its worker retries like any update.
     pub fn open(path: &Path, chain: &Chain) -> Result<Self> {
+        let mut index = Self::connect(path, chain)?;
+        index.sync(chain);
+        Ok(index)
+    }
+
+    /// The opened and initialised database, not yet set up for `chain`.
+    pub(crate) fn connect(path: &Path, chain: &Chain) -> Result<Self> {
         let db = Connection::open(crate::local_files::sidecar(path, "explorer.sqlite"))?;
         db.busy_timeout(std::time::Duration::from_millis(500))?;
+        // As for the chain database, the journal limit returns WAL space after
+        // a checkpoint of a large catch-up or rebuild commit instead of
+        // keeping the log at its peak size.
         db.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA journal_size_limit=67108864;
             CREATE TABLE IF NOT EXISTS explorer_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);",
         )?;
         let identity = hex::encode(chain.chain_id());
@@ -240,7 +257,7 @@ impl Explorer {
                 r.get(0)
             })
             .optional()?;
-        let mut index = Self {
+        Ok(Self {
             db: Some(db),
             tip: tip.and_then(|v| parse_hash(&v).ok()),
             height: 0,
@@ -252,9 +269,7 @@ impl Explorer {
             retry_delay: RETRY_FAILED,
             #[cfg(test)]
             hooks: TestHooks::default(),
-        };
-        index.sync(chain)?;
-        Ok(index)
+        })
     }
 
     pub(crate) fn capture(&mut self, chain: &Chain) -> Result<Option<Update>> {
@@ -289,11 +304,37 @@ impl Explorer {
         })
     }
 
+    /// The update that sets the index up for `chain`: detach rows above the
+    /// common ancestor and resume from the checkpoints the chain retains, or
+    /// first index genesis when no indexed block is canonical.
+    fn setup(&self, chain: &Chain) -> Result<Option<Update>> {
+        let db = self.db.as_ref().context("explorer index unavailable")?;
+        let Some(height) = common_ancestor(db, chain)? else {
+            let hash = chain.hash_at_height(0).context("missing genesis")?;
+            if self.backed_off(hash, chain) {
+                return Ok(None);
+            }
+            let genesis = chain.block(&hash).context("missing genesis block")?;
+            return Ok(Some(Update::Genesis(Box::new(genesis))));
+        };
+        let hash = chain
+            .hash_at_height(height)
+            .context("missing common ancestor")?;
+        if self.backed_off(hash, chain) {
+            return Ok(None);
+        }
+        Ok(Some(Update::Rebuild(
+            height,
+            hash,
+            checkpoints(chain, height)?,
+        )))
+    }
+
     fn next_update(&self, chain: &Chain) -> Result<Option<Update>> {
-        let (tip, state) = self
-            .states
-            .back()
-            .context("missing explorer checkpoint state")?;
+        let Some((tip, state)) = self.states.back() else {
+            // Startup could not set the index up; set it up here instead.
+            return self.setup(chain);
+        };
         if chain.hash_at_height(state.height) != Some(*tip) {
             if let Some((hash, state)) = self
                 .states
@@ -390,6 +431,19 @@ impl Explorer {
     fn apply(&mut self, c: &Config, update: Update) -> Result<()> {
         let db = self.db.as_mut().context("explorer index unavailable")?;
         match update {
+            Update::Genesis(block) => {
+                ensure!(block.height == 0, "explorer genesis mismatch");
+                let transaction = db.transaction()?;
+                detach(&transaction, None)?;
+                index_block(&transaction, c, &block, None)?;
+                let hash = codec::block_hash(&block);
+                set_tip(&transaction, &hash)?;
+                transaction.commit()?;
+                self.tip = Some(hash);
+                self.height = 0;
+                // Its checkpoint is the next setup step, a rebuild at genesis.
+                self.states.clear();
+            }
             Update::Rollback(hash, state) => {
                 let transaction = db.transaction()?;
                 detach(&transaction, Some(state.height))?;
@@ -420,6 +474,7 @@ impl Explorer {
                 self.tip = Some(hash);
                 self.height = height;
                 self.states = states;
+                self.ready = true;
             }
             Update::Replay(block) => {
                 let (tip, parent) = self
@@ -482,36 +537,42 @@ impl Explorer {
     /// A short catch-up finishes here; a longer one (first start, rebuild or a
     /// lagging index) continues on the background worker, committing each
     /// block, so startup never waits on a full replay for a derived index.
-    pub fn sync(&mut self, chain: &Chain) -> Result<()> {
+    /// A failure here, transient or not, is logged and left to the worker,
+    /// which retries it as it would its own failed update; the index is never
+    /// disabled until the next restart.
+    pub fn sync(&mut self, chain: &Chain) {
         if self.ready && self.tip == Some(chain.tip_hash()) {
-            return Ok(());
+            return;
         }
         self.ready = false;
-        let db = self.db.as_mut().context("explorer index unavailable")?;
-        let height = match common_ancestor(db, chain)? {
-            Some(height) => height,
-            None => {
-                let genesis = chain
-                    .block(&chain.hash_at_height(0).context("missing genesis")?)
-                    .context("missing genesis block")?;
-                let transaction = db.transaction()?;
-                detach(&transaction, None)?;
-                index_block(&transaction, &chain.config, &genesis, None)?;
-                set_tip(&transaction, &codec::block_hash(&genesis))?;
-                transaction.commit()?;
-                0
-            }
-        };
-        let hash = chain
-            .hash_at_height(height)
-            .context("missing common ancestor")?;
+        self.states.clear();
         self.attempt = None;
-        self.apply(
-            &chain.config,
-            Update::Rebuild(height, hash, checkpoints(chain, height)?),
-        )?;
-        self.ready = true;
-        let start = self.states.back().map_or(0, |(_, state)| state.height);
+        if let Err(error) = self.catch_up(chain) {
+            eprintln!("Explorer index catch-up continues in the background: {error:#}");
+        }
+    }
+
+    fn catch_up(&mut self, chain: &Chain) -> Result<()> {
+        // Genesis when nothing indexed is canonical, then the checkpoints.
+        for _ in 0..2 {
+            if !self.states.is_empty() {
+                break;
+            }
+            let update = self.setup(chain).inspect_err(|_| {
+                self.retry = Some(Instant::now() + self.retry_failed());
+            })?;
+            let Some(update) = update else {
+                return Ok(());
+            };
+            self.attempt = Some((update.target(), chain.tip_hash()));
+            self.apply_update(&chain.config, update)?;
+        }
+        let start = self
+            .states
+            .back()
+            .context("missing explorer checkpoint state")?
+            .1
+            .height;
         if chain.tip_height().saturating_sub(start) <= CHECKPOINTS as u64 {
             while let Some(update) = self.capture(chain)? {
                 self.apply_update(&chain.config, update)?;
@@ -1832,6 +1893,39 @@ fn index_block(
                 pass.put(*recipient, Account::default(), c)?;
             }
         }
+        // Record weight is charged only for a support record that does not
+        // exist yet. A proposal writes its proposer's record and a support
+        // writes its sender's, so a later support for the same record in this
+        // block pays none, as consensus quotes it against the running state.
+        let supported = match &operation {
+            Operation::Propose {
+                round,
+                description,
+                proposal,
+                support,
+            } => Some((
+                *round,
+                crate::state::proposal_id(&chain_id, *round, &t.body.sender, description, proposal),
+                support,
+            )),
+            Operation::Support {
+                round,
+                proposal,
+                amount,
+            } => Some((*round, *proposal, amount)),
+            _ => None,
+        };
+        if let Some((round, proposal, amount)) = supported {
+            let key = crate::state::support_key(round, &proposal, &t.body.sender);
+            let mut record = opening.supports.get(&key).cloned().unwrap_or(crate::state::SupportRecord {
+                round,
+                proposal,
+                sender: t.body.sender,
+                amount: Amount::zero(),
+            });
+            record.amount += amount;
+            opening.supports.insert(key, record);
+        }
         match &operation {
             Operation::Propose {
                 round,
@@ -2596,6 +2690,143 @@ mod indexing_tests {
             "reapplication restores every indexed row"
         );
     }
+
+    #[test]
+    fn supports_after_their_record_in_one_block_are_indexed_without_record_weight() {
+        // Consensus quotes each transaction against the running block state:
+        // a support for a record written earlier in the block (by its
+        // proposal or another support) pays no record weight. The index used
+        // to quote it against the block's opening state, overstating its
+        // minimum fee and the block's mandatory fees.
+        let mut c = Config::testnet();
+        c.initial.rest = 0;
+        c.test_work = false;
+        let secret = [94; 32];
+        let owner = crypto::public_key(&secret).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("support-weight.sqlite");
+        let chain = Chain::open(&path, c.clone()).unwrap();
+        let mut index = Explorer::open(&path, &chain).unwrap();
+        let mut parent = State::genesis(&c);
+        parent
+            .world
+            .put(
+                owner,
+                Account {
+                    ordinary: 1_000_000u32.into(),
+                    ..Account::default()
+                },
+                &c,
+            )
+            .unwrap();
+        parent.issued = 1_000_000u32.into();
+        parent.height = 1;
+        assert_eq!(parent.auction_round(), Some(0));
+        let parent_hash = [42; 32];
+        let mut block = chain.tip_block().clone();
+        block.height = 2;
+        block.header.previous = parent_hash;
+        block.miner = owner;
+        let work = math::work(&math::target_from_bits(block.header.bits).unwrap());
+        let proposal = Proposal::Parameter {
+            parameter: Parameter::MinimumFeeRate,
+            old: 1,
+            new: 2,
+        };
+        let description = [7; 32];
+        let id = crate::state::proposal_id(&parent.chain_id, 0, &owner, &description, &proposal);
+        let mut execution = consensus::prepare_block(&c, &parent, &owner, &work).unwrap();
+        let mut quotes = Vec::new();
+        for (nonce, operation) in [
+            Operation::Propose {
+                round: 0,
+                description,
+                proposal,
+                support: 5u32.into(),
+            },
+            Operation::Support {
+                round: 0,
+                proposal: id,
+                amount: 3u32.into(),
+            },
+            Operation::Support {
+                round: 0,
+                proposal: id,
+                amount: 2u32.into(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Each pays exactly the minimum consensus charges it.
+            let mut body = TransactionBody {
+                sender: owner,
+                nonce: nonce as u64,
+                fee: Amount::zero(),
+                anchor: [38; 32],
+                expiry_blocks: 100,
+                operation,
+                data: Vec::new(),
+            };
+            let quote = loop {
+                let unsigned = Transaction {
+                    body: body.clone(),
+                    signature: [0; 64],
+                };
+                let quote = fees::quote(&c, &execution.state, &unsigned).unwrap();
+                if quote.minimum_fee == body.fee {
+                    break quote;
+                }
+                body.fee = quote.minimum_fee.clone();
+            };
+            let tx = crypto::sign(&parent.chain_id, &body, &secret).unwrap();
+            execution.apply_verified_transaction(&c, &tx).unwrap();
+            quotes.push(quote);
+            block.transactions.push(tx);
+        }
+        // Only the proposal writes its proposer's support record.
+        assert!(!quotes[0].record_fee.is_zero());
+        assert!(quotes[1..].iter().all(|quote| quote.record_fee.is_zero()));
+        let post = consensus::execute(
+            &c,
+            &parent,
+            &parent_hash,
+            &owner,
+            &work,
+            &block.transactions,
+        )
+        .unwrap();
+        block.state_root = post.root();
+        block.header.merkle_root = codec::merkle_root(&block).unwrap();
+        let db = index.db.as_mut().unwrap();
+        let transaction = db.transaction().unwrap();
+        index_block(&transaction, &c, &block, Some(&parent)).unwrap();
+        let record = |sql: &str, key: String| -> Value {
+            let text: String = transaction.query_row(sql, [key], |row| row.get(0)).unwrap();
+            serde_json::from_str(&text).unwrap()
+        };
+        for (tx, quote) in block.transactions.iter().zip(&quotes) {
+            let value = record(
+                "SELECT record FROM explorer_transactions WHERE txid=?1",
+                hex::encode(codec::transaction_id(tx)),
+            );
+            assert_eq!(value["minimum_fee"], quote.minimum_fee.to_str_radix(10));
+            assert_eq!(value["extra_fee"], "0");
+        }
+        let summary = record(
+            "SELECT record FROM explorer_blocks WHERE hash=?1",
+            hex::encode(codec::block_hash(&block)),
+        );
+        let mandatory = quotes
+            .iter()
+            .fold(Amount::zero(), |sum, quote| sum + &quote.minimum_fee);
+        assert_eq!(
+            summary["rewards"]["minimum_fees"],
+            mandatory.to_str_radix(10)
+        );
+        assert_eq!(summary["rewards"]["extra_fees"], "0");
+        drop(transaction);
+    }
 }
 
 #[cfg(test)]
@@ -2621,6 +2852,7 @@ mod worker_tests {
         let mut kinds = Vec::new();
         while let Some(update) = index.capture(chain).unwrap() {
             kinds.push(match update {
+                Update::Genesis(_) => "genesis",
                 Update::Advance(_) => "advance",
                 Update::Replay(_) => "replay",
                 Update::Rollback(..) => "rollback",
@@ -2812,6 +3044,71 @@ mod worker_tests {
         assert!(index.failed.is_none());
         assert_eq!(drain(&mut index, &chain), ["advance"]);
         assert_eq!(index.tip, Some(chain.tip_hash()));
+    }
+
+    #[test]
+    fn a_failed_startup_keeps_the_index_for_its_worker() {
+        // Startup used to return the error of any failed setup or catch-up
+        // step, and the node then replaced the index with an unavailable one
+        // that nothing reopened: a transient failure, such as a full disk,
+        // froze the explorer, mail and chat until a manual restart. The
+        // failing step is now retried like any failed worker update.
+        let dir = tempfile::tempdir().unwrap();
+        let c = Config::devnet();
+        // (index name, blocks indexed before the restart, failing apply call,
+        // the updates that then finish the work)
+        for (name, indexed, failing, expected) in [
+            ("catch-up", 3, 2, vec!["advance"; 10]),
+            ("rebuild", 3, 1, [vec!["rebuild"], vec!["advance"; 10]].concat()),
+            (
+                "genesis",
+                0,
+                1,
+                [vec!["genesis", "rebuild"], vec!["advance"; 13]].concat(),
+            ),
+        ] {
+            let path = dir.path().join(format!("{name}.sqlite"));
+            let mut chain = Chain::open(&path, c.clone()).unwrap();
+            for salt in 0..3 {
+                extend(&mut chain, salt);
+            }
+            if indexed > 0 {
+                drop(Explorer::open(&path, &chain).unwrap());
+            }
+            for salt in 3..13 {
+                extend(&mut chain, salt);
+            }
+            let mut index = Explorer::connect(&path, &chain).unwrap();
+            let mut calls = 0;
+            index.hooks.before_apply = Some(Box::new(move || {
+                calls += 1;
+                ensure!(calls != failing, "injected explorer failure");
+                Ok(())
+            }));
+            index.sync(&chain);
+            let before = (indexed > 0).then(|| chain.hash_at_height(indexed).unwrap());
+            assert_eq!(index.tip, before, "{name}");
+            assert!(index.retry_at().is_some(), "{name}");
+            // The worker waits for the retry time, then finishes the work.
+            assert!(index.capture(&chain).unwrap().is_none(), "{name}");
+            index.failed.as_mut().unwrap().1 = Instant::now();
+            assert_eq!(drain(&mut index, &chain), expected, "{name}");
+            assert_eq!(index.tip, Some(chain.tip_hash()), "{name}");
+            assert_eq!(canonical_blocks(&index), chain.tip_height() + 1);
+            assert!(
+                index
+                    .rpc(
+                        "explorer_blocks",
+                        json!({}),
+                        &c,
+                        chain.tip_state(),
+                        chain.tip_hash(),
+                        &[],
+                    )
+                    .is_ok(),
+                "{name}"
+            );
+        }
     }
 
     #[test]

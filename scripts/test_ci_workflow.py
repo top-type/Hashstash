@@ -185,11 +185,26 @@ class WorkflowTest(unittest.TestCase):
         self.assertRegex(self.environment.get('FUZZ_TOOLCHAIN', ''), r'^nightly-\d{4}-\d{2}-\d{2}$',
                          'the fuzz job needs a dated nightly')
         self.assertRegex(self.environment.get('CARGO_FUZZ_VERSION', ''), r'^\d+\.\d+\.\d+$')
+        # A major or minor version alone takes the newest release of that
+        # line, and with Node.js the corepack that checks the pnpm hash.
+        for name in ('NODE_VERSION', 'PYTHON_VERSION'):
+            with self.subTest(variable=name):
+                self.assertRegex(self.environment.get(name, ''), r'^\d+\.\d+\.\d+$')
+        pinned = {
+            'toolchain': ('${{ env.RUST_TOOLCHAIN }}', '${{ env.FUZZ_TOOLCHAIN }}'),
+            'node-version': ('${{ env.NODE_VERSION }}',),
+            'python-version': ('${{ env.PYTHON_VERSION }}',),
+        }
+        installers = {'actions/setup-node': 'node-version', 'actions/setup-python': 'python-version'}
         for job, step in self.steps():
-            toolchain = step.keys.get('with', {}).get('toolchain', '') if isinstance(step.keys.get('with'), dict) else ''
-            if toolchain:
-                with self.subTest(job=job.name, step=step.name):
-                    self.assertIn(toolchain, ('${{ env.RUST_TOOLCHAIN }}', '${{ env.FUZZ_TOOLCHAIN }}'))
+            settings = step.keys.get('with') if isinstance(step.keys.get('with'), dict) else {}
+            action = step.keys.get('uses', '').partition('@')[0]
+            with self.subTest(job=job.name, step=step.name):
+                if action in installers:
+                    self.assertIn(installers[action], settings, 'name the version an installer sets up')
+                for key, allowed in pinned.items():
+                    if key in settings:
+                        self.assertIn(settings[key], allowed)
         self.assertNotRegex(self.text, r'\+nightly\b', 'name the dated fuzz toolchain, not a moving nightly')
         installs = re.findall(r'^.*cargo .*install .*$', self.text, re.M)
         self.assertTrue(installs)

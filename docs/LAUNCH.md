@@ -45,7 +45,7 @@ bash scripts/release.sh --verify
 
 Have a second person build the same commit on another machine with the same Rust and C compiler versions and compare `SHA256SUMS`; they must be identical. Then sign the file with the release manager's key, for example `gpg --armor --detach-sign SHA256SUMS`, and keep `BUILDINFO` with the deployment record.
 
-Check: both builds agree, `./hashstash --version` prints `hashstash 0.43.0`, and `sha256sum -c SHA256SUMS` passes.
+Check: the full continuous-integration gate is green on this exact commit and recorded under [release gate](VALIDATION.md#release-gate), both builds agree, `./hashstash --version` prints `hashstash 0.43.0`, and `sha256sum -c SHA256SUMS` passes.
 
 ## 3 Create and calibrate the genesis
 

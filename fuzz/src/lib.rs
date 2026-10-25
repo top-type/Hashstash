@@ -11,13 +11,16 @@
 //! agreement between the peer preflight and the consensus codec, agreement
 //! between the bounded JSON parsers, the discovery address book's bounds,
 //! read-only RPC methods leaving the node unchanged, mining sessions
-//! answering in JSON lines and releasing their worker once closed, and a node
-//! that synchronized from a hostile peer sending only canonical requests,
-//! keeping its tip on its active chain and holding a state that a replay of
-//! that chain reproduces.
+//! answering in JSON lines and releasing their worker once closed, a node
+//! that synchronized from a hostile peer sending only canonical requests, a
+//! node serving a hostile peer answering each request in protocol order with
+//! canonical replies that its active chain and the declared capacity bound,
+//! and after either session a node keeping its tip on its active chain, its
+//! held headers within their bounds and a state that a replay of that chain
+//! reproduces.
 
 use hashstash::{
-    address, chat, codec,
+    address, chain, chat, codec,
     config::Config,
     crypto, mail, math, network_guard,
     node::{self, Node},
@@ -180,6 +183,15 @@ pub const TARGETS: &[Target] = &[
         dictionary: PEER_TOKENS,
         max_len: 64 * 1024,
         // A loopback session, block validation and sometimes a replay.
+        cost: 8,
+    },
+    Target {
+        name: "peer_serve",
+        run: Run::Node(peer_serve),
+        seeds: serve_seeds,
+        dictionary: PEER_TOKENS,
+        max_len: 64 * 1024,
+        // As for `peer_sync`.
         cost: 8,
     },
 ];
@@ -1601,26 +1613,27 @@ fn sync_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-/// The replies of a `peer_sync` input: each a two-byte big-endian length,
-/// then that many bytes of peer message; a short last reply takes the rest.
-fn sync_script(mut data: &[u8]) -> Vec<Vec<u8>> {
-    let mut replies = Vec::new();
-    while replies.len() < SYNC_REPLIES && data.len() >= 2 {
+/// The peer messages of a `peer_sync` or `peer_serve` input, at most `most`:
+/// each a two-byte big-endian length, then that many bytes of peer message;
+/// a short last message takes the rest.
+fn script(mut data: &[u8], most: usize) -> Vec<Vec<u8>> {
+    let mut messages = Vec::new();
+    while messages.len() < most && data.len() >= 2 {
         let length = usize::from(u16::from_be_bytes([data[0], data[1]]));
-        let (reply, rest) = data[2..].split_at(length.min(data.len() - 2));
-        replies.push(reply.to_vec());
+        let (message, rest) = data[2..].split_at(length.min(data.len() - 2));
+        messages.push(message.to_vec());
         data = rest;
     }
-    replies
+    messages
 }
 
-/// The `peer_sync` input that scripts these replies.
-fn sync_input(replies: &[Message]) -> Vec<u8> {
+/// The `peer_sync` or `peer_serve` input that scripts these messages.
+fn script_input(messages: &[Message]) -> Vec<u8> {
     let [wide, _] = limits();
     let mut input = Vec::new();
-    for reply in replies {
-        let payload = peer_wire::encode(reply, wide).expect("seed reply");
-        let length = u16::try_from(payload.len()).expect("a seed reply fits its length");
+    for message in messages {
+        let payload = peer_wire::encode(message, wide).expect("seed message");
+        let length = u16::try_from(payload.len()).expect("a seed message fits its length");
         input.extend_from_slice(&length.to_be_bytes());
         input.extend_from_slice(&payload);
     }
@@ -1685,17 +1698,76 @@ fn replay_agrees(node: &Node, status: &Value) {
     }
 }
 
+/// A count in words up to six, where `how_many` is too coarse.
+fn in_words(count: usize) -> &'static str {
+    ["no", "one", "two", "three", "four", "five", "six"]
+        .get(count)
+        .copied()
+        .unwrap_or("more")
+}
+
+/// Whether a peer session failed because a peer worker panicked. The
+/// session reports that as a failed worker; the panic stays on the worker's
+/// thread, where only libFuzzer's panic hook would see it.
+fn worker_panicked<'a>(
+    mut causes: impl Iterator<Item = &'a (dyn std::error::Error + 'static)>,
+) -> bool {
+    causes.any(|cause| {
+        cause
+            .downcast_ref::<tokio::task::JoinError>()
+            .is_some_and(tokio::task::JoinError::is_panic)
+    })
+}
+
+/// The held-header store's bounds, as far as its counts show them: admitted
+/// and pinned headers together number at most `MAX_SYNC_HEADERS`, and the
+/// evictable rest at most `MAX_HELD_HEADERS`. A header can be both admitted
+/// and pinned, so the evictable ones are at least those neither count covers.
+fn assert_held_headers_bounded(node: &Node) {
+    let (held, admitted, pinned) = node::fuzz::held_headers(node).expect("held header counts");
+    assert!(
+        admitted <= chain::MAX_SYNC_HEADERS && pinned <= chain::MAX_SYNC_HEADERS,
+        "{admitted} admitted or {pinned} pinned held headers exceed MAX_SYNC_HEADERS"
+    );
+    assert!(
+        held <= chain::MAX_HELD_HEADERS + chain::MAX_SYNC_HEADERS
+            && held.saturating_sub(admitted + pinned) <= chain::MAX_HELD_HEADERS,
+        "{held} held headers, {admitted} admitted and {pinned} pinned, exceed the store's bounds"
+    );
+}
+
+/// After a session with a hostile peer the node must still answer, its tip
+/// must be its active block at its height, its held headers must stay within
+/// their bounds, and once the tip changed a replay of the active chain must
+/// reach the same state. Says whether the tip changed.
+fn settled(node: &Node, before: &Value) -> &'static str {
+    let status = node
+        .status()
+        .expect("the node answers after a peer session");
+    let height = status["height"].as_u64().expect("status height");
+    assert_eq!(
+        Value::from(hex::encode(codec::block_hash(&active_block(node, height)))),
+        status["tip"],
+        "the tip is not the active block at the tip height"
+    );
+    assert_held_headers_bounded(node);
+    if status["tip"] == before["tip"] {
+        "same tip"
+    } else {
+        replay_agrees(node, &status);
+        "new tip"
+    }
+}
+
 /// A peer this node synchronizes from, as an outbound peer it chose: each
 /// request the node sends gets the input's next reply, and the peer closes
 /// once the script ends. Headers-first synchronization, the held-header
 /// store with its download pins, and validation of the blocks that follow
 /// all see what a hostile peer can send. Every listener is a new address to
 /// the node, so state it keeps per peer starts afresh while node-wide state
-/// carries over. Afterwards the node must still answer, its
-/// tip must be its active block at its height, and once the tip changed a
-/// replay of the active chain must reach the same state.
+/// carries over. Afterwards the node must settle (see `settled`).
 pub fn peer_sync(node: &Node, data: &[u8]) -> String {
-    let replies = sync_script(data);
+    let replies = script(data, SYNC_REPLIES);
     let before = node.status().expect("fixture status");
     let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let result = sync_runtime().block_on(async {
@@ -1737,36 +1809,33 @@ pub fn peer_sync(node: &Node, data: &[u8]) -> String {
         }
         result
     });
-    let status = node
-        .status()
-        .expect("the node answers after a peer session");
-    let height = status["height"].as_u64().expect("status height");
-    assert_eq!(
-        Value::from(hex::encode(codec::block_hash(&active_block(node, height)))),
-        status["tip"],
-        "the tip is not the active block at the tip height"
-    );
-    let tip = if status["tip"] == before["tip"] {
-        "same tip"
-    } else {
-        replay_agrees(node, &status);
-        "new tip"
-    };
+    let tip = settled(node, &before);
     let outcome = match result {
         Err(_) => panic!("a session with a scripted peer outlived {SYNC_LIMIT:?}"),
         // Whatever the session reports about itself, the checks above hold;
-        // what it reports, such as a header reply that failed while the
-        // block exchange went on, tells outcomes apart.
-        Ok(Ok(report)) => format!("synchronized {report:?}"),
-        Ok(Err(error)) => rejected(error),
+        // what it reports tells outcomes apart, first why a header reply
+        // ended the header requests while the block exchange went on: the
+        // stable runner drops what parentheses enclose and cuts labels short.
+        Ok(Ok(report)) => format!(
+            "synchronized, header error: {}, {} header rounds, {} blocks{}",
+            report.header_error.as_deref().unwrap_or("none"),
+            in_words(report.header_rounds),
+            how_many(report.blocks),
+            if report.deferred { ", deferred" } else { "" }
+        ),
+        Ok(Err(error)) => {
+            assert!(
+                !worker_panicked(error.chain()),
+                "a peer worker panicked: {error:#}"
+            );
+            rejected(error)
+        }
     };
     // What the runners tell apart comes first: labels are cut short.
     let requests = requests.lock().expect("requests");
-    let count = ["no", "one", "two", "three", "four", "five", "six"]
-        .get(requests.len())
-        .unwrap_or(&"more");
     format!(
-        "{tip}, {count} requests: {outcome}; sent {}",
+        "{tip}, {} requests: {outcome}; sent {}",
+        in_words(requests.len()),
         requests.join(", ")
     )
 }
@@ -1776,12 +1845,94 @@ pub fn peer_sync(node: &Node, data: &[u8]) -> String {
 /// `peer_wire::MAX_HEADERS`, then the node's locator request with blocks,
 /// then the node's own batch with an acknowledgement. The seeds extend the
 /// chain, reorganize it to a heavier branch from genesis whose headers are
-/// held first, deliver part of a branch, withhold its blocks, repeat or
-/// reverse headers, or answer with another chain, transport version or
+/// held first, deliver part of a branch, withhold its blocks, repeat,
+/// reverse or skip headers, change a header's target, or answer with
+/// another chain, transport version or
 /// message. A libFuzzer process mines its own fixture chain, so of the seeds
 /// `write_seed_corpus` wrote, only those from genesis connect there.
 fn sync_seeds(node: Option<&Node>) -> Vec<Vec<u8>> {
     let node = node.expect("sync seeds extend the fixture node's chain");
+    let SeedChains {
+        active,
+        extension,
+        branch,
+    } = seed_chains(node);
+    let headers = |blocks: &[Block]| Message::Headers {
+        chain: chain_id(),
+        version: peer_wire::TRANSPORT_VERSION,
+        headers: blocks.iter().map(|block| block.header.clone()).collect(),
+    };
+    let sync = |blocks: &[Block]| {
+        let mut locator: Vec<Hash> = blocks.last().map(codec::block_hash).into_iter().collect();
+        locator.push(genesis_hash());
+        Message::Sync(Sync {
+            chain: chain_id(),
+            locator,
+            blocks: blocks.to_vec(),
+            transactions: Vec::new(),
+        })
+    };
+    let reversed: Vec<Block> = branch.iter().rev().cloned().collect();
+    let repeated: Vec<Block> = branch.iter().chain(&branch).cloned().collect();
+    let (first, rest) = branch.split_at(2);
+    // A header that skips its parent, and one whose target was changed.
+    let unlinked = [branch[0].clone(), branch[2].clone()];
+    let mut retargeted = branch[0].clone();
+    retargeted.header.bits ^= 1;
+    let retargeted = [retargeted];
+    // In order: the branch's headers are held, and its blocks withheld,
+    // before a seed delivers them.
+    let scripts = [
+        vec![headers(&extension)],
+        vec![headers(&extension), sync(&extension), Message::Ack],
+        vec![headers(&branch), sync(&[]), Message::Ack],
+        vec![headers(&branch), sync(first), Message::Ack],
+        vec![headers(rest), sync(rest), Message::Ack],
+        vec![headers(first), sync(&branch), Message::Ack],
+        vec![headers(&branch), sync(&branch), Message::Ack],
+        vec![headers(&[]), sync(&branch), Message::Ack],
+        vec![headers(&[]), sync(&[]), Message::Ack],
+        vec![headers(&active), sync(&active), Message::Ack],
+        vec![headers(&reversed), sync(&reversed), Message::Ack],
+        vec![headers(&repeated), sync(&branch), Message::Ack],
+        // Header replies that fail their checks, which the block exchange outlives.
+        vec![headers(&unlinked), sync(&[]), Message::Ack],
+        vec![headers(&retargeted), sync(&[]), Message::Ack],
+        // A header round more than the node asks for.
+        vec![headers(&branch), headers(&[]), sync(&branch), Message::Ack],
+        vec![
+            Message::Headers {
+                chain: [1; 32],
+                version: peer_wire::TRANSPORT_VERSION,
+                headers: Vec::new(),
+            },
+            Message::Ack,
+        ],
+        // A transport version this node does not speak yet.
+        vec![Message::Headers {
+            chain: chain_id(),
+            version: peer_wire::TRANSPORT_VERSION + 1,
+            headers: Vec::new(),
+        }],
+        vec![Message::Ack],
+        vec![sync(&branch)],
+    ];
+    let mut seeds: Vec<Vec<u8>> = scripts.iter().map(|script| script_input(script)).collect();
+    seeds.push(Vec::new());
+    seeds
+}
+
+/// Blocks the peer session seeds send, from the fixture node's chain.
+struct SeedChains {
+    /// The active chain after genesis.
+    active: Vec<Block>,
+    /// Two blocks extending it.
+    extension: Vec<Block>,
+    /// A branch from genesis with more work than both together.
+    branch: Vec<Block>,
+}
+
+fn seed_chains(node: &Node) -> SeedChains {
     let height = node.status().expect("fixture status")["height"]
         .as_u64()
         .expect("fixture height");
@@ -1804,59 +1955,405 @@ fn sync_seeds(node: Option<&Node>) -> Vec<Vec<u8>> {
     let branch: Vec<Block> = (0..active.len() + extension.len() + 1)
         .map(|_| fork.mine(1_000_000).expect("branch block"))
         .collect();
-    let headers = |blocks: &[Block]| Message::Headers {
-        chain: chain_id(),
-        version: peer_wire::TRANSPORT_VERSION,
-        headers: blocks.iter().map(|block| block.header.clone()).collect(),
+    SeedChains {
+        active,
+        extension,
+        branch,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serving a hostile peer.
+
+/// The most messages one `peer_serve` input sends: a header request past
+/// the session's limit, then a locator request and the push after it.
+const SERVE_REQUESTS: usize = peer_wire::MAX_HEADER_ROUNDS + 3;
+
+fn serve_runtime() -> &'static tokio::runtime::Runtime {
+    // As for `sync_runtime`. Its own, so the two targets never share a
+    // scheduler when the stable runner runs them at once.
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("peer serve runtime")
+    })
+}
+
+fn reply_kind(message: &Message) -> &'static str {
+    match message {
+        Message::Sync(_) => "sync",
+        Message::Ack => "ack",
+        Message::GetAddresses { .. } => "get addresses",
+        Message::Addresses { .. } => "addresses",
+        Message::GetHeaders { .. } => "get headers",
+        Message::Headers { .. } => "headers",
+    }
+}
+
+/// The reply each message of a session gets, in order, while the session
+/// keeps to the protocol: each header request that opens it, up to
+/// `MAX_HEADER_ROUNDS`, gets headers; the locator request after them gets
+/// blocks, and the push after that an acknowledgement; an address request
+/// that opens a session gets addresses and ends it. Any other message ends
+/// the session unanswered, as may one the node refuses. Also says whether
+/// the list stops at a message this side could not decode, after which only
+/// the node's own reading decides.
+fn serve_order(requests: &[Option<Message>]) -> (Vec<&'static str>, bool) {
+    let mut replies: Vec<&'static str> = Vec::new();
+    for request in requests {
+        let Some(request) = request else {
+            return (replies, true);
+        };
+        let reply = match (request, replies.last().copied()) {
+            (Message::GetHeaders { .. }, None | Some("headers"))
+                if replies.len() < peer_wire::MAX_HEADER_ROUNDS =>
+            {
+                "headers"
+            }
+            (Message::Sync(_), None | Some("headers")) => "sync",
+            (Message::GetAddresses { .. }, None) => "addresses",
+            (Message::Sync(_), Some("sync")) => "ack",
+            _ => break,
+        };
+        replies.push(reply);
+    }
+    (replies, false)
+}
+
+/// The active chain, genesis first: each block's hash and header.
+fn active_chain(node: &Node) -> Vec<(Hash, Header)> {
+    let height = node.status().expect("fixture status")["height"]
+        .as_u64()
+        .expect("status height");
+    std::iter::once((genesis_hash(), genesis().header))
+        .chain((1..=height).map(|h| {
+            let block = active_block(node, h);
+            (codec::block_hash(&block), block.header)
+        }))
+        .collect()
+}
+
+/// The height of a locator's best match on `active`, as a node matches it.
+fn best_match(active: &[(Hash, Header)], locator: &[Hash]) -> Option<usize> {
+    locator
+        .iter()
+        .filter_map(|hash| active.iter().position(|(active, _)| active == hash))
+        .max()
+}
+
+/// The node's next reply, read as its requester reads one: a plain frame
+/// within the requester's limits. None once the node closed.
+async fn served_reply<R: tokio::io::AsyncRead + Unpin>(
+    read: &mut R,
+    requester: Limits,
+) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut length = [0; 4];
+    read.read_exact(&mut length).await.ok()?;
+    let length = u32::from_be_bytes(length) as usize;
+    assert!(
+        length <= requester.frame_bytes(),
+        "the node sent a frame larger than its requester can receive"
+    );
+    let mut payload = vec![0; length];
+    read.read_exact(&mut payload).await.ok()?;
+    Some(payload)
+}
+
+/// Each reply against the message it answers and the active chain before
+/// the session. Header replies precede any message that could change that
+/// chain, and so does a locator reply to a locator request without blocks.
+fn assert_served(requests: &[Option<Message>], replies: &[Message], active: &[(Hash, Header)]) {
+    let (order, open) = serve_order(requests);
+    assert!(
+        open || replies.len() <= order.len(),
+        "the node answered a message it must refuse: {order:?}, then {}",
+        reply_kind(&replies[order.len()])
+    );
+    for ((reply, expected), request) in replies.iter().zip(&order).zip(requests) {
+        assert_eq!(
+            reply_kind(reply),
+            *expected,
+            "a reply out of protocol order"
+        );
+        match (request.as_ref().expect("an answered message"), reply) {
+            (
+                Message::GetHeaders {
+                    version, locator, ..
+                },
+                Message::Headers {
+                    chain,
+                    version: chosen,
+                    headers,
+                },
+            ) => {
+                assert_eq!(*chain, chain_id(), "a header reply names another chain");
+                assert_eq!(
+                    *chosen,
+                    (*version).min(peer_wire::TRANSPORT_VERSION),
+                    "a header reply chose another transport version"
+                );
+                let base = best_match(active, locator)
+                    .expect("a header reply answers a locator with an active entry");
+                let available = (active.len() - 1 - base).min(peer_wire::MAX_HEADERS);
+                // A requester catching up on this chain is sent one header.
+                assert!(
+                    headers.len() == available || (headers.len() == 1 && available > 1),
+                    "a header reply of {} headers where {available} follow the best match",
+                    headers.len()
+                );
+                for (offset, header) in headers.iter().enumerate() {
+                    assert_eq!(
+                        *header,
+                        active[base + 1 + offset].1,
+                        "a header reply strays from the active chain"
+                    );
+                }
+            }
+            (Message::Sync(hello), Message::Sync(sent)) => {
+                assert_eq!(
+                    sent.chain,
+                    chain_id(),
+                    "a locator reply names another chain"
+                );
+                assert!(
+                    sent.locator.len() <= peer_wire::MAX_LOCATORS
+                        && sent.locator.last() == Some(&genesis_hash()),
+                    "a locator reply's own locator does not end at genesis"
+                );
+                // Blocks from the locator's best match on, each the next.
+                let mut previous = sent.blocks.first().map(|block| block.header.previous);
+                assert!(
+                    previous.is_none_or(|first| hello.locator.contains(&first)),
+                    "a locator reply's blocks do not follow its locator"
+                );
+                for block in &sent.blocks {
+                    assert_eq!(
+                        Some(block.header.previous),
+                        previous,
+                        "a locator reply's blocks are not consecutive"
+                    );
+                    previous = Some(codec::block_hash(block));
+                }
+                if hello.blocks.is_empty() {
+                    let base = best_match(active, &hello.locator)
+                        .expect("a locator reply answers a locator with an active entry");
+                    for (offset, block) in sent.blocks.iter().enumerate() {
+                        assert_eq!(
+                            Some(codec::block_hash(block)),
+                            active.get(base + 1 + offset).map(|(hash, _)| *hash),
+                            "a locator reply strays from the active chain"
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A host that connects to the node's peer port, from another loopback
+/// address for each input, as any host that reaches it can. It sends the
+/// input's messages one at a time, each once the node answered the one
+/// before, and closes when the script ends or the node stops answering.
+/// This drives the node's inbound handler: header requests with a hostile
+/// locator, transport version and declared capacity, their round limit,
+/// the locator request and its blocks, the push after it and address
+/// requests. Every reply must fit the frame its requester can receive,
+/// decode within the capacity that requester declared with exactly one
+/// encoding, keep to protocol order and match the active chain from the
+/// locator's best match (see `assert_served`); then the node must settle
+/// (see `settled`).
+pub fn peer_serve(node: &Node, data: &[u8]) -> String {
+    let [wide, _] = limits();
+    let messages = script(data, SERVE_REQUESTS);
+    let requests: Vec<Option<Message>> = messages
+        .iter()
+        .map(|message| peer_wire::decode(message, wide).ok())
+        .collect();
+    // The opening header requests declare the capacity the session's blocks fit.
+    let declared = requests
+        .iter()
+        .take(peer_wire::MAX_HEADER_ROUNDS)
+        .map_while(|request| match request {
+            Some(Message::GetHeaders { capacity, .. }) => Some(*capacity),
+            _ => None,
+        })
+        .last();
+    let requester = declared.map_or(wide, |capacity| Limits::for_capacity(config(), capacity));
+    let before = node.status().expect("fixture status");
+    let active = active_chain(node);
+    let session = serve_runtime().block_on(async {
+        // Systems that answer only 127.0.0.1 share its record.
+        let listener = match tokio::net::TcpListener::bind((sync_peer_address(), 0)).await {
+            Ok(listener) => listener,
+            Err(_) => tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("loopback listener"),
+        };
+        let address = listener.local_addr().expect("listener address");
+        let socket = tokio::net::TcpSocket::new_v4().expect("client socket");
+        let _ = socket.bind(SocketAddr::from((sync_peer_address(), 0)));
+        let (accepted, connected) = tokio::join!(listener.accept(), socket.connect(address));
+        let (stream, _) = accepted.expect("loopback accept");
+        let (read, mut write) = connected.expect("loopback connect").into_split();
+        let client = async move {
+            let mut read = tokio::io::BufReader::new(read);
+            let mut replies = Vec::new();
+            for message in messages {
+                let mut frame = (message.len() as u32).to_be_bytes().to_vec();
+                frame.extend_from_slice(&message);
+                if write.write_all(&frame).await.is_err() {
+                    break;
+                }
+                match served_reply(&mut read, requester).await {
+                    Some(reply) => replies.push(reply),
+                    None => break,
+                }
+            }
+            // Closing ends a session that waits for more; nothing may follow.
+            drop(write);
+            assert!(
+                served_reply(&mut read, requester).await.is_none(),
+                "the node sent a reply nobody asked for"
+            );
+            replies
+        };
+        tokio::time::timeout(SYNC_LIMIT, async {
+            tokio::join!(node::fuzz::peer_session(node, stream), client)
+        })
+        .await
+    });
+    let Ok((ended, replies)) = session else {
+        panic!("a session with a scripted peer outlived {SYNC_LIMIT:?}")
     };
-    let sync = |blocks: &[Block]| {
-        let mut locator: Vec<Hash> = blocks.last().map(codec::block_hash).into_iter().collect();
-        locator.push(genesis_hash());
+    // Each reply decodes as its requester decodes it, with one encoding.
+    let replies: Vec<Message> = replies
+        .iter()
+        .map(|payload| {
+            let reply = peer_wire::decode(payload, requester)
+                .expect("the node's reply decodes within its requester's limits");
+            assert_eq!(
+                peer_wire::encode(&reply, requester).expect("a reply re-encodes"),
+                *payload,
+                "the node's reply has exactly one encoding"
+            );
+            reply
+        })
+        .collect();
+    assert_served(&requests, &replies, &active);
+    let tip = settled(node, &before);
+    let ended = match ended {
+        Ok(()) => "served".to_owned(),
+        Err(error) => {
+            assert!(
+                !worker_panicked(error.chain()),
+                "a peer worker panicked: {error:#}"
+            );
+            rejected(error)
+        }
+    };
+    let kinds: Vec<String> = replies.iter().map(message_kind).collect();
+    format!(
+        "{tip}, {} replies: {ended}; got {}",
+        in_words(replies.len()),
+        kinds.join(", ")
+    )
+}
+
+/// Sessions from the fixture node's chain: header requests from genesis,
+/// from the node's tip and from a block behind it, each followed by a
+/// locator request and an empty push; declared capacities and transport
+/// versions at their extremes; one header request too many; locators with
+/// no active entry or none at all, and another chain; address requests;
+/// messages out of order; and last, as they change the chain, a version 1
+/// peer that pushes an extension of the chain, one whose locator request
+/// carries a heavier branch from genesis, which a first message may not,
+/// and one that pushes that branch. As for `peer_sync`, a
+/// libFuzzer process mines its own fixture chain, so of the seeds
+/// `write_seed_corpus` wrote, only those from genesis match it.
+fn serve_seeds(node: Option<&Node>) -> Vec<Vec<u8>> {
+    let node = node.expect("serve seeds name the fixture node's chain");
+    let SeedChains {
+        active,
+        extension,
+        branch,
+    } = seed_chains(node);
+    let capacity = config().initial.block_bytes;
+    let genesis = [genesis_hash()];
+    // A locator at the node's tip, as the node writes its own, and one a block behind.
+    let tip: Vec<Hash> = active
+        .iter()
+        .rev()
+        .map(codec::block_hash)
+        .chain(genesis)
+        .collect();
+    let behind = &tip[1..];
+    let get_headers = |version: u8, capacity: u64, locator: &[Hash]| Message::GetHeaders {
+        chain: chain_id(),
+        version,
+        capacity,
+        locator: locator.to_vec(),
+    };
+    let request = |locator: &[Hash]| get_headers(peer_wire::TRANSPORT_VERSION, capacity, locator);
+    let sync = |locator: &[Hash], blocks: &[Block]| {
         Message::Sync(Sync {
             chain: chain_id(),
-            locator,
+            locator: locator.to_vec(),
             blocks: blocks.to_vec(),
             transactions: Vec::new(),
         })
     };
-    let reversed: Vec<Block> = branch.iter().rev().cloned().collect();
-    let repeated: Vec<Block> = branch.iter().chain(&branch).cloned().collect();
-    let (first, rest) = branch.split_at(2);
-    // In order: the branch's headers are held, and its blocks withheld,
-    // before a seed delivers them.
+    let addresses = Message::GetAddresses {
+        chain: chain_id(),
+        node: [3; 32],
+        advertise: Some(SocketAddr::from(([203, 0, 113, 5], 18481))),
+    };
     let scripts = [
-        vec![headers(&extension)],
-        vec![headers(&extension), sync(&extension), Message::Ack],
-        vec![headers(&branch), sync(&[]), Message::Ack],
-        vec![headers(&branch), sync(first), Message::Ack],
-        vec![headers(rest), sync(rest), Message::Ack],
-        vec![headers(first), sync(&branch), Message::Ack],
-        vec![headers(&branch), sync(&branch), Message::Ack],
-        vec![headers(&[]), sync(&branch), Message::Ack],
-        vec![headers(&[]), sync(&[]), Message::Ack],
-        vec![headers(&active), sync(&active), Message::Ack],
-        vec![headers(&reversed), sync(&reversed), Message::Ack],
-        vec![headers(&repeated), sync(&branch), Message::Ack],
-        // A header round more than the node asks for.
-        vec![headers(&branch), headers(&[]), sync(&branch), Message::Ack],
+        vec![request(&genesis), sync(&genesis, &[]), sync(&genesis, &[])],
+        vec![request(&tip), sync(&tip, &[]), sync(&tip, &[])],
         vec![
-            Message::Headers {
-                chain: [1; 32],
-                version: peer_wire::TRANSPORT_VERSION,
-                headers: Vec::new(),
-            },
-            Message::Ack,
+            request(behind),
+            request(&genesis),
+            sync(behind, &[]),
+            sync(behind, &[]),
         ],
-        // A transport version this node does not speak yet.
+        vec![
+            get_headers(u8::MAX, 0, &genesis),
+            sync(&genesis, &[]),
+            sync(&genesis, &[]),
+        ],
+        vec![
+            get_headers(peer_wire::TRANSPORT_VERSION, u64::MAX, &genesis),
+            sync(&genesis, &[]),
+            sync(&genesis, &[]),
+        ],
+        vec![request(&genesis); peer_wire::MAX_HEADER_ROUNDS + 1],
+        vec![request(&[[7; 32]])],
+        vec![request(&[])],
+        vec![Message::GetHeaders {
+            chain: [1; 32],
+            version: peer_wire::TRANSPORT_VERSION,
+            capacity,
+            locator: genesis.to_vec(),
+        }],
+        vec![addresses.clone()],
+        vec![request(&genesis), addresses],
+        vec![Message::Ack],
+        vec![sync(&genesis, &[]), Message::Ack],
         vec![Message::Headers {
             chain: chain_id(),
-            version: peer_wire::TRANSPORT_VERSION + 1,
+            version: peer_wire::TRANSPORT_VERSION,
             headers: Vec::new(),
         }],
-        vec![Message::Ack],
-        vec![sync(&branch)],
+        vec![sync(&genesis, &[]), sync(&tip, &extension)],
+        vec![sync(&genesis, &branch), sync(&genesis, &[])],
+        vec![sync(&genesis, &[]), sync(&genesis, &branch)],
+        vec![request(&genesis), sync(&genesis, &[]), sync(&genesis, &[])],
     ];
-    let mut seeds: Vec<Vec<u8>> = scripts.iter().map(|script| sync_input(script)).collect();
+    let mut seeds: Vec<Vec<u8>> = scripts.iter().map(|script| script_input(script)).collect();
     seeds.push(Vec::new());
     seeds
 }

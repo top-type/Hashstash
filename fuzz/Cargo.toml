@@ -142,3 +142,10 @@ path = "fuzz_targets/peer_sync.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "peer_serve"
+path = "fuzz_targets/peer_serve.rs"
+test = false
+doc = false
+bench = false

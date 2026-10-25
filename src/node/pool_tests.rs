@@ -2097,11 +2097,13 @@ fn a_waiting_block_submission_goes_ahead_of_queued_admissions() {
     assert_eq!(queued(&node), 1);
     assert!(pool(&node).0.is_empty());
     node.blocks_waiting.fetch_sub(1, Ordering::AcqRel);
-    // The block is stored first; the newcomer then enters the new tip's
-    // pool, once its recovery selection has run.
+    // The block is stored first, with its recovery selection; the newcomer
+    // then enters the new tip's pool, admitted on a thread of its own so the
+    // submitter need not wait for it.
     let block = empty_block(&node);
     assert!(node.submit_block(block.clone()).unwrap());
-    assert_eq!(selections(), 2);
+    assert_eq!(selections(), 1);
+    node.settle_admissions().unwrap();
     let (selection, _, tip) = pool(&node);
     assert_eq!(
         (selection, tip),
@@ -2268,6 +2270,62 @@ fn a_child_waiting_for_its_parent_goes_on_once_the_parent_is_stored() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn a_new_tip_is_reported_before_the_admission_it_starts() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let view = snapshot(&node);
+    let state = view.chain.tip_state();
+    let paid = payment(
+        view.chain.config.as_ref(),
+        state,
+        &SECRET,
+        nonce(&node, &key()),
+        other(),
+        1,
+        0,
+    );
+    // A relayed newcomer waits in the admission queue for the next block.
+    node.queue_admissions(
+        vec![Newcomer::new(paid.clone(), None, true)],
+        state.settings.block_bytes,
+    );
+    // Once the block is stored, the node lock is taken elsewhere, so the
+    // admission that storing starts cannot run until it is released.
+    let (stored, store) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel::<()>();
+    let (answered, answer) = mpsc::channel();
+    let submitter = node.clone();
+    let block = empty_block(&node);
+    let thread = std::thread::spawn(move || {
+        BLOCK_STORED_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let _ = stored.send(());
+                let _ = resumed.recv();
+            }));
+        });
+        let _ = answered.send(submitter.submit_block(block));
+    });
+    store
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the block was stored");
+    let lock = node.locked().unwrap();
+    drop(resume);
+    // The submitter, such as a Stratum finder awaiting its reply and next
+    // job, is answered at once; the admission waits on a thread of its own.
+    let reply = answer.recv_timeout(Duration::from_secs(5));
+    drop(lock);
+    thread.join().unwrap();
+    let reply = reply.expect("the submitter waited for the admission");
+    assert!(reply.unwrap(), "the block became the tip");
+    node.settle_admissions().unwrap();
+    assert_eq!(pool(&node).0, vec![paid]);
+}
+
+#[test]
 fn a_side_branch_flood_from_one_source_spends_only_its_own_share() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 16 * 1024);
@@ -2381,6 +2439,72 @@ fn a_template_build_is_claimed_for_the_tip_it_extends() {
     let mined = mined.unwrap();
     assert_eq!(mined.header.previous, tip);
     assert_eq!(snapshot(&node).chain.tip_hash(), codec::block_hash(&mined));
+}
+
+/// Run `request` on another thread while another build holds a claim for
+/// every tip, taken before that tip arrives and released only once the next
+/// one has, so a request waiting for that claim always finds the tip moved
+/// on. Up to twelve new tips arrive while it runs. What the request returned
+/// meanwhile, if it did, and the new tips.
+fn claims_while_the_tip_keeps_moving<T: Send + 'static>(
+    node: &Node,
+    request: impl FnOnce(&Node) -> T + Send + 'static,
+) -> (Option<T>, Vec<Hash>) {
+    let mut held = node.template_builds.claim(snapshot(node).chain.tip_hash());
+    let (done, returned) = mpsc::channel();
+    let requester = node.clone();
+    let thread = std::thread::spawn(move || {
+        let _ = done.send(request(&requester));
+    });
+    let mut tips = Vec::new();
+    let mut outcome = None;
+    for _ in 0..12 {
+        // Let the request reach its wait for the claimed tip.
+        if let Ok(served) = returned.recv_timeout(Duration::from_millis(300)) {
+            outcome = Some(served);
+            break;
+        }
+        let block = empty_block(node);
+        let tip = codec::block_hash(&block);
+        let next = node.template_builds.claim(tip);
+        node.submit_block(block).unwrap();
+        held = next;
+        tips.push(tip);
+    }
+    let outcome = outcome.or_else(|| returned.recv_timeout(Duration::from_millis(300)).ok());
+    // Otherwise the request goes on only once the tip rests.
+    drop(held);
+    thread.join().unwrap();
+    (outcome, tips)
+}
+
+#[test]
+fn a_template_request_ends_while_the_tip_moves_during_each_claim_wait() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 64 * 1024);
+    // Each claim the request waited for counts as one of its
+    // TEMPLATE_BUILD_ATTEMPTS, so once a new tip has overtaken that many, it
+    // is served an empty template for the tip then current, unstored and due
+    // again at once, rather than waiting until the tip rests.
+    let (served, tips) =
+        claims_while_the_tip_keeps_moving(&node, |node| node.template_shared(Freshness::Throttled));
+    let (block, retry) = served
+        .expect("the request returned while the tip kept moving")
+        .unwrap();
+    assert!(tips.len() > TEMPLATE_BUILD_ATTEMPTS as usize, "{tips:?}");
+    assert!(tips.contains(&block.header.previous));
+    assert!(block.transactions.is_empty());
+    assert!(retry.is_some_and(|retry| retry <= Instant::now()));
+    assert!(node.locked().unwrap().template.is_none());
+    // A block for another payout key stops waiting as well, and builds for
+    // the tip then current.
+    let (mined, tips) =
+        claims_while_the_tip_keeps_moving(&node, |node| node.mine_to(1_000_000, other()));
+    let mined = mined
+        .expect("the block was mined while the tip kept moving")
+        .unwrap();
+    assert!(tips.len() > TEMPLATE_BUILD_ATTEMPTS as usize, "{tips:?}");
+    assert!(tips.contains(&mined.header.previous));
 }
 
 #[test]
@@ -2545,7 +2669,7 @@ fn a_side_block_rebuilding_its_parent_state_is_bounded_before_any_replay() {
 }
 
 #[test]
-fn a_reorg_replay_sizes_its_lock_holds_by_their_time() {
+fn a_reorg_replay_runs_one_historical_block_per_lock_hold() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 16 * 1024);
     for _ in 0..92 {
@@ -2570,21 +2694,17 @@ fn a_reorg_replay_sizes_its_lock_holds_by_their_time() {
         }
         assert!(branch.len() < 200, "the branch never claimed more work");
     }
-    // The first hold replays one historical block. Each later hold replays
-    // as many as fit REPLAY_HOLD_TIME at the pace the previous one took:
-    // one after holds counted as a second each, and REPLAY_STEPS_PER_HOLD
-    // after a quick one.
+    // Every node-lock hold replays one historical block, whatever the holds
+    // before it took: these blocks are empty, so every hold is quick, and a
+    // hold sized by the pace of a quick one could still run several heavy
+    // blocks under the lock.
     let holds = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let recorded = holds.clone();
     REPLAY_HOLD_HOOK.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move || {
-            let mut recorded = recorded.borrow_mut();
-            recorded.push(crate::chain::REPLAYED_BLOCKS.with(|count| count.replace(0)));
-            if recorded.len() <= 2 {
-                Duration::from_secs(1)
-            } else {
-                Duration::ZERO
-            }
+            recorded
+                .borrow_mut()
+                .push(crate::chain::REPLAYED_BLOCKS.with(|count| count.replace(0)));
         }));
     });
     crate::chain::REPLAYED_BLOCKS.with(|count| count.set(0));
@@ -2592,11 +2712,10 @@ fn a_reorg_replay_sizes_its_lock_holds_by_their_time() {
     REPLAY_HOLD_HOOK.with(|hook| hook.borrow_mut().take());
     assert!(!first.unwrap(), "stored, not yet the tip");
     assert!(stored(&node, &branch[0]));
-    assert_eq!(*holds.borrow(), vec![1, 1, 1, REPLAY_STEPS_PER_HOLD, 2]);
     assert_eq!(
-        holds.borrow().iter().sum::<usize>(),
-        45 - 32,
-        "each historical block was replayed once"
+        *holds.borrow(),
+        vec![1; 45 - 32],
+        "each historical block was replayed once, in a hold of its own"
     );
     // The rest of the branch then takes over.
     for block in &branch[1..] {

@@ -810,18 +810,15 @@ const SIDE_SOURCE_BLOCKS_PER_TIP: u64 = 1;
 /// Sources tracked for side-branch shares; fully refilled ones are forgotten.
 const MAX_SIDE_SOURCES: usize = 1024;
 /// Historical state replay one block submission may run, in steps between
-/// which the node lock is released: in all, and per lock hold for a block
-/// that would become the tip and for a side block. Every hold of a side
-/// block is charged to the side-validation budgets, which are checked again
-/// before the next. A block that would become the tip is never refused, so
-/// its holds are sized by time instead: its first hold replays one step, and
-/// each later one as many as fit REPLAY_HOLD_TIME at the pace the previous
-/// hold measured, at least one and at most REPLAY_STEPS_PER_HOLD (see
-/// [replay_steps_after]).
+/// which the node lock is released: in all, and per lock hold. One step per
+/// hold bounds every hold to one historical block's execution, however
+/// costly that block and however quick the hold before it: a block that
+/// would become the tip is never refused, so nothing else would stop a
+/// hold of it, and every hold of a side block is also charged to the
+/// side-validation budgets, which are checked again before the next. Each
+/// further hold repeats only the block's own checks that precede its replay.
 const REPLAY_STEPS: usize = 64;
-const REPLAY_STEPS_PER_HOLD: usize = 8;
-const SIDE_REPLAY_STEPS_PER_HOLD: usize = 1;
-const REPLAY_HOLD_TIME: Duration = Duration::from_millis(50);
+const REPLAY_STEPS_PER_HOLD: usize = 1;
 /// Spends from accounts that a pending transfer creates, held until that
 /// funding confirms: in all, per sender and per untrusted holder (see
 /// [Holder]), and the new tips one may wait for. They also stay within one
@@ -1470,10 +1467,10 @@ impl Drop for ValidatingClaim<'_> {
     }
 }
 
-/// Template builds at once. Each is claimed for the parent it extends. A
-/// build for the tip waits only for another build of that same parent, whose
-/// result it then reuses; a build that a new tip overtook stops at its next
-/// step, so it delays the new tip's by at most the step it is in.
+/// Template builds at once. Each full build is claimed for the parent it
+/// extends. A build for the tip waits only for another build of that same
+/// parent, whose result it then reuses; a build that a new tip overtook stops
+/// at its next step, so it delays the new tip's by at most the step it is in.
 const MAX_TEMPLATE_BUILDS: usize = 2;
 /// Template builds in progress, by the parent each extends.
 #[derive(Default)]
@@ -1513,17 +1510,6 @@ impl Drop for BuildClaim<'_> {
     }
 }
 
-/// Replay steps for the next node-lock hold of a block that would become
-/// the tip, after a hold that ran `granted` steps in `spent`: as many as fit
-/// REPLAY_HOLD_TIME at that pace, at least one and at most
-/// REPLAY_STEPS_PER_HOLD. After a slow step the next hold runs one.
-fn replay_steps_after(granted: usize, spent: Duration) -> usize {
-    let fit = REPLAY_HOLD_TIME.as_nanos().saturating_mul(granted as u128) / spent.as_nanos().max(1);
-    usize::try_from(fit)
-        .unwrap_or(usize::MAX)
-        .clamp(1, REPLAY_STEPS_PER_HOLD)
-}
-
 #[cfg(test)]
 thread_local! {
     /// Run on this thread once a submitted block that became the tip is
@@ -1531,8 +1517,8 @@ thread_local! {
     static BLOCK_STORED_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
     /// Run on this thread after each node-lock hold of a block that would
-    /// become the tip; it returns how long to count that hold as.
-    static REPLAY_HOLD_HOOK: std::cell::RefCell<Option<Box<dyn FnMut() -> Duration>>> =
+    /// become the tip that was granted replay.
+    static REPLAY_HOLD_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -1722,9 +1708,10 @@ enum Freshness {
     /// tip is always built at once.
     Throttled,
 }
-/// Template builds one request runs while new tips keep overtaking them.
-/// After these it is served an empty template for the tip then current,
-/// which clears no trades (see [Node::template_shared]).
+/// Build claims one request takes while new tips keep overtaking them, the
+/// builds it ran or the ones it waited for. After these it is served an
+/// empty template for the tip then current, which clears no trades (see
+/// [Node::template_shared]).
 const TEMPLATE_BUILD_ATTEMPTS: u32 = 3;
 /// A stored side-branch block whose descendants a peer may still provide,
 /// and the source that delivered it (see `network_guard::peer_source`).
@@ -4290,13 +4277,13 @@ impl Node {
     /// The configured miner's template for the current tip, committing to the
     /// installed selection. Finishing a block clears its batch trades, so the
     /// build runs outside the node lock; the lock is held only to capture the
-    /// selection and to store the result. Each build is claimed for the tip
-    /// it extends: a request waits only for a build of the same parent, whose
-    /// result it then reuses (see [TemplateBuilds]), and a new tip abandons a
-    /// build for the old one at its next step, so new-tip work waits for an
-    /// outdated build only until that step ends. The instant returned with a
-    /// template that lags the selection or the tip is when to ask again; only
-    /// Throttled templates lag the selection.
+    /// selection and to store the result. Each full build is claimed for the
+    /// tip it extends: a request waits only for a build of the same parent,
+    /// whose result it then reuses (see [TemplateBuilds]), and a new tip
+    /// abandons a build for the old one at its next step, so new-tip work
+    /// waits for an outdated build only until that step ends. The instant
+    /// returned with a template that lags the selection or the tip is when to
+    /// ask again; only Throttled templates lag the selection.
     fn template_shared(&self, freshness: Freshness) -> Result<(Arc<Block>, Option<Instant>)> {
         let served = |i: &Inner| -> Option<(Arc<Block>, Option<Instant>)> {
             let entry = i.template.as_ref()?;
@@ -4323,33 +4310,36 @@ impl Node {
             let _build = self.template_builds.claim(parent);
             // A new tip needs proof of work, so a repeat is rare. While the
             // tip keeps moving, as during catch-up, a request stops after
-            // TEMPLATE_BUILD_ATTEMPTS builds rather than holding a build
-            // slot, and a Stratum worker, until it rests. Each of those stops
-            // at the next step once a new tip arrives and starts again on it.
-            // The request is then served an empty template for the tip then
-            // current: it clears no trades, so it runs to its end, holding its
-            // slot only briefly, and is served unstored and due again at
-            // once, so Stratum connections ask for the full template as soon
-            // as their refresh interval allows.
-            let (job, selection, generation, mut parked, empty) = {
+            // TEMPLATE_BUILD_ATTEMPTS claims rather than holding a build
+            // slot, and a Stratum worker, until it rests. Every claim counts:
+            // one whose build stopped at its next step once a new tip arrived,
+            // and one that a new tip overtook while the request waited for it,
+            // as for another request's build of the same parent. The request
+            // is then served an empty template for the tip then current, even
+            // without a claim for that tip: it clears no trades, so it runs to
+            // its end, holding a slot only briefly, and is served unstored and
+            // due again at once, so Stratum connections ask for the full
+            // template as soon as their refresh interval allows.
+            attempt += 1;
+            let empty = attempt > TEMPLATE_BUILD_ATTEMPTS;
+            let (job, selection, generation, mut parked) = {
                 let mut i = self.locked()?;
                 // Another build may have finished while this one waited.
                 if let Some(served) = served(&i) {
                     return Ok(served);
                 }
                 // A new tip arrived while this one waited: claim that tip
-                // instead, so a build is always claimed for the parent it
-                // extends and a build of it never runs twice at once.
-                if i.chain.tip_hash() != parent {
+                // instead, so a full build is always claimed for the parent
+                // it extends and never runs twice at once.
+                let tip = i.chain.tip_hash();
+                if tip != parent && !empty {
                     continue;
                 }
-                attempt += 1;
-                let empty = attempt > TEMPLATE_BUILD_ATTEMPTS;
                 self.refresh_stale_pool(&mut i)?;
                 let parked = i
                     .template
                     .as_ref()
-                    .filter(|entry| entry.tip == parent)
+                    .filter(|entry| entry.tip == tip)
                     .map(|entry| entry.parked.clone())
                     .unwrap_or_default();
                 let transactions = if empty {
@@ -4365,7 +4355,6 @@ impl Node {
                     i.selection_revision,
                     self.tip_generation.load(Ordering::Acquire),
                     parked,
-                    empty,
                 )
             };
             let stale = || !empty && self.tip_generation.load(Ordering::Acquire) != generation;
@@ -4552,20 +4541,22 @@ impl Node {
         Ok(body)
     }
     /// Returns whether the block became the tip. A committed block is reported
-    /// as accepted even when the following pool recovery fails.
+    /// as accepted even when the following pool recovery fails, and without
+    /// waiting for the transaction admission that a new tip starts (see
+    /// [Node::drain_admissions_detached]).
     pub fn submit_block(&self, block: Block) -> Result<bool> {
         self.submit_block_from(block, None)
     }
     /// [Node::submit_block] for a block that `source` relayed, or that was
     /// submitted locally. The node lock is held only to check the block
-    /// against the chain, in bounded replay steps between which it is
-    /// released, and to store it: execution, which may clear batch trades
-    /// for seconds, runs without it, so admission, templates and reads go
-    /// on meanwhile. A block that would not become the tip replays its
-    /// parent state and executes only within the side-branch bounds (see
-    /// [Node::side_permit]), checked before any of that work and between
-    /// its replay steps; otherwise its header is held, as the side-branch
-    /// admission policy holds it.
+    /// against the chain, in replay steps of at most one historical block
+    /// between which it is released, and to store it: execution, which may
+    /// clear batch trades for seconds, runs without it, so admission,
+    /// templates and reads go on meanwhile. A block that would not become
+    /// the tip replays its parent state and executes only within the
+    /// side-branch bounds (see [Node::side_permit]), checked before any of
+    /// that work and between its replay steps; otherwise its header is held,
+    /// as the side-branch admission policy holds it.
     fn submit_block_from(&self, block: Block, source: Option<IpAddr>) -> Result<bool> {
         // A parent another worker is still validating is stored first.
         drop(self.validating.settle(&block.header.previous));
@@ -4573,35 +4564,30 @@ impl Node {
         // The execution slot of a block that would not become the tip.
         let mut slot = None;
         let mut replay = REPLAY_STEPS;
-        // Replay steps for the next hold of a block that would become the
-        // tip, sized by time (see [replay_steps_after]).
-        let mut per_hold = 1;
         let validation = loop {
             let mut i = self.locked_for_block()?;
             let height = i.chain.tip_height();
             let started = Instant::now();
             let mut granted = 0;
             let begun = i.chain.begin_submission(&block, now(), &mut |side| {
-                let steps = if side {
+                if side {
                     self.side_permit(&mut slot, source, height)?;
-                    SIDE_REPLAY_STEPS_PER_HOLD
-                } else {
-                    per_hold
-                };
-                granted = steps.min(replay);
+                }
+                granted = REPLAY_STEPS_PER_HOLD.min(replay);
                 Ok(Some(granted))
             });
-            let spent = started.elapsed();
             // A side block's checks and replay under the lock are charged
-            // as its execution is; a block that would become the tip sizes
-            // its next hold by this one's pace.
+            // as its execution is.
             if slot.is_some() {
-                self.charge_side(source, spent);
-            } else if granted > 0 {
-                #[cfg(test)]
-                let spent = REPLAY_HOLD_HOOK
-                    .with(|hook| hook.borrow_mut().as_mut().map_or(spent, |hook| hook()));
-                per_hold = replay_steps_after(granted, spent);
+                self.charge_side(source, started.elapsed());
+            }
+            #[cfg(test)]
+            if slot.is_none() && granted > 0 {
+                REPLAY_HOLD_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().as_mut() {
+                        hook();
+                    }
+                });
             }
             match begun {
                 Ok(Some(validation)) => break validation,
@@ -4691,12 +4677,59 @@ impl Node {
             }
         });
         // Spends whose funding just confirmed, and relayed newcomers that
-        // waited for the block, go through admission now.
+        // waited for the block, go through admission now, without holding
+        // the submitter.
         self.queue_admissions(funded, block_bytes);
-        if let Err(error) = self.drain_admissions() {
-            eprintln!("Queued transaction admission deferred: {error:#}");
-        }
+        self.drain_admissions_detached();
         Ok(true)
+    }
+    /// Whether [Node::drain_admissions] would admit anything now.
+    fn admission_ready(&self) -> bool {
+        let mut admission = self.admission.unpoisoned();
+        !admission.queue.is_empty()
+            && self.blocks_waiting.load(Ordering::Acquire) == 0
+            && admission.budget.wait(Instant::now()).is_zero()
+    }
+    /// [Node::drain_admissions] on a thread of its own, so whoever stored a
+    /// new tip, such as a Stratum finder awaiting its reply and next job, or
+    /// a peer worker with more blocks to submit, goes on at once rather than
+    /// after up to a node-wide burst of relay admission. Nothing starts while
+    /// nothing would be admitted: an admission already running takes what is
+    /// queued meanwhile, and what waits for credit or a block submission
+    /// waits for the next drain, as it would here.
+    fn drain_admissions_detached(&self) {
+        if !self.admission_ready() {
+            return;
+        }
+        let node = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("hashstash-admission".into())
+            .spawn(move || {
+                if let Err(error) = node.drain_admissions() {
+                    eprintln!("Queued transaction admission deferred: {error:#}");
+                }
+            });
+        if let Err(error) = spawned {
+            eprintln!("Admission thread unavailable, admitting in place: {error}");
+            if let Err(error) = self.drain_admissions() {
+                eprintln!("Queued transaction admission deferred: {error:#}");
+            }
+        }
+    }
+    /// Wait for admission running on another thread, such as the one a new
+    /// tip started, then admit what is still queued while admission could
+    /// run, so the caller sees the pool those admissions leave.
+    fn settle_admissions(&self) -> Result<()> {
+        loop {
+            // A drain in progress holds this until it is done.
+            let run = self.admission_run.unpoisoned();
+            let ready = self.admission_ready();
+            drop(run);
+            if !ready {
+                return Ok(());
+            }
+            self.drain_admissions()?;
+        }
     }
     /// Admit a block that would not become the tip to replay its parent
     /// state and execute, into `slot`: one at a time node-wide, while
@@ -4881,6 +4914,9 @@ impl Node {
     fn mining_job_eligible(&self, block: &Block) -> Result<bool> {
         Ok(self.read_view()?.chain.tip_hash() == block.header.previous)
     }
+    /// A development block for the configured miner. It returns once the
+    /// admission its new tip started has run, so its caller sees the pool
+    /// that the block left, as [Node::mine_to] does.
     pub fn mine(&self, max_attempts: u64) -> Result<Block> {
         ensure!(
             (1..=100_000_000).contains(&max_attempts),
@@ -4888,6 +4924,9 @@ impl Node {
         );
         let block = Chain::mine(self.template()?, max_attempts)?;
         self.submit_block(block.clone())?;
+        if let Err(error) = self.settle_admissions() {
+            eprintln!("Queued transaction admission deferred: {error:#}");
+        }
         Ok(block)
     }
     fn mine_to(&self, max_attempts: u64, recipient: PublicKey) -> Result<Block> {
@@ -4905,14 +4944,19 @@ impl Node {
         // Mining rewards affect the complete post-state commitment. Build a new
         // candidate without changing the configured miner or its Stratum
         // cache, finished outside the node lock like every template.
+        let mut claims = 0;
         let candidate = loop {
             let parent = self.locked()?.chain.tip_hash();
             let _build = self.template_builds.claim(parent);
+            claims += 1;
             let job = {
                 let i = self.locked()?;
                 // A new tip arrived while this waited: claim that tip
                 // instead, so the build is claimed for the parent it extends.
-                if i.chain.tip_hash() != parent {
+                // While the tip keeps moving, it stops waiting after
+                // TEMPLATE_BUILD_ATTEMPTS claims and builds for the tip then
+                // current under the claim it holds.
+                if i.chain.tip_hash() != parent && claims <= TEMPLATE_BUILD_ATTEMPTS {
                     continue;
                 }
                 let candidates: Vec<Transaction> = i.pending().cloned().collect();
@@ -4932,6 +4976,9 @@ impl Node {
         };
         let block = Chain::mine(candidate, max_attempts)?;
         self.submit_block(block.clone())?;
+        if let Err(error) = self.settle_admissions() {
+            eprintln!("Queued transaction admission deferred: {error:#}");
+        }
         Ok(block)
     }
     fn locator(chain: &Chain) -> Vec<Hash> {

@@ -47,13 +47,17 @@ pub const FRAME_PROGRESS_WINDOW: Duration = Duration::from_secs(2);
 pub const INBOUND_PEER_SLOTS: usize = 16;
 pub const RESERVED_PEER_SLOTS: usize = 4;
 pub const VERIFIED_PEER_SLOTS: usize = 4;
-/// Concurrent inbound sessions from one network group (IPv4 /16, IPv6 /32).
+/// Concurrent inbound sessions from one network group (IPv4 /16, IPv6 /32)
+/// within its cap. While general slots are free, a newcomer from a group at
+/// its cap whose address holds none of the group's sessions takes one beyond
+/// the cap; once they are full, such sessions are the first taken over.
 pub const PEER_SLOTS_PER_GROUP: usize = 2;
 /// A newcomer never takes over the slot of a session admitted less than this
 /// long ago, one ordinary peer read allowance, so an honest session has time
 /// to finish its exchange before sources that keep reconnecting can displace
 /// it. Only an address holding more of its group's sessions than a
-/// newcomer from that group gives one up sooner.
+/// newcomer from that group gives one up sooner, and so does a session its
+/// group holds beyond its cap once the general slots are full.
 pub const EVICTION_GRACE: Duration = Duration::from_secs(15);
 /// A source that delivered a new valid block or transaction keeps its general
 /// inbound sessions from eviction this long. Eviction spares at most
@@ -1504,10 +1508,13 @@ struct Occupant {
     since: Instant,
     evict: Arc<Notify>,
 }
-impl Occupant {
-    fn settled(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.since) >= EVICTION_GRACE
-    }
+/// How a newcomer from a network group that holds its cap gets a session
+/// (`SlotCounts::group_turn`).
+enum GroupTurn {
+    /// It takes over this session of the group's.
+    TakeOver(u64),
+    /// It takes a free general slot beyond the cap.
+    Beyond,
 }
 #[derive(Default)]
 struct SlotCounts {
@@ -1523,37 +1530,88 @@ struct SlotCounts {
     useful: HashMap<IpAddr, Instant>,
     /// When each source last delivered a block that became the tip.
     advanced: HashMap<IpAddr, Instant>,
+    /// When each source last delivered headers or blocks of a branch that
+    /// claims more work than the tip and is not adopted yet.
+    progressed: HashMap<IpAddr, Instant>,
     /// Ranks network groups for eviction protection. It never leaves this
     /// process, so no source can tell which groups it favours.
     key: [u8; 32],
+    /// `EVICTION_GRACE`, which only integration tests shorten.
+    grace: Duration,
 }
 impl SlotCounts {
-    /// Whether `source` delivered a new valid block or transaction recently.
-    fn useful_at(&self, source: IpAddr, now: Instant) -> bool {
+    /// Whether `occupant` has had its grace period, so a newcomer may take
+    /// its slot over.
+    fn settled(&self, occupant: &Occupant, now: Instant) -> bool {
+        now.saturating_duration_since(occupant.since) >= self.grace
+    }
+    /// When `source` last delivered a new valid block or transaction, if
+    /// that was recent.
+    fn useful_since(&self, source: IpAddr, now: Instant) -> Option<Instant> {
         self.useful
             .get(&source)
-            .is_some_and(|at| now.saturating_duration_since(*at) < USEFUL_PEER_WINDOW)
+            .copied()
+            .filter(|at| now.saturating_duration_since(*at) < USEFUL_PEER_WINDOW)
+    }
+    /// Whether `source` delivered a new valid block or transaction recently.
+    fn useful_at(&self, source: IpAddr, now: Instant) -> bool {
+        self.useful_since(source, now).is_some()
+    }
+    /// The sessions network groups hold beyond their cap, which took general
+    /// slots while those were free (`group_turn`): each group's sessions
+    /// after its `PEER_SLOTS_PER_GROUP` oldest.
+    fn beyond_cap(&self) -> HashSet<u64> {
+        let mut seen: HashMap<IpAddr, usize> = HashMap::new();
+        self.occupants
+            .iter()
+            .filter(|(_, occupant)| {
+                occupant.counted.is_some_and(|group| {
+                    let held = seen.entry(group).or_default();
+                    *held += 1;
+                    *held > PEER_SLOTS_PER_GROUP
+                })
+            })
+            .map(|(id, _)| *id)
+            .collect()
     }
     /// The general-slot session a newcomer takes over when every slot it may
-    /// use is full. Configured and pinned peers are never evicted, and no
-    /// session is before `EVICTION_GRACE` has passed since its admission. Of
-    /// the others, the sessions of the sources that most recently delivered
-    /// a new block or transaction, the oldest session of a few groups ranked
-    /// by a keyed hash and the longest-connected others are spared, each
-    /// within its bound and never so many that fewer than
-    /// `EVICTABLE_GENERAL` candidates remain. Of the rest, the newest session
-    /// of the group holding the most general slots goes. However many groups
-    /// or useful sources the occupants span, a newcomer is therefore refused
-    /// only while configured and pinned peers and sessions still in their
-    /// grace period hold every general slot.
+    /// use is full. A session its group holds beyond its cap goes first,
+    /// whatever its age: such sessions only used general slots while they
+    /// were free. Otherwise configured and pinned peers are never evicted,
+    /// and no session is before its grace period (`EVICTION_GRACE`) has
+    /// passed since its admission. Of the others, the sessions of the sources
+    /// that most recently delivered a new block or transaction, the oldest
+    /// session of a few groups ranked by a keyed hash and the
+    /// longest-connected others are spared, each within its bound and never
+    /// so many that fewer than `EVICTABLE_GENERAL` candidates remain. Of the
+    /// rest, the newest session of the group holding the most general slots
+    /// goes. However many groups or useful sources the occupants span, a
+    /// newcomer is therefore refused only while configured and pinned peers
+    /// and sessions still in their grace period hold every general slot.
     fn victim(&self, now: Instant) -> Option<u64> {
+        let mut held: HashMap<IpAddr, usize> = HashMap::new();
+        for occupant in self.occupants.values() {
+            if occupant.pool == PeerClass::General {
+                *held.entry(occupant.group).or_default() += 1;
+            }
+        }
+        let beyond = self.beyond_cap();
+        let excess = self
+            .occupants
+            .iter()
+            .filter(|(id, occupant)| occupant.pool == PeerClass::General && beyond.contains(*id))
+            .max_by_key(|(id, occupant)| (held[&occupant.group], **id))
+            .map(|(id, _)| *id);
+        if excess.is_some() {
+            return excess;
+        }
         let mut candidates: Vec<(u64, &Occupant)> = self
             .occupants
             .iter()
             .filter(|(_, occupant)| {
                 occupant.pool == PeerClass::General
                     && occupant.class != PeerClass::Operator
-                    && occupant.settled(now)
+                    && self.settled(occupant, now)
             })
             .map(|(id, occupant)| (*id, occupant))
             .collect();
@@ -1592,12 +1650,6 @@ impl SlotCounts {
         candidates.retain(|(id, _)| !protected.contains(id));
         let longest = spare(&candidates, PROTECTED_LONGEST);
         candidates.drain(..longest);
-        let mut held: HashMap<IpAddr, usize> = HashMap::new();
-        for occupant in self.occupants.values() {
-            if occupant.pool == PeerClass::General {
-                *held.entry(occupant.group).or_default() += 1;
-            }
-        }
         candidates
             .into_iter()
             .max_by_key(|(id, occupant)| (held[&occupant.group], *id))
@@ -1613,26 +1665,33 @@ impl SlotCounts {
             .iter()
             .find(|(_, occupant)| {
                 occupant.pool == PeerClass::Verified
-                    && occupant.settled(now)
+                    && self.settled(occupant, now)
                     && !self.useful_at(occupant.source, now)
             })
             .map(|(id, _)| *id)
     }
-    /// The session of network group `group`, which holds its cap, that a
-    /// newcomer from `source` takes over, so the cap rotates sessions rather
-    /// than letting the holders of the group's slots keep its other members
+    /// How a newcomer from `source` gets a session of network group `group`,
+    /// which holds its cap, if at all. The cap orders evictions rather than
+    /// letting the holders of the group's sessions keep its other members
     /// out. An address holding more of the group's sessions than the
-    /// newcomer would gives its oldest up at once. Otherwise only a newcomer
-    /// whose address holds none of them takes over the oldest session past
-    /// its grace period whose source has not delivered anything new
-    /// recently. Only sessions in slots the newcomer may use are candidates.
-    fn group_victim(
+    /// newcomer's would gives its oldest up at once. Otherwise only a
+    /// newcomer whose address holds none of them gets one: while general
+    /// slots are free (`free`) it takes one beyond the cap, so the cap never
+    /// refuses a member while there is room. Once they are full it takes
+    /// over one of the group's sessions past its grace period: the newest
+    /// beyond the cap, or else the one whose source delivered something new
+    /// least recently, the oldest among equals, however recently that was.
+    /// (A newcomer from another group takes over a session beyond a cap
+    /// whatever its age: see `victim`.) Only sessions in slots the newcomer
+    /// may use are candidates.
+    fn group_turn(
         &self,
         group: IpAddr,
         source: IpAddr,
         class: PeerClass,
+        free: bool,
         now: Instant,
-    ) -> Option<u64> {
+    ) -> Option<GroupTurn> {
         let members: Vec<(u64, &Occupant)> = self
             .occupants
             .iter()
@@ -1654,15 +1713,30 @@ impl SlotCounts {
             .filter(|(_, o)| held(o.source) > own + 1)
             .max_by_key(|(id, o)| (held(o.source), std::cmp::Reverse(*id)));
         if let Some((id, _)) = crowded {
-            return Some(*id);
+            return Some(GroupTurn::TakeOver(*id));
         }
         if own > 0 {
             return None;
         }
-        usable
+        if free {
+            return Some(GroupTurn::Beyond);
+        }
+        let settled: Vec<&&(u64, &Occupant)> = usable
             .iter()
-            .find(|(_, o)| o.settled(now) && !self.useful_at(o.source, now))
-            .map(|(id, _)| *id)
+            .filter(|(_, o)| self.settled(o, now))
+            .collect();
+        let beyond = self.beyond_cap();
+        let excess = settled
+            .iter()
+            .filter(|(id, _)| beyond.contains(id))
+            .max_by_key(|(id, _)| *id);
+        excess
+            .or_else(|| {
+                settled
+                    .iter()
+                    .min_by_key(|(id, o)| (self.useful_since(o.source, now), *id))
+            })
+            .map(|(id, _)| GroupTurn::TakeOver(*id))
     }
     /// End session `id`'s hold on its slot and group, and tell it to close.
     fn evict(&mut self, id: u64) {
@@ -1694,14 +1768,16 @@ impl SlotCounts {
     }
 }
 /// Inbound peer session capacity. Network groups have a concurrency cap,
-/// which a newcomer from a group holding it rotates rather than being kept
-/// out (`SlotCounts::group_victim`). While the general slots are full,
-/// configured and pinned peers keep slots no other source can use, recently
-/// verified discovery peers keep separate slots, at most one per network
-/// group, which they take over from each other (`SlotCounts::verified_victim`),
-/// and any other newcomer takes over an unprotected general session's slot
-/// (`SlotCounts::victim`). A session that loses its slot is told to close; no
-/// session loses it within `EVICTION_GRACE` of its admission.
+/// which a newcomer from a group holding it exceeds while general slots are
+/// free and otherwise rotates rather than being kept out
+/// (`SlotCounts::group_turn`). While the general slots are full, sessions
+/// beyond their group's cap go first, configured and pinned peers keep slots
+/// no other source can use, recently verified discovery peers keep separate
+/// slots, at most one per network group, which they take over from each
+/// other (`SlotCounts::verified_victim`), and any other newcomer takes over
+/// an unprotected general session's slot (`SlotCounts::victim`). A session
+/// that loses its slot is told to close; no session within its group's cap
+/// loses it within `EVICTION_GRACE` of its admission.
 pub struct PeerSlots {
     counts: Mutex<SlotCounts>,
 }
@@ -1733,9 +1809,17 @@ impl PeerSlots {
         Self {
             counts: Mutex::new(SlotCounts {
                 key,
+                grace: EVICTION_GRACE,
                 ..Default::default()
             }),
         }
+    }
+    /// Shorten the grace period before a session's slot may be taken over,
+    /// so an integration test can show a takeover without holding sessions
+    /// for a whole read allowance.
+    #[cfg(feature = "test-fixtures")]
+    pub fn set_grace(&self, grace: Duration) {
+        accounting(&self.counts).grace = grace;
     }
     pub fn try_acquire(self: &Arc<Self>, ip: IpAddr, class: PeerClass) -> Option<PeerSlot> {
         self.try_acquire_at(ip, class, Instant::now())
@@ -1759,10 +1843,16 @@ impl PeerSlots {
                 .get(&g)
                 .is_some_and(|(sessions, _)| *sessions >= PEER_SLOTS_PER_GROUP)
         {
-            // The cap rotates the group's sessions. The session taken over
-            // held a slot the newcomer may use, which it then takes.
-            let id = counts.group_victim(g, source, class, now)?;
-            counts.evict(id);
+            let free = counts.general < INBOUND_PEER_SLOTS;
+            match counts.group_turn(g, source, class, free, now)? {
+                // The session taken over held a slot the newcomer may use,
+                // which it then takes.
+                GroupTurn::TakeOver(id) => counts.evict(id),
+                // It takes a free general slot below, and the group holds
+                // more sessions than its cap until some end or are taken
+                // over.
+                GroupTurn::Beyond => {}
+            }
         }
         let verified = group
             .and_then(|g| counts.groups.get(&g))
@@ -1843,6 +1933,19 @@ impl PeerSlots {
         Self::credit(&mut counts.useful, source, now);
         Self::credit(&mut counts.advanced, source, now);
     }
+    /// A source delivered headers or new blocks of a branch that claims more
+    /// work than the tip, which this node holds but has not adopted yet:
+    /// progress toward a reorganization although none of its blocks became
+    /// the tip. It tells the discovery scheduler that synchronizing with it
+    /// made progress (`progressed_since`), and protects no inbound session.
+    /// Only proof of work earns it, more than the tip's.
+    pub fn progressed(&self, ip: IpAddr) {
+        self.progressed_at(ip, Instant::now());
+    }
+    fn progressed_at(&self, ip: IpAddr, now: Instant) {
+        let mut counts = accounting(&self.counts);
+        Self::credit(&mut counts.progressed, admission_address(ip), now);
+    }
     /// Record `source`'s credit at `now`, forgetting the oldest source's once
     /// `USEFUL_PEER_SOURCES` are remembered.
     fn credit(credits: &mut HashMap<IpAddr, Instant>, source: IpAddr, now: Instant) {
@@ -1859,7 +1962,8 @@ impl PeerSlots {
     }
     /// Whether `ip`'s source delivered a new valid block or transaction at
     /// or after `since`.
-    pub fn delivered_since(&self, ip: IpAddr, since: Instant) -> bool {
+    #[cfg(test)]
+    pub(crate) fn delivered_since(&self, ip: IpAddr, since: Instant) -> bool {
         accounting(&self.counts)
             .useful
             .get(&admission_address(ip))
@@ -1870,6 +1974,14 @@ impl PeerSlots {
     pub fn advanced_since(&self, ip: IpAddr, since: Instant) -> bool {
         accounting(&self.counts)
             .advanced
+            .get(&admission_address(ip))
+            .is_some_and(|at| *at >= since)
+    }
+    /// Whether `ip`'s source delivered headers or new blocks of a branch
+    /// that claims more work than the tip at or after `since`.
+    pub fn progressed_since(&self, ip: IpAddr, since: Instant) -> bool {
+        accounting(&self.counts)
+            .progressed
             .get(&admission_address(ip))
             .is_some_and(|at| *at >= since)
     }
@@ -3143,17 +3255,65 @@ mod tests {
     fn inbound_peer_slots_require_network_diversity_and_keep_reserved_capacity() {
         let slots = Arc::new(PeerSlots::default());
         let public = |a: u8, b: u8, c: u8| IpAddr::from([8, a, b, c]);
-        // Two addresses in one public /16 hold at most two sessions at once;
-        // others from it wait until one has had its grace period.
+        let ipv6 = |n: u16| IpAddr::from([0x2001, 0x4860, n, 0, 0, 0, 0, 1]);
+        // Two sessions of a public /16, or of an IPv6 /32, fit its cap. While
+        // general slots are free, other addresses from it take free ones
+        // beyond the cap, but an address already holding one of the group's
+        // sessions takes no second.
         let same: Vec<_> = (1..=4)
             .filter_map(|n| slots.try_acquire(public(1, n, 1), PeerClass::General))
             .collect();
-        assert_eq!(same.len(), 2);
-        let ipv6 = |n: u16| IpAddr::from([0x2001, 0x4860, n, 0, 0, 0, 0, 1]);
+        assert_eq!(same.len(), 4);
+        assert!(
+            slots
+                .try_acquire(public(1, 1, 1), PeerClass::General)
+                .is_none()
+        );
         let v6: Vec<_> = (1..=3)
             .filter_map(|n| slots.try_acquire(ipv6(n), PeerClass::General))
             .collect();
-        assert_eq!(v6.len(), 2);
+        assert_eq!(v6.len(), 3);
+        // Once the general slots are full, sessions beyond a cap are the
+        // first taken over, whatever their age: the newest of the group
+        // holding the most general slots first.
+        let others: Vec<_> = (21..=29)
+            .map(|a| {
+                slots
+                    .try_acquire(public(a, 1, 1), PeerClass::General)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(slots.counts.lock().unwrap().general, INBOUND_PEER_SLOTS);
+        let newcomers: Vec<_> = (41..=43)
+            .map(|a| {
+                slots
+                    .try_acquire(public(a, 1, 1), PeerClass::General)
+                    .unwrap()
+            })
+            .collect();
+        let gone: Vec<_> = same.iter().chain(&v6).chain(&others).collect();
+        assert!(taken_over(&slots, &same[3]) && taken_over(&slots, &v6[2]));
+        assert!(taken_over(&slots, &same[2]));
+        assert_eq!(gone.iter().filter(|s| taken_over(&slots, s)).count(), 3);
+        // Then every session is within its group's cap and its grace period.
+        assert!(
+            slots
+                .try_acquire(public(44, 1, 1), PeerClass::General)
+                .is_none()
+        );
+        drop((same, v6, others, newcomers));
+        // Two addresses in one public /16 and two in an IPv6 /32 hold their
+        // groups' caps.
+        let same: Vec<_> = (1..=2)
+            .map(|n| {
+                slots
+                    .try_acquire(public(1, n, 1), PeerClass::General)
+                    .unwrap()
+            })
+            .collect();
+        let v6: Vec<_> = (1..=2)
+            .map(|n| slots.try_acquire(ipv6(n), PeerClass::General).unwrap())
+            .collect();
         // A full general pool takes over an unprotected session's slot rather
         // than refusing a newcomer, once that session has had its grace
         // period. With configured or pinned peers holding twelve slots, the
@@ -4329,9 +4489,10 @@ mod tests {
         );
         assert!(!taken_over(&slots, &honest));
         drop((squatter, honest));
-        // Two addresses holding one session each keep a third out during
-        // their grace periods. Then the oldest whose source delivered nothing
-        // new rotates out.
+        // Two addresses holding one session each, however recently admitted
+        // and whatever they delivered, cannot keep a third out while general
+        // slots are free: it takes one beyond the cap, and nobody's session
+        // is taken over.
         let slots = Arc::new(PeerSlots::default());
         let (first, second) = (
             slots
@@ -4341,18 +4502,61 @@ mod tests {
                 .try_acquire_at(member(2), PeerClass::General, now)
                 .unwrap(),
         );
+        slots.delivered_at(member(1), now);
+        slots.delivered_at(member(2), now);
+        let third = slots
+            .try_acquire_at(member(3), PeerClass::General, now)
+            .unwrap();
+        assert!(!taken_over(&slots, &first) && !taken_over(&slots, &second));
+        // Reconnecting before the grace period ends does not help them keep
+        // it out either.
+        drop((first, third));
+        let first = slots
+            .try_acquire_at(member(1), PeerClass::General, now)
+            .unwrap();
+        let third = slots
+            .try_acquire_at(member(3), PeerClass::General, now)
+            .unwrap();
+        assert_eq!(slots.counts.lock().unwrap().general, 3);
+        drop((first, second, third));
+        // Once the general slots are full, members keep their grace periods
+        // against each other, but a newcomer from another group takes over
+        // the session beyond the cap at once, whatever its age.
+        let slots = Arc::new(PeerSlots::default());
+        let held: Vec<_> = (1..=3)
+            .map(|c| {
+                slots
+                    .try_acquire_at(member(c), PeerClass::General, now)
+                    .unwrap()
+            })
+            .chain((2..=14).map(|a| {
+                slots
+                    .try_acquire_at(IpAddr::from([8, a, 1, 1]), PeerClass::General, now)
+                    .unwrap()
+            }))
+            .collect();
+        assert_eq!(slots.counts.lock().unwrap().general, INBOUND_PEER_SLOTS);
         assert!(
             slots
-                .try_acquire_at(member(3), PeerClass::General, now)
+                .try_acquire_at(member(4), PeerClass::General, now)
                 .is_none()
         );
-        slots.delivered_at(member(1), now);
-        let settled = now + EVICTION_GRACE;
-        let third = slots
-            .try_acquire_at(member(3), PeerClass::General, settled)
+        let outsider = slots
+            .try_acquire_at(IpAddr::from([8, 20, 1, 1]), PeerClass::General, now)
             .unwrap();
-        assert!(!taken_over(&slots, &first) && taken_over(&slots, &second));
-        drop((first, second, third));
+        assert!(taken_over(&slots, &held[2]));
+        assert_eq!(held.iter().filter(|s| taken_over(&slots, s)).count(), 1);
+        // A member newcomer then takes over the member session past its grace
+        // period whose source delivered something new least recently,
+        // however recently that was.
+        slots.delivered_at(member(1), now);
+        slots.delivered_at(member(2), now + Duration::from_secs(1));
+        let settled = now + EVICTION_GRACE;
+        let fourth = slots
+            .try_acquire_at(member(4), PeerClass::General, settled)
+            .unwrap();
+        assert!(taken_over(&slots, &held[0]) && !taken_over(&slots, &held[1]));
+        drop((held, outsider, fourth));
         let counts = slots.counts.lock().unwrap();
         assert_eq!(counts.general, 0);
         assert!(counts.groups.is_empty() && counts.occupants.is_empty());
@@ -4489,6 +4693,13 @@ mod tests {
         let host = |n: u16| IpAddr::from([0x2001, 0x4860, 1, 2, 0, 0, 0, n]);
         slots.advanced_at(host(1), later);
         assert!(slots.advanced_since(host(2), later));
+        // Headers or blocks of a heavier branch not adopted yet are progress,
+        // but neither advance this node nor protect inbound sessions.
+        let follower = IpAddr::from([8, 3, 1, 1]);
+        slots.progressed_at(follower, later);
+        assert!(slots.progressed_since(follower, later));
+        assert!(!slots.advanced_since(follower, now) && !slots.delivered_since(follower, now));
+        assert!(!slots.progressed_since(miner, now) && !slots.progressed_since(relayer, now));
     }
     #[test]
     fn broad_public_trusted_prefixes_need_an_explicit_override() {

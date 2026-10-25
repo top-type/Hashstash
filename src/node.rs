@@ -2502,6 +2502,9 @@ pub struct Node {
     published: Arc<RwLock<Arc<ReadView>>>,
     peer_events: Arc<Mutex<VecDeque<Value>>>,
     outbound_sessions: Arc<Semaphore>,
+    /// The outbound slot reserved for discovery turns with the operator's
+    /// chosen peers (`AddressBook::next_chosen`), which no other turn uses.
+    reserved_sessions: Arc<Semaphore>,
     mining: Arc<Mutex<MiningRuntime>>,
     work_updates: watch::Sender<u64>,
     mining_session_ids: Arc<Mutex<SessionIds>>,
@@ -2695,6 +2698,7 @@ impl Node {
             published,
             peer_events: Arc::new(Mutex::new(VecDeque::new())),
             outbound_sessions: Arc::new(Semaphore::new(2)),
+            reserved_sessions: Arc::new(Semaphore::new(1)),
             mining: Arc::new(Mutex::new(MiningRuntime::default())),
             work_updates: watch::channel(0).0,
             mining_session_ids: Arc::new(Mutex::new(SessionIds::random())),
@@ -2992,6 +2996,13 @@ impl Node {
         } else {
             PeerClass::General
         }
+    }
+    /// Shorten the grace period before an inbound peer session's slot may be
+    /// taken over (`network_guard::EVICTION_GRACE`), so an integration test
+    /// can show a takeover end to end.
+    #[cfg(feature = "test-fixtures")]
+    pub fn set_peer_eviction_grace(&self, grace: Duration) {
+        self.peer_sessions.set_grace(grace);
     }
     fn peer_event(&self, peer: String, result: &Result<()>) {
         let error = result
@@ -5031,11 +5042,28 @@ impl Node {
             return Ok(false);
         }
         // Headers that one reply admits are written in one commit.
+        let before = header_syncs.get(&peer).map(HeaderSync::position);
+        let tips = chain.admitted_header_tips(usize::MAX);
         let result = chain
             .hold_batch(|chain| {
                 follow_headers(chain, header_syncs, downloads, peer, headers, now())
             })
             .and_then(std::convert::identity);
+        // Holding more of a branch whose count passed the tip's work, or
+        // admitting or extending a held chain that claims more work than the
+        // tip, is progress toward adopting it (`PeerSlots::progressed`).
+        // Counting is not: headers of a branch that claims little work can
+        // be cheap.
+        let holding = header_syncs
+            .get(&peer)
+            .is_some_and(|sync| sync.proof.is_some() && Some(sync.position()) != before);
+        let admitted = chain
+            .admitted_header_tips(usize::MAX)
+            .iter()
+            .any(|tip| !tips.contains(tip));
+        if holding || admitted {
+            self.peer_sessions.progressed(peer.ip());
+        }
         // An admitted chain can raise the capacity allowance without a new block.
         if let Err(error) = self.note_capacity(chain) {
             eprintln!("Peer capacity allowance unchanged: {error:#}");
@@ -5085,7 +5113,8 @@ impl Node {
     /// selection admits as new, credit that address with a delivery, which
     /// keeps its inbound sessions from eviction (`PeerSlots::delivered`); the
     /// block also tells discovery that the address advanced this node
-    /// (`PeerSlots::advanced`).
+    /// (`PeerSlots::advanced`), and a new side block of a heavier branch not
+    /// adopted yet that it made progress (`PeerSlots::progressed`).
     fn receive_peer(&self, msg: &PeerMessage, source: IpAddr) -> Result<()> {
         ensure!(
             msg.chain == self.read_view()?.chain.chain_id(),
@@ -5118,6 +5147,7 @@ impl Node {
                 }
             };
             shared = None;
+            let mut stored = false;
             if !known {
                 // Every valid block meets its own compact target within the
                 // genesis limit. Check that before copying or hashing a large
@@ -5130,7 +5160,7 @@ impl Node {
                 math::check_pow(&b.header, &target)?;
                 match self.submit_block_from(b.clone(), Some(source)) {
                     Ok(true) => self.peer_sessions.advanced(peer),
-                    Ok(false) => {}
+                    Ok(false) => stored = true,
                     // A declined side block's header is held for presync, so
                     // the rest of its branch is still downloaded after it. A
                     // full presync bound may evict that header at once; the
@@ -5151,6 +5181,12 @@ impl Node {
             // consume one entry each rather than one per batch.
             // Retain accepted progress even if a later message entry is invalid.
             let mut i = self.locked_for_block()?;
+            // A new block stored on a side branch while this node holds a
+            // branch that claims more work than the tip is progress toward
+            // adopting that branch (`PeerSlots::progressed`).
+            if stored && !i.chain.admitted_header_tips(1).is_empty() {
+                self.peer_sessions.progressed(peer);
+            }
             note_download(&mut i.downloads, hash, b.header.previous, source);
         }
         if let Some(hash) = shared {
@@ -7224,16 +7260,26 @@ fn protected_peers(
 /// One discovery turn with `peer`, judged as a whole for scheduling
 /// (`discovery_contact`): a synchronization and, when that succeeded, at
 /// most once a minute per peer, an address exchange, which holds the
-/// outbound slot as well. One overall deadline of five read allowances
-/// still bounds the synchronization, but one that has delivered nothing new
-/// after two is cut off, so a slow-walking endpoint holds a slot for at most
-/// that long plus one allowance for the address exchange.
-async fn discovery_turn(node: &Node, peer: SocketAddr) -> peer_discovery::Contact {
+/// outbound slot as well. The turn uses the outbound slot reserved for the
+/// operator's chosen peers when `reserved`, and otherwise one of the two
+/// general ones. One overall deadline of five read allowances still bounds
+/// the synchronization, but one that after two has not advanced this node
+/// (`discovery_progress`) is cut off, so a slow-walking endpoint holds a slot
+/// for at most that long plus one allowance for the address exchange.
+async fn discovery_turn(node: &Node, peer: SocketAddr, reserved: bool) -> peer_discovery::Contact {
     let Ok(allowance) = node.peer_exchange_timeout() else {
         return peer_discovery::Contact::Failed;
     };
+    let slots = if reserved {
+        &node.reserved_sessions
+    } else {
+        &node.outbound_sessions
+    };
     let started = Instant::now();
-    let session = timeout(allowance.saturating_mul(5), sync_peer(node, peer));
+    let session = timeout(
+        allowance.saturating_mul(5),
+        sync_peer_through(node, peer, slots),
+    );
     tokio::pin!(session);
     let cutoff = tokio::time::sleep(allowance.saturating_mul(2));
     tokio::pin!(cutoff);
@@ -7241,10 +7287,10 @@ async fn discovery_turn(node: &Node, peer: SocketAddr) -> peer_discovery::Contac
     let result = loop {
         tokio::select! {
             // Only whether the exchange completed counts here; what this
-            // node made of the blocks is judged from the tip below.
+            // node made of the blocks is judged from its credits below.
             result = &mut session => break Some(discovery_result(result)),
             () = &mut cutoff, if watching => {
-                if !node.peer_sessions.delivered_since(peer.ip(), started) {
+                if !discovery_progress(node, peer, started) {
                     break None;
                 }
                 watching = false;
@@ -7253,14 +7299,17 @@ async fn discovery_turn(node: &Node, peer: SocketAddr) -> peer_discovery::Contac
     };
     if result.is_none() {
         let stalled = Err(anyhow!(
-            "peer synchronization delivered nothing new within two read allowances"
+            "peer synchronization did not advance this node within two read allowances"
         ));
         node.peer_event(peer.to_string(), &stalled);
     }
     let advanced = node.peer_sessions.advanced_since(peer.ip(), started);
-    let contact = discovery_contact(result.as_ref(), advanced, started.elapsed(), allowance);
+    let progressed = node.peer_sessions.progressed_since(peer.ip(), started);
+    let judge =
+        |elapsed| discovery_contact(result.as_ref(), advanced, progressed, elapsed, allowance);
+    let contact = judge(started.elapsed());
     let query = contact.success()
-        && matches!(result, Some(Ok(())))
+        && matches!(&result, Some(Ok(outcome)) if !outcome.deferred)
         && node
             .discovery
             .unpoisoned()
@@ -7271,41 +7320,52 @@ async fn discovery_turn(node: &Node, peer: SocketAddr) -> peer_discovery::Contac
     }
     // A separate exchange cannot change Sync/Ack semantics or cause an
     // authenticated connection to retry unsigned.
-    let exchanged = discover_peer(node, peer).await;
+    let exchanged = discover_peer(node, peer, slots).await;
     if exchanged.is_err() {
         node.peer_event(format!("discovery/{peer}"), &exchanged);
     }
-    discovery_contact(result.as_ref(), advanced, started.elapsed(), allowance)
+    judge(started.elapsed())
+}
+/// Whether a discovery turn with `peer` since `started` advanced this node:
+/// one of its blocks became the tip, or it delivered headers or new blocks
+/// of a branch that claims more work than the tip, which this node holds
+/// but has not adopted yet. A synchronization that has not after two read
+/// allowances is cut off. A new transaction does not count, since any funded
+/// sender can supply one, nor do side blocks or headers of a branch that
+/// claims no more work than the tip, which can be cheap.
+fn discovery_progress(node: &Node, peer: SocketAddr, started: Instant) -> bool {
+    node.peer_sessions.advanced_since(peer.ip(), started)
+        || node.peer_sessions.progressed_since(peer.ip(), started)
 }
 /// A discovery turn's synchronization result as `discovery_contact` judges
-/// it. A session whose replay this node deferred completes (`SyncOutcome`),
-/// and is judged as the deferral it reports: this node's own limit, never
-/// the peer's, however long the exchange took.
+/// it: the outcome of a session that completed, or why it did not.
 fn discovery_result(
     result: Result<Result<SyncOutcome>, tokio::time::error::Elapsed>,
-) -> Result<()> {
-    match result {
-        Ok(Ok(outcome)) if outcome.deferred => Err(crate::chain::ValidationDeferred.into()),
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(anyhow!(
+) -> Result<SyncOutcome> {
+    result.unwrap_or_else(|_| {
+        Err(anyhow!(
             "peer synchronization exceeded its overall deadline"
-        )),
-    }
+        ))
+    })
 }
 /// What a discovery turn achieved, for scheduling: `result` is the
-/// synchronization's, `None` for one cut off because it had delivered
-/// nothing new, and `elapsed` the whole turn's time. A block of the peer's
+/// synchronization's, `None` for one cut off because it had not advanced
+/// this node, and `elapsed` the whole turn's time. A block of the peer's
 /// that became the tip makes it `Advanced`, whatever else happened; only
-/// proof of work earns that. A turn whose exchange otherwise completed is
-/// `Current` within one read allowance and `Stalled` after it: a slow turn
-/// that delivered nothing held an outbound slot without advancing this
-/// node. As for configured peers (`sync_completed`), a deferred replay or a
-/// held side-branch header completes an exchange; a deferred replay is this
-/// node's own limit, never the peer's.
+/// proof of work earns that. Otherwise headers or new blocks of a heavier
+/// branch not adopted yet (`progressed`) make it `Progressed`, as long as
+/// it was not cut off: more of that branch may follow at once. A turn whose
+/// exchange otherwise completed is `Current` within one read allowance and
+/// `Stalled` after it: a slow turn that delivered nothing held an outbound
+/// slot without advancing this node. As for configured peers
+/// (`sync_completed`), a deferred replay or a held side-branch header
+/// completes an exchange; a deferred replay, which the session's outcome
+/// reports, is this node's own limit, never the peer's, however long the
+/// exchange took.
 fn discovery_contact(
-    result: Option<&Result<()>>,
+    result: Option<&Result<SyncOutcome>>,
     advanced: bool,
+    progressed: bool,
     elapsed: Duration,
     allowance: Duration,
 ) -> peer_discovery::Contact {
@@ -7316,6 +7376,8 @@ fn discovery_contact(
     }
     match result {
         None => Contact::Stalled,
+        Some(_) if progressed => Contact::Progressed,
+        Some(Ok(outcome)) if outcome.deferred => Contact::Current,
         Some(Err(error)) if error.is::<ValidationDeferred>() => Contact::Current,
         Some(Err(error)) if !error.is::<SideBranchRefused>() => Contact::Failed,
         Some(_) if elapsed <= allowance => Contact::Current,
@@ -7360,21 +7422,48 @@ async fn discovery_seed_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
                 ),
             }
         }
-        tokio::select! { _=shutdown.changed()=>return, _=tokio::time::sleep(Duration::from_secs(600))=>{} }
+        // Seed results that never answered are dropped after a few failures.
+        // While no peer answered for a while, as after a lost connection or
+        // before the first answer, seeds are resolved again every minute, so
+        // the node reconnects soon after its connectivity returns.
+        let connected = node
+            .discovery
+            .unpoisoned()
+            .as_ref()
+            .is_none_or(|book| book.connected(now()));
+        let wait = if connected { SEED_REFRESH } else { SEED_RETRY };
+        tokio::select! { _=shutdown.changed()=>return, _=tokio::time::sleep(wait)=>{} }
     }
 }
+/// How often DNS seeds are resolved again, and how often while no peer has
+/// answered for `peer_discovery::CONTACT_WINDOW`.
+const SEED_REFRESH: Duration = Duration::from_secs(600);
+const SEED_RETRY: Duration = Duration::from_secs(60);
 async fn discovery_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
     let mut workers = tokio::task::JoinSet::new();
+    // The turn in the outbound slot reserved for the operator's chosen
+    // peers, and its peer.
+    let mut reserved = tokio::task::JoinSet::new();
+    let mut chosen = None;
     let mut saved_at = 0;
     loop {
         let candidates = {
             let mut guard = node.discovery.unpoisoned();
             let Some(book) = guard.as_mut() else { break };
+            if reserved.is_empty() {
+                chosen = book.next_chosen(now());
+            }
             book.next(now(), 2usize.saturating_sub(workers.len()))
         };
+        if let Some(peer) = chosen
+            && reserved.is_empty()
+        {
+            let n = node.clone();
+            reserved.spawn(async move { discovery_turn(&n, peer, true).await });
+        }
         for peer in candidates {
             let n = node.clone();
-            workers.spawn(async move { (peer, discovery_turn(&n, peer).await) });
+            workers.spawn(async move { (peer, discovery_turn(&n, peer, false).await) });
         }
         tokio::select! {
             _=shutdown.changed()=>break,
@@ -7382,6 +7471,14 @@ async fn discovery_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
                 if let Ok((peer,contact))=result
                     && let Some(book)=node.discovery.unpoisoned().as_mut() {
                     book.finished(peer,contact,now(),random_u64());
+                }
+            }
+            Some(result)=reserved.join_next(),if !reserved.is_empty()=>{
+                // A turn that panicked failed, and frees the reserved slot.
+                let contact = result.unwrap_or(peer_discovery::Contact::Failed);
+                if let Some(peer) = chosen.take()
+                    && let Some(book) = node.discovery.unpoisoned().as_mut() {
+                    book.finished(peer, contact, now(), random_u64());
                 }
             }
             _=tokio::time::sleep(Duration::from_millis(200))=>{},
@@ -7392,7 +7489,9 @@ async fn discovery_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
         }
     }
     workers.abort_all();
+    reserved.abort_all();
     while workers.join_next().await.is_some() {}
+    while reserved.join_next().await.is_some() {}
     persist_address_book(&node).await;
 }
 /// Stratum addresses that authorized are saved at most once per this interval,
@@ -7456,13 +7555,13 @@ async fn persist_address_book(node: &Node) {
         }
     }
 }
-async fn discover_peer(node: &Node, peer: SocketAddr) -> Result<()> {
+async fn discover_peer(node: &Node, peer: SocketAddr, slots: &Arc<Semaphore>) -> Result<()> {
     // As for synchronization, one deadline covers the wait for an outbound
     // slot and the whole exchange, so a slow-walking endpoint holds a slot,
     // and a discovery worker, for at most one exchange allowance. Expiry
     // drops the exchange without a cooldown and is reported by the caller.
     let deadline = tokio::time::Instant::now() + node.peer_exchange_timeout()?;
-    let _permit = tokio::time::timeout_at(deadline, node.outbound_sessions.clone().acquire_owned())
+    let _permit = tokio::time::timeout_at(deadline, slots.clone().acquire_owned())
         .await
         .map_err(|_| anyhow!("outbound peer slots remained busy"))??;
     tokio::time::timeout_at(deadline, discover_peer_steps(node, peer))
@@ -7705,11 +7804,19 @@ pub struct SyncOutcome {
     pub deferred: bool,
 }
 pub async fn sync_peer(node: &Node, peer: SocketAddr) -> Result<SyncOutcome> {
+    sync_peer_through(node, peer, &node.outbound_sessions).await
+}
+/// [sync_peer] in one of the outbound slots `slots` holds.
+async fn sync_peer_through(
+    node: &Node,
+    peer: SocketAddr,
+    slots: &Arc<Semaphore>,
+) -> Result<SyncOutcome> {
     // Only configured peers enter this bounded map; manual diagnostics cannot grow it.
     if let Some(h) = node.peer_health.unpoisoned().get_mut(&peer) {
         h.last_attempt = now();
     }
-    let result = sync_peer_inner(node, peer).await;
+    let result = sync_peer_inner(node, peer, slots).await;
     if let Some(h) = node.peer_health.unpoisoned().get_mut(&peer) {
         if sync_completed(&result) {
             h.last_success = now();
@@ -7957,7 +8064,11 @@ async fn header_rounds<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     }
     Ok(phase)
 }
-async fn sync_peer_inner(node: &Node, peer: SocketAddr) -> Result<SyncOutcome> {
+async fn sync_peer_inner(
+    node: &Node,
+    peer: SocketAddr,
+    slots: &Arc<Semaphore>,
+) -> Result<SyncOutcome> {
     // Keep the former five-stage overall budget, growing with the same
     // validated capacity as individual exchanges. One deadline covers the
     // wait for an outbound slot and the exchange, so a slow peer can hold one
@@ -7966,10 +8077,9 @@ async fn sync_peer_inner(node: &Node, peer: SocketAddr) -> Result<SyncOutcome> {
     let deadline = tokio::time::Instant::now() + node.peer_exchange_timeout()?.saturating_mul(5);
     // Reserve separate inbound capacity so simultaneous outgoing synchronizations
     // cannot consume every receiving slot on all peers.
-    let _frame_permit =
-        tokio::time::timeout_at(deadline, node.outbound_sessions.clone().acquire_owned())
-            .await
-            .map_err(|_| anyhow!("outbound peer slots remained busy"))??;
+    let _frame_permit = tokio::time::timeout_at(deadline, slots.clone().acquire_owned())
+        .await
+        .map_err(|_| anyhow!("outbound peer slots remained busy"))??;
     tokio::time::timeout_at(deadline, sync_peer_steps(node, peer))
         .await
         .map_err(|_| anyhow!("peer synchronization exceeded its overall deadline"))?
@@ -14678,6 +14788,55 @@ mod peer_tests {
     }
 
     #[test]
+    fn only_progress_toward_a_heavier_branch_keeps_a_discovery_turn_going() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        let receiver = node_on(&dir.path().join("receiver.db"), &config, |chain| {
+            while math::work(&chain.next_target().unwrap()) <= Amount::from(128u32) {
+                rush(chain, crypto::public_key(&[62; 32]).unwrap());
+            }
+        });
+        let work = receiver.locked().unwrap().chain.chain_work().clone();
+        let sender = node_on(&dir.path().join("sender.db"), &config, |chain| {
+            while *chain.chain_work() <= work {
+                rush(chain, crypto::public_key(&[63; 32]).unwrap());
+            }
+        });
+        let branch = sender.read_view().unwrap().chain.tip_height() as usize;
+        assert!(branch > 2 * MAX_BATCH, "{branch}");
+        let peer: SocketAddr = HEADER_PEER.parse().unwrap();
+        let started = Instant::now();
+        // A new transaction, which any funded sender can supply, does not
+        // keep a discovery synchronization from being cut off.
+        receiver.peer_sessions.delivered(peer.ip());
+        assert!(!discovery_progress(&receiver, peer, started));
+        // Nor do headers of a branch whose count has not passed the tip's
+        // work: such headers can be cheap.
+        assert!(!header_round(&sender, &receiver, branch / 2).0);
+        assert!(!discovery_progress(&receiver, peer, started));
+        // Once the count passes it, the branch is fetched again and held:
+        // progress, although no block of it is the tip yet.
+        assert!(header_round(&sender, &receiver, usize::MAX).0);
+        assert!(discovery_progress(&receiver, peer, started));
+        let holding = Instant::now();
+        header_round(&sender, &receiver, usize::MAX);
+        assert_eq!(held_counts(&receiver), (branch, branch));
+        assert!(receiver.peer_sessions.progressed_since(peer.ip(), holding));
+        // So are its blocks, stored on a side branch until it overtakes the
+        // tip.
+        let blocks = Instant::now();
+        let request = receiver.peer_snapshot(None).unwrap();
+        let reply = sender.peer_snapshot(Some(&request.locator)).unwrap();
+        assert_eq!(reply.blocks.len(), MAX_BATCH);
+        receiver.receive_peer(&reply, peer.ip()).unwrap();
+        assert!(receiver.peer_sessions.progressed_since(peer.ip(), blocks));
+        assert!(!receiver.peer_sessions.advanced_since(peer.ip(), started));
+        // The block that makes it the tip advances this node.
+        assert!(converge(&sender, &receiver, branch / MAX_BATCH + 4).is_some());
+        assert!(receiver.peer_sessions.advanced_since(peer.ip(), blocks));
+    }
+
+    #[test]
     fn header_downloads_follow_branches_too_long_for_held_presync() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::devnet();
@@ -15590,7 +15749,9 @@ mod peer_tests {
             drop((channel, stream));
         });
         let started = Instant::now();
-        let error = discover_peer(&node, endpoint).await.unwrap_err();
+        let error = discover_peer(&node, endpoint, &node.outbound_sessions)
+            .await
+            .unwrap_err();
         let elapsed = started.elapsed();
         // Each step used to have its own 15-second allowance, so this took 25
         // seconds and could take far longer; one allowance now bounds the
@@ -15772,39 +15933,50 @@ mod peer_tests {
         use peer_discovery::Contact;
         let allowance = Duration::from_secs(15);
         let (quick, slow) = (Duration::from_secs(2), Duration::from_secs(16));
-        let ok: Result<()> = Ok(());
-        let deferred: Result<()> = Err(crate::chain::ValidationDeferred.into());
-        let refused: Result<()> = Err(crate::chain::SideBranchRefused("test").into());
-        let failed: Result<()> = Err(anyhow!("peer closed"));
-        let judge =
-            |result, advanced, elapsed| discovery_contact(result, advanced, elapsed, allowance);
-        // Completing promptly with nothing new: the peer is not ahead.
-        assert_eq!(judge(Some(&ok), false, quick), Contact::Current);
-        assert_eq!(judge(Some(&refused), false, quick), Contact::Current);
-        // Completing slowly with nothing new, or being cut off for that,
-        // held an outbound slot without advancing this node.
-        assert_eq!(judge(Some(&ok), false, slow), Contact::Stalled);
-        assert_eq!(judge(Some(&refused), false, slow), Contact::Stalled);
-        assert_eq!(judge(None, false, slow * 2), Contact::Stalled);
-        // This node's own replay limit is never the peer's fault.
-        assert_eq!(judge(Some(&deferred), false, slow), Contact::Current);
-        assert_eq!(judge(Some(&failed), false, quick), Contact::Failed);
-        // A block of the peer's that became the tip outweighs the rest.
-        for result in [Some(&ok), Some(&failed), None] {
-            assert_eq!(judge(result, true, slow * 4), Contact::Advanced);
-        }
-        // A session that completes after this node deferred its replay
-        // reports that in its outcome, and is judged as the deferral.
         let outcome = |deferred| SyncOutcome {
             header_rounds: 1,
             header_error: None,
             blocks: MAX_BATCH,
             deferred,
         };
+        let ok: Result<SyncOutcome> = Ok(outcome(false));
+        let deferred: Result<SyncOutcome> = Err(crate::chain::ValidationDeferred.into());
+        let refused: Result<SyncOutcome> = Err(crate::chain::SideBranchRefused("test").into());
+        let failed: Result<SyncOutcome> = Err(anyhow!("peer closed"));
+        let judge = |result, advanced, progressed, elapsed| {
+            discovery_contact(result, advanced, progressed, elapsed, allowance)
+        };
+        // Completing promptly with nothing new: the peer is not ahead.
+        assert_eq!(judge(Some(&ok), false, false, quick), Contact::Current);
+        assert_eq!(judge(Some(&refused), false, false, quick), Contact::Current);
+        // Completing slowly with nothing new, or being cut off for that,
+        // held an outbound slot without advancing this node, even with a
+        // full batch of blocks that changed nothing.
+        assert_eq!(judge(Some(&ok), false, false, slow), Contact::Stalled);
+        assert_eq!(judge(Some(&refused), false, false, slow), Contact::Stalled);
+        assert_eq!(judge(None, false, false, slow * 2), Contact::Stalled);
+        // This node's own replay limit is never the peer's fault.
+        assert_eq!(judge(Some(&deferred), false, false, slow), Contact::Current);
+        assert_eq!(judge(Some(&failed), false, false, quick), Contact::Failed);
+        // A block of the peer's that became the tip outweighs the rest.
+        for result in [Some(&ok), Some(&failed), None] {
+            assert_eq!(judge(result, true, true, slow * 4), Contact::Advanced);
+        }
+        // So do headers or new blocks of a heavier branch not adopted yet,
+        // however long the turn took, unless it was cut off.
+        for result in [Some(&ok), Some(&refused), Some(&failed), Some(&deferred)] {
+            assert_eq!(judge(result, false, true, slow * 4), Contact::Progressed);
+        }
+        assert_eq!(judge(None, false, true, slow * 2), Contact::Stalled);
+        // A session that completes after this node deferred its replay
+        // reports that in its outcome, and is judged as the deferral.
         let deferred = discovery_result(Ok(Ok(outcome(true))));
-        assert_eq!(judge(Some(&deferred), false, slow), Contact::Current);
+        assert_eq!(judge(Some(&deferred), false, false, slow), Contact::Current);
         let completed = discovery_result(Ok(Ok(outcome(false))));
-        assert_eq!(judge(Some(&completed), false, slow), Contact::Stalled);
+        assert_eq!(
+            judge(Some(&completed), false, false, slow),
+            Contact::Stalled
+        );
     }
 
     #[test]

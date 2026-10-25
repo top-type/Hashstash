@@ -1992,6 +1992,7 @@ pub fn address_book(data: &[u8]) -> String {
                 let Some(flags) = script.byte() else { break };
                 if let Some(address) = tried.pop() {
                     let contact = match (flags & 1 != 0, flags & 4 != 0) {
+                        (true, false) if flags & 16 != 0 => Contact::Progressed,
                         (true, false) => Contact::Current,
                         (true, true) => Contact::Advanced,
                         (false, false) => Contact::Failed,

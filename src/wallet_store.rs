@@ -286,9 +286,10 @@ impl WalletStore {
     /// A node checks its wallets before the chain replay, and records the
     /// network only once its chain database has accepted this configuration.
     /// Without a passphrase hot secrets are stored unencrypted, so the
-    /// database and its journal are owner-only (`local_files::restrict_to_owner`)
-    /// either way. The journal persists (TRUNCATE mode) with that protection
-    /// instead of being recreated with the directory's defaults for every write.
+    /// database and its journal are owner-only (`local_files::create_private`)
+    /// either way. The node creates the journal itself, so SQLite never
+    /// creates one with the directory's defaults, and it persists (TRUNCATE
+    /// mode) with that protection instead of being recreated for every write.
     ///
     /// A passphrase seals every hot secret (`hashstash-node-wallet-lock-v1`):
     /// the first start with one encrypts the saved plaintext keys in one
@@ -307,19 +308,28 @@ impl WalletStore {
         let journal = journal_path(&path);
         local_files::create_private(&path)
             .with_context(|| format!("cannot open wallet storage {}", path.display()))?;
+        // A journal another account created, which SQLite would play back
+        // into the keys, is refused here.
         local_files::create_private(&journal)?;
         let mut connection = Connection::open(&path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        // The first read plays back a journal an interrupted write left, while
+        // the connection is still in DELETE mode, and SQLite then deletes it;
+        // it also deletes a nonempty journal beside a database without pages.
+        // It would create the next journal itself, with the directory's
+        // inherited access list on Windows, and write page images, keys
+        // included, into it. So the journal is created owner-only again before
+        // anything is written. SQLite counts an empty journal as absent, so it
+        // never deletes this one and opens it instead of creating its own.
+        connection.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        local_files::create_private(&journal)?;
         connection.execute_batch("PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;
             CREATE TABLE IF NOT EXISTS wallets(id TEXT PRIMARY KEY,name TEXT NOT NULL,public BLOB NOT NULL,secret BLOB);
             CREATE TABLE IF NOT EXISTS wallet_selection(singleton INTEGER PRIMARY KEY CHECK(singleton=1),active TEXT NOT NULL,revision TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS wallet_network(singleton INTEGER PRIMARY KEY CHECK(singleton=1),chain_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS wallet_lock(singleton INTEGER PRIMARY KEY CHECK(singleton=1),format TEXT NOT NULL,salt BLOB NOT NULL,check_value BLOB NOT NULL);")?;
-        // SQLite discards an empty journal beside a new, empty database and
-        // creates its own for the schema; restrict that one before any key.
-        if journal.exists() {
-            local_files::restrict_to_owner(&journal)?;
-        }
         let selection: Option<(String, String)> = connection
             .query_row(
                 "SELECT active,revision FROM wallet_selection WHERE singleton=1",
@@ -1226,6 +1236,139 @@ mod tests {
             1,
             "keys remain shared across networks"
         );
+    }
+
+    /// A write the node never finished leaves a hot journal. SQLite plays it
+    /// back on the first read, while the connection is still in its default
+    /// DELETE mode, and then deletes it; it would create the next journal
+    /// itself, with the folder's inherited access list on Windows, and keep
+    /// it for the rest of the run. The store creates it again owner-only
+    /// before anything is written.
+    #[test]
+    fn an_interrupted_write_is_rolled_back_and_its_journal_recreated_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chain.sqlite");
+        let wallets = path.with_extension("wallets.sqlite");
+        let mut store = WalletStore::open(&path, [1; 32]).unwrap();
+        manage(
+            &mut store,
+            json!({"action":"import","private_key":hex::encode([3;32])}),
+        );
+        let saved = store.status();
+        drop(store);
+        // A transaction whose changes already spilled into the database
+        // file, both files copied as a crash would leave them.
+        let crashed = tempfile::tempdir().unwrap();
+        let copy = crashed.path().join("chain.sqlite");
+        let copied = copy.with_extension("wallets.sqlite");
+        let journal = journal_path(&copied);
+        {
+            let connection = Connection::open(&wallets).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=FULL;
+                    CREATE TABLE filler(x BLOB);
+                    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<400)
+                        INSERT INTO filler SELECT randomblob(500) FROM n;
+                    PRAGMA cache_size=2;
+                    BEGIN IMMEDIATE; DELETE FROM wallets; UPDATE filler SET x=randomblob(600);",
+                )
+                .unwrap();
+            // Read with every sharing mode: SQLite holds both open for writing.
+            for (from, to) in [(&wallets, &copied), (&journal_path(&wallets), &journal)] {
+                std::fs::write(to, std::fs::read(from).unwrap()).unwrap();
+            }
+        }
+        assert!(
+            std::fs::read(&journal)
+                .unwrap()
+                .first()
+                .is_some_and(|&byte| byte != 0),
+            "a hot journal"
+        );
+        let mut reopened = WalletStore::open(&copy, [1; 32]).unwrap();
+        assert_eq!(
+            reopened.status(),
+            saved,
+            "the unfinished write is rolled back"
+        );
+        assert_eq!(
+            std::fs::metadata(&journal).ok().map(|m| m.len()),
+            Some(0),
+            "a new journal before anything is written"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&journal).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        #[cfg(windows)]
+        {
+            use crate::local_files::tests::{assert_owner_only, created_owner_only};
+            assert!(created_owner_only(&journal));
+            assert_owner_only(&journal);
+        }
+        manage(&mut reopened, json!({"action":"create"}));
+        assert_eq!(std::fs::metadata(&journal).unwrap().len(), 0);
+        #[cfg(windows)]
+        assert!(
+            crate::local_files::tests::created_owner_only(&journal),
+            "SQLite keeps writing into the node's journal"
+        );
+    }
+
+    /// On Windows, in a folder whose inherited list lets Users read, the
+    /// wallet database and its journal stay the files the node created
+    /// owner-only: through a new store's schema (SQLite counts the empty
+    /// journal as absent, so it opens it instead of creating its own), later
+    /// writes and the first start with a passphrase, which journals the
+    /// plaintext keys' pages as it seals them, and after SQLite deletes a
+    /// nonempty journal left beside an empty database. Restricting a journal
+    /// SQLite created would leave any handle another account opened first.
+    #[cfg(windows)]
+    #[test]
+    fn windows_wallet_journals_are_owner_only_from_creation() {
+        use crate::local_files::tests::{assert_owner_only, created_owner_only, shared_directory};
+        let directory = shared_directory();
+        let chain = directory.path().join("chain.sqlite");
+        let wallets = chain.with_extension("wallets.sqlite");
+        let journal = journal_path(&wallets);
+        let check = |when: &str| {
+            for path in [&wallets, &journal] {
+                assert!(created_owner_only(path), "{when}: {}", path.display());
+                assert_owner_only(path);
+            }
+        };
+        let mut store = WalletStore::open(&chain, [1; 32]).unwrap();
+        check("a new store");
+        manage(
+            &mut store,
+            json!({"action":"import","private_key":hex::encode([3;32])}),
+        );
+        check("a saved key");
+        drop(store);
+        let file = directory.path().join("wallet-passphrase");
+        local_files::write_private(&file, b"node wallet passphrase\n").unwrap();
+        let phrase = WalletPassphrase::read(&file).unwrap();
+        drop(WalletStore::open_locked(&chain, [1; 32], Some(&phrase)).unwrap());
+        check("sealing the saved key");
+        // A nonempty journal beside an empty database, as a removed database
+        // or an interrupted first write leaves it.
+        let stale = directory.path().join("stale.sqlite");
+        let stale_wallets = stale.with_extension("wallets.sqlite");
+        let stale_journal = journal_path(&stale_wallets);
+        std::fs::write(&stale_wallets, b"").unwrap();
+        std::fs::write(&stale_journal, b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7").unwrap();
+        let mut store = WalletStore::open(&stale, [1; 32]).unwrap();
+        manage(&mut store, json!({"action":"create"}));
+        drop(store);
+        assert!(created_owner_only(&stale_journal));
+        for path in [&stale_wallets, &stale_journal] {
+            assert_owner_only(path);
+        }
     }
 
     /// `net.db` and `net.sqlite` once shared `net.wallets.sqlite`. Each now

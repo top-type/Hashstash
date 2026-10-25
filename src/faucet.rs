@@ -54,11 +54,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// The longest pause a busy node's `Retry-After` can impose between refreshes.
 const MAX_POLL_WAIT: Duration = Duration::from_secs(60);
 /// The longest `Retry-After` waited out before a refused request is resent
-/// once. A claim's answer awaits one such lookup, its preparation, and at
-/// most `CLAIM_BROADCAST_WAIT` of its broadcast: a prompt refusal, this wait
-/// and a prompt resend fit the request deadline, though each attempt may take
-/// up to the client's five-second timeout and the claim may first wait for
-/// the engine.
+/// once. A claim's answer awaits its preparation, and at most
+/// `CLAIM_BROADCAST_WAIT` of its broadcast: a prompt refusal, this wait and a
+/// prompt resend fit the request deadline, though each attempt may take up to
+/// the client's five-second timeout, the claim may first wait for the engine,
+/// and a block arriving meanwhile adds a refresh and another preparation.
 const NODE_RETRY_WAIT: Duration = Duration::from_secs(5);
 /// How long a reserved claim's answer waits for its first broadcast before
 /// that broadcast continues in the background. The wait ends earlier when
@@ -67,6 +67,11 @@ const CLAIM_BROADCAST_WAIT: Duration = Duration::from_secs(2);
 /// A request still running this long is answered that it is still being
 /// checked.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(15);
+/// Preparations one claim may ask the node for. Each after the first follows
+/// a refresh showing that a block arrived since the previous one was asked
+/// for, so only blocks arriving faster than a claim's few loopback calls
+/// refuse it.
+const CLAIM_PREPARATIONS: usize = 3;
 /// The part of the request deadline a reserved claim keeps for its answer.
 const ANSWER_MARGIN: Duration = Duration::from_secs(1);
 
@@ -265,6 +270,58 @@ impl std::fmt::Display for NodeBusy {
     }
 }
 impl std::error::Error for NodeBusy {}
+
+/// The node ran a request and answered it with a JSON-RPC error. Its text is
+/// never journaled or answered; a refused preparation is told apart from a
+/// moved tip by refreshing (see `claim_reserve`).
+#[derive(Clone, Copy, Debug)]
+struct NodeRefused;
+impl std::fmt::Display for NodeRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("node refused faucet request")
+    }
+}
+impl std::error::Error for NodeRefused {}
+
+/// A preparation quoted another chain snapshot than the one the claim was
+/// prepared from: the node's tip moved after the faucet's last refresh.
+#[derive(Clone, Copy, Debug)]
+struct QuoteMoved;
+impl std::fmt::Display for QuoteMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("prepared faucet snapshot changed")
+    }
+}
+impl std::error::Error for QuoteMoved {}
+
+/// The faucet cannot pay a claim in this public state (see `View::availability`).
+/// `retry_after` is the short wait, in seconds, after which another attempt
+/// may be paid; only another visitor's outstanding payment sets it.
+#[derive(Clone, Copy, Debug)]
+struct Unready {
+    state: &'static str,
+    retry_after: Option<u64>,
+}
+impl std::fmt::Display for Unready {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Faucet is waiting for mining, funds, or its next allowance")
+    }
+}
+impl std::error::Error for Unready {}
+
+/// A refresh that another refresh overtook. A claim whose preparation found
+/// the chain moved refreshes the engine itself, from a later snapshot, while
+/// the poll's refresh may be waiting for the node; that refresh then applies
+/// nothing more, so an older snapshot or older lookups never replace newer
+/// ones.
+#[derive(Clone, Copy, Debug)]
+struct Superseded;
+impl std::fmt::Display for Superseded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("faucet refresh superseded")
+    }
+}
+impl std::error::Error for Superseded {}
 
 /// Loads the dedicated signer from a regular, owner-only file and wipes every
 /// parsed copy of the secret.
@@ -928,7 +985,9 @@ async fn node_rpc_once<T: DeserializeOwned>(
         bytes.extend_from_slice(&chunk);
     }
     let reply: RpcReply<T> = serde_json::from_slice(&bytes)?;
-    ensure!(reply.error.is_none(), "node refused faucet request");
+    if reply.error.is_some() {
+        return Err(NodeRefused.into());
+    }
     reply.result.context("missing RPC result")
 }
 
@@ -1348,6 +1407,11 @@ struct Engine {
     fault: Option<&'static str>,
     scan: Option<Scan>,
     reported_state: Option<&'static str>,
+    /// Refreshes ended so far. A refresh notes the count before it asks for
+    /// its snapshot and takes each later step only while the count is
+    /// unchanged: once another refresh ended, which only a claim's own
+    /// refresh can do meanwhile, this one is `Superseded`.
+    refreshes: u64,
 }
 
 impl Engine {
@@ -1410,9 +1474,18 @@ impl Engine {
             fault: None,
             scan: None,
             reported_state: None,
+            refreshes: 0,
         };
         engine.publish();
         Ok(engine)
+    }
+    /// Fails with `Superseded` once a refresh ended after the one that noted
+    /// `seen` began.
+    fn current(&self, seen: u64) -> Result<()> {
+        if self.refreshes != seen {
+            return Err(Superseded.into());
+        }
+        Ok(())
     }
     #[cfg(test)]
     fn mining(&self) -> bool {
@@ -1579,7 +1652,18 @@ impl Engine {
     /// resulting state. A failed refresh clears the last success here, in the
     /// step that adopts its unaccounted snapshot, so the claim the engine goes
     /// to next can never prepare against that snapshot as if it were fresh.
-    fn finish_refresh(&mut self, accounted: Result<(Snap, Result<Option<Fault>>)>) -> Result<()> {
+    /// A refresh that another one overtook since it noted `seen` ends here
+    /// without changing anything: the newer refresh's snapshot and outcome
+    /// stand.
+    fn finish_refresh(
+        &mut self,
+        seen: u64,
+        accounted: Result<(Snap, Result<Option<Fault>>)>,
+    ) -> Result<()> {
+        if self.current(seen).is_err() {
+            return Ok(());
+        }
+        self.refreshes = self.refreshes.wrapping_add(1);
         let refreshed = accounted.and_then(|(snap, outcome)| {
             self.height = Some(snap.height);
             self.tip = Some(snap.tip);
@@ -1819,10 +1903,18 @@ impl Engine {
             }
             return Ok(ClaimStart::Answered(result));
         }
-        ensure!(
-            self.availability()? == "ready",
-            "Faucet is waiting for mining, funds, or its next allowance"
-        );
+        let state = self.availability()?;
+        if state != "ready" {
+            // Another visitor's payment is outstanding. It settles within a
+            // block or two, so the visitor may try again after about one
+            // governed interval; other states last longer.
+            let retry_after = (state == "pending").then(|| {
+                self.settings
+                    .map_or(0, |s| s.interval)
+                    .clamp(POLL_INTERVAL.as_secs(), MAX_POLL_WAIT.as_secs())
+            });
+            return Err(Unready { state, retry_after }.into());
+        }
         self.ledger
             .eligible(&self.config, &canonical, client_subnet, time)?;
         let height = self.height.context("missing chain height")?;
@@ -1876,16 +1968,21 @@ impl Engine {
         } = claim;
         let quote = &result["fee_quote"];
         ensure!(
-            quote["chain_id"] == self.config.chain_id
-                && quote["tip"] == hex::encode(anchor)
-                && quote["state_root"] == hex::encode(state_root)
-                && quote["height"] == height
-                && quote["anchor"] == hex::encode(anchor)
-                && quote["anchor_height"] == height
-                && quote["expiry_blocks"] == expiry_blocks
-                && quote["expiry_height"] == expiry,
+            quote["chain_id"] == self.config.chain_id && quote["expiry_blocks"] == expiry_blocks,
             "prepared faucet snapshot changed"
         );
+        // A quote of another snapshot is never signed. When the node's tip
+        // moved since this claim's snapshot, the claim refreshes and prepares
+        // again (see `claim_reserve`).
+        if !(quote["tip"] == hex::encode(anchor)
+            && quote["state_root"] == hex::encode(state_root)
+            && quote["height"] == height
+            && quote["anchor"] == hex::encode(anchor)
+            && quote["anchor_height"] == height
+            && quote["expiry_height"] == expiry)
+        {
+            return Err(QuoteMoved.into());
+        }
         // A payment heavier than the block capacity could never be included and
         // must not consume an allowance. The node's preparation refuses one too;
         // this check does not depend on the node's release.
@@ -1998,7 +2095,8 @@ impl Hold for Shared {
 
 /// The service engine as a claim uses it: kept from the eligibility checks
 /// through the reservation, so the nonce, the anchor and the one pending
-/// payment cannot change while the node prepares the transfer.
+/// payment cannot change while the node prepares the transfer. A refresh the
+/// claim makes after its tip moved runs within this hold too.
 struct Held(Option<OwnedMutexGuard<Engine>>);
 impl Hold for Held {
     async fn step<R, F>(&mut self, work: F) -> Result<R>
@@ -2023,9 +2121,18 @@ impl Hold for Held {
 
 /// One refresh: the node snapshot and its accounting, then one step that
 /// adopts it and records the outcome, whether the refresh succeeded or not.
+///
+/// The count of ended refreshes is noted before the snapshot is requested.
+/// Another refresh can end meanwhile only when a claim refreshes the engine
+/// it holds (see `claim_reserve`); this refresh is then `Superseded` and
+/// changes nothing more. Every adopted snapshot was therefore requested after
+/// the previously adopted one was answered, so the engine never returns to
+/// an older snapshot, and what an overtaken refresh's lookups found is never
+/// applied over the newer accounting.
 async fn poll_once(hold: &mut impl Hold, node: &NodeClient, key: &str) -> Result<()> {
-    let accounted = account(hold, node, key).await;
-    hold.step(move |engine| engine.finish_refresh(accounted))
+    let seen = hold.step(|engine| Ok(engine.refreshes)).await?;
+    let accounted = account(hold, node, key, seen).await;
+    hold.step(move |engine| engine.finish_refresh(seen, accounted))
         .await
 }
 
@@ -2034,11 +2141,17 @@ async fn account(
     hold: &mut impl Hold,
     node: &NodeClient,
     key: &str,
+    seen: u64,
 ) -> Result<(Snap, Result<Option<Fault>>)> {
     // The snapshot is the largest reply; nothing is held while it arrives.
     let snapshot: NodeSnapshot = node.call("snapshot", json!({"key":key})).await?;
-    let snap = hold.step(move |engine| engine.observe(snapshot)).await?;
-    let outcome = reconcile(hold, node, &snap).await;
+    let snap = hold
+        .step(move |engine| {
+            engine.current(seen)?;
+            engine.observe(snapshot)
+        })
+        .await?;
+    let outcome = reconcile(hold, node, &snap, seen).await;
     Ok((snap, outcome))
 }
 
@@ -2048,15 +2161,24 @@ async fn account(
 /// one recorded claim, so no repair can create another payment. Node lookups
 /// run between local steps, holding nothing, so a claim can be reserved
 /// meanwhile; what those lookups found is then applied on a later refresh,
-/// against the ledger as it is by then.
-async fn reconcile(hold: &mut impl Hold, node: &NodeClient, snap: &Snap) -> Result<Option<Fault>> {
+/// against the ledger as it is by then. Every step first checks that no
+/// other refresh ended since this one began (see `poll_once`).
+async fn reconcile(
+    hold: &mut impl Hold,
+    node: &NodeClient,
+    snap: &Snap,
+    seen: u64,
+) -> Result<Option<Fault>> {
     let (height, nonce, interval) = (snap.height, snap.nonce, snap.settings.interval);
     // The newest confirmed receipt is checked by its block hash alone. One
     // that left the canonical chain is accounted again from its nonce.
     let mut verified = None;
     for _ in 0..RECEIPT_REPAIRS_PER_REFRESH {
         let Some(receipt) = hold
-            .step(move |engine| engine.receipt_to_check(height))
+            .step(move |engine| {
+                engine.current(seen)?;
+                engine.receipt_to_check(height)
+            })
             .await?
         else {
             verified = Some(None);
@@ -2066,20 +2188,29 @@ async fn reconcile(hold: &mut impl Hold, node: &NodeClient, snap: &Snap) -> Resu
             verified = Some(Some(receipt.nonce));
             break;
         }
-        hold.step(move |engine| engine.repair_receipt(receipt))
-            .await?;
+        hold.step(move |engine| {
+            engine.current(seen)?;
+            engine.repair_receipt(receipt)
+        })
+        .await?;
     }
     let Some(top) = verified else {
         // More reorganized receipts remain for the next refresh.
         return Ok(Some(Fault("verifying_payments")));
     };
     if let Some(mut job) = hold
-        .step(move |engine| engine.settlement(top, nonce))
+        .step(move |engine| {
+            engine.current(seen)?;
+            engine.settlement(top, nonce)
+        })
         .await?
     {
         let located = advance(node, &mut job.scan, height).await;
         if let Some(pause) = hold
-            .step(move |engine| engine.settled(job, located, height))
+            .step(move |engine| {
+                engine.current(seen)?;
+                engine.settled(job, located, height)
+            })
             .await?
         {
             return Ok(Some(pause));
@@ -2087,7 +2218,10 @@ async fn reconcile(hold: &mut impl Hold, node: &NodeClient, snap: &Snap) -> Resu
     }
     // Only bytes whose nonce is still unused here may be retried or expired.
     if let Some(raw) = hold
-        .step(move |engine| engine.pending_retry(height, nonce, interval))
+        .step(move |engine| {
+            engine.current(seen)?;
+            engine.pending_retry(height, nonce, interval)
+        })
         .await?
     {
         // Any RPC error is uncertain. Keep the durable pending record and its
@@ -2102,27 +2236,65 @@ async fn reconcile(hold: &mut impl Hold, node: &NodeClient, snap: &Snap) -> Resu
 /// Reserves one claim, or answers a repeated one. A new reservation also
 /// returns its signed bytes for the first broadcast, which needs no hold: a
 /// refresh retries reserved bytes anyway.
+///
+/// A claim is prepared against the engine's latest refresh, up to a poll
+/// interval old. When a block reached the node since, the node refuses that
+/// anchor, or quotes its newer snapshot, and nothing is signed. The claim
+/// then refreshes the engine it still holds, through the poll's own steps
+/// with all their accounting, and starts again from its eligibility checks
+/// against the new snapshot. It does so only while that refresh shows the
+/// tip moved, at most `CLAIM_PREPARATIONS` times in all; a refusal on an
+/// unmoved tip is the node's answer and ends the claim.
 async fn claim_reserve(
     hold: &mut impl Hold,
     node: &NodeClient,
     recipient: String,
     client_subnet: String,
 ) -> Result<(Value, Option<String>)> {
-    let preparation = match hold
-        .step(move |engine| engine.claim_start(&recipient, &client_subnet))
-        .await?
-    {
-        ClaimStart::Answered(answer) => return Ok((answer, None)),
-        ClaimStart::Prepare(preparation) => *preparation,
-    };
-    let prepared: Value = node
-        .call("preparetransaction", preparation.params.clone())
-        .await?;
-    let (raw, answer) = hold
-        .step(move |engine| engine.claim_commit(preparation, prepared))
-        .await?;
-    hold.release();
-    Ok((answer, Some(raw)))
+    let mut preparations = 0;
+    loop {
+        let (to, from) = (recipient.clone(), client_subnet.clone());
+        let preparation = match hold
+            .step(move |engine| engine.claim_start(&to, &from))
+            .await?
+        {
+            ClaimStart::Answered(answer) => return Ok((answer, None)),
+            ClaimStart::Prepare(preparation) => *preparation,
+        };
+        let anchor = preparation.anchor;
+        preparations += 1;
+        let refused = match node
+            .call::<Value>("preparetransaction", preparation.params.clone())
+            .await
+        {
+            Ok(prepared) => match hold
+                .step(move |engine| engine.claim_commit(preparation, prepared))
+                .await
+            {
+                Ok((raw, answer)) => {
+                    hold.release();
+                    return Ok((answer, Some(raw)));
+                }
+                Err(error) if error.is::<QuoteMoved>() => error,
+                Err(error) => return Err(error),
+            },
+            // The refusal's text is not read; the refresh tells whether the
+            // tip moved.
+            Err(error) if error.is::<NodeRefused>() => error,
+            Err(error) => return Err(error),
+        };
+        if preparations >= CLAIM_PREPARATIONS {
+            return Err(refused);
+        }
+        let key = hold.step(|engine| Ok(hex::encode(engine.sender))).await?;
+        poll_once(hold, node, &key).await?;
+        if hold
+            .step(move |engine| Ok(engine.tip == Some(anchor)))
+            .await?
+        {
+            return Err(refused);
+        }
+    }
 }
 
 /// The first broadcast of reserved bytes. Any RPC error is uncertain; the
@@ -2418,20 +2590,59 @@ async fn claim_handler(
                     response.headers_mut().insert("retry-after", value);
                 }
                 response
-            } else if message == "Faucet allowance reached" {
+            } else if message == "Faucet allowance reached"
+                || error
+                    .downcast_ref::<Unready>()
+                    .is_some_and(|unready| unready.state == "quota_reached")
+            {
                 (
                     StatusCode::TOO_MANY_REQUESTS,
-                    Json(json!({"error":message,"state":"quota_reached"})),
+                    Json(json!({"error":"Faucet allowance reached","state":"quota_reached"})),
                 )
                     .into_response()
             } else {
-                failure(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Faucet is waiting for mining, funds, or another payment",
-                )
+                unavailable(&error)
             }
         }
     }
+}
+
+/// The 503 answer to a claim the faucet cannot pay now; nothing was signed or
+/// reserved. `state` is the reason as status names it, or `node_busy` when
+/// the node could not prepare the payment. A short wait after which another
+/// attempt may be paid, another visitor's outstanding payment or a busy
+/// node, is given in `retry_after_seconds` and `Retry-After`. The error text
+/// is fixed; refresh diagnostics stay in the journal.
+fn unavailable(error: &anyhow::Error) -> Response {
+    let (state, retry_after) = if let Some(unready) = error.downcast_ref::<Unready>() {
+        (unready.state, unready.retry_after)
+    } else if let Some(busy) = error.downcast_ref::<NodeBusy>() {
+        let wait = busy.retry_after.unwrap_or(NODE_RETRY_WAIT);
+        (
+            "node_busy",
+            Some(wait.clamp(Duration::from_secs(1), MAX_POLL_WAIT).as_secs()),
+        )
+    } else if error.is::<NodeRefused>() || error.is::<QuoteMoved>() {
+        // Blocks kept arriving while the claim was prepared, or the node
+        // refused its preparation.
+        ("node_busy", Some(POLL_INTERVAL.as_secs()))
+    } else {
+        ("unavailable", None)
+    };
+    let message = if state == "pending" {
+        "Faucet is sending another payment; try again shortly"
+    } else {
+        "Faucet is waiting for mining, funds, or another payment"
+    };
+    let mut body = json!({"error":message,"state":state});
+    if let Some(seconds) = retry_after {
+        body["retry_after_seconds"] = json!(seconds);
+    }
+    let mut response = (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    if let Some(value) = retry_after.and_then(|v| HeaderValue::from_str(&v.to_string()).ok()) {
+        response.headers_mut().insert("retry-after", value);
+    }
+    response
 }
 
 pub struct FaucetServer {
@@ -3256,6 +3467,16 @@ mod tests {
         /// the status and `Retry-After`, without running.
         refusals: Vec<(&'static str, StatusCode, Option<&'static str>)>,
         prepared: usize,
+        /// The next preparations each find a block that arrived after the
+        /// faucet's last refresh: the tip advances by one before the node
+        /// answers.
+        advance_before_prepare: usize,
+        /// Prepare a stale anchor anyway and quote the node's newer view. By
+        /// default the node refuses an anchor other than its tip, as
+        /// `preparetransaction` does.
+        requote_stale_anchor: bool,
+        /// Refuse every preparation, on a tip that did not move.
+        refuse_prepare: bool,
     }
     fn mock_hash(node: &MockNode, height: u64) -> Hash {
         codec::block_hash(node.blocks.get(&height).unwrap_or(&block(height, vec![])))
@@ -3295,6 +3516,17 @@ mod tests {
             }
             "preparetransaction" => {
                 node.prepared += 1;
+                if node.advance_before_prepare > 0 {
+                    node.advance_before_prepare -= 1;
+                    node.height += 1;
+                }
+                let tip = hex::encode(mock_hash(&node, node.height));
+                if node.refuse_prepare
+                    || (p["anchor"].as_str() != Some(tip.as_str()) && !node.requote_stale_anchor)
+                {
+                    // The node's own refusal of a stale anchor, as a JSON-RPC error.
+                    return Json(json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"anchor differs from the quoted tip; refresh before preparing"}})).into_response();
+                }
                 let mut operation: Operation =
                     serde_json::from_value(p["operation"].clone()).unwrap();
                 if node.malicious_prepare {
@@ -3340,7 +3572,7 @@ mod tests {
                     };
                     let mut result =
                         serde_json::to_value(wallet::unsigned(&body, &[7; 32])).unwrap();
-                    result["fee_quote"] = json!({"chain_id":hex::encode([7; 32]),"tip":hex::encode(body.anchor),"anchor":hex::encode(body.anchor),"state_root":hex::encode([0;32]),"height":node.height,"anchor_height":node.height,"expiry_blocks":body.expiry_blocks,"expiry_height":node.height.checked_add(body.expiry_blocks).unwrap(),"weight":weight.to_string()});
+                    result["fee_quote"] = json!({"chain_id":hex::encode([7; 32]),"tip":tip,"anchor":hex::encode(body.anchor),"state_root":hex::encode([0;32]),"height":node.height,"anchor_height":node.height,"expiry_blocks":body.expiry_blocks,"expiry_height":node.height.checked_add(body.expiry_blocks).unwrap(),"weight":weight.to_string()});
                     result
                 }
             }
@@ -3693,17 +3925,22 @@ mod tests {
         engine.refresh().await.unwrap();
         node.lock().await.height = 2;
         engine.refresh().await.unwrap();
-        node.lock().await.height = 3;
-        assert!(
-            engine
-                .claim(&recipient(3), "a")
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("snapshot changed")
-        );
+        // A node quoting a newer snapshot before every preparation is never
+        // signed for. The claim prepares again after each refresh that shows
+        // the tip moved, a bounded number of times.
+        {
+            let mut node = node.lock().await;
+            node.requote_stale_anchor = true;
+            node.advance_before_prepare = usize::MAX;
+        }
+        let moved = engine.claim(&recipient(3), "a").await.unwrap_err();
+        assert!(moved.is::<QuoteMoved>());
+        assert!(moved.to_string().contains("snapshot changed"));
+        assert_eq!(node.lock().await.prepared, CLAIM_PREPARATIONS);
         assert!(engine.ledger.pending().unwrap().is_none());
+        assert!(engine.ledger.last(&recipient(3)).unwrap().is_none());
         assert!(node.lock().await.transactions.is_empty());
+        node.lock().await.advance_before_prepare = 0;
         engine.refresh().await.unwrap();
         engine.config.expiry_blocks = i64::MAX as u64;
         assert!(
@@ -3725,6 +3962,96 @@ mod tests {
         );
         assert!(engine.ledger.pending().unwrap().is_none());
         assert!(node.lock().await.transactions.is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_block_after_the_last_refresh_is_quoted_again_within_the_claim() {
+        // A claim was prepared against the tip of the faucet's last refresh,
+        // up to three seconds old. A block arriving in between made the node
+        // refuse that anchor, or quote another snapshot, and the visitor was
+        // answered 503 although the faucet could pay: about one claim in ten
+        // at 15-second blocks.
+        for requote in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let (mut engine, _, node, task) = ready_engine(&dir, |_| {}).await;
+            {
+                let mut node = node.lock().await;
+                node.advance_before_prepare = 1;
+                node.requote_stale_anchor = requote;
+            }
+            let paid = engine.claim(&recipient(3), "a").await.unwrap();
+            assert_eq!(paid["status"], "pending");
+            // The claim refreshed, accounting the new block as any refresh
+            // does, and signed only the transfer prepared on its tip.
+            assert_eq!(engine.height, Some(3));
+            assert_eq!(engine.tip, Some(codec::block_hash(&block(3, vec![]))));
+            let claim = engine.ledger.pending().unwrap().unwrap();
+            assert_eq!(claim.txid, paid["txid"]);
+            let signed = wallet::decode_signed(&claim.raw, &[7; 32]).unwrap();
+            assert_eq!(signed.body.anchor, codec::block_hash(&block(3, vec![])));
+            assert_eq!(signed.body.nonce, 0);
+            assert_eq!((claim.height, claim.expiry), (3, 5));
+            let reserved: u64 = engine
+                .ledger
+                .db
+                .query_row("SELECT COUNT(*) FROM claims", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(reserved, 1);
+            let node = node.lock().await;
+            assert_eq!(node.prepared, 2);
+            assert_eq!(node.transactions.len(), 1);
+            assert_eq!(
+                codec::transaction_id(&node.transactions[0]),
+                codec::transaction_id(&signed)
+            );
+            drop(node);
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_claim_prepares_again_only_while_the_tip_moves_and_a_bounded_number_of_times() {
+        let dir = TempDir::new().unwrap();
+        let (mut engine, _, node, task) = ready_engine(&dir, |_| {}).await;
+        // A refusal on a tip that did not move is the node's answer: the
+        // claim refreshes once to tell, and prepares nothing more.
+        node.lock().await.refuse_prepare = true;
+        let refused = engine.claim(&recipient(3), "a").await.unwrap_err();
+        assert!(refused.is::<NodeRefused>());
+        assert_eq!(node.lock().await.prepared, 1);
+        assert!(engine.fault.is_none());
+        // Blocks arriving before every preparation end the claim after a
+        // bounded number of attempts, all refused by the node.
+        {
+            let mut node = node.lock().await;
+            node.refuse_prepare = false;
+            node.advance_before_prepare = usize::MAX;
+        }
+        let refused = engine.claim(&recipient(3), "a").await.unwrap_err();
+        assert!(refused.is::<NodeRefused>());
+        assert_eq!(node.lock().await.prepared, 1 + CLAIM_PREPARATIONS);
+        // Nothing was signed, reserved or sent, and the visitor's allowance
+        // is untouched.
+        assert!(engine.ledger.last(&recipient(3)).unwrap().is_none());
+        assert!(node.lock().await.transactions.is_empty());
+        assert_eq!(engine.ledger.lifetime, 0);
+        // Once blocks arrive at their usual pace the same visitor is paid,
+        // against the tip the claim's own refresh read.
+        node.lock().await.advance_before_prepare = 1;
+        let paid = engine.claim(&recipient(3), "a").await.unwrap();
+        assert_eq!(paid["status"], "pending");
+        let height = node.lock().await.height;
+        let claim = engine.ledger.pending().unwrap().unwrap();
+        assert_eq!(claim.height, height);
+        assert_eq!(
+            wallet::decode_signed(&claim.raw, &[7; 32])
+                .unwrap()
+                .body
+                .anchor,
+            codec::block_hash(&block(height, vec![]))
+        );
+        assert_eq!(node.lock().await.transactions.len(), 1);
         task.abort();
     }
 
@@ -5149,6 +5476,164 @@ mod tests {
         );
         assert_eq!(node.lock().await.transactions.len(), 1);
         task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_that_refreshes_during_a_slow_refresh_keeps_the_newer_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let (mut engine, _, node, mock_task) = ready_engine(&dir, |_| {}).await;
+        // A confirmed receipt makes every refresh look up its block.
+        engine.claim(&recipient(3), "a").await.unwrap();
+        {
+            let mut node = node.lock().await;
+            let transactions = node.transactions.clone();
+            node.blocks.insert(3, block(3, transactions));
+            node.nonce = 1;
+            node.height = 4;
+        }
+        engine.refresh().await.unwrap();
+        assert_eq!(
+            engine.status(Some(&recipient(3)), "a").unwrap()["claim"]["status"],
+            "confirmed"
+        );
+        let key = hex::encode(engine.sender);
+        let app = App::new(
+            engine,
+            vec!["https://faucet.example".into()],
+            vec!["faucet.example".into()],
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let routes = router(app.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, routes).await.unwrap();
+        });
+        // The poll's next refresh reads the snapshot at height 5, then waits
+        // for its receipt lookup, as a slow node's would.
+        let (entered, release) = {
+            let mut node = node.lock().await;
+            node.height = 5;
+            gate_receipts(&mut node)
+        };
+        let refresh = {
+            let (engine, client) = (app.engine.clone(), app.node.clone());
+            tokio::spawn(async move { poll_once(&mut Shared(engine), &client, &key).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        // Another block arrives. The engine still holds the tip at height 4,
+        // so the node refuses the claim's first preparation.
+        node.lock().await.height = 6;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let paid = client
+            .post(format!("{base}/faucet/claim"))
+            .header("host", "faucet.example")
+            .header("origin", "https://faucet.example")
+            .header("x-real-ip", "192.0.2.4")
+            .json(&json!({"address":recipient(4)}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paid.status(), StatusCode::OK);
+        assert_eq!(paid.json::<Value>().await.unwrap()["status"], "pending");
+        assert!(!refresh.is_finished());
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), refresh)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        // The overtaken refresh's older snapshot, and what its lookup found,
+        // were not applied over the claim's own refresh.
+        let engine = app.engine.lock().await;
+        assert_eq!(engine.height, Some(6));
+        assert_eq!(engine.tip, Some(codec::block_hash(&block(6, vec![]))));
+        assert!(engine.fault.is_none());
+        assert_eq!(engine.state().unwrap(), "pending");
+        let pending = engine.ledger.pending().unwrap().unwrap();
+        assert_eq!(pending.address, recipient(4));
+        assert_eq!((pending.nonce, pending.height), (1, 6));
+        drop(engine);
+        broadcasts(&node, 2).await;
+        server.abort();
+        mock_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn claims_the_faucet_cannot_pay_now_say_why_and_when_to_try_again() {
+        let dir = TempDir::new().unwrap();
+        let (engine, _, node, mock_task) = ready_engine(&dir, |_| {}).await;
+        let key = hex::encode(engine.sender);
+        let app = App::new(
+            engine,
+            vec!["https://faucet.example".into()],
+            vec!["faucet.example".into()],
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let routes = router(app.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, routes).await.unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let claim = |n: u8, ip: &'static str| {
+            client
+                .post(format!("{base}/faucet/claim"))
+                .header("host", "faucet.example")
+                .header("origin", "https://faucet.example")
+                .header("x-real-ip", ip)
+                .json(&json!({"address":recipient(n)}))
+                .send()
+        };
+        // A block arrives after the faucet's last refresh: still paid.
+        node.lock().await.advance_before_prepare = 1;
+        let paid = claim(3, "192.0.2.3").await.unwrap();
+        assert_eq!(paid.status(), StatusCode::OK);
+        // Another visitor's payment is outstanding: try again in about one
+        // block interval.
+        let waiting = claim(4, "198.51.100.4").await.unwrap();
+        assert_eq!(waiting.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(waiting.headers()["retry-after"], "15");
+        let body: Value = waiting.json().await.unwrap();
+        assert_eq!(body["state"], "pending");
+        assert_eq!(body["retry_after_seconds"], 15);
+        // Once that payment confirms, a busy node's refusal of the
+        // preparation is answered with the node's wait.
+        {
+            let mut node = node.lock().await;
+            let transactions = node.transactions.clone();
+            node.blocks.insert(4, block(4, transactions));
+            node.nonce = 1;
+            node.height = 5;
+            node.refusals
+                .push(("preparetransaction", StatusCode::TOO_MANY_REQUESTS, None));
+        }
+        poll_once(&mut Shared(app.engine.clone()), &app.node, &key)
+            .await
+            .unwrap();
+        assert_eq!(app.engine.lock().await.state().unwrap(), "ready");
+        let busy = claim(4, "198.51.100.4").await.unwrap();
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(busy.headers()["retry-after"], "5");
+        let body: Value = busy.json().await.unwrap();
+        assert_eq!(body["state"], "node_busy");
+        assert_eq!(body["retry_after_seconds"], 5);
+        // A state that lasts gives no wait.
+        app.engine.lock().await.fault = Some("nonce_conflict");
+        let paused = claim(4, "198.51.100.4").await.unwrap();
+        assert_eq!(paused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(paused.headers().get("retry-after").is_none());
+        let body: Value = paused.json().await.unwrap();
+        assert_eq!(body["state"], "unavailable");
+        assert!(body.get("retry_after_seconds").is_none());
+        // None of these reserved anything for the second visitor.
+        let engine = app.engine.lock().await;
+        assert!(engine.ledger.last(&recipient(4)).unwrap().is_none());
+        assert_eq!(engine.ledger.lifetime, 1);
+        drop(engine);
+        server.abort();
+        mock_task.abort();
     }
 
     #[tokio::test]

@@ -28,7 +28,9 @@ gossip. A release build issues whole atoms of one petahash of expected work,
 so CPU blocks issue nothing and the faucet stays unfunded. Phase C, with
 --fixture-release-dir (a test-fixtures build, one atom per hash), funds the
 faucet from mined coins as INSTALL.md step 11 does, prepared on the web host,
-signed by hashstash-cold and broadcast, and completes a claim. Nothing outside
+signed by hashstash-cold and broadcast, and completes three claims from three
+client networks, each sent the moment a new block arrives and each paid on its
+first attempt. Nothing outside
 --work is touched; every process started here is stopped at the end. No
 network access beyond loopback.
 """
@@ -56,6 +58,9 @@ ROOT = Path(__file__).resolve().parents[1]
 KIT = ROOT / "scripts" / "launch-kit.sh"
 DOMAIN = "wallet.rehearsal.test"
 ORIGIN = "https://" + DOMAIN
+# Visitors' addresses as nginx sets X-Real-IP: one client network each, so the
+# per-network cooldown never delays the next claim.
+FAUCET_VISITORS = ["198.51.100.23", "203.0.113.23", "192.0.2.23"]
 REPORT = {"phases": {}}
 PROCESSES = []
 
@@ -546,8 +551,8 @@ class Rehearsal:
         path.write_text(json.dumps(config, indent=2))
         return path, config
 
-    def faucet_request(self, path, method="GET", body=None, headers=None):
-        base = {"Host": DOMAIN, "X-Real-IP": "198.51.100.23"}
+    def faucet_request(self, path, method="GET", body=None, headers=None, ip=FAUCET_VISITORS[0]):
+        base = {"Host": DOMAIN, "X-Real-IP": ip}
         if headers is not None:
             base = headers
         if method == "POST":
@@ -593,7 +598,10 @@ class Rehearsal:
         if funded:
             payout_balance = balance(servers[0].rpc, self.payout_public)
             amount = payout_balance // 2
-            check(amount > 0, "mined coins to fund the faucet")
+            kit_faucet = json.loads((out / f"server-1-{self.ips[0]}" / "faucet" / "config.json").read_text())
+            # Each claim needs the payout and the fee allowance available.
+            needed = len(FAUCET_VISITORS) * (int(kit_faucet["payout"]) + int(kit_faucet["max_fee"]))
+            check(amount >= needed, f"mined coins fund {len(FAUCET_VISITORS)} claims: {amount} of {needed} atoms")
             report["funding_transfer"] = dict(self.fund_offline(release, out, run_dir, faucet_address, amount),
                                               payout_balance_before=payout_balance, amount=amount)
             deadline = time.monotonic() + 120
@@ -619,47 +627,61 @@ class Rehearsal:
         wrong_host, _, _ = self.faucet_request("/faucet/status", headers={"Host": "evil.example", "X-Real-IP": "198.51.100.23"})
         check(no_ip == 403 and wrong_host == 403, "faucet refuses requests without X-Real-IP or with another Host")
         report["faucet_refusals"] = {"without_x_real_ip": no_ip, "other_host": wrong_host}
-        recipient_public = re.search(r"Public key: ([0-9a-f]{64})",
-                                     run([binary, "keygen", "--out", run_dir / "recipient.key"]).stdout).group(1)
-        recipient = run([binary, "address", "--public-key", recipient_public, "--config",
-                         out / "genesis" / "network.json"]).stdout.strip()
-        deadline = time.monotonic() + 120
-        while time.monotonic() < deadline:
-            code, status, _ = self.faucet_request(f"/faucet/status?address={recipient}")
-            if status.get("state") not in ("waiting_for_mining", "unavailable"):
-                break
-            time.sleep(1)
-        report["faucet_status_before_claim"] = status
-        log(f"faucet state before the claim: {status.get('state')}")
-        # A block that reaches the faucet's node between the faucet's snapshot
-        # and the node's preparation can make a claim answer 503, and a visitor
-        # then claims again; so does this rehearsal, every attempt recorded
-        # (a funded faucet only: an unfunded one answers 503 every time).
-        attempts = []
-        while True:
-            code, claim, headers = self.faucet_request("/faucet/claim", "POST", {"address": recipient})
-            attempts.append(code)
-            if not funded or code != 503 or len(attempts) >= 15:
-                break
-            time.sleep(1)
-        report["claim"] = {"http": code, "reply": claim, "attempts": attempts}
-        log(f"claim: HTTP {code} after {len(attempts)} attempt(s) {attempts} {json.dumps(claim)[:200]}")
-        if funded:
-            check(code == 200 and claim.get("status") in ("pending", "confirmed"), "claim accepted")
+        # A funded faucet pays several visitors in turn (it keeps one payment
+        # outstanding), each from its own client network. Each claim is sent
+        # the moment a new block reaches the web host's node, before the
+        # faucet's next three-second refresh can show it: the faucet then
+        # prepares against the tip it last saw, the node refuses that anchor,
+        # and the claim must refresh and prepare again instead of answering
+        # 503. Every claim is sent once; none may need a retry.
+        claims = []
+        for index, visitor_ip in enumerate(FAUCET_VISITORS if funded else FAUCET_VISITORS[:1]):
+            name = f"recipient-{index + 1}"
+            recipient_public = re.search(r"Public key: ([0-9a-f]{64})",
+                                         run([binary, "keygen", "--out", run_dir / f"{name}.key"]).stdout).group(1)
+            recipient = run([binary, "address", "--public-key", recipient_public, "--config",
+                             out / "genesis" / "network.json"]).stdout.strip()
+            # The previous payment confirmed and the faucet sees mining.
             deadline = time.monotonic() + 180
             while time.monotonic() < deadline:
-                code, status, _ = self.faucet_request(f"/faucet/status?address={recipient}")
+                code, status, _ = self.faucet_request(f"/faucet/status?address={recipient}", ip=visitor_ip)
+                if status.get("state") not in ("waiting_for_mining", "unavailable", "pending"):
+                    break
+                time.sleep(1)
+            log(f"faucet state before claim {index + 1}: {status.get('state')}")
+            check(not funded or status.get("state") == "ready", f"faucet ready for claim {index + 1}: {status}")
+            height = rpc(servers[0].rpc, "status")["height"]
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and rpc(servers[0].rpc, "status")["height"] <= height:
+                time.sleep(0.05)
+            arrived = time.monotonic()
+            code, claim, headers = self.faucet_request("/faucet/claim", "POST", {"address": recipient},
+                                                       ip=visitor_ip)
+            entry = {"http": code, "reply": claim, "attempts": 1, "after_block_height": height + 1,
+                     "seconds_after_block": round(time.monotonic() - arrived, 3),
+                     "retry_after": headers.get("Retry-After")}
+            claims.append(entry)
+            log(f"claim {index + 1}: HTTP {code} on the first attempt, sent at a new block "
+                f"{json.dumps(claim)[:200]}")
+            if not funded:
+                check(code != 200 or claim.get("status") not in ("pending", "confirmed"),
+                      "an unfunded faucet pays nothing")
+                check(code == 503 and claim.get("state") == "unfunded", f"an unfunded faucet says so: {code} {claim}")
+                continue
+            check(code == 200 and claim.get("status") in ("pending", "confirmed"),
+                  f"claim {index + 1} accepted on its first attempt: HTTP {code} {claim}")
+            deadline = time.monotonic() + 180
+            while time.monotonic() < deadline:
+                code, status, _ = self.faucet_request(f"/faucet/status?address={recipient}", ip=visitor_ip)
                 if (status.get("claim") or {}).get("status") == "confirmed":
                     break
-                time.sleep(2)
-            report["claim_final"] = status.get("claim")
+                time.sleep(1)
             received = balance(servers[0].rpc, recipient_public)
-            report["recipient_balance"] = received
+            entry.update(final=status.get("claim"), recipient_balance=received)
             check((status.get("claim") or {}).get("status") == "confirmed" and received == int(config["payout"]),
-                  f"claim confirmed and paid: {status.get('claim')} balance {received}")
-            log(f"claim confirmed; recipient balance {received} atoms")
-        else:
-            check(code != 200 or claim.get("status") not in ("pending", "confirmed"), "an unfunded faucet pays nothing")
+                  f"claim {index + 1} confirmed and paid: {status.get('claim')} balance {received}")
+            log(f"claim {index + 1} confirmed; recipient balance {received} atoms")
+        report["claims"] = claims
         report["faucet_exit"] = stop(faucet)
 
     def fund_offline(self, release, out, run_dir, faucet_address, amount):
@@ -828,8 +850,9 @@ class Rehearsal:
         values, out, servers, converged = self.mined_network(phase, release, kit_name, run_name)
         report.update(chain_id=values["CHAIN_ID"], genesis_sha256=values["GENESIS_SHA256"], start=converged)
         miner = None
-        # A funded faucet needs coins: a fixture block issues about two atoms.
-        blocks = max(self.options.blocks, 24) if funded else self.options.blocks
+        # A funded faucet needs coins: a fixture block issues about two atoms,
+        # and half the payout account funds three claims of 5 + up to 10 atoms.
+        blocks = max(self.options.blocks, 50) if funded else self.options.blocks
         try:
             # Stratum runs on servers 2 and 3; server 1 is the web host.
             miner = Miner(self.ips[1], self.ports["stratum"], self.passwords[1].read_text().strip(), 0.5,

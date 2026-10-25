@@ -152,7 +152,16 @@ each local accounting step, never while it waits for the node (each node call
 has a five-second timeout). A claim holds the engine from its eligibility checks
 through its reservation, including the node's preparation of the transfer, so
 the nonce, anchor and one pending payment cannot change meanwhile; the
-broadcast that follows holds nothing. The claim's answer waits at most two
+broadcast that follows holds nothing. A claim is prepared against the
+snapshot of the latest refresh, up to three seconds old. When a block reached
+the node since, the node refuses that anchor (or quotes its newer snapshot)
+and nothing is signed: the claim then refreshes, within its hold and through
+the same accounting as every refresh, and starts again from its eligibility
+checks against the new snapshot. It does so only while that refresh shows the
+tip moved, and asks for at most three preparations in all, so a visitor is
+refused for a moving chain only when blocks arrive faster than a few loopback
+calls. A refresh the poll began before such a claim refresh ended applies
+nothing more, so the engine never returns to an older snapshot. The claim's answer waits at most two
 seconds for that broadcast, which a node usually accepts at once, and never
 past one second before the 15-second request deadline below, so a claim
 reserved in time is answered with its payment; a busy node's `Retry-After` and
@@ -226,7 +235,21 @@ the UI should handle malformed-body errors without assuming a JSON payload.
 An HTTP 429 cooldown response includes the actual remaining seconds in both
 `retry_after_seconds` and the `Retry-After` header, plus `cooldown_scope`.
 Global budget exhaustion remains separate and does not invent a cooldown
-countdown. Changing the subnet cooldown preserves the entire existing claim
+countdown: it is answered 429 with `state` `quota_reached`.
+
+A 503 from the claim engine means the faucet cannot pay now and reserved
+nothing. Its `state` names the reason as status does (`pending`,
+`waiting_for_mining`, `unfunded`, `fee_cap_exceeded`, `capacity_exceeded`,
+`unavailable`), or `node_busy` when the node could not prepare the payment
+(it was busy, refused the preparation, or blocks kept arriving during it).
+For a short wait it adds `retry_after_seconds` and `Retry-After`: about one
+block interval (at least 3 and at most 60 seconds) for another visitor's
+outstanding payment, which settles within a block or two, and the node's own
+wait, or 3 or 5 seconds, for `node_busy`. The wallet sends the claim once
+more after such a wait of at most a minute (a repeated claim is answered
+from the ledger, so it is never paid twice) and otherwise asks the visitor
+to try again. A 503 whose request outlived the 15-second deadline carries
+neither field: it may have been reserved, and status tells. Changing the subnet cooldown preserves the entire existing claim
 ledger, all address cooldowns, and hourly, daily, and lifetime budget usage.
 
 ## Payment and recovery rules

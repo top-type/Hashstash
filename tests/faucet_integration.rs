@@ -385,6 +385,69 @@ async fn fixed_payment_is_exact_and_durable_against_repeat_claims_and_restart() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_block_mined_just_before_a_claim_does_not_refuse_it() {
+    // The faucet prepares a claim against the tip of its last refresh, every
+    // three seconds. A block mined in between made the node refuse that
+    // anchor, and the visitor was answered 503 although the faucet could
+    // pay. Each claim here is sent right after a block, before the faucet's
+    // next refresh, and must be paid on its first attempt.
+    let dir = tempfile::tempdir().unwrap();
+    let (key_file, donor) = dedicated_key(&dir);
+    let mut config = Config::devnet();
+    config.network = "faucet-moved-tip-integration".into();
+    let node = Node::open(&dir.path().join("chain.sqlite"), config.clone(), donor).unwrap();
+    let node_server = node::serve(node.clone(), options()).await.unwrap();
+    let policy = faucet_config(&dir, key_file, &config, node_server.rpc);
+    let server = faucet::serve(policy).await.unwrap();
+    let client = Client::new();
+    sleep(Duration::from_millis(3300)).await;
+    // Mining funds the faucet's own key: the payout and the fee allowance.
+    for _ in 0..30 {
+        node.mine(100_000).unwrap();
+    }
+    wait_status(&client, &server, None, |v| v["state"] == "ready").await;
+    for (index, ip) in ["192.0.2.31", "198.51.100.31", "203.0.113.31"]
+        .into_iter()
+        .enumerate()
+    {
+        let recipient = crypto::public_key(&[120 + index as u8; 32]).unwrap();
+        let recipient_address = address::encode(&recipient, &config.chain_id()).unwrap();
+        let unseen = node.mine(100_000).unwrap();
+        let response = claim(&client, &server, &recipient_address, ip).await;
+        let status = response.status();
+        let paid: Value = response.json().await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "claim {index} after block {}: {paid}",
+            unseen.height
+        );
+        assert_eq!(paid["status"], "pending");
+        // Signed against the block the faucet had not yet refreshed for.
+        let payment = node.mine(100_000).unwrap();
+        assert_eq!(payment.transactions.len(), 1);
+        assert_eq!(
+            hex::encode(codec::transaction_id(&payment.transactions[0])),
+            paid["txid"]
+        );
+        assert_eq!(
+            payment.transactions[0].body.anchor,
+            codec::block_hash(&unseen)
+        );
+        node.mine(100_000).unwrap();
+        wait_status(&client, &server, Some(&recipient_address), |v| {
+            v["claim"]["status"] == "confirmed"
+        })
+        .await;
+        assert_eq!(amount(&account(&node, recipient)["ordinary"]), 5u32.into());
+        wait_status(&client, &server, None, |v| v["state"] == "ready").await;
+    }
+    assert_eq!(account(&node, donor)["nonce"], 3);
+    server.stop().await;
+    node_server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mined_faucet_balances_remain_liquid_across_initial_rest_and_auction() {
     let dir = tempfile::tempdir().unwrap();
     let (key_file, donor) = dedicated_key(&dir);

@@ -114,6 +114,72 @@ async function run() {
   assert.equal(limited.get('faucet-claim').disabled, true); checks++;
   assert.match(limited.get('faucet-status').textContent, /Limit reached|Available in/); checks++;
 
+  {
+    // A 503 naming a short wait reserved nothing: the claim is sent once more
+    // after it, and only once.
+    const busy = (state, retry) => response({ error: 'Faucet is sending another payment; try again shortly', state, retry_after_seconds: retry }, 503);
+    const retryApi = service(); let refusals = 1;
+    retryApi.post = body => {
+      if (refusals-- > 0) return busy('pending', 15);
+      const result = claim(); retryApi.claims.set(body.address, result); return response(result);
+    };
+    const retrying = await harness({ hash: '#wallet', faucetTransport: retryApi.fetch }); await settle();
+    const sending = retrying.get('faucet-claim').click(); await settle();
+    assert.equal(posts(retrying).length, 1); checks++;
+    assert.equal(retrying.get('faucet-status').textContent, 'Faucet busy · trying again shortly'); checks++;
+    assert.equal(retrying.get('faucet-claim').disabled, true); checks++;
+    await retrying.get('faucet-claim').click();
+    assert.equal(posts(retrying).length, 1, 'a click while waiting sends nothing'); checks++;
+    await retrying.timersDue(15000); await sending; await settle();
+    assert.equal(posts(retrying).length, 2, 'sent once more after the named wait'); checks++;
+    assert.equal(JSON.parse(posts(retrying)[1].options.body).address, addr(first)); checks++;
+    assert.match(retrying.get('faucet-status').textContent, /Pending/); checks++;
+    assert.equal(retrying.get('faucet-claim').disabled, true); checks++;
+
+    // Refused again: a clear prompt that outlasts the status read, and no
+    // third attempt. The next click clears it.
+    const againApi = service(); againApi.post = () => busy('pending', 15);
+    const again = await harness({ hash: '#wallet', faucetTransport: againApi.fetch }); await settle();
+    const refused = again.get('faucet-claim').click(); await settle();
+    await again.timersDue(15000); await refused; await settle();
+    assert.equal(posts(again).length, 2); checks++;
+    assert.equal(again.get('faucet-status').textContent, 'Faucet was busy. Try again.'); checks++;
+    assert.equal(again.get('faucet-claim').disabled, false, 'the visitor may try again'); checks++;
+    again.wallClock += 11000; await again.refresh(); await settle();
+    assert.equal(again.get('faucet-status').textContent, 'Faucet was busy. Try again.'); checks++;
+    assert.equal(posts(again).length, 2, 'refreshes never resend a claim'); checks++;
+    againApi.post = null;
+    await again.get('faucet-claim').click(); await settle();
+    assert.equal(posts(again).length, 3); checks++;
+    assert.match(again.get('faucet-status').textContent, /Pending/); checks++;
+
+    // While another payment is outstanding, status says so.
+    const otherApi = service(); Object.assign(otherApi.status, { state: 'pending', available: false });
+    const other = await harness({ hash: '#wallet', faucetTransport: otherApi.fetch }); await settle();
+    assert.equal(other.get('faucet-status').textContent, 'Busy with another payment · try again shortly'); checks++;
+    assert.equal(other.get('faucet-claim').disabled, true); checks++;
+
+    // A 503 without a wait, or with a long one, is not resent.
+    for (const reply of [response({ error: 'Faucet is waiting for mining, funds, or another payment', state: 'unavailable' }, 503), busy('node_busy', 3600)]) {
+      const plainApi = service(); plainApi.post = () => reply;
+      const plain = await harness({ hash: '#wallet', faucetTransport: plainApi.fetch }); await settle();
+      await plain.get('faucet-claim').click(); await settle();
+      await plain.timersDue(60000); await settle();
+      assert.equal(posts(plain).length, 1); checks++;
+      assert.equal(plain.get('faucet-status').textContent, 'Faucet was busy. Try again.'); checks++;
+    }
+
+    // A wallet changed during the wait cancels the resend.
+    const movedApi = service(); movedApi.post = () => busy('node_busy', 3);
+    const moved = await harness({ hash: '#wallet', faucetTransport: movedApi.fetch }); await settle();
+    const leaving = moved.get('faucet-claim').click(); await settle();
+    moved.currentSession = { ...moved.currentSession, public_key: second, wallet_id: `hot:${second}`, wallets: [{ id: `hot:${second}`, public_key: second, mode: 'hot' }] };
+    await moved.refresh(); await settle();
+    await moved.timersDue(3000); await leaving; await settle();
+    assert.equal(posts(moved).length, 1, 'no resend for a wallet no longer selected'); checks++;
+    assert.equal(moved.get('faucet-status').hidden, true); checks++;
+  }
+
   const connectionApi = service(); Object.assign(connectionApi.status, { state: 'cooldown', available: false, retry_after_seconds: 45, cooldown_scope: 'network' });
   const connection = await harness({ hash: '#wallet', faucetTransport: connectionApi.fetch }); await settle();
   assert.equal(connection.get('faucet-claim').disabled, true, 'network cooldown is visible before a failed claim'); checks++;

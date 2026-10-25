@@ -80,6 +80,11 @@
         error: "",
         sequence: 0,
         busy: new Set,
+        // Claims waiting out a 503's short wait before their one resend.
+        retrying: new Set,
+        // The last claim the faucet refused with 503, by claim key, so the
+        // prompt to try again outlasts the status read that follows it.
+        refused: null,
         claims: new Map
     };
     function recipientKey(form) { return addressKey(form.elements.recipient.value); }
@@ -956,8 +961,11 @@
         text("faucet-claim", busy ? "Requesting…" : "Get test hashes");
         amountText("faucet-amount", current?.amount_hashes ? formatHash(current.amount_hashes) : "");
         const wait = cooldown ? current?.cooldown_scope === "network" ? `Retry in ${duration(cooldown)}` : `Available in ${duration(cooldown)}` : "";
+        // A refused claim keeps its prompt for two minutes while the faucet
+        // reports itself ready again, until the next claim is sent.
+        const refused = faucet.refused?.key === claimKey && Date.now() - faucet.refused.at < 12e4 ? "Faucet was busy. Try again." : "";
         let message = "";
-        busy ? message = "Requesting…" : pending ? message = "Pending" : claim?.status === "confirmed" ? message = `${formatHash(claim.amount_hashes)} received.${wait ? ` ${wait}` : ""}` : cooldown ? message = wait : state.ready ? faucet.lastKey === claimKey && faucet.error ? message = faucet.error : current?.state === "waiting_for_mining" ? message = "Waiting for mining" : current?.state === "unfunded" ? message = "Unfunded" : current?.state === "quota_reached" ? message = "Limit reached" : current?.state === "pending" ? message = "Payment pending" : current && !current.available ? message = "Unavailable" : current || (message = "Checking…") : message = "Connecting…";
+        busy ? message = faucet.retrying.has(claimKey) ? "Faucet busy · trying again shortly" : "Requesting…" : pending ? message = "Pending" : claim?.status === "confirmed" ? message = `${formatHash(claim.amount_hashes)} received.${wait ? ` ${wait}` : ""}` : cooldown ? message = wait : state.ready ? faucet.lastKey === claimKey && faucet.error ? message = faucet.error : current?.state === "waiting_for_mining" ? message = "Waiting for mining" : current?.state === "unfunded" ? message = "Unfunded" : current?.state === "quota_reached" ? message = "Limit reached" : current?.state === "pending" ? message = "Busy with another payment · try again shortly" : current && !current.available ? message = "Unavailable" : refused ? message = refused : current || (message = "Checking…") : message = "Connecting…";
         pending && current?.mining_active === false && (message = "Pending · waiting for mining");
         text("faucet-status", message);
         $("faucet-status").hidden = !message;
@@ -1047,11 +1055,13 @@
         if ($("wallet-faucet").hidden || $("faucet-claim").disabled) return;
         const claimKey = faucetKey(), chain = state.status.chain_id, recipient = address(), config = faucet.config;
         const identity = walletIdentity();
+        const unchanged = () => identity === walletIdentity() && chain === state.status?.chain_id;
         faucet.busy.add(claimKey);
         faucet.sequence++;
+        faucet.refused = null;
         faucetView();
         try {
-            const {response: response, data: data} = await faucetRequest(`${config.url}/faucet/claim`, {
+            const send = () => faucetRequest(`${config.url}/faucet/claim`, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json"
@@ -1060,21 +1070,42 @@
                     address: recipient
                 })
             });
+            let {response: response, data: data} = await send();
+            // A 503 that names a short wait reserved nothing: another
+            // visitor's payment was outstanding or the faucet's node was
+            // busy. The claim is sent once more after that wait, while the
+            // same wallet stays selected; a repeated claim is answered from
+            // the faucet's ledger, so it can never be paid twice.
+            const wait = response.status === 503 ? faucetRetry(data?.retry_after_seconds) : 0;
+            if (wait > 0 && wait <= 60 && unchanged()) {
+                faucet.retrying.add(claimKey);
+                faucetView();
+                try {
+                    await new Promise(resolve => setTimeout(resolve, wait * 1e3));
+                } finally {
+                    faucet.retrying.delete(claimKey);
+                }
+                unchanged() && ({response: response, data: data} = await send());
+            }
             if (!response.ok) {
                 const retry = faucetRetry(data?.retry_after_seconds);
                 retry && faucet.claims.set(claimKey, {
                     retryAt: Date.now() + retry * 1e3
                 });
-                throw new Error(response.status === 429 ? "Limit reached" : "Faucet unavailable. Try again shortly.");
+                response.status === 503 && unchanged() && (faucet.refused = {
+                    key: claimKey,
+                    at: Date.now()
+                });
+                throw new Error(response.status === 429 ? "Limit reached" : data?.state === "pending" ? "Busy with another payment. Try again shortly." : "Faucet unavailable. Try again shortly.");
             }
             if (data?.chain_id !== chain) throw new Error("Faucet network changed. Refresh and try again.");
             faucet.claims.set(claimKey, faucetClaimResult(data, chain));
-            if (identity === walletIdentity() && chain === state.status?.chain_id) {
+            if (unchanged()) {
                 faucet.error = "";
                 await refresh();
             }
         } catch (error) {
-            if (identity === walletIdentity() && chain === state.status?.chain_id) {
+            if (unchanged()) {
                 faucet.error = error.message;
                 faucet.lastKey = claimKey;
                 faucet.data = null;
@@ -1083,8 +1114,9 @@
             faucet.busy.delete(claimKey);
             faucet.lastAt = 0;
             faucetView();
-            // Only GET is retried. A timed-out POST may already have been accepted.
-                        refreshFaucet(true);
+            // Status is read again. A POST that failed otherwise is never
+            // resent: a timed-out one may already have been accepted.
+            refreshFaucet(true);
         }
     }
     $("faucet-claim").addEventListener("click", claimFaucet);

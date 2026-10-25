@@ -429,6 +429,8 @@ mod windows {
     const FILE_PERSISTENT_ACLS: u32 = 0x0000_0008;
     pub(super) const READ_CONTROL: u32 = 0x0002_0000;
     pub(super) const WRITE_DAC: u32 = 0x0004_0000;
+    #[cfg(test)]
+    pub(super) const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     /// Read, write and delete sharing, as the standard library opens files.
     pub(super) const FILE_SHARE_ALL: u32 = 0x0000_0007;
@@ -451,8 +453,34 @@ mod windows {
         inherit_handle: i32,
     }
 
+    /// BY_HANDLE_FILE_INFORMATION.
+    #[cfg(test)]
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileInformation {
+        attributes: u32,
+        times: [u32; 6],
+        volume_serial: u32,
+        size: [u32; 2],
+        links: u32,
+        index_high: u32,
+        index_low: u32,
+    }
+
+    /// Every file `open_private` created in this process, by volume and file
+    /// index, so tests can tell a secret file this module created owner-only
+    /// from one SQLite or another library created with the folder's inherited
+    /// list and something restricted afterwards. NTFS never gives a later
+    /// file the same index, while it does carry a deleted file's creation
+    /// time over to a new one of the same name.
+    #[cfg(test)]
+    pub(super) static CREATED: std::sync::Mutex<Vec<(u32, u64)>> =
+        std::sync::Mutex::new(Vec::new());
+
     #[link(name = "kernel32")]
     unsafe extern "system" {
+        #[cfg(test)]
+        fn GetFileInformationByHandle(file: RawHandle, information: *mut FileInformation) -> i32;
         fn GetVolumeInformationByHandleW(
             file: RawHandle,
             volume_name: *mut u16,
@@ -683,7 +711,34 @@ mod windows {
         }
         // SAFETY: a valid handle that nothing else owns.
         let file = unsafe { fs::File::from_raw_handle(handle) };
-        Ok((file, status.raw_os_error() == Some(ERROR_ALREADY_EXISTS)))
+        let existed = status.raw_os_error() == Some(ERROR_ALREADY_EXISTS);
+        #[cfg(test)]
+        if !existed {
+            use std::os::windows::fs::OpenOptionsExt;
+            // The creating handle may lack FILE_READ_ATTRIBUTES.
+            let created = fs::OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_ALL)
+                .open(path)?;
+            CREATED.lock().unwrap().push(identity(&created)?);
+        }
+        Ok((file, existed))
+    }
+
+    /// An open file's volume serial number and file index. The handle needs
+    /// FILE_READ_ATTRIBUTES.
+    #[cfg(test)]
+    pub(super) fn identity(file: &fs::File) -> Result<(u32, u64)> {
+        let mut information = FileInformation::default();
+        // SAFETY: the handle stays open for the call, and the output is a
+        // live structure of the size the system writes.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+            return Err(io::Error::last_os_error()).context("cannot identify the file");
+        }
+        Ok((
+            information.volume_serial,
+            (u64::from(information.index_high) << 32) | u64::from(information.index_low),
+        ))
     }
 
     /// Creates a directory whose protected list grants only the current
@@ -842,7 +897,7 @@ mod windows {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1107,7 +1162,7 @@ mod tests {
 
     /// One protected entry granting this account full control, nothing else.
     #[cfg(windows)]
-    fn assert_owner_only(path: &Path) {
+    pub(crate) fn assert_owner_only(path: &Path) {
         let sid = windows::current_sid().unwrap();
         let list = dacl(path);
         let (flags, entries) = list.split_at(list.find('(').unwrap());
@@ -1191,10 +1246,25 @@ mod tests {
         windows::run("icacls.exe", &arguments).unwrap();
     }
 
+    /// Whether `path` is a file `create_private` or `create_new_private`
+    /// created in this process, owner-only from its first moment, rather than
+    /// one SQLite or another library created with the folder's inherited list
+    /// and something restricted afterwards.
+    #[cfg(windows)]
+    pub(crate) fn created_owner_only(path: &Path) -> bool {
+        let file = fs::OpenOptions::new()
+            .access_mode(windows::FILE_READ_ATTRIBUTES)
+            .share_mode(windows::FILE_SHARE_ALL)
+            .open(path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let identity = windows::identity(&file).unwrap();
+        windows::CREATED.lock().unwrap().contains(&identity)
+    }
+
     /// A directory that lets Users read everything created inside it, as one
     /// under C:\ or ProgramData does.
     #[cfg(windows)]
-    fn shared_directory() -> tempfile::TempDir {
+    pub(crate) fn shared_directory() -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         grant_users(directory.path(), "(OI)(CI)R");
         let probe = directory.path().join("probe");
@@ -1233,7 +1303,14 @@ mod tests {
         create_private(&directory.path().join("journal")).unwrap();
         for name in ["session-token", "written", "journal"] {
             assert_owner_only(&directory.path().join(name));
+            assert!(created_owner_only(&directory.path().join(name)), "{name}");
         }
+        // A file created otherwise and restricted afterwards is told apart.
+        let restricted = directory.path().join("restricted");
+        fs::write(&restricted, b"secret").unwrap();
+        create_private(&restricted).unwrap();
+        assert_owner_only(&restricted);
+        assert!(!created_owner_only(&restricted));
         // A file a helper creates inside a private directory inherits only
         // this account's entry, before anything restricts it.
         let staging = directory.path().join("staging");

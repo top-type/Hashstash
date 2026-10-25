@@ -217,8 +217,20 @@ fn mutate(
     input.truncate(max_len);
 }
 
-/// Outcome labels without the input they quote back, or numbers, hashes and keys.
+/// Outcome labels without the input they quote back, in quotes or in
+/// parentheses such as another peer protocol generation's marker, or
+/// numbers, hashes and keys. Quoted-back bytes can hold parentheses
+/// themselves, so everything from the first `(` to the last `)` goes.
 fn normalized(label: &str) -> String {
+    let label = match label.find('(') {
+        Some(open) => {
+            let rest = label[open..]
+                .rfind(')')
+                .map_or("", |close| &label[open + close + 1..]);
+            format!("{}{rest}", &label[..open])
+        }
+        None => label.to_owned(),
+    };
     let mut unquoted = String::new();
     let mut quote = None;
     for c in label.chars() {
@@ -389,10 +401,16 @@ fn fuzz(
     let mut corpus = Vec::new();
     let mut labels = HashSet::new();
     let mut slowest = Duration::ZERO;
+    // Printing each new outcome shows what a target's feedback distinguishes,
+    // and what its seeds reach.
+    let verbose = std::env::var_os("HASHSTASH_FUZZ_VERBOSE").is_some();
     for input in initial_corpus(target, node, local) {
         match execute(target, node, &input) {
             Ok((label, elapsed)) => {
                 slowest = slowest.max(elapsed);
+                if verbose {
+                    eprintln!("{} seed: {label}", target.name);
+                }
                 labels.insert(normalized(&label));
                 corpus.push(input);
             }
@@ -400,8 +418,6 @@ fn fuzz(
         }
     }
     assert!(!corpus.is_empty(), "{} has no seeds", target.name);
-    // Printing each new outcome shows what a target's feedback distinguishes.
-    let verbose = std::env::var_os("HASHSTASH_FUZZ_VERBOSE").is_some();
     let mut count = 0;
     while count < inputs && until.is_none_or(|until| Instant::now() < until) {
         count += 1;
@@ -510,6 +526,10 @@ fn address_book() {
 #[test]
 fn stratum_session() {
     bounded("stratum_session");
+}
+#[test]
+fn peer_sync() {
+    bounded("peer_sync");
 }
 
 /// The ordinary runs start from tracked inputs only, whatever libFuzzer

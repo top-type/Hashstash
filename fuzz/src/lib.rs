@@ -10,8 +10,11 @@
 //! invariants checked here: canonical decoding (one encoding per value),
 //! agreement between the peer preflight and the consensus codec, agreement
 //! between the bounded JSON parsers, the discovery address book's bounds,
-//! read-only RPC methods leaving the node unchanged, and mining sessions
-//! answering in JSON lines and releasing their worker once closed.
+//! read-only RPC methods leaving the node unchanged, mining sessions
+//! answering in JSON lines and releasing their worker once closed, and a node
+//! that synchronized from a hostile peer sending only canonical requests,
+//! keeping its tip on its active chain and holding a state that a replay of
+//! that chain reproduces.
 
 use hashstash::{
     address, chat, codec,
@@ -168,6 +171,15 @@ pub const TARGETS: &[Target] = &[
         dictionary: STRATUM_TOKENS,
         // Past the session's 16 KiB line bound.
         max_len: 20 * 1024,
+        cost: 8,
+    },
+    Target {
+        name: "peer_sync",
+        run: Run::Node(peer_sync),
+        seeds: sync_seeds,
+        dictionary: PEER_TOKENS,
+        max_len: 64 * 1024,
+        // A loopback session, block validation and sometimes a replay.
         cost: 8,
     },
 ];
@@ -1550,6 +1562,302 @@ fn channel_seeds(_: Option<&Node>) -> Vec<Vec<u8>> {
             .into_iter()
             .map(|payload| [&[1], &payload[..]].concat()),
     );
+    seeds
+}
+
+// ---------------------------------------------------------------------------
+// Synchronization from a hostile peer.
+
+/// The most replies one `peer_sync` input scripts: every header round, the
+/// block batch and the closing acknowledgement.
+const SYNC_REPLIES: usize = peer_wire::MAX_HEADER_ROUNDS + 2;
+/// Past the runners' own hang limits, which report a session that waits on
+/// a peer that already answered or closed.
+const SYNC_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The next scripted peer's address: another loopback address for each
+/// input, as a hostile peer can use many addresses. A peer whose replies
+/// break the protocol starts a cooldown of its address, which on one address
+/// would refuse nearly every later session before it reached synchronization.
+/// Loopback peers are accounted per address, with no shared prefix.
+fn sync_peer_address() -> std::net::Ipv4Addr {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // 127.H.M.L with L in 1..=254, so never a .0, .255 or the /8 broadcast.
+    let index = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % (255 * 256 * 254);
+    let low = 1 + index % 254;
+    let rest = index / 254;
+    std::net::Ipv4Addr::new(127, (rest / 256) as u8, (rest % 256) as u8, low as u8)
+}
+
+fn sync_runtime() -> &'static tokio::runtime::Runtime {
+    // Validation runs on the blocking pool, which a runtime joins when
+    // dropped; as for mining sessions, this runtime is never dropped.
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("peer sync runtime")
+    })
+}
+
+/// The replies of a `peer_sync` input: each a two-byte big-endian length,
+/// then that many bytes of peer message; a short last reply takes the rest.
+fn sync_script(mut data: &[u8]) -> Vec<Vec<u8>> {
+    let mut replies = Vec::new();
+    while replies.len() < SYNC_REPLIES && data.len() >= 2 {
+        let length = usize::from(u16::from_be_bytes([data[0], data[1]]));
+        let (reply, rest) = data[2..].split_at(length.min(data.len() - 2));
+        replies.push(reply.to_vec());
+        data = rest;
+    }
+    replies
+}
+
+/// The `peer_sync` input that scripts these replies.
+fn sync_input(replies: &[Message]) -> Vec<u8> {
+    let [wide, _] = limits();
+    let mut input = Vec::new();
+    for reply in replies {
+        let payload = peer_wire::encode(reply, wide).expect("seed reply");
+        let length = u16::try_from(payload.len()).expect("a seed reply fits its length");
+        input.extend_from_slice(&length.to_be_bytes());
+        input.extend_from_slice(&payload);
+    }
+    input
+}
+
+fn active_block(node: &Node, height: u64) -> Block {
+    let block = node
+        .rpc("getblock", json!({ "height": height }))
+        .expect("an active height has a block");
+    serde_json::from_value(block).expect("getblock returns a block")
+}
+
+/// One request the node sent its peer: a plain frame that the node's own
+/// limits decode, with exactly one encoding.
+async fn sync_request<R: tokio::io::AsyncRead + Unpin>(read: &mut R) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+    let [wide, _] = limits();
+    let mut length = [0; 4];
+    read.read_exact(&mut length).await.ok()?;
+    let length = u32::from_be_bytes(length) as usize;
+    assert!(
+        length <= wide.frame_bytes(),
+        "the node sent a frame its own limits refuse"
+    );
+    let mut payload = vec![0; length];
+    read.read_exact(&mut payload).await.ok()?;
+    let message = peer_wire::decode(&payload, wide).expect("the node's request decodes");
+    assert_eq!(
+        peer_wire::encode(&message, wide).expect("a request re-encodes"),
+        payload,
+        "the node's request has exactly one encoding"
+    );
+    Some(message_kind(&message))
+}
+
+/// Replays the active chain into a fresh node, which must reach the same tip,
+/// state root, height and issuance.
+fn replay_agrees(node: &Node, status: &Value) {
+    let height = status["height"].as_u64().expect("status height");
+    let directory = tempfile::tempdir().expect("replay directory");
+    let fresh = Node::open(
+        &directory.path().join("replay.sqlite"),
+        config().clone(),
+        key(5),
+    )
+    .expect("replay node");
+    for h in 1..=height {
+        assert!(
+            fresh
+                .submit_block(active_block(node, h))
+                .expect("an active block replays"),
+            "replayed active block {h} did not become the tip"
+        );
+    }
+    let replayed = fresh.status().expect("replay status");
+    for field in ["tip", "state_root", "height", "issued"] {
+        assert_eq!(
+            replayed[field], status[field],
+            "a replay of the active chain disagrees on {field}"
+        );
+    }
+}
+
+/// A peer this node synchronizes from, as an outbound peer it chose: each
+/// request the node sends gets the input's next reply, and the peer closes
+/// once the script ends. Headers-first synchronization, the held-header
+/// store with its download pins, and validation of the blocks that follow
+/// all see what a hostile peer can send. Every listener is a new address to
+/// the node, so state it keeps per peer starts afresh while node-wide state
+/// carries over. Afterwards the node must still answer, its
+/// tip must be its active block at its height, and once the tip changed a
+/// replay of the active chain must reach the same state.
+pub fn peer_sync(node: &Node, data: &[u8]) -> String {
+    let replies = sync_script(data);
+    let before = node.status().expect("fixture status");
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let result = sync_runtime().block_on(async {
+        // Systems that answer only 127.0.0.1 share its record.
+        let listener = match tokio::net::TcpListener::bind((sync_peer_address(), 0)).await {
+            Ok(listener) => listener,
+            Err(_) => tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("loopback listener"),
+        };
+        let address = listener.local_addr().expect("listener address");
+        let seen = requests.clone();
+        // A task, so a node that never connects or stops early ends the input.
+        let peer = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (read, mut write) = stream.into_split();
+            let mut read = tokio::io::BufReader::new(read);
+            for reply in replies {
+                let Some(request) = sync_request(&mut read).await else {
+                    return;
+                };
+                seen.lock().expect("requests").push(request);
+                let mut frame = (reply.len() as u32).to_be_bytes().to_vec();
+                frame.extend_from_slice(&reply);
+                if write.write_all(&frame).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let result = tokio::time::timeout(SYNC_LIMIT, node::sync_peer(node, address)).await;
+        peer.abort();
+        // A request that broke an invariant panicked the peer task.
+        if let Err(error) = peer.await
+            && error.is_panic()
+        {
+            std::panic::resume_unwind(error.into_panic());
+        }
+        result
+    });
+    let status = node
+        .status()
+        .expect("the node answers after a peer session");
+    let height = status["height"].as_u64().expect("status height");
+    assert_eq!(
+        Value::from(hex::encode(codec::block_hash(&active_block(node, height)))),
+        status["tip"],
+        "the tip is not the active block at the tip height"
+    );
+    let tip = if status["tip"] == before["tip"] {
+        "same tip"
+    } else {
+        replay_agrees(node, &status);
+        "new tip"
+    };
+    let outcome = match result {
+        Err(_) => panic!("a session with a scripted peer outlived {SYNC_LIMIT:?}"),
+        // Whatever the session reports about itself, the checks above hold;
+        // what it reports, such as a header reply that failed while the
+        // block exchange went on, tells outcomes apart.
+        Ok(Ok(report)) => format!("synchronized {report:?}"),
+        Ok(Err(error)) => rejected(error),
+    };
+    // What the runners tell apart comes first: labels are cut short.
+    let requests = requests.lock().expect("requests");
+    let count = ["no", "one", "two", "three", "four", "five", "six"]
+        .get(requests.len())
+        .unwrap_or(&"more");
+    format!(
+        "{tip}, {count} requests: {outcome}; sent {}",
+        requests.join(", ")
+    )
+}
+
+/// Scripts from the fixture node's chain. A session answers one header
+/// request, which leads to another only after a full reply of
+/// `peer_wire::MAX_HEADERS`, then the node's locator request with blocks,
+/// then the node's own batch with an acknowledgement. The seeds extend the
+/// chain, reorganize it to a heavier branch from genesis whose headers are
+/// held first, deliver part of a branch, withhold its blocks, repeat or
+/// reverse headers, or answer with another chain, transport version or
+/// message. A libFuzzer process mines its own fixture chain, so of the seeds
+/// `write_seed_corpus` wrote, only those from genesis connect there.
+fn sync_seeds(node: Option<&Node>) -> Vec<Vec<u8>> {
+    let node = node.expect("sync seeds extend the fixture node's chain");
+    let height = node.status().expect("fixture status")["height"]
+        .as_u64()
+        .expect("fixture height");
+    let active: Vec<Block> = (1..=height).map(|h| active_block(node, h)).collect();
+    let directory = tempfile::tempdir().expect("seed directory");
+    let open = |name: &str, miner: u8| {
+        Node::open(&directory.path().join(name), config().clone(), key(miner)).expect("seed node")
+    };
+    // The same chain, two blocks longer.
+    let source = open("source.sqlite", 7);
+    for block in &active {
+        source.submit_block(block.clone()).expect("fixture block");
+    }
+    let extension: Vec<Block> = (0..2)
+        .map(|_| source.mine(1_000_000).expect("extension block"))
+        .collect();
+    // A branch from genesis with more work than the fixture chain, also once
+    // the extension above made it the tip.
+    let fork = open("fork.sqlite", 8);
+    let branch: Vec<Block> = (0..active.len() + extension.len() + 1)
+        .map(|_| fork.mine(1_000_000).expect("branch block"))
+        .collect();
+    let headers = |blocks: &[Block]| Message::Headers {
+        chain: chain_id(),
+        version: peer_wire::TRANSPORT_VERSION,
+        headers: blocks.iter().map(|block| block.header.clone()).collect(),
+    };
+    let sync = |blocks: &[Block]| {
+        let mut locator: Vec<Hash> = blocks.last().map(codec::block_hash).into_iter().collect();
+        locator.push(genesis_hash());
+        Message::Sync(Sync {
+            chain: chain_id(),
+            locator,
+            blocks: blocks.to_vec(),
+            transactions: Vec::new(),
+        })
+    };
+    let reversed: Vec<Block> = branch.iter().rev().cloned().collect();
+    let repeated: Vec<Block> = branch.iter().chain(&branch).cloned().collect();
+    let (first, rest) = branch.split_at(2);
+    // In order: the branch's headers are held, and its blocks withheld,
+    // before a seed delivers them.
+    let scripts = [
+        vec![headers(&extension)],
+        vec![headers(&extension), sync(&extension), Message::Ack],
+        vec![headers(&branch), sync(&[]), Message::Ack],
+        vec![headers(&branch), sync(first), Message::Ack],
+        vec![headers(rest), sync(rest), Message::Ack],
+        vec![headers(first), sync(&branch), Message::Ack],
+        vec![headers(&branch), sync(&branch), Message::Ack],
+        vec![headers(&[]), sync(&branch), Message::Ack],
+        vec![headers(&[]), sync(&[]), Message::Ack],
+        vec![headers(&active), sync(&active), Message::Ack],
+        vec![headers(&reversed), sync(&reversed), Message::Ack],
+        vec![headers(&repeated), sync(&branch), Message::Ack],
+        // A header round more than the node asks for.
+        vec![headers(&branch), headers(&[]), sync(&branch), Message::Ack],
+        vec![
+            Message::Headers {
+                chain: [1; 32],
+                version: peer_wire::TRANSPORT_VERSION,
+                headers: Vec::new(),
+            },
+            Message::Ack,
+        ],
+        // A transport version this node does not speak yet.
+        vec![Message::Headers {
+            chain: chain_id(),
+            version: peer_wire::TRANSPORT_VERSION + 1,
+            headers: Vec::new(),
+        }],
+        vec![Message::Ack],
+        vec![sync(&branch)],
+    ];
+    let mut seeds: Vec<Vec<u8>> = scripts.iter().map(|script| sync_input(script)).collect();
+    seeds.push(Vec::new());
     seeds
 }
 

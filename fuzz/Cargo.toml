@@ -17,11 +17,13 @@ cargo-fuzz = true
 # reach quotes and preparation for an account that exists.
 hashstash = { path = "..", features = ["test-fixtures"] }
 hex = "0.4"
-libfuzzer-sys = "0.4"
+# CI copies the node's Cargo.lock here, which fixes every shared dependency;
+# the fuzzer runtime, which no lockfile here records, is pinned exactly.
+libfuzzer-sys = "=0.4.13"
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
-tokio = { version = "1", features = ["io-util", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "net", "rt", "sync", "time"] }
 
 [lib]
 name = "hashstash_fuzz"
@@ -130,6 +132,13 @@ bench = false
 [[bin]]
 name = "stratum_session"
 path = "fuzz_targets/stratum_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_sync"
+path = "fuzz_targets/peer_sync.rs"
 test = false
 doc = false
 bench = false

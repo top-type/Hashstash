@@ -241,6 +241,10 @@ fn search_price(
     } else {
         ceil(&(&w.curve_mass * &scale), &w.shares)
     };
+    // The D/B cap never binds: D/B > M(R+D)/(RS+MB) reduces to D*S > B*M,
+    // which is what buying means, so the closing bound is always the lower
+    // one. It is a harmless guard, and the specification lets an
+    // implementation omit it (tests/clearing_vectors.rs checks the claim).
     if buying && !sold.is_zero() {
         upper = upper.min(ceil(&(cash * &scale), sold));
     }

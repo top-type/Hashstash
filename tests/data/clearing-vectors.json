@@ -473,7 +473,7 @@
    }
   },
   {
-   "name": "curved two-sided net buy below the D/B cap",
+   "name": "curved two-sided net buy",
    "config": {
     "money_bits": 128,
     "share_bits": 128,

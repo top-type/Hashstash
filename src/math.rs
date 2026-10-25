@@ -816,6 +816,30 @@ mod tests {
             assert!(rounded <= target);
         }
     }
+    /// docs/CONSENSUS.md's compact(x) keeps the three most significant bytes,
+    /// or two when the first of them is 0x80 or more (audit L083).
+    #[test]
+    fn compact_rounding_keeps_two_bytes_after_a_high_leading_byte() {
+        assert_eq!(bits_from_target(&Amount::from(0x8012_3456u32)), 0x0500_8012);
+        assert_eq!(
+            target_from_bits(0x0500_8012).unwrap(),
+            Amount::from(0x8012_0000u32)
+        );
+        for bytes in 1..=32usize {
+            for leading in [0x01u8, 0x7f, 0x80, 0xff] {
+                let mut value = vec![0xa5u8; bytes];
+                value[0] = leading;
+                let keep = (if leading >= 0x80 { 2 } else { 3 }).min(bytes);
+                let mut expected = value.clone();
+                expected[keep..].fill(0);
+                assert_eq!(
+                    target_from_bits(bits_from_target(&Amount::from_bytes_be(&value))).unwrap(),
+                    Amount::from_bytes_be(&expected),
+                    "{bytes} bytes led by {leading:02x}"
+                );
+            }
+        }
+    }
     #[test]
     fn asert_halves_doubles_extremes_and_signed_fraction() {
         let limit = target_from_bits(0x1d00ffff).unwrap();

@@ -5,6 +5,7 @@ use crate::{
     address,
     chain::{
         Chain, HeaderDeferred, HeaderHold, HeaderParent, MAX_SELECTION_CANDIDATES, SelectionResult,
+        StorageHealth,
     },
     codec,
     config::Config,
@@ -583,6 +584,21 @@ pub fn development_network(config: &Config, untrusted_peers: bool) -> bool {
 /// Mining attempts charged as one work unit by the `mine` RPC.
 const MINE_ATTEMPTS_PER_WORK: u64 = 4096;
 
+/// Block commits that may fail in a row, over at least STORAGE_EXIT_SECONDS,
+/// before the node exits with STORAGE_EXIT_STATUS: storage that cannot take
+/// blocks, such as a full disk, would otherwise leave a running node on a
+/// frozen tip whose miners' blocks are lost.
+const STORAGE_EXIT_FAILURES: u32 = 8;
+const STORAGE_EXIT_SECONDS: u64 = 60;
+/// EX_IOERR from sysexits.h, distinct from the 70 of a poisoned lock.
+const STORAGE_EXIT_STATUS: i32 = 74;
+/// Whether storage has failed long enough for the node to stop.
+fn storage_exit_due(health: &StorageHealth, now: u64) -> bool {
+    health.failed_commits >= STORAGE_EXIT_FAILURES
+        && health
+            .failing_since
+            .is_some_and(|since| now.saturating_sub(since) >= STORAGE_EXIT_SECONDS)
+}
 /// A panic while shared node state was held may have left it half updated.
 /// Exit so a supervisor restarts from durable storage instead of keeping a live
 /// process that can no longer validate, mine or accept mutations.
@@ -1897,6 +1913,8 @@ struct ReadView {
     mempool: Arc<[Transaction]>,
     pool_revision: u64,
     cache: Arc<TipCache>,
+    /// The chain's live storage faults, shared by every view.
+    storage: Arc<Mutex<StorageHealth>>,
 }
 /// Read-only results derived from one published tip state. Views of the same
 /// tip share it across mempool changes, so repeated reads never rebuild them.
@@ -2202,7 +2220,15 @@ impl ReadView {
             mempool: inner.shared_pending(),
             pool_revision: inner.pool_revision,
             cache: Arc::default(),
+            storage: inner.chain.storage_health(),
         }
+    }
+    /// The storage faults to report: degraded while blocks cannot be stored.
+    fn storage_value(&self) -> Value {
+        let health = self.storage.unpoisoned().clone();
+        json!({"degraded":health.degraded(), "failed_commits":health.failed_commits,
+            "failing_since":health.failing_since, "last_error":health.last_error,
+            "checkpoint_error":health.checkpoint_error})
     }
     fn state_root(&self) -> Hash {
         *self
@@ -2689,8 +2715,28 @@ impl Node {
             "capacity_allowance":self.known_block_bytes.load(Ordering::Acquire),
             "chain_height":view.chain.tip_height(),
             "seconds_without_new_tip":at.saturating_sub(self.last_tip_change.load(Ordering::Relaxed)),
-            "chain_stalled":at.saturating_sub(self.last_tip_change.load(Ordering::Relaxed)) >= stall_after}),
+            "chain_stalled":at.saturating_sub(self.last_tip_change.load(Ordering::Relaxed)) >= stall_after,
+            "storage":view.storage_value()}),
         )
+    }
+    /// Blocks cannot currently be stored, as on a full disk: the tip stays
+    /// where it is, so work handed out on it is wasted until they can.
+    pub fn storage_degraded(&self) -> Result<bool> {
+        Ok(self.read_view()?.storage.unpoisoned().degraded())
+    }
+    /// Exit, for a supervised restart, once block commits have failed for
+    /// long enough (see [storage_exit_due]); `chain` just failed to store one.
+    fn exit_if_storage_failing(chain: &Chain) {
+        let health = chain.storage_health().unpoisoned().clone();
+        if storage_exit_due(&health, now()) {
+            eprintln!(
+                "fatal: {} block commits failed in a row since {}, the last with: {}; exiting for a supervised restart",
+                health.failed_commits,
+                health.failing_since.unwrap_or_default(),
+                health.last_error.as_deref().unwrap_or("unknown error")
+            );
+            std::process::exit(STORAGE_EXIT_STATUS);
+        }
     }
     /// Validation may change the greatest competitive capacity on any branch,
     /// including without a tip change. Record it for transport tasks and
@@ -3795,7 +3841,7 @@ impl Node {
     }
     fn status_locked(inner: &ReadView) -> Value {
         let s = inner.chain.tip_state();
-        json!({"chain_id":hex::encode(inner.chain.chain_id()), "height":inner.chain.tip_height(), "tip":hex::encode(inner.chain.tip_hash()), "state_root":hex::encode(inner.state_root()), "clock":s.clock, "time_unit":"seconds", "clock_basis":"target_interval", "issued":s.issued.to_str_radix(10), "test_work":inner.chain.config.test_work, "phase":s.phase_name(), "decision":s.decision_id().map(hex::encode), "auction_round":s.auction_round(), "settings":s.settings, "mempool":inner.mempool.len(), "reserve":s.world.reserve.to_str_radix(10), "shares":s.world.shares.to_str_radix(10), "curve_mass":s.world.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(&s.world).to_str_radix(10), "revenue":s.world.revenue.to_str_radix(10), "fee_policy":json!({"minimum_fee_rate":s.settings.minimum_fee_rate.to_string(),"fee_scale":crate::fees::FEE_SCALE,"account_weight":crate::fees::ACCOUNT_WEIGHT})})
+        json!({"chain_id":hex::encode(inner.chain.chain_id()), "height":inner.chain.tip_height(), "storage":inner.storage_value(), "tip":hex::encode(inner.chain.tip_hash()), "state_root":hex::encode(inner.state_root()), "clock":s.clock, "time_unit":"seconds", "clock_basis":"target_interval", "issued":s.issued.to_str_radix(10), "test_work":inner.chain.config.test_work, "phase":s.phase_name(), "decision":s.decision_id().map(hex::encode), "auction_round":s.auction_round(), "settings":s.settings, "mempool":inner.mempool.len(), "reserve":s.world.reserve.to_str_radix(10), "shares":s.world.shares.to_str_radix(10), "curve_mass":s.world.curve_mass.to_str_radix(10),"grant_capacity":crate::consensus::grant_capacity(&s.world).to_str_radix(10), "revenue":s.world.revenue.to_str_radix(10), "fee_policy":json!({"minimum_fee_rate":s.settings.minimum_fee_rate.to_string(),"fee_scale":crate::fees::FEE_SCALE,"account_weight":crate::fees::ACCOUNT_WEIGHT})})
     }
     pub fn template(&self) -> Result<Block> {
         let mut block = self.template_shared(Freshness::Current)?.0.as_ref().clone();
@@ -4158,6 +4204,9 @@ impl Node {
         // Validation can change the competitive capacity on any branch.
         if let Err(error) = self.note_capacity(&i.chain) {
             eprintln!("Peer capacity allowance unchanged: {error:#}");
+        }
+        if submitted.is_err() {
+            Self::exit_if_storage_failing(&i.chain);
         }
         let changed = submitted?;
         if !changed {
@@ -9549,6 +9598,7 @@ mod read_admission_tests {
             mempool: mempool.into(),
             pool_revision: 0,
             cache: Arc::default(),
+            storage: Arc::default(),
         }
     }
     /// A loopback proxy session (no cooldown) with its work burst spent.
@@ -11782,6 +11832,7 @@ mod tests {
                 mempool: Arc::from(Vec::new()),
                 pool_revision: 0,
                 cache: Arc::default(),
+                storage: Arc::default(),
             },
             key,
         )
@@ -12050,6 +12101,63 @@ mod tests {
             Node::read_rpc(&old_view, "snapshot", request).unwrap(),
             before
         );
+    }
+    #[test]
+    fn storage_that_cannot_take_blocks_is_reported_until_it_can() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = crypto::public_key(&[1; 32]).unwrap();
+        let node = Node::open(&dir.path().join("chain.sqlite"), Config::devnet(), key).unwrap();
+        node.mine(100_000).unwrap();
+        let healthy = node.status().unwrap()["storage"].clone();
+        assert_eq!(healthy["degraded"], false);
+        assert_eq!(healthy["failed_commits"], 0);
+        // Blocks commit until the database cannot grow, as on a full disk.
+        node.locked().unwrap().chain.limit_database_pages(Some(0));
+        let mut mined = 0;
+        let error = loop {
+            match node.mine(100_000) {
+                Ok(_) => mined += 1,
+                Err(error) => break error,
+            }
+            assert!(mined < 200, "the database never filled");
+        };
+        assert!(format!("{error:#}").contains("full"), "{error:#}");
+        assert!(node.storage_degraded().unwrap());
+        for report in [
+            node.status().unwrap()["storage"].clone(),
+            node.rpc("status", json!({})).unwrap()["storage"].clone(),
+            node.peer_status().unwrap()["storage"].clone(),
+        ] {
+            assert_eq!(report["degraded"], true, "{report}");
+            assert_eq!(report["failed_commits"], 1);
+            assert!(report["last_error"].as_str().unwrap().contains("full"));
+        }
+        // A stored block ends the streak.
+        node.locked().unwrap().chain.limit_database_pages(None);
+        node.mine(100_000).unwrap();
+        assert!(!node.storage_degraded().unwrap());
+        assert_eq!(node.peer_status().unwrap()["storage"]["degraded"], false);
+    }
+    #[test]
+    fn the_node_stops_only_after_storage_failed_repeatedly_for_a_minute() {
+        let failing = |failed_commits, since| StorageHealth {
+            failed_commits,
+            failing_since: Some(since),
+            last_error: Some("database or disk is full".into()),
+            checkpoint_error: None,
+        };
+        let now = 10_000;
+        assert!(storage_exit_due(
+            &failing(STORAGE_EXIT_FAILURES, now - 60),
+            now
+        ));
+        // Fewer failures, or a burst of deliveries within the minute, do not.
+        assert!(!storage_exit_due(
+            &failing(STORAGE_EXIT_FAILURES - 1, now - 600),
+            now
+        ));
+        assert!(!storage_exit_due(&failing(100, now - 59), now));
+        assert!(!storage_exit_due(&StorageHealth::default(), now));
     }
     #[test]
     fn stash_quotes_match_execution_and_account_withdrawal_value() {
@@ -13101,14 +13209,19 @@ mod peer_tests {
         Node::open(path, config.clone(), crypto::public_key(&[66; 32]).unwrap()).unwrap()
     }
     /// Synchronize `target` from `source` until their tips agree; the number
-    /// of exchanges, each one request locator and one reply.
+    /// of exchanges, each one request locator and one reply. As in the sync
+    /// loop, a deferred replay resumes at the next exchange: a node restarted
+    /// from a saved checkpoint rebuilds a fork point below it in steps.
     fn converge(source: &Node, target: &Node, limit: usize) -> Option<usize> {
         for round in 1..=limit {
             let request = target.peer_snapshot(None).unwrap();
             let reply = source.peer_snapshot(Some(&request.locator)).unwrap();
-            target
-                .receive_peer(&reply, "8.1.1.1".parse().unwrap())
-                .unwrap();
+            let received = target.receive_peer(&reply, "8.1.1.1".parse().unwrap());
+            if let Err(error) = &received
+                && !error.is::<crate::chain::ValidationDeferred>()
+            {
+                panic!("{error:#}");
+            }
             if target.read_view().unwrap().chain.tip_hash()
                 == source.read_view().unwrap().chain.tip_hash()
             {

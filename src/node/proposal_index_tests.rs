@@ -50,6 +50,7 @@ fn view(s: State, cache: TipCache) -> ReadView {
         mempool: Arc::from(Vec::new()),
         pool_revision: 0,
         cache: Arc::new(cache),
+        storage: Arc::default(),
     }
 }
 

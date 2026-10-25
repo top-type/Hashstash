@@ -45,8 +45,9 @@ hyper-util = { version = "0.1", features = ["server", "http1", "service", "tokio
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [target.'cfg(unix)'.dependencies]
-# Safe core-dump limits for the cold signer; already built for tempfile.
-rustix = { version = "1", features = ["process"] }
+# Safe core-dump limits for the cold signer, and the free disk space the
+# chain keeps in reserve; both already built for tempfile.
+rustix = { version = "1", features = ["process", "fs"] }
 
 [dev-dependencies]
 tempfile = "3"

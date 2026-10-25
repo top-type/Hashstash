@@ -11,6 +11,7 @@ binds loopback aliases such as 127.0.0.11 so each node's peer traffic has its ow
 """
 import argparse
 import collections
+import fractions
 import hashlib
 import http.client
 import json
@@ -33,7 +34,8 @@ from test_network import rpc  # noqa: E402  shared JSON-RPC helper used by the n
 from fixture_support import require_test_work  # noqa: E402
 
 REPOSITORY = Path(__file__).resolve().parents[1]
-TRANSACTION_TAG = 'Hashstash/anchor-only-transaction'
+# Must match crypto::TRANSACTION_TAG: signatures commit to chain_id || body (crypto::signing_message).
+TRANSACTION_TAG = 'Hashstash/chain-bound-transaction'
 # Fixture difficulty floor: about 4096 expected hashes (and atoms of test HASH) per block. The
 # timestamp adjustment raises difficulty while the soak mines faster than the target interval;
 # this floor leaves about eight half-lives before blocks reach --max-block-hashes.
@@ -146,7 +148,9 @@ def bip340_sign(secret, message, auxiliary):
 
 
 def self_test_signatures():
-    """Check the signer against the repository's official BIP340 vectors before any network use."""
+    """Before any network use, check the signer against the repository's official BIP340 vectors
+    and the transaction domain against tests/data/transaction-signing.json, which the Rust
+    suite checks against crypto::signing_message and crypto::verify."""
     checked = 0
     for line in (REPOSITORY / 'tests/data/bip340.csv').read_text().splitlines()[1:]:
         row = line.split(',')
@@ -158,6 +162,12 @@ def self_test_signatures():
         assert signature.hex().upper() == row[5], ('signature vector', row[0])
         checked += 1
     assert checked >= 4, 'BIP340 signing vectors not found'
+    vector = json.loads((REPOSITORY / 'tests/data/transaction-signing.json').read_text())
+    body = bytes.fromhex(vector['body'])
+    assert signing_message(vector['chain_id'], body).hex() == vector['message'], 'chain-bound signing message'
+    signature = bip340_sign(int(vector['secret_key'], 16), bytes.fromhex(vector['message']),
+                            bytes.fromhex(vector['auxiliary']))
+    assert signature.hex() == vector['signature'], 'chain-bound transaction signature'
     return checked
 
 
@@ -231,9 +241,16 @@ def with_anchor(raw, anchor, expiry=None):
     return raw[:fields['fee_end']] + anchor + varint(lifetime) + raw[fields['expiry_end']:]
 
 
-def sign_body(key, body, rng):
-    message = tagged_hash(TRANSACTION_TAG, body)
-    return body + bip340_sign(key.secret, message, rng.randbytes(32))
+def signing_message(chain_id, body):
+    """crypto::signing_message: the chain ID (hex, as the node reports it) is signed but not sent."""
+    chain = bytes.fromhex(chain_id)
+    if len(chain) != 32:
+        raise ValueError('chain ID must be 32 bytes')
+    return tagged_hash(TRANSACTION_TAG, chain + body)
+
+
+def sign_body(key, chain_id, body, rng):
+    return body + bip340_sign(key.secret, signing_message(chain_id, body), rng.randbytes(32))
 
 
 def header_hash(header):
@@ -276,6 +293,22 @@ def error_class(error):
 def unavailable(error):
     """Connection-level failures are expected while the harness kills or restarts a node."""
     return isinstance(error, OSError)
+
+
+def grant_capacity(revenue, reserve):
+    """consensus::grant_capacity: all waiting revenue and at most half of the reserve, rounded down."""
+    return revenue + reserve // 2
+
+
+def pool_byte_bound(block_bytes):
+    """The published pool is the next-block selection, which fits one block, followed by a backlog
+    of entries that lost only to capacity, kept within one more block's bytes (docs/RUNNING.md)."""
+    return 2 * block_bytes
+
+
+def signature_refused(error):
+    """The node refused a signature the harness made for its own key: the signing domains differ."""
+    return 'invalid transaction signature' in error_text(error).lower()
 
 
 THROTTLE_MARKERS = ('rate limit', 'cooldown', 'connection limit', 'budget exhausted', 'admission')
@@ -717,6 +750,8 @@ class Soak:
         self.settings_seen = []
         self.phases_seen = collections.Counter()
         self.decisions_seen = set()
+        self.bent_tips = set()
+        self.bent_denominator_bits = 0
         self.chain_id = None
         self.config = None
         self.root = None
@@ -1022,11 +1057,17 @@ class Soak:
                                 f'{name} world: account_shares {world["account_shares"]} != shares {world["shares"]}',
                                 world=name, **where)
             mass = int(world['curve_mass'])
+            if 0 < reserve < mass:
+                # Coverage: trades on this tip cleared on a bent curve (reserve below curve mass).
+                denominator = fractions.Fraction(reserve, mass).denominator
+                with self.state_lock:
+                    self.bent_tips.add(status['tip'])
+                    self.bent_denominator_bits = max(self.bent_denominator_bits, denominator.bit_length())
             self.recorder.check('curve_bounds', 0 <= reserve <= mass and (reserve == 0) == (mass == 0) == (int(world['shares']) == 0),
                                 node.name, f'{name} world: reserve {reserve}, curve mass {mass}, shares {world["shares"]}',
                                 world=name, **where)
-            self.recorder.check('grant_capacity', int(world['grant_capacity']) == revenue + max(0, reserve - 1), node.name,
-                                f'{name} world: grant capacity {world["grant_capacity"]} != revenue + reserve - 1',
+            self.recorder.check('grant_capacity', int(world['grant_capacity']) == grant_capacity(revenue, reserve), node.name,
+                                f'{name} world: grant capacity {world["grant_capacity"]} != revenue + floor(reserve / 2)',
                                 world=name, **where)
 
     def check_mempool(self, node):
@@ -1090,8 +1131,10 @@ class Soak:
         self.recorder.check('mempool_anchor_valid', not bad_anchors, node.name, f'expired or off-branch anchors pooled: {bad_anchors[:5]}', **where)
         size = sum(length + len(varint(length)) for _, _, length in entries)
         capacity = int(after['settings']['block_bytes'])
-        self.recorder.check('mempool_capacity', size <= capacity, node.name,
-                            f'pooled records {size} bytes exceed block capacity {capacity}', **where)
+        bound = pool_byte_bound(capacity)
+        self.recorder.check('mempool_capacity', size <= bound, node.name,
+                            f'pooled records {size} bytes exceed the selection and backlog bound {bound} '
+                            f'(block capacity {capacity})', **where)
 
     def observe_tips(self):
         """Poll every node; run invariant checks on each new tip and record reorganizations."""
@@ -1336,6 +1379,15 @@ class Soak:
                 return key, account
         return None, None
 
+    def check_signature(self, node, kind, error=None):
+        """A transaction the harness signed for its own key must never fail signature checks.
+        Every refusal means the harness and node signing domains differ, so the soak would
+        otherwise run with nearly every transaction rejected and exercise nothing."""
+        refused = error is not None and signature_refused(error)
+        self.recorder.check('signature_accepted', not refused, node.name,
+                            f'{kind}: node refused a harness signature: {error_text(error) if refused else ""}',
+                            chain_id=self.chain_id)
+
     def submit(self, rng, node, sender, operation, kind, data_hex=None, extra_fee=None, expiry=None):
         params = {'sender': sender.hex, 'operation': operation,
                   'extra_fee': str(extra_fee if extra_fee is not None else rng.choice([0, 0, 0, 1, 2, 5, rng.randint(1, 200)])),
@@ -1352,7 +1404,7 @@ class Soak:
         fields = body_fields(body)
         self.recorder.check('prepared_body', fields['sender'] == sender.public and fields['expiry'] == params['expiry_blocks'],
                             node.name, 'prepared body differs from the requested sender or lifetime')
-        raw = sign_body(sender, body, rng)
+        raw = sign_body(sender, self.chain_id, body, rng)
         target = node
         others = [n for n in self.live_nodes() if n is not node]
         if others and rng.random() < self.args.cross_submit:
@@ -1362,8 +1414,10 @@ class Soak:
         except RuntimeError as error:
             # Another node may not yet hold the sender's earlier pooled transactions.
             route = ' (cross-node)' if target is not node else ''
+            self.check_signature(target, kind, error)
             self.recorder.count('rejected', f'{kind}{route}: {error_class(error)}')
             return None
+        self.check_signature(target, kind)
         txid = sha256d(raw).hex()
         self.recorder.check('transaction_id', result.get('transaction_id') == txid, target.name,
                             f'node returned {result.get("transaction_id")} for transaction {txid}')
@@ -1450,10 +1504,11 @@ class Soak:
             recipients.append(self.new_account())
         recipients = sorted({k.public: k for k in recipients}.values(), key=lambda k: k.public)
         # A grant covered by waiting revenue leaves both curves flat, and flat curves can never
-        # earn PASS blocks. The winner's support also joins waiting revenue when it wins, so ask
-        # for revenue plus that support plus part of reserve: a winning grant then bends the
-        # PASS curve. Grants carry more support than parameter changes so they win auctions
-        # too. Some requests exceed capacity and stay unfunded.
+        # earn PASS blocks. The winner's support joins waiting revenue only after its grant is
+        # reserved, so asking for revenue plus that support plus part of reserve (capacity allows
+        # at most half of it) draws on the reserve: a winning grant then bends both curves.
+        # Grants carry more support than parameter changes so they win auctions too. Some
+        # requests exceed capacity and stay unfunded.
         capacity = max(1, int(status['grant_capacity']))
         ordinary = int(account['ordinary'])
         support = rng.randint(max(1, ordinary // 40), max(1, ordinary // 15))
@@ -1543,15 +1598,18 @@ class Soak:
         underbid = rng.random() < 0.2 and original['fee'] > 1
         fee = original['fee'] - 1 if underbid else original['fee'] + rng.randint(1, 50)
         body = with_fee(original['body'], fee)
-        raw = sign_body(original['key'], body, rng)
+        raw = sign_body(original['key'], self.chain_id, body, rng)
         kind = 'fee_underbid' if underbid else 'fee_bump'
         target = original['node']
         self.recorder.count('submitted', kind)
         try:
             result = self.timed(target, 'broadcasttransaction', {'raw': raw.hex()})
         except (OSError, RuntimeError) as error:
+            if not unavailable(error):
+                self.check_signature(target, kind, error)
             self.recorder.count('rejected', f'{kind}: {error_class(error)}')
             return
+        self.check_signature(target, kind)
         txid = result.get('transaction_id')
         self.recorder.count('accepted', kind)
         self.recorder.note('tx', kind=kind, node=target.name, txid=(txid or '')[:16], replaces=original['txid'][:16], fee=fee)
@@ -1603,7 +1661,7 @@ class Soak:
             except RuntimeError:
                 self.recorder.count('rejected', f'garbage_{variant}: rejected at preparation')
                 return
-            raw = sign_body(sender, bytes.fromhex(prepared['body']), rng)
+            raw = sign_body(sender, self.chain_id, bytes.fromhex(prepared['body']), rng)
         else:
             sender, body = self.prepared_transfer(rng, node)
             if body is None:
@@ -1619,7 +1677,7 @@ class Soak:
             elif variant == 'wrong_signer':
                 with self.state_lock:
                     signer = rng.choice([k for k in self.keys.values() if k is not sender])
-            raw = bytearray(sign_body(signer, body, rng))
+            raw = bytearray(sign_body(signer, self.chain_id, body, rng))
             if variant == 'truncated':
                 raw = raw[:rng.randint(1, len(raw) - 1)]
             elif variant == 'trailing_byte':
@@ -1985,6 +2043,8 @@ class Soak:
             'reorgs': {'count': len(self.reorgs), 'max_depth_at_least': max(reorg_depths) if reorg_depths else 0,
                        'depth_histogram': dict(sorted(collections.Counter(reorg_depths).items()))},
             'governance': {'phases_observed': dict(self.phases_seen), 'decisions_observed': len(self.decisions_seen),
+                           'bent_curve_tips': len(self.bent_tips),
+                           'bent_curve_denominator_bits': self.bent_denominator_bits,
                            'settings_history': self.settings_seen, 'explorer_decisions': final.get('decisions')},
             'final': final.get('status'),
             'nodes': nodes,

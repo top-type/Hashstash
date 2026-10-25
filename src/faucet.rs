@@ -4,7 +4,7 @@
 use crate::{address, codec, crypto, fees, types::*, wallet};
 use anyhow::{Context, Result, anyhow, ensure};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{DefaultBodyLimit, Query, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
@@ -56,13 +56,19 @@ const MAX_POLL_WAIT: Duration = Duration::from_secs(60);
 /// The longest `Retry-After` waited out before a refused request is resent
 /// once. A claim's answer awaits one such lookup, its preparation, and at
 /// most `CLAIM_BROADCAST_WAIT` of its broadcast: a prompt refusal, this wait
-/// and a prompt resend fit the 15-second request deadline, though each
-/// attempt may take up to the client's five-second timeout and the claim may
-/// first wait for the engine.
+/// and a prompt resend fit the request deadline, though each attempt may take
+/// up to the client's five-second timeout and the claim may first wait for
+/// the engine.
 const NODE_RETRY_WAIT: Duration = Duration::from_secs(5);
 /// How long a reserved claim's answer waits for its first broadcast before
-/// that broadcast continues in the background.
+/// that broadcast continues in the background. The wait ends earlier when
+/// the request deadline, less `ANSWER_MARGIN`, comes first.
 const CLAIM_BROADCAST_WAIT: Duration = Duration::from_secs(2);
+/// A request still running this long is answered that it is still being
+/// checked.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(15);
+/// The part of the request deadline a reserved claim keeps for its answer.
+const ANSWER_MARGIN: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -2179,6 +2185,8 @@ struct App {
     hosts: Arc<Vec<String>>,
     sessions: Arc<Semaphore>,
     clients: Arc<ClientSessions>,
+    /// REQUEST_DEADLINE, shortened by tests.
+    deadline: Duration,
 }
 impl App {
     fn new(engine: Engine, origins: Vec<String>, hosts: Vec<String>) -> Self {
@@ -2193,9 +2201,15 @@ impl App {
             hosts: Arc::new(hosts),
             sessions: Arc::new(Semaphore::new(16)),
             clients: Arc::default(),
+            deadline: REQUEST_DEADLINE,
         }
     }
 }
+
+/// When `protect` stops waiting for a request and answers that it is still
+/// being checked.
+#[derive(Clone, Copy)]
+struct Deadline(tokio::time::Instant);
 
 /// Requests in flight per client network, so one network cannot hold every
 /// global session. Entries exist only while requests run and are never stored.
@@ -2245,7 +2259,7 @@ fn failure(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({"error":message}))).into_response()
 }
 
-async fn protect(State(app): State<App>, request: Request, next: Next) -> Response {
+async fn protect(State(app): State<App>, mut request: Request, next: Next) -> Response {
     let Ok(_permit) = app.sessions.clone().try_acquire_owned() else {
         return failure(StatusCode::TOO_MANY_REQUESTS, "Faucet is busy");
     };
@@ -2275,7 +2289,11 @@ async fn protect(State(app): State<App>, request: Request, next: Next) -> Respon
     } else if request.method() == Method::OPTIONS {
         StatusCode::NO_CONTENT.into_response()
     } else {
-        match tokio::time::timeout(Duration::from_secs(15), next.run(request)).await {
+        // A claim reads the deadline, so an answer it already has is never
+        // held past it.
+        let deadline = tokio::time::Instant::now() + app.deadline;
+        request.extensions_mut().insert(Deadline(deadline));
+        match tokio::time::timeout_at(deadline, next.run(request)).await {
             Ok(response) => response,
             Err(_) => failure(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2358,6 +2376,7 @@ async fn status_handler(
 }
 async fn claim_handler(
     State(app): State<App>,
+    Extension(Deadline(deadline)): Extension<Deadline>,
     headers: HeaderMap,
     Json(request): Json<ClaimRequest>,
 ) -> Response {
@@ -2377,11 +2396,17 @@ async fn claim_handler(
             // and the answer still follows it; a busy node's Retry-After and
             // resend, or a slow reply, continue in the background instead of
             // holding the answer past the request deadline, which reported a
-            // reserved payment as still being checked.
+            // reserved payment as still being checked. A claim reserved late,
+            // after waiting for the engine or a slow preparation, waits only
+            // until shortly before that deadline, or not at all.
             if let Some(raw) = raw {
                 let node = app.node.clone();
                 let broadcast = tokio::spawn(async move { broadcast_claim(&node, raw).await });
-                let _ = tokio::time::timeout(CLAIM_BROADCAST_WAIT, broadcast).await;
+                let until = deadline
+                    .checked_sub(ANSWER_MARGIN)
+                    .unwrap_or(deadline)
+                    .min(tokio::time::Instant::now() + CLAIM_BROADCAST_WAIT);
+                let _ = tokio::time::timeout_at(until, broadcast).await;
             }
             Json(answer).into_response()
         }
@@ -3895,7 +3920,9 @@ mod tests {
         assert_eq!(paid.status(), StatusCode::OK);
         let paid: Value = paid.json().await.unwrap();
         assert_eq!(paid["status"], "pending");
-        assert_eq!(mock_node.lock().await.transactions.len(), 1);
+        // The answer waits for the broadcast only briefly; a loaded host may
+        // finish it afterwards.
+        broadcasts(&mock_node, 1).await;
         assert_eq!(
             engine
                 .lock()
@@ -4820,7 +4847,8 @@ mod tests {
             engine.ledger.pending().unwrap().unwrap().address,
             recipient(4)
         );
-        assert_eq!(node.lock().await.transactions.len(), 2);
+        drop(engine);
+        broadcasts(&node, 2).await;
         server.abort();
         mock_task.abort();
     }
@@ -4879,6 +4907,72 @@ mod tests {
         broadcasts(&node, 1).await;
         assert!(node.lock().await.refusals.is_empty());
         assert!(started.elapsed() >= Duration::from_secs(5));
+        server.abort();
+        mock_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_reserved_near_the_deadline_is_answered_before_it() {
+        // The answer then waited a fixed two seconds for the broadcast,
+        // whatever was left of the request deadline: a claim reserved within
+        // two seconds of it, after a slow preparation or a wait for the
+        // engine, was answered as still being checked although reserved.
+        let dir = TempDir::new().unwrap();
+        let (engine, _, node, mock_task) = ready_engine(&dir, |_| {}).await;
+        let mut app = App::new(
+            engine,
+            vec!["https://faucet.example".into()],
+            vec!["faucet.example".into()],
+        );
+        // The test's deadline stands in for 15 seconds: the preparation's
+        // three-second Retry-After reserves the claim 1.8 seconds before it,
+        // less than the two-second broadcast wait.
+        app.deadline = Duration::from_millis(4800);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let routes = router(app.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, routes).await.unwrap();
+        });
+        node.lock().await.refusals.extend([
+            (
+                "preparetransaction",
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("3"),
+            ),
+            (
+                "broadcasttransaction",
+                StatusCode::TOO_MANY_REQUESTS,
+                Some("3"),
+            ),
+        ]);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let started = Instant::now();
+        let paid = client
+            .post(format!("{base}/faucet/claim"))
+            .header("host", "faucet.example")
+            .header("origin", "https://faucet.example")
+            .header("x-real-ip", "192.0.2.6")
+            .json(&json!({"address":recipient(6)}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paid.status(), StatusCode::OK);
+        assert_eq!(paid.json::<Value>().await.unwrap()["status"], "pending");
+        assert!(started.elapsed() >= Duration::from_secs(3));
+        assert!(node.lock().await.transactions.is_empty());
+        assert_eq!(
+            app.engine
+                .lock()
+                .await
+                .ledger
+                .pending()
+                .unwrap()
+                .unwrap()
+                .address,
+            recipient(6)
+        );
+        broadcasts(&node, 1).await;
         server.abort();
         mock_task.abort();
     }

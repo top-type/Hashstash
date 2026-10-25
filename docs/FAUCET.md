@@ -153,13 +153,15 @@ has a five-second timeout). A claim holds the engine from its eligibility checks
 through its reservation, including the node's preparation of the transfer, so
 the nonce, anchor and one pending payment cannot change meanwhile; the
 broadcast that follows holds nothing. The claim's answer waits at most two
-seconds for that broadcast, which a node usually accepts at once; a busy node's
-`Retry-After` and resend (below), or a slow reply, continue in the background,
-and refreshes retry the reserved bytes anyway. All ledger work, including its
-synchronous commits, runs on blocking threads rather than the HTTP workers. A
-request still waiting after 15 seconds receives HTTP 503: a claim queued behind
-other claims, or whose preparation the node is slow to answer, can reach it,
-and the visitor then reads the claim's outcome from status.
+seconds for that broadcast, which a node usually accepts at once, and never
+past one second before the 15-second request deadline below, so a claim
+reserved in time is answered with its payment; a busy node's `Retry-After` and
+resend (below), or a slow reply, continue in the background, and refreshes
+retry the reserved bytes anyway. All ledger work, including its synchronous
+commits, runs on blocking threads rather than the HTTP workers. A request still
+waiting after 15 seconds receives HTTP 503: a claim queued behind other claims,
+or whose preparation the node is slow to answer, can reach it before it is
+reserved, and the visitor then reads the claim's outcome from status.
 
 A node refusing a request on admission grounds answers 429 or 503 with
 `Retry-After`; the request did not run. The faucet waits out a `Retry-After` of

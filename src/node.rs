@@ -6356,6 +6356,7 @@ impl Node {
                     i.state_root(),
                     &body,
                 )?;
+                check_local_room(i.chain.tip_state(), &self.miner, &result["fee_quote"])?;
 
                 Ok(result)
             }
@@ -6371,7 +6372,9 @@ impl Node {
                 // behind the token.
                 required_str(&params, "sender")?;
                 let i = self.read_view()?;
-                Self::read_rpc_metered(&i, method, params, admission)
+                let quote = Self::read_rpc_metered(&i, method, params, admission)?;
+                check_local_room(i.chain.tip_state(), &self.miner, &quote)?;
+                Ok(quote)
             }
             "broadcasttransaction" => self.broadcast(params, false),
             "getblock" => {
@@ -6774,6 +6777,40 @@ fn check_operation_bounds(config: &Config, operation: &Operation) -> Result<()> 
         }
         Operation::Refund { .. } => {}
     }
+    Ok(())
+}
+
+/// While this node's miner account does not exist, its admission keeps
+/// `fees::ACCOUNT_WEIGHT` of the next block for the reward that creates it,
+/// unless the transaction itself creates it (consensus
+/// `apply_prepared_transaction`). A quoted transaction that fits the block
+/// only without that room is valid on other nodes, but this one would refuse
+/// it at broadcast with its generic admission error and never relay it, so
+/// quotes and preparation here refuse it with the reason instead. Every block
+/// with a subsidy or a fee pays a reward, so the room is assumed needed.
+fn check_local_room(s: &State, miner: &PublicKey, quote: &Value) -> Result<()> {
+    if s.account(miner, None).is_some() {
+        return Ok(());
+    }
+    let weight: u64 = quote["weight"]
+        .as_str()
+        .and_then(|weight| weight.parse().ok())
+        .context("quote without weight")?;
+    if weight.saturating_add(fees::ACCOUNT_WEIGHT) <= s.settings.block_bytes {
+        return Ok(());
+    }
+    let operation: Operation = serde_json::from_value(quote["operation"].clone())?;
+    ensure!(
+        matches!(
+            &operation,
+            Operation::TransferExact { recipient, .. } if recipient == miner
+        ),
+        "transaction weight {weight} leaves no room in the block capacity of {} weight units \
+         for this node's miner account, which does not exist yet and takes {}: make the \
+         transaction that much lighter, or send it through a node whose miner account exists",
+        s.settings.block_bytes,
+        fees::ACCOUNT_WEIGHT
+    );
     Ok(())
 }
 

@@ -31,6 +31,17 @@ const PAGE_BYTES: usize = 32 * 1024 * 1024;
 const CHECKPOINTS: usize = 128;
 /// Detached blocks walked to relate an orphaned mail anchor to the canonical chain.
 const ANCHOR_DEPTH: usize = 128;
+/// Detached rows stay this many blocks below the indexed tip, a day at the
+/// launch's 15-second interval, for direct lookup and mail anchors; each
+/// advance then deletes older ones with their transaction data. A deleted
+/// block that becomes canonical again is indexed again.
+const DETACHED_BLOCKS: u64 = 5_760;
+/// The write-ahead log is truncated after a commit that detaches rows, and
+/// after each block at a multiple of this height. SQLite's automatic
+/// checkpoints never wait for readers, so overlapping reads can keep the log
+/// from restarting, and the journal size limit applies only at a restart; a
+/// truncating checkpoint waits for them, up to the busy timeout.
+const WAL_TRUNCATE_BLOCKS: u64 = 64;
 /// Every governed capacity allows responses of at least MAX_RESPONSE_FRAME, so
 /// a stored record kept below it, with room for the response envelope, stays
 /// deliverable alone even after capacity is lowered; it is also far below
@@ -65,7 +76,7 @@ pub const METHODS: &[&str] = &[
     "explorer_chat",
     "explorer_mail",
 ];
-const SCHEMA: &str = "petahash-atoms-separate-data-ordered-events";
+const SCHEMA: &str = "petahash-atoms-separate-data-ordered-events-compact-mail";
 pub const MAX_PAGE: u64 = 50;
 
 pub struct Explorer {
@@ -87,6 +98,8 @@ pub struct Explorer {
     retry: Option<Instant>,
     /// RETRY_FAILED, shortened by worker tests.
     pub(crate) retry_delay: Duration,
+    /// DETACHED_BLOCKS, shortened by worker tests.
+    pub(crate) detached_blocks: u64,
     #[cfg(test)]
     pub(crate) hooks: TestHooks,
 }
@@ -133,6 +146,7 @@ impl Explorer {
             failed: None,
             retry: None,
             retry_delay: RETRY_FAILED,
+            detached_blocks: DETACHED_BLOCKS,
             #[cfg(test)]
             hooks: TestHooks::default(),
         }
@@ -182,6 +196,7 @@ impl Explorer {
             failed: None,
             retry: None,
             retry_delay: RETRY_FAILED,
+            detached_blocks: DETACHED_BLOCKS,
             #[cfg(test)]
             hooks: TestHooks::default(),
         };
@@ -200,9 +215,10 @@ impl Explorer {
     pub(crate) fn connect(path: &Path, chain: &Chain) -> Result<Self> {
         let db = Connection::open(crate::local_files::sidecar(path, "explorer.sqlite"))?;
         db.busy_timeout(std::time::Duration::from_millis(500))?;
-        // As for the chain database, the journal limit returns WAL space after
-        // a checkpoint of a large catch-up or rebuild commit instead of
-        // keeping the log at its peak size.
+        // As for the chain database, the journal limit returns WAL space when
+        // the log restarts after a checkpoint instead of keeping it at its
+        // peak size; truncating checkpoints (see WAL_TRUNCATE_BLOCKS) return
+        // it while readers overlap.
         db.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA journal_size_limit=67108864;
             CREATE TABLE IF NOT EXISTS explorer_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);",
@@ -252,6 +268,13 @@ impl Explorer {
             CREATE INDEX IF NOT EXISTS explorer_current_contribution_page ON explorer_contributions(height DESC,position DESC) WHERE canonical=1;
             CREATE INDEX IF NOT EXISTS explorer_current_decision ON explorer_decisions(height DESC) WHERE canonical=1;
 ")?;
+        // Pruning finds detached rows without scanning the canonical ones.
+        for table in TABLES {
+            db.execute_batch(&format!(
+                "CREATE INDEX IF NOT EXISTS {table}_detached ON {table}(height) WHERE canonical=0;"
+            ))?;
+        }
+        truncate_wal(&db);
         let tip: Option<String> = db
             .query_row("SELECT value FROM explorer_meta WHERE key='tip'", [], |r| {
                 r.get(0)
@@ -267,6 +290,7 @@ impl Explorer {
             failed: None,
             retry: None,
             retry_delay: RETRY_FAILED,
+            detached_blocks: DETACHED_BLOCKS,
             #[cfg(test)]
             hooks: TestHooks::default(),
         })
@@ -430,6 +454,12 @@ impl Explorer {
 
     fn apply(&mut self, c: &Config, update: Update) -> Result<()> {
         let db = self.db.as_mut().context("explorer index unavailable")?;
+        // Detaching rewrites rows in bulk; advances add to the log steadily.
+        let truncate = match &update {
+            Update::Genesis(_) | Update::Rollback(..) | Update::Rebuild(..) => true,
+            Update::Advance(block) => block.height % WAL_TRUNCATE_BLOCKS == 0,
+            Update::Replay(_) => false,
+        };
         match update {
             Update::Genesis(block) => {
                 ensure!(block.height == 0, "explorer genesis mismatch");
@@ -515,6 +545,9 @@ impl Explorer {
                 );
                 let transaction = db.transaction()?;
                 let post = Arc::new(index_block(&transaction, c, &block, Some(parent))?);
+                if let Some(below) = block.height.checked_sub(self.detached_blocks) {
+                    prune_detached(&transaction, below)?;
+                }
                 let hash = codec::block_hash(&block);
                 set_tip(&transaction, &hash)?;
                 transaction.commit()?;
@@ -522,6 +555,9 @@ impl Explorer {
                 self.height = block.height;
                 self.checkpoint(hash, post);
             }
+        }
+        if truncate && let Some(db) = &self.db {
+            truncate_wal(db);
         }
         Ok(())
     }
@@ -623,7 +659,8 @@ impl Explorer {
                 fields(&p, &["limit", "after", "anchor"])?;
                 let anchor = scan_anchor(db, &p, "after", "Mail")?;
                 let (h, n) = scan_after(&p, anchor, "Mail", c)?;
-                let mut statement=db.prepare("SELECT t.record,t.height,t.position FROM explorer_mail t JOIN explorer_blocks b ON b.hash=t.block_hash WHERE t.canonical=1 AND b.canonical=1 AND (t.height>?1 OR(t.height=?1 AND t.position>?2)) ORDER BY t.height,t.position LIMIT ?3")?;
+                // Each record's signed transaction is restored from its data.
+                let mut statement=db.prepare("SELECT t.record,t.height,t.position,x.data FROM explorer_mail t JOIN explorer_blocks b ON b.hash=t.block_hash JOIN explorer_transaction_data x ON x.txid=t.txid AND x.block_hash=t.block_hash WHERE t.canonical=1 AND b.canonical=1 AND (t.height>?1 OR(t.height=?1 AND t.position>?2)) ORDER BY t.height,t.position LIMIT ?3")?;
                 let (items, next) = paged_more(
                     &mut statement,
                     params![h, n, limit + 1],
@@ -648,7 +685,8 @@ impl Explorer {
                 fields(&p, &["limit", "cursor"])?;
                 let (h, n) = cursor_named(&p, "cursor", s.height, c)?;
                 // Message text is read from the stored transaction data rather
-                // than from a second, JSON-escaped copy in the chat projection.
+                // than from a second, JSON-escaped copy in the chat projection
+                // (see restore_data).
                 let mut statement = db.prepare("SELECT t.record,t.height,t.position,x.data FROM explorer_chat t JOIN explorer_blocks b ON b.hash=t.block_hash JOIN explorer_transaction_data x ON x.txid=t.txid AND x.block_hash=t.block_hash WHERE t.canonical=1 AND b.canonical=1 AND (t.height<?1 OR (t.height=?1 AND t.position<?2)) ORDER BY t.height DESC,t.position DESC LIMIT ?3")?;
                 let (items, next) = paged(
                     &mut statement,
@@ -1268,8 +1306,9 @@ fn paged_with_budget<P: rusqlite::Params>(
     has_lookahead: bool,
     budget: &mut Budget,
 ) -> Result<(Vec<Value>, Value)> {
-    // Chat rows select their transaction data as a fourth column: the text.
-    let text = statement.column_count() > 3;
+    // Chat and mail rows select their transaction data as a fourth column,
+    // which restores the chat text or the mail record's signed transaction.
+    let data_column = statement.column_count() > 3;
     let mut rows = statement.query(p)?;
     let mut items = Vec::new();
     let mut last = None;
@@ -1278,18 +1317,19 @@ fn paged_with_budget<P: rusqlite::Params>(
             return Ok((items, json!(last)));
         }
         let record: String = row.get(0)?;
-        let data: Option<Vec<u8>> = text.then(|| row.get(3)).transpose()?;
-        let bytes = record.len() + data.as_ref().map_or(0, Vec::len);
+        let data: Option<Vec<u8>> = data_column.then(|| row.get(3)).transpose()?;
         // A single record can expand in JSON. Return it alone rather than
         // silently skipping it; the HTTP response envelope stays bounded too.
-        if !items.is_empty() && !budget.fits(bytes) {
+        if !items.is_empty() && !budget.fits(record.len() + data.as_ref().map_or(0, Vec::len)) {
             return Ok((items, json!(last)));
         }
         let (h, n): (u64, u64) = (row.get(1)?, row.get(2)?);
         let mut value: Value = serde_json::from_str(&record)?;
-        if let Some(data) = data {
-            value["text"] = json!(String::from_utf8(data).context("invalid indexed text")?);
-        }
+        let bytes = record.len()
+            + match data {
+                Some(data) => restore_data(&mut value, data)?,
+                None => 0,
+            };
         confirmations(&mut value, tip);
         if !budget.admit(bytes, &value, items.is_empty()) {
             return Ok((items, json!(last)));
@@ -1320,6 +1360,25 @@ fn detach(db: &rusqlite::Transaction<'_>, height: Option<u64>) -> Result<()> {
         };
     }
     Ok(())
+}
+/// Delete rows detached below `height`, with their transactions' data.
+fn prune_detached(db: &rusqlite::Transaction<'_>, height: u64) -> Result<()> {
+    db.execute(
+        "DELETE FROM explorer_transaction_data WHERE rowid IN (SELECT d.rowid FROM explorer_transactions t JOIN explorer_transaction_data d ON d.txid=t.txid AND d.block_hash=t.block_hash WHERE t.canonical=0 AND t.height<?1)",
+        [height],
+    )?;
+    for table in TABLES {
+        db.execute(
+            &format!("DELETE FROM {table} WHERE canonical=0 AND height<?1"),
+            [height],
+        )?;
+    }
+    Ok(())
+}
+/// Housekeeping only: a failed or busy checkpoint leaves committed rows
+/// intact, and a later one returns the space.
+fn truncate_wal(db: &Connection) {
+    let _ = db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
 }
 fn set_tip(db: &rusqlite::Transaction<'_>, hash: &Hash) -> Result<()> {
     db.execute(
@@ -1609,6 +1668,67 @@ fn mail_value(
     )
 }
 
+/// A mail record as stored, or `None` when it could not be delivered. It is
+/// bounded as reads return it, but stores `raw_without_data`, the signed
+/// transaction with empty data, instead of `raw` and `data_hex`: reads
+/// restore both from the transaction's data row (see [restore_data]), so the
+/// data is stored once rather than three times.
+fn mail_record(mut message: Value, t: &Transaction) -> Option<String> {
+    if bounded_json(&message, RECORD_BYTES).is_none() {
+        // As record_text: the decoded operation is the bulky copy.
+        let fields = message.as_object_mut()?;
+        fields.remove("operation");
+        fields.insert("operation_omitted".into(), json!(true));
+        bounded_json(&message, RECORD_BYTES)?;
+    }
+    let stub = Transaction {
+        body: TransactionBody {
+            sender: t.body.sender,
+            nonce: t.body.nonce,
+            fee: t.body.fee.clone(),
+            anchor: t.body.anchor,
+            expiry_blocks: t.body.expiry_blocks,
+            operation: t.body.operation.clone(),
+            data: Vec::new(),
+        },
+        signature: t.signature,
+    };
+    let fields = message.as_object_mut()?;
+    fields.remove("raw");
+    fields.remove("data_hex");
+    fields.insert(
+        "raw_without_data".into(),
+        json!(hex::encode(codec::encode(&stub))),
+    );
+    serde_json::to_string(&message).ok()
+}
+/// Restores what a record read with its transaction data does not store:
+/// chat text, or a mail record's signed `raw` transaction and `data_hex`.
+/// Returns the bytes of text this adds.
+fn restore_data(value: &mut Value, data: Vec<u8>) -> Result<usize> {
+    let fields = value.as_object_mut().context("invalid indexed record")?;
+    let Some(stub) = fields.remove("raw_without_data") else {
+        let text = String::from_utf8(data).context("invalid indexed text")?;
+        let bytes = text.len();
+        fields.insert("text".into(), json!(text));
+        return Ok(bytes);
+    };
+    let stub = hex::decode(stub.as_str().context("invalid indexed mail")?)?;
+    let mut transaction: Transaction = codec::decode(&stub, stub.len())?;
+    transaction.body.data = data;
+    let txid = hex::encode(codec::transaction_id(&transaction));
+    ensure!(
+        fields.get("txid").and_then(Value::as_str) == Some(txid.as_str()),
+        "invalid indexed mail"
+    );
+    let raw = crate::wallet::signed_hex(&transaction);
+    let data_hex = hex::encode(&transaction.body.data);
+    let bytes = raw.len() + data_hex.len();
+    fields.insert("raw".into(), json!(raw));
+    fields.insert("data_hex".into(), json!(data_hex));
+    Ok(bytes)
+}
+
 fn tx_value(
     c: &Config,
     s: &State,
@@ -1844,6 +1964,7 @@ fn index_block(
         // decoded operation against it, so an oversized record drops that copy.
         // One whose signed transaction alone exceeds the bound is not listed:
         // a listed record must stay deliverable, or every scan would stop on it.
+        // It is stored without the transaction data, which reads restore.
         if let Some(record) = mail_value(
             opening,
             t,
@@ -1851,7 +1972,7 @@ fn index_block(
             Some(hash),
             Some(position as u64),
         )
-        .and_then(|message| record_text(&message, "operation", RECORD_BYTES))
+        .and_then(|message| mail_record(message, t))
         {
             db.execute("INSERT OR REPLACE INTO explorer_mail(txid,block_hash,height,position,record) VALUES(?1,?2,?3,?4,?5)",params![id,hash_text,b.height,position as u64,record])?;
         }
@@ -3189,6 +3310,165 @@ mod worker_tests {
                 );
             }
         }
+        // Pruning reads only detached rows, through their own indexes.
+        let plan = |sql: &str| {
+            db.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([0], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        for table in TABLES {
+            let steps = plan(&format!(
+                "DELETE FROM {table} WHERE canonical=0 AND height<?1"
+            ));
+            assert!(
+                steps
+                    .iter()
+                    .any(|step| step.contains(&format!("USING INDEX {table}_detached"))),
+                "{table}: {steps:?}"
+            );
+        }
+        let steps = plan(
+            "DELETE FROM explorer_transaction_data WHERE rowid IN (SELECT d.rowid FROM explorer_transactions t JOIN explorer_transaction_data d ON d.txid=t.txid AND d.block_hash=t.block_hash WHERE t.canonical=0 AND t.height<?1)",
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.contains("USING INDEX explorer_transactions_detached")),
+            "{steps:?}"
+        );
+        assert!(
+            !steps.iter().any(|step| step.starts_with("SCAN")),
+            "{steps:?}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "test-fixtures"),
+        ignore = "requires explicit test-fixtures funding"
+    )]
+    fn detached_rows_are_deleted_with_their_data_below_the_retained_depth() {
+        // Detached rows were only marked, and a transaction's data row was
+        // never removed: every reorganization grew the index for good.
+        let dir = tempfile::tempdir().unwrap();
+        let c = Config::devnet();
+        let path = dir.path().join("prune.sqlite");
+        let mut main = Chain::open(&path, c.clone()).unwrap();
+        for salt in 0..3 {
+            extend(&mut main, salt);
+        }
+        let shared: Vec<_> = (1..=3)
+            .map(|height| main.block(&main.hash_at_height(height).unwrap()).unwrap())
+            .collect();
+        // Height 4 holds a transaction, so detaching it leaves a data row.
+        let owner = crypto::public_key(&[91; 32]).unwrap();
+        let transfer = crypto::sign(
+            &main.chain_id(),
+            &TransactionBody {
+                sender: owner,
+                nonce: 0,
+                fee: 1u32.into(),
+                anchor: main.tip_hash(),
+                expiry_blocks: 10,
+                operation: Operation::TransferExact {
+                    recipient: owner,
+                    amount: 1u32.into(),
+                },
+                data: b"detached".to_vec(),
+            },
+            &[91; 32],
+        )
+        .unwrap();
+        let block = main
+            .template(
+                owner,
+                vec![transfer],
+                main.tip_block().header.timestamp + 15,
+            )
+            .unwrap();
+        let block = Chain::mine(block, 100_000).unwrap();
+        main.submit(block.clone(), block.header.timestamp as u64)
+            .unwrap();
+        let mut index = Explorer::open(&path, &main).unwrap();
+        index.detached_blocks = 4;
+        assert_eq!(index.tip, Some(main.tip_hash()));
+        // A heavier branch from height 3 detaches height 4.
+        let mut fork = Chain::open(&dir.path().join("fork.sqlite"), c.clone()).unwrap();
+        for block in shared {
+            fork.submit(block.clone(), block.header.timestamp as u64)
+                .unwrap();
+        }
+        for salt in 100..102 {
+            let block = extend(&mut fork, salt);
+            main.submit(block.clone(), block.header.timestamp as u64)
+                .unwrap();
+        }
+        assert_eq!(main.tip_hash(), fork.tip_hash());
+        drain(&mut index, &main);
+        let count = |index: &Explorer, sql: &str| -> u64 {
+            index
+                .db
+                .as_ref()
+                .unwrap()
+                .query_row(sql, [], |row| row.get(0))
+                .unwrap()
+        };
+        let detached = |index: &Explorer| -> u64 {
+            TABLES
+                .iter()
+                .map(|table| {
+                    count(
+                        index,
+                        &format!("SELECT COUNT(*) FROM {table} WHERE canonical=0"),
+                    )
+                })
+                .sum()
+        };
+        let data = "SELECT COUNT(*) FROM explorer_transaction_data";
+        // Kept for lookup while within the retained depth of the tip.
+        for salt in 200..203 {
+            extend(&mut main, salt);
+            drain(&mut index, &main);
+            assert_eq!(count(&index, data), 1);
+            assert!(detached(&index) > 0);
+        }
+        assert_eq!(main.tip_height(), 8);
+        // Height 9 leaves height 4 more than four blocks behind.
+        extend(&mut main, 203);
+        drain(&mut index, &main);
+        assert_eq!(count(&index, data), 0);
+        assert_eq!(detached(&index), 0);
+        assert_eq!(canonical_blocks(&index), main.tip_height() + 1);
+        assert_eq!(index.tip, Some(main.tip_hash()));
+    }
+
+    #[test]
+    fn the_index_truncates_its_write_ahead_log() {
+        // Only the journal size limit returned log space, and only when the
+        // log restarted, which overlapping readers can postpone indefinitely.
+        let dir = tempfile::tempdir().unwrap();
+        let c = Config::devnet();
+        let path = dir.path().join("wal.sqlite");
+        let mut chain = Chain::open(&path, c.clone()).unwrap();
+        let mut index = Explorer::open(&path, &chain).unwrap();
+        let mut wal = path.with_extension("explorer.sqlite").into_os_string();
+        wal.push("-wal");
+        let size = || std::fs::metadata(&wal).map_or(0, |file| file.len());
+        for salt in 1..WAL_TRUNCATE_BLOCKS {
+            extend(&mut chain, salt);
+            drain(&mut index, &chain);
+        }
+        assert!(size() > 0);
+        extend(&mut chain, WAL_TRUNCATE_BLOCKS);
+        drain(&mut index, &chain);
+        assert_eq!(index.tip, Some(chain.tip_hash()));
+        assert_eq!(size(), 0);
+        extend(&mut chain, WAL_TRUNCATE_BLOCKS + 1);
+        drain(&mut index, &chain);
+        assert!(size() > 0);
     }
 
     #[test]
@@ -3418,6 +3698,35 @@ mod chat_tests {
             feed["messages"][0]["txid"],
             hex::encode(codec::transaction_id(&payment))
         );
+        // The stored record kept the data twice more, as hex in `raw` and in
+        // `data_hex`, beside its own row. It now stores the signed
+        // transaction without its data, and reads restore both exactly.
+        let stored: String = index
+            .db
+            .as_ref()
+            .unwrap()
+            .query_row(
+                "SELECT record FROM explorer_mail WHERE txid=?1",
+                [hex::encode(codec::transaction_id(&payment))],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            stored.len() < payment.body.data.len(),
+            "stored {} bytes",
+            stored.len()
+        );
+        let stored: Value = serde_json::from_str(&stored).unwrap();
+        assert!(stored.get("raw").is_none() && stored.get("data_hex").is_none());
+        assert_eq!(
+            feed["messages"][0]["raw"],
+            crate::wallet::signed_hex(&payment)
+        );
+        assert_eq!(
+            feed["messages"][0]["data_hex"],
+            hex::encode(&payment.body.data)
+        );
+        assert!(feed["messages"][0].get("raw_without_data").is_none());
         assert_eq!(feed["messages"][0]["nonce"], "0");
         assert_eq!(feed["messages"][0]["confirmations"], 1);
         assert_eq!(feed["messages"][0]["sender_public_key"], hex::encode(owner));

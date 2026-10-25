@@ -52,6 +52,8 @@ MemoryMax=1G
 # peerstatus): keep MemoryMax at least 128 MiB plus 20 times that capacity
 # above the measured peak. That fits the launch capacity of 16 KiB; raise
 # both limits before governance raises capacity to several MiB (README).
+# The node logs "warning: this node's memory limit ..." and peerstatus
+# reports memory.short while MemoryMax leaves less than that.
 TasksMax=128
 RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

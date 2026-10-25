@@ -722,7 +722,9 @@ impl NetworkGuard {
                 // an eighth whatever the share, and still admit one largest
                 // reply's bytes and work and one largest request's work, so
                 // how many others are active changes how long a call waits,
-                // never whether it can fit.
+                // never whether it can fit. Only wallet-critical calls may
+                // spend the work burst beyond the ordinary one
+                // (`essential_work_at`).
                 let burst = PUBLIC_WEB_VISITOR_SHARE;
                 policy.connections = PUBLIC_WEB_VISITOR_SESSIONS;
                 policy.requests = (base.requests / share).max(1);
@@ -730,7 +732,7 @@ impl NetworkGuard {
                 policy.bytes = (base.bytes / share).max(1);
                 policy.byte_burst = (base.byte_burst / burst).max(frame);
                 policy.work = (base.work / share).max(1);
-                policy.work_burst = (base.work_burst / burst).max(largest_work);
+                policy.work_burst = Self::ordinary_visitor_work(frame).max(largest_work);
             }
         }
         if key.3 == Scope::Aggregate {
@@ -740,6 +742,31 @@ impl NetworkGuard {
     }
     fn key_policy(&self, key: Key, share: u64) -> Policy {
         self.key_policy_at(key, share, self.max_frame_bytes.load(Ordering::Relaxed))
+    }
+    /// A public visitor's ordinary work burst: an eighth of the base, and at
+    /// least the work one largest reply pays for its bytes.
+    fn ordinary_visitor_work(frame: u64) -> u64 {
+        (Surface::Rpc.policy().work_burst / PUBLIC_WEB_VISITOR_SHARE)
+            .max(frame / REPLY_BYTES_PER_WORK)
+    }
+    /// The top of a public visitor's (or its aggregate's) work burst `p`
+    /// that only wallet-critical calls may spend: what the allowance for one
+    /// largest request, such as a broadcast of a largest transaction, adds
+    /// to the ordinary burst. Other calls, such as explorer and governance
+    /// reads, leave it, so one visitor's share of them stays what it was
+    /// before governance raised capacity, about a tenth of the proxy's pool
+    /// at the governed maximum, however large that allowance grows. Zero for
+    /// the proxy's own record and on the private guard.
+    fn essential_work_at(&self, key: Key, p: &Policy, frame: u64) -> u64 {
+        if !self.loopback_rpc_is_proxy || key.1 != Surface::Rpc || self.is_proxy(key) {
+            return 0;
+        }
+        let ordinary = Self::ordinary_visitor_work(frame);
+        let ordinary = match key.3 {
+            Scope::Address => ordinary,
+            Scope::Aggregate => ordinary.saturating_mul(AGGREGATE_SHARE),
+        };
+        p.work_burst.saturating_sub(ordinary)
     }
     /// The largest single valid peer message must remain admissible, even on a
     /// genesis whose signature limit exceeds the baseline work burst. Refill
@@ -1300,21 +1327,20 @@ impl Session {
     ) -> Result<()> {
         let mut records = accounting(&self.guard.records);
         let share = self.guard.visitor_share(&records, now);
+        let frame = self.guard.max_frame_bytes.load(Ordering::Relaxed);
         let keys = self.keys();
-        let reserve = if self.nonessential.load(Ordering::Relaxed) {
-            NetworkGuard::essential_reserve()
-        } else {
-            (0, 0, 0)
-        };
+        let nonessential = self.nonessential.load(Ordering::Relaxed);
         // A charge is admitted by every record or by none, so a visitor past
         // its share, or members past their aggregate, spend nothing. The
         // first record that refuses says when this charge fits again.
         for (key, member) in keys.into_iter().flatten() {
-            let p = self.guard.key_policy(key, share);
-            let (request_floor, byte_floor, work_floor) = if self.guard.is_proxy(key) {
-                reserve
-            } else {
-                (0, 0, 0)
+            let p = self.guard.key_policy_at(key, share, frame);
+            // A call that is not wallet-critical leaves the proxy's essential
+            // reserve, and a visitor's allowance for one largest request.
+            let (request_floor, byte_floor, work_floor) = match nonessential {
+                false => (0, 0, 0),
+                true if self.guard.is_proxy(key) => NetworkGuard::essential_reserve(),
+                true => (0, 0, self.guard.essential_work_at(key, &p, frame)),
             };
             let record = records
                 .get_mut(&key)
@@ -1351,7 +1377,7 @@ impl Session {
             }
         }
         for (key, _) in keys.into_iter().flatten() {
-            let p = self.guard.key_policy(key, share);
+            let p = self.guard.key_policy_at(key, share, frame);
             let record = records.get_mut(&key).expect("checked above");
             record
                 .requests
@@ -1406,6 +1432,18 @@ impl Session {
             return None;
         }
         Some(self.aggregate.map_or(self.key.0, |aggregate| aggregate.0))
+    }
+    /// The network whose share of the public reply allowance a reply to
+    /// this session uses: that of the visitor its proxy named, else its own,
+    /// as an IPv4 /24 or IPv6 /48, or one address on a local network. The
+    /// proxy's sessions that name no visitor count as its own address.
+    pub fn reply_network(&self) -> IpAddr {
+        let (key, aggregate) = self
+            .visitor
+            .get()
+            .copied()
+            .unwrap_or((self.key, self.aggregate));
+        aggregate.map_or(key.0, |aggregate| aggregate.0)
     }
     /// Only malformed framing/JSON and explicit resource violations trigger this.
     /// Ordinary stale transactions, unknown parents and competing forks do not.
@@ -4062,6 +4100,70 @@ mod tests {
         assert!(public.key_policy(named, 8).work_burst < broadcast as u64);
         public.allow_rpc_work(broadcast).unwrap();
         visitor.work(broadcast).unwrap();
+    }
+    #[test]
+    fn only_wallet_critical_calls_spend_the_largest_request_allowance() {
+        // At the governed maximum one largest request, a broadcast of a
+        // 64 MiB transaction, pays about 1.98 million units, and every
+        // visitor's work burst grows to admit it. Before, every call could
+        // spend that growth: one visitor's explorer and governance reads
+        // took the proxy's whole pool above its reserve in one burst,
+        // denying those reads to everyone else.
+        let largest = 1_980_000;
+        let guard = Arc::new(NetworkGuard::for_public_web());
+        guard.set_frame(193 * 1024 * 1024).unwrap();
+        guard.allow_rpc_work(largest as usize).unwrap();
+        let proxy = (
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Surface::Rpc,
+            Direction::Inbound,
+            Scope::Address,
+        );
+        let pool = guard.key_policy(proxy, 8).work_burst - NetworkGuard::essential_reserve().2;
+        assert!(pool >= largest);
+        let visitor = |n: u8| {
+            let session = guard
+                .admit("127.0.0.1".parse().unwrap(), Surface::Rpc)
+                .unwrap();
+            session
+                .forwarded_for(IpAddr::from([198, 51, 100, n]))
+                .unwrap();
+            session
+        };
+        // One visitor's reads now stop at its ordinary burst, the work of one
+        // largest reply (197,632 at the 193 MiB response limit): about a
+        // tenth of that pool, as before governance raised capacity.
+        let reader = visitor(1);
+        reader.nonessential();
+        let mut spent = 0;
+        while reader.outgoing(0, 4096).is_ok() {
+            spent += 4096;
+        }
+        assert!(spent > 190_000 && spent * 10 <= pool, "{spent} of {pool}");
+        // Such a refusal only asks the reader to wait for its refill.
+        let refusal = reader.outgoing(0, 4096).unwrap_err();
+        assert!(
+            refusal
+                .downcast_ref::<Limited>()
+                .unwrap()
+                .retry_after
+                .is_some()
+        );
+        // A read pricier than that ordinary burst never runs on the public
+        // listener, as before.
+        let pricey = visitor(2);
+        pricey.nonessential();
+        let refusal = pricey.outgoing(0, 197_633).unwrap_err();
+        assert!(
+            refusal
+                .downcast_ref::<Limited>()
+                .unwrap()
+                .retry_after
+                .is_none()
+        );
+        // A wallet-critical call may still spend the whole burst: a largest
+        // broadcast fits a visitor's, even after the reads above.
+        visitor(3).work(largest as usize).unwrap();
     }
     #[test]
     fn unused_reserved_work_returns_to_every_record_that_paid_it() {

@@ -2962,6 +2962,7 @@ impl Node {
             "observed_at":at, "encrypted":false,
             "transport_version":peer_wire::TRANSPORT_VERSION, "version1_peers":legacy,
             "capacity_allowance":self.known_block_bytes.load(Ordering::Acquire),
+            "memory":MemoryHeadroom::measure(self.known_block_bytes.load(Ordering::Acquire)).status(),
             "chain_height":view.chain.tip_height(),
             "seconds_without_new_tip":at.saturating_sub(self.last_tip_change.load(Ordering::Relaxed)),
             "chain_stalled":at.saturating_sub(self.last_tip_change.load(Ordering::Relaxed)) >= stall_after,
@@ -7399,7 +7400,7 @@ pub async fn serve(mut node: Node, options: ServerOptions) -> Result<Server> {
         parsers: Arc::new(Semaphore::new(2)),
         workers: Arc::new(Semaphore::new(4)),
         mutations: Arc::new(Semaphore::new(2)),
-        replies: Some(Arc::new(Semaphore::new(PUBLIC_REPLY_MEMORY_KIB))),
+        replies: Some(PublicReplies::new(PUBLIC_REPLY_MEMORY_KIB)),
         guard: Arc::new(NetworkGuard::for_public_web()),
     });
     let (stop, rx) = watch::channel(false);
@@ -7544,6 +7545,10 @@ pub async fn serve(mut node: Node, options: ServerOptions) -> Result<Server> {
             stratum_trusted_loop(node.clone(), rx.clone()),
         ));
     }
+    tasks.push(service_task(
+        "memory headroom",
+        memory_headroom_loop(node.clone(), rx.clone()),
+    ));
     for peer in options
         .peers
         .into_iter()
@@ -7574,6 +7579,135 @@ pub async fn serve(mut node: Node, options: ServerOptions) -> Result<Server> {
         tasks,
         _lease: lease,
     })
+}
+/// Memory that peers and public visitors can make the node hold on demand,
+/// which measurements of normal running do not show, at the greatest
+/// validated block capacity: 128 MiB plus 20 times that capacity. That
+/// covers buffered and decoding peer frames (seven frame allowances of
+/// about twice the capacity, at least 64 MiB), the pending pool and its
+/// published copy, and the 64 MiB public reply allowance, with room to
+/// spare. deploy/linux/README.md gives operators the same rule.
+fn peer_fillable_memory(capacity: u64) -> u64 {
+    (128u64 << 20).saturating_add(capacity.saturating_mul(20))
+}
+/// How often the node compares its memory limit with what peers can make
+/// it hold, and how often it repeats a warning while the limit is too low.
+const MEMORY_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+const MEMORY_WARNING_REPEAT: Duration = Duration::from_secs(3600);
+/// This process's memory limit and resident memory, where the system
+/// reports them, against the memory peers can make it hold at a capacity.
+struct MemoryHeadroom {
+    capacity: u64,
+    /// The least memory limit of this process's control group and the
+    /// groups above it (cgroup v2 `memory.max`, v1 `memory.limit_in_bytes`),
+    /// such as the systemd unit's `MemoryMax`.
+    limit: Option<u64>,
+    resident: Option<u64>,
+    fillable: u64,
+}
+impl MemoryHeadroom {
+    fn measure(capacity: u64) -> Self {
+        let read = |path: &Path| std::fs::read_to_string(path).ok();
+        Self {
+            capacity,
+            limit: read(Path::new("/proc/self/cgroup"))
+                .and_then(|groups| cgroup_memory_limit(&groups, read)),
+            resident: read(Path::new("/proc/self/status"))
+                .and_then(|status| resident_memory(&status)),
+            fillable: peer_fillable_memory(capacity),
+        }
+    }
+    /// Whether the limit leaves less than the fillable memory above the
+    /// resident memory, so peers can make the kernel kill the node.
+    fn short(&self) -> bool {
+        self.limit
+            .is_some_and(|limit| self.resident.unwrap_or(0).saturating_add(self.fillable) > limit)
+    }
+    /// For `peerstatus`: the limit and resident memory in bytes (null where
+    /// unknown), what peers can fill, and whether the limit is too low.
+    fn status(&self) -> Value {
+        json!({"limit":self.limit,"resident":self.resident,"peer_fillable":self.fillable,"short":self.short()})
+    }
+    fn warning(&self) -> String {
+        const MIB: u64 = 1 << 20;
+        format!(
+            "warning: this node's memory limit of {} MiB leaves less than the {} MiB that peers and public visitors can make it hold at the validated block capacity of {} KiB (128 MiB plus 20 times that capacity) above its {} MiB of resident memory; an out-of-memory kill would repeat after every restart. Raise MemoryHigh and MemoryMax now (deploy/linux/README.md)",
+            self.limit.unwrap_or(0) / MIB,
+            self.fillable.div_ceil(MIB),
+            self.capacity / 1024,
+            self.resident.unwrap_or(0).div_ceil(MIB),
+        )
+    }
+}
+/// The least memory limit set on the control groups that `/proc/self/cgroup`
+/// (`groups`) names and their ancestors, read through `read`. A group
+/// without a limit ("max" in cgroup v2) is skipped.
+fn cgroup_memory_limit(groups: &str, read: impl Fn(&Path) -> Option<String>) -> Option<u64> {
+    let mut least: Option<u64> = None;
+    for line in groups.lines() {
+        let mut fields = line.splitn(3, ':');
+        let (Some(_), Some(controllers), Some(group)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (mut directory, file) = if controllers.is_empty() {
+            (PathBuf::from("/sys/fs/cgroup"), "memory.max")
+        } else if controllers.split(',').any(|c| c == "memory") {
+            (
+                PathBuf::from("/sys/fs/cgroup/memory"),
+                "memory.limit_in_bytes",
+            )
+        } else {
+            continue;
+        };
+        let mut limits = vec![read(&directory.join(file))];
+        for part in group.split('/').filter(|part| !part.is_empty()) {
+            directory.push(part);
+            limits.push(read(&directory.join(file)));
+        }
+        for limit in limits
+            .into_iter()
+            .flatten()
+            .filter_map(|text| text.trim().parse::<u64>().ok())
+        {
+            least = Some(least.map_or(limit, |least| least.min(limit)));
+        }
+    }
+    least
+}
+/// Resident memory in bytes from `/proc/self/status`.
+fn resident_memory(status: &str) -> Option<u64> {
+    let line = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))?;
+    let kib = line.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()?;
+    Some(kib.saturating_mul(1024))
+}
+/// Peers can make the node hold memory that grows with the greatest
+/// validated block capacity. At startup and every minute, compare the
+/// process's memory limit with that and the resident memory, and warn when
+/// the limit leaves too little: at once, again whenever the capacity
+/// changes, and hourly while it stays too low. `peerstatus` reports the
+/// same comparison as `memory`.
+async fn memory_headroom_loop(node: Node, mut shutdown: watch::Receiver<bool>) {
+    let mut warned: Option<(u64, Instant)> = None;
+    loop {
+        let capacity = node.known_block_bytes.load(Ordering::Acquire);
+        let headroom = MemoryHeadroom::measure(capacity);
+        if !headroom.short() {
+            warned = None;
+        } else if warned.is_none_or(|(at_capacity, at)| {
+            at_capacity != capacity || at.elapsed() >= MEMORY_WARNING_REPEAT
+        }) {
+            eprintln!("{}", headroom.warning());
+            warned = Some((capacity, Instant::now()));
+        }
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            _ = tokio::time::sleep(MEMORY_CHECK_INTERVAL) => {}
+        }
+    }
 }
 /// Long-lived service loops (listeners, configured-peer synchronization and
 /// discovery) have no supervisor inside the process: a panic in one would
@@ -8884,9 +9018,9 @@ struct HttpContext {
     parsers: Arc<Semaphore>,
     workers: Arc<Semaphore>,
     mutations: Arc<Semaphore>,
-    /// The public website's built reply bodies held until written, in KiB
-    /// (`PUBLIC_REPLY_MEMORY_KIB`); `None` on the private listener.
-    replies: Option<Arc<Semaphore>>,
+    /// The public website's built reply bodies held until written
+    /// (`PublicReplies`); `None` on the private listener.
+    replies: Option<Arc<PublicReplies>>,
     guard: Arc<NetworkGuard>,
 }
 impl HttpContext {
@@ -8928,10 +9062,81 @@ impl HttpSlot {
 /// reply is replaced by a short error, so slow readers cannot make the node
 /// hold a reply per session.
 const PUBLIC_REPLY_MEMORY_KIB: usize = 64 * 1024;
+/// One network may hold at most this fraction of the reply allowance, or
+/// one reply of any size while it holds none (`PublicReplies::hold`).
+const PUBLIC_REPLY_NETWORK_SHARE: usize = 4;
 /// Public reply bodies up to this size need no allowance: all sessions
 /// together hold at most 2 MiB of them, and a wallet's short replies, such
 /// as a broadcast's, are never replaced for want of it.
 const PUBLIC_REPLY_UNHELD: usize = 64 * 1024;
+/// The public website's allowance for built reply bodies waiting for their
+/// clients to read them, in KiB, in total and for each network: an IPv4 /24
+/// or IPv6 /48, or one address on a local network, of the visitor the proxy
+/// named or of the client itself (`Session::reply_network`). Sessions of one
+/// network that never read their replies, up to the 24 its aggregate may
+/// hold, therefore cannot keep every other network's large replies out:
+/// that takes at least `PUBLIC_REPLY_NETWORK_SHARE` networks.
+struct PublicReplies {
+    capacity: usize,
+    held: Mutex<PublicReplyTable>,
+}
+#[derive(Default)]
+struct PublicReplyTable {
+    total: usize,
+    networks: HashMap<IpAddr, usize>,
+}
+/// One reply body's part of the allowance, released by its drop.
+struct HeldReply {
+    replies: Arc<PublicReplies>,
+    network: IpAddr,
+    kib: usize,
+}
+impl PublicReplies {
+    fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            capacity,
+            held: Mutex::default(),
+        })
+    }
+    /// Hold a reply body of `bytes` for `network` until the result drops,
+    /// if the allowance has room: a network may hold up to its share, or
+    /// one reply of any size while it holds none, and one larger than the
+    /// whole allowance takes all of it.
+    fn hold(self: &Arc<Self>, network: IpAddr, bytes: usize) -> Option<HeldReply> {
+        let kib = bytes.div_ceil(1024).min(self.capacity);
+        let mut held = self.held.unpoisoned();
+        let own = held.networks.get(&network).copied().unwrap_or(0);
+        let share = self.capacity / PUBLIC_REPLY_NETWORK_SHARE;
+        if held.total.saturating_add(kib) > self.capacity
+            || (own > 0 && own.saturating_add(kib) > share)
+        {
+            return None;
+        }
+        held.total += kib;
+        *held.networks.entry(network).or_default() += kib;
+        Some(HeldReply {
+            replies: self.clone(),
+            network,
+            kib,
+        })
+    }
+    #[cfg(test)]
+    fn available(&self) -> usize {
+        self.capacity - self.held.unpoisoned().total
+    }
+}
+impl Drop for HeldReply {
+    fn drop(&mut self) {
+        let mut held = self.replies.held.unpoisoned();
+        held.total = held.total.saturating_sub(self.kib);
+        if let Some(own) = held.networks.get_mut(&self.network) {
+            *own = own.saturating_sub(self.kib);
+            if *own == 0 {
+                held.networks.remove(&self.network);
+            }
+        }
+    }
+}
 /// The public website's sessions. When all are in use, a newcomer from a
 /// network (an IPv4 /24 or IPv6 /48, or one address on a local network)
 /// holding at least two fewer sessions than the network holding the most
@@ -9507,21 +9712,20 @@ fn charge_public_reply(admission: &Session, bytes: usize, work: usize) -> Result
 /// work stays paid either way. Returns the held allowance.
 fn settle_public_reply(
     admission: &Session,
-    replies: &Arc<Semaphore>,
+    replies: &Arc<PublicReplies>,
     body: &mut Vec<u8>,
     reply_work: usize,
     reserved: usize,
     rpc_error: impl Fn(&str) -> Value,
-) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+) -> Result<Option<HeldReply>> {
     admission.refund_work(reserved.saturating_sub(reply_work));
     let unreserved = reply_work.saturating_sub(reserved);
     // A reply is held in memory until its client has read it. A large one is
-    // held against the allowance and, past it, replaced at once rather than
-    // held, however many sessions read slowly.
+    // held against its network's part of the allowance and, past it,
+    // replaced at once rather than held, however many sessions read slowly.
     let mut held = None;
     if body.len() > PUBLIC_REPLY_UNHELD {
-        let kib = body.len().div_ceil(1024).min(PUBLIC_REPLY_MEMORY_KIB);
-        held = replies.clone().try_acquire_many_owned(kib as u32).ok();
+        held = replies.hold(admission.reply_network(), body.len());
         if held.is_none() {
             *body = serde_json::to_vec(&rpc_error("public replies are busy; try again"))?;
         }
@@ -10322,6 +10526,69 @@ mod capacity_work_tests {
     }
 
     #[test]
+    fn a_memory_limit_too_low_for_what_peers_can_fill_is_detected() {
+        const MIB: u64 = 1 << 20;
+        let files = |entries: &[(&str, &str)]| {
+            let entries: HashMap<PathBuf, String> = entries
+                .iter()
+                .map(|(path, text)| (PathBuf::from(path), text.to_string()))
+                .collect();
+            move |path: &Path| entries.get(path).cloned()
+        };
+        // The shipped unit's MemoryMax on cgroup v2, below a slice without
+        // a limit; a lower limit on a parent group wins.
+        let unit = "0::/system.slice/hashstash.service\n";
+        let mut layout = vec![
+            ("/sys/fs/cgroup/system.slice/memory.max", "max\n"),
+            (
+                "/sys/fs/cgroup/system.slice/hashstash.service/memory.max",
+                "1073741824\n",
+            ),
+        ];
+        assert_eq!(cgroup_memory_limit(unit, files(&layout)), Some(1024 * MIB));
+        layout[0].1 = "536870912\n";
+        assert_eq!(cgroup_memory_limit(unit, files(&layout)), Some(512 * MIB));
+        // cgroup v1 keeps the limit in the memory controller's hierarchy.
+        let v1 = "5:cpu,cpuacct:/system.slice/hashstash.service\n4:memory:/system.slice/hashstash.service\n";
+        let layout = [(
+            "/sys/fs/cgroup/memory/system.slice/hashstash.service/memory.limit_in_bytes",
+            "805306368\n",
+        )];
+        assert_eq!(cgroup_memory_limit(v1, files(&layout)), Some(768 * MIB));
+        // No limit anywhere, or no control groups at all (other systems).
+        assert_eq!(cgroup_memory_limit("0::/\n", files(&[])), None);
+        assert_eq!(cgroup_memory_limit("", files(&[])), None);
+        assert_eq!(
+            resident_memory("Name:\thashstash\nVmRSS:\t  614400 kB\nVmData:\t1 kB\n"),
+            Some(600 * MIB)
+        );
+        assert_eq!(resident_memory("Name:\thashstash\n"), None);
+        // The default 1 GiB limit leaves room at the 16 KiB launch capacity,
+        // but not once governance raised it to 16 MiB: peers could then make
+        // the kernel kill the node after every restart, and nothing said so.
+        let headroom = |capacity: u64| MemoryHeadroom {
+            capacity,
+            limit: Some(1024 * MIB),
+            resident: Some(600 * MIB),
+            fillable: peer_fillable_memory(capacity),
+        };
+        assert!(!headroom(16 * 1024).short());
+        let raised = headroom(16 * MIB);
+        assert_eq!(raised.fillable, 448 * MIB);
+        assert!(raised.short());
+        assert!(raised.warning().contains("memory limit of 1024 MiB"));
+        assert!(raised.warning().contains("the 448 MiB that peers"));
+        assert_eq!(raised.status()["short"], true);
+        // Without a known limit nothing is reported short.
+        let unknown = MemoryHeadroom {
+            limit: None,
+            ..headroom(64 * MIB)
+        };
+        assert!(!unknown.short());
+        assert_eq!(unknown.status()["limit"], Value::Null);
+    }
+
+    #[test]
     fn short_replies_must_be_written_within_seconds_and_long_ones_within_the_deadline() {
         assert_eq!(reply_write_deadline(0), REPLY_WRITE_BASE);
         // A script of about 200 KiB that a client never reads holds its
@@ -10380,7 +10647,7 @@ mod capacity_work_tests {
         let visitor = guard
             .admit("198.51.100.30".parse().unwrap(), Surface::Rpc)
             .unwrap();
-        let replies = Arc::new(Semaphore::new(PUBLIC_REPLY_MEMORY_KIB));
+        let replies = PublicReplies::new(PUBLIC_REPLY_MEMORY_KIB);
         let error = |message: &str| json!({"error": message});
         // The reservation at the governed maximum: a whole page budget.
         let reserve = explorer_reply_reserve(crate::config::MAX_GOVERNED_BLOCK_BYTES as usize);
@@ -10398,7 +10665,7 @@ mod capacity_work_tests {
             serde_json::from_slice::<Value>(&body).unwrap()["error"],
             "public response byte budget exhausted; try again"
         );
-        assert_eq!(replies.available_permits(), PUBLIC_REPLY_MEMORY_KIB);
+        assert_eq!(replies.available(), PUBLIC_REPLY_MEMORY_KIB);
         // Without that payment the whole 131,072-unit burst would remain.
         assert!(visitor.outgoing(0, 131_072 - 8 * 1024).is_err());
         // A page smaller than the reservation pays only its own work, and
@@ -10410,15 +10677,16 @@ mod capacity_work_tests {
         let mut body = vec![b'x'; MIB];
         let held = settle_public_reply(&reader, &replies, &mut body, 1024, reserve, error).unwrap();
         assert_eq!(body.len(), MIB);
-        assert_eq!(replies.available_permits(), PUBLIC_REPLY_MEMORY_KIB - 1024);
+        assert_eq!(replies.available(), PUBLIC_REPLY_MEMORY_KIB - 1024);
         reader.outgoing(0, 131_072 - 2 * 1024).unwrap();
         // Past the allowance a reply is replaced at once rather than held.
-        let crowded = Arc::new(Semaphore::new(512));
+        let crowded = PublicReplies::new(512);
         let mut body = vec![b'x'; MIB];
         let other = guard
             .admit("198.51.102.30".parse().unwrap(), Surface::Rpc)
             .unwrap();
-        let _held_elsewhere = crowded.clone().try_acquire_many_owned(256).unwrap();
+        let elsewhere = "203.0.113.0".parse().unwrap();
+        let _held_elsewhere = crowded.hold(elsewhere, 256 * 1024).unwrap();
         assert!(
             settle_public_reply(&other, &crowded, &mut body, 0, 0, error)
                 .unwrap()
@@ -10429,11 +10697,13 @@ mod capacity_work_tests {
             "public replies are busy; try again"
         );
         drop(held);
-        assert_eq!(replies.available_permits(), PUBLIC_REPLY_MEMORY_KIB);
+        assert_eq!(replies.available(), PUBLIC_REPLY_MEMORY_KIB);
         // A short reply, such as a broadcast's, needs no allowance: it is
         // never replaced, however many large replies wait.
-        let _rest = crowded.clone().try_acquire_many_owned(256).unwrap();
-        assert_eq!(crowded.available_permits(), 0);
+        let _rest = crowded
+            .hold("203.0.114.0".parse().unwrap(), 256 * 1024)
+            .unwrap();
+        assert_eq!(crowded.available(), 0);
         let mut body = vec![b'x'; PUBLIC_REPLY_UNHELD];
         assert!(
             settle_public_reply(&other, &crowded, &mut body, 0, 0, error)
@@ -10441,6 +10711,77 @@ mod capacity_work_tests {
                 .is_none()
         );
         assert_eq!(body.len(), PUBLIC_REPLY_UNHELD);
+    }
+
+    #[test]
+    fn one_network_holding_unread_replies_cannot_deny_another_networks_large_replies() {
+        const MIB: usize = 1024 * 1024;
+        let guard = Arc::new(NetworkGuard::for_public_web());
+        guard.set_frame(MAX_RESPONSE_FRAME).unwrap();
+        let replies = PublicReplies::new(PUBLIC_REPLY_MEMORY_KIB);
+        let error = |message: &str| json!({"error": message});
+        // A reply's held allowance, and whether its body was served.
+        let settle = |session: &Session, size: usize| {
+            let mut body = vec![b'x'; size];
+            let held = settle_public_reply(session, &replies, &mut body, 0, 0, error).unwrap();
+            assert_eq!(held.is_some(), body.len() == size);
+            held
+        };
+        // The 24 sessions one /24 may hold, from four addresses, each ask for
+        // a 4 MiB explorer page and never read it. Before, 16 of them held
+        // the whole 64 MiB allowance, and every other network's reply over
+        // 64 KiB was replaced by "public replies are busy" until their write
+        // deadlines ran out, again and again.
+        let flood: Vec<Session> = (1..=4u8)
+            .map(|n| {
+                guard
+                    .admit(IpAddr::from([198, 51, 100, n]), Surface::Rpc)
+                    .unwrap()
+            })
+            .collect();
+        let held: Vec<HeldReply> = flood
+            .iter()
+            .cycle()
+            .take(24)
+            .filter_map(|session| settle(session, 4 * MIB))
+            .collect();
+        // That network holds a quarter of the allowance; its other pages
+        // were replaced at once.
+        assert_eq!(held.len(), 4);
+        assert_eq!(replies.available(), PUBLIC_REPLY_MEMORY_KIB / 4 * 3);
+        // Another network's page as large as a whole quarter is served.
+        let other = guard
+            .admit("203.0.113.9".parse().unwrap(), Surface::Rpc)
+            .unwrap();
+        let page = settle(&other, 16 * MIB).unwrap();
+        // A visitor the proxy names counts with its own network, not with
+        // the proxy's other visitors.
+        let proxied = |visitor: &str| {
+            let session = guard
+                .admit("127.0.0.1".parse().unwrap(), Surface::Rpc)
+                .unwrap();
+            session.forwarded_for(visitor.parse().unwrap()).unwrap();
+            session
+        };
+        let flooder = proxied("198.51.100.77");
+        assert!(settle(&flooder, 4 * MIB).is_none());
+        let neighbour = proxied("192.0.2.1");
+        let served = settle(&neighbour, 4 * MIB).unwrap();
+        drop((held, page, served));
+        assert_eq!(replies.available(), PUBLIC_REPLY_MEMORY_KIB);
+        // A network holding nothing may hold one reply beyond its share, and
+        // one beyond the whole allowance takes all of it, so a largest valid
+        // reply is always served.
+        let net = |n: u8| IpAddr::from([198, 51, n, 0]);
+        let large = replies.hold(net(1), 20 * MIB).unwrap();
+        assert!(replies.hold(net(1), MIB).is_none());
+        let second = replies.hold(net(2), 20 * MIB).unwrap();
+        drop((large, second));
+        let largest = replies.hold(net(3), 100 * MIB).unwrap();
+        assert_eq!(replies.available(), 0);
+        assert!(replies.hold(net(4), 65 * 1024).is_none());
+        drop(largest);
+        assert_eq!(replies.available(), PUBLIC_REPLY_MEMORY_KIB);
     }
 
     #[test]

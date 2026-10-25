@@ -235,9 +235,16 @@ The governed body measurement is state_root[32], CompactSize record count, and e
 
 Proof of work compares the little-endian SHA256d header digest with a canonical positive target no easier than genesis limit_bits. Each branch derives cumulative scheduled seconds S_h = S_(h-1) + parent_settings.interval. Its first mined block supplies the anchor scheduled seconds S_1. The anchor timestamp T_1 is max(block_1.timestamp, block_2.timestamp - parent_settings.interval), fixed by the branch's second block; the first block's entry uses its own timestamp. For a child of a non-genesis parent, error = (parent.timestamp - T_1) - (parent.expected_seconds - S_1). Ideal target is initial_target * 2^(error/daa_half_life), using the fixed-point integer ASERT approximation, compact rounding and target limit. The first two blocks use initial_bits, and the third block's error is at most zero: time before mining began is excluded even when the first block's timestamp is backdated toward genesis. A miner producing both of the first two blocks can still backdate them; `init --hashrate` bounds the resulting easing by setting limit_bits to 256 times the calibrated initial target. An interval change modifies future schedule increments without resetting the anchor. Competing branches retain their own first-block anchors; reopening reconstructs these from validated history.
 
-The integer approximation is the aserti3-2d polynomial with these exact steps; every constant and rounding direction is consensus. `initial` and `limit` are the targets of initial_bits and limit_bits, `error` is the signed value above (it fits an i128), `half_life` is daa_half_life, and `compact(x)` is the target that Bitcoin's compact encoding of x decodes to (GetCompact, which keeps the three most significant bytes):
+The integer approximation is the aserti3-2d polynomial with these exact steps; every constant and rounding direction is consensus. `initial` and `limit` are the targets of initial_bits and limit_bits, `error` is the signed value above (it fits an i128), `half_life` is daa_half_life, and `compact(x)` is the target that Bitcoin's compact encoding of x (GetCompact) decodes to. It keeps the three most significant bytes of x, but only two when the first of them is 0x80 or more, because the compact mantissa's top bit is a sign bit; for example 0x80123456 encodes as 0x05008012 and decodes to 0x80120000:
 
 ```text
+compact(x):                                     # x > 0
+  size = number of bytes of x                   # bits(x) rounded up to whole bytes
+  mantissa = x >> 8 * (size - 3) if size >= 3 else x << 8 * (3 - size)
+  if mantissa >= 0x800000: mantissa = mantissa >> 8; size = size + 1
+  bits = size * 2^24 + mantissa                 # the header's compact target
+  return mantissa << 8 * (size - 3) if size >= 3 else mantissa >> 8 * (3 - size)
+
 asert(initial, error, half_life, limit):
   if error >= 512 * half_life: return compact(limit)
   if error <= -512 * half_life: return 1
@@ -254,7 +261,7 @@ asert(initial, error, half_life, limit):
   return compact(target)
 ```
 
-The vectors in `tests/data/consensus-vectors.json`, computed from this pseudocode by `scripts/consensus_model.py`, pin truncation toward zero, the floored shift, both cutoffs, the floor at one and the clamp before compact rounding; the official aserti3-2d test runs cover the polynomial.
+The vectors in `tests/data/consensus-vectors.json`, computed from this pseudocode by `scripts/consensus_model.py`, pin truncation toward zero, the floored shift, both cutoffs, the floor at one, the clamp before compact rounding and compact rounding to two bytes (error 3,333 gives bits 1d00d06b); the official aserti3-2d test runs cover the polynomial.
 
 Timestamp must exceed median past time and must not exceed local now + future_seconds. Median uses available ancestors including the parent, capped by timestamp_window, sorted at index length/2. Future blocks remain retryable. Because the header timestamp is u32, no block can follow once median past time equals u32::MAX (2106-02-07 06:28:15 UTC); templates then fail with "timestamp exhausted". This is the protocol's lifetime limit. Time checks reduce but do not eliminate timestamp manipulation. Header time affects ASERT, while governance phases advance by the target interval, independently of the candidate timestamp. Transaction expiry is measured in blocks after its signed anchor; timestamp samples and confirmations retain their count units.
 

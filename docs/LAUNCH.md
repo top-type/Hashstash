@@ -4,7 +4,7 @@ This runbook takes a new public Hashstash network from a reviewed source commit 
 
 Work through it in order. Each section ends with a check; do not continue past a failed check. Run a complete rehearsal on a throwaway genesis before launch day (section 10): every command below works the same way on it.
 
-For a concrete network, `scripts/launch-kit.sh` turns the servers' addresses, the calibration hashrate and the release into every server's `node.env`, firewall rules, nginx site, faucet configuration and service, and a numbered `INSTALL.md`, and creates the genesis once. The [launch-day sequence](LAUNCH-DAY.md) is the order of commands across servers, and `scripts/launch_rehearsal.py` rehearses the whole kit on one machine.
+For a concrete network, `scripts/launch-kit.sh` turns the servers' addresses, the calibration hashrate and the release into every server's `node.env`, firewall rules, nginx site, faucet configuration and service, and a numbered `INSTALL.md`, and creates the genesis once. The [launch-day sequence](LAUNCH-DAY.md) is the order of commands across servers. `scripts/launch_rehearsal.py` rehearses a kit's nodes, discovery, Stratum and faucet on one machine; the rehearsal on the real hosts (section 10) covers the rest.
 
 ## 1 Roles, hosts and schedule
 
@@ -137,7 +137,7 @@ Check: `peer-keycheck` passes for every node's identity and pins (the installer'
 
 ## 7 Stratum
 
-Enable Stratum (`STRATUM_ENABLED=true`) only on nodes that serve miners; set it to `false` on seeds and website nodes. A Stratum listener on a public address requires the password file, and the node refuses to start without one.
+Enable Stratum (`STRATUM_ENABLED=true`) only on nodes that serve miners; set it to `false` on seeds and website nodes. A small network whose every server is a seed has no dedicated mining nodes: there, the seeds other than the website host serve the miners, and the website host, which holds the faucet's key and serves the wallet, runs no Stratum. That is `scripts/launch-kit.sh`'s default. A Stratum listener on a public address requires the password file, and the node refuses to start without one.
 
 - Stratum V1 is plain TCP: the password and all shares are visible to anyone on the path, and a rental provider sees the password. Use a different random password per node and never reuse it elsewhere. Restrict 18482 to the miners' addresses with the firewall where they are known.
 - `STRATUM_TRUSTED` lists the operator's own miners' and rental proxies' addresses or prefixes (for example `STRATUM_TRUSTED=198.51.100.0/24`), at least /16 for IPv4 or /32 for IPv6 outside local networks. They always keep reserved slots, so a flood of unauthenticated connections cannot lock them out, and 16 of the 64 authorized worker slots that other holders of the password cannot take. Once authorized they are not limited to 16 connections per address. The 256 addresses that most recently authorized also keep reserved waiting slots, in `chain.stratum-trusted.json`.
@@ -177,7 +177,7 @@ Check: `--check` prints "Configuration and payout public key are valid", and `sy
 
 ## 10 Rehearsal
 
-First rehearse the generated files on one Linux machine: `python3 scripts/launch_rehearsal.py --release-dir target/release` builds kits for three loopback servers and checks installation, discovery, convergence, Stratum mining and the faucet ([launch day](LAUNCH-DAY.md#before-launch-day-t-4-to-t-1)). Then, two or three days before launch, run the whole procedure on a throwaway genesis created the same way (`./hashstash init --config rehearsal.json --preset slow --hashrate 2P`), on the real hosts, with real miners for at least an hour:
+First rehearse the generated files on one Linux machine: `python3 scripts/launch_rehearsal.py --release-dir target/release` builds kits for three loopback servers and checks installation, seed-to-seed discovery and convergence, Stratum mining, outsiders joining with the published command and through gossip, and the faucet ([launch day](LAUNCH-DAY.md#before-launch-day-t-4-to-t-1)). It cannot exercise nginx, certbot, the firewall, the systemd units, the archiving of an earlier installation or real miners. So, two or three days before launch, run the whole procedure on a throwaway genesis created the same way (`./hashstash init --config rehearsal.json --preset slow --hashrate 2P`, or a throwaway kit from `scripts/launch-kit.sh`), on the real hosts, with real miners for at least an hour:
 
 1. Install every node, start them, and confirm convergence (section 11).
 2. Send transactions through the website, sign one offline with the cold signer and broadcast it, and run a small governance round if time allows.

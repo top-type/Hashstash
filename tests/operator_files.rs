@@ -487,8 +487,9 @@ fn linux_launcher_script_regressions() {
     run_script(&["deploy/linux/test-launcher.sh"]);
 }
 
-/// launch-kit.sh input validation and generated files (stub binary), then a
-/// kit from this build whose every server passes the installer's --check.
+/// launch-kit.sh input validation and generated files (stub binary), then kits
+/// from this build, unpinned and pinned, whose every server runs its rendered
+/// INSTALL.md steps up to the installer's --check.
 #[cfg(target_os = "linux")]
 #[test]
 fn launch_kit_regressions() {

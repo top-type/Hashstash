@@ -3,7 +3,7 @@
 
     python3 scripts/launch_rehearsal.py --release-dir DIR [--work DIR]
         [--fixture-release-dir DIR] [--ips 127.0.0.21,127.0.0.22,127.0.0.23]
-        [--base-port 61480] [--blocks 6]
+        [--joiner-ip 127.0.0.24] [--base-port 61480] [--blocks 6]
 
 Three "servers" are loopback addresses of this machine. Everything runs from
 the generated kit: the kit's own deploy/install.sh --check, and its
@@ -12,19 +12,25 @@ small shim between run-node.sh and the binary changes only what one machine
 cannot share: the data path, the bind address of P2P and Stratum (one
 loopback alias per server instead of 0.0.0.0) and --allow-private-peer-discovery
 for those loopback addresses. node.env's PEER_KEY_FILE points to the
-rehearsal's identity instead of /etc/hashstash.
+rehearsal's identity instead of /etc/hashstash. The kit's defaults apply:
+Stratum on servers 2 and 3, the website and faucet on server 1 without it.
 
 Phase A uses the real launch genesis (init --preset slow --hashrate 1.67P):
-install checks, start, discovery, convergence at height 0, Stratum
+install checks, start, seed-to-seed discovery, convergence at height 0, Stratum
 authorization, the public web listener. It is far too hard to mine on a CPU.
 Phase B uses an --uncalibrated rehearsal genesis through the same kit, with
-the backbone pinned: start, convergence, Stratum mining of real blocks, and the
-faucet from the kit's configuration with the headers nginx sets. A release
-build issues whole atoms of one petahash of expected work, so CPU blocks issue
-nothing and the faucet stays unfunded. Phase C, with --fixture-release-dir (a
-test-fixtures build, one atom per hash), funds the faucet from mined coins and
-completes a claim. Nothing outside --work is touched; every process started
-here is stopped at the end. No network access beyond loopback.
+the backbone pinned: start, convergence, Stratum mining of real blocks,
+outsiders joining with the kit's published command, and the faucet from the
+kit's configuration with the headers nginx sets. Of the outsiders, one runs
+the README's join command as published and must reach the seeds' tip; another
+knows one seed and advertises itself, and the first must learn it through
+gossip. A release build issues whole atoms of one petahash of expected work,
+so CPU blocks issue nothing and the faucet stays unfunded. Phase C, with
+--fixture-release-dir (a test-fixtures build, one atom per hash), funds the
+faucet from mined coins as INSTALL.md step 11 does, prepared on the web host,
+signed by hashstash-cold and broadcast, and completes a claim. Nothing outside
+--work is touched; every process started here is stopped at the end. No
+network access beyond loopback.
 """
 
 import argparse
@@ -253,10 +259,10 @@ exec "$real" "${args[@]}"
 """
 
 
-def start(args, logfile, env=None):
+def start(args, logfile, env=None, cwd=None):
     handle = open(logfile, "ab")
     process = subprocess.Popen([str(a) for a in args], stdout=handle, stderr=subprocess.STDOUT, env=env,
-                               start_new_session=True)
+                               cwd=cwd, start_new_session=True)
     PROCESSES.append((process, handle))
     return process
 
@@ -384,9 +390,18 @@ class Rehearsal:
         self.options = options
         self.work = Path(options.work).resolve()
         self.ips = options.ips.split(",")
+        check(len(self.ips) >= 3, "three servers: the web host and two Stratum servers")
+        # The outsider running the published command listens on an alias of
+        # its own. The node that advertises itself listens on 127.0.0.1: on one
+        # machine every outbound connection leaves from 127.0.0.1, and a node
+        # accepts an advertisement only for the address the advertiser connects
+        # from (on the servers, its public address).
+        check(options.joiner_ip not in self.ips and options.joiner_ip != "127.0.0.1", "an outsider address besides the servers'")
+        self.joiner_binds = [f"{options.joiner_ip}:{options.base_port + 1}", f"127.0.0.1:{options.base_port + 6}"]
         self.base = options.base_port
         self.ports = {"rpc": self.base, "p2p": self.base + 1, "stratum": self.base + 2,
-                      "web": self.base + 3, "faucet": self.base + 4}
+                      "web": self.base + 3, "faucet": self.base + 4, "cold": self.base + 5}
+        check(self.base + 1000 * (len(self.ips) + 1) <= 65535, "--base-port leaves room for every RPC port")
         self.shim = self.work / "run-node-shim.sh"
 
     def kit(self, release_dir, out, genesis_args, extra=()):
@@ -463,7 +478,17 @@ class Rehearsal:
             bad.close()
         check(authorized.get("result") is True, "Stratum accepts the password")
         check(refused.get("result") is not True, "Stratum refuses a wrong password")
-        return {"authorized": True, "job_bits": job[6], "wrong_password": refused.get("error") or refused.get("result")}
+        return {"server": server.number, "authorized": True, "job_bits": job[6],
+                "wrong_password": refused.get("error") or refused.get("result")}
+
+    def no_stratum(self, server):
+        """The web host runs no Stratum listener (the kit's default)."""
+        check(server.env.get("STRATUM_ENABLED") == "false", "the kit leaves Stratum off the web host")
+        try:
+            socket.create_connection((server.ip, self.ports["stratum"]), timeout=3).close()
+        except ConnectionRefusedError:
+            return {"server": server.number, "stratum_port": "connection refused"}
+        raise AssertionError(f"server {server.number} accepts Stratum connections")
 
     def public_web(self):
         base = f"http://127.0.0.1:{self.ports['web']}"
@@ -495,8 +520,14 @@ class Rehearsal:
             self.start_all(servers)
             report["convergence"] = wait_converged(servers, "Phase A", 0)
             check(report["convergence"]["chain_id"] == values["CHAIN_ID"], "nodes run the kit's chain ID")
-            report["stratum"] = self.stratum_auth(servers[0])
-            log(f"Phase A: Stratum authorization ok, wrong password refused ({report['stratum']['wrong_password']})")
+            report["stratum"] = self.stratum_auth(servers[1])
+            log(f"Phase A: Stratum authorization ok on server 2, wrong password refused ({report['stratum']['wrong_password']})")
+            report["web_host_stratum"] = self.no_stratum(servers[0])
+            log("Phase A: the web host runs no Stratum listener")
+            joiner, _, _, report["published_command"] = self.join_published(out, release / "hashstash",
+                                                                             self.work / "run-launch", servers, False)
+            report["published_command"]["exit"] = stop(joiner["process"])
+            check(report["published_command"]["exit"] == 0, "the outsider stopped cleanly")
             report["public_web"] = self.public_web()
             log("Phase A: public web listener serves the wallet and refuses private methods")
             report["argv_server_1"] = sorted(p.read_text().split("\n") for p in (self.work / "run-launch" / "server-1").glob("argv-*.txt"))[-1]
@@ -563,11 +594,8 @@ class Rehearsal:
             payout_balance = balance(servers[0].rpc, self.payout_public)
             amount = payout_balance // 2
             check(amount > 0, "mined coins to fund the faucet")
-            transfer = run([binary, "transfer", "--url", f"http://127.0.0.1:{servers[0].rpc}/rpc", "--config",
-                            out / "genesis" / "network.json", "--key", self.work / "keys" / "payout.key",
-                            "--recipient", faucet_address, "--amount", str(amount)])
-            report["funding_transfer"] = {"payout_balance_before": payout_balance, "amount": amount,
-                                          "output": transfer.stdout.strip()[-400:]}
+            report["funding_transfer"] = dict(self.fund_offline(release, out, run_dir, faucet_address, amount),
+                                              payout_balance_before=payout_balance, amount=amount)
             deadline = time.monotonic() + 120
             while time.monotonic() < deadline and balance(servers[0].rpc, faucet_public) < amount:
                 time.sleep(1)
@@ -603,9 +631,19 @@ class Rehearsal:
             time.sleep(1)
         report["faucet_status_before_claim"] = status
         log(f"faucet state before the claim: {status.get('state')}")
-        code, claim, headers = self.faucet_request("/faucet/claim", "POST", {"address": recipient})
-        report["claim"] = {"http": code, "reply": claim}
-        log(f"claim: HTTP {code} {json.dumps(claim)[:200]}")
+        # A block that reaches the faucet's node between the faucet's snapshot
+        # and the node's preparation can make a claim answer 503, and a visitor
+        # then claims again; so does this rehearsal, every attempt recorded
+        # (a funded faucet only: an unfunded one answers 503 every time).
+        attempts = []
+        while True:
+            code, claim, headers = self.faucet_request("/faucet/claim", "POST", {"address": recipient})
+            attempts.append(code)
+            if not funded or code != 503 or len(attempts) >= 15:
+                break
+            time.sleep(1)
+        report["claim"] = {"http": code, "reply": claim, "attempts": attempts}
+        log(f"claim: HTTP {code} after {len(attempts)} attempt(s) {attempts} {json.dumps(claim)[:200]}")
         if funded:
             check(code == 200 and claim.get("status") in ("pending", "confirmed"), "claim accepted")
             deadline = time.monotonic() + 180
@@ -624,6 +662,163 @@ class Rehearsal:
             check(code != 200 or claim.get("status") not in ("pending", "confirmed"), "an unfunded faucet pays nothing")
         report["faucet_exit"] = stop(faucet)
 
+    def fund_offline(self, release, out, run_dir, faucet_address, amount):
+        """INSTALL.md step 11 on the web host: the rendered prepare command through
+        its private RPC (no key), hashstash-cold with the payout key as on the
+        offline machine, then the rendered broadcast command."""
+        web_dir = out / f"server-1-{self.ips[0]}"
+        lines = (web_dir / "INSTALL.md").read_text().splitlines()
+        first = next(n for n, line in enumerate(lines) if line.startswith("./release/hashstash prepare "))
+        check(lines[first].endswith(" \\"), "the prepare command continues on the next line")
+        prepare = lines[first][:-1].strip() + " " + lines[first + 1].strip()
+        broadcast = next(line for line in lines if line.startswith("./release/hashstash broadcast "))
+        check(f"--url http://127.0.0.1:{self.ports['rpc']}/rpc" in prepare and f"--sender {self.payout_public}" in prepare
+              and "--expiry-blocks 240" in prepare, f"rendered prepare command: {prepare}")
+        check(not any("transfer --url" in line or "payout.key" in line for line in lines),
+              "INSTALL.md never puts the payout key on a networked machine")
+        # The kit's 12-hash example exceeds a fixture chain's coins; the command is otherwise the rendered one.
+        (web_dir / "faucet-funding.json").write_text(
+            json.dumps({"TransferExact": {"recipient": faucet_address, "amount": str(amount)}}) + "\n")
+        prepared = run(["bash", "-c", prepare], cwd=web_dir)
+        envelope = json.loads((web_dir / "faucet-funding.unsigned.json").read_text())
+        check(envelope.get("format") == "hashstash-unsigned-anchor", "an unsigned export, no signature")
+        # The offline machine: the release's cold signer, network from the kit's genesis.
+        cold = start([Path(release) / "hashstash-cold", "--port", self.ports["cold"], "--config", web_dir / "network.json"],
+                     run_dir / "cold.log")
+        try:
+            deadline = time.monotonic() + 30
+            launch = None
+            while launch is None and time.monotonic() < deadline:
+                check(cold.poll() is None, "hashstash-cold exited: " + (run_dir / "cold.log").read_text()[-2000:])
+                launch = re.search(r"cold signer: (http://127\.0\.0\.1:\d+)/#token=([0-9a-f]{64})",
+                                   (run_dir / "cold.log").read_text())
+                time.sleep(0.2)
+            check(launch is not None, "hashstash-cold printed its launch address")
+            base, token = launch.group(1), launch.group(2)
+
+            def cold_call(action, value):
+                status, reply, _ = http(f"{base}/api/{action}", "POST",
+                                        {"Origin": base, "Content-Type": "application/json",
+                                         "X-Hashstash-Cold-Token": token}, json.dumps(value).encode())
+                check(status == 200, f"cold signer {action}: HTTP {status} {reply}")
+                return reply
+
+            secret = json.loads((self.work / "keys" / "payout.key").read_text())["secret"]
+            opened = cold_call("import", {"private_key": secret})
+            check(opened.get("public_key") == self.payout_public, "the cold signer opened the payout key")
+            review = cold_call("review", envelope)
+            fields = {field["label"]: field["value"] for field in review["fields"]}
+            check(fields.get("Recipient") == faucet_address, f"the review names the faucet as recipient: {fields}")
+            signed = cold_call("sign", {"review_token": review["review_token"]})
+            cold_call("lock", {})
+        finally:
+            cold_exit = stop(cold)
+        (web_dir / "faucet-funding.signed.txt").write_text(signed["raw"] + "\n")
+        result = run(["bash", "-c", broadcast], cwd=web_dir)
+        check(json.loads(result.stdout).get("transaction_id") == signed["txid"], "broadcast reports the signed transaction")
+        log(f"faucet funding prepared on the web host, signed by hashstash-cold, broadcast as {signed['txid'][:16]}")
+        return {"prepare": prepare, "broadcast": broadcast, "review": fields, "txid": signed["txid"],
+                "prepare_review": prepared.stderr.strip()[-800:], "cold_exit": cold_exit}
+
+    def join_args(self, out):
+        """The join command of the kit's README as published, after `hashstash`."""
+        lines = [line for line in (out / "README.md").read_text().splitlines() if line.startswith("hashstash run ")]
+        check(len(lines) == 1, "README.md has one join command")
+        args = lines[0].split()[1:]
+        check(args.count("--seed") == len(self.ips) and "--peer-discovery" in args and "--no-stratum" in args,
+              f"the join command lists every seed: {lines[0]}")
+        announcement = (out / "ANNOUNCEMENT.md").read_text()
+        check(lines[0][len("hashstash "):] in announcement, "ANNOUNCEMENT.md gives the same command")
+        return [self.payout_public if a == "YOUR_PAYOUT_PUBLIC_KEY" else a for a in args]
+
+    def start_joiner(self, index, args, out, binary, run_dir, easy):
+        """An outsider's node running `args` from a directory holding network.json,
+        plus only what one machine cannot share: loopback listeners of its own and
+        private-address discovery (and, on the uncalibrated rehearsal genesis,
+        what the seeds' ALLOW_EASY_TARGET gives them)."""
+        work = run_dir / f"joiner-{index + 1}"
+        work.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(out / "genesis" / "network.json", work / "network.json")
+        port = self.base + 1000 * (len(self.ips) + index)
+        address = self.joiner_binds[index]
+        extra = ["--rpc", f"127.0.0.1:{port}", "--p2p", address, "--allow-private-peer-discovery"]
+        if easy:
+            extra.append("--allow-easy-target")
+        process = start([binary, *args, *extra], work / "node.log", cwd=work)
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            check(process.poll() is None, f"joiner {index + 1} exited: " + (work / "node.log").read_text()[-3000:])
+            try:
+                rpc(port, "status")
+                return {"process": process, "rpc": port, "address": address, "args": args, "added": extra}
+            except (urllib.error.URLError, ConnectionError, TimeoutError, RuntimeError):
+                time.sleep(0.25)
+        raise AssertionError(f"joiner {index + 1} did not answer RPC")
+
+    def join_published(self, out, binary, run_dir, servers, easy):
+        """An outsider runs the README's join command and reaches the seeds' tip."""
+        tip = rpc(servers[0].rpc, "status")
+        args = self.join_args(out)
+        first = self.start_joiner(0, args, out, binary, run_dir, easy)
+        started = time.monotonic()
+        while True:
+            status, peer = rpc(first["rpc"], "status"), rpc(first["rpc"], "peerstatus")
+            if (status["tip"] == tip["tip"] and peer["discovery"].get("verified", 0) >= len(self.ips)
+                    and peer.get("transport") == "authenticated-discovery"):
+                break
+            check(time.monotonic() - started < 180, f"the published command did not join: height {status['height']} "
+                  f"of {tip['height']}, discovery {peer['discovery'].get('verified')}")
+            time.sleep(1)
+        report = {"args": first["args"], "added": first["added"], "height": status["height"], "tip": status["tip"],
+                  "discovery_verified": peer["discovery"]["verified"], "seconds": round(time.monotonic() - started, 1)}
+        log(f"outsider with the published command reached height {status['height']} at the seeds' tip and verified "
+            f"{peer['discovery']['verified']} seeds in {report['seconds']} s")
+        return first, args, tip, report
+
+    def outsiders(self, out, binary, run_dir, servers, easy):
+        """Users join with the published command; a public node advertises itself
+        to one seed, which passes it on through gossip."""
+        report = {}
+        first, args, tip, report["published_command"] = self.join_published(out, binary, run_dir, servers, easy)
+        # A public node that knows one seed and advertises itself.
+        one_seed, skip = [], False
+        for a in args:
+            if skip:
+                skip = False
+            elif a == "--seed":
+                skip = True
+            else:
+                one_seed.append(a)
+        seed = f"{self.ips[0]}:{self.ports['p2p']}"
+        address = self.joiner_binds[1]
+        second = self.start_joiner(1, one_seed + ["--seed", seed, "--advertise-peer", address], out, binary, run_dir,
+                                   easy)
+        started = time.monotonic()
+        seen = {}
+        while not {"seed_knows", "seed_verified", "gossiped"} <= seen.keys():
+            elapsed = round(time.monotonic() - started, 1)
+            book = {e["address"]: e for e in rpc(servers[0].rpc, "peerstatus")["discovery"].get("peers", [])}
+            if address in book:
+                seen.setdefault("seed_knows", elapsed)
+                if book[address].get("last_success", 0) > 0:
+                    seen.setdefault("seed_verified", elapsed)
+            learned = {e["address"]: e for e in rpc(first["rpc"], "peerstatus")["discovery"].get("peers", [])}
+            if address in learned:
+                seen.setdefault("gossiped", elapsed)
+                report["gossiped_entry"] = learned[address]
+            check(elapsed < 420, f"no gossip of the advertised node within 420 s: {seen}")
+            time.sleep(2)
+        status = rpc(second["rpc"], "status")
+        check(status["tip"] == tip["tip"], "the one-seed node synchronized")
+        second_book = sorted(e["address"] for e in rpc(second["rpc"], "peerstatus")["discovery"].get("peers", []))
+        report["advertised_node"] = {"args": second["args"], "added": second["added"], "seconds": seen,
+                                     "its_book": second_book}
+        log(f"advertised node: seed 1 knew it after {seen['seed_knows']} s, verified it after {seen['seed_verified']} s, "
+            f"the first outsider learned it by gossip after {seen['gossiped']} s; its own book: {second_book}")
+        report["exit_codes"] = [stop(second["process"]), stop(first["process"])]
+        check(report["exit_codes"] == [0, 0], f"outsiders stopped cleanly: {report['exit_codes']}")
+        return report
+
     def phase_mined(self, phase, release, kit_name, run_name, funded):
         log(f"Phase {phase}: uncalibrated rehearsal genesis through the same kit, backbone pinned"
             + (" (test-fixtures build, funded faucet)" if funded else ""))
@@ -636,32 +831,37 @@ class Rehearsal:
         # A funded faucet needs coins: a fixture block issues about two atoms.
         blocks = max(self.options.blocks, 24) if funded else self.options.blocks
         try:
-            miner = Miner(self.ips[0], self.ports["stratum"], self.passwords[0].read_text().strip(), 0.5,
+            # Stratum runs on servers 2 and 3; server 1 is the web host.
+            miner = Miner(self.ips[1], self.ports["stratum"], self.passwords[1].read_text().strip(), 0.5,
                           limit=blocks)
             miner.start()
             miner.join(timeout=300)
             check(miner.error is None, f"miner error: {miner.error}")
             check(miner.accepted >= blocks, f"mined {miner.accepted} blocks")
-            # Server 2 mines on the tip it received from server 1.
-            report["converged_after_server_1"] = wait_converged(servers, f"Phase {phase} server 1 blocks", blocks)
-            second = Miner(self.ips[1], self.ports["stratum"], self.passwords[1].read_text().strip(), 0.5, limit=2)
+            # Server 3 mines on the tip it received from server 2.
+            report["converged_after_server_2"] = wait_converged(servers, f"Phase {phase} server 2 blocks", blocks)
+            second = Miner(self.ips[2], self.ports["stratum"], self.passwords[2].read_text().strip(), 0.5, limit=2)
             second.start()
             second.join(timeout=120)
-            check(second.error is None and second.accepted == 2, f"second server mined: {second.error}")
-            report["mined"] = {"server_1": miner.accepted, "server_2": second.accepted,
+            check(second.error is None and second.accepted == 2, f"third server mined: {second.error}")
+            report["mined"] = {"server_2": miner.accepted, "server_3": second.accepted,
                                "rejected": miner.rejected + second.rejected}
             report["converged_after_mining"] = wait_converged(servers, f"Phase {phase} mined", blocks + 2)
             check(report["converged_after_mining"]["state_roots_equal"], "state roots agree")
-            mining = rpc(servers[0].rpc, "mining")
-            report["mining_rpc_server_1"] = {k: mining.get(k) for k in
+            mining = rpc(servers[1].rpc, "mining")
+            report["mining_rpc_server_2"] = {k: mining.get(k) for k in
                                              ("workers_connected", "accepted_shares", "rejected_shares", "blocks_found")}
             report["payout_balance_atoms"] = balance(servers[0].rpc, self.payout_public)
             status = rpc(servers[0].rpc, "status")
             report["issued_atoms"] = status.get("issued")
             log(f"Phase {phase}: mined {miner.accepted}+{second.accepted} blocks, all nodes agree at height "
                 f"{report['converged_after_mining']['height']}; issued {status.get('issued')} atoms")
-            # Keep blocks coming so the faucet sees an active chain.
-            miner = Miner(self.ips[0], self.ports["stratum"], self.passwords[0].read_text().strip(), 2.0)
+            if not funded:
+                report["outsiders"] = self.outsiders(out, Path(release) / "hashstash", self.work / run_name, servers,
+                                                     values["EASY_TARGET"] == "true")
+            # Keep blocks coming so the faucet sees an active chain, a few
+            # seconds apart as the faucet refreshes its snapshot every 3 s.
+            miner = Miner(self.ips[1], self.ports["stratum"], self.passwords[1].read_text().strip(), 5.0)
             miner.start()
             self.faucet_checks(report, release, out, self.work / run_name, servers, funded)
         finally:
@@ -680,6 +880,8 @@ def main():
     parser.add_argument("--fixture-release-dir", help="a test-fixtures build for the funded faucet phase")
     parser.add_argument("--work", help="new work directory (default: a temporary one)")
     parser.add_argument("--ips", default="127.0.0.21,127.0.0.22,127.0.0.23")
+    parser.add_argument("--joiner-ip", default="127.0.0.24",
+                        help="loopback address of the outsider that runs the published command")
     parser.add_argument("--base-port", type=int, default=61480)
     parser.add_argument("--blocks", type=int, default=6)
     options = parser.parse_args()

@@ -18,8 +18,10 @@
 #                           wallet website and the faucet behind nginx and TLS.
 #   --domain NAME           DNS name of the web host (recommended: browsers apply
 #                           HSTS only to names). Without it the site uses the IP.
-#   --stratum-hosts LIST    Servers that run Stratum for miners: IPs, "all"
-#                           (default) or "none".
+#   --stratum-hosts LIST    Servers that run Stratum for miners: IPs, "all" or
+#                           "none". Default: every seed except the web host,
+#                           which holds the faucet key and serves the wallet
+#                           (docs/LAUNCH.md section 7); "all" includes it.
 #   --miner-prefixes LIST   Your miners' addresses or prefixes (IPv4 /16 or
 #                           longer, IPv6 /32 or longer outside local networks).
 #                           They become STRATUM_TRUSTED, and only they may reach
@@ -34,6 +36,8 @@
 #   --hashrate RATE         Expected aggregate SHA256d hashrate for
 #                           init --preset slow --hashrate (for example 1.67P).
 #   --genesis-time UNIX     Genesis time for init (default: the clock at init).
+#                           At most 120 seconds ahead, as init warns about any
+#                           later time (48 hours with --rehearsal).
 #   --binary PATH           The release's hashstash binary, normally
 #                           target/dist/hashstash-VERSION-linux-ARCH/hashstash
 #                           beside its SHA256SUMS. With --hashrate the genesis is
@@ -54,7 +58,8 @@
 #   --p2p-port, --stratum-port, --rpc-port, --web-port, --faucet-port PORT
 #                           Defaults 18481, 18482, 18480, 18483, 18484. Server N
 #                           uses RPC port --rpc-port + 1000*(N-1), so SSH tunnels
-#                           to several dashboards do not collide.
+#                           to several dashboards do not collide. Ports 80 and
+#                           443 belong to nginx.
 # Output
 #   --out DIR               New directory for the kit; it must not exist.
 #   --rehearsal             Local rehearsal only: also accept private and loopback
@@ -81,7 +86,7 @@ for command in sha256sum awk sed realpath mktemp grep cp; do
 done
 
 seeds_arg= web_host= domain= hashrate= genesis_time= binary= genesis_in= out=
-miner_prefixes_arg= admin_prefixes_arg= payout_keys_arg= peer_pins_arg= stratum_hosts_arg=all
+miner_prefixes_arg= admin_prefixes_arg= payout_keys_arg= peer_pins_arg= stratum_hosts_arg=
 stratum_public=false rehearsal=false
 share_difficulty=65536 faucet_payout=10 ssh_port=22
 p2p_port=18481 stratum_port=18482 rpc_port=18480 web_port=18483 faucet_port=18484
@@ -272,6 +277,9 @@ claim_port() {
     [[ ! ${port_owner[$1]+x} ]] || fail "port $1 is used for both ${port_owner[$1]} and $2"
     port_owner[$1]=$2
 }
+# nginx binds 80 and 443 on every address of the web host, which every
+# server's P2P, Stratum and SSH ports share and any server's RPC may be.
+claim_port 80 'the website (nginx)'; claim_port 443 'the website (nginx)'
 claim_port "$p2p_port" P2P; claim_port "$stratum_port" Stratum; claim_port "$web_port" 'public web'
 claim_port "$faucet_port" faucet; claim_port "$ssh_port" SSH
 rpc_ports=()
@@ -284,6 +292,7 @@ done
 
 declare -A stratum_on=()
 case "$stratum_hosts_arg" in
+    '') for ip in "${seeds[@]}"; do [[ "$ip" == "$web_host" ]] || stratum_on[$ip]=1; done ;;
     all) for ip in "${seeds[@]}"; do stratum_on[$ip]=1; done ;;
     none) ;;
     *)
@@ -362,7 +371,10 @@ fi
 [[ "$share_difficulty" =~ ^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$ ]] \
     && awk -v v="$share_difficulty" 'BEGIN { exit !(v >= 1e-12 && v <= 1e18) }' \
     || fail '--share-difficulty must be a number from 1e-12 to 1e18'
-[[ "$faucet_payout" =~ ^[1-9][0-9]{0,17}$ ]] || fail '--faucet-payout must be a positive whole number of atoms'
+[[ "$faucet_payout" =~ ^[1-9][0-9]{0,8}$ ]] || fail '--faucet-payout must be a positive whole number of atoms, at most 999999999'
+# The faucet's lifetime allowance with its fees: a payment to a new account
+# pays ceil((bytes + 1024) / 1024) = 2 atoms at the launch fee rate.
+faucet_funding=$(( 1000 * (faucet_payout + 2) ))
 
 if [[ -n "$genesis_in" ]]; then
     [[ -z "$hashrate" && -z "$genesis_time" ]] || fail '--genesis uses an existing genesis; do not combine it with --hashrate or --genesis-time'
@@ -380,6 +392,10 @@ else
         [[ "$genesis_time" =~ ^[1-9][0-9]{0,9}$ ]] && (( genesis_time <= 4294967295 )) || fail '--genesis-time must be Unix seconds'
         now=$(date +%s)
         (( genesis_time <= now + 172800 )) || fail '--genesis-time is more than 48 hours ahead; nodes defer block 1 until then'
+        # init warns about a genesis more than future_seconds (120) ahead, and a
+        # launch genesis must have no warning (docs/LAUNCH.md section 3).
+        (( genesis_time <= now + 120 )) || [[ "$rehearsal" == true ]] \
+            || fail "--genesis-time is $(( genesis_time - now )) seconds ahead; init warns about any genesis more than 120 seconds ahead and a launch genesis must have no warning: omit --genesis-time (the genesis time is then the clock at init) or give one at most 120 seconds ahead"
         (( genesis_time <= now )) || warn "--genesis-time is $(( genesis_time - now )) seconds in the future: no block can be mined before it"
         (( genesis_time >= now - 30 * 86400 )) || warn '--genesis-time is more than 30 days in the past'
     fi
@@ -500,7 +516,14 @@ if command -v git >/dev/null && git -C "$root" rev-parse --verify -q HEAD > /dev
     commit=$(git -C "$root" rev-parse HEAD)
     [[ -z $(git -C "$root" status --porcelain --untracked-files=no 2>/dev/null) ]] || commit="$commit (with uncommitted changes)"
 fi
-generated=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+generated_at=$(date +%s)
+generated=$(date -u -d "@$generated_at" +%Y-%m-%dT%H:%M:%SZ)
+# Every kit is copied to its own new directory on the servers, named after
+# its chain and creation time: a kit copied over an earlier one (a rehearsal,
+# a preview or an abandoned genesis) would land inside it instead.
+kit_tag=preview
+[[ -z "$chain_id" ]] || kit_tag=${chain_id:0:12}
+remote_dir=/root/hashstash-kit-$kit_tag-$(date -u -d "@$generated_at" +%Y%m%dT%H%M%SZ)
 banner=
 [[ "$rehearsal" == false ]] || banner='REHEARSAL ONLY - NOT FOR THE LAUNCH NETWORK. '
 
@@ -528,6 +551,10 @@ vars[WEB_PORT]=$web_port
 vars[FAUCET_PORT]=$faucet_port
 vars[COMMIT]=$commit
 vars[GENERATED]=$generated
+vars[REMOTE_DIR]=$remote_dir
+vars[FUNDING]=$faucet_funding
+vars[FUNDING_HASH]=$(( faucet_payout + 2 ))
+vars[FAUCET_PAYOUT]=$faucet_payout
 
 # ------------------------------------------------------------ static files
 archive_script() {
@@ -674,7 +701,6 @@ EOF
 faucet_config() {
     vars[ORIGIN]="https://$public_host"
     vars[FAUCET_RPC]=$1
-    vars[FAUCET_PAYOUT]=$faucet_payout
     render <<'EOF'
 {
   "bind": "127.0.0.1:@FAUCET_PORT@",
@@ -851,13 +877,20 @@ for i in "${!seeds[@]}"; do
     fi
     (( ${#miner_prefixes[@]} == 0 )) || vars[STRATUM_REACH]+=" They are in \`STRATUM_TRUSTED\` and keep reserved slots."
     vars[KIT_OUT]=$(basename -- "$out")
+    if (( ${#payout_keys[@]} == 1 )); then
+        vars[FUND_SENDER]=${payout_keys[0]}
+        vars[FUND_SENDER_NOTE]="the payout key every server mines to (\`${payout_keys[0]}\`)"
+    else
+        vars[FUND_SENDER]=PAYOUT_PUBLIC_KEY
+        vars[FUND_SENDER_NOTE]='the payout key of a Stratum server that has found blocks: replace `PAYOUT_PUBLIC_KEY` below with its public key'
+    fi
     {
         render <<'EOF'
 # Server @N@: `@IP@` (@ROLES@)
 
 @BANNER@Hashstash @VERSION@ install steps for this server, generated by `scripts/launch-kit.sh` on @GENERATED@ from source commit @COMMIT@. Follow `docs/LAUNCH-DAY.md` in the source checkout for the order across servers; this file is the order on this server.
 
-Run the commands as root (or with `sudo`) on this server, from this directory, in order. Each step ends with a check: stop at the first failure.
+Run the commands as root (or with `sudo`) on this server, from `@REMOTE_DIR@` (step 0), in order. Each step ends with a check: stop at the first failure.
 
 | Value | |
 | --- | --- |
@@ -867,18 +900,22 @@ Run the commands as root (or with `sudo`) on this server, from this directory, i
 | Chain ID | `@CHAIN_ID@` |
 | P2P (public) | `@IP@:@P2P_PORT@` |
 | Private RPC (loopback only) | `127.0.0.1:@RPC@` |
+| Kit directory on this server | `@REMOTE_DIR@` |
 
 Before step 3, compare the two SHA256 values and the chain ID with the values published through your second channel (docs/LAUNCH.md section 4).
 
 ## 0 Copy this directory to the server
 
-On the preparation machine:
+On the preparation machine, from the directory that holds `@KIT_OUT@/`. Each kit goes to a new directory of its own, named after its chain ID and creation time, so that it never lands inside an earlier kit (a rehearsal, a preview or an abandoned genesis) on the server:
 
 ```sh
-scp -r @KIT_OUT@/@DIR@ root@@IP@:/root/hashstash-kit
+ssh root@@IP@ "test ! -e @REMOTE_DIR@ || { echo '@REMOTE_DIR@ exists: this kit was copied before' >&2; exit 1; }" \
+  && scp -r @KIT_OUT@/@DIR@ root@@IP@:@REMOTE_DIR@
 ssh root@@IP@
-cd /root/hashstash-kit
+cd @REMOTE_DIR@
 ```
+
+Check: `scp` copied the files and `pwd` prints `@REMOTE_DIR@`. Run every later step from this directory, never from another kit's directory on the server.
 
 ## 1 Host preparation
 
@@ -896,7 +933,7 @@ Check: the clock is synchronized (a block more than 120 seconds ahead of a node'
 sudo bash archive-old-node.sh
 ```
 
-It stops and disables every `hashstash*` service, refuses to continue while a Hashstash process started by hand still runs (rerun with `--stop-processes` to stop those with SIGINT), and moves `/var/lib/hashstash`, `/etc/hashstash`, the faucet's files and the old service files into `/root/hashstash-archive-STAMP`. Nothing is deleted. Old 0.42.0 data must never be reused: 0.43.0 refuses a 0.42.0 database by name.
+It stops and disables every `hashstash*` service, refuses to continue while a Hashstash process started by hand still runs (rerun with `--stop-processes` to stop those with SIGINT), and moves `/var/lib/hashstash`, `/etc/hashstash`, the faucet's files and the old service files into `/root/hashstash-archive-STAMP`. Nothing is deleted. Old 0.42.0 data must never be reused: 0.43.0 refuses a 0.42.0 database by name. It leaves `/root/hashstash-keys`, nginx, `/etc/letsencrypt` and the firewall alone.
 
 Check: it ends with `No Hashstash service or process is running.`
 
@@ -910,7 +947,7 @@ echo "@GENESIS_SHA256@  network.json" | sha256sum -c -
 ./release/hashstash network --config network.json
 ```
 
-Check: every line says `OK`, the version is `hashstash @VERSION@` and `chain_id` is `@CHAIN_ID@`.
+Check: every line says `OK`, the version is `hashstash @VERSION@`, and `chain_id` is `@CHAIN_ID@` and equals the chain ID published through your second channel. Any other chain ID means an old or wrong kit: stop, and copy the right one (step 0).
 
 EOF
         if [[ -z "$binary" ]]; then
@@ -919,50 +956,9 @@ EOF
 
 EOF
         fi
-        render <<'EOF'
-## 4 Keys, generated on this server
-
-These never leave the server except in the encrypted backups of docs/LAUNCH.md section 13.
-
-```sh
-install -d -m 700 /root/hashstash-keys
-EOF
-        if [[ -n "${pin_of[$ip]:-}" ]]; then
-            render <<'EOF'
-# The peer identity was generated here before the kit (its public key is pinned by the other seeds).
-./release/hashstash peer-keycheck --key-file /root/hashstash-keys/peer-identity.json --peer-discovery --miner @PAYOUT@
-EOF
-        else
-            render <<'EOF'
-./release/hashstash peer-keygen --out /root/hashstash-keys/peer-identity.json
-EOF
-        fi
-        if [[ "$is_stratum" == true ]]; then
-            render <<'EOF'
-(umask 077; openssl rand -hex 32 > /root/hashstash-keys/stratum-password)
-EOF
-        fi
-        printf '```\n\n'
-        if [[ -n "${pin_of[$ip]:-}" ]]; then
-            render <<'EOF'
-Check: `peer-keycheck` prints exactly `@PIN@`, the key the other seeds pin. Any other key means the wrong file: the other seeds would refuse this node.
-
-EOF
-        else
-            render <<'EOF'
-Check: `peer-keygen` printed this node's peer public key; record it with the server. (To pin the backbone, run this step on every server before generating the kit and pass the keys with `--peer-pins`.)
-
-EOF
-        fi
-        if [[ "$is_stratum" == true ]]; then
-            render <<'EOF'
-The Stratum password is in `/root/hashstash-keys/stratum-password` (`cat` it once and give it to your miners over a private channel). Stratum V1 is plain TCP: never reuse this value elsewhere.
-
-EOF
-        fi
         if [[ "$payout" == REPLACE_* ]]; then
             render <<'EOF'
-## 5 Payout key
+## 4 Payout key
 
 No payout key was given to the kit. Put this node's payout PUBLIC key (from `hashstash keygen` on your offline machine; never the private key) into `node.env`:
 
@@ -976,7 +972,7 @@ Check: `address` prints the payout address you expect.
 EOF
         else
             render <<'EOF'
-## 5 Payout key
+## 4 Payout key
 
 `node.env` pays every block found through this node to the public key `@PAYOUT@`. Its private key stays offline.
 
@@ -985,6 +981,48 @@ EOF
 ```
 
 Check: the printed address is the payout address you expect.
+
+EOF
+        fi
+        render <<'EOF'
+## 5 Keys, generated on this server
+
+These never leave the server except in the encrypted backups of docs/LAUNCH.md section 13. `/root/hashstash-keys` (root only) keeps them for a reinstall: `archive-old-node.sh` never touches it, so a rehearsal's or an abandoned genesis's identity and password are reused here.
+
+```sh
+install -d -m 700 /root/hashstash-keys
+EOF
+        if [[ -n "${pin_of[$ip]:-}" ]]; then
+            render <<'EOF'
+# The peer identity was generated here before the kit (its public key is pinned by the other seeds).
+./release/hashstash peer-keycheck --key-file /root/hashstash-keys/peer-identity.json --peer-discovery --miner "$(sed -n 's/^MINER_PUBLIC_KEY=//p' node.env)"
+EOF
+        else
+            render <<'EOF'
+test -e /root/hashstash-keys/peer-identity.json || ./release/hashstash peer-keygen --out /root/hashstash-keys/peer-identity.json
+./release/hashstash peer-keycheck --key-file /root/hashstash-keys/peer-identity.json --peer-discovery --miner "$(sed -n 's/^MINER_PUBLIC_KEY=//p' node.env)"
+EOF
+        fi
+        if [[ "$is_stratum" == true ]]; then
+            render <<'EOF'
+test -e /root/hashstash-keys/stratum-password || (umask 077; openssl rand -hex 32 > /root/hashstash-keys/stratum-password)
+EOF
+        fi
+        printf '```\n\n'
+        if [[ -n "${pin_of[$ip]:-}" ]]; then
+            render <<'EOF'
+Check: `peer-keycheck` prints exactly `@PIN@`, the key the other seeds pin. Any other key, or a missing file, means the wrong identity: the other seeds would refuse this node. If `/root/hashstash-keys/peer-identity.json` was removed after an earlier installation, `archive-old-node.sh` kept the installed copy; restore it with `install -m 600 /root/hashstash-archive-STAMP/etc/hashstash/peer-identity.json /root/hashstash-keys/` and run the check again.
+
+EOF
+        else
+            render <<'EOF'
+Check: `peer-keycheck` prints this node's peer public key; record it with the server. (To pin the backbone, generate the identity on every server before generating the kit and pass the keys with `--peer-pins`.)
+
+EOF
+        fi
+        if [[ "$is_stratum" == true ]]; then
+            render <<'EOF'
+Step 6 installs the Stratum password as `/etc/hashstash/stratum-password`; step 10 gives it to your miners. Stratum V1 is plain TCP: never reuse this value elsewhere.
 
 EOF
         fi
@@ -998,11 +1036,7 @@ EOF
         printf 'sudo bash deploy/install.sh %b\n' "$install_args"
         printf '```\n\n'
         render <<'EOF'
-Check: `--check` prints `Configuration and payout public key are valid` and the chain ID, and the install prints `Installed.` The node is installed but not started. The installed copies of the peer identity and Stratum password are in `/etc/hashstash`; remove the staging copies once your encrypted backup holds them:
-
-```sh
-shred -u /root/hashstash-keys/*
-```
+Check: `--check` prints `Configuration and payout public key are valid` and the chain ID, and the install prints `Installed.` The node is installed but not started. The installed copies of the staged keys are in `/etc/hashstash`. Keep the staging copies in `/root/hashstash-keys` until the network is announced: a reinstall before then (docs/LAUNCH-DAY.md, rollback) reuses them. After the announcement, once your encrypted backup holds `/etc/hashstash` (docs/LAUNCH.md section 13), remove them (the last section of this file).
 
 ## 7 Firewall
 
@@ -1016,34 +1050,43 @@ Check: `ufw status` shows @P2P_PORT@/tcp open to everyone, SSH open as you inten
 EOF
         if [[ "$is_web" == true ]]; then
             if [[ -n "$domain" ]]; then
-                certbot_lines="certbot certonly --webroot --webroot-path /var/www/hashstash-acme -d $domain --cert-name $domain"
-                cert_note="Point the DNS name \`$domain\` (A record) at \`$ip\` first."
+                vars[CERT_NOTE]="Point the DNS name \`$domain\` (A record) at \`$ip\` first."
+                vars[CERT_INSTALL]='apt-get install -y nginx certbot'
+                vars[CERTBOT]=certbot
+                vars[CERT_REQUEST]="--webroot --webroot-path /var/www/hashstash-acme -d $domain --cert-name $domain"
+                vars[CERT_CHECK]=''
             else
-                certbot_lines="certbot certonly --preferred-profile shortlived --webroot --webroot-path /var/www/hashstash-acme --ip-address $ip --cert-name $ip"
-                cert_note="Without a DNS name the certificate is a short-lived IP-address certificate, which needs certbot 5.4 or later (\`snap install --classic certbot\`), and browsers never apply HSTS to an IP address. Prefer a DNS name (\`--domain\`)."
+                vars[CERT_NOTE]="Without a DNS name the certificate is a short-lived (six-day) IP-address certificate. That needs certbot 5.4 or later, which only the certbot snap provides (Ubuntu 24.04 ships 2.9), so these commands replace the distribution's certbot with the snap: one certbot and one renewal timer remain, and the snap renews the certificate automatically (on Debian, \`apt-get install -y snapd\` first). Browsers never apply HSTS to an IP address. Prefer a DNS name (\`--domain\`)."
+                vars[CERT_INSTALL]="apt-get install -y nginx
+apt-get remove -y certbot           # the distribution's certbot predates IP-address certificates
+snap install --classic certbot
+ln -sf /snap/bin/certbot /usr/bin/certbot
+/snap/bin/certbot --version         # must print certbot 5.4.0 or later"
+                vars[CERTBOT]=/snap/bin/certbot
+                vars[CERT_REQUEST]="--preferred-profile shortlived --webroot --webroot-path /var/www/hashstash-acme --ip-address $ip --cert-name $ip"
+                vars[CERT_CHECK]=' `certbot --version` printed 5.4.0 or later (stop otherwise: an older certbot refuses the IP-address options),'
             fi
-            vars[CERTBOT]=$certbot_lines vars[CERT_NOTE]=$cert_note
             render <<'EOF'
-## 8 nginx and TLS (the day before launch is fine)
+## 8 nginx and TLS (before launch day is fine)
 
-@CERT_NOTE@ nginx 1.15.7 or later is required.
+@CERT_NOTE@ nginx 1.15.7 or later is required. Run step 7 first: it opens port 80 for the certificate's HTTP challenge. If the on-host rehearsal (docs/LAUNCH-DAY.md) already ran this step for this host, skip it: the certificate, its renewal hook and nginx stay in place.
 
 ```sh
-apt-get install -y nginx certbot
+@CERT_INSTALL@
 nginx -v
 install -d -m 755 /var/www/hashstash-acme
 install -m 644 nginx/acme-bootstrap.conf /etc/nginx/sites-available/hashstash
 ln -sf /etc/nginx/sites-available/hashstash /etc/nginx/sites-enabled/hashstash
 rm -f /etc/nginx/sites-enabled/default
 nginx -t && systemctl reload nginx
-@CERTBOT@
+@CERTBOT@ certonly @CERT_REQUEST@
 install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
 printf '#!/bin/sh\nnginx -t && systemctl reload nginx\n' > /etc/letsencrypt/renewal-hooks/deploy/hashstash-nginx.sh
 chmod 755 /etc/letsencrypt/renewal-hooks/deploy/hashstash-nginx.sh
-certbot renew --dry-run
+@CERTBOT@ renew --dry-run
 ```
 
-Check: certbot saved a certificate under `/etc/letsencrypt/live/@PUBLIC_HOST@/` and the dry run succeeded. The full site is enabled in step 12, after the node runs.
+Check:@CERT_CHECK@ certbot saved a certificate under `/etc/letsencrypt/live/@PUBLIC_HOST@/` and the dry run succeeded. The full site is enabled in step 12, after the node runs.
 
 EOF
         fi
@@ -1065,7 +1108,13 @@ EOF
             render <<'EOF'
 ## 10 Miners
 
-Point your ASICs at `stratum+tcp://@IP@:@STRATUM_PORT@` with any worker name (for example `rig01`) and the password from `/root/hashstash-keys/stratum-password` (installed as `/etc/hashstash/stratum-password`). @STRATUM_REACH@ Every block found here pays this node's `MINER_PUBLIC_KEY`, whatever the worker name.
+Point your ASICs at `stratum+tcp://@IP@:@STRATUM_PORT@` with any worker name (for example `rig01`) and the password installed in step 6; read it once and give it to your miners over a private channel:
+
+```sh
+sudo cat /etc/hashstash/stratum-password
+```
+
+@STRATUM_REACH@ Every block found here pays this node's `MINER_PUBLIC_KEY`, whatever the worker name.
 
 ```sh
 sudo -u hashstash /usr/local/libexec/hashstash/run-node.sh snapshot | grep -E '"(workers_connected|accepted_shares|rejected_shares|blocks_found|hashrate_hps)"'
@@ -1098,14 +1147,29 @@ sudo systemctl daemon-reload
 
 Check: `keygen` printed the faucet's public key and `address` its funding address. The key never leaves this server.
 
-Fund it with a limited amount from mined coins. On the machine that holds a payout key (never this server), tunnel to this node's private RPC and transfer, for example 10 hashes (10,000 atoms):
+### Fund it, signed offline
+
+The payout key never comes online (docs/LAUNCH.md section 5). This server prepares an unsigned transfer through its own private RPC, which needs no key; your offline machine signs it with the release's `hashstash-cold`; this server broadcasts the signed result. @FUNDING@ atoms (@FUNDING_HASH@ hashes) cover the faucet's lifetime allowance of 1,000 claims of @FAUCET_PAYOUT@ atoms with their fees (at most 2 atoms each). The sender is @FUND_SENDER_NOTE@. On this server:
 
 ```sh
-ssh -N -L 127.0.0.1:@RPC@:127.0.0.1:@RPC@ root@@IP@ &
-hashstash transfer --url http://127.0.0.1:@RPC@/rpc --config network.json --key PATH/TO/payout.key --recipient FAUCET_ADDRESS --amount 10000
+./release/hashstash rpc --url http://127.0.0.1:@RPC@/rpc account --params '{"key":"@FUND_SENDER@"}' | grep payment_available_hash
+faucet_address=$(sudo "$(cat /etc/hashstash/binary.path)" address --key /etc/hashstash-faucet/faucet.key --config /etc/hashstash/network.json)
+printf '{"TransferExact":{"recipient":"%s","amount":"@FUNDING@"}}\n' "$faucet_address" > faucet-funding.json
+./release/hashstash prepare --url http://127.0.0.1:@RPC@/rpc --config network.json --sender @FUND_SENDER@ \
+  --operation-file faucet-funding.json --expiry-blocks 240 --out faucet-funding.unsigned.json
 ```
 
-Then start it and check it from this server, as nginx will call it:
+Check: the sender's `payment_available_hash` exceeds @FUNDING@ atoms plus a few for the fee, and `prepare` printed its review (the faucet address as recipient, @FUNDING@ atoms, the fee and a 240-block lifetime, one hour at 15-second blocks: two blocks would be 30 seconds, too short for the round trip) and saved `faucet-funding.unsigned.json`, which holds no secret.
+
+Move `faucet-funding.unsigned.json` to the offline machine, for example with `scp root@@IP@:@REMOTE_DIR@/faucet-funding.unsigned.json .` on your workstation and then removable media. There, start `hashstash-cold --config network.json` from the release (checked against `SHA256SUMS`) and open the address it prints; open the payout key (**Private key**, the file `hashstash keygen` wrote); import the unsigned file and choose **Review**. Compare the recipient with the faucet address, the amount (@FUNDING_HASH@ hashes) and the fee, choose **Sign transaction**, save the signed result as `faucet-funding.signed.txt` and **Lock** the signer. Bring that file back into this directory and, within the hour, broadcast it:
+
+```sh
+./release/hashstash broadcast --url http://127.0.0.1:@RPC@/rpc --raw-file faucet-funding.signed.txt
+```
+
+Check: `broadcast` prints the `transaction_id`. If the lifetime has passed, prepare and sign again; never broadcast an old signed file instead.
+
+Then start the faucet and check it from this server, as nginx will call it:
 
 ```sh
 sudo systemctl enable --now hashstash-faucet
@@ -1123,7 +1187,7 @@ sudo install -m 644 nginx/hashstash-public.conf /etc/nginx/sites-available/hashs
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-Check from another network:
+Check: `nginx -t` succeeds (it fails if step 8 has not obtained the certificate). From another network:
 
 ```sh
 curl -sI https://@PUBLIC_HOST@/ | head -1                                    # HTTP/2 200 (or HTTP/1.1 200)
@@ -1140,7 +1204,9 @@ EOF
         render <<'EOF'
 ## Monitoring and rollback
 
-Poll `run-node.sh snapshot` and `peerstatus` every 10 seconds and alert as in docs/LAUNCH.md section 12. For a dashboard, tunnel the private RPC from your machine with `ssh -N -L 127.0.0.1:@RPC@:127.0.0.1:@RPC@ root@@IP@` and open `http://127.0.0.1:@RPC@`. Rollback and abort criteria are in docs/LAUNCH-DAY.md.
+Poll `run-node.sh snapshot` and `peerstatus` every 10 seconds and alert as in docs/LAUNCH.md section 12. For a dashboard, tunnel the private RPC from your machine with `ssh -N -L 127.0.0.1:@RPC@:127.0.0.1:@RPC@ root@@IP@` and open `http://127.0.0.1:@RPC@`. Rollback and abort criteria are in docs/LAUNCH-DAY.md; a rollback before the announcement copies the new kit to its own directory (step 0) and reinstalls from step 3 here.
+
+After the announcement, back up `/etc/hashstash` encrypted (docs/LAUNCH.md section 13), then remove the staging copies of step 5: `shred -u /root/hashstash-keys/*`.
 EOF
     } > "$dir/INSTALL.md"
 done
@@ -1200,13 +1266,15 @@ EOF
     printf '%s\n' "${summary_rows[@]}"
     render <<'EOF'
 
-Copy each `server-N-IP/` directory to its server (`INSTALL.md` step 0). Nothing in this kit is secret: peer identities, Stratum passwords and the faucet key are generated on the servers; payout keys appear only as public keys.
+Copy each `server-N-IP/` directory to its server, into `@REMOTE_DIR@` (`INSTALL.md` step 0). Nothing in this kit is secret: peer identities, Stratum passwords and the faucet key are generated on the servers; payout keys appear only as public keys.
 
 Users join with:
 
 ```sh
 hashstash run --config network.json --data chain.sqlite --miner YOUR_PAYOUT_PUBLIC_KEY --peer-discovery@SEED_FLAGS@ --no-stratum
 ```
+
+Give users every seed, as this command does. Each seed lists the others as configured peers, and a node never passes configured peers on, so a node that knows one seed learns from it only the nodes that advertise themselves (`--advertise-peer`), not the other seeds.
 
 `ANNOUNCEMENT.md` is a draft of the launch announcement with these values and the limitations users must be told.
 EOF
@@ -1253,6 +1321,7 @@ grep -q '^## Limitations users must be told' "$out/ANNOUNCEMENT.md" || fail 'doc
     printf 'GENESIS_SHA256=%s\nCHAIN_ID=%s\nGENESIS_TIME=%s\nNETWORK=%s\nHASHRATE=%s\n' \
         "${vars[GENESIS_SHA256]}" "${vars[CHAIN_ID]}" "${vars[GENESIS_TIME]}" "${vars[NETWORK_NAME]}" "${vars[HASHRATE]}"
     printf 'SEEDS=%s\nWEB_HOST=%s\nWEBSITE=https://%s/\n' "${seeds[*]}" "$web_host" "$public_host"
+    printf 'STRATUM_HOSTS=%s\nKIT_REMOTE_DIR=%s\nFAUCET_FUNDING_ATOMS=%s\n' "$(for ip in "${seeds[@]}"; do [[ ! ${stratum_on[$ip]+x} ]] || printf '%s ' "$ip"; done | sed 's/ $//')" "$remote_dir" "$faucet_funding"
     printf 'P2P_PORT=%s\nSTRATUM_PORT=%s\n' "$p2p_port" "$stratum_port"
     printf 'REHEARSAL=%s\nEASY_TARGET=%s\nFIXTURE_BUILD=%s\n' "$rehearsal" "$easy" "$fixture"
 } > "$out/launch-values.env"
@@ -1261,6 +1330,7 @@ find "$out" -name '*.sh' -exec chmod 755 {} +
 created=false
 printf 'Launch kit written to %s\n' "$out"
 for dir_name in "${server_dirs[@]}"; do printf '  %s/\n' "$dir_name"; done
+printf 'On each server it goes into %s (INSTALL.md step 0).\n' "$remote_dir"
 if [[ -n "$chain_id" ]]; then
     printf 'Chain ID: %s\nnetwork.json SHA256: %s\n' "$chain_id" "$genesis_sha"
 else

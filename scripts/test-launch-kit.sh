@@ -7,6 +7,7 @@
 #   bash scripts/test-launch-kit.sh [/path/hashstash /path/hashstash-faucet]
 set -euo pipefail
 export LC_ALL=C
+trap 'printf "test-launch-kit: check failed at line %s\n" "$LINENO" >&2' ERR
 (( $# == 0 || $# == 2 )) || { printf 'Usage: bash scripts/test-launch-kit.sh [/path/hashstash /path/hashstash-faucet]\n' >&2; exit 1; }
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 kit=$repo/scripts/launch-kit.sh
@@ -41,6 +42,27 @@ reject() {
 has() { grep -Fxq -- "$2" "$1" || { printf 'Missing line in %s: %s\n' "$1" "$2" >&2; exit 1; }; checks=$((checks + 1)); }
 lacks() { ! grep -Fq -- "$2" "$1" || { printf 'Unexpected text in %s: %s\n' "$1" "$2" >&2; exit 1; }; checks=$((checks + 1)); }
 contains() { grep -Fq -- "$2" "$1" || { printf 'Missing text in %s: %s\n' "$1" "$2" >&2; exit 1; }; checks=$((checks + 1)); }
+# Run the sh blocks of INSTALL.md steps FIRST to LAST of a server directory as
+# rendered, from that directory, with /root/hashstash-keys moved to KEYS and
+# the payout placeholder of step 4 filled in. Step 6 stops at its read-only
+# --check. Output in $fixture/steps.out.
+run_rendered() {
+    local dir=$1 first=$2 last=$3 keys=$4
+    {
+        command -v openssl > /dev/null || printf 'openssl() { head -c 32 /dev/urandom | od -An -tx1 | tr -d " \\n"; echo; }\n'
+        awk -v first="$first" -v last="$last" '
+            /^## [0-9]+ / { step = $2 + 0; next }
+            step < first || step > last { next }
+            /^```sh$/ { code = 1; next }
+            /^```$/ { code = 0; next }
+            code && !stopped { print; if (step == 6 && / --check$/) stopped = 1 }' "$dir/INSTALL.md" \
+            | sed "s|/root/hashstash-keys|$keys|g; s|YOUR_64_HEX_PUBLIC_KEY|$key|"
+    } > "$fixture/steps.sh"
+    grep -q . "$fixture/steps.sh" || { printf 'No commands in steps %s-%s of %s\n' "$first" "$last" "$dir" >&2; exit 1; }
+    (cd "$dir" && bash -e "$fixture/steps.sh") > "$fixture/steps.out" 2> "$fixture/steps.err" \
+        || { cat "$fixture/steps.sh" "$fixture/steps.err" >&2; printf 'Rendered steps %s-%s of %s failed\n' "$first" "$last" "$dir" >&2; exit 1; }
+    checks=$((checks + 1))
+}
 
 # ------------------------------------------------------------ refusals
 if bash "$kit" > /dev/null 2>&1; then printf 'No arguments accepted\n' >&2; exit 1; fi; checks=$((checks + 1))
@@ -86,6 +108,14 @@ for name in p2p stratum rpc web faucet ssh; do
 done
 reject 'is used for both P2P and Stratum' "${base[@]}" --stratum-port 18481
 reject 'is used for both' "${base[@]}" --faucet-port 18483
+# nginx owns 80 and 443 on the web host.
+reject 'port 80 is used for both the website (nginx) and P2P' "${base[@]}" --p2p-port 80
+reject 'port 443 is used for both the website (nginx) and Stratum' "${base[@]}" --stratum-port 443
+reject 'port 80 is used for both the website (nginx) and public web' "${base[@]}" --web-port 80
+reject 'port 443 is used for both the website (nginx) and faucet' "${base[@]}" --faucet-port 443
+reject 'port 443 is used for both the website (nginx) and SSH' "${base[@]}" --ssh-port 443
+reject 'port 80 is used for both the website (nginx) and RPC of server 1' "${base[@]}" --rpc-port 80
+reject 'port 443 is used for both the website (nginx) and RPC of server 1' "${base[@]}" --rpc-port 443
 reject 'is used for both P2P and RPC of server 2' "${base[@]}" --rpc-port 17481
 reject 'choose a lower --rpc-port' "${base[@]}" --rpc-port 64480
 reject 'is not one of --seeds' "${base[@]}" --stratum-hosts 45.32.40.4
@@ -122,11 +152,18 @@ reject 'below 73.4G' --seeds "$seeds" --web-host 45.32.10.1 --miner-prefixes 98.
 pass --seeds "$seeds" --web-host 45.32.10.1 --miner-prefixes 98.10.0.0/16 --hashrate 73.4G
 pass --seeds "$seeds" --web-host 45.32.10.1 --miner-prefixes 98.10.0.0/16 --hashrate 2e
 reject 'more than 48 hours ahead' "${base[@]}" --genesis-time $(( $(date +%s) + 3 * 86400 ))
+# init warns about a genesis more than 120 seconds ahead, which a launch refuses.
+reject 'init warns about any genesis more than 120 seconds ahead' "${base[@]}" --genesis-time $(( $(date +%s) + 3600 ))
+reject 'init warns about any genesis more than 120 seconds ahead' "${base[@]}" --genesis-time $(( $(date +%s) + 600 ))
+pass "${base[@]}" --genesis-time $(( $(date +%s) + 60 ))
+pass "${base[@]}" --genesis-time $(( $(date +%s) - 86400 ))
+pass --rehearsal "${base[@]}" --genesis-time $(( $(date +%s) + 3600 ))
+contains "$fixture/err" 'seconds in the future'
 for bad in 1.5 0 4294967296 01790000000 soon; do reject '--genesis-time must be Unix seconds' "${base[@]}" --genesis-time "$bad"; done
 reject 'needs --binary' --seeds "$seeds" --web-host 45.32.10.1 --miner-prefixes 98.10.0.0/16 --genesis "$repo/config/devnet.json"
 reject 'do not combine it with --hashrate' "${base[@]}" --genesis "$repo/config/devnet.json"
 for bad in 0 1e-13 2e18 abc -5; do reject '' "${base[@]}" --share-difficulty "$bad"; done
-for bad in 0 01 1.5 x; do reject '--faucet-payout must be a positive whole number' "${base[@]}" --faucet-payout "$bad"; done
+for bad in 0 01 1.5 x 1000000000; do reject '--faucet-payout must be a positive whole number' "${base[@]}" --faucet-payout "$bad"; done
 mkdir -- "$fixture/existing"
 if bash "$kit" "${base[@]}" --out "$fixture/existing" > /dev/null 2> "$fixture/err"; then exit 1; fi
 grep -Fq 'already exists' "$fixture/err"; [[ -z $(ls -A -- "$fixture/existing") ]]; checks=$((checks + 1))
@@ -148,11 +185,9 @@ for dir in "$s1" "$s2" "$s3"; do
     cmp -s "$dir/deploy/install.sh" "$repo/deploy/linux/install.sh"; cmp -s "$dir/deploy/run-node.sh" "$repo/deploy/linux/run-node.sh"
     bash -n "$dir/firewall.sh"; bash -n "$dir/archive-old-node.sh"
     has "$dir/node.env" PEER_DISCOVERY=true; has "$dir/node.env" PEER_KEY_FILE=/etc/hashstash/peer-identity.json
-    has "$dir/node.env" P2P_PORT=18481; has "$dir/node.env" STRATUM_PORT=18482; has "$dir/node.env" STRATUM_ENABLED=true
-    has "$dir/node.env" STRATUM_TRUSTED=98.10.0.0/16; has "$dir/node.env" SHARE_DIFFICULTY=65536
+    has "$dir/node.env" P2P_PORT=18481; has "$dir/node.env" STRATUM_PORT=18482; has "$dir/node.env" SHARE_DIFFICULTY=65536
     lacks "$dir/node.env" PEER_PINS; lacks "$dir/node.env" ALLOW_EASY_TARGET
     has "$dir/firewall.sh" "ufw allow 18481/tcp comment 'hashstash p2p'"
-    has "$dir/firewall.sh" "ufw allow from 98.10.0.0/16 to any port 18482 proto tcp comment 'hashstash stratum'"
     lacks "$dir/firewall.sh" 'ufw allow 18482'; lacks "$dir/firewall.sh" 'ufw limit 22'
     has "$dir/firewall.sh" "ufw allow from 203.0.113.0/24 to any port 22 proto tcp comment 'hashstash-kit ssh'"
     has "$dir/firewall.sh" "ufw allow from 2001:db8:5::/48 to any port 22 proto tcp comment 'hashstash-kit ssh'"
@@ -164,6 +199,38 @@ for dir in "$s1" "$s2" "$s3"; do
     lacks "$dir/INSTALL.md" '"secret"'
 done
 has "$s1/node.env" MINER_PUBLIC_KEY=$key; has "$s2/node.env" MINER_PUBLIC_KEY=$key2; has "$s3/node.env" MINER_PUBLIC_KEY=$key3
+# By default Stratum runs on every seed except the web host (docs/LAUNCH.md section 7).
+for dir in "$s2" "$s3"; do
+    has "$dir/node.env" STRATUM_ENABLED=true; has "$dir/node.env" STRATUM_TRUSTED=98.10.0.0/16
+    has "$dir/firewall.sh" "ufw allow from 98.10.0.0/16 to any port 18482 proto tcp comment 'hashstash stratum'"
+    contains "$dir/INSTALL.md" '## 10 Miners'; contains "$dir/INSTALL.md" 'sudo cat /etc/hashstash/stratum-password'
+    contains "$dir/INSTALL.md" 'test -e /root/hashstash-keys/stratum-password || (umask 077; openssl rand -hex 32 > /root/hashstash-keys/stratum-password)'
+    contains "$dir/INSTALL.md" '--stratum-password-file /root/hashstash-keys/stratum-password'
+done
+has "$s1/node.env" STRATUM_ENABLED=false; lacks "$s1/node.env" STRATUM_TRUSTED
+has "$s1/firewall.sh" "ufw deny 18482/tcp comment 'hashstash stratum (disabled here)'"
+lacks "$s1/INSTALL.md" '## 10 Miners'; lacks "$s1/INSTALL.md" stratum-password
+has "$out/launch-values.env" 'STRATUM_HOSTS=45.32.20.2 45.32.30.3'
+# Steps in an order that can be followed: the payout key before the keys
+# that check against it, staging copies kept for a reinstall, no Stratum
+# password read from a removed file.
+for dir in "$s1" "$s2" "$s3"; do
+    [[ $(grep -n '^## 4 Payout key$' "$dir/INSTALL.md" | cut -d: -f1) -lt $(grep -n '^## 5 Keys, generated on this server$' "$dir/INSTALL.md" | cut -d: -f1) ]]; checks=$((checks + 1))
+    contains "$dir/INSTALL.md" 'test -e /root/hashstash-keys/peer-identity.json || ./release/hashstash peer-keygen --out /root/hashstash-keys/peer-identity.json'
+    contains "$dir/INSTALL.md" "peer-keycheck --key-file /root/hashstash-keys/peer-identity.json --peer-discovery --miner \"\$(sed -n 's/^MINER_PUBLIC_KEY=//p' node.env)\""
+    contains "$dir/INSTALL.md" 'Keep the staging copies in `/root/hashstash-keys` until the network is announced'
+    [[ $(grep -c 'shred -u /root/hashstash-keys' "$dir/INSTALL.md") == 1 ]]; checks=$((checks + 1))
+    contains "$dir/INSTALL.md" 'After the announcement, back up `/etc/hashstash` encrypted'
+done
+# Each kit is copied into a new directory of its own on the server, never into an earlier kit.
+remote=$(sed -n 's/^KIT_REMOTE_DIR=//p' "$out/launch-values.env")
+[[ "$remote" =~ ^/root/hashstash-kit-preview-[0-9]{8}T[0-9]{6}Z$ ]]; checks=$((checks + 1))
+contains "$s2/INSTALL.md" "ssh root@45.32.20.2 \"test ! -e $remote || { echo '$remote exists: this kit was copied before' >&2; exit 1; }\" \\"
+contains "$s2/INSTALL.md" "  && scp -r kit-$serial/server-2-45.32.20.2 root@45.32.20.2:$remote"
+has "$s2/INSTALL.md" "cd $remote"
+lacks "$s2/INSTALL.md" 'root@45.32.20.2:/root/hashstash-kit '
+! grep -qx 'cd /root/hashstash-kit' "$s2/INSTALL.md"; checks=$((checks + 1))
+contains "$out/README.md" "into \`$remote\`"
 has "$s1/node.env" 'PEERS=45.32.20.2:18481 45.32.30.3:18481'; has "$s1/node.env" 'PEER_SEEDS=45.32.20.2:18481 45.32.30.3:18481'
 has "$s2/node.env" 'PEER_SEEDS=45.32.10.1:18481 45.32.30.3:18481'; has "$s3/node.env" 'PEER_SEEDS=45.32.10.1:18481 45.32.20.2:18481'
 has "$s1/node.env" PEER_ADVERTISE=45.32.10.1:18481; has "$s2/node.env" PEER_ADVERTISE=45.32.20.2:18481
@@ -180,13 +247,18 @@ printf '%s\n' "$@" > "$STUB_ARGS"
 EOF
 chmod 755 "$fixture/stub-run"
 printf 'test-password\n' > "$fixture/password"; printf 'stub\n' > "$fixture/peer.json"; chmod 600 "$fixture/peer.json"
-for dir in "$s1" "$s2"; do
+for dir in "$s1" "$s3" "$s2"; do
     sed "s|^PEER_KEY_FILE=.*|PEER_KEY_FILE=$fixture/peer.json|" "$dir/node.env" > "$fixture/node.env"
     STUB_ARGS=$fixture/args bash "$repo/deploy/linux/run-node.sh" run "$fixture/node.env" "$fixture/stub-run" "$fixture/password" "$fixture/password"
-    has "$fixture/args" --peer-discovery; has "$fixture/args" --advertise-peer; has "$fixture/args" --stratum-trusted
+    has "$fixture/args" --peer-discovery; has "$fixture/args" --advertise-peer
     [[ $(grep -Fxc -- --seed "$fixture/args") == 2 && $(grep -Fxc -- --peer "$fixture/args") == 2 ]]; checks=$((checks + 1))
+    if [[ "$dir" == "$s1" ]]; then
+        has "$fixture/args" --no-stratum; has "$fixture/args" --public-web; lacks "$fixture/args" --stratum-trusted
+    else
+        has "$fixture/args" --stratum-trusted; lacks "$fixture/args" --no-stratum
+    fi
 done
-has "$fixture/args" 45.32.20.2:18481; lacks "$fixture/args" --public-web
+has "$fixture/args" 45.32.30.3:18481; lacks "$fixture/args" --public-web
 # nginx: the template with the host and the faucet routes; X-Real-IP is always overwritten.
 site=$s1/nginx/hashstash-public.conf
 has "$site" '    server_name wallet.example.com;'; has "$site" '    ssl_certificate /etc/letsencrypt/live/wallet.example.com/fullchain.pem;'
@@ -215,7 +287,18 @@ contains "$s1/faucet/hashstash-faucet.service" "ExecStart=/opt/hashstash-faucet/
 lacks "$s1/faucet/hashstash-faucet.service" FAUCET_PIN
 contains "$s1/INSTALL.md" '## 11 Faucet'; lacks "$s2/INSTALL.md" '## 11 Faucet'; lacks "$s2/INSTALL.md" '## 8 nginx'
 contains "$s1/INSTALL.md" 'certbot certonly --webroot --webroot-path /var/www/hashstash-acme -d wallet.example.com'
+has "$s1/INSTALL.md" 'apt-get install -y nginx certbot'; lacks "$s1/INSTALL.md" 'snap install'; lacks "$s1/INSTALL.md" 'shortlived'
 contains "$s1/INSTALL.md" 'scp -r kit-'
+# The faucet is funded offline: the server prepares, the cold signer signs, the server broadcasts.
+contains "$s1/INSTALL.md" '### Fund it, signed offline'
+contains "$s1/INSTALL.md" "printf '{\"TransferExact\":{\"recipient\":\"%s\",\"amount\":\"12000\"}}\\n' \"\$faucet_address\" > faucet-funding.json"
+contains "$s1/INSTALL.md" './release/hashstash prepare --url http://127.0.0.1:18480/rpc --config network.json --sender PAYOUT_PUBLIC_KEY \'
+contains "$s1/INSTALL.md" '--operation-file faucet-funding.json --expiry-blocks 240 --out faucet-funding.unsigned.json'
+contains "$s1/INSTALL.md" './release/hashstash broadcast --url http://127.0.0.1:18480/rpc --raw-file faucet-funding.signed.txt'
+contains "$s1/INSTALL.md" 'hashstash-cold --config network.json'
+contains "$s1/INSTALL.md" '12000 atoms (12 hashes) cover the faucet'"'"'s lifetime allowance of 1,000 claims of 10 atoms'
+lacks "$s1/INSTALL.md" 'transfer --url'; lacks "$s1/INSTALL.md" 'payout.key'; lacks "$s1/INSTALL.md" 'ssh -N -L 127.0.0.1:18480:127.0.0.1:18480 root@45.32.10.1 &'
+has "$out/launch-values.env" FAUCET_FUNDING_ATOMS=12000
 contains "$out/genesis/create-genesis.sh" 'init --config "$here/network.json" --preset slow --hashrate 1.67P'
 bash -n "$out/genesis/create-genesis.sh"; checks=$((checks + 1))
 contains "$out/ANNOUNCEMENT.md" '## Limitations users must be told'
@@ -238,13 +321,29 @@ has "$s3/node.env" "PEER_PINS=45.32.10.1:18481=$pin1 45.32.20.2:18481=$pin2"
 has "$s1/node.env" MINER_PUBLIC_KEY=REPLACE_WITH_PAYOUT_PUBLIC_KEY
 contains "$s1/INSTALL.md" "peer-keycheck --key-file /root/hashstash-keys/peer-identity.json --peer-discovery"
 contains "$s1/INSTALL.md" "prints exactly \`$pin1\`"
-contains "$s1/INSTALL.md" '## 5 Payout key'; contains "$s1/INSTALL.md" 'sed -i'
+lacks "$s1/INSTALL.md" 'peer-keygen --out'
+contains "$s1/INSTALL.md" '## 4 Payout key'; contains "$s1/INSTALL.md" 'sed -i'
+# The pinned identity is checked against the payout key that step 4 wrote, never the placeholder.
+lacks "$s1/INSTALL.md" '--miner REPLACE_WITH_PAYOUT_PUBLIC_KEY'
+contains "$s1/INSTALL.md" "--peer-discovery --miner \"\$(sed -n 's/^MINER_PUBLIC_KEY=//p' node.env)\""
+[[ $(grep -n "^sed -i 's/^MINER_PUBLIC_KEY=" "$s1/INSTALL.md" | cut -d: -f1) -lt $(grep -n 'peer-keycheck --key-file' "$s1/INSTALL.md" | head -1 | cut -d: -f1) ]]; checks=$((checks + 1))
+contains "$s1/INSTALL.md" '/root/hashstash-archive-STAMP/etc/hashstash/peer-identity.json /root/hashstash-keys/'
 lacks "$s1/INSTALL.md" stratum-password; contains "$s3/INSTALL.md" '--stratum-password-file /root/hashstash-keys/stratum-password'
 has "$s2/node.env" PUBLIC_WEB_PORT=18483; lacks "$s1/node.env" PUBLIC_WEB_PORT
 has "$s2/faucet/config.json" '  "origins": ["https://45.32.20.2"],'
 has "$s2/faucet/config.json" '  "rpc_url": "http://127.0.0.1:19480/rpc",'
 has "$s2/nginx/hashstash-public.conf" '    server_name 45.32.20.2;'
-contains "$s2/INSTALL.md" '--preferred-profile shortlived --webroot --webroot-path /var/www/hashstash-acme --ip-address 45.32.20.2'
+# An IP-address certificate needs the certbot snap (5.4 or later), called by its path.
+has "$s2/INSTALL.md" '/snap/bin/certbot certonly --preferred-profile shortlived --webroot --webroot-path /var/www/hashstash-acme --ip-address 45.32.20.2 --cert-name 45.32.20.2'
+has "$s2/INSTALL.md" 'apt-get install -y nginx'; lacks "$s2/INSTALL.md" 'apt-get install -y nginx certbot'
+contains "$s2/INSTALL.md" 'apt-get remove -y certbot'; has "$s2/INSTALL.md" 'snap install --classic certbot'
+contains "$s2/INSTALL.md" '/snap/bin/certbot --version         # must print certbot 5.4.0 or later'
+has "$s2/INSTALL.md" '/snap/bin/certbot renew --dry-run'; ! grep -qx 'certbot renew --dry-run' "$s2/INSTALL.md"; checks=$((checks + 1))
+contains "$s2/INSTALL.md" 'Run step 7 first: it opens port 80'
+# Without one payout key for all servers, the funding sender is named by hand.
+contains "$s2/INSTALL.md" '--sender PAYOUT_PUBLIC_KEY'
+pass "${base[@]}" --stratum-hosts all
+has "$out/server-1-45.32.10.1/node.env" STRATUM_ENABLED=true; has "$out/launch-values.env" 'STRATUM_HOSTS=45.32.10.1 45.32.20.2 45.32.30.3'
 pass "${base[@]}" --p2p-port 28481 --stratum-port 28482 --rpc-port 28480 --web-port 28483 --faucet-port 28484 --ssh-port 2222 --share-difficulty 1e-3 --faucet-payout 250
 s1=$out/server-1-45.32.10.1
 has "$s1/node.env" P2P_PORT=28481; has "$s1/node.env" SHARE_DIFFICULTY=1e-3; has "$out/server-3-45.32.30.3/node.env" RPC_PORT=30480
@@ -296,6 +395,13 @@ for dir in "$s1" "$s2"; do
     lacks "$dir/INSTALL.md" REPLACE_WITH; lacks "$dir/INSTALL.md" 'generated without the release'
 done
 [[ -f "$s1/release/hashstash-faucet" && ! -e "$s2/release/hashstash-faucet" ]]; checks=$((checks + 1))
+# The server directory is named after the chain; one payout key for all servers funds the faucet.
+remote=$(sed -n 's/^KIT_REMOTE_DIR=//p' "$out/launch-values.env")
+[[ "$remote" =~ ^/root/hashstash-kit-abababababab-[0-9]{8}T[0-9]{6}Z$ ]]; checks=$((checks + 1))
+has "$s2/INSTALL.md" "cd $remote"
+contains "$s1/INSTALL.md" "--config network.json --sender $key \\"
+contains "$s1/INSTALL.md" "account --params '{\"key\":\"$key\"}'"
+contains "$s1/INSTALL.md" "the payout key every server mines to (\`$key\`)"
 contains "$s1/faucet/hashstash-faucet.service" "ExecStart=/opt/hashstash-faucet/$version-$faucet_sha/hashstash-faucet"
 contains "$s1/faucet/config.json" "\"chain_id\": \"$chain\""
 contains "$s1/nginx/hashstash-public.conf" "\"chain_id\":\"$chain\"}';"
@@ -344,21 +450,48 @@ if (( $# == 2 )); then
     {
         pass "${mode[@]}" "${base[@]}" --binary "$real/hashstash" --domain wallet.example.com --payout-keys "$key,$key2,$key3"
         [[ -n $(sed -n 's/^CHAIN_ID=\([0-9a-f]\{64\}\)$/\1/p' "$out/launch-values.env") ]]; checks=$((checks + 1))
-        sha=$(sed -n 's/^HASHSTASH_SHA256=//p' "$out/launch-values.env"); genesis_sha=$(sed -n 's/^GENESIS_SHA256=//p' "$out/launch-values.env")
-        # INSTALL.md steps 3, 4 and 6 (--check) on every server, with keys made here.
+        # INSTALL.md steps 3 to 6 (up to the read-only --check) on every server,
+        # exactly as rendered, with only the key directory moved here.
         n=0
         for dir in "$out"/server-*; do
             n=$((n + 1))
-            (cd "$dir/release" && sha256sum --quiet -c SHA256SUMS)
-            "$dir/release/hashstash" peer-keygen --out "$fixture/peer-$n.json" > /dev/null
-            printf '%s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$fixture/password-$n"
-            (cd "$dir" && bash deploy/install.sh --binary release/hashstash --sha256 "$sha" --genesis network.json \
-                --genesis-sha256 "$genesis_sha" --node-env node.env --peer-key-file "$fixture/peer-$n.json" \
-                --stratum-password-file "$fixture/password-$n" --check) > "$fixture/install.out" 2> "$fixture/install.err" \
-                || { cat "$fixture/install.err" >&2; exit 1; }
-            grep -Fq 'Configuration and payout public key are valid' "$fixture/install.out"; checks=$((checks + 1))
+            run_rendered "$dir" 3 6 "$fixture/keys-a$n"
+            grep -Fq 'Configuration and payout public key are valid' "$fixture/steps.out"; checks=$((checks + 1))
+            [[ -f "$fixture/keys-a$n/peer-identity.json" ]]; checks=$((checks + 1))
+            identity=$(tail -n 1 < <(grep -Ex '[0-9a-f]{64}' "$fixture/steps.out"))
+            # A second run (a reinstall) reuses the identity and the password.
+            cp -p -- "$fixture/keys-a$n/peer-identity.json" "$fixture/identity-before"
+            [[ ! -e "$fixture/keys-a$n/stratum-password" ]] || cp -p -- "$fixture/keys-a$n/stratum-password" "$fixture/password-before"
+            run_rendered "$dir" 5 5 "$fixture/keys-a$n"
+            grep -Fxq -- "$identity" "$fixture/steps.out"; checks=$((checks + 1))
+            cmp -s -- "$fixture/identity-before" "$fixture/keys-a$n/peer-identity.json"; checks=$((checks + 1))
+            if [[ -e "$fixture/keys-a$n/stratum-password" ]]; then
+                cmp -s -- "$fixture/password-before" "$fixture/keys-a$n/stratum-password"
+                [[ $(stat -c %a -- "$fixture/keys-a$n/stratum-password") == 600 ]]; checks=$((checks + 1))
+            fi
         done
         (( n == 3 )); checks=$((checks + 1))
+        # Pinned without payout keys: the identities exist before the kit
+        # (peer-keygen on each server), step 4 writes the payout key, and
+        # step 5 checks each pinned identity against it.
+        declare -A pin_real=()
+        pinned= n=0
+        for ip in ${seeds//,/ }; do
+            n=$((n + 1))
+            mkdir -m 700 -- "$fixture/keys-b$n"
+            pin_real[$n]=$("$real/hashstash" peer-keygen --out "$fixture/keys-b$n/peer-identity.json")
+            pinned+="${pinned:+,}$ip=${pin_real[$n]}"
+        done
+        pass "${mode[@]}" "${base[@]}" --binary "$real/hashstash" --peer-pins "$pinned"
+        n=0
+        for dir in "$out"/server-*; do
+            n=$((n + 1))
+            has "$dir/node.env" MINER_PUBLIC_KEY=REPLACE_WITH_PAYOUT_PUBLIC_KEY
+            run_rendered "$dir" 4 6 "$fixture/keys-b$n"
+            has "$dir/node.env" "MINER_PUBLIC_KEY=$key"
+            grep -Fxq -- "${pin_real[$n]}" "$fixture/steps.out"; checks=$((checks + 1))
+            grep -Fq 'Configuration and payout public key are valid' "$fixture/steps.out"; checks=$((checks + 1))
+        done
         if (( ${#mode[@]} == 0 )); then
             # A release refuses the uncalibrated limit behind discovery, and so does the kit.
             "$real/hashstash" init --config "$fixture/easy.json" --preset slow --uncalibrated > /dev/null 2>&1

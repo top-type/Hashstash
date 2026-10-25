@@ -15114,10 +15114,22 @@ mod peer_tests {
                 .receive_headers(free, std::slice::from_ref(&stored))
                 .unwrap()
         );
-        let i = receiver.locked().unwrap();
-        assert_eq!(i.header_syncs.len(), MAX_CONNECTIONS);
-        assert!(i.header_syncs.contains_key(&honest));
-        assert!(!i.header_syncs.contains_key(&free));
+        let downloads = header_downloads(&receiver);
+        assert_eq!(downloads.len(), MAX_CONNECTIONS);
+        assert!(downloads.contains(&honest));
+        assert!(!downloads.contains(&free));
+    }
+
+    /// The peers whose header downloads `node` runs, read under the node lock
+    /// and checked after it is released, so a failed check fails the test
+    /// instead of poisoning the lock.
+    fn header_downloads(node: &Node) -> BTreeSet<SocketAddr> {
+        node.locked()
+            .unwrap()
+            .header_syncs
+            .keys()
+            .copied()
+            .collect()
     }
 
     #[test]
@@ -15187,12 +15199,10 @@ mod peer_tests {
             assert!(!receiver.receive_headers(sybil(n), &cheap).unwrap());
         }
         assert_eq!(cursor(honest), counted);
-        {
-            let i = receiver.locked().unwrap();
-            assert_eq!(i.header_syncs.len(), MAX_CONNECTIONS);
-            // The oldest of the equal sybil downloads gave way instead.
-            assert!(!i.header_syncs.contains_key(&sybil(0)));
-        }
+        // The oldest of the equal sybil downloads gave way instead.
+        let downloads = header_downloads(&receiver);
+        assert_eq!(downloads.len(), MAX_CONNECTIONS);
+        assert!(!downloads.contains(&sybil(0)));
         // The sybils go on to count more work than the honest download, which
         // then counted least. A reply of a header this node stores, which
         // counts nothing, still does not take its place.
@@ -15217,13 +15227,13 @@ mod peer_tests {
                 .unwrap()
         );
         assert_eq!(cursor(honest), counted);
-        assert!(!receiver.locked().unwrap().header_syncs.contains_key(&free));
+        assert!(!header_downloads(&receiver).contains(&free));
         // Work buys the place: a newcomer that counts more than the honest
         // download in one reply takes it.
         assert!(!receiver.receive_headers(free, &extended).unwrap());
-        let i = receiver.locked().unwrap();
-        assert!(i.header_syncs.contains_key(&free));
-        assert!(!i.header_syncs.contains_key(&honest));
+        let downloads = header_downloads(&receiver);
+        assert!(downloads.contains(&free));
+        assert!(!downloads.contains(&honest));
     }
 
     #[test]
@@ -15324,21 +15334,21 @@ mod peer_tests {
 
     /// Hold `headers` in order, as pushed blocks' headers are, in one batch,
     /// until one is refused for its lead or for room.
+    /// A failure is reported once the node lock is released, so it fails the
+    /// test instead of poisoning the lock.
     fn hold_headers(node: &Node, headers: &[Header]) -> Vec<HeaderHold> {
-        let mut i = node.locked().unwrap();
-        i.chain
-            .hold_batch(|chain| {
-                let mut holds = Vec::new();
-                for header in headers {
-                    let hold = chain.hold_header(header.clone(), now(), 0).unwrap();
-                    holds.push(hold);
-                    if matches!(hold, HeaderHold::Ahead | HeaderHold::Full) {
-                        break;
-                    }
+        let held = node.locked().unwrap().chain.hold_batch(|chain| {
+            let mut holds = Vec::new();
+            for header in headers {
+                let hold = chain.hold_header(header.clone(), now(), 0)?;
+                holds.push(hold);
+                if matches!(hold, HeaderHold::Ahead | HeaderHold::Full) {
+                    break;
                 }
-                holds
-            })
-            .unwrap()
+            }
+            Ok::<_, anyhow::Error>(holds)
+        });
+        held.and_then(std::convert::identity).unwrap()
     }
     /// A node whose next block needs more than 1,024 times the work of a
     /// header at the network limit, so a lead of 16 next-block works would let

@@ -402,9 +402,19 @@ pub const STRATUM_GROUP_WORKERS: usize = 16;
 /// When the slots a newly authorized worker may use are full, it replaces
 /// the worker it competes with that has gone longest without a valid share,
 /// counted from its authorization, once that is at least this long. Miners
-/// that keep reporting shares are never replaced, and idle sockets cannot
-/// keep every slot from new miners.
+/// that keep reporting shares are never replaced.
 pub const STRATUM_IDLE_WORKER: Duration = Duration::from_secs(300);
+/// A worker from outside the trusted prefixes counts as idle from the
+/// earliest authorization among its group's workers that have sent no valid
+/// share: those still connected, and those that left, until this long after
+/// the last of them left. A source that does no work therefore cannot
+/// restart its idle time by reconnecting or by replacing its own idle
+/// workers: holding slots without work takes another network every
+/// STRATUM_IDLE_WORKER, one unused for this long.
+pub const STRATUM_GROUP_MEMORY: Duration = Duration::from_secs(3600);
+/// Groups whose departed workers' idle time is remembered. When more have
+/// left within STRATUM_GROUP_MEMORY, the one that left longest ago is forgotten.
+const STRATUM_REMEMBERED_GROUPS: usize = 4096;
 
 struct MiningWorker {
     worker: String,
@@ -415,7 +425,11 @@ struct MiningWorker {
     last_share: Option<Instant>,
     /// When it authorized or last sent a valid share or block. A share
     /// refused for a rate or a budget that others share still proves work.
+    /// Outside trusted prefixes, a new worker starts from its group's idle
+    /// time instead (see STRATUM_GROUP_MEMORY).
     active: Instant,
+    /// Whether it has sent a valid share or block since it authorized.
+    proven: bool,
     /// The source's group (see `network_guard::stratum_group`), and whether
     /// a prefix the operator trusts holds it.
     group: IpAddr,
@@ -445,6 +459,9 @@ struct MiningRuntime {
     rejected: u64,
     blocks: u64,
     workers: HashMap<u32, MiningWorker>,
+    /// For each group outside trusted prefixes whose workers left without a
+    /// valid share: the oldest of their idle times, and when the last left.
+    departed: HashMap<IpAddr, (Instant, Instant)>,
     buckets: VecDeque<WorkBucket>,
 }
 impl Default for MiningRuntime {
@@ -462,6 +479,7 @@ impl Default for MiningRuntime {
             rejected: 0,
             blocks: 0,
             workers: HashMap::new(),
+            departed: HashMap::new(),
             buckets: VecDeque::new(),
         }
     }
@@ -471,14 +489,19 @@ impl MiningRuntime {
     /// when the slots it may use are full: one of its own group when that
     /// group is at its cap, otherwise one outside trusted prefixes, or for a
     /// trusted newcomer, failing that, a trusted one. The replaced session is
-    /// told to close. Without such a worker the newcomer is refused.
+    /// told to close. Without such a worker the newcomer is refused. A
+    /// newcomer from outside trusted prefixes counts as idle from its group's
+    /// idle time, if that is earlier than its own authorization.
     fn register(
         &mut self,
         id: u32,
-        worker: MiningWorker,
+        mut worker: MiningWorker,
         now: Instant,
     ) -> Result<(), &'static str> {
         let (group, trusted) = (worker.group, worker.trusted);
+        if !trusted && let Some(idle) = self.group_idle(group, now) {
+            worker.active = worker.active.min(idle);
+        }
         let general = self.workers.values().filter(|w| !w.trusted).count();
         let grouped = self
             .workers
@@ -498,11 +521,52 @@ impl MiningRuntime {
         } else {
             None
         };
-        if let Some(old) = victim.and_then(|victim| self.workers.remove(&victim)) {
+        if let Some(old) = victim.and_then(|victim| self.leave(victim, now)) {
             old.evict.notify_one();
         }
         self.workers.insert(id, worker);
         Ok(())
+    }
+    /// The earliest idle time among `group`'s workers outside trusted
+    /// prefixes that have sent no valid share, connected or departed less
+    /// than STRATUM_GROUP_MEMORY after the group's last such departure.
+    fn group_idle(&self, group: IpAddr, now: Instant) -> Option<Instant> {
+        let departed = self
+            .departed
+            .get(&group)
+            .filter(|(_, left)| now.saturating_duration_since(*left) < STRATUM_GROUP_MEMORY)
+            .map(|(idle, _)| *idle);
+        self.workers
+            .values()
+            .filter(|w| !w.trusted && !w.proven && w.group == group)
+            .map(|w| w.active)
+            .chain(departed)
+            .min()
+    }
+    /// Remove worker `id`, remembering its idle time if it never sent a
+    /// valid share.
+    fn leave(&mut self, id: u32, now: Instant) -> Option<MiningWorker> {
+        let old = self.workers.remove(&id)?;
+        if old.trusted || old.proven {
+            return Some(old);
+        }
+        let memory = |left: Instant| now.saturating_duration_since(left) < STRATUM_GROUP_MEMORY;
+        let known = self.departed.get(&old.group).copied();
+        if known.is_none() && self.departed.len() >= STRATUM_REMEMBERED_GROUPS {
+            self.departed.retain(|_, (_, left)| memory(*left));
+            if self.departed.len() >= STRATUM_REMEMBERED_GROUPS {
+                let oldest = self.departed.iter().min_by_key(|(_, (_, left))| *left);
+                if let Some(oldest) = oldest.map(|(group, _)| *group) {
+                    self.departed.remove(&oldest);
+                }
+            }
+        }
+        let entry = match known {
+            Some((idle, left)) if memory(left) => (idle.min(old.active), left.max(now)),
+            _ => (old.active, now),
+        };
+        self.departed.insert(old.group, entry);
+        Some(old)
     }
     /// The worker matching `candidate` that has gone longest without a valid
     /// share since it authorized, if that is STRATUM_IDLE_WORKER or more.
@@ -519,6 +583,7 @@ impl MiningRuntime {
     fn proved(&mut self, id: u32, now: Instant) {
         if let Some(worker) = self.workers.get_mut(&id) {
             worker.active = worker.active.max(now);
+            worker.proven = true;
         }
     }
     fn prune(&mut self, second: u64) {
@@ -609,7 +674,7 @@ struct MiningConnection {
 }
 impl Drop for MiningConnection {
     fn drop(&mut self) {
-        self.runtime.unpoisoned().workers.remove(&self.id);
+        self.runtime.unpoisoned().leave(self.id, Instant::now());
     }
 }
 
@@ -12224,20 +12289,26 @@ const STRATUM_AUTHORIZATION_WINDOW: Duration = network_guard::STRATUM_AUTHORIZAT
 /// second, difficulty is multiplied by the largest power of two that keeps
 /// the rate at or above STRATUM_TARGET_SHARE_RATE. A stream above
 /// STRATUM_BURST_SHARE_RATE, the session request rate past which its shares
-/// are refused, is raised as soon as its sample is complete.
+/// are refused, is raised as soon as its sample is complete, by at most the
+/// factor that brings that rate to the target.
 const STRATUM_MAX_SHARE_RATE: u64 = 2;
 const STRATUM_TARGET_SHARE_RATE: u64 = 1;
 const STRATUM_BURST_SHARE_RATE: u64 = 8;
 const STRATUM_RATE_SAMPLE: u64 = 16;
-/// The shortest span a rate is measured over, so shares buffered together
-/// cannot imply an unbounded rate, and the span after which a sample is
-/// judged and restarts.
-const STRATUM_RATE_FLOOR: Duration = Duration::from_millis(250);
+/// The shortest span a burst is measured over: the time a sample takes at
+/// the session rate. Shares buffered together, by a proxy or a connection
+/// that stalled, then never imply a rate above it, and a burst raise is
+/// capped, so only a stream that keeps arriving faster is raised further.
+const STRATUM_BURST_SPAN: Duration =
+    Duration::from_secs(STRATUM_RATE_SAMPLE / STRATUM_BURST_SHARE_RATE);
+/// The span after which a sample is judged and restarts.
 const STRATUM_SHARE_WINDOW: Duration = Duration::from_secs(30);
 /// Difficulty above the floor or what the miner negotiated halves once its
 /// valid shares since the last change average fewer than one per
-/// STRATUM_SLOW_SHARE over at least STRATUM_DECAY_SPAN.
-const STRATUM_SLOW_SHARE: Duration = Duration::from_secs(4);
+/// STRATUM_SLOW_SHARE over at least STRATUM_DECAY_SPAN: half the target
+/// rate, as a raise needs twice it, so a halving never undoes a raise that
+/// noise alone could repeat.
+const STRATUM_SLOW_SHARE: Duration = Duration::from_secs(2);
 const STRATUM_DECAY_SPAN: Duration = Duration::from_secs(120);
 /// Worker names one connection may authorize, as a proxy does for each of
 /// the miners behind it.
@@ -12334,12 +12405,13 @@ fn stratum_session_expired(authorized: bool, connected: Duration) -> bool {
 /// Power-of-two difficulty multiplier for `intervals` share intervals observed
 /// over `elapsed`, or None while the rate is acceptable or not yet judged.
 fn stratum_rate_factor(intervals: u64, elapsed: Duration) -> Option<f64> {
+    let burst = elapsed < STRATUM_SHARE_WINDOW;
     let millis = elapsed
-        .max(STRATUM_RATE_FLOOR)
+        .max(STRATUM_BURST_SPAN)
         .as_millis()
         .min(u64::MAX as u128) as u64;
     let shares = intervals.saturating_mul(1000);
-    let ceiling = if elapsed < STRATUM_SHARE_WINDOW {
+    let ceiling = if burst {
         STRATUM_BURST_SHARE_RATE
     } else {
         STRATUM_MAX_SHARE_RATE
@@ -12348,7 +12420,10 @@ fn stratum_rate_factor(intervals: u64, elapsed: Duration) -> Option<f64> {
         return None;
     }
     // Rounded down, so noise in a sample never pushes the rate below target.
-    let factor = shares / STRATUM_TARGET_SHARE_RATE.saturating_mul(millis);
+    let mut factor = shares / STRATUM_TARGET_SHARE_RATE.saturating_mul(millis);
+    if burst {
+        factor = factor.min(STRATUM_BURST_SHARE_RATE / STRATUM_TARGET_SHARE_RATE);
+    }
     Some((1u64 << factor.ilog2()) as f64)
 }
 /// Whether `shares` valid shares over `elapsed` since the difficulty last
@@ -12599,7 +12674,7 @@ async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             let trusted = pending.as_ref().is_some_and(network_guard::PendingSlot::operator_trusted);
                             let entry = MiningWorker {
                                 worker:name.to_owned(),accepted:0,rejected:0,blocks:0,difficulty,last_share:None,
-                                active:Instant::now(),group:network_guard::stratum_group(admission.address()),
+                                active:Instant::now(),proven:false,group:network_guard::stratum_group(admission.address()),
                                 trusted,evict:evicted.clone(),
                             };
                             if let Err(reason) = node.mining.unpoisoned().register(identity, entry, Instant::now()) {
@@ -14858,24 +14933,31 @@ mod tests {
         // rate, whose shares are being refused, is raised.
         assert_eq!(stratum_rate_factor(16, seconds(2)), None);
         assert_eq!(stratum_rate_factor(17, seconds(2)), Some(8.0));
-        assert_eq!(stratum_rate_factor(16, seconds(1)), Some(16.0));
+        // A burst is measured over at least the two seconds a sample takes
+        // at the session rate, so shares buffered together imply at most
+        // their count over that span, and is raised by at most the eight
+        // times that brings the session rate to the target. These pinned 16,
+        // 64 and 128 while bursts were measured over 250 ms and uncapped.
+        assert_eq!(stratum_rate_factor(16, seconds(1)), None);
+        assert_eq!(stratum_rate_factor(16, Duration::ZERO), None);
+        assert_eq!(stratum_rate_factor(17, Duration::ZERO), Some(8.0));
+        assert_eq!(
+            stratum_rate_factor(40, Duration::from_millis(100)),
+            Some(8.0)
+        );
+        assert_eq!(stratum_rate_factor(800, seconds(29)), Some(8.0));
         // A whole window is judged against two shares per second, and the
         // factor rounds down, so the raised rate stays at or above the target.
         assert_eq!(stratum_rate_factor(60, seconds(30)), None);
         assert_eq!(stratum_rate_factor(61, seconds(30)), Some(2.0));
         assert_eq!(stratum_rate_factor(119, seconds(30)), Some(2.0));
         assert_eq!(stratum_rate_factor(120, seconds(30)), Some(4.0));
-        // Shares buffered together are measured over at least 250 ms.
-        assert_eq!(stratum_rate_factor(16, Duration::ZERO), Some(64.0));
-        assert_eq!(
-            stratum_rate_factor(40, Duration::from_millis(100)),
-            Some(128.0)
-        );
         assert_eq!(stratum_rate_factor(355 * 30, seconds(30)), Some(256.0));
         // Extreme counts and spans saturate instead of overflowing.
+        assert_eq!(stratum_rate_factor(u64::MAX, Duration::ZERO), Some(8.0));
         assert_eq!(
-            stratum_rate_factor(u64::MAX, Duration::ZERO),
-            Some((1u64 << 56) as f64)
+            stratum_rate_factor(u64::MAX, seconds(30)),
+            Some((1u64 << 49) as f64)
         );
         assert_eq!(stratum_rate_factor(u64::MAX, Duration::MAX), None);
     }
@@ -14902,27 +14984,77 @@ mod tests {
         let raised = (0..=120u32).find_map(|n| rate.sample(start + quarter * n).map(|f| (n, f)));
         assert_eq!(raised, Some((120, 4.0)));
         // Ten per second exceed the session rate and are raised as soon as
-        // the sample is complete.
+        // the sample shows more than 16 intervals in two seconds.
         let mut rate = ShareRate::new(start);
         let tenth = Duration::from_millis(100);
-        let raised = (0..=16u32).find_map(|n| rate.sample(start + tenth * n).map(|f| (n, f)));
-        assert_eq!(raised, Some((16, 8.0)));
+        let raised = (0..=17u32).find_map(|n| rate.sample(start + tenth * n).map(|f| (n, f)));
+        assert_eq!(raised, Some((17, 8.0)));
+    }
+    #[test]
+    fn buffered_shares_raise_difficulty_at_most_eightfold_and_slow_shares_undo_it() {
+        let start = tokio::time::Instant::now();
+        let second = Duration::from_secs(1);
+        // A miner at one share per second stalls after twelve shares. The
+        // stall carries its sample past the window, so the first share
+        // after it closes the sample and starts the next one...
+        let mut rate = ShareRate::new(start);
+        for n in 0..12u32 {
+            assert_eq!(rate.sample(start + second * n), None);
+        }
+        // ...and the buffered shares arrive together, 17 of them within
+        // 250 ms. Measured over 250 ms they read as 64 per second and raised
+        // difficulty 64 times.
+        let flush = |n: u32| start + second * 32 + Duration::from_millis(15) * n;
+        for n in 0..17 {
+            assert_eq!(rate.sample(flush(n)), None, "share {n}");
+        }
+        // A larger batch is raised once, by at most eight times.
+        let raised = (17..64).find_map(|n| rate.sample(flush(n)));
+        assert_eq!(raised, Some(8.0));
+        // Raised eight times, a miner reporting 0.95 shares per second at
+        // its negotiated difficulty slows to under one share per two seconds
+        // at each raised level and halves back to where it started. While
+        // raised difficulty halved only below one share per four seconds, it
+        // stayed at twice its difficulty.
+        let mut level = 8u32;
+        let gap = |level: u32| Duration::from_secs_f64(f64::from(level) / 0.95);
+        let mut rate = ShareRate::new(start);
+        let mut next = start + gap(level);
+        let mut returned = None;
+        for tick in 1..=3600u32 {
+            let now = start + second * tick;
+            while next <= now {
+                rate.shares += 1;
+                assert_eq!(rate.sample(next), None);
+                next += gap(level);
+            }
+            if level > 1 && rate.slow(now) {
+                level /= 2;
+                rate = ShareRate::new(now);
+            }
+            if level == 1 {
+                returned = Some(tick);
+                break;
+            }
+        }
+        assert_eq!(returned, Some(360));
     }
     #[test]
     fn slow_shares_halve_raised_difficulty() {
         let seconds = Duration::from_secs;
-        // Fewer than one share per four seconds over two minutes.
+        // Fewer than one share per two seconds over two minutes: half the
+        // target rate (these pinned one per four seconds before).
         assert!(stratum_decays(0, seconds(120)));
-        assert!(stratum_decays(29, seconds(120)));
-        assert!(!stratum_decays(30, seconds(120)));
+        assert!(stratum_decays(59, seconds(120)));
+        assert!(!stratum_decays(60, seconds(120)));
         assert!(!stratum_decays(0, seconds(119)));
-        assert!(stratum_decays(249, seconds(1000)));
-        assert!(!stratum_decays(250, seconds(1000)));
+        assert!(stratum_decays(499, seconds(1000)));
+        assert!(!stratum_decays(500, seconds(1000)));
         let start = tokio::time::Instant::now();
         let mut rate = ShareRate::new(start);
         assert!(!rate.slow(start + seconds(119)));
         assert!(rate.slow(start + seconds(120)));
-        rate.shares = 30;
+        rate.shares = 60;
         assert!(!rate.slow(start + seconds(120)));
     }
     fn idle_worker(authorized: Instant, source: &str, trusted: bool) -> MiningWorker {
@@ -14934,6 +15066,7 @@ mod tests {
             difficulty: DEFAULT_STRATUM_SHARE_DIFFICULTY,
             last_share: None,
             active: authorized,
+            proven: false,
             group: network_guard::stratum_group(source.parse().unwrap()),
             trusted,
             evict: Arc::new(tokio::sync::Notify::new()),
@@ -15043,6 +15176,132 @@ mod tests {
         let newcomer = idle_worker(start, &source(20, 1), false);
         let refused = open.register(next(), newcomer, start);
         assert_eq!(refused, Err("mining worker capacity reached"));
+    }
+    #[test]
+    fn renewing_or_reconnecting_without_work_keeps_a_groups_idle_time() {
+        let start = Instant::now();
+        let idle = start + STRATUM_IDLE_WORKER;
+        let source = |group: usize, host: usize| format!("198.51.{group}.{host}");
+        let mut id = 0u32;
+        let mut next = || {
+            id += 1;
+            id
+        };
+        // With no trusted prefix, four groups fill every slot and never send
+        // a share.
+        let mut registry = MiningRuntime {
+            trusted_reserve: 0,
+            ..MiningRuntime::default()
+        };
+        let mut squatters = Vec::new();
+        for group in 0..MAX_CONNECTIONS / STRATUM_GROUP_WORKERS {
+            for host in 0..STRATUM_GROUP_WORKERS {
+                let worker = idle_worker(start, &source(group, host), false);
+                squatters.push((group, next()));
+                registry
+                    .register(squatters.last().unwrap().1, worker, start)
+                    .unwrap();
+            }
+        }
+        // Once their workers are idle, two groups renew each one with a new
+        // session from a second address, which replaces the group's own idle
+        // worker at its cap, and two close each and authorize again.
+        for (group, old) in squatters {
+            if group >= 2 {
+                registry.leave(old, idle);
+            }
+            let worker = idle_worker(idle, &source(group, 100 + old as usize), false);
+            registry.register(next(), worker, idle).unwrap();
+        }
+        assert_eq!(registry.workers.len(), MAX_CONNECTIONS);
+        // Neither restarted their idle time, so a newcomer from another
+        // network replaces one at once. Their sessions' own authorizations
+        // left every slot taken for another five minutes.
+        assert!(registry.workers.values().all(|w| w.active == start));
+        let newcomer = idle_worker(idle, &source(9, 1), false);
+        registry.register(next(), newcomer, idle).unwrap();
+        assert_eq!(registry.workers.len(), MAX_CONNECTIONS);
+        let outsider = network_guard::stratum_group(source(9, 1).parse().unwrap());
+        let newcomer = registry.workers.values().find(|w| w.active == idle);
+        assert!(newcomer.is_some_and(|w| w.group == outsider));
+        // A group's workers that sent a valid share pass nothing on, so a
+        // reporting miner's new connection starts its own idle time.
+        let mut registry = MiningRuntime::default();
+        let (reporting, silent) = (next(), next());
+        registry
+            .register(reporting, idle_worker(start, &source(1, 1), false), start)
+            .unwrap();
+        registry.proved(reporting, start);
+        registry.leave(reporting, idle);
+        let renewed = next();
+        let worker = idle_worker(idle, &source(1, 2), false);
+        registry.register(renewed, worker, idle).unwrap();
+        assert_eq!(registry.workers[&renewed].active, idle);
+        // A silent worker's idle time passes to its group's later workers
+        // until STRATUM_GROUP_MEMORY after the last such worker left.
+        registry
+            .register(silent, idle_worker(start, &source(2, 1), false), start)
+            .unwrap();
+        registry.leave(silent, idle);
+        let group = network_guard::stratum_group(source(2, 1).parse().unwrap());
+        assert_eq!(registry.group_idle(group, idle), Some(start));
+        let forgotten = idle + STRATUM_GROUP_MEMORY;
+        assert_eq!(
+            registry.group_idle(group, forgotten - Duration::from_secs(1)),
+            Some(start)
+        );
+        assert_eq!(registry.group_idle(group, forgotten), None);
+        let late = next();
+        let worker = idle_worker(forgotten, &source(2, 3), false);
+        registry.register(late, worker, forgotten).unwrap();
+        assert_eq!(registry.workers[&late].active, forgotten);
+        // Trusted prefixes keep their own authorization time.
+        let trusted = next();
+        let worker = idle_worker(idle, &source(1, 9), true);
+        registry
+            .register(next(), idle_worker(start, &source(1, 8), false), start)
+            .unwrap();
+        registry.register(trusted, worker, idle).unwrap();
+        assert_eq!(registry.workers[&trusted].active, idle);
+        // A worker's session that closes leaves its idle time behind too.
+        let runtime = Arc::new(Mutex::new(MiningRuntime::default()));
+        let authorized = Instant::now();
+        let worker = idle_worker(authorized, &source(3, 1), false);
+        runtime
+            .unpoisoned()
+            .register(7, worker, authorized)
+            .unwrap();
+        drop(MiningConnection {
+            runtime: runtime.clone(),
+            id: 7,
+        });
+        let group = network_guard::stratum_group(source(3, 1).parse().unwrap());
+        assert!(runtime.unpoisoned().workers.is_empty());
+        assert_eq!(
+            runtime.unpoisoned().group_idle(group, Instant::now()),
+            Some(authorized)
+        );
+        // Groups are remembered within a bound, forgetting the one that left
+        // longest ago.
+        let mut registry = MiningRuntime::default();
+        let member = |index: usize| format!("203.{}.{}.1", index / 256, index % 256);
+        for index in 0..=STRATUM_REMEMBERED_GROUPS {
+            let at = start + Duration::from_millis(index as u64);
+            let worker = next();
+            registry
+                .register(worker, idle_worker(at, &member(index), false), at)
+                .unwrap();
+            registry.leave(worker, at);
+        }
+        assert_eq!(registry.departed.len(), STRATUM_REMEMBERED_GROUPS);
+        let group = |index| network_guard::stratum_group(member(index).parse().unwrap());
+        assert_eq!(registry.group_idle(group(0), idle), None);
+        assert!(registry.group_idle(group(1), idle).is_some());
+        assert!(
+            registry
+                .group_idle(group(STRATUM_REMEMBERED_GROUPS), idle)
+                .is_some()
+        );
     }
     /// A Stratum session served over loopback TCP as the listener serves one
     /// without a pre-authorization slot, with the miner's ends of it.

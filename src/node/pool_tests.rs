@@ -837,6 +837,47 @@ fn a_block_finishing_failure_truncates_only_the_template() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
+fn a_transaction_a_template_could_not_be_finished_with_waits_for_the_next_tip() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 1024 * 1024);
+    fund_other(&node);
+    let view = snapshot(&node);
+    let (config, state) = (view.chain.config.as_ref(), view.chain.tip_state());
+    let start = nonce(&node, &key());
+    let pending: Vec<_> = (0..6)
+        .map(|offset| payment(config, state, &SECRET, start + offset, key(), 1, 0))
+        .collect();
+    for tx in &pending {
+        node.submit_transaction(tx.clone()).unwrap();
+    }
+    // The block cannot be finished with more than three transactions, so
+    // the template stops before the fourth.
+    crate::chain::FAIL_FINISH_ABOVE.with(|limit| limit.set(Some(3)));
+    let template = node.template();
+    crate::chain::FAIL_FINISH_ABOVE.with(|limit| limit.set(None));
+    assert_eq!(template.unwrap().transactions, pending[..3]);
+    // After the selection changes, later templates for this tip leave that
+    // transaction out, with its sender's later nonces, rather than finding
+    // the cut again on every rebuild; another sender's newcomer is built in.
+    let newcomer = payment(config, state, &OTHER, nonce(&node, &other()), key(), 1, 0);
+    node.submit_transaction(newcomer.clone()).unwrap();
+    assert!(ids(&pool(&node).0).is_superset(&ids(&pending)));
+    let rebuilt = node.template().unwrap();
+    assert_eq!(
+        ids(&rebuilt.transactions),
+        &ids(&pending[..3]) | &ids(&[newcomer])
+    );
+    // They stay pooled, and the next tip tries them again.
+    let block = node.mine(1_000_000).unwrap();
+    assert_eq!(block.transactions, rebuilt.transactions);
+    assert_eq!(node.template().unwrap().transactions, pending[3..]);
+}
+
+#[test]
 fn a_damaged_wallet_store_stops_startup_before_history_replay() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("chain.sqlite");
@@ -1572,10 +1613,25 @@ fn same_parent_changes_wait_while_a_stratum_refresh_is_scheduled() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fixtures"),
+    ignore = "requires explicit test-fixtures funding"
+)]
 fn a_template_request_builds_at_most_three_times_while_the_tip_moves() {
     let directory = tempfile::tempdir().unwrap();
     let node = funded_node(directory.path(), 64 * 1024);
-    // A new tip arrives during each of the first seven builds.
+    let view = snapshot(&node);
+    let pending = payment(
+        view.chain.config.as_ref(),
+        view.chain.tip_state(),
+        &SECRET,
+        nonce(&node, &key()),
+        other(),
+        1,
+        0,
+    );
+    node.submit_transaction(pending.clone()).unwrap();
+    // A new tip arrives as each of the first seven builds starts.
     let builds = std::rc::Rc::new(std::cell::Cell::new(0u32));
     let (counter, mover) = (builds.clone(), node.clone());
     crate::chain::TEMPLATE_BUILD_HOOK.with(|hook| {
@@ -1589,27 +1645,34 @@ fn a_template_request_builds_at_most_three_times_while_the_tip_moves() {
     let tip = || snapshot(&node).chain.tip_hash();
     let height = || snapshot(&node).chain.tip_height();
     let stored = || node.locked().unwrap().template.is_some();
-    // Each build was overtaken by a new tip. The third is returned for its
-    // own parent, a sibling of the tip, as if the tip had moved just after it
-    // was served, rather than rebuilding for as long as the tip moves.
+    // Each of three builds was overtaken by a new tip and stopped at its
+    // next step, the last one too, so none held its build slot for an
+    // outdated parent. The request is then served an empty template, which
+    // clears no trades, for the tip then current, rather than rebuilding for
+    // as long as the tip moves. Another tip arrived as it was built, so it is
+    // a sibling of the tip, as if the tip had moved just after it was served.
     let block = node.template().unwrap();
-    assert_eq!(builds.get(), 3);
+    assert_eq!(builds.get(), 4);
+    assert!(block.transactions.is_empty());
     assert_ne!(block.header.previous, tip());
     assert_eq!(block.height, height());
-    // Stratum is told to ask again at once. Nothing is stored.
-    let (block, retry) = node.template_shared(Freshness::Throttled).unwrap();
-    assert_eq!(builds.get(), 6);
-    assert_ne!(block.header.previous, tip());
-    assert!(retry.is_some_and(|retry| retry <= Instant::now()));
-    assert!(!stored());
-    // A build overtaken once is rebuilt for the new tip and stored.
+    // Stratum gets the empty template for the current tip and is told to
+    // ask again at once. Nothing is stored.
     let (block, retry) = node.template_shared(Freshness::Throttled).unwrap();
     assert_eq!(builds.get(), 8);
+    assert!(block.transactions.is_empty());
+    assert_eq!(block.header.previous, tip());
+    assert!(retry.is_some_and(|retry| retry <= Instant::now()));
+    assert!(!stored());
+    // Once the tip rests, the selection is built for it and stored.
+    let (block, retry) = node.template_shared(Freshness::Throttled).unwrap();
+    assert_eq!(builds.get(), 9);
     assert_eq!((block.header.previous, retry), (tip(), None));
+    assert_eq!(block.transactions, vec![pending]);
     assert!(stored());
     let (again, _) = node.template_shared(Freshness::Throttled).unwrap();
     assert!(Arc::ptr_eq(&again, &block));
-    assert_eq!(builds.get(), 8);
+    assert_eq!(builds.get(), 9);
     crate::chain::TEMPLATE_BUILD_HOOK.with(|hook| hook.borrow_mut().take());
 }
 
@@ -2135,6 +2198,75 @@ fn concurrently_validated_siblings_commit_as_tip_and_side_branch() {
     check(&node);
 }
 
+/// A chain at `path` holding the node's active blocks up to `height`.
+fn copied_chain(node: &Node, path: &Path, height: u64) -> Chain {
+    let mut copy = Chain::open(path, configuration(16 * 1024)).unwrap();
+    for height in 1..=height {
+        let block = {
+            let i = node.locked().unwrap();
+            i.chain
+                .hash_at_height(height)
+                .and_then(|hash| i.chain.block(&hash))
+        }
+        .unwrap();
+        let time = block.header.timestamp as u64;
+        assert!(copy.submit(block, time).unwrap());
+    }
+    copy
+}
+/// Mine an empty child of `chain`'s tip, distinguished by `salt`, and store it.
+fn extend_copy(chain: &mut Chain, miner: PublicKey, salt: u64) -> Block {
+    let time = chain.tip_block().header.timestamp + 1;
+    let mut candidate = chain.template(miner, Vec::new(), time).unwrap();
+    candidate.extranonce = salt.to_le_bytes();
+    candidate.header.merkle_root = codec::merkle_root(&candidate).unwrap();
+    let block = Chain::mine(candidate, 1_000_000).unwrap();
+    assert!(chain.submit(block.clone(), time as u64).unwrap());
+    block
+}
+
+#[test]
+fn a_child_waiting_for_its_parent_goes_on_once_the_parent_is_stored() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    let height = snapshot(&node).chain.tip_height();
+    let mut copy = copied_chain(&node, &directory.path().join("copy.sqlite"), height);
+    let parent = extend_copy(&mut copy, node.miner, 1);
+    let child = extend_copy(&mut copy, node.miner, 2);
+    // The parent's submission stores it, then pauses before the admission
+    // that storing starts, which drains queued relays for up to a second.
+    let (paused, pause) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel::<()>();
+    let submitter = node.clone();
+    let first = std::thread::spawn(move || {
+        BLOCK_STORED_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let _ = paused.send(());
+                let _ = resumed.recv();
+            }));
+        });
+        submitter.submit_block(parent)
+    });
+    pause
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the parent was stored");
+    // Its child no longer waits for that admission: the parent's
+    // validation ended when it was stored, and the child, which waited only
+    // for that, is validated and becomes the tip meanwhile.
+    let (delivered, done) = mpsc::channel();
+    let deliverer = node.clone();
+    let expected = codec::block_hash(&child);
+    std::thread::spawn(move || {
+        let _ = delivered.send(deliverer.submit_block(child));
+    });
+    let second = done.recv_timeout(Duration::from_secs(10));
+    drop(resume);
+    assert!(first.join().unwrap().unwrap(), "the parent became the tip");
+    let second = second.expect("the child waited for its parent's admission");
+    assert!(second.unwrap(), "the child became the tip");
+    assert_eq!(snapshot(&node).chain.tip_hash(), expected);
+}
+
 #[test]
 fn a_side_branch_flood_from_one_source_spends_only_its_own_share() {
     let directory = tempfile::tempdir().unwrap();
@@ -2192,6 +2324,63 @@ fn a_new_tip_template_never_waits_for_a_build_of_the_old_tip() {
     drop(resume);
     let (served, _) = building.join().unwrap().unwrap();
     assert!(Arc::ptr_eq(&served, &block));
+}
+
+/// Run `request` on another thread while a build of the tip is claimed;
+/// once it waits for that claim, add a new tip and release the claim. The
+/// parents claimed while its own build then runs, the new tip, and what the
+/// request returned.
+fn claims_across_a_new_tip<T: Send + 'static>(
+    node: &Node,
+    request: impl FnOnce(&Node) -> T + Send + 'static,
+) -> (Vec<Hash>, Hash, T) {
+    let running = node.template_builds.claim(snapshot(node).chain.tip_hash());
+    let (paused, pause) = mpsc::channel();
+    let (resume, resumed) = mpsc::channel::<()>();
+    let requester = node.clone();
+    let thread = std::thread::spawn(move || {
+        crate::chain::TEMPLATE_BUILD_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let _ = paused.send(());
+                let _ = resumed.recv();
+            }));
+        });
+        request(&requester)
+    });
+    // Let it read the tip and wait for that tip's build.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(node.submit_block(empty_block(node)).unwrap());
+    let tip = snapshot(node).chain.tip_hash();
+    drop(running);
+    pause
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the request's build started");
+    let claimed = node.template_builds.running.unpoisoned().clone();
+    drop(resume);
+    (claimed, tip, thread.join().unwrap())
+}
+
+#[test]
+fn a_template_build_is_claimed_for_the_tip_it_extends() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 64 * 1024);
+    // A request that waited for a build of the old tip builds the new one
+    // under a claim for the new tip, so another request for it waits and
+    // reuses that build rather than running a second one beside it.
+    let (claimed, tip, served) =
+        claims_across_a_new_tip(&node, |node| node.template_shared(Freshness::Throttled));
+    assert_eq!(claimed, vec![tip]);
+    let (served, retry) = served.unwrap();
+    assert_eq!((served.header.previous, retry), (tip, None));
+    let (again, _) = node.template_shared(Freshness::Throttled).unwrap();
+    assert!(Arc::ptr_eq(&again, &served));
+    // So does a block for another payout key.
+    let (claimed, tip, mined) =
+        claims_across_a_new_tip(&node, |node| node.mine_to(1_000_000, other()));
+    assert_eq!(claimed, vec![tip]);
+    let mined = mined.unwrap();
+    assert_eq!(mined.header.previous, tip);
+    assert_eq!(snapshot(&node).chain.tip_hash(), codec::block_hash(&mined));
 }
 
 #[test]
@@ -2353,6 +2542,70 @@ fn a_side_block_rebuilding_its_parent_state_is_bounded_before_any_replay() {
     let resumed = replayed();
     assert!(stored(&node, &side));
     assert_eq!(resumed, 45 - 32 - 1, "the replay resumed from its progress");
+}
+
+#[test]
+fn a_reorg_replay_sizes_its_lock_holds_by_their_time() {
+    let directory = tempfile::tempdir().unwrap();
+    let node = funded_node(directory.path(), 16 * 1024);
+    for _ in 0..92 {
+        node.mine(1_000_000).unwrap();
+    }
+    // A branch from height 45, below the dense checkpoints and between
+    // sparse ones, whose headers claim more work than the tip: its blocks
+    // are validated as blocks that would become the tip, which are never
+    // refused, and its first block's parent state is replayed from the
+    // checkpoint at height 32.
+    let mut fork = copied_chain(&node, &directory.path().join("fork.sqlite"), 45);
+    let mut branch = Vec::new();
+    loop {
+        let block = extend_copy(&mut fork, node.miner, 7);
+        let mut i = node.locked().unwrap();
+        let held = i.chain.hold_header(block.header.clone(), now(), 0);
+        drop(i);
+        branch.push(block);
+        match held.unwrap() {
+            HeaderHold::Admitted => break,
+            held => assert_eq!(held, HeaderHold::Held),
+        }
+        assert!(branch.len() < 200, "the branch never claimed more work");
+    }
+    // The first hold replays one historical block. Each later hold replays
+    // as many as fit REPLAY_HOLD_TIME at the pace the previous one took:
+    // one after holds counted as a second each, and REPLAY_STEPS_PER_HOLD
+    // after a quick one.
+    let holds = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let recorded = holds.clone();
+    REPLAY_HOLD_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let mut recorded = recorded.borrow_mut();
+            recorded.push(crate::chain::REPLAYED_BLOCKS.with(|count| count.replace(0)));
+            if recorded.len() <= 2 {
+                Duration::from_secs(1)
+            } else {
+                Duration::ZERO
+            }
+        }));
+    });
+    crate::chain::REPLAYED_BLOCKS.with(|count| count.set(0));
+    let first = node.submit_block(branch[0].clone());
+    REPLAY_HOLD_HOOK.with(|hook| hook.borrow_mut().take());
+    assert!(!first.unwrap(), "stored, not yet the tip");
+    assert!(stored(&node, &branch[0]));
+    assert_eq!(*holds.borrow(), vec![1, 1, 1, REPLAY_STEPS_PER_HOLD, 2]);
+    assert_eq!(
+        holds.borrow().iter().sum::<usize>(),
+        45 - 32,
+        "each historical block was replayed once"
+    );
+    // The rest of the branch then takes over.
+    for block in &branch[1..] {
+        node.submit_block(block.clone()).unwrap();
+    }
+    assert_eq!(
+        snapshot(&node).chain.tip_hash(),
+        codec::block_hash(branch.last().unwrap())
+    );
 }
 
 #[test]

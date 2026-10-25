@@ -112,14 +112,20 @@ const AGGREGATE_STRIKES: usize = 4;
 /// byte and work budgets.
 pub const PUBLIC_WEB_SESSIONS: usize = 32;
 pub const PUBLIC_WEB_VISITOR_SESSIONS: usize = 6;
-/// A visitor's share is one over the number of visitors active in the last
-/// `PUBLIC_WEB_VISITOR_ACTIVITY`, kept between these bounds, so a few
-/// addresses cannot take the whole budget while many are active.
+/// A visitor's share is one over the number of visitor shares active in the
+/// last `PUBLIC_WEB_VISITOR_ACTIVITY`, kept between these bounds, so a few
+/// addresses cannot take the whole budget while many are active. A network
+/// counts one share per active address, up to the `AGGREGATE_SHARE` its
+/// aggregate may spend. The count is recomputed at most once per
+/// `PUBLIC_WEB_SHARE_REFRESH`, not on every charge.
 const PUBLIC_WEB_VISITOR_SHARE: u64 = 8;
 const PUBLIC_WEB_MAX_VISITOR_SHARE: u64 = 32;
 const PUBLIC_WEB_VISITOR_ACTIVITY: Duration = Duration::from_secs(10);
-/// One over this much of the proxy's work and byte bursts is kept for
-/// wallet-critical calls: other calls must leave it in the bucket.
+const PUBLIC_WEB_SHARE_REFRESH: Duration = Duration::from_millis(100);
+/// One over this much of the proxy's request, work and byte bursts is kept
+/// for wallet-critical calls: other calls must leave it in the bucket. The
+/// proxy's request refill is this much above what visitors' shares together
+/// refill, because every call spends request units before it is known.
 const PUBLIC_WEB_ESSENTIAL_SHARE: u64 = 4;
 /// A public reply whose method price is flat, such as an explorer read, pays
 /// one work unit per this many bytes it returns. Public work bursts admit the
@@ -525,8 +531,12 @@ impl Drop for FrameDecoding {
 pub struct NetworkGuard {
     max_frame_bytes: AtomicU64,
     max_peer_work: AtomicU64,
+    /// The work of one largest valid RPC request at the current capacity.
+    max_rpc_work: AtomicU64,
     loopback_rpc_is_proxy: bool,
     records: Mutex<HashMap<Key, Record>>,
+    /// The public website's visitor share and when it was computed.
+    share_cache: Mutex<Option<(Instant, u64)>>,
     frame_memory: Mutex<FrameMemory>,
 }
 pub struct Session {
@@ -591,6 +601,11 @@ impl NetworkGuard {
             policy.bytes = policy.bytes.max(session);
             policy.byte_burst = policy.byte_burst.max(session);
         }
+        if surface == Surface::Rpc {
+            policy.work_burst = policy
+                .work_burst
+                .max(self.max_rpc_work.load(Ordering::Relaxed));
+        }
         policy
     }
     #[cfg(test)]
@@ -614,55 +629,92 @@ impl NetworkGuard {
         }
         aggregate_prefix(key.0, key.1).map(|prefix| (prefix, key.1, key.2, Scope::Aggregate))
     }
-    /// The proxy's work and byte reserve for wallet-critical calls.
-    fn essential_reserve() -> (u64, u64) {
+    /// The proxy's request, byte and work reserve for wallet-critical calls.
+    fn essential_reserve() -> (u64, u64, u64) {
         let base = Surface::Rpc.policy();
         (
+            base.request_burst / PUBLIC_WEB_ESSENTIAL_SHARE,
             base.byte_burst / PUBLIC_WEB_ESSENTIAL_SHARE,
             base.work_burst / PUBLIC_WEB_ESSENTIAL_SHARE,
         )
     }
     /// A visitor's share of the proxy's budgets: one over the number of
-    /// visitor networks (named or direct) holding a session or admitted in
-    /// the last ten seconds, within bounds. A visitor with an aggregate is
-    /// counted by it, so the addresses of one /24 or /48 count once, and an
-    /// attempt that admission refused counts not at all. Unused on the
-    /// private guard.
+    /// visitor shares (named or direct) holding a session or admitted in the
+    /// last ten seconds, within bounds. Each such address is one share, and
+    /// the addresses of one /24 or /48 count at most the four shares their
+    /// aggregate may spend, so visitors' refill rates together stay within
+    /// the proxy's while at most 32 shares are active, and the many addresses
+    /// of one prefix cannot shrink everyone else's share further. An attempt
+    /// that admission refused counts not at all. The share is reused for
+    /// `PUBLIC_WEB_SHARE_REFRESH`, so a charge does not scan the table each
+    /// time. Unused on the private guard.
     fn visitor_share(&self, records: &HashMap<Key, Record>, now: Instant) -> u64 {
         if !self.loopback_rpc_is_proxy {
             return PUBLIC_WEB_VISITOR_SHARE;
         }
-        let active = records
-            .iter()
-            .filter(|(key, record)| {
-                key.1 == Surface::Rpc
-                    && !self.is_proxy(**key)
-                    && (key.3 == Scope::Aggregate || self.aggregate_of(**key).is_none())
-                    && (record.active > 0
-                        || record.admitted.is_some_and(|at| {
-                            now.saturating_duration_since(at) < PUBLIC_WEB_VISITOR_ACTIVITY
-                        }))
-            })
-            .count();
-        (active as u64).clamp(PUBLIC_WEB_VISITOR_SHARE, PUBLIC_WEB_MAX_VISITOR_SHARE)
+        let mut cached = accounting(&self.share_cache);
+        if let Some((at, share)) = *cached
+            && now >= at
+            && now.duration_since(at) < PUBLIC_WEB_SHARE_REFRESH
+        {
+            return share;
+        }
+        let share = self.count_visitor_shares(records, now);
+        *cached = Some((now, share));
+        share
+    }
+    /// The visitor share as of `now`, counted afresh.
+    fn count_visitor_shares(&self, records: &HashMap<Key, Record>, now: Instant) -> u64 {
+        let mut members: HashMap<Key, u64> = HashMap::new();
+        let mut shares = 0u64;
+        for (key, record) in records {
+            let active = record.active > 0
+                || record.admitted.is_some_and(|at| {
+                    now.saturating_duration_since(at) < PUBLIC_WEB_VISITOR_ACTIVITY
+                });
+            if key.1 != Surface::Rpc || key.3 != Scope::Address || self.is_proxy(*key) || !active {
+                continue;
+            }
+            match self.aggregate_of(*key) {
+                Some(aggregate) => {
+                    let counted = members.entry(aggregate).or_default();
+                    if *counted < AGGREGATE_SHARE {
+                        *counted += 1;
+                        shares += 1;
+                    }
+                }
+                None => shares += 1,
+            }
+        }
+        shares.clamp(PUBLIC_WEB_VISITOR_SHARE, PUBLIC_WEB_MAX_VISITOR_SHARE)
     }
     fn key_policy_at(&self, key: Key, share: u64, frame: u64) -> Policy {
         let mut policy = self.policy_at(key.1, frame);
         if self.loopback_rpc_is_proxy && key.1 == Surface::Rpc {
             let base = Surface::Rpc.policy();
-            // The work one largest public reply pays for its bytes.
+            // The work one largest public reply pays for its bytes, and the
+            // work one largest request, such as a broadcast, is charged.
             let reply_work = frame / REPLY_BYTES_PER_WORK;
+            let largest_work = reply_work.max(self.max_rpc_work.load(Ordering::Relaxed));
             if self.is_proxy(key) {
                 policy.connections = PUBLIC_WEB_SESSIONS;
-                // One largest reply still fits above the essential reserve.
-                let (bytes, work) = Self::essential_reserve();
+                // Visitors' shares together refill at most the base request
+                // rate, so the reserve above it stays for calls that every
+                // request pays before it is known. One largest reply or
+                // request still fits above the essential reserve.
+                let (requests, bytes, work) = Self::essential_reserve();
+                policy.requests = base
+                    .requests
+                    .saturating_add(base.requests / PUBLIC_WEB_ESSENTIAL_SHARE);
+                policy.request_burst = base.request_burst.saturating_add(requests);
                 policy.byte_burst = base.byte_burst.max(frame.saturating_add(bytes));
-                policy.work_burst = base.work_burst.max(reply_work.saturating_add(work));
+                policy.work_burst = base.work_burst.max(largest_work.saturating_add(work));
             } else {
                 // Refill rates are the visitor's current share. Bursts stay
                 // an eighth whatever the share, and still admit one largest
-                // reply's bytes and work, so how many others are active
-                // changes how long a call waits, never whether it can fit.
+                // reply's bytes and work and one largest request's work, so
+                // how many others are active changes how long a call waits,
+                // never whether it can fit.
                 let burst = PUBLIC_WEB_VISITOR_SHARE;
                 policy.connections = PUBLIC_WEB_VISITOR_SESSIONS;
                 policy.requests = (base.requests / share).max(1);
@@ -670,7 +722,7 @@ impl NetworkGuard {
                 policy.bytes = (base.bytes / share).max(1);
                 policy.byte_burst = (base.byte_burst / burst).max(frame);
                 policy.work = (base.work / share).max(1);
-                policy.work_burst = (base.work_burst / burst).max(reply_work);
+                policy.work_burst = (base.work_burst / burst).max(largest_work);
             }
         }
         if key.3 == Scope::Aggregate {
@@ -703,6 +755,41 @@ impl NetworkGuard {
                 let new = base.max(maximum).saturating_mul(factor);
                 record.work.tokens = record.work.tokens.saturating_add(new - old).min(new);
             }
+        }
+        Ok(())
+    }
+    /// The work of one largest valid RPC request, such as the broadcast of a
+    /// largest transaction at a governed capacity, must remain admissible:
+    /// every RPC work burst, a public visitor's and the proxy's above its
+    /// reserve included, grows to at least `maximum`. A request within the
+    /// governed transaction size is then never refused as larger than a
+    /// whole burst, which would also penalize its sender. Like the peer
+    /// allowance it only grows; refill rates do not change.
+    pub fn allow_rpc_work(&self, maximum: usize) -> Result<()> {
+        let maximum = u64::try_from(maximum)?;
+        if maximum <= self.max_rpc_work.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let mut records = accounting(&self.records);
+        let share = self.visitor_share(&records, Instant::now());
+        let old: Vec<(Key, u64)> = records
+            .keys()
+            .filter(|key| key.1 == Surface::Rpc)
+            .map(|key| (*key, self.key_policy(*key, share).work_burst))
+            .collect();
+        if maximum <= self.max_rpc_work.fetch_max(maximum, Ordering::Relaxed) {
+            return Ok(());
+        }
+        for (key, old) in old {
+            let new = self.key_policy(key, share).work_burst;
+            let record = records
+                .get_mut(&key)
+                .expect("held under the accounting lock");
+            record.work.tokens = record
+                .work
+                .tokens
+                .saturating_add(new.saturating_sub(old))
+                .min(new);
         }
         Ok(())
     }
@@ -992,9 +1079,10 @@ impl Session {
         self.charge(0, bytes as u64, work as u64, false)
     }
     /// Mark the rest of this public session as a call that is not
-    /// wallet-critical: its work and reply bytes must leave the proxy's
-    /// essential reserve in place. Charges made before the call is known,
-    /// such as for its request bytes, may use the whole budget.
+    /// wallet-critical: its requests, work and reply bytes must leave the
+    /// proxy's essential reserve in place. Charges made before the call is
+    /// known, such as for a JSON-RPC request's unit and bytes, may use the
+    /// whole budget.
     pub fn nonessential(&self) {
         self.nonessential.store(true, Ordering::Relaxed);
     }
@@ -1168,17 +1256,17 @@ impl Session {
         let reserve = if self.nonessential.load(Ordering::Relaxed) {
             NetworkGuard::essential_reserve()
         } else {
-            (0, 0)
+            (0, 0, 0)
         };
         // A charge is admitted by every record or by none, so a visitor past
         // its share, or members past their aggregate, spend nothing. The
         // first record that refuses says when this charge fits again.
         for (key, member) in keys.into_iter().flatten() {
             let p = self.guard.key_policy(key, share);
-            let (byte_floor, work_floor) = if self.guard.is_proxy(key) {
+            let (request_floor, byte_floor, work_floor) = if self.guard.is_proxy(key) {
                 reserve
             } else {
-                (0, 0)
+                (0, 0, 0)
             };
             let record = records
                 .get_mut(&key)
@@ -1191,7 +1279,8 @@ impl Session {
             record.requests.take(0, p.requests, p.request_burst, now);
             record.bytes.take(0, p.bytes, p.byte_burst, now);
             record.work.take(0, p.work, p.work_burst, now);
-            let (bytes, work) = (
+            let (requests, bytes, work) = (
+                requests.saturating_add(request_floor),
                 bytes.saturating_add(byte_floor),
                 work.saturating_add(work_floor),
             );
@@ -1225,6 +1314,50 @@ impl Session {
             record.admitted = Some(now);
         }
         Ok(())
+    }
+    /// Return `work` this session paid and did not use, such as the unused
+    /// part of a reply's reservation, to every record that paid it.
+    pub fn refund_work(&self, work: usize) {
+        if work == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let mut records = accounting(&self.guard.records);
+        let share = self.guard.visitor_share(&records, now);
+        for (key, _) in self.keys().into_iter().flatten() {
+            let p = self.guard.key_policy(key, share);
+            if let Some(record) = records.get_mut(&key) {
+                record.work.give(work as u64, p.work, p.work_burst, now);
+            }
+        }
+    }
+    /// The visitor that this proxied session tried to name was refused:
+    /// return the connection unit the proxy's record paid when the session
+    /// was admitted, before anyone knew whose it was. Attempts that a
+    /// visitor's own quota or cooldown refuses then never spend the request
+    /// budget that all visitors share. Call it once, after `forwarded_for`
+    /// failed.
+    pub fn refund_refused_visitor(&self) {
+        if !self.proxied() || self.visitor.get().is_some() {
+            return;
+        }
+        let now = Instant::now();
+        let mut records = accounting(&self.guard.records);
+        let share = self.guard.visitor_share(&records, now);
+        let p = self.guard.key_policy(self.key, share);
+        if let Some(record) = records.get_mut(&self.key) {
+            record.requests.give(1, p.requests, p.request_burst, now);
+        }
+    }
+    /// The network whose public sessions this one counts with when the
+    /// public session pool is full: its /24 or /48 aggregate, or on a local
+    /// network its own address. `None` for the public website's proxy, which
+    /// carries many visitors behind its own limits.
+    pub fn network(&self) -> Option<IpAddr> {
+        if self.proxied() {
+            return None;
+        }
+        Some(self.aggregate.map_or(self.key.0, |aggregate| aggregate.0))
     }
     /// Only malformed framing/JSON and explicit resource violations trigger this.
     /// Ordinary stale transactions, unknown parents and competing forks do not.
@@ -3368,8 +3501,10 @@ mod tests {
             session.forwarded_for(client).unwrap();
             session
         };
-        let share = || guard.visitor_share(&guard.records.lock().unwrap(), Instant::now());
-        // Forty /64s of one /48 are one network: the share stays an eighth.
+        // Counted afresh: charges reuse a share for up to 100 milliseconds.
+        let share = || guard.count_visitor_shares(&guard.records.lock().unwrap(), Instant::now());
+        // Forty /64s of one /48 count at most the four shares their aggregate
+        // may spend: the share stays an eighth.
         for n in 0..40 {
             visitor(IpAddr::from([0x2001, 0xdb8, 0x77, n, 0, 0, 0, 1]))
                 .request()
@@ -3410,6 +3545,187 @@ mod tests {
         for _ in 0..48 {
             visitor(browser).request().unwrap();
         }
+    }
+    #[test]
+    fn the_visitor_share_counts_each_prefix_up_to_its_aggregate_and_is_reused_briefly() {
+        let guard = Arc::new(NetworkGuard::for_public_web());
+        let now = Instant::now();
+        let direct = |ip: IpAddr| {
+            guard
+                .admit_at(ip, Surface::Rpc, Direction::Inbound, now)
+                .unwrap()
+        };
+        // Two /24s with six active addresses each, as the finding's attack
+        // used, count four shares each: what their aggregates may spend, not
+        // one each as before. Two lone addresses add one each.
+        let mut held = Vec::new();
+        for net in [1u8, 2] {
+            for host in 1..=6 {
+                held.push(direct(IpAddr::from([198, 51, net, host])));
+            }
+        }
+        for net in [3u8, 4] {
+            held.push(direct(IpAddr::from([198, 51, net, 1])));
+        }
+        let counted = guard.count_visitor_shares(&guard.records.lock().unwrap(), now);
+        assert_eq!(counted, 10);
+        // The shares' request refill together stays within the base rate the
+        // proxy keeps above its reserve, unlike two networks taking it all.
+        let first = now + PUBLIC_WEB_SHARE_REFRESH;
+        let share = guard.visitor_share(&guard.records.lock().unwrap(), first);
+        assert_eq!(share, 10);
+        let rate = |ip: IpAddr| {
+            let key = (ip, Surface::Rpc, Direction::Inbound, Scope::Address);
+            let aggregate = guard.aggregate_of(key).unwrap();
+            guard.key_policy(aggregate, share).requests
+        };
+        let base = Surface::Rpc.policy().requests;
+        let together = 2 * rate("198.51.1.1".parse().unwrap())
+            + 2 * guard
+                .key_policy(
+                    (
+                        "198.51.3.1".parse().unwrap(),
+                        Surface::Rpc,
+                        Direction::Inbound,
+                        Scope::Address,
+                    ),
+                    share,
+                )
+                .requests;
+        assert!(together <= base, "{together}");
+        let proxy = (
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Surface::Rpc,
+            Direction::Inbound,
+            Scope::Address,
+        );
+        assert_eq!(
+            guard.key_policy(proxy, share).requests,
+            base + base / PUBLIC_WEB_ESSENTIAL_SHARE
+        );
+        // Charges and admissions reuse the share for 100 milliseconds instead
+        // of scanning the accounting table each time, then count it afresh.
+        for net in 10u8..30 {
+            held.push(
+                guard
+                    .admit_at(
+                        IpAddr::from([203, 0, net, 1]),
+                        Surface::Rpc,
+                        Direction::Inbound,
+                        first,
+                    )
+                    .unwrap(),
+            );
+        }
+        let soon = first + Duration::from_millis(50);
+        assert_eq!(
+            guard.visitor_share(&guard.records.lock().unwrap(), soon),
+            10
+        );
+        let later = first + PUBLIC_WEB_SHARE_REFRESH;
+        assert_eq!(
+            guard.visitor_share(&guard.records.lock().unwrap(), later),
+            30
+        );
+    }
+    #[test]
+    fn refused_visitors_and_page_floods_leave_the_proxys_request_reserve() {
+        let guard = Arc::new(NetworkGuard::for_public_web());
+        let proxy: IpAddr = "127.0.0.1".parse().unwrap();
+        // A visitor in a long cooldown keeps trying through the proxy, more
+        // times than the proxy's whole request burst. Each attempt is refused
+        // by the visitor's own record and returns the unit the proxy paid to
+        // admit its connection.
+        let cooling: IpAddr = "198.51.100.77".parse().unwrap();
+        let named = (cooling, Surface::Rpc, Direction::Forwarded, Scope::Address);
+        guard.records.lock().unwrap().insert(named, {
+            let mut record = Record::new(guard.key_policy(named, 8), Instant::now());
+            record.cooldown = Instant::now() + Duration::from_secs(60);
+            record
+        });
+        for _ in 0..2_000 {
+            let session = guard.admit(proxy, Surface::Rpc).unwrap();
+            assert!(session.forwarded_for(cooling).is_err());
+            session.refund_refused_visitor();
+        }
+        // Wallet calls of other visitors are still admitted.
+        let wallet = guard.admit(proxy, Surface::Rpc).unwrap();
+        wallet.forwarded_for("192.0.2.40".parse().unwrap()).unwrap();
+        wallet.request().unwrap();
+        drop(wallet);
+        // Page loads are not wallet-critical: their request units leave a
+        // quarter of the proxy's base burst, which a wallet call may spend.
+        let pages = guard.admit(proxy, Surface::Rpc).unwrap();
+        pages.nonessential();
+        while pages.request().is_ok() {}
+        let level = guard.records.lock().unwrap()[&(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Surface::Rpc,
+            Direction::Inbound,
+            Scope::Address,
+        )]
+            .requests
+            .tokens;
+        let (floor, _, _) = NetworkGuard::essential_reserve();
+        assert!((floor..floor + 8).contains(&level), "{level}");
+        let wallet = guard.admit(proxy, Surface::Rpc).unwrap();
+        wallet.request().unwrap();
+    }
+    #[test]
+    fn every_rpc_work_burst_admits_one_largest_request() {
+        // A broadcast of a 64 MiB transaction pays about 1.98 million units,
+        // more than the private RPC burst of 1,048,576; one of 8 MiB pays
+        // about 250,000, more than a visitor's 197,632 burst.
+        let largest = 1_980_000;
+        let private = Arc::new(NetworkGuard::default());
+        let local = private
+            .admit("127.0.0.1".parse().unwrap(), Surface::Rpc)
+            .unwrap();
+        assert!(private.policy(Surface::Rpc).work_burst < largest as u64);
+        // Once the capacity's largest request is allowed, an existing session
+        // is admitted at once, and a lower allowance changes nothing.
+        private.allow_rpc_work(largest).unwrap();
+        private.allow_rpc_work(1).unwrap();
+        assert_eq!(private.policy(Surface::Rpc).work_burst, largest as u64);
+        local.work(largest).unwrap();
+        // A public visitor's burst, and the proxy's above its reserve, too.
+        let public = Arc::new(NetworkGuard::for_public_web());
+        public.set_frame(193 * 1024 * 1024).unwrap();
+        let visitor = public
+            .admit("127.0.0.1".parse().unwrap(), Surface::Rpc)
+            .unwrap();
+        visitor
+            .forwarded_for("198.51.100.90".parse().unwrap())
+            .unwrap();
+        let broadcast = 250_000;
+        let named = visitor.visitor.get().unwrap().0;
+        assert!(public.key_policy(named, 8).work_burst < broadcast as u64);
+        public.allow_rpc_work(broadcast).unwrap();
+        visitor.work(broadcast).unwrap();
+    }
+    #[test]
+    fn unused_reserved_work_returns_to_every_record_that_paid_it() {
+        let guard = Arc::new(NetworkGuard::for_public_web());
+        let proxy: IpAddr = "127.0.0.1".parse().unwrap();
+        let visitor = guard.admit(proxy, Surface::Rpc).unwrap();
+        visitor
+            .forwarded_for("198.51.100.92".parse().unwrap())
+            .unwrap();
+        let burst = guard
+            .key_policy(visitor.visitor.get().unwrap().0, 8)
+            .work_burst as usize;
+        visitor.outgoing(0, burst).unwrap();
+        assert!(visitor.outgoing(0, 20_000).is_err());
+        visitor.refund_work(burst / 2);
+        visitor.outgoing(0, burst / 2 - 1_000).unwrap();
+        assert!(visitor.outgoing(0, 20_000).is_err());
+        // A direct client's own record and its aggregate are refunded too.
+        let direct = guard
+            .admit("198.51.101.1".parse().unwrap(), Surface::Rpc)
+            .unwrap();
+        direct.outgoing(0, burst).unwrap();
+        direct.refund_work(burst);
+        direct.outgoing(0, burst - 1_000).unwrap();
     }
     #[test]
     fn a_lower_frame_allowance_lowers_byte_bursts_and_frame_memory_again() {

@@ -361,20 +361,25 @@
     // reorganization; the node then drops it without notice. Follow each
     // form's last submission by sender nonce until it leaves the pool.
     //
-    // A broadcast answered by anything but a 429 or 503 refusal may have run,
-    // even when its answer was an error or never arrived: the transaction can
-    // be pending and relayed. Such an uncertain submission is followed the
-    // same way and blocks its form, whose next submission would sign a second
-    // transaction at the next nonce, until the snapshots show its nonce
-    // pending or used, or twice show it free. Its exact signed bytes can be
-    // sent again meanwhile: the node answers a transaction it already holds
-    // with the same ID, and one nonce can be used only once. The node's own
-    // answer (which may say "try again") is shown only once the transaction
-    // is known not to be pending.
+    // A broadcast answered by anything but the node's own 429 or 503 refusal
+    // may have run, even when its answer was an error or never arrived: the
+    // transaction can be pending and relayed. Such an uncertain submission is
+    // followed the same way and blocks its form, whose next submission would
+    // sign a second transaction at the next nonce, until the snapshots show
+    // it pending, show another transaction at its nonce, show its nonce used
+    // (then the transaction is looked up by its ID), or twice show its nonce
+    // free. Its exact signed bytes can be sent again meanwhile: the node
+    // answers a transaction it already holds with the same ID, and one nonce
+    // can be used only once. The node's own answer (which may say "try
+    // again") is shown only once the transaction is known not to be pending.
+    //
+    // `chain` is the network the transaction was signed for, not the page's
+    // current one: another tab's wallet change resets the page's context
+    // while a broadcast is still in flight.
     const submissions = new Map;
     let refreshSerial = 0;
-    function trackSubmission(form, id, sender, nonce, uncertain = null) {
-        const tracked = {id: id, sender: sender, chain: state.status?.chain_id, nonce: BigInt(nonce), misses: 0, since: refreshSerial, uncertain: uncertain};
+    function trackSubmission(form, id, sender, nonce, chain, uncertain = null) {
+        const tracked = {id: id, sender: sender, chain: chain, nonce: BigInt(nonce), misses: 0, since: refreshSerial, uncertain: uncertain};
         submissions.set(form.id, tracked);
         showSubmission(form, tracked);
     }
@@ -385,18 +390,39 @@
     function mailDraft(form) {
         return form.id === "mail-form" ? JSON.stringify([ form.elements.recipient.value, form.elements.subject.value, form.elements.message.value ]) : null;
     }
-    // An uncertain submission found pending was sent after all: a mail draft
-    // it carried, still unchanged, is cleared as after an answered send.
+    // An uncertain submission found pending or mined was sent after all: a
+    // mail draft it carried, still unchanged, is cleared as after an answered
+    // send.
     function submissionSent(form, uncertain) {
         uncertain.draft !== null && uncertain.draft === mailDraft(form) && mail?.sent();
     }
+    // The fields of a pending row that identify an uncertain submission's
+    // signed body. Rows carry the fee, anchor, lifetime and operation (a
+    // summary lists a large grant's first payments and their count, and only
+    // a full row carries the data), not the signature: another tab or form
+    // can sign a different transaction at the same nonce, or replace it.
+    function signedFields(body) {
+        return {fee: String(body.fee), anchor: hex(body.anchor).toLowerCase(), expiry_blocks: String(body.expiry_blocks), operation: body.operation, data_hex: String(body.data_hex || "").toLowerCase()};
+    }
+    function pendingMatches(row, signed) {
+        const body = row?.body;
+        if (!body || !signed || String(body.fee) !== signed.fee || hex(body.anchor).toLowerCase() !== signed.anchor || String(body.expiry_blocks) !== signed.expiry_blocks) return false;
+        if (body.data !== void 0 && hex(body.data).toLowerCase() !== signed.data_hex) return false;
+        let operation = signed.operation;
+        const payments = operation?.Propose?.proposal?.Grant?.payments, listed = body.operation?.Propose?.proposal?.Grant?.payments;
+        if (row.truncated && Array.isArray(payments) && Array.isArray(listed)) {
+            if (row.payment_count !== payments.length) return false;
+            operation = {Propose: {...operation.Propose, proposal: {Grant: {payments: payments.slice(0, listed.length)}}}};
+        }
+        return HashstashBrowserWallet.sameOperation?.(body.operation, operation) === true;
+    }
     function showSubmission(form, tracked) {
-        const uncertain = tracked.uncertain;
-        feedback(form, uncertain ? `Result unknown · ${short(tracked.id)}: the node may have received this transaction although its answer was lost or was an error. Checking whether it is pending. Do not submit it again.${uncertain.note ? ` ${uncertain.note}` : ""} ` : `Pending · ${short(tracked.id)}`, !!uncertain);
+        const uncertain = tracked.uncertain, checking = !!uncertain?.used;
+        feedback(form, !uncertain ? `Pending · ${short(tracked.id)}` : checking ? `Checking · ${short(tracked.id)}: transaction number ${tracked.nonce} is now used, by this transaction or another one from this account. Looking it up. Do not submit it again.` : `Result unknown · ${short(tracked.id)}: the node may have received this transaction although its answer was lost or was an error. Checking whether it is pending. Do not submit it again.${uncertain.note ? ` ${uncertain.note}` : ""} `, !!uncertain && !checking);
         const node = form.querySelector(".form-feedback");
         if (!node) return;
         node.dataset.submission = tracked.id;
-        if (!uncertain) return;
+        if (!uncertain || checking) return;
         const resend = append(node, "button", "small-link submission-resend", "Send the same transaction again");
         resend.type = "button";
         resend.disabled = !!uncertain.resending;
@@ -404,7 +430,7 @@
     }
     async function resendSubmission(form, tracked) {
         const uncertain = tracked.uncertain;
-        if (!uncertain || uncertain.resending || submissions.get(form.id) !== tracked) return;
+        if (!uncertain || uncertain.resending || uncertain.checking || submissions.get(form.id) !== tracked) return;
         uncertain.resending = true;
         uncertain.note = "";
         showSubmission(form, tracked);
@@ -428,6 +454,38 @@
         }
         await refresh();
     }
+    // An uncertain submission whose nonce is used was mined, or another
+    // transaction used its nonce: the account does not say which. Only finding
+    // the transaction by its ID is conclusive, since the explorer index can lag
+    // the tip; it is looked up after a few snapshots, and otherwise the form
+    // says that it cannot tell and keeps a mail draft.
+    const USED_LOOKUPS = 3;
+    async function usedSubmission(form, tracked) {
+        const uncertain = tracked.uncertain;
+        uncertain.used = uncertain.checking = true;
+        uncertain.lookups = (uncertain.lookups || 0) + 1;
+        showSubmission(form, tracked);
+        let status = null;
+        try {
+            status = (await rpc("explorer_transaction", {
+                txid: tracked.id
+            }))?.transaction?.status;
+        } catch {}
+        if (submissions.get(form.id) !== tracked) return;
+        uncertain.checking = false;
+        // A submission is settled on its own account, and not found yet is
+        // asked again with a later snapshot.
+        if (tracked.sender !== key() || status !== "confirmed" && uncertain.lookups < USED_LOOKUPS) {
+            tracked.sender === key() && showSubmission(form, tracked);
+            return;
+        }
+        submissions.delete(form.id);
+        if (status === "confirmed") {
+            submissionSent(form, uncertain);
+            feedback(form, `Mined · ${short(tracked.id)}`);
+        } else feedback(form, `Transaction number used · ${short(tracked.id)}: this transaction or another one from this account used transaction number ${tracked.nonce}, and this page could not find which. Look it up in Explorer before you submit it again.`, true);
+        modeButtons();
+    }
     function followSubmissions(cleared, serial) {
         for (const [formId, tracked] of submissions) {
             const form = $(formId);
@@ -440,6 +498,7 @@
                 tracked.uncertain || submissions.delete(formId);
                 continue;
             }
+            if (tracked.uncertain?.checking) continue;
             const node = form.querySelector(".form-feedback");
             let shown = node?.dataset.submission === tracked.id;
             if (!shown && !tracked.uncertain && !(cleared && node?.textContent === "")) {
@@ -448,16 +507,31 @@
                 submissions.delete(formId);
                 continue;
             }
+            const uncertain = tracked.uncertain, answer = uncertain?.answer ? ` Its reply was: ${uncertain.answer.replace(/[.\s]+$/, "")}.` : "";
             if (BigInt(state.account?.account?.nonce || "0") > tracked.nonce) {
+                if (uncertain) {
+                    uncertain.resending || usedSubmission(form, tracked);
+                    continue;
+                }
                 submissions.delete(formId);
                 feedback(form, `Mined or replaced · ${short(tracked.id)}`);
                 continue;
             }
-            if (ownPending().some(tx => hex(tx.body?.sender) === tracked.sender && BigInt(tx.body.nonce) === tracked.nonce)) {
+            // Free again, as after a reorganization.
+            uncertain?.used && (uncertain.used = false, shown = false);
+            const row = ownPending().find(tx => hex(tx.body?.sender) === tracked.sender && BigInt(tx.body.nonce) === tracked.nonce);
+            if (row) {
                 tracked.misses = 0;
-                if (tracked.uncertain && !tracked.uncertain.resending) {
+                if (uncertain && !uncertain.resending) {
+                    if (!pendingMatches(row, uncertain.signed)) {
+                        // Another transaction holds the nonce, so this one is
+                        // not pending and a mail draft stays.
+                        submissions.delete(formId);
+                        feedback(form, `Not pending · ${short(tracked.id)}: another transaction from this account is pending with its transaction number ${tracked.nonce}, so this one was not accepted or was replaced.${answer} Submit it again if it is still needed.`, true);
+                        continue;
+                    }
                     // Its broadcast ran: an ordinary pending submission now.
-                    submissionSent(form, tracked.uncertain);
+                    submissionSent(form, uncertain);
                     tracked.uncertain = null;
                     shown = false;
                 }
@@ -474,8 +548,7 @@
                 continue;
             }
             submissions.delete(formId);
-            const answer = tracked.uncertain?.answer;
-            feedback(form, tracked.uncertain ? `Not pending · ${short(tracked.id)} is not in the pool and its transaction number is unused: it was not accepted, or it expired.${answer ? ` Its reply was: ${answer.replace(/[.\s]+$/, "")}.` : ""} Submit it again.` : `No longer pending · ${short(tracked.id)} expired or was invalidated by a reorganization. Prepare it again.`, true);
+            feedback(form, uncertain ? `Not pending · ${short(tracked.id)} is not in the pool and its transaction number is unused: it was not accepted, or it expired.${answer} Submit it again.` : `No longer pending · ${short(tracked.id)} expired or was invalidated by a reorganization. Prepare it again.`, true);
         }
     }
     // Node JSON carries u64 values (settings, proposal parameters, lifetimes)
@@ -512,6 +585,12 @@
     // traffic (the refresh poll, and the Mail, Chat and Explorer loops) for
     // that long: a refused address is usually cooling down, and anything sent
     // meanwhile is refused too.
+    //
+    // Only the node's own JSON-RPC refusal, which carries this request's ID,
+    // proves that the request did not run (`notRun`). A proxy can answer 429
+    // or 503 for a request it already forwarded: the public website's nginx
+    // template answers every upstream 502, which nginx also returns when the
+    // node drops a connection mid-request, with 503 and a body without an ID.
     const RPC_BACKOFF_LIMIT_MS = 60e3;
     let rpcBackoffUntil = 0;
     function rpcBackoff() {
@@ -525,6 +604,7 @@
         return seconds;
     }
     async function rpc(method, params = {}) {
+        const id = ++rpcId;
         const response = await fetch("/rpc", {
             method: "POST",
             headers: {
@@ -535,7 +615,7 @@
             },
             body: JSON.stringify({
                 jsonrpc: "2.0",
-                id: ++rpcId,
+                id: id,
                 method: method,
                 params: params
             }),
@@ -543,14 +623,16 @@
         });
         if (!response.ok) {
             // A refusal still carries the node's JSON-RPC error.
-            let message = null;
+            let body = null;
             try {
-                message = (await exactJSON(response))?.error?.message;
+                body = await exactJSON(response);
             } catch {}
+            const message = body?.error?.message;
             const refused = response.status === 429 || response.status === 503, retry = refusalWait(response);
             const error = new Error(typeof message !== "string" || !message ? `Node request failed (${response.status}).` : retry !== null ? `${message} (try again in ${retry} s)` : message);
             error.status = response.status;
             error.refused = refused;
+            error.notRun = refused && body?.jsonrpc === "2.0" && body.id === id;
             refused && (error.retryAfter = retry ?? 1);
             throw error;
         }
@@ -1091,8 +1173,9 @@
                     raw: signed.raw
                 });
             } catch (error) {
-                // Refused: nothing ran, so the same details can be submitted again.
-                if (error.refused) throw new Error(`Not sent: ${error.message}`);
+                // The node refused it: nothing ran, so the same details can
+                // be submitted again.
+                if (error.notRun) throw new Error(`Not sent: ${error.message}`);
                 // A reply's text; a lost connection has none.
                 error.status === void 0 || (answer = error.message);
             }
@@ -1102,8 +1185,11 @@
                 // signed bytes rather than invite a second signature at the
                 // next nonce (see trackSubmission).
                 form.id === "propose-form" && rememberDescription(operation);
-                trackSubmission(form, signed.transaction_id, request.sender, nonce, {
+                trackSubmission(form, signed.transaction_id, request.sender, nonce, expected.chain_id, {
                     raw: signed.raw,
+                    // The body signUnsigned signed: verifyUnsigned matched
+                    // every byte to these details.
+                    signed: signedFields({...expected, expiry_blocks: expiry}),
                     note: "",
                     answer: answer ?? (data ? "The node returned an unexpected transaction ID." : null),
                     draft: draft !== null && draft === mailDraft(form) ? draft : null
@@ -1117,7 +1203,7 @@
             toast("Transaction submitted.");
             if (form.id !== "mail-form" || identity === submissionIdentity(form)) {
                 form.id === "mail-form" && mail?.sent();
-                trackSubmission(form, id, request.sender, nonce);
+                trackSubmission(form, id, request.sender, nonce, expected.chain_id);
             }
             await refresh();
             return data;
@@ -3448,8 +3534,9 @@
             // Follow the selected account's own broadcasts by sender nonce, as
             // the transaction forms do. Another account's is not refreshed here.
             let signed = null, result = null;
+            const chain = state.status?.chain_id;
             try {
-                signed = HashstashBrowserWallet.verifySigned(raw, {chain_id: state.status?.chain_id});
+                signed = HashstashBrowserWallet.verifySigned(raw, {chain_id: chain});
             } catch {
                 // The node may accept bytes this page cannot decode or verify
                 // for its network; it reports only the ID.
@@ -3459,12 +3546,13 @@
                     raw: raw
                 });
             } catch (error) {
-                if (error.refused) throw new Error(`Not sent: ${error.message}`);
+                if (error.notRun) throw new Error(`Not sent: ${error.message}`);
                 // As in submit(): this broadcast may have run. The same bytes
                 // can be sent again safely, a newly signed transaction not.
                 if (signed?.sender === key()) {
-                    trackSubmission(form, signed.txid, signed.sender, signed.nonce, {
+                    trackSubmission(form, signed.txid, signed.sender, signed.nonce, chain, {
                         raw: raw.toLowerCase(),
+                        signed: signedFields(signed),
                         note: "",
                         answer: error.status === void 0 ? null : error.message,
                         draft: null
@@ -3477,7 +3565,7 @@
             }
             if (!result?.transaction_id) throw new Error("The node did not return a transaction ID.");
             if (signed?.txid === result.transaction_id && signed.sender === key()) {
-                trackSubmission(form, result.transaction_id, signed.sender, signed.nonce);
+                trackSubmission(form, result.transaction_id, signed.sender, signed.nonce, chain);
             } else {
                 feedback(form, `Broadcast · ${short(result.transaction_id)}. This form follows only the selected account's transactions.`);
             }

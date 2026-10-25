@@ -233,6 +233,16 @@ async function run() {
     const verified=b.api.verifySigned(signed.raw,{...signedFields(intent),txid:signed.transaction_id});
     equal(JSON.stringify(verified.operation),JSON.stringify(operation));equal(verified.data_hex,intent.data_hex);
   }
+  // A pending row's operation as the node serializes it (keys and hashes as
+  // byte arrays, safe u64 values as numbers) is compared with a signed one by
+  // its encoding.
+  {
+    const node=value=>typeof value==='string'&&/^[0-9a-f]{64}$/.test(value)?Array.from(Buffer.from(value,'hex')):Array.isArray(value)?value.map(node):value&&typeof value==='object'?Object.fromEntries(Object.entries(value).map(([k,v])=>[k,k==='round'&&BigInt(v)<=BigInt(Number.MAX_SAFE_INTEGER)?Number(v):node(v)])):value;
+    for(const [operation] of operationVectors)equal(b.api.sameOperation(node(operation),operation),true);
+    equal(b.api.sameOperation(operationVectors[0][0],operationVectors[1][0]),false);
+    equal(b.api.sameOperation({Support:{round:65536,proposal,amount:'2'}},operationVectors[4][0]),false);
+    equal(b.api.sameOperation({Donate:{amount:'1'}},{Donate:{amount:'1'}}),false,'an operation this page cannot encode matches nothing');
+  }
   for (const [operation,inner] of operationVectors.slice(0,3)) {
     const kind=Object.keys(operation)[0],field=kind==='Deposit'?'min_shares':'min_received';
     const intent={...expected,data_hex:'',operation:{[kind]:{...operation[kind],[field]:'0'}}};

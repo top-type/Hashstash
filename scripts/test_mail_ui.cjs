@@ -403,6 +403,8 @@ async function run(){
   // A mail whose broadcast answer was an error, but which the snapshots then
   // show pending, was sent after all: its unchanged draft is cleared as after
   // an answered send, while a draft edited meanwhile is kept.
+  // The pending row is the node's summary of the signed body.
+  const row=(h,nonce,changes={})=>{const w=h.wallet.at(-1);return {body:{sender:h.sender,nonce,fee:w.fee,anchor:w.anchor,expiry_blocks:w.expiry_blocks,operation:w.operation,...changes}};};
   for(const edited of [false,true]){
    const h=await setup(),f=await h.compose(),s=h.currentSnapshot,nonce=s.account.account.nonce;
    h.handlers.broadcasttransaction=()=>response({jsonrpc:'2.0',id:1,error:{code:-32000,message:'public response byte budget exhausted; try again'}});
@@ -410,10 +412,59 @@ async function run(){
    ok(f.feedback.textContent.startsWith('Result unknown · '),f.feedback.textContent);ok(!f.feedback.textContent.includes('try again'),'the node text does not invite a second send');
    eq(f.elements.subject.value,'Fixture subject','the draft is kept while the result is unknown');
    if(edited){f.elements.message.value='Edited meanwhile';await f.fire('input');}
-   s.mempool.push({body:{sender:h.sender,nonce,operation:{TransferExact:{recipient:h.sender,amount:'1'}}}});await h.refresh();
+   s.mempool.push(row(h,nonce));s.status.mempool=1;await h.refresh();
    ok(f.feedback.textContent.startsWith('Pending · '),f.feedback.textContent);
    eq(f.elements.subject.value,edited?'Fixture subject':'');eq(f.elements.message.value,edited?'Edited meanwhile':'');
   }
+  // Another transaction pending at the lost mail's nonce, such as one sent
+  // from another tab, is not this mail: it was not sent, and the draft stays.
+  {
+   const h=await setup(),f=await h.compose(),s=h.currentSnapshot,nonce=s.account.account.nonce;
+   h.handlers.broadcasttransaction=()=>{throw new TypeError('Failed to fetch');};
+   await f.requestSubmit();ok(f.feedback.textContent.startsWith('Result unknown · '),f.feedback.textContent);
+   s.mempool.push(row(h,nonce,{fee:'7'}));s.status.mempool=1;await h.refresh();
+   ok(f.feedback.textContent.startsWith('Not pending · ')&&f.feedback.textContent.includes('another transaction from this account is pending with its transaction number'),f.feedback.textContent);
+   eq(f.elements.subject.value,'Fixture subject','the unsent draft is kept');eq(f.elements.message.value,'Secret fixture body');
+  }
+  // A lost mail mined before any snapshot showed it pending is found by its
+  // ID: the draft is cleared. A used nonce the explorer cannot attribute
+  // keeps the draft and says so.
+  for(const found of [true,false]){
+   const h=await setup(),f=await h.compose(),s=h.currentSnapshot;
+   h.handlers.broadcasttransaction=()=>{throw new TypeError('Failed to fetch');};
+   h.handlers.explorer_transaction=p=>found?response({result:{transaction:{txid:p.txid,status:'confirmed'}}}):response({error:{message:'unknown transaction'}});
+   await f.requestSubmit();ok(f.feedback.textContent.startsWith('Result unknown · '),f.feedback.textContent);
+   s.account.account.nonce=1;for(let i=0;i<(found?1:3);i++){await h.refresh();await settle();}
+   ok(f.feedback.textContent.startsWith(found?'Mined · ':'Transaction number used · '),f.feedback.textContent);
+   eq(f.elements.subject.value,found?'':'Fixture subject');eq(f.elements.message.value,found?'':'Secret fixture body');
+  }
+ }
+ {
+  // The node can run a page and then replace its reply with a 200 JSON-RPC
+  // error asking to try again (the public reply allowance or the visitor's
+  // byte budget was spent, or the explorer index was updating). The page is
+  // read again from the same cursor after a pause, not at the next block, a
+  // bounded number of times.
+  for(const message of ['public replies are busy; try again','public response byte budget exhausted; try again','explorer index is updating; try again']){
+   const h=await setup(),m=await h.message(),s=h.currentSnapshot,good=h.handlers.explorer_mail;let replaced=0;
+   h.handlers.explorer_mail=p=>replaced++<2?response({jsonrpc:'2.0',id:1,error:{code:-32000,message}}):good(p);
+   h.history.push(m);s.status.height=m.height;s.status.tip=key(4545);const before=h.calls.length;await h.refresh();
+   await wait(()=>h.get('mail-scan-status').textContent.includes('waiting for the node'),h);
+   eq(h.get('mail-error').textContent,'',`${message}: a replaced reply is not reported as a failed scan`);ok([...h.timers.values()].some(timer=>timer.delay===1500),'the first resend waits 1.5 s');
+   h.wallClock+=1500;await h.timersDue(1500);await wait(()=>[...h.timers.values()].some(timer=>timer.delay===3000),h);
+   h.wallClock+=3000;await h.timersDue(3000);await h.drain();
+   const requests=h.calls.slice(before).filter(x=>x.body.method==='explorer_mail').map(x=>x.body.params);
+   eq(requests.length,3,'the page is read three times');eq(requests[2],requests[0],'from the same cursor');
+   eq(h.get('mail-list').children.length,1,'and finds the mail without another block');eq(h.get('mail-error').textContent,'');
+  }
+  // Without end, the scan stops after four resends and reports the error.
+  const h=await setup(),m=await h.message(),s=h.currentSnapshot;
+  h.handlers.explorer_mail=()=>response({jsonrpc:'2.0',id:1,error:{code:-32000,message:'public replies are busy; try again'}});
+  h.history.push(m);s.status.height=m.height;s.status.tip=key(4646);const before=h.calls.length;await h.refresh();
+  for(let n=1;n<=4;n++){await wait(()=>[...h.timers.values()].some(timer=>timer.delay===n*1500),h);h.wallClock+=n*1500;await h.timersDue(n*1500);}
+  await h.drain();
+  eq(h.calls.slice(before).filter(x=>x.body.method==='explorer_mail').length,5,'one page and four resends');
+  eq(h.get('mail-error').textContent,'public replies are busy; try again');
  }
  {
   const h=await harness({mail:true,empty:true});await h.refresh();await h.navigate('#mail');eq(h.calls.filter(c=>c.body.method==='explorer_mail').length,0);ok(h.get('mail-empty').textContent.includes('Select a wallet'));

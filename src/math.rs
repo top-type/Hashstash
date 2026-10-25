@@ -52,7 +52,24 @@ fn curve_scale() -> Amount {
 // 9 / (4(2N+1)3^(2N+1)). Since 9>8 and 3N>=bits,
 // one fixed-point unit bounds this tail. Each arithmetic operation below also
 // rounds outwards, so the returned interval encloses the exact logarithm.
+//
+// Every precision is a whole number of 64-bit limbs, so each shift by it is a
+// limb offset and the series runs on limb vectors that reuse their buffers.
+// The upper power and square exceed the lower ones by a few units, so each
+// upper step is derived from the lower one: with high = low + g and low =
+// q*d + r, ceil(high/d) = q + ceil((r+g)/d), and with square_high =
+// square_low + h, high*square_high = low*square_low + low*h + g*square_high.
+// One long product and one division pass by the small term divisor, through
+// its reciprocal, therefore serve both bounds; a gap of 2^64 or more, which
+// these bounds do not reach, would take the direct steps. Each step takes
+// exactly the floors and ceilings of the arbitrary-precision definition kept
+// as the reference in the tests, so the bounds, and every clearing they
+// decide, are unchanged.
 fn log_atanh(z_numerator: &Amount, z_denominator: &Amount, bits: usize) -> Bounds {
+    assert!(
+        bits.is_multiple_of(64) && bits <= CURVE_BITS,
+        "unsupported logarithm precision"
+    );
     if z_numerator.is_zero() {
         return Bounds {
             low: Amount::zero(),
@@ -60,38 +77,230 @@ fn log_atanh(z_numerator: &Amount, z_denominator: &Amount, bits: usize) -> Bound
         };
     }
     let terms = bits.div_ceil(3);
+    let unit = bits / 64;
     let numerator = z_numerator << bits;
-    let z = Bounds {
-        low: &numerator / z_denominator,
-        high: ceil_div(&numerator, z_denominator),
-    };
-    let square = Bounds {
-        low: (&z.low * &z.low) >> bits,
-        high: ceil_shift(&(&z.high * &z.high), bits),
-    };
-    let mut power = z;
-    let mut sum = Bounds {
-        low: Amount::zero(),
-        high: Amount::zero(),
-    };
+    // One long division gives both directed quotients: the ceiling exceeds
+    // the floor exactly when the division is inexact.
+    let z = &numerator / z_denominator;
+    let exact = &z * z_denominator == numerator;
+    let mut low = z.to_u64_digits();
+    let mut high = low.clone();
+    if !exact {
+        add_limbs(&mut high, &[1]);
+    }
+    let mut product = Vec::with_capacity(2 * unit + 3);
+    let mut quotient = Vec::with_capacity(unit + 1);
+    let mut next = Vec::with_capacity(unit + 2);
+    let (mut square_low, mut square_high) = (Vec::new(), Vec::new());
+    multiply(&low, &low, &mut product);
+    shifted(&product, unit, false, &mut square_low);
+    multiply(&high, &high, &mut product);
+    shifted(&product, unit, true, &mut square_high);
+    let square_gap = gap(&square_high, &square_low);
+    let mut sum_low = Vec::with_capacity(unit + 2);
+    let mut sum_high = Vec::with_capacity(unit + 2);
     for index in 0..terms {
-        if power.low.is_zero() && power.high.is_one() {
+        if low.is_empty() && high == [1] {
             // A fixed point: 0 < square.high <= 2^bits keeps the upper power at
             // one unit, so each remaining term adds exactly zero below and one
             // unit above. Adding them directly gives the identical bounds.
-            sum.high += terms - index;
+            add_limbs(&mut sum_high, &[(terms - index) as u64]);
             break;
         }
-        let divisor = Amount::from(2 * index + 1);
-        sum.low += &power.low / &divisor;
-        sum.high += ceil_div(&power.high, &divisor);
-        power.low = (&power.low * &square.low) >> bits;
-        power.high = ceil_shift(&(&power.high * &square.high), bits);
+        let divisor = SmallDivisor::new(2 * index as u64 + 1);
+        let power_gap = gap(&high, &low);
+        let remainder = divide(&low, divisor, &mut quotient);
+        add_limbs(&mut sum_low, &quotient);
+        match power_gap {
+            Some(power_gap) => {
+                // remainder + power_gap < 2^65, so the extra quotient is
+                // below 2^64 for every divisor above one, and for one the
+                // remainder is zero.
+                let extra = (u128::from(remainder) + u128::from(power_gap))
+                    .div_ceil(u128::from(divisor.divisor));
+                add_limbs(&mut quotient, &[extra as u64]);
+            }
+            None => {
+                if divide(&high, divisor, &mut quotient) != 0 {
+                    add_limbs(&mut quotient, &[1]);
+                }
+            }
+        }
+        add_limbs(&mut sum_high, &quotient);
+        multiply(&low, &square_low, &mut product);
+        shifted(&product, unit, false, &mut next);
+        match (power_gap, square_gap) {
+            (Some(power_gap), Some(square_gap)) => {
+                add_scaled(&mut product, &low, square_gap);
+                add_scaled(&mut product, &square_high, power_gap);
+            }
+            _ => multiply(&high, &square_high, &mut product),
+        }
+        shifted(&product, unit, true, &mut high);
+        std::mem::swap(&mut low, &mut next);
     }
     Bounds {
-        low: sum.low << 1usize,
-        high: (sum.high << 1usize) + 1u32,
+        low: from_limbs(&sum_low) << 1usize,
+        high: (from_limbs(&sum_high) << 1usize) + 1u32,
     }
+}
+
+/// The value of little-endian 64-bit limbs.
+fn from_limbs(limbs: &[u64]) -> Amount {
+    Amount::new(
+        limbs
+            .iter()
+            .flat_map(|&limb| [limb as u32, (limb >> 32) as u32])
+            .collect(),
+    )
+}
+
+fn trim(limbs: &mut Vec<u64>) {
+    while limbs.last() == Some(&0) {
+        limbs.pop();
+    }
+}
+
+/// high - low when it is below 2^64 and high >= low.
+fn gap(high: &[u64], low: &[u64]) -> Option<u64> {
+    if high.len() > low.len() + 1 || low.len() > high.len() {
+        return None;
+    }
+    let mut borrow = false;
+    let mut result = 0;
+    for (index, &limb) in high.iter().enumerate() {
+        let (partial, first) = limb.overflowing_sub(low.get(index).copied().unwrap_or(0));
+        let (difference, second) = partial.overflowing_sub(u64::from(borrow));
+        borrow = first || second;
+        if index == 0 {
+            result = difference;
+        } else if difference != 0 {
+            return None;
+        }
+    }
+    (!borrow).then_some(result)
+}
+
+/// sum += addend.
+fn add_limbs(sum: &mut Vec<u64>, addend: &[u64]) {
+    if sum.len() < addend.len() {
+        sum.resize(addend.len(), 0);
+    }
+    let mut carry = false;
+    for (index, limb) in sum.iter_mut().enumerate() {
+        if index >= addend.len() && !carry {
+            break;
+        }
+        let (partial, first) = limb.overflowing_add(addend.get(index).copied().unwrap_or(0));
+        let (total, second) = partial.overflowing_add(u64::from(carry));
+        *limb = total;
+        carry = first || second;
+    }
+    if carry {
+        sum.push(1);
+    }
+}
+
+/// sum += value * factor.
+fn add_scaled(sum: &mut Vec<u64>, value: &[u64], factor: u64) {
+    if factor == 0 || value.is_empty() {
+        return;
+    }
+    if sum.len() < value.len() + 1 {
+        sum.resize(value.len() + 1, 0);
+    }
+    let mut carry = 0u64;
+    for (limb, &v) in sum.iter_mut().zip(value) {
+        let t = u128::from(v) * u128::from(factor) + u128::from(*limb) + u128::from(carry);
+        *limb = t as u64;
+        carry = (t >> 64) as u64;
+    }
+    add_limbs_at(sum, value.len(), carry);
+}
+
+/// sum += carry * 2^(64 * at).
+fn add_limbs_at(sum: &mut Vec<u64>, at: usize, mut carry: u64) {
+    let mut index = at;
+    while carry != 0 {
+        if index == sum.len() {
+            sum.push(0);
+        }
+        let (total, overflow) = sum[index].overflowing_add(carry);
+        sum[index] = total;
+        carry = u64::from(overflow);
+        index += 1;
+    }
+}
+
+/// product = a * b.
+fn multiply(a: &[u64], b: &[u64], product: &mut Vec<u64>) {
+    product.clear();
+    product.resize(a.len() + b.len(), 0);
+    for (i, &x) in a.iter().enumerate() {
+        let row = &mut product[i..=i + b.len()];
+        let mut carry = 0u64;
+        for (limb, &y) in row.iter_mut().zip(b) {
+            let t = u128::from(x) * u128::from(y) + u128::from(*limb) + u128::from(carry);
+            *limb = t as u64;
+            carry = (t >> 64) as u64;
+        }
+        row[b.len()] = carry;
+    }
+}
+
+/// result = floor(value / 2^(64 * unit)), or the ceiling.
+fn shifted(value: &[u64], unit: usize, ceiling: bool, result: &mut Vec<u64>) {
+    let split = unit.min(value.len());
+    result.clear();
+    result.extend_from_slice(&value[split..]);
+    trim(result);
+    if ceiling && value[..split].iter().any(|&limb| limb != 0) {
+        add_limbs(result, &[1]);
+    }
+}
+
+/// A series divisor below 2^11 with m = ceil(2^54 / d). For n < 2^43,
+/// floor(n * m / 2^54) = floor(n / d): with e = m*d - 2^54 < d, n*m/2^54 =
+/// n/d + n*e/(d*2^54), and n*e < 2^54 keeps that excess below 1/d, which
+/// never carries the fraction of n/d, at most (d-1)/d, past the next integer
+/// (Granlund and Montgomery). A multiplication replaces each division.
+#[derive(Clone, Copy)]
+struct SmallDivisor {
+    divisor: u64,
+    reciprocal: u64,
+}
+
+impl SmallDivisor {
+    const BITS: u32 = 11;
+    fn new(divisor: u64) -> Self {
+        assert!(divisor != 0 && divisor >> Self::BITS == 0);
+        Self {
+            divisor,
+            reciprocal: (1u64 << 54).div_ceil(divisor),
+        }
+    }
+    /// The quotient and remainder of n < 2^43.
+    fn div_rem(self, n: u64) -> (u64, u64) {
+        debug_assert!(n >> 43 == 0);
+        let quotient = ((u128::from(n) * u128::from(self.reciprocal)) >> 54) as u64;
+        (quotient, n - quotient * self.divisor)
+    }
+}
+
+/// quotient = floor(value / divisor); returns the remainder. Each step
+/// divides a remainder below 2^11 and 32 more bits.
+fn divide(value: &[u64], divisor: SmallDivisor, quotient: &mut Vec<u64>) -> u64 {
+    quotient.clear();
+    quotient.resize(value.len(), 0);
+    let mut remainder = 0u64;
+    for (index, &limb) in value.iter().enumerate().rev() {
+        let (upper, rest) = divisor.div_rem((remainder << 32) | (limb >> 32));
+        let (lower, rest) = divisor.div_rem((rest << 32) | (limb & 0xffff_ffff));
+        quotient[index] = (upper << 32) | lower;
+        remainder = rest;
+    }
+    trim(quotient);
+    remainder
 }
 
 fn log_two(bits: usize) -> &'static Bounds {
@@ -696,6 +905,91 @@ mod tests {
         for bits in [192, 448, 1088, CURVE_BITS] {
             for (n, d) in zs {
                 let (n, d) = (Amount::from(n), Amount::from(d));
+                let fast = log_atanh(&n, &d, bits);
+                let slow = full_series(&n, &d, bits);
+                assert_eq!(
+                    (fast.low, fast.high),
+                    (slow.low, slow.high),
+                    "{n}/{d} at {bits}"
+                );
+            }
+        }
+        // Every series divisor's reciprocal against hardware division, at the
+        // ends of the operand range and around each multiple's boundary.
+        for divisor in 1..1u64 << SmallDivisor::BITS {
+            let small = SmallDivisor::new(divisor);
+            let top = (1u64 << 43) - 1;
+            let high = top / divisor * divisor;
+            for n in [
+                0,
+                1,
+                divisor - 1,
+                divisor,
+                divisor + 1,
+                high - 1,
+                high,
+                top - 1,
+                top,
+            ]
+            .into_iter()
+            .chain((0..64).map(|k| (top >> k).wrapping_mul(0x9e37_79b9) & top))
+            {
+                assert_eq!(
+                    small.div_rem(n),
+                    (n / divisor, n % divisor),
+                    "{n}/{divisor}"
+                );
+            }
+        }
+        // The limb series against the reference at every precision step, on
+        // random operands from tiny to maximal z and on all-ones limbs, whose
+        // products and sums carry through every limb.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut random = |bits: usize| {
+            let mut value = Amount::zero();
+            for _ in 0..bits.div_ceil(64) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                value = (value << 64usize) + state;
+            }
+            (value >> (bits.div_ceil(64) * 64 - bits)).max(Amount::one())
+        };
+        for bits in (PRECISION_STEP..=CURVE_BITS).step_by(PRECISION_STEP) {
+            let mut cases = Vec::new();
+            for width in [1, 63, 64, 65, 200, 700] {
+                let d = random(width + 2);
+                for shift in [1usize, 2, 9, width / 2 + 1, width + 1] {
+                    cases.push(((&d >> shift).max(Amount::one()).min(&d / 2u32), d.clone()));
+                }
+            }
+            for limbs in [1usize, 2, 5, 33] {
+                let ones = (Amount::one() << (64 * limbs)) - 1u32;
+                cases.push((&ones / 3u32, ones.clone()));
+                cases.push((&ones / 3u32 - 1u32, ones.clone()));
+                cases.push((Amount::one(), ones.clone()));
+                cases.push((&ones >> 70usize, ones));
+            }
+            for (n, d) in cases {
+                if n.is_zero() || n > d {
+                    continue;
+                }
+                let fast = log_atanh(&n, &d, bits);
+                let slow = full_series(&n, &d, bits);
+                assert_eq!(
+                    (fast.low, fast.high),
+                    (slow.low, slow.high),
+                    "{n}/{d} at {bits}"
+                );
+            }
+        }
+        // Callers keep z below one, where the upper chain stays within a few
+        // units of the lower. Above one the powers grow and the gaps pass
+        // 2^64 (for the squares too, from z near 2^64), so these take the
+        // direct upper steps.
+        for bits in [64, 128, 192] {
+            for (n, d) in [(2u32, 1u32), (7, 3), (1 << 31, 3), (u32::MAX, 7)] {
+                let (n, d) = (Amount::from(n) << 40usize, Amount::from(d));
                 let fast = log_atanh(&n, &d, bits);
                 let slow = full_series(&n, &d, bits);
                 assert_eq!(

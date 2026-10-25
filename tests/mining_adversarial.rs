@@ -1072,9 +1072,36 @@ async fn a_trusted_proxy_address_connects_more_workers_than_the_per_address_limi
         let share = reporting_share(job, worker, extra);
         assert_eq!(worker.submit(job, &share, extra).await["result"], true);
     }
-    // Other addresses keep their limit.
-    let crowd = vec![Ipv4Addr::new(127, 0, 88, 160); 4];
-    authorize_from(address, crowd).await;
+    // Other addresses keep their limit: their authorized workers still count
+    // toward the address's 16 connections. A new address waits for
+    // authorization on at most four at once, and once one has authorized,
+    // on more.
+    let crowd = Ipv4Addr::new(127, 0, 88, 160);
+    let mut others = authorize_from(address, vec![crowd; 4]).await;
+    others.extend(authorize_from(address, vec![crowd; 12]).await);
+    let connected =
+        |node: &Node| node.rpc("mining", json!({})).unwrap()["workers_connected"].clone();
+    assert_eq!(connected(&node), 40);
+    // The 17th connection is refused before it is answered, while the
+    // trusted proxy's address, already past 16, still connects another.
+    assert!(pending_socket(address, 160).await.is_none());
+    assert_eq!(connected(&node), 40);
+    workers.extend(authorize_from(address, vec![proxy]).await);
+    assert_eq!(connected(&node), 41);
+    // The limit is the address's connections, not its rate: once one of its
+    // workers leaves, it connects again.
+    drop(others.pop());
+    timeout(DEADLINE, async {
+        while connected(&node) != 40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the closed worker stayed registered");
+    // Its session releases the address's connection as it ends.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    others.extend(authorize_from(address, vec![crowd]).await);
+    assert_eq!(connected(&node), 41);
     server.stop().await;
 }
 

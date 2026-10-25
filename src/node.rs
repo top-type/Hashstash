@@ -1619,10 +1619,12 @@ struct HeaderSync {
     /// The peer's last answer while counting; the last answer that held a
     /// new header while holding.
     touched: Instant,
-    /// Headers this download counted that passed their proof-of-work and
-    /// target checks. Stored headers, which a peer can resend without any
-    /// work, never count: downloads that counted least give way first.
-    counted: u64,
+    /// The work of the headers this download counted, each of which passed
+    /// its proof-of-work and target checks, so that much work was spent on
+    /// them. Stored headers, which a peer can resend without any work,
+    /// count none, and a header at the network limit counts only the little
+    /// work it took: downloads that counted least give way first.
+    counted: Amount,
 }
 impl HeaderSync {
     /// Where holding resumes: the last held header, or the stored root.
@@ -1647,25 +1649,37 @@ impl HeaderSync {
 /// stored root at the peer's next answer. Counting holds nothing and never
 /// expires; at most MAX_CONNECTIONS downloads run, and at most
 /// HEADER_SYNCS_PER_SOURCE from one network group. A new download beyond
-/// either bound displaces the one that counted fewest checked headers, the
-/// least recently answered among equals (see `make_room_for_header_sync`).
+/// either bound takes the place of the one that counted the least work, the
+/// least recently answered among equals, only if it counted more itself
+/// (see `make_room_for_header_sync`).
 const HEADER_SYNC_IDLE: Duration = Duration::from_secs(600);
 /// Header downloads from peers in one network group (`network_guard::peer_source`).
 const HEADER_SYNCS_PER_SOURCE: usize = 4;
 /// Headers a reply reads under one hold of the node lock.
 const HEADER_READ_CHUNK: usize = 250;
-/// Before a new header download from `peer` is kept, displace one when the
-/// downloads are full, or when `peer`'s network group already runs its
-/// share: the download that counted fewest checked headers, the least
-/// recently answered among equals, from that group or else from all. A
-/// download that only resent stored headers has counted none, so downloads
-/// created for free, however many addresses create them, displace only each
-/// other, never one that counted work.
+/// Whether `newcomer`, a new header download from `peer`, may be kept. When
+/// the downloads are full, or `peer`'s network group already runs its share,
+/// the download that counted the least work, the least recently answered
+/// among equals, from that group or else from all, is ranked with the
+/// newcomer: the weaker of the two gives way. The newcomer is the most
+/// recently answered, so it takes an incumbent's place on equal work and is
+/// refused on less.
+///
+/// Ranking by counted work rather than by headers bounds what a place costs.
+/// A download that only resent stored headers has counted none, so
+/// downloads created for free, however many addresses create them, displace
+/// only each other, never one that counted work. A header after a parent
+/// that is not stored needs only its own proof of work within the network
+/// limit, and counts no more work than that took, so headers at the limit
+/// cannot cheaply outrank a branch whose headers carry real work: once the
+/// downloads are full, a newcomer must count at least as much work in its
+/// first reply as the download it displaces counted in all of its.
 fn make_room_for_header_sync(
     chain: &mut Chain,
     syncs: &mut BTreeMap<SocketAddr, HeaderSync>,
     peer: SocketAddr,
-) {
+    newcomer: &HeaderSync,
+) -> bool {
     let source = network_guard::peer_source(peer.ip());
     let same = |other: &SocketAddr| network_guard::peer_source(other.ip()) == source;
     let pool: Vec<_> =
@@ -1674,17 +1688,23 @@ fn make_room_for_header_sync(
         } else if syncs.len() >= MAX_CONNECTIONS {
             syncs.iter().collect()
         } else {
-            return;
+            return true;
         };
-    let weakest = pool
+    let rank = |peer: &SocketAddr, sync: &HeaderSync| (sync.counted.clone(), sync.touched, *peer);
+    let Some(weakest) = pool
         .into_iter()
-        .min_by_key(|(other, sync)| (sync.counted, sync.touched, **other))
-        .map(|(other, _)| *other);
-    if let Some(weakest) = weakest
-        && let Some(old) = syncs.remove(&weakest)
-    {
+        .map(|(other, sync)| rank(other, sync))
+        .min()
+    else {
+        return true;
+    };
+    if rank(&peer, newcomer) <= weakest {
+        return false;
+    }
+    if let Some(old) = syncs.remove(&weakest.2) {
         chain.release_header_pin(old.pin);
     }
+    true
 }
 /// A peer that closed this many consecutive sessions on their first header
 /// request, before any reply byte, is taken for a version 1 peer.
@@ -1794,7 +1814,7 @@ fn follow_headers(
                     proof: None,
                     pin: chain.new_header_pin(),
                     touched: Instant::now(),
-                    counted: 0,
+                    counted: Amount::zero(),
                 },
                 // The peer continues an admitted chain from its best header.
                 // It is extended while it leads the tip by less than
@@ -1839,9 +1859,16 @@ fn follow_headers(
         HeaderStep::Continue(more) => {
             // One download per outbound peer. The peer's own download left
             // the map above, so only a new one can displace another.
-            make_room_for_header_sync(chain, syncs, peer);
-            syncs.insert(peer, sync);
-            Ok(more)
+            if make_room_for_header_sync(chain, syncs, peer, &sync) {
+                syncs.insert(peer, sync);
+                Ok(more)
+            } else {
+                // It ranks below every download it could displace: it ends
+                // here with its pins, and so do the header requests, whose
+                // next one would bring the same headers again.
+                chain.release_header_pin(sync.pin);
+                Ok(false)
+            }
         }
         HeaderStep::Admitted => {
             // The branch's blocks are requested from its stored root on, and
@@ -1903,10 +1930,10 @@ fn advance_headers(
             Err(error) if error.is::<HeaderDeferred>() => return Ok(HeaderStep::Continue(false)),
             Err(error) => return Err(error),
         };
-        let (height, claimed) = (height + 1, claimed + work);
+        let (height, claimed) = (height + 1, claimed + &work);
         match sync.proof {
             None => {
-                sync.counted = sync.counted.saturating_add(1);
+                sync.counted += work;
                 sync.last = (hash, height, claimed.clone());
                 if claimed <= tip_work {
                     continue;
@@ -15060,16 +15087,143 @@ mod peer_tests {
                 .receive_headers(peer, std::slice::from_ref(&stored))
                 .unwrap();
         }
+        {
+            let i = receiver.locked().unwrap();
+            assert_eq!(i.header_syncs.len(), MAX_CONNECTIONS);
+            let group = network_guard::peer_source(IpAddr::from([9, 200, 1, 1]));
+            let same = i
+                .header_syncs
+                .keys()
+                .filter(|peer| network_guard::peer_source(peer.ip()) == group)
+                .count();
+            assert_eq!(same, HEADER_SYNCS_PER_SOURCE);
+            assert!(i.header_syncs.contains_key(&honest));
+        }
+        // Three more peers in the honest peer's network group count the same
+        // branch, each in place of a download that counted nothing. A free
+        // download from that group, which now runs four that counted work, is
+        // refused instead of displacing the least recently answered of them,
+        // the honest one.
+        for n in 2..=HEADER_SYNCS_PER_SOURCE {
+            let peer = SocketAddr::from(([8, 1, n as u8, 1], 18481));
+            assert!(!receiver.receive_headers(peer, &branch).unwrap());
+        }
+        let free = SocketAddr::from(([8, 1, 99, 1], 18481));
+        assert!(
+            !receiver
+                .receive_headers(free, std::slice::from_ref(&stored))
+                .unwrap()
+        );
         let i = receiver.locked().unwrap();
         assert_eq!(i.header_syncs.len(), MAX_CONNECTIONS);
-        let group = network_guard::peer_source(IpAddr::from([9, 200, 1, 1]));
-        let same = i
-            .header_syncs
-            .keys()
-            .filter(|peer| network_guard::peer_source(peer.ip()) == group)
-            .count();
-        assert_eq!(same, HEADER_SYNCS_PER_SOURCE);
         assert!(i.header_syncs.contains_key(&honest));
+        assert!(!i.header_syncs.contains_key(&free));
+    }
+
+    #[test]
+    fn header_downloads_give_way_by_counted_work_not_by_header_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        let receiver = node_on(&dir.path().join("receiver.db"), &config, |chain| {
+            while math::work(&chain.next_target().unwrap()) <= Amount::from(128u32) {
+                rush(chain, crypto::public_key(&[62; 32]).unwrap());
+            }
+        });
+        let (genesis, stored) = {
+            let i = receiver.locked().unwrap();
+            let stored = i.chain.hash_at_height(2).unwrap();
+            (
+                i.chain.hash_at_height(0).unwrap(),
+                i.chain.block_header(&stored).unwrap().unwrap(),
+            )
+        };
+        let cursor = |peer| match receiver.header_request(peer).unwrap() {
+            PeerPacket::GetHeaders { locator, .. } => locator[0],
+            _ => panic!("not a header request"),
+        };
+        let work = |headers: &[Header]| -> Amount {
+            headers
+                .iter()
+                .map(|header| math::work(&math::target_from_bits(header.bits).unwrap()))
+                .sum()
+        };
+        let start = config.genesis_time + 15;
+        // An honest branch from genesis whose headers after the first carry
+        // 32 times the work of a header at the network limit. It claims less
+        // work than the tip so far: the download waits for more.
+        let limit = math::target_from_bits(config.limit_bits).unwrap();
+        let heavier = math::bits_from_target(&(limit / 32u32));
+        let mut branch = mined_headers(genesis, start, 15, config.initial_bits, 1, 7);
+        branch.extend(mined_headers(
+            header_hash(&branch[0]),
+            start + 15,
+            15,
+            heavier,
+            19,
+            7,
+        ));
+        let honest: SocketAddr = HEADER_PEER.parse().unwrap();
+        assert!(!receiver.receive_headers(honest, &branch).unwrap());
+        let counted = header_hash(branch.last().unwrap());
+        assert_eq!(cursor(honest), counted);
+        // Sybil outbound peers serve one header at genesis's required target,
+        // mined once, and hundreds at the network limit after it: many times
+        // the honest branch's headers, less of its work. Once they fill the
+        // downloads, by header count the next one displaced the honest
+        // download, whose count then restarted from genesis.
+        let mut cheap = mined_headers(genesis, start, 15, config.initial_bits, 1, 8);
+        cheap.extend(mined_headers(
+            header_hash(&cheap[0]),
+            start + 15,
+            1,
+            config.limit_bits,
+            499,
+            8,
+        ));
+        assert!(cheap.len() > 20 * branch.len());
+        assert!(work(&cheap) < work(&branch));
+        let sybil = |n: usize| SocketAddr::from(([9, n as u8, 1, 1], 18481));
+        for n in 0..MAX_CONNECTIONS {
+            assert!(!receiver.receive_headers(sybil(n), &cheap).unwrap());
+        }
+        assert_eq!(cursor(honest), counted);
+        {
+            let i = receiver.locked().unwrap();
+            assert_eq!(i.header_syncs.len(), MAX_CONNECTIONS);
+            // The oldest of the equal sybil downloads gave way instead.
+            assert!(!i.header_syncs.contains_key(&sybil(0)));
+        }
+        // The sybils go on to count more work than the honest download, which
+        // then counted least. A reply of a header this node stores, which
+        // counts nothing, still does not take its place.
+        let more = mined_headers(
+            header_hash(cheap.last().unwrap()),
+            start + 15 + 499,
+            1,
+            config.limit_bits,
+            200,
+            8,
+        );
+        for n in 1..MAX_CONNECTIONS {
+            assert!(!receiver.receive_headers(sybil(n), &more).unwrap());
+        }
+        let mut extended = cheap.clone();
+        extended.extend(more.iter().cloned());
+        assert!(work(&extended) > work(&branch));
+        let free = SocketAddr::from(([9, 200, 1, 1], 18481));
+        assert!(
+            !receiver
+                .receive_headers(free, std::slice::from_ref(&stored))
+                .unwrap()
+        );
+        assert_eq!(cursor(honest), counted);
+        assert!(!receiver.locked().unwrap().header_syncs.contains_key(&free));
+        // Work buys the place: a newcomer that counts more than the honest
+        // download in one reply takes it.
+        assert!(!receiver.receive_headers(free, &extended).unwrap());
+        let i = receiver.locked().unwrap();
+        assert!(i.header_syncs.contains_key(&free));
+        assert!(!i.header_syncs.contains_key(&honest));
     }
 
     #[test]
@@ -15166,6 +15320,174 @@ mod peer_tests {
                 .chain
                 .admitted_header_tip(&header_hash(&heavier[4]))
         );
+    }
+
+    /// Hold `headers` in order, as pushed blocks' headers are, in one batch,
+    /// until one is refused for its lead or for room.
+    fn hold_headers(node: &Node, headers: &[Header]) -> Vec<HeaderHold> {
+        let mut i = node.locked().unwrap();
+        i.chain
+            .hold_batch(|chain| {
+                let mut holds = Vec::new();
+                for header in headers {
+                    let hold = chain.hold_header(header.clone(), now(), 0).unwrap();
+                    holds.push(hold);
+                    if matches!(hold, HeaderHold::Ahead | HeaderHold::Full) {
+                        break;
+                    }
+                }
+                holds
+            })
+            .unwrap()
+    }
+    /// A node whose next block needs more than 1,024 times the work of a
+    /// header at the network limit, so a lead of 16 next-block works would let
+    /// an admitted chain grow by more than HELD_LEAD_HEADERS such headers.
+    fn node_ahead_of_the_limit(path: &Path, config: &Config) -> Node {
+        node_on(path, config, |chain| {
+            while math::work(&chain.next_target().unwrap()) <= Amount::from(1024u32) {
+                rush(chain, crypto::public_key(&[62; 32]).unwrap());
+            }
+        })
+    }
+
+    #[test]
+    fn a_detour_inside_an_admitted_chain_keeps_its_header_lead() {
+        use crate::chain::HELD_LEAD_HEADERS;
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        let receiver = node_ahead_of_the_limit(&dir.path().join("receiver.db"), &config);
+        let tip = receiver.locked().unwrap().chain.tip_block().header.clone();
+        let lead = HELD_LEAD_HEADERS as usize;
+        // A tied sibling of the tip and headers at the network limit after it:
+        // the first of these is admitted at once, then the chain is extended
+        // by HELD_LEAD_HEADERS more and no further.
+        let sibling = mined_headers(tip.previous, tip.timestamp, 0, tip.bits, 1, 1);
+        let mut best = sibling.clone();
+        best.extend(mined_headers(
+            header_hash(&sibling[0]),
+            tip.timestamp + 1,
+            1,
+            config.limit_bits,
+            lead + 2,
+            1,
+        ));
+        let holds = hold_headers(&receiver, &best);
+        assert_eq!(holds.len(), best.len());
+        assert_eq!(holds[0], HeaderHold::Held);
+        assert!(
+            holds[1..=lead + 1]
+                .iter()
+                .all(|h| *h == HeaderHold::Admitted)
+        );
+        assert_eq!(holds[lead + 2], HeaderHold::Ahead);
+        let admitted = lead + 2;
+        assert_eq!(held_counts(&receiver), (admitted, admitted));
+        // A header after the best header's parent ties the best header and is
+        // held without admission. A header after it claims more work than
+        // every admitted chain. Admitted, it used to start the count again,
+        // so a two-header detour every HELD_LEAD_HEADERS headers let one
+        // admitted path grow without that bound. It counts on instead, past
+        // the bound, and is not held.
+        let detour = mined_headers(
+            header_hash(&best[lead]),
+            tip.timestamp + 1,
+            1,
+            config.limit_bits,
+            2,
+            2,
+        );
+        assert_eq!(
+            hold_headers(&receiver, &detour),
+            [HeaderHold::Held, HeaderHold::Ahead]
+        );
+        assert_eq!(held_counts(&receiver), (admitted + 1, admitted));
+    }
+
+    #[test]
+    fn a_chain_held_below_a_header_before_its_admission_keeps_its_header_lead() {
+        use crate::chain::HELD_LEAD_HEADERS;
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::devnet();
+        let receiver = node_ahead_of_the_limit(&dir.path().join("receiver.db"), &config);
+        let (tip, parent, grandparent) = {
+            let i = receiver.locked().unwrap();
+            let tip = i.chain.tip_block().header.clone();
+            let parent = i.chain.block_header(&tip.previous).unwrap().unwrap();
+            let grandparent = i.chain.block_header(&parent.previous).unwrap().unwrap();
+            (tip, parent, grandparent)
+        };
+        let lead = HELD_LEAD_HEADERS as usize;
+        let limit = math::target_from_bits(config.limit_bits).unwrap();
+        // One header carrying the work of `count` headers at the network limit.
+        let heavy = |previous: &Header, count: u32, salt: u8| {
+            let bits = math::bits_from_target(&(&limit / count));
+            mined_headers(header_hash(previous), tip.timestamp + 1, 1, bits, 1, salt)
+        };
+        let cheap = |previous: &Header, count: usize, salt: u8| {
+            mined_headers(
+                header_hash(previous),
+                tip.timestamp + 1,
+                1,
+                config.limit_bits,
+                count,
+                salt,
+            )
+        };
+        // A sibling of `stored`, which ties its work, and one header at the
+        // network limit after it, which still claims less work than the tip:
+        // both are held without admission. A heavy header after the sibling
+        // then admits it.
+        let fork = |stored: &Header, heavy_count: u32, salt: u8| {
+            let sibling = mined_headers(stored.previous, stored.timestamp, 0, stored.bits, 1, salt);
+            let below = cheap(&sibling[0], 1, salt);
+            assert_eq!(
+                hold_headers(&receiver, &[sibling[0].clone(), below[0].clone()]),
+                [HeaderHold::Held, HeaderHold::Held]
+            );
+            let admitting = heavy(&sibling[0], heavy_count, salt);
+            assert_eq!(hold_headers(&receiver, &admitting), [HeaderHold::Admitted]);
+            below[0].clone()
+        };
+        // The header held below the sibling before its admission now leaves
+        // an admitted chain, and its chain is held without admission until it
+        // claims more work than every admitted chain. Admitted then, it used
+        // to start the count again from zero; it counts on from the sibling,
+        // so the path grows to HELD_LEAD_HEADERS headers above the sibling
+        // and no further.
+        let below = fork(&parent, 1_500, 3);
+        let rest = cheap(&below, 2 * lead, 3);
+        let holds = hold_headers(&receiver, &rest);
+        let admitted = holds
+            .iter()
+            .position(|h| *h == HeaderHold::Admitted)
+            .unwrap();
+        assert!(holds[..admitted].iter().all(|h| *h == HeaderHold::Held));
+        assert!(admitted + 2 < lead, "{admitted}");
+        // `rest[k]` is k + 2 headers above the sibling: the last one held,
+        // just before the one refused, is `holds.len()` above it.
+        assert_eq!(holds.last(), Some(&HeaderHold::Ahead));
+        assert!(
+            holds[admitted..holds.len() - 1]
+                .iter()
+                .all(|h| *h == HeaderHold::Admitted)
+        );
+        assert_eq!(holds.len(), lead);
+        // A chain that only claims more work than every admitted chain once it
+        // is more than HELD_LEAD_HEADERS headers above the sibling would go
+        // past that bound when admitted: it is not held.
+        let before = held_counts(&receiver).1;
+        let below = fork(&grandparent, lead as u32 + 200, 4);
+        let rest = cheap(&below, 2 * lead, 4);
+        let holds = hold_headers(&receiver, &rest);
+        assert_eq!(holds.last(), Some(&HeaderHold::Ahead));
+        assert!(holds.len() + 1 > lead, "{}", holds.len());
+        assert!(
+            holds[..holds.len() - 1]
+                .iter()
+                .all(|h| *h == HeaderHold::Held)
+        );
+        assert_eq!(held_counts(&receiver).1, before + 2);
     }
 
     #[test]

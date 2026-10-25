@@ -77,7 +77,9 @@ pub const MAX_SYNC_HEADERS: usize = 2 * MAX_HELD_HEADERS;
 /// next-block works needs no further headers until its blocks arrive.
 pub const HELD_LEAD_BLOCKS: u32 = 16;
 /// Nor does an admitted chain extended by this many headers since it was
-/// admitted or restored: cheap headers can claim little work each.
+/// admitted or restored: cheap headers can claim little work each. A chain
+/// that leaves an admitted chain counts on from the admitted header it
+/// leaves, admitted or not, so a detour cannot start the count again.
 pub const HELD_LEAD_HEADERS: u32 = 2_048;
 /// A losing branch raises the peer capacity allowance only while it stays within
 /// this many next-block works of the tip, with at least 1/CAPACITY_BRANCH_WORK_RATIO
@@ -187,7 +189,8 @@ pub enum HeaderHold {
     /// validated without the side-branch admission policy.
     Admitted,
     /// Not held: its chain already leads the tip by HELD_LEAD_BLOCKS, or
-    /// by HELD_LEAD_HEADERS headers since it was admitted.
+    /// by HELD_LEAD_HEADERS headers since the admitted header below it was
+    /// admitted.
     Ahead,
     /// Not held: admitted and pinned headers already number MAX_SYNC_HEADERS.
     Full,
@@ -587,11 +590,13 @@ struct HeldHeader {
     /// Header downloads holding this header after counting that its branch
     /// claims more work than the tip (see `HeldHeaders::pinned`).
     pins: u32,
-    /// Headers held after an admitted parent since its chain was admitted
-    /// or restored, this one included; zero for others.
+    /// Headers held since the admitted header below this one was admitted
+    /// or restored, this one included: after an admitted parent, after a
+    /// parent that carries such a lead, or admitted with a chain leaving an
+    /// admitted header; zero for others.
     lead: u32,
     /// For a header that is not admitted, the admitted header its chain was
-    /// last found to leave (`HeldHeaders::admits_after`), so a later search
+    /// last found to leave (`HeldHeaders::admitted_below`), so a later search
     /// starts there instead of walking the chain again.
     below: Option<Hash>,
 }
@@ -775,6 +780,30 @@ impl HeldHeaders {
         }
         marked
     }
+    /// Headers `admit` just marked that continue an admitted header count
+    /// their lead on from it, as if each had been held after its admitted
+    /// parent: a chain held below an admitted header before that header was
+    /// admitted does not start the count again when it is admitted itself.
+    /// A lead already carried is never lowered.
+    fn continue_lead(&mut self, marked: &[Hash]) {
+        let Some(stop) = marked.last().and_then(|bottom| self.previous(bottom)) else {
+            return;
+        };
+        let Some((lead, height)) = self
+            .headers
+            .get(&stop)
+            .filter(|stop| stop.admitted)
+            .map(|stop| (stop.lead, stop.height))
+        else {
+            return;
+        };
+        for hash in marked {
+            if let Some(held) = self.headers.get_mut(hash) {
+                let above = u32::try_from(held.height.saturating_sub(height)).unwrap_or(u32::MAX);
+                held.lead = held.lead.max(lead.saturating_add(above));
+            }
+        }
+    }
     fn admitted(&self, hash: &Hash) -> bool {
         self.headers.get(hash).is_some_and(|header| header.admitted)
     }
@@ -801,6 +830,39 @@ impl HeldHeaders {
         }
         cost
     }
+    /// The admitted header a chain whose header follows `hash` leaves, if
+    /// any: `hash` itself when it is admitted.
+    ///
+    /// The search remembers what it found on the headers it walked, so a
+    /// chain that keeps growing below an admitted chain without being
+    /// admitted is not walked again for each header. A remembered header
+    /// that is no longer admitted is walked past; one that has gained an
+    /// admitted header below it since only answers more strictly, as it is
+    /// no admitted chain's best header, and with the same lead, as a header
+    /// admitted below it counts its lead on from it.
+    fn admitted_below(&mut self, hash: &Hash) -> Option<Hash> {
+        let mut cursor = *hash;
+        let mut walked = Vec::new();
+        let left = loop {
+            let held = self.headers.get(&cursor)?;
+            if held.admitted {
+                break cursor;
+            }
+            if let Some(below) = held.below
+                && self.admitted(&below)
+            {
+                break below;
+            }
+            walked.push(cursor);
+            cursor = held.header.previous;
+        };
+        for hash in walked {
+            if let Some(held) = self.headers.get_mut(&hash) {
+                held.below = Some(left);
+            }
+        }
+        Some(left)
+    }
     /// Whether a chain whose header after `hash` claims `claimed` work may be
     /// admitted. An admitted chain is extended only from its best header: a
     /// branch that leaves an admitted chain below an admitted header that
@@ -808,40 +870,22 @@ impl HeldHeaders {
     /// admitted chain. Siblings fanned out inside admitted chains therefore
     /// each raise the best claimed work, instead of one admitted chain taking
     /// a new admitted sibling for every cheap header.
-    ///
-    /// The search for the admitted header a chain leaves remembers what it
-    /// found on the headers it walked, so a chain that keeps growing below an
-    /// admitted chain without being admitted is not walked again for each
-    /// header. A remembered header that is no longer admitted is walked
-    /// past; one that has gained an admitted header below it since only
-    /// answers more strictly, as it is no admitted chain's best header.
     fn admits_after(&mut self, hash: &Hash, claimed: &Amount) -> bool {
-        let mut cursor = *hash;
-        let mut walked = Vec::new();
-        let left = loop {
-            let Some(held) = self.headers.get(&cursor) else {
-                break None;
-            };
-            if held.admitted {
-                break Some(cursor);
-            }
-            if let Some(below) = held.below
-                && self.admitted(&below)
-            {
-                break Some(below);
-            }
-            walked.push(cursor);
-            cursor = held.header.previous;
-        };
-        let Some(left) = left else {
+        let Some(left) = self.admitted_below(hash) else {
             return true;
         };
-        for hash in walked {
-            if let Some(held) = self.headers.get_mut(&hash) {
-                held.below = Some(left);
-            }
-        }
         self.admitted_tip(&left) || self.tips.last().is_none_or(|(best, _)| claimed > best)
+    }
+    /// The lead a header at `height` after `hash` takes when its chain is
+    /// admitted (see `continue_lead`): counted on from the admitted header
+    /// the chain leaves, zero when it leaves none.
+    fn lead_after(&mut self, hash: &Hash, height: u64) -> u32 {
+        let Some(left) = self.admitted_below(hash) else {
+            return 0;
+        };
+        let left = &self.headers[&left];
+        let above = u32::try_from(height.saturating_sub(left.height)).unwrap_or(u32::MAX);
+        left.lead.saturating_add(above)
     }
     /// Pin a held header to a header download, once per download.
     fn pin(&mut self, hash: Hash, pin: u64) {
@@ -2962,13 +3006,22 @@ impl Chain {
     /// headers are persisted and its bodies validated when they arrive. One
     /// that leaves an admitted chain below that chain's best header is
     /// admitted only once it claims more work than every admitted chain
-    /// (`HeldHeaders::admits_after`), and is held as presync until then. A
+    /// (`HeldHeaders::admits_after`), and is held as presync until then;
+    /// admitted, it counts its lead on from the admitted header it leaves. A
     /// nonzero `pin` keeps the header for that header download. A header
-    /// that would make more than MAX_SYNC_HEADERS pinned or admitted is not
-    /// held.
+    /// that would make more than MAX_SYNC_HEADERS pinned or admitted, or
+    /// lead an admitted header by more than HELD_LEAD_HEADERS, is not held.
     fn hold(&mut self, hash: Hash, held: HeldHeader, pin: u64) -> Result<HeaderHold> {
         let overtakes = held.claimed > self.tip_entry.work
             && self.held.admits_after(&held.header.previous, &held.claimed);
+        // A chain admitted after an admitted header counts its lead on from
+        // there (see `continue_lead`). One that would then lead by more than
+        // HELD_LEAD_HEADERS headers, as a chain held below that header before
+        // its admission can, is not held, as a header after such a lead is not.
+        if overtakes && self.held.lead_after(&held.header.previous, held.height) > HELD_LEAD_HEADERS
+        {
+            return Ok(HeaderHold::Ahead);
+        }
         let cost = usize::from(pin != 0 || overtakes)
             + if overtakes {
                 self.held.admission_cost(&held.header.previous)
@@ -2982,6 +3035,7 @@ impl Chain {
         self.held.pin(hash, pin);
         let hold = if overtakes {
             let marked = self.held.admit(&hash);
+            self.held.continue_lead(&marked);
             match &mut self.held_batch {
                 Some(batch) => batch.extend(marked),
                 None => {
@@ -3135,8 +3189,9 @@ impl Chain {
     /// header download fetches a branch again only after counting that it
     /// claims more work than the tip. An admitted chain already leading the
     /// tip by HELD_LEAD_BLOCKS next-block works, or extended by
-    /// HELD_LEAD_HEADERS headers, is not extended. Nothing is pinned or
-    /// admitted beyond MAX_SYNC_HEADERS.
+    /// HELD_LEAD_HEADERS headers, is not extended, nor is a chain leaving it
+    /// past that many headers. Nothing is pinned or admitted beyond
+    /// MAX_SYNC_HEADERS.
     pub fn hold_header(&mut self, header: Header, now: u64, pin: u64) -> Result<HeaderHold> {
         let hash = crypto::sha256d(&codec::header_bytes(&header));
         if self.load_entry(&hash)?.is_some() {
@@ -3155,11 +3210,17 @@ impl Chain {
         let (height, root, contributed, claimed, lead) =
             match self.held.headers.get(&header.previous) {
                 Some(parent) => {
+                    // A parent that is not admitted but carries a lead lies
+                    // above an admitted header: a chain leaving an admitted
+                    // chain counts on from where it leaves, so a detour
+                    // through a header without admission cannot start the
+                    // count again once it is admitted.
+                    if parent.lead >= HELD_LEAD_HEADERS {
+                        return Ok(HeaderHold::Ahead);
+                    }
                     if parent.admitted {
                         let next = math::work(&self.target(&self.tip_entry)?);
-                        if parent.claimed > &self.tip_entry.work + next * HELD_LEAD_BLOCKS
-                            || parent.lead >= HELD_LEAD_HEADERS
-                        {
+                        if parent.claimed > &self.tip_entry.work + next * HELD_LEAD_BLOCKS {
                             return Ok(HeaderHold::Ahead);
                         }
                     }
@@ -3168,7 +3229,11 @@ impl Chain {
                         parent.root,
                         parent.contributed.clone(),
                         parent.claimed.clone(),
-                        if parent.admitted { parent.lead + 1 } else { 0 },
+                        if parent.admitted || parent.lead > 0 {
+                            parent.lead + 1
+                        } else {
+                            0
+                        },
                     )
                 }
                 None => {
@@ -5273,6 +5338,35 @@ mod cache_tests {
         // chain then leaves validated history and may be admitted.
         held.remove(&held_id(1, 4));
         assert!(held.admits_after(&held_id(2, 999), &work(100)));
+    }
+    #[test]
+    fn a_chain_admitted_after_an_admitted_header_counts_on_its_lead() {
+        let mut held = HeldHeaders::default();
+        let mut previous = ZERO_HASH;
+        for n in 0..10 {
+            held.insert(held_id(1, n), held_header(previous, n as u64 + 1, n + 1));
+            previous = held_id(1, n);
+        }
+        // A chain admitted from a stored block starts its count at zero.
+        let marked = held.admit(&held_id(1, 9));
+        held.continue_lead(&marked);
+        assert!((0..10).all(|n| held.headers[&held_id(1, n)].lead == 0));
+        assert_eq!(held.lead_after(&ZERO_HASH, 1), 0);
+        // A chain held below its fifth header without admission, as one held
+        // before that header was admitted is, counts on from that header,
+        // whatever lead it was held with.
+        let mut previous = held_id(1, 4);
+        for n in 0..20 {
+            held.insert(held_id(2, n), held_header(previous, 6 + n as u64, 1));
+            previous = held_id(2, n);
+        }
+        assert_eq!(held.lead_after(&held_id(2, 19), 26), 21);
+        let marked = held.admit(&held_id(2, 19));
+        assert_eq!(marked.len(), 20);
+        held.continue_lead(&marked);
+        assert!((0..20u32).all(|n| held.headers[&held_id(2, n)].lead == n + 1));
+        // Counted from its own best header, its next header's lead is the same.
+        assert_eq!(held.lead_after(&held_id(2, 19), 26), 21);
     }
     #[test]
     fn held_headers_stay_pinned_until_every_download_holding_them_ends() {

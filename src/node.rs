@@ -11881,7 +11881,7 @@ impl RpcClient {
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            let error = serde_json::from_slice::<Value>(&bytes)
+            let error = network_guard::plain_json(&bytes)
                 .ok()
                 .and_then(|mut body| body.get_mut("error").map(Value::take));
             return Err(match error {
@@ -11905,7 +11905,10 @@ impl RpcClient {
             rpc_json_values(&bytes) <= limits.values,
             "RPC response exceeds its JSON value budget"
         );
-        let mut v: Value = serde_json::from_slice(&bytes)?;
+        // The budget counts the values the reply's text spells, so read it as
+        // spelled: serde_json's own Value would replace an object under its
+        // reserved RawValue key with the document in the key's string value.
+        let mut v = network_guard::plain_json(&bytes)?;
         if let Some(error) = v.get("error") {
             bail!("RPC error: {error}");
         }
@@ -12617,6 +12620,9 @@ async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             let mut next_negotiated = negotiated;
                             for ext in extensions {
                                 let ext = ext.as_str().context("extension must be a string")?;
+                                // The reply names each extension as a key, so a name must be
+                                // one the node's own JSON accepts (see json_key_allowed).
+                                ensure!(network_guard::json_key_allowed(ext), "invalid extension name");
                                 if ext == "version-rolling" {
                                     let requested = options.get("version-rolling.mask").map(hex_u32).transpose()?.unwrap_or(u32::MAX);
                                     let candidate = requested & VERSION_MASK;

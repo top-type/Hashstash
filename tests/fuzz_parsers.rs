@@ -733,6 +733,78 @@ fn quote_methods_refuse_parameters_that_are_not_objects() {
     }
 }
 
+/// Found by `stratum_session` (see `fuzz/regressions/stratum_session/`): a
+/// `mining.configure` naming serde_json's private RawValue token as an
+/// extension was answered with that name as a key, and serde_json, whose
+/// `raw_value` feature axum enables, refuses such an object (or, led by a
+/// string, reads that string as a document). Miners never need to
+/// authorize to send it. Replies now name only keys the node's own JSON
+/// accepts, and requests with a reserved key anywhere are refused unread.
+#[test]
+fn stratum_replies_never_name_keys_serde_json_reserves() {
+    const RAW: &str = "$serde_json::private::RawValue";
+    let directory = tempfile::tempdir().unwrap();
+    let node = targets::fixture_node(directory.path());
+    let target = targets::target("stratum_session");
+    let session = |input: &[u8]| {
+        // The fuzz target's own checks, then the raw session for its replies.
+        if let Err(message) = execute(target, Some(&node), input) {
+            panic!("{}: {message}", String::from_utf8_lossy(input));
+        }
+        node::fuzz::stratum_session(&node, input, Some(targets::STRATUM_PASSWORD))
+    };
+    let replies = |replies: &[u8]| -> Vec<Value> {
+        replies
+            .split(|&byte| byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let reply: Value = serde_json::from_slice(line)
+                    .unwrap_or_else(|error| panic!("{}: {error}", String::from_utf8_lossy(line)));
+                if let Err(error) = hashstash::network_guard::parse_json(line) {
+                    panic!("the node refuses its own reply: {error}");
+                }
+                reply
+            })
+            .collect()
+    };
+    let (_, minimized) = regressions("stratum_session")
+        .into_iter()
+        .find(|(path, _)| path.ends_with("serde-json-reserved-extension-key.hex"))
+        .expect("kept regression");
+    let line = |request: Value| format!("{request}\n").into_bytes();
+    for input in [
+        minimized,
+        line(json!({"id":4,"method":"mining.configure","params":[[RAW]]})),
+        line(json!({"id":4,"method":"mining.configure","params":[["version-rolling",RAW]]})),
+        line(json!({"id":4,"method":"mining.configure","params":[["x".repeat(129)]]})),
+    ] {
+        let answered = replies(&session(&input).replies);
+        assert_eq!(answered.len(), 1, "{answered:?}");
+        assert_eq!(answered[0]["id"], 4);
+        assert_eq!(answered[0]["error"][1], "invalid extension name");
+    }
+    // Other extension names are still answered under their own names.
+    let answered = replies(
+        &session(&line(json!({"id":5,"method":"mining.configure","params":[
+            ["version-rolling","$other-extension"],{"version-rolling.mask":"1fffe000"}
+        ]})))
+        .replies,
+    );
+    assert_eq!(answered[0]["result"]["version-rolling"], true);
+    assert_eq!(answered[0]["result"]["$other-extension"], false);
+    // A reserved key in a request, wherever it is, closes the session unread:
+    // as a later key it would otherwise be echoed back first in the sorted id.
+    for request in [
+        format!(r#"{{"id":{{"a":1,"{RAW}":2}},"method":"mining.subscribe","params":[]}}"#),
+        format!(r#"{{"{RAW}":"{{\"id\":6,\"method\":\"mining.subscribe\"}}"}}"#),
+    ] {
+        let closed = session(format!("{request}\n").as_bytes());
+        assert!(closed.replies.is_empty(), "{request}");
+        let ended = closed.ended.unwrap_err().to_string();
+        assert!(ended.contains("reserved"), "{request}: {ended}");
+    }
+}
+
 /// Fuzz every selected target concurrently, each for the chosen time.
 #[test]
 #[ignore = "long-running; select with --ignored, see the module documentation"]

@@ -9,7 +9,8 @@
 //! target panics only when the code under test panics or breaks one of the
 //! invariants checked here: canonical decoding (one encoding per value),
 //! agreement between the peer preflight and the consensus codec, agreement
-//! between the bounded JSON parsers, the discovery address book's bounds,
+//! between the bounded JSON parsers, which also accept what they accepted
+//! once it is written back, the discovery address book's bounds,
 //! read-only RPC methods leaving the node unchanged, mining sessions
 //! answering in JSON lines and releasing their worker once closed, a node
 //! that synchronized from a hostile peer sending only canonical requests, a
@@ -700,6 +701,15 @@ pub fn json_body(data: &[u8]) -> String {
     let unbounded: Value =
         serde_json::from_slice(data).expect("serde accepts what the bounded parser accepted");
     assert_eq!(&unbounded, value);
+    // Written back, an accepted value is accepted again, so a node that echoes
+    // what it read never answers in JSON it or serde_json would refuse
+    // (fuzz/regressions/stratum_session/). Only acceptance is compared:
+    // without its float_roundtrip feature serde_json may read a float it
+    // wrote back as the neighbouring one.
+    let written = serde_json::to_vec(value).expect("JSON value");
+    if let Err(error) = network_guard::parse_json(&written) {
+        panic!("the bounded parser refused what it accepted, written back: {error}");
+    }
     // Each body parser lifts the string bound of one field, and requires that
     // field to be a string (or null where it is optional).
     let field = match value.get("method").and_then(Value::as_str) {
@@ -763,6 +773,9 @@ pub const JSON_TOKENS: &[&[u8]] = &[
     b"\"chain_id\"",
     b"\"body\"",
     b"hashstash.mail/2\n",
+    // Object keys serde_json reserves for its own types.
+    b"\"$serde_json::private::RawValue\"",
+    b"\"$serde_json::private::Number\"",
 ];
 
 fn json_seeds(_: Option<&Node>) -> Vec<Vec<u8>> {
@@ -2565,7 +2578,7 @@ fn address_book_seeds(_: Option<&Node>) -> Vec<Vec<u8>> {
 // ---------------------------------------------------------------------------
 // Mining sessions.
 
-const STRATUM_PASSWORD: &str = "fuzz-fixture-password";
+pub const STRATUM_PASSWORD: &str = "fuzz-fixture-password";
 /// The identifier of the first job a session is sent: a per-session counter.
 const FIRST_JOB: &str = "0000000000000001";
 
@@ -2624,6 +2637,7 @@ const STRATUM_TOKENS: &[&[u8]] = &[
     b"\"subscribe-extranonce\"",
     b"\"fuzz.worker\"",
     b"\"fuzz-fixture-password\"",
+    b"\"$serde_json::private::RawValue\"",
     b"\"0000000000000001\"",
     b"\"0000000000000002\"",
     b"\"00000000\"",

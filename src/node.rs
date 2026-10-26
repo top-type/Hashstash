@@ -11881,7 +11881,7 @@ impl RpcClient {
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            let error = serde_json::from_slice::<Value>(&bytes)
+            let error = network_guard::plain_json(&bytes)
                 .ok()
                 .and_then(|mut body| body.get_mut("error").map(Value::take));
             return Err(match error {
@@ -11905,7 +11905,10 @@ impl RpcClient {
             rpc_json_values(&bytes) <= limits.values,
             "RPC response exceeds its JSON value budget"
         );
-        let mut v: Value = serde_json::from_slice(&bytes)?;
+        // The budget counts the values the reply's text spells, so read it as
+        // spelled: serde_json's own Value would replace an object under its
+        // reserved RawValue key with the document in the key's string value.
+        let mut v = network_guard::plain_json(&bytes)?;
         if let Some(error) = v.get("error") {
             bail!("RPC error: {error}");
         }

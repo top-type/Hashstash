@@ -2663,8 +2663,11 @@ impl<'de> serde::de::Visitor<'de> for PlainJson {
         Ok(Value::Object(object))
     }
 }
-/// One JSON text, with nothing but whitespace after it.
-fn plain_json(bytes: &[u8]) -> serde_json::Result<Value> {
+/// One JSON text, with nothing but whitespace after it, read as its text
+/// spells it (see `PlainJson`) and otherwise unbounded: the parsers here
+/// bound it first, and so does the RPC client's reply budget, which counts
+/// values in the reply's text.
+pub(crate) fn plain_json(bytes: &[u8]) -> serde_json::Result<Value> {
     use serde::de::DeserializeSeed;
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let value = PlainJson.deserialize(&mut deserializer)?;
@@ -3778,6 +3781,25 @@ mod tests {
     fn json_parsers_refuse_keys_serde_json_reserves() {
         const RAW: &str = "$serde_json::private::RawValue";
         let deep = format!("{}{}", "[".repeat(120), "]".repeat(120));
+        // The key with each of `chars` written as a JSON unicode escape: a
+        // backslash, `u` and four hex digits, assembled here rather than spelled.
+        let escaped = |chars: &[char]| -> String {
+            let key: String = RAW
+                .chars()
+                .map(|c| {
+                    if chars.contains(&c) {
+                        format!("{}u{:04x}", '\\', u32::from(c))
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect();
+            assert!(key.len() > RAW.len() && !key.contains(RAW), "{key}");
+            key
+        };
+        let dollar = escaped(&['$']);
+        let colons = escaped(&[':']);
+        let several = escaped(&['$', ':', 'R']);
         type Parser = fn(&[u8]) -> Result<Value>;
         let parsers: [(&str, Parser); 3] = [
             ("ordinary", parse_json),
@@ -3791,8 +3813,13 @@ mod tests {
                 format!(r#"{{"a":1,"{RAW}":2}}"#),
                 format!(r#"{{"id":1,"params":{{"{RAW}":"{deep}"}}}}"#),
                 format!(r#"[{{"x":[{{"{RAW}":"{{}}"}}]}}]"#),
-                // The escaped spelling names the same key.
+                // An embedded document written with escapes in its string.
                 r#"{"$serde_json::private::RawValue":"{\"k\":3}"}"#.to_owned(),
+                // JSON escapes spell the same key, first or later: the refusal
+                // follows the decoded key, as serde_json's own reader does.
+                format!(r#"{{"{dollar}":"[1]"}}"#),
+                format!(r#"{{"{colons}":"[1]"}}"#),
+                format!(r#"{{"a":1,"{several}":2}}"#),
                 r#"{"$serde_json::private::Number":"1"}"#.to_owned(),
             ] {
                 let error = parse(refused.as_bytes()).unwrap_err().to_string();

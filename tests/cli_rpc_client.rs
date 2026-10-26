@@ -319,6 +319,64 @@ async fn small_replies_are_bounded_by_bytes_and_json_values() {
 }
 
 #[tokio::test]
+async fn replies_never_read_keys_serde_json_reserves() {
+    // serde_json's raw_value feature, which axum enables for the whole build,
+    // makes its Value read an object led by this key as the document in the
+    // key's string: 100,001 values that the reply budget counts as one string.
+    const RAW: &str = "$serde_json::private::RawValue";
+    let document =
+        serde_json::to_string(&serde_json::to_string(&vec![0u8; 100_000]).unwrap()).unwrap();
+    // The same key with its `$` and colons as JSON unicode escapes, assembled
+    // from a backslash, `u` and four hex digits rather than spelled.
+    let escaped: String = RAW
+        .chars()
+        .map(|c| {
+            if matches!(c, '$' | ':') {
+                format!("{}u{:04x}", '\\', u32::from(c))
+            } else {
+                c.to_string()
+            }
+        })
+        .collect();
+    assert!(!escaped.contains('$') && escaped.len() > RAW.len());
+    let endpoint = mock(Duration::ZERO, move |method, _| {
+        let key = if method == "escaped" {
+            escaped.as_str()
+        } else {
+            RAW
+        };
+        if method == "failing" {
+            let body = format!(r#"{{"error":{{"{key}":"\"from the token\""}}}}"#);
+            return http("500 Internal Server Error", "", body.as_bytes());
+        }
+        let body = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"{key}":{document}}}}}"#);
+        http("200 OK", "", body.as_bytes())
+    })
+    .await;
+    let client = RpcClient::new(&endpoint.url(), false).unwrap();
+    for method in ["plain", "escaped"] {
+        for limits in [RpcLimits::SMALL, RpcLimits::FRAME] {
+            let error = client
+                .call(method, json!({}), limits)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("reserved"), "{method} {limits:?}: {error}");
+        }
+    }
+    // An error body is read the same way: the bare status, not the token's text.
+    let error = client
+        .call("failing", json!({}), RpcLimits::SMALL)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("500") && !error.contains("from the token"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn pending_nonce_discovery_counts_only_signed_rows_and_is_bounded() {
     let secret = [21u8; 32];
     let sender = crypto::public_key(&secret).unwrap();

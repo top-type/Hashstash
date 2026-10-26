@@ -500,6 +500,67 @@ fn launch_kit_regressions() {
     ]);
 }
 
+/// A shell script under pipefail never pipes into a grep that stops reading
+/// at its first match (-q, -m): the writer, still writing, then dies of
+/// SIGPIPE now and then, and the pipeline fails with status 141 or, as a
+/// condition, reads as no match. launch_kit_regressions failed so in CI once
+/// launch-kit.sh --help outgrew one 4096-byte write. Such a check reads the
+/// whole output first, or counts the matches.
+#[test]
+fn pipefail_scripts_never_pipe_into_an_early_exiting_grep() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut checked = 0;
+    for directory in ["scripts", "deploy/linux"] {
+        for entry in fs::read_dir(root.join(directory)).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|extension| extension != "sh") {
+                continue;
+            }
+            let script = fs::read_to_string(&path).unwrap();
+            if !script.contains("pipefail") {
+                continue;
+            }
+            checked += 1;
+            for (number, line) in script.lines().enumerate() {
+                if line.trim_start().starts_with('#') {
+                    continue;
+                }
+                let bytes = line.as_bytes();
+                // Each `|` or `|&` that is not part of `||`.
+                let pipes = (0..bytes.len()).filter(|&i| {
+                    bytes[i] == b'|'
+                        && (i == 0 || bytes[i - 1] != b'|')
+                        && bytes.get(i + 1) != Some(&b'|')
+                });
+                for pipe in pipes {
+                    let reader = line[pipe + 1..].trim_start_matches('&');
+                    let mut words = reader
+                        .split_whitespace()
+                        .skip_while(|word| word.contains('='));
+                    if !matches!(words.next(), Some("grep" | "egrep" | "fgrep")) {
+                        continue;
+                    }
+                    let early = words
+                        .take_while(|word| word.starts_with('-') && *word != "--")
+                        .any(|flag| match flag.strip_prefix("--") {
+                            Some(long) => {
+                                matches!(long, "quiet" | "silent") || long.starts_with("max-count")
+                            }
+                            None => flag.contains(['q', 'm']),
+                        });
+                    assert!(
+                        !early,
+                        "{}:{}: a pipe into a grep that stops at its first match: {line}",
+                        path.display(),
+                        number + 1
+                    );
+                }
+            }
+        }
+    }
+    assert!(checked >= 6, "only {checked} pipefail scripts were found");
+}
+
 /// Read-only installer preflights against this build, from private input copies.
 #[cfg(target_os = "linux")]
 #[test]

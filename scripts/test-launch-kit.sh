@@ -66,7 +66,10 @@ run_rendered() {
 
 # ------------------------------------------------------------ refusals
 if bash "$kit" > /dev/null 2>&1; then printf 'No arguments accepted\n' >&2; exit 1; fi; checks=$((checks + 1))
-bash "$kit" --help | grep -Fq -- '--seeds LIST'; checks=$((checks + 1))
+# The help is read in full before it is searched: grep -q stops reading at its
+# match, so under pipefail a writer still writing died of SIGPIPE (status 141)
+# now and then once the help outgrew one 4096-byte write.
+help=$(bash "$kit" --help); grep -Fq -- '--seeds LIST' <<< "$help"; checks=$((checks + 1))
 reject '--seeds is required' --web-host 45.32.10.1 --hashrate 1.67P
 reject '--web-host is required' --seeds "$seeds" --hashrate 1.67P
 reject '--hashrate is required' --seeds "$seeds" --web-host 45.32.10.1 --miner-prefixes 98.10.0.0/16
@@ -263,7 +266,7 @@ has "$fixture/args" 45.32.30.3:18481; lacks "$fixture/args" --public-web
 site=$s1/nginx/hashstash-public.conf
 has "$site" '    server_name wallet.example.com;'; has "$site" '    ssl_certificate /etc/letsencrypt/live/wallet.example.com/fullchain.pem;'
 has "$site" '    location / { return 308 https://wallet.example.com$request_uri; }'
-if grep -v '^[[:space:]]*#' "$site" | grep -q PUBLIC_HOST; then printf 'PUBLIC_HOST left in %s\n' "$site" >&2; exit 1; fi
+[[ $(grep -v '^[[:space:]]*#' "$site" | grep -c PUBLIC_HOST) == 0 ]] || { printf 'PUBLIC_HOST left in %s\n' "$site" >&2; exit 1; }
 checks=$((checks + 1))
 [[ $(grep -c 'proxy_set_header X-Real-IP $remote_addr;' "$site") == 2 ]]; checks=$((checks + 1))
 faucet_block=$(sed -n '/^    location \/faucet\/ {$/,/^    }$/p' "$site")

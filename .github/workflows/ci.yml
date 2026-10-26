@@ -213,11 +213,12 @@ jobs:
         run: cargo build --release --locked --bins
       - name: Rust tests with test fixtures
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cargo test --release --all-targets --locked --features test-fixtures --target-dir target/fixtures
+        # The wrapper turns failing tests into annotations, readable without the log.
+        run: ./scripts/ci_annotate.ps1 -- cargo test --release --all-targets --locked --features test-fixtures --target-dir target/fixtures
       - name: Owner-only secret files on NTFS
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         # Reads each secret file's access list back with icacls.
-        run: cargo test --release --locked --lib --target-dir target/fixtures --features test-fixtures windows_ -- --nocapture
+        run: ./scripts/ci_annotate.ps1 -- cargo test --release --locked --lib --target-dir target/fixtures --features test-fixtures windows_ -- --nocapture
       - name: Cold signer launcher token hand-off, PowerShell 7
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\test_cold_launcher.ps1 -Executable .\target\release\hashstash-cold.exe -Port 21980 -Report work\cold-launcher-report.json

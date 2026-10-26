@@ -46,7 +46,7 @@ command -v cargo >/dev/null || fail 'cargo is required'
 toolchain=${RUST_TOOLCHAIN:-1.97.1}
 run=()
 if [[ $(rustc --version 2>/dev/null) != "rustc $toolchain "* ]]; then
-    if command -v rustup >/dev/null && rustup toolchain list | grep -q "^$toolchain-"; then
+    if command -v rustup >/dev/null && grep -q "^$toolchain-" <<< "$(rustup toolchain list)"; then
         run=(rustup run "$toolchain")
     else
         fail "rustc $toolchain is required (found: $(rustc --version 2>/dev/null || echo none)); install it with: rustup toolchain install $toolchain --profile minimal"

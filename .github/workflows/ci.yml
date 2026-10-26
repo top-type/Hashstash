@@ -107,10 +107,11 @@ jobs:
           cargo build --release --locked --bins --features test-fixtures --target-dir target/fixtures
       - name: Rust tests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cargo test --release --all-targets --locked
+        # The wrapper turns failing tests into annotations, readable without the log.
+        run: bash scripts/ci_annotate.sh -- cargo test --release --all-targets --locked
       - name: Rust tests with test fixtures
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cargo test --release --all-targets --locked --features test-fixtures --target-dir target/fixtures
+        run: bash scripts/ci_annotate.sh -- cargo test --release --all-targets --locked --features test-fixtures --target-dir target/fixtures
       - name: Frontend suites
         if: ${{ !cancelled() }}
         run: node scripts/test_all_frontend.cjs
@@ -187,7 +188,8 @@ jobs:
         run: cargo build --release --locked --bins --features test-fixtures --target-dir target/debug-assertions
       - name: Rust tests with test fixtures and debug assertions
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        run: cargo test --release --all-targets --locked --features test-fixtures --target-dir target/debug-assertions
+        # The wrapper turns failing tests into annotations, readable without the log.
+        run: bash scripts/ci_annotate.sh -- cargo test --release --all-targets --locked --features test-fixtures --target-dir target/debug-assertions
 
   windows:
     name: Tests (Windows)

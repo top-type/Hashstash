@@ -12,17 +12,24 @@ guessing. They check that:
 - each check is its own step and still runs after another check failed;
 - the browser cryptography bundle is rebuilt from its lockfile;
 - one Rust pass and the fuzzers run with debug assertions;
+- the Rust test steps of the test jobs report failing tests as annotations,
+  through scripts/ci_annotate.sh or .ps1, which mirror the command's output
+  and exit code;
 - a pushed release tag or release branch runs the full gate on its commit;
 - every standalone test program and launcher test is run by a job, or only
   wraps programs that are.
 """
 import pathlib
 import re
+import shutil
+import subprocess
+import sys
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / '.github' / 'workflows' / 'ci.yml'
 NETWORK_SUITES = ROOT / 'scripts' / 'ci_network_suites.sh'
+ANNOTATE = ROOT / 'scripts' / 'ci_annotate.sh'
 
 
 def indentation(line):
@@ -262,6 +269,18 @@ class WorkflowTest(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIn('--release --debug-assertions', arguments)
 
+    def test_rust_test_steps_report_failures_as_annotations(self):
+        wrappers = {'linux': 'bash scripts/ci_annotate.sh -- ', 'debug-assertions': 'bash scripts/ci_annotate.sh -- ',
+                    'windows': './scripts/ci_annotate.ps1 -- '}
+        for name, wrapper in wrappers.items():
+            tests = [step for step in self.jobs[name].steps if 'cargo test' in step.keys.get('run', '')]
+            self.assertTrue(tests, f'{name}: no Rust test step')
+            for step in tests:
+                with self.subTest(job=name, step=step.name):
+                    self.assertEqual(len(step.commands()), 1)
+                    self.assertTrue(step.commands()[0].startswith(wrapper + 'cargo test '),
+                                    'run the Rust tests through the annotation wrapper')
+
     def test_release_refs_run_the_full_gate(self):
         # Nightly and manual runs start only from the default branch, so a
         # pushed release tag or branch is how the release commit itself gets
@@ -299,6 +318,59 @@ class WorkflowTest(unittest.TestCase):
                 for inner in wrapped:
                     suffix = '.ps1' if name.endswith('.ps1') else '.py'
                     self.assertIn(inner + suffix, ran, f'{name} wraps {inner}, which no job runs')
+
+
+@unittest.skipIf(sys.platform == 'win32' or not shutil.which('bash'), 'needs bash on a POSIX system')
+class AnnotateScriptTest(unittest.TestCase):
+    def run_wrapped(self, script):
+        return subprocess.run(['bash', str(ANNOTATE), '--', 'bash', '-c', script],
+                              capture_output=True, text=True, timeout=60)
+
+    def annotations(self, output):
+        return [line for line in output.splitlines() if line.startswith('::error ')]
+
+    def test_success_mirrors_the_output_and_adds_nothing(self):
+        result = self.run_wrapped('echo out; echo err >&2; echo "---- x stdout ----"')
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.splitlines(), ['out', 'err', '---- x stdout ----'])
+        self.assertEqual(self.annotations(result.stdout), [])
+
+    def test_failing_tests_and_compile_errors_become_annotations(self):
+        script = r"""
+            printf 'running 2 tests\n\nfailures:\n\n'
+            printf -- '---- tests::a_b stdout ----\n'
+            printf "thread 'tests::a_b' (7) panicked at src/x.rs:3:5:\n"
+            printf 'left: 1, right: 2 (100%%)\n\nnote: run with `RUST_BACKTRACE=1`\n'
+            printf '\033[1m\033[91merror[E0425]\033[0m: cannot find value\n'
+            exit 101
+        """
+        result = self.run_wrapped(script)
+        self.assertEqual(result.returncode, 101)
+        self.assertIn('---- tests::a_b stdout ----', result.stdout.splitlines())
+        self.assertEqual(self.annotations(result.stdout), [
+            '::error title=tests%3A%3Aa_b::---- tests::a_b stdout ----%0A'
+            "thread 'tests::a_b' (7) panicked at src/x.rs:3:5:%0A"
+            'left: 1, right: 2 (100%25)%0Aerror[E0425]: cannot find value',
+            '::error title=compile error::error[E0425]: cannot find value',
+        ])
+
+    def test_cargo_names_the_failed_test_target(self):
+        result = self.run_wrapped("printf '\\033[1m\\033[91merror\\033[0m: test failed, to rerun pass `--lib`\\n'; exit 101")
+        self.assertEqual(result.returncode, 101)
+        self.assertEqual(self.annotations(result.stdout),
+                         ['::error title=tests failed::error: test failed, to rerun pass `--lib`'])
+
+    def test_annotations_are_at_most_ten(self):
+        result = self.run_wrapped('for i in $(seq 12); do echo "---- t$i stdout ----"; done; exit 1')
+        self.assertEqual(result.returncode, 1)
+        titles = [line.split('::')[1] for line in self.annotations(result.stdout)]
+        self.assertEqual(titles, [f'error title=t{i}' for i in range(1, 11)])
+
+    def test_another_failure_reports_the_last_lines(self):
+        result = self.run_wrapped('seq 20; exit 3')
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(self.annotations(result.stdout),
+                         ['::error title=bash failed (3)::' + '%0A'.join(str(i) for i in range(6, 21))])
 
 
 if __name__ == '__main__':

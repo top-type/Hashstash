@@ -665,7 +665,7 @@ public_site() {
     template=${template%x}
     [[ $(grep -cx '    location / {' <<< "$template") == 1 ]] || fail 'unexpected public-web.nginx.template: no single "location / {" block'
     [[ $(grep -c 'server 127.0.0.1:18483 max_conns=' <<< "$template") == 1 ]] || fail 'unexpected public-web.nginx.template upstream'
-    ! grep -v '^[[:space:]]*#' <<< "$template" | grep -q PUBLIC_HOST || fail 'internal error: PUBLIC_HOST left in the nginx site'
+    [[ $(grep -v '^[[:space:]]*#' <<< "$template" | grep -c PUBLIC_HOST) == 0 ]] || fail 'internal error: PUBLIC_HOST left in the nginx site'
     template=${template//server 127.0.0.1:18483 max_conns=/server 127.0.0.1:$web_port max_conns=}
     faucet=$(render <<'EOF'
     # Faucet (docs/FAUCET.md). The wallet reads this descriptor; it must

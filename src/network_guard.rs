@@ -2587,9 +2587,93 @@ fn preflight_json_with_limits(bytes: &[u8], max_values: usize, max_string: usize
     );
     Ok(values)
 }
+/// The longest JSON object key the bounded parsers accept.
+pub const MAX_JSON_KEY_BYTES: usize = 128;
+/// Object keys serde_json reserves for its own types. With its `raw_value`
+/// feature, which axum enables for the whole build, `serde_json::Value`
+/// reads an object whose first key is `$serde_json::private::RawValue` as
+/// the JSON text held in its string value; `arbitrary_precision` reserves a
+/// key of the same prefix for numbers.
+const RESERVED_JSON_KEY_PREFIX: &str = "$serde_json::private::";
+/// Whether `key` may name a member of JSON this node reads or writes: within
+/// the key bound and not reserved by serde_json. Anything the node echoes as
+/// a key, such as a Stratum extension name, must pass this too, so its
+/// replies stay JSON that it and serde_json-based clients read as written.
+pub fn json_key_allowed(key: &str) -> bool {
+    key.len() <= MAX_JSON_KEY_BYTES && !key.starts_with(RESERVED_JSON_KEY_PREFIX)
+}
+/// A JSON value read exactly as its text spells it. serde_json's own `Value`
+/// deserializer would replace an object led by the RawValue key with the
+/// document in its string, after the preflight bounded only that string, and
+/// would accept the key elsewhere in an object, where the node's sorted
+/// output can put it first and make its reply unreadable to serde_json.
+/// This reader keeps every key a plain string and refuses reserved keys.
+struct PlainJson;
+impl<'de> serde::de::DeserializeSeed<'de> for PlainJson {
+    type Value = Value;
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+impl<'de> serde::de::Visitor<'de> for PlainJson {
+    type Value = Value;
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+    fn visit_bool<E>(self, value: bool) -> Result<Value, E> {
+        Ok(Value::Bool(value))
+    }
+    fn visit_i64<E>(self, value: i64) -> Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+    fn visit_u64<E>(self, value: u64) -> Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+    fn visit_f64<E>(self, value: f64) -> Result<Value, E> {
+        Ok(serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number))
+    }
+    fn visit_str<E>(self, value: &str) -> Result<Value, E> {
+        Ok(Value::String(value.to_owned()))
+    }
+    fn visit_string<E>(self, value: String) -> Result<Value, E> {
+        Ok(Value::String(value))
+    }
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_none<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut values = Vec::new();
+        while let Some(value) = seq.next_element_seed(PlainJson)? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if key.starts_with(RESERVED_JSON_KEY_PREFIX) {
+                return Err(serde::de::Error::custom("JSON key reserved by serde_json"));
+            }
+            // A repeated key keeps its last value, as serde_json's own does.
+            object.insert(key, map.next_value_seed(PlainJson)?);
+        }
+        Ok(Value::Object(object))
+    }
+}
+/// One JSON text, with nothing but whitespace after it.
+fn plain_json(bytes: &[u8]) -> serde_json::Result<Value> {
+    use serde::de::DeserializeSeed;
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value = PlainJson.deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(value)
+}
 pub fn parse_json(bytes: &[u8]) -> Result<Value> {
     preflight_json(bytes)?;
-    let value: Value = serde_json::from_slice(bytes)?;
+    let value = plain_json(bytes)?;
     json_bounds(&value)?;
     Ok(value)
 }
@@ -2597,7 +2681,7 @@ pub fn parse_json(bytes: &[u8]) -> Result<Value> {
 /// JSON string bound. All other fields retain their existing limits.
 pub(crate) fn parse_rpc_json(bytes: &[u8], max_raw_hex: usize) -> Result<Value> {
     preflight_json_with_limits(bytes, MAX_JSON_VALUES, max_raw_hex.max(1024))?;
-    let mut value: Value = serde_json::from_slice(bytes)?;
+    let mut value = plain_json(bytes)?;
     match value.get("method").and_then(Value::as_str) {
         Some("broadcasttransaction") => {
             bounded_string_field(&mut value, "/params/raw", max_raw_hex)?;
@@ -2614,7 +2698,7 @@ pub(crate) fn parse_rpc_json(bytes: &[u8], max_raw_hex: usize) -> Result<Value> 
 /// endpoint. Wallet management and other endpoints do not inherit this exception.
 pub(crate) fn parse_wallet_json(bytes: &[u8], max_data_hex: usize) -> Result<Value> {
     preflight_json_with_limits(bytes, MAX_JSON_VALUES, max_data_hex.max(1024))?;
-    let mut value: Value = serde_json::from_slice(bytes)?;
+    let mut value = plain_json(bytes)?;
     bounded_data_field(&mut value, "/data_hex", max_data_hex)?;
     Ok(value)
 }
@@ -2653,7 +2737,7 @@ fn json_bounds(value: &Value) -> Result<()> {
         }
         Value::Object(o) => {
             for (k, v) in o {
-                ensure!(k.len() <= 128, "JSON key exceeds protocol bound");
+                ensure!(json_key_allowed(k), "JSON key exceeds protocol bound");
                 json_bounds(v)?;
             }
         }
@@ -3684,6 +3768,55 @@ mod tests {
         assert!(preflight_json(format!("\"{}\"", "x".repeat(6145)).as_bytes()).is_err());
         assert!(preflight_json(b"[1,2").is_err());
         assert!(parse_json(format!("\"{}\"", "x".repeat(1025)).as_bytes()).is_err());
+    }
+    /// Found by the stratum_session fuzz target (fuzz/regressions/stratum_session/):
+    /// with serde_json's `raw_value` feature, which axum enables, its `Value`
+    /// read an object led by the RawValue key as the document in its string,
+    /// past the preflight's bounds, and kept the key anywhere else in an
+    /// object, from where sorted output wrote JSON no serde_json parser reads.
+    #[test]
+    fn json_parsers_refuse_keys_serde_json_reserves() {
+        const RAW: &str = "$serde_json::private::RawValue";
+        let deep = format!("{}{}", "[".repeat(120), "]".repeat(120));
+        type Parser = fn(&[u8]) -> Result<Value>;
+        let parsers: [(&str, Parser); 3] = [
+            ("ordinary", parse_json),
+            ("rpc", |bytes| parse_rpc_json(bytes, 32_768)),
+            ("wallet", |bytes| parse_wallet_json(bytes, 32_768)),
+        ];
+        for (name, parse) in parsers {
+            for refused in [
+                format!(r#"{{"{RAW}":"[1,2]"}}"#),
+                format!(r#"{{"{RAW}":false}}"#),
+                format!(r#"{{"a":1,"{RAW}":2}}"#),
+                format!(r#"{{"id":1,"params":{{"{RAW}":"{deep}"}}}}"#),
+                format!(r#"[{{"x":[{{"{RAW}":"{{}}"}}]}}]"#),
+                // The escaped spelling names the same key.
+                r#"{"$serde_json::private::RawValue":"{\"k\":3}"}"#.to_owned(),
+                r#"{"$serde_json::private::Number":"1"}"#.to_owned(),
+            ] {
+                let error = parse(refused.as_bytes()).unwrap_err().to_string();
+                assert!(error.contains("reserved"), "{name} {refused}: {error}");
+            }
+            // Other keys, and the token as a string value, are ordinary JSON.
+            for accepted in [
+                r#"{"$ref":1,"$serde_json":2}"#.to_owned(),
+                format!(r#"{{"id":"{RAW}","params":["{RAW}"]}}"#),
+            ] {
+                let value = parse(accepted.as_bytes()).unwrap();
+                assert_eq!(value, serde_json::from_str::<Value>(&accepted).unwrap());
+                let written = serde_json::to_vec(&value).unwrap();
+                assert_eq!(
+                    parse(&written).unwrap(),
+                    value,
+                    "{name} reads back {accepted}"
+                );
+            }
+        }
+        assert!(json_key_allowed("version-rolling"));
+        assert!(json_key_allowed(&"k".repeat(MAX_JSON_KEY_BYTES)));
+        assert!(!json_key_allowed(&"k".repeat(MAX_JSON_KEY_BYTES + 1)));
+        assert!(!json_key_allowed(RAW));
     }
     #[test]
     fn addresses_in_one_prefix_share_an_aggregate_while_other_prefixes_stay_independent() {

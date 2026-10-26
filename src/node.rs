@@ -12617,6 +12617,9 @@ async fn stratum_lines<R: tokio::io::AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                             let mut next_negotiated = negotiated;
                             for ext in extensions {
                                 let ext = ext.as_str().context("extension must be a string")?;
+                                // The reply names each extension as a key, so a name must be
+                                // one the node's own JSON accepts (see json_key_allowed).
+                                ensure!(network_guard::json_key_allowed(ext), "invalid extension name");
                                 if ext == "version-rolling" {
                                     let requested = options.get("version-rolling.mask").map(hex_u32).transpose()?.unwrap_or(u32::MAX);
                                     let candidate = requested & VERSION_MASK;

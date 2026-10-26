@@ -81,7 +81,7 @@ The executable tests and their assertions define the coverage. Public fixture ke
 
 ## Fuzzing
 
-Each parser of hostile input has a fuzz target in [`fuzz/src/lib.rs`](../fuzz/src/lib.rs), and so do synchronization from a hostile peer and serving one. Besides the absence of panics, each target checks invariants: one encoding per decoded value, agreement between the peer preflight and the consensus codec, agreement between the bounded JSON parsers, the discovery address book's bounds, that read-only RPC methods leave the node unchanged, that a node serving a hostile peer answers in protocol order with replies that fit the capacity the peer declared and follow the node's active chain, and that after either peer session a node's tip is its active block, its held headers stay within their bounds and a replay of its active chain reaches the same state root.
+Each parser of hostile input has a fuzz target in [`fuzz/src/lib.rs`](../fuzz/src/lib.rs), and so do synchronization from a hostile peer and serving one. Besides the absence of panics, each target checks invariants: one encoding per decoded value, agreement between the peer preflight and the consensus codec, agreement between the bounded JSON parsers, which also accept what they accepted once it is written back, the discovery address book's bounds, that read-only RPC methods leave the node unchanged, that a node serving a hostile peer answers in protocol order with replies that fit the capacity the peer declared and follow the node's active chain, and that after either peer session a node's tip is its active block, its held headers stay within their bounds and a replay of its active chain reaches the same state root.
 
 | Target | Input |
 | --- | --- |

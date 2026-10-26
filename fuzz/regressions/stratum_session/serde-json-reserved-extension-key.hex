@@ -1,0 +1,8 @@
+# mining.configure naming serde_json's private RawValue token as an extension,
+# then a partial line. The reply named it as a key, which serde_json (raw_value,
+# enabled by axum) refuses: libFuzzer crash-9dd88ccbf71208d886f6763b5a8790debb304a00,
+# minimized by cargo fuzz tmin to these 104 bytes.
+7b226964223a342c226d6574686f64223a226d696e696e672e636f6e66696775
+7265222c22706172616d73223a5b5b222473657264655f6a736f6e3a3a707269
+766174653a3a52617756616c7565222c227375627367225d2c7b226069223a30
+2e30317d5d7d0a7b

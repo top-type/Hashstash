@@ -325,12 +325,24 @@ jobs:
           # The RPC target's fixture node lives for the whole process by design,
           # so leak detection is left to the sanitizer's ordinary error checks.
           # Every target runs even after another failed.
+          set -o pipefail  # so piping the fuzzer through tee keeps its exit status
           failed=
           for target in $targets; do
             echo "::group::$target"
-            $fuzz run --release --debug-assertions "$target" "fuzz/corpus/$target" -- \
+            log="fuzz/run-$target.log"
+            if ! $fuzz run --release --debug-assertions "$target" "fuzz/corpus/$target" -- \
               -max_total_time="$FUZZ_SECONDS" -rss_limit_mb=4096 -timeout=30 -detect_leaks=0 -print_final_stats=1 \
-              || failed="$failed $target"
+              2>&1 | tee "$log"; then
+              failed="$failed $target"
+              # Annotations are public through the API, unlike the log and artifacts:
+              # report libFuzzer's error lines and each failing input (base64).
+              summary=$(grep -E 'ERROR: |panicked at|SUMMARY|Test unit written|^thread ' "$log" | head -c 3000 | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g') || true
+              echo "::error title=libFuzzer $target::$summary"
+              for input in fuzz/artifacts/"$target"/*; do
+                [ -f "$input" ] || continue
+                echo "::error title=libFuzzer input $(basename "$input")::$(base64 -w0 "$input" | head -c 6000)"
+              done
+            fi
             echo "::endgroup::"
           done
           [ -z "$failed" ] || { echo "::error::libFuzzer failed:$failed"; exit 1; }

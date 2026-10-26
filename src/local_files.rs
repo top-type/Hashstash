@@ -544,6 +544,10 @@ mod windows {
             dacl: *mut c_void,
             sacl: *mut c_void,
         ) -> u32;
+        #[cfg(test)]
+        fn ConvertStringSidToSidW(text: *const u16, sid: *mut *mut c_void) -> i32;
+        #[cfg(test)]
+        fn ConvertSidToStringSidW(sid: *mut c_void, text: *mut *mut u16) -> i32;
     }
 
     /// Memory the system allocated with LocalAlloc, freed when dropped.
@@ -669,7 +673,12 @@ mod windows {
         if converted == 0 {
             return Err(io::Error::last_os_error()).context("cannot read the file's access list");
         }
-        let text = Local(text.cast());
+        system_string(Local(text.cast()))
+    }
+
+    /// A NUL-terminated UTF-16 string the system allocated, which is freed
+    /// once it is copied.
+    fn system_string(text: Local) -> Result<String> {
         let start = text.0.cast::<u16>();
         let mut length = 0;
         // SAFETY: the string is NUL-terminated, so every unit read up to and
@@ -775,28 +784,29 @@ mod windows {
         let (owner, _) = security(file).with_context(restricted)?;
         super::trusted_owner(&owner, sid).with_context(restricted)?;
         if replace {
-            replace_list(file, sid).with_context(restricted)?;
+            replace_list(file, &super::owner_only_sddl(sid, false)).with_context(restricted)?;
         }
         let (_, list) = security(file).with_context(restricted)?;
         super::owner_only_access_list(&list, sid).with_context(restricted)
     }
 
-    /// Replaces an existing file's whole access list with the protected
-    /// owner-only one, so inherited entries and other accounts' explicit
-    /// ones both go.
-    fn replace_list(file: &fs::File, sid: &str) -> Result<()> {
-        let owner_only = descriptor(&super::owner_only_sddl(sid, false))?;
+    /// Replaces an existing file's (or directory's) whole access list with
+    /// the protected one `sddl` describes, such as the owner-only one, so
+    /// inherited entries and other accounts' explicit ones both go. The
+    /// handle needs WRITE_DAC.
+    pub(super) fn replace_list(file: &fs::File, sddl: &str) -> Result<()> {
+        let replacement = descriptor(sddl)?;
         let (mut present, mut defaulted, mut dacl) = (0, 0, ptr::null_mut());
         // SAFETY: a valid descriptor; the list it returns points inside it.
         if unsafe {
-            GetSecurityDescriptorDacl(owner_only.0, &mut present, &mut dacl, &mut defaulted)
+            GetSecurityDescriptorDacl(replacement.0, &mut present, &mut dacl, &mut defaulted)
         } == 0
             || present == 0
         {
             return Err(io::Error::last_os_error()).context("cannot build an access list");
         }
         // SAFETY: the handle is open with WRITE_DAC, and `dacl` lives inside
-        // `owner_only`, which outlives the call.
+        // `replacement`, which outlives the call.
         let status = unsafe {
             SetSecurityInfo(
                 file.as_raw_handle(),
@@ -863,6 +873,30 @@ mod windows {
             .filter(|account| !account.is_empty())
             .map(str::to_owned)
             .context("unrecognized account")
+    }
+
+    /// `account`, a SID string or an SDDL alias such as LA, as its SID string
+    /// (S-1-...), so tests compare accounts by SID however a list spells
+    /// them. Unlike `spelled`, this never yields an alias.
+    #[cfg(test)]
+    pub(super) fn sid_string(account: &str) -> Result<String> {
+        let text = wide(OsStr::new(account));
+        let mut sid = ptr::null_mut();
+        // SAFETY: `text` is NUL-terminated and outlives the call; the system
+        // allocates the SID, which `Local` frees.
+        if unsafe { ConvertStringSidToSidW(text.as_ptr(), &mut sid) } == 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("unrecognized account {account}"));
+        }
+        let sid = Local(sid);
+        let mut string: *mut u16 = ptr::null_mut();
+        // SAFETY: `sid` is a valid SID; the system allocates a NUL-terminated
+        // string, which `system_string` frees.
+        if unsafe { ConvertSidToStringSidW(sid.0, &mut string) } == 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("cannot write account {account} as a SID"));
+        }
+        system_string(Local(string.cast()))
     }
 
     /// A file's access list as `icacls /save` reports it, in SDDL: a second
@@ -1160,33 +1194,156 @@ pub(crate) mod tests {
         windows::access_list(path).unwrap()
     }
 
+    /// One entry of an SDDL access list.
+    #[cfg(windows)]
+    #[derive(Debug)]
+    struct Entry {
+        /// A (allow), D (deny) and so on.
+        kind: String,
+        /// Inheritance flags: ID marks an entry inherited from the folder.
+        flags: String,
+        rights: String,
+        /// A SID string or an SDDL alias, as the system wrote it.
+        account: String,
+    }
+
+    /// An SDDL access list's flags (`D:` and any of P, AI, AR) and entries,
+    /// as `owner_only_access_list` reads them; anything unrecognized fails
+    /// the test.
+    #[cfg(windows)]
+    fn entries(list: &str) -> (&str, Vec<Entry>) {
+        let (flags, mut rest) = list.split_at(list.find('(').unwrap_or(list.len()));
+        assert!(flags.starts_with("D:"), "unrecognized access list {list}");
+        let mut entries = Vec::new();
+        while let Some(entry) = rest.strip_prefix('(') {
+            // A conditional entry nests parentheses of its own.
+            let mut depth = 1usize;
+            let end = entry
+                .char_indices()
+                .find_map(|(at, c)| {
+                    match c {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    (depth == 0).then_some(at)
+                })
+                .unwrap_or_else(|| panic!("unrecognized access list {list}"));
+            // type;flags;rights;object;inherited object;account[;condition]
+            let fields: Vec<&str> = entry[..end].splitn(7, ';').collect();
+            assert!(fields.len() >= 6, "unrecognized access list {list}");
+            entries.push(Entry {
+                kind: fields[0].to_owned(),
+                flags: fields[1].to_owned(),
+                rights: fields[2].to_owned(),
+                account: fields[5].to_owned(),
+            });
+            rest = &entry[end + 1..];
+        }
+        // Anything after the list is another section, such as the system list.
+        assert!(
+            rest.is_empty() || rest.starts_with("S:"),
+            "unrecognized access list {list}"
+        );
+        (flags, entries)
+    }
+
+    /// Whether two accounts, each a SID string or an SDDL alias, are one
+    /// account. The system writes some accounts by an alias, such as LA for
+    /// this computer's built-in Administrator (the account a GitHub Windows
+    /// runner uses), so accounts are compared by SID.
+    #[cfg(windows)]
+    fn same_account(one: &str, other: &str) -> bool {
+        let sid = |account: &str| {
+            windows::sid_string(account).unwrap_or_else(|error| panic!("{error:#}"))
+        };
+        sid(one) == sid(other)
+    }
+
+    /// Whether `list` has exactly one entry, explicit or (`inherited`) marked
+    /// inherited (ID), granting `sid` full control. A file created in a
+    /// private directory gets the directory's entry marked inherited on most
+    /// systems, but a GitHub Windows runner wrote it unmarked:
+    /// D:(A;;FA;;;LA).
+    #[cfg(windows)]
+    fn grants_only(list: &str, sid: &str, inherited: bool) -> bool {
+        let (_, entries) = entries(list);
+        matches!(
+            entries.as_slice(),
+            [entry] if entry.kind == "A"
+                && (entry.flags.is_empty() || (inherited && entry.flags == "ID"))
+                && entry.rights == "FA"
+                && same_account(&entry.account, sid)
+        )
+    }
+
+    /// Whether `list` is protected, so the folder passes nothing on to it, and
+    /// is one explicit entry granting `sid` full control: what a secret file
+    /// gets.
+    #[cfg(windows)]
+    fn owner_only(list: &str, sid: &str) -> bool {
+        entries(list).0.starts_with("D:P") && grants_only(list, sid, false)
+    }
+
+    /// Whether `list` has an entry granting `account` some access.
+    #[cfg(windows)]
+    fn lets_in(list: &str, account: &str) -> bool {
+        entries(list)
+            .1
+            .iter()
+            .any(|entry| entry.kind == "A" && same_account(&entry.account, account))
+    }
+
     /// One protected entry granting this account full control, nothing else.
     #[cfg(windows)]
     pub(crate) fn assert_owner_only(path: &Path) {
         let sid = windows::current_sid().unwrap();
         let list = dacl(path);
-        let (flags, entries) = list.split_at(list.find('(').unwrap());
-        assert!(flags.starts_with("D:P"), "{}: {list}", path.display());
-        assert_eq!(entries, format!("(A;;FA;;;{sid})"), "{}", path.display());
+        assert!(owner_only(&list, sid), "{}: {list}", path.display());
+    }
+
+    /// Sets `path`'s (a file's or a directory's) whole access list to the
+    /// protected one `sddl` describes, as production replaces a secret
+    /// file's, whatever the folder would pass on.
+    #[cfg(windows)]
+    fn set_access_list(path: &Path, sddl: &str) {
+        let file = fs::OpenOptions::new()
+            .access_mode(windows::READ_CONTROL | windows::WRITE_DAC)
+            .share_mode(windows::FILE_SHARE_ALL)
+            .custom_flags(windows::FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        windows::replace_list(&file, sddl).unwrap_or_else(|error| panic!("{sddl}: {error:#}"));
+    }
+
+    /// A new temporary directory whose whole access list is `sddl`, so what
+    /// is created inside starts from a known list rather than whatever the
+    /// system's temporary folder passes on, which differs between computers.
+    #[cfg(windows)]
+    fn directory_with_list(sddl: &str) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        set_access_list(directory.path(), sddl);
+        directory
     }
 
     /// On NTFS, where an access list can be set, it is, so this reads the
     /// list back. Every secret file path, new or existing, ends with one
-    /// protected entry granting this account full control and nothing
-    /// inherited from its directory.
+    /// protected entry granting this account full control and nothing its
+    /// directory passes on, here an entry letting Users read.
     #[cfg(windows)]
     #[test]
     fn windows_secret_files_list_only_the_current_account() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = shared_directory();
         let written = directory.path().join("written.json");
         write_private(&written, b"secret").unwrap();
         let created = directory.path().join("created.json");
         create_private(&created).unwrap();
         let existing = directory.path().join("existing.json");
         fs::write(&existing, b"secret").unwrap();
+        let list = dacl(&existing);
         assert!(
-            dacl(&existing).contains("(A;ID;"),
-            "temporary files inherit entries"
+            lets_in(&list, "BU"),
+            "files created otherwise get the folder's entries: {list}"
         );
         restrict_to_owner(&existing).unwrap();
         for path in [&written, &created, &existing] {
@@ -1195,33 +1352,34 @@ pub(crate) mod tests {
     }
 
     /// Where the volume keeps access lists, failing to set one is an error,
-    /// not a warning. This file's list leaves its owner, this account, only
-    /// read access (an OWNER RIGHTS entry replaces the owner's implicit right
-    /// to change the list), so icacls cannot restrict it; an account whose
-    /// privileges still let it may succeed, and then the file is owner-only.
+    /// not a warning. This file's whole list is one OWNER RIGHTS entry that
+    /// lets its owner, this account, only read: it replaces the owner's
+    /// implicit right to change the list, so this account cannot restrict
+    /// it; an account whose privileges still let it may succeed, and then
+    /// the file is owner-only.
     #[cfg(windows)]
     #[test]
     fn windows_access_list_failures_are_errors_on_ntfs() {
-        let directory = tempfile::tempdir().unwrap();
+        // The folder's entry lets this account remove the locked file again.
+        let sid = windows::current_sid().unwrap();
+        let directory = directory_with_list(&format!("D:P(A;OICI;FA;;;{sid})"));
         let path = directory.path().join("locked.json");
         fs::write(&path, b"secret").unwrap();
         assert!(
             windows::keeps_access_lists(&fs::File::open(&path).unwrap()).unwrap(),
             "the temporary directory keeps access lists"
         );
-        let arguments: [OsString; 5] = [
-            path.as_path().into(),
-            "/inheritance:r".into(),
-            "/grant:r".into(),
-            "*S-1-3-4:R".into(),
-            "/q".into(),
-        ];
-        windows::run("icacls.exe", &arguments).unwrap();
+        set_access_list(&path, "D:P(A;;FR;;;OW)");
         let locked = dacl(&path);
+        let (flags, entries) = entries(&locked);
         assert!(
-            locked.starts_with("D:P")
-                && locked.ends_with(";;;OW)")
-                && locked.matches('(').count() == 1,
+            flags.starts_with("D:P")
+                && matches!(
+                    entries.as_slice(),
+                    [entry] if entry.kind == "A"
+                        && entry.rights == "FR"
+                        && same_account(&entry.account, "S-1-3-4")
+                ),
             "{locked}"
         );
         match restrict_to_owner(&path) {
@@ -1262,17 +1420,19 @@ pub(crate) mod tests {
     }
 
     /// A directory that lets Users read everything created inside it, as one
-    /// under C:\ or ProgramData does.
+    /// under C:\ or ProgramData does. Its whole list is set, granting this
+    /// account full control and Users read access, both passed on to what is
+    /// created inside, whatever the temporary folder would pass on.
     #[cfg(windows)]
     pub(crate) fn shared_directory() -> tempfile::TempDir {
-        let directory = tempfile::tempdir().unwrap();
-        grant_users(directory.path(), "(OI)(CI)R");
+        let sid = windows::current_sid().unwrap();
+        let directory = directory_with_list(&format!("D:P(A;OICI;FA;;;{sid})(A;OICI;FR;;;BU)"));
         let probe = directory.path().join("probe");
         fs::write(&probe, b"").unwrap();
+        let list = dacl(&probe);
         assert!(
-            dacl(&probe).contains(";;;BU)"),
-            "files created here let Users read them: {}",
-            dacl(&probe)
+            lets_in(&list, "BU"),
+            "files created here let Users read them: {list}"
         );
         fs::remove_file(&probe).unwrap();
         directory
@@ -1311,25 +1471,114 @@ pub(crate) mod tests {
         create_private(&restricted).unwrap();
         assert_owner_only(&restricted);
         assert!(!created_owner_only(&restricted));
-        // A file a helper creates inside a private directory inherits only
-        // this account's entry, before anything restricts it.
+        // A file a helper creates inside a private directory gets only this
+        // account's entry from it, before anything restricts it.
         let staging = directory.path().join("staging");
         create_private_directory(&staging).unwrap();
+        let sid = windows::current_sid().unwrap();
         let list = dacl(&staging);
-        assert!(list.starts_with("D:P"), "{list}");
+        let (flags, entries) = entries(&list);
+        assert!(
+            flags.starts_with("D:P")
+                && matches!(
+                    entries.as_slice(),
+                    [entry] if entry.kind == "A"
+                        && entry.flags == "OICI"
+                        && entry.rights == "FA"
+                        && same_account(&entry.account, sid)
+                ),
+            "only this account's entry, passed on: {list}"
+        );
         assert!(
             create_private_directory(&staging).is_err(),
             "only a new one"
         );
         let staged = staging.join("key.json");
         fs::write(&staged, b"secret").unwrap();
-        let sid = windows::current_sid().unwrap();
         let list = dacl(&staged);
         assert!(
-            list.ends_with(&format!("(A;ID;FA;;;{sid})")) && list.matches('(').count() == 1,
-            "only this account's inherited entry: {list}"
+            grants_only(&list, sid, true),
+            "only this account's entry, from the directory: {list}"
         );
         owner_only_access_list(&list, sid).unwrap();
+    }
+
+    /// The tests compare accounts by SID, however the system spells them:
+    /// for this computer's built-in Administrator, the account a GitHub
+    /// Windows runner's tests run as, it writes LA. Production names the
+    /// current account as the system writes it (`spelled`), so its own
+    /// comparisons hold for that account too.
+    #[cfg(windows)]
+    #[test]
+    fn windows_lists_naming_the_built_in_administrator_as_la_compare_by_sid() {
+        let administrator = windows::sid_string("LA").unwrap();
+        assert!(
+            administrator.starts_with("S-1-5-21-") && administrator.ends_with("-500"),
+            "{administrator}"
+        );
+        assert_eq!(windows::sid_string(&administrator).unwrap(), administrator);
+        let spelled = windows::spelled(&administrator).unwrap();
+        assert_eq!(spelled, "LA");
+        for list in ["D:P(A;;FA;;;LA)", "D:AI(A;ID;FA;;;LA)", "D:(A;;FA;;;LA)"] {
+            owner_only_access_list(list, &spelled).unwrap();
+        }
+        trusted_owner("O:LA", &spelled).unwrap();
+        assert!(same_account("LA", &administrator));
+        assert!(same_account("la", &administrator));
+        for other in [
+            "LG",
+            "BA",
+            "SY",
+            "BU",
+            "S-1-5-21-1004336348-1177238915-682003330-500",
+        ] {
+            assert!(!same_account(other, &administrator), "{other}");
+        }
+        for sid in [administrator.as_str(), "LA"] {
+            for list in [
+                "D:P(A;;FA;;;LA)".to_owned(),
+                "D:PAI(A;;FA;;;LA)".to_owned(),
+                format!("D:P(A;;FA;;;{administrator})"),
+                "D:P(A;;FA;;;LA)S:(ML;;NW;;;LW)".to_owned(),
+            ] {
+                assert!(owner_only(&list, sid), "{sid}: {list}");
+            }
+            for list in [
+                "D:(A;;FA;;;LA)",
+                "D:P(A;ID;FA;;;LA)",
+                "D:P(A;;FR;;;LA)",
+                "D:P(D;;FA;;;LA)",
+                "D:P(A;;FA;;;BA)",
+                "D:P(A;;FA;;;LA)(A;;FR;;;BU)",
+                "D:P",
+            ] {
+                assert!(!owner_only(list, sid), "{sid}: {list}");
+            }
+            // A file created in a private directory, the entry it gets marked
+            // inherited or, as on a GitHub Windows runner, not.
+            for list in ["D:AI(A;ID;FA;;;LA)", "D:(A;ID;FA;;;LA)", "D:(A;;FA;;;LA)"] {
+                assert!(grants_only(list, sid, true), "{sid}: {list}");
+            }
+            for list in [
+                "D:(A;ID;FA;;;LA)(A;ID;FA;;;SY)",
+                "D:(A;OICIID;FA;;;LA)",
+                "D:(A;ID;FA;;;LG)",
+            ] {
+                assert!(!grants_only(list, sid, true), "{sid}: {list}");
+            }
+            assert!(lets_in("D:AI(A;ID;FR;;;BU)(A;ID;FA;;;LA)", sid));
+            assert!(!lets_in("D:P(D;;FA;;;LA)(A;;FA;;;BA)", sid));
+        }
+        // The list a file naming that account gets, as icacls writes it.
+        let me = windows::current_sid().unwrap();
+        let directory = directory_with_list(&format!("D:P(A;OICI;FA;;;{me})"));
+        let path = directory.path().join("administrator.json");
+        fs::write(&path, b"secret").unwrap();
+        set_access_list(&path, &format!("D:P(A;;FA;;;{administrator})"));
+        let list = dacl(&path);
+        assert!(list.ends_with("(A;;FA;;;LA)"), "{list}");
+        assert!(owner_only(&list, &administrator), "{list}");
+        assert!(owner_only(&list, "LA"), "{list}");
     }
 
     /// The current account is compared as the system writes it in access
@@ -1373,7 +1622,9 @@ pub(crate) mod tests {
             grant_users(path, "R");
             let list = dacl(path);
             assert!(
-                list.contains("(A;;") && list.contains(";;;BU)"),
+                entries(&list).1.iter().any(|entry| entry.kind == "A"
+                    && entry.flags.is_empty()
+                    && same_account(&entry.account, "BU")),
                 "an explicit entry for Users: {list}"
             );
         }
